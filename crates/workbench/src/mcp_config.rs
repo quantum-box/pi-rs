@@ -58,6 +58,8 @@ pub enum McpCommand {
         /// Authenticate with credentials saved by mcp login.
         #[arg(long)]
         oauth: bool,
+        #[command(flatten)]
+        oauth_client: Box<McpOAuthAddOptions>,
         #[arg(long, value_parser = ["direct", "deferred", "codemode", "hidden"])]
         exposure: Option<String>,
         #[arg(long = "env")]
@@ -70,6 +72,25 @@ pub enum McpCommand {
         #[arg(short = 'l', long)]
         local: bool,
     },
+}
+
+#[derive(Clone, clap::Args)]
+pub struct McpOAuthAddOptions {
+    /// Pre-registered OAuth client ID.
+    #[arg(long)]
+    oauth_client_id: Option<String>,
+    /// OAuth client secret or reference such as '${CLIENT_SECRET}' or '!command'.
+    #[arg(long)]
+    oauth_client_secret: Option<String>,
+    /// Fixed loopback OAuth callback port.
+    #[arg(long)]
+    oauth_callback_port: Option<u16>,
+    /// Client name sent during dynamic registration.
+    #[arg(long)]
+    oauth_client_name: Option<String>,
+    /// OAuth client registration mode.
+    #[arg(long, value_parser = ["auto", "cimd", "dcr"])]
+    oauth_client_registration: Option<String>,
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
@@ -740,10 +761,18 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             description,
             bearer_token_env_var,
             oauth,
+            oauth_client,
             exposure,
             environment,
             command,
         } => {
+            let McpOAuthAddOptions {
+                oauth_client_id,
+                oauth_client_secret,
+                oauth_callback_port,
+                oauth_client_name,
+                oauth_client_registration,
+            } = *oauth_client;
             if name.is_empty()
                 || !name
                     .bytes()
@@ -788,7 +817,26 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 }
                 value["headers"] = Value::Object(map);
             }
-            if oauth {
+            let mut oauth_options = serde_json::Map::new();
+            for (key, option) in [
+                ("clientId", oauth_client_id),
+                ("clientSecret", oauth_client_secret),
+                ("clientName", oauth_client_name),
+                ("clientRegistration", oauth_client_registration),
+            ] {
+                if let Some(option) = option {
+                    oauth_options.insert(key.into(), json!(option));
+                }
+            }
+            if let Some(port) = oauth_callback_port {
+                if port == 0 {
+                    return Err(Error::Config(
+                        "OAuth callback port must be between 1 and 65535".into(),
+                    ));
+                }
+                oauth_options.insert("callbackPort".into(), json!(port));
+            }
+            if oauth || !oauth_options.is_empty() {
                 if value.get("url").is_none()
                     || bearer_token_env_var.is_some()
                     || value["headers"].as_object().is_some_and(|headers| {
@@ -801,7 +849,15 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                         "--oauth requires --url and cannot use --bearer-token-env-var".into(),
                     ));
                 }
-                value["oauth"] = json!(true);
+                if oauth_options.is_empty() {
+                    value["oauth"] = json!(true);
+                } else {
+                    let options = Value::Object(oauth_options);
+                    if !valid_oauth(&options) {
+                        return Err(Error::Config("invalid MCP OAuth client settings".into()));
+                    }
+                    value["oauth"] = options;
+                }
             }
             if let Some(exposure) = exposure {
                 value["exposure"] = json!(exposure);

@@ -2127,7 +2127,7 @@ impl Tool for CodingTool {
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec!["pattern"],
             ),
             Kind::Find => (
@@ -2365,6 +2365,57 @@ fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
         .into_iter()
         .find_map(&mut get)
         .unwrap_or_default()
+}
+
+fn is_ecmascript_whitespace(character: char) -> bool {
+    matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+// Pi consumes fd's stdout with readline, trims each line, then relativizes
+// absolute lines against the search root. File names may themselves contain
+// line breaks, so a single fd result can become several displayed results.
+fn find_pi_lines(root: &Path, path: &Path, is_directory: bool) -> Vec<String> {
+    let mut raw = path.to_string_lossy().into_owned();
+    if is_directory {
+        raw.push(std::path::MAIN_SEPARATOR);
+    }
+    raw.split(['\r', '\n'])
+        .map(|line| line.trim_matches(is_ecmascript_whitespace))
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = Path::new(line);
+            if !path.is_absolute() {
+                return line.replace(std::path::MAIN_SEPARATOR, "/");
+            }
+            let trailing = line.ends_with(std::path::MAIN_SEPARATOR);
+            let target = crate::coding_paths::resolve(root, path);
+            let root_parts: Vec<_> = root.components().collect();
+            let target_parts: Vec<_> = target.components().collect();
+            let common = root_parts
+                .iter()
+                .zip(&target_parts)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let mut relative = PathBuf::new();
+            if common == 0 {
+                relative.push(&target);
+            } else {
+                for _ in common..root_parts.len() {
+                    relative.push("..");
+                }
+                for component in &target_parts[common..] {
+                    relative.push(component.as_os_str());
+                }
+            }
+            let mut relative = relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if trailing && !relative.ends_with('/') {
+                relative.push('/');
+            }
+            relative
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -2936,8 +2987,13 @@ impl CodingTool {
         };
         let limit = args["limit"]
             .as_u64()
-            .unwrap_or(if is_find { 1000 } else { 100 })
-            .min(100_000) as usize;
+            .unwrap_or(if is_find { 1000 } else { 100 });
+        let limit = if is_find || !self.unrestricted {
+            limit.min(100_000)
+        } else {
+            limit
+        };
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
         let glob = if is_find {
@@ -2978,6 +3034,11 @@ impl CodingTool {
                 }
                 error => error,
             })?;
+            let grep = if self.unrestricted {
+                grep.with_numeric_limit(args["limit"].as_f64().unwrap_or(100.0))
+            } else {
+                grep
+            };
             Some(if base.is_file() {
                 grep.with_explicit_file()
             } else {
@@ -2985,6 +3046,8 @@ impl CodingTool {
             })
         };
         let mut results = Vec::new();
+        let mut find_count = 0usize;
+        let mut find_paths = Vec::new();
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -3074,20 +3137,35 @@ impl CodingTool {
                     break;
                 }
             } else {
-                let mut path = relative
-                    .to_string_lossy()
-                    .replace(std::path::MAIN_SEPARATOR, "/");
-                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                    path.push('/');
+                let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
+                if self.unrestricted {
+                    find_paths.push((entry.path().to_owned(), is_directory));
+                } else {
+                    let mut path = relative
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    if is_directory {
+                        path.push('/');
+                    }
+                    results.push(path);
                 }
-                results.push(path);
-                if results.len() >= limit {
+                find_count += 1;
+                if find_count >= limit {
                     break;
                 }
             }
         }
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+        if is_find && self.unrestricted {
+            find_paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (path, is_directory) in find_paths {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                results.extend(find_pi_lines(&base, &path, is_directory));
+            }
         }
         Ok(match grep {
             Some(grep) => grep.finish(),
@@ -3098,7 +3176,9 @@ impl CodingTool {
                     }
                     return Ok(Outcome::Succeeded("No files found matching pattern".into()));
                 }
-                results.sort();
+                if !self.unrestricted {
+                    results.sort();
+                }
                 let mut details = Map::new();
                 let mut notices = Vec::new();
                 if results.len() >= limit {
@@ -4639,6 +4719,123 @@ mod tests {
                 .await;
             assert!(outcome.tool_content().starts_with("fixture-1- before\n"));
         }
+    }
+
+    #[test]
+    fn unrestricted_grep_accepts_more_than_one_hundred_thousand_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let count = 100_001usize;
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(count)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let args = json!({"pattern":"needle", "limit":200_000, "context":1});
+        assert!(
+            jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
+        match tool
+            .search(&args, &pi_rs::CancellationToken::new())
+            .unwrap()
+        {
+            Outcome::SucceededWithDetails { details, .. } => {
+                assert!(details.get("matchLimitReached").is_none());
+                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+            }
+            other => panic!("expected truncated result with details, got {other:?}"),
+        }
+        tool.unrestricted = false;
+        assert!(
+            !jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_grep_numeric_limits_through_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(4)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        for (limit, count, notice, effective) in [
+            (
+                json!(0),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(-3),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(2.0),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
+            (
+                json!(2.5),
+                3,
+                "2.5 matches limit reached. Use limit=5",
+                json!(2.5),
+            ),
+        ] {
+            let args = json!({"pattern":"needle", "limit":limit, "context":1});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            match outcome {
+                Outcome::SucceededWithDetails { output, details } => {
+                    assert_eq!(
+                        output
+                            .lines()
+                            .filter(|line| line.contains(": needle"))
+                            .count(),
+                        count
+                    );
+                    assert!(output.contains(notice), "{output}");
+                    assert_eq!(details["matchLimitReached"], effective);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        for limit in [json!(1e100), json!(18446744073709551615u64)] {
+            let args = json!({"pattern":"needle", "limit":limit});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert_eq!(outcome.tool_content().lines().count(), 4);
+        }
+        tool.unrestricted = false;
+        let scoped = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        assert!(!scoped.is_valid(&json!({"pattern":"needle", "limit":2.5})));
     }
 
     #[tokio::test]
@@ -6305,6 +6502,109 @@ mod tests {
         assert_eq!(partial.unwrap().tool_content(), "a-readable.txt");
         assert!(no_match.is_err());
         assert!(grep_error.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_fd_lines_trim_then_relativize_and_split() {
+        let root = Path::new("/tmp/find-root");
+        assert_eq!(find_pi_lines(root, &root.join(". "), false), [""]);
+        assert_eq!(find_pi_lines(root, &root.join("sub/.. "), false), [""]);
+        assert_eq!(
+            find_pi_lines(root, &root.join("foo\n bar "), false),
+            ["foo", "bar"]
+        );
+        assert_eq!(
+            find_pi_lines(root, &root.join("foo\r\n bar "), false),
+            ["foo", "bar"]
+        );
+        assert_eq!(find_pi_lines(root, &root.join("dir "), true), ["dir /"]);
+        assert_eq!(
+            find_pi_lines(root, &root.join("nel\u{85}"), false),
+            ["nel\u{85}"]
+        );
+    }
+
+    #[test]
+    fn find_orders_fd_paths_before_expanding_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("a").join("x"), "").unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        let output = tool
+            .search(&json!({"pattern":"*"}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "a/\na/x\na.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_newline_filename_counts_displayed_lines_for_limit_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("foo\n bar "), "").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        for limit in [1, 2] {
+            let output = tool
+                .search(
+                    &json!({"pattern":"*","limit":limit}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .unwrap()
+                .tool_content();
+            assert_eq!(
+                output,
+                format!(
+                    "foo\nbar\n\n[{limit} results limit reached. Use limit={} for more, or refine pattern]",
+                    limit * 2
+                )
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_trims_upstream_line_whitespace_only_for_unrestricted_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for name in ["space ", "bom\u{feff}", "nel\u{85}"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
+        std::fs::create_dir(root.join("dir ")).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let output = tool
+            .search(&json!({"pattern":"*"}), &cancellation)
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "bom\ndir /\nnel\u{85}\nspace");
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let output = scoped
+            .search(&json!({"pattern":"*"}), &cancellation)
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "bom\u{feff}\ndir /\nnel\u{85}\nspace ");
     }
 
     #[test]

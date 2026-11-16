@@ -89,6 +89,160 @@ async fn mcp_login_sigint_cancels_discovery() {
 }
 
 #[test]
+fn mcp_add_persists_oauth_client_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&[
+        "mcp",
+        "add",
+        "remote",
+        "--url",
+        "https://example.com/mcp",
+        "--oauth-client-id",
+        "client",
+        "--oauth-client-secret",
+        "${CLIENT_SECRET}",
+        "--oauth-callback-port",
+        "12345",
+        "--oauth-client-name",
+        "client name",
+        "--oauth-client-registration",
+        "dcr",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = root.path().join("mcp.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["remote"]["oauth"],
+        json!({"clientId":"client","clientSecret":"${CLIENT_SECRET}","callbackPort":12345,"clientName":"client name","clientRegistration":"dcr"})
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--oauth-client-id",
+            "client",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-secret",
+            "secret",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-registration",
+            "cimd",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-callback-port",
+            "0",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--header",
+            "authorization=Bearer token",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
+fn mcp_added_oauth_secret_reference_is_resolved_for_login() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |args: &[&str], secret: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_TEST_MCP_SECRET")
+            .args(args);
+        if let Some(secret) = secret {
+            command.env("PI_RS_TEST_MCP_SECRET", secret);
+        }
+        command.output().unwrap()
+    };
+    let added = command(
+        &[
+            "mcp",
+            "add",
+            "fixture",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-secret",
+            "${PI_RS_TEST_MCP_SECRET}",
+        ],
+        None,
+    );
+    assert!(added.status.success());
+    let path = root.path().join("mcp.json");
+    let before = std::fs::read(&path).unwrap();
+    let missing = command(&["mcp", "login", "fixture"], None);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("missing environment variable PI_RS_TEST_MCP_SECRET")
+    );
+    let resolved = command(&["mcp", "login", "fixture"], Some("private-fixture-secret"));
+    assert!(!resolved.status.success());
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("missing environment variable"));
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("private-fixture-secret"));
+    assert!(!String::from_utf8_lossy(&resolved.stdout).contains("private-fixture-secret"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!String::from_utf8_lossy(&before).contains("private-fixture-secret"));
+}
+
+#[test]
 fn mcp_logout_local_targets_trusted_project_credentials() {
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();
@@ -396,6 +550,88 @@ fn mcp_add_saves_stdio_and_http_options() {
     let after: Value =
         serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
     assert_eq!(after, config);
+}
+
+#[test]
+fn startup_fork_preserves_inert_sibling_history() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.jsonl");
+    let entries = [
+        json!({"type":"session","version":3,"id":"legacy"}),
+        json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"root"}}),
+        json!({"type":"session_info","id":"n","parentId":"a","name":"shared name"}),
+        json!({"type":"message","id":"b","parentId":"n","message":{"role":"user","content":"sibling"}}),
+        json!({"type":"message","id":"c","parentId":"n","message":{"role":"user","content":"active"}}),
+    ];
+    let source_text = entries
+        .iter()
+        .map(|v| v.to_string() + "\n")
+        .collect::<String>();
+    std::fs::write(&source, &source_text).unwrap();
+    let sessions = root.path().join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .arg("--fork")
+        .arg(&source)
+        .arg("--print")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_text);
+    let journals: Vec<_> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    assert_eq!(journals.len(), 1);
+    let destination = &journals[0];
+    let mut session = Session::open(destination).unwrap();
+    assert_ne!(session.external_session_id(), "legacy");
+    assert_eq!(session.parent_session(), Some(source.to_str().unwrap()));
+    assert_eq!(session.name(), Some("shared name"));
+    assert_eq!(
+        session
+            .records()
+            .iter()
+            .filter(|record| matches!(
+                &record.event,
+                pi_rs::Event::SessionInfo { name: Some(_), .. }
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        session
+            .current_messages()
+            .iter()
+            .any(|m| matches!(m, pi_rs::Message::User { content } if content == "active"))
+    );
+    let sibling = session
+        .records()
+        .iter()
+        .find(|record| {
+            matches!(&record.event,
+        pi_rs::Event::User { content, .. } if content == "sibling")
+        })
+        .unwrap()
+        .id;
+    session.checkout(sibling).unwrap();
+    assert!(
+        session
+            .current_messages()
+            .iter()
+            .any(|m| matches!(m, pi_rs::Message::User { content } if content == "sibling"))
+    );
 }
 
 #[test]
@@ -6478,6 +6714,138 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     };
     reader.join().unwrap();
     assert!(status.success(), "RPC process exited with {status}");
+}
+
+#[cfg(unix)]
+#[test]
+fn single_command_session_lifecycle_persists_custom_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("lifecycle.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'lifecycle','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    event=frame['request']['event']['type']
+    if event in ('session_start','session_shutdown'):
+        assert frame['has_custom_entries'] and frame['has_custom_entry_read']
+        print(json.dumps({'type':'list_custom_entries','custom_type':'lifecycle'}),flush=True)
+        previous=json.loads(sys.stdin.readline())['Ok']
+        assert len(previous)==(0 if event=='session_start' else 1)
+        print(json.dumps({'type':'append_entry','entry':{'customType':'lifecycle','data':{'event':event}}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("model fixture accept failed: {error}"),
+                }
+            };
+            // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut length = 0;
+            let mut metadata_request = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                metadata_request |= line.starts_with("GET /api/ps ");
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if metadata_request {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                !serde_json::to_string(&request["messages"])
+                    .unwrap()
+                    .contains("session_start")
+            );
+            let response = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+            break;
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--print", "same input"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(session_path).unwrap();
+    let entries: Vec<_> = session
+        .branch()
+        .iter()
+        .filter_map(|record| match &record.event {
+            pi_rs::Event::CustomEntry { entry } if entry.custom_type == "lifecycle" => {
+                entry.data.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            json!({"event":"session_start"}),
+            json!({"event":"session_shutdown"})
+        ]
+    );
 }
 
 #[cfg(unix)]
