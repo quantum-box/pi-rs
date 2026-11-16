@@ -3707,7 +3707,10 @@ mod replacement_tests {
             })
             .unwrap();
         session
-            .append(crate::Event::ToolStarted { operation_id })
+            .append(crate::Event::ToolStarted {
+                operation_id,
+                tool_execution: None,
+            })
             .unwrap();
         let before = session.records().len();
         let resources = registry

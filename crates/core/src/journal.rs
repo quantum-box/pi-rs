@@ -15,7 +15,8 @@ use crate::{
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
 const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
 const TOOL_DECISION_JOURNAL_VERSION: u32 = 5;
-const FORMAT_VERSION: u32 = TOOL_DECISION_JOURNAL_VERSION;
+const TOOL_EXECUTION_JOURNAL_VERSION: u32 = 6;
+const FORMAT_VERSION: u32 = TOOL_EXECUTION_JOURNAL_VERSION;
 const MAX_TOOL_DECISION_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -352,6 +353,12 @@ pub enum Event {
     },
     ToolStarted {
         operation_id: Uuid,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_execution_marker"
+        )]
+        tool_execution: Option<ToolExecutionMarker>,
     },
     ToolFinished {
         operation_id: Uuid,
@@ -502,6 +509,30 @@ fn deserialize_decision_marker<'de, D: serde::Deserializer<'de>>(
 struct ToolDecisionMetadata {
     version: u32,
     snapshot: crate::ToolDecisionSnapshot,
+}
+
+/// Independent binding for one tool start. The snapshot is atomic metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExecutionMarker {
+    version: u32,
+    origin_session_id: Uuid,
+    request_id: Uuid,
+    decision_sha256: String,
+    binding_sha256: String,
+}
+
+fn deserialize_execution_marker<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<ToolExecutionMarker>, D::Error> {
+    ToolExecutionMarker::deserialize(deserializer).map(Some)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolExecutionMetadata {
+    version: u32,
+    snapshot: crate::ToolExecutionSnapshot,
 }
 
 /// A decision from the active branch or historical session/branch context.
@@ -993,6 +1024,223 @@ impl Session {
             return Err(Error::Session("duplicate tool decision request ID".into()));
         }
         self.recorded_tool_decision(record.id)
+    }
+
+    // Resolve an unambiguous direct model invocation. Nested tool-planned calls
+    // do not carry a request ID and are deliberately rejected here.
+    fn execution_provenance(
+        &self,
+        request_id: Uuid,
+        operation_id: Uuid,
+        before: u64,
+        run_id: Option<Uuid>,
+        spec: &crate::ToolSpec,
+    ) -> Result<(crate::Invocation, String)> {
+        let RecordedToolDecision::Current(decision) = self.active_tool_decision(request_id)? else {
+            return Err(Error::Session(
+                "tool execution requires a current decision".into(),
+            ));
+        };
+        let branch = self.branch();
+        let request_record = branch.iter().find(|record| matches!(&record.event, Event::ModelRequested { request_id: Some(id), .. } if *id == request_id))
+            .ok_or_else(|| Error::Session("missing tool execution request".into()))?;
+        let Event::ModelRequested {
+            tool_decision: Some(marker),
+            ..
+        } = &request_record.event
+        else {
+            return Err(Error::Session("missing tool decision marker".into()));
+        };
+        if request_record.id >= before || request_record.run_id != run_id {
+            return Err(Error::Session(
+                "tool execution request position or run mismatch".into(),
+            ));
+        }
+        let validated = decision
+            .validate_recorded(
+                decision.context(),
+                &marker.request_sha256,
+                &marker.dispatch_sha256,
+                &marker.binding_sha256,
+            )
+            .map_err(|_| Error::Session("invalid tool decision".into()))?;
+        if !validated
+            .effective_tools()
+            .iter()
+            .any(|tool| &tool.spec == spec)
+        {
+            return Err(Error::Session(
+                "registered tool is not in the request decision".into(),
+            ));
+        }
+        let mut found = None;
+        for record in &branch {
+            match &record.event {
+                Event::Assistant {
+                    invocations,
+                    request_id: assistant_request,
+                    ..
+                } => {
+                    for invocation in invocations
+                        .iter()
+                        .filter(|inv| inv.operation_id == operation_id)
+                    {
+                        if found.is_some()
+                            || record.id <= request_record.id
+                            || record.id >= before
+                            || record.run_id != run_id
+                            || *assistant_request != Some(request_id)
+                            || invocation.call.name != spec.name
+                        {
+                            return Err(Error::Session(
+                                "ambiguous tool invocation provenance".into(),
+                            ));
+                        }
+                        found = Some(invocation.clone());
+                    }
+                }
+                Event::ToolPlanned { invocation, .. }
+                    if invocation.operation_id == operation_id =>
+                {
+                    return Err(Error::Session("ambiguous or nested tool invocation".into()));
+                }
+                Event::ToolStarted {
+                    operation_id: id, ..
+                }
+                | Event::ToolFinished {
+                    operation_id: id, ..
+                }
+                | Event::ToolReconciled {
+                    operation_id: id, ..
+                } if *id == operation_id && record.id < before => {
+                    return Err(Error::Session(
+                        "tool operation already started or finished".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok((
+            found.ok_or_else(|| Error::Session("missing tool invocation".into()))?,
+            marker.binding_sha256.clone(),
+        ))
+    }
+
+    /// Atomically record an authorized execution snapshot before starting a tool.
+    /// `owner`, `spec`, and `recovery_identity` must come from the current registry.
+    pub fn append_tool_execution_started(
+        &mut self,
+        request_id: Uuid,
+        operation_id: Uuid,
+        snapshot: &crate::ToolExecutionSnapshot,
+        owner: &str,
+        spec: &crate::ToolSpec,
+        recovery_identity: &str,
+    ) -> Result<&Record> {
+        let (invocation, decision) = self.execution_provenance(
+            request_id,
+            operation_id,
+            self.records.len() as u64 + 1,
+            self.run_id,
+            spec,
+        )?;
+        snapshot.validate(
+            request_id,
+            &invocation,
+            owner,
+            spec,
+            recovery_identity,
+            &decision,
+            snapshot.binding_sha256(),
+        )?;
+        let event = Event::ToolStarted {
+            operation_id,
+            tool_execution: Some(ToolExecutionMarker {
+                version: 1,
+                origin_session_id: self.session_id(),
+                request_id,
+                decision_sha256: decision,
+                binding_sha256: snapshot.binding_sha256().to_owned(),
+            }),
+        };
+        let metadata = serde_json::json!({"toolExecution": ToolExecutionMetadata { version: 1, snapshot: snapshot.clone() }});
+        self.append_inner_with_metadata(event, true, Some(metadata))
+    }
+
+    /// Return validated arguments for an active-branch start, or None for a
+    /// legacy start. Historical/forked records cannot authorize execution.
+    pub fn recorded_tool_execution(
+        &self,
+        id: u64,
+        owner: &str,
+        spec: &crate::ToolSpec,
+        recovery_identity: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let record = id
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| self.records.get(i))
+            .ok_or_else(|| Error::Session("missing tool start record".into()))?;
+        let Event::ToolStarted {
+            operation_id,
+            tool_execution,
+        } = &record.event
+        else {
+            return Err(Error::Session("record is not a tool start".into()));
+        };
+        let Some(marker) = tool_execution else {
+            if self
+                .record_metadata(id)
+                .is_some_and(|value| value.get("toolExecution").is_some())
+            {
+                return Err(Error::Session(
+                    "tool execution metadata without marker".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        if record.version < TOOL_EXECUTION_JOURNAL_VERSION
+            || marker.version != 1
+            || marker.origin_session_id != self.session_id()
+            || marker.request_id.is_nil()
+            || operation_id.is_nil()
+            || !decision_valid_hash(&marker.decision_sha256)
+            || !decision_valid_hash(&marker.binding_sha256)
+            || !self.branch().iter().any(|entry| entry.id == id)
+        {
+            return Err(Error::Session(
+                "invalid or historical tool execution marker".into(),
+            ));
+        }
+        if self.branch().iter().filter(|entry| matches!(&entry.event, Event::ToolStarted { operation_id: other, .. } if other == operation_id)).count() != 1 {
+            return Err(Error::Session("ambiguous tool start".into()));
+        }
+        let (invocation, decision) =
+            self.execution_provenance(marker.request_id, *operation_id, id, record.run_id, spec)?;
+        if decision != marker.decision_sha256 {
+            return Err(Error::Session("tool execution decision mismatch".into()));
+        }
+        let value = self
+            .record_metadata(id)
+            .and_then(|metadata| metadata.get("toolExecution"))
+            .ok_or_else(|| Error::Session("missing tool execution metadata".into()))?;
+        let metadata: ToolExecutionMetadata = serde_json::from_value(value.clone())
+            .map_err(|_| Error::Session("invalid tool execution metadata".into()))?;
+        if metadata.version != 1 {
+            return Err(Error::Session(
+                "unsupported tool execution metadata version".into(),
+            ));
+        }
+        let validated = metadata.snapshot.validate(
+            marker.request_id,
+            &invocation,
+            owner,
+            spec,
+            recovery_identity,
+            &decision,
+            &marker.binding_sha256,
+        )?;
+        Ok(Some(validated.arguments().clone()))
     }
 
     /// Verify the provenance of all Pi source entries in this snapshot.
@@ -3227,6 +3475,16 @@ impl Session {
                 "marked request requires tool decision metadata".into(),
             ));
         }
+        if matches!(
+            &event,
+            Event::ToolStarted {
+                tool_execution: Some(_),
+                ..
+            }
+        ) && metadata.is_none()
+        {
+            return Err(Error::Session("marked tool start requires metadata".into()));
+        }
         // A native message branching directly from a legacy Pi source needs a
         // distinct parent, even if its content is identical to the old message.
         if matches!(&event, Event::CustomMessage { .. } | Event::CustomMessageDelivered { .. })
@@ -3278,12 +3536,24 @@ impl Session {
         }
         let version = if matches!(
             &event,
+            Event::ToolStarted {
+                tool_execution: Some(_),
+                ..
+            }
+        ) {
+            TOOL_EXECUTION_JOURNAL_VERSION
+        } else if matches!(
+            &event,
             Event::ModelRequested {
                 tool_decision: Some(_),
                 ..
             }
         ) {
-            TOOL_DECISION_JOURNAL_VERSION
+            self.records
+                .last()
+                .map_or(TOOL_DECISION_JOURNAL_VERSION, |record| {
+                    record.version.max(TOOL_DECISION_JOURNAL_VERSION)
+                })
         } else if matches!(
             &event,
             Event::BranchModelSelected { .. }
@@ -3312,6 +3582,26 @@ impl Session {
             parent,
             event,
         };
+        if matches!(
+            &record.event,
+            Event::ToolStarted {
+                tool_execution: Some(_),
+                ..
+            }
+        ) {
+            let limit = self
+                .store
+                .encoded_record_limit()
+                .unwrap_or(MAX_RECORD_BYTES)
+                .min(MAX_RECORD_BYTES);
+            if encode_record(&record, metadata.as_ref())?
+                .len()
+                .saturating_add(1)
+                > limit
+            {
+                return Err(Error::Session("journal record exceeds size limit".into()));
+            }
+        }
         // Reject an oversized metadata record before a store write is attempted;
         // this is a deterministic validation failure, not an ambiguous I/O error.
         if metadata.is_some()
@@ -3544,6 +3834,19 @@ fn validated_head(records: &[Record]) -> Result<u64> {
             || matches!(record.event, Event::Created { .. }) != (id == 1)
         {
             return Err(Error::Session(format!("invalid journal record {id}")));
+        }
+        if record.version < TOOL_EXECUTION_JOURNAL_VERSION
+            && matches!(
+                &record.event,
+                Event::ToolStarted {
+                    tool_execution: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(Error::Session(format!(
+                "invalid tool execution version in record {id}"
+            )));
         }
         if record.version < TOOL_DECISION_JOURNAL_VERSION
             && matches!(
@@ -3869,7 +4172,7 @@ fn operations(path: &[&Record]) -> Vec<(Invocation, OperationState)> {
                 indices.insert(invocation.operation_id, ops.len());
                 ops.push((invocation.clone(), OperationState::Planned));
             }
-            Event::ToolStarted { operation_id } => {
+            Event::ToolStarted { operation_id, .. } => {
                 if let Some(&index) = indices.get(operation_id) {
                     ops[index].1 = OperationState::Started;
                 }
@@ -5059,7 +5362,12 @@ mod session_metadata_tests {
                 request_id: None,
             })
             .unwrap();
-        session.append(Event::ToolStarted { operation_id }).unwrap();
+        session
+            .append(Event::ToolStarted {
+                operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
         let head = session.head();
         assert!(
             matches!(session.begin_tree_trigger_handoff(trigger), Err(Error::Reconciliation(id)) if id == operation_id)
@@ -6179,7 +6487,12 @@ mod snapshot_tests {
                     request_id: None,
                 })
                 .unwrap();
-            session.append(Event::ToolStarted { operation_id }).unwrap();
+            session
+                .append(Event::ToolStarted {
+                    operation_id,
+                    tool_execution: None,
+                })
+                .unwrap();
             session
                 .append(Event::ToolFinished {
                     operation_id,
@@ -6229,7 +6542,12 @@ mod snapshot_tests {
                 request_id: None,
             })
             .unwrap();
-        session.append(Event::ToolStarted { operation_id }).unwrap();
+        session
+            .append(Event::ToolStarted {
+                operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
         assert!(session.conversation_at(session.head()).is_err());
         assert!(
             matches!(&session.current_messages()[1], Message::Assistant { calls, .. } if calls.len()==1)
@@ -6675,5 +6993,356 @@ mod durable_tool_decision_tests {
                 .is_err()
         );
         assert_eq!(session.records().len(), 1);
+    }
+
+    fn execution_fixture(
+        session: &mut Session,
+    ) -> (
+        Uuid,
+        crate::Invocation,
+        crate::ToolSpec,
+        crate::ToolExecutionSnapshot,
+    ) {
+        let (event, decision, request, declarations) = fixture(session);
+        let request_id = decision.context().request_id;
+        let spec = request.tools[0].clone();
+        session
+            .append_tool_decision_request(event, &decision, &request, &request, &declarations)
+            .unwrap();
+        let invocation = crate::Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: spec.name.clone(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::Assistant {
+                content: "".into(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        let execution = crate::ToolExecutionSnapshot::capture(
+            request_id,
+            &invocation,
+            "owner",
+            &spec,
+            "backend-v1",
+            decision.binding_sha256(),
+            serde_json::json!({"path":"authorized"}),
+        )
+        .unwrap();
+        (request_id, invocation, spec, execution)
+    }
+
+    #[test]
+    fn tool_execution_roundtrip_and_legacy_after_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let (request, inv, spec, execution) = execution_fixture(&mut session);
+        let id = session
+            .append_tool_execution_started(
+                request,
+                inv.operation_id,
+                &execution,
+                "owner",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap()
+            .id;
+        assert_eq!(
+            session
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .unwrap(),
+            Some(serde_json::json!({"path":"authorized"}))
+        );
+        assert!(
+            session
+                .recorded_tool_execution(id, "owner", &spec, "changed-backend")
+                .is_err()
+        );
+        session
+            .append(Event::ToolStarted {
+                operation_id: Uuid::new_v4(),
+                tool_execution: None,
+            })
+            .unwrap();
+        assert_eq!(
+            session
+                .recorded_tool_execution(session.head(), "owner", &spec, "backend-v1")
+                .unwrap(),
+            None
+        );
+        drop(session);
+        let session = Session::open(&path).unwrap();
+        assert_eq!(
+            session
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .unwrap(),
+            Some(serde_json::json!({"path":"authorized"}))
+        );
+        let stripped = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(
+            stripped
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tool_execution_rejects_orphan_corruption_and_identity_mismatch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (request, inv, spec, execution) = execution_fixture(&mut session);
+        let id = session
+            .append_tool_execution_started(
+                request,
+                inv.operation_id,
+                &execution,
+                "owner",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap()
+            .id;
+        assert!(
+            session
+                .recorded_tool_execution(id, "wrong", &spec, "backend-v1")
+                .is_err()
+        );
+        let mut records = session.records().to_vec();
+        if let Event::ToolStarted { tool_execution, .. } = &mut records[id as usize - 1].event {
+            *tool_execution = None;
+        }
+        let orphan =
+            Session::from_records_with_metadata(records.clone(), session.record_metadata.clone())
+                .unwrap();
+        assert!(
+            orphan
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+        let mut metadata = session.record_metadata.clone();
+        metadata.get_mut(&id).unwrap()["toolExecution"]["snapshot"]["authorized_arguments"] =
+            serde_json::json!({"path":"tampered"});
+        let corrupt =
+            Session::from_records_with_metadata(session.records().to_vec(), metadata).unwrap();
+        assert!(
+            corrupt
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+        let mut records = session.records().to_vec();
+        if let Event::ToolStarted {
+            tool_execution: Some(marker),
+            ..
+        } = &mut records[id as usize - 1].event
+        {
+            marker.version = 99;
+        }
+        let unknown =
+            Session::from_records_with_metadata(records, session.record_metadata.clone()).unwrap();
+        assert!(
+            unknown
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+        let mut changed = session.records().to_vec();
+        let assistant = changed
+            .iter_mut()
+            .find(|r| matches!(r.event, Event::Assistant { .. }))
+            .unwrap();
+        if let Event::Assistant { invocations, .. } = &mut assistant.event {
+            invocations[0].call.arguments = "{\"changed\":true}".into();
+        }
+        let changed =
+            Session::from_records_with_metadata(changed, session.record_metadata.clone()).unwrap();
+        assert!(
+            changed
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+        let mut changed = session.records().to_vec();
+        let assistant = changed
+            .iter_mut()
+            .find(|r| matches!(r.event, Event::Assistant { .. }))
+            .unwrap();
+        if let Event::Assistant { request_id, .. } = &mut assistant.event {
+            *request_id = Some(Uuid::new_v4());
+        }
+        let changed =
+            Session::from_records_with_metadata(changed, session.record_metadata.clone()).unwrap();
+        assert!(
+            changed
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+        let mut changed = session.records().to_vec();
+        if let Event::ToolStarted {
+            tool_execution: Some(marker),
+            ..
+        } = &mut changed[id as usize - 1].event
+        {
+            marker.decision_sha256 = "f".repeat(64);
+        }
+        let changed =
+            Session::from_records_with_metadata(changed, session.record_metadata.clone()).unwrap();
+        assert!(
+            changed
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+        let mut value = serde_json::to_value(&session.records()[id as usize - 1]).unwrap();
+        value["event"]["tool_execution"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Record>(value).is_err());
+    }
+
+    #[test]
+    fn tool_execution_rejects_wrong_provenance_and_historical_start() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let base = session.head();
+        let (request, inv, spec, execution) = execution_fixture(&mut session);
+        assert!(
+            session
+                .append_tool_execution_started(
+                    Uuid::new_v4(),
+                    inv.operation_id,
+                    &execution,
+                    "owner",
+                    &spec,
+                    "backend-v1"
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .append_tool_execution_started(
+                    request,
+                    Uuid::new_v4(),
+                    &execution,
+                    "owner",
+                    &spec,
+                    "backend-v1"
+                )
+                .is_err()
+        );
+        let id = session
+            .append_tool_execution_started(
+                request,
+                inv.operation_id,
+                &execution,
+                "owner",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap()
+            .id;
+        session
+            .append(Event::ToolFinished {
+                operation_id: inv.operation_id,
+                outcome: Outcome::Succeeded("ok".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let forked = fork
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    record.event,
+                    Event::ToolStarted {
+                        tool_execution: Some(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap()
+            .id;
+        assert!(
+            fork.recorded_tool_execution(forked, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+        session.checkout(base).unwrap();
+        assert!(
+            session
+                .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tool_execution_checks_complete_record_size_before_write() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Limited {
+            inner: MemoryStore,
+            limit: Arc<AtomicUsize>,
+        }
+        impl SessionStore for Limited {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.inner.load()
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                self.inner.append(record)
+            }
+            fn supports_record_metadata(&self) -> bool {
+                true
+            }
+            fn encoded_record_limit(&self) -> Option<usize> {
+                Some(self.limit.load(Ordering::Relaxed))
+            }
+            fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+                self.inner.load_record_metadata()
+            }
+            fn append_with_metadata(
+                &mut self,
+                record: &Record,
+                metadata: Option<&serde_json::Value>,
+            ) -> Result<()> {
+                self.inner.append_with_metadata(record, metadata)
+            }
+        }
+        let limit = Arc::new(AtomicUsize::new(MAX_RECORD_BYTES));
+        let mut session = Session::with_store(Limited {
+            inner: MemoryStore::default(),
+            limit: limit.clone(),
+        })
+        .unwrap();
+        let (request, inv, spec, execution) = execution_fixture(&mut session);
+        let before = session.records().len();
+        limit.store(100, Ordering::Relaxed);
+        assert!(
+            session
+                .append_tool_execution_started(
+                    request,
+                    inv.operation_id,
+                    &execution,
+                    "owner",
+                    &spec,
+                    "backend-v1"
+                )
+                .is_err()
+        );
+        assert_eq!(session.records().len(), before);
+        limit.store(MAX_RECORD_BYTES, Ordering::Relaxed);
+        assert!(
+            session
+                .append_tool_execution_started(
+                    request,
+                    inv.operation_id,
+                    &execution,
+                    "owner",
+                    &spec,
+                    "backend-v1"
+                )
+                .is_ok()
+        );
     }
 }

@@ -1172,6 +1172,7 @@ pub fn convert(
                         .iter()
                         .map(|invocation| Event::ToolStarted {
                             operation_id: invocation.operation_id,
+                            tool_execution: None,
                         })
                         .collect();
                     let usage = message.get("usage").map(|usage| Usage {

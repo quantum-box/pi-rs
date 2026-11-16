@@ -380,7 +380,7 @@ impl Stream {
                 self.calls
                     .insert(invocation.operation_id, (invocation, parent));
             }
-            Event::ToolStarted { operation_id } => {
+            Event::ToolStarted { operation_id, .. } => {
                 if let Some((invocation, parent)) = self.calls.get(&operation_id) {
                     let mut event = json!({
                         "type":"tool_execution_start", "toolCallId":invocation.call.id,

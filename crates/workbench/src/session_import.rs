@@ -2131,7 +2131,7 @@ mod tests {
             .records()
             .iter()
             .filter_map(|r| match &r.event {
-                Event::ToolStarted { operation_id } => Some(*operation_id),
+                Event::ToolStarted { operation_id, .. } => Some(*operation_id),
                 _ => None,
             })
             .collect();

@@ -1045,7 +1045,7 @@ impl Agent<'_> {
                                     continue;
                                 }
                                 let ran = matches!(&prepared, TurnPreparation::Ready { .. });
-                                if ran { commit(session, Event::ToolStarted { operation_id: calls[index].invocation.operation_id }, observer)?; }
+                                if ran { commit(session, Event::ToolStarted { operation_id: calls[index].invocation.operation_id, tool_execution: None }, observer)?; }
                                 let cancellation = match &prepared { TurnPreparation::Ready { context, .. } => context.cancellation.clone(), TurnPreparation::Skipped(_) => calls[index].cancellation.child_token() };
                                 let (updates, mut progress_input) = mpsc::channel::<TurnProgress>(32);
                                 let (finish_progress, mut finish_signal) = oneshot::channel();

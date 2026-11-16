@@ -8832,7 +8832,10 @@ mod tests {
             })
             .unwrap();
         journal
-            .append(crate::Event::ToolStarted { operation_id })
+            .append(crate::Event::ToolStarted {
+                operation_id,
+                tool_execution: None,
+            })
             .unwrap();
         journal
             .append(crate::Event::ToolFinished {
@@ -13929,7 +13932,10 @@ mod tests {
             })
             .unwrap();
         session
-            .append(crate::Event::ToolStarted { operation_id })
+            .append(crate::Event::ToolStarted {
+                operation_id,
+                tool_execution: None,
+            })
             .unwrap();
         session
             .append(crate::Event::ToolFinished {
@@ -14186,7 +14192,10 @@ mod tests {
             })
             .unwrap();
         original
-            .append(crate::Event::ToolStarted { operation_id })
+            .append(crate::Event::ToolStarted {
+                operation_id,
+                tool_execution: None,
+            })
             .unwrap();
         original
             .append(crate::Event::ToolFinished {
