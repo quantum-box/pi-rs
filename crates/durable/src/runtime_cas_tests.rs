@@ -5559,6 +5559,20 @@ fn anchored_reset_derivation_replays_committed_prefix_and_rejects_tampering() {
             max_output_tokens: 10,
         })
         .unwrap();
+    let address = crate::document::Address {
+        scope: id.to_string(),
+        name: "proof-doc".into(),
+        key: "".into(),
+    };
+    let mut document = crate::document::Transaction::new();
+    document
+        .put(
+            &address,
+            Expected::Missing,
+            serde_json::json!({"version":1}).as_object().unwrap(),
+        )
+        .unwrap();
+    document.commit(h.owner.store()).unwrap();
     h.submit(id, None, "active".into()).unwrap();
     let blocks1 = vec![serde_json::json!({"type":"text","text":"first"})];
     let blocks2 = vec![serde_json::json!({"type":"text","text":"second"})];
@@ -5575,7 +5589,7 @@ fn anchored_reset_derivation_replays_committed_prefix_and_rejects_tampering() {
         .submit_write(id, None, "second.write".into(), None)
         .unwrap();
     drop(h);
-    let h = Harness::open_paused(&path, options()).unwrap();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
     let (before, version) = h.load(id).unwrap();
     let steps = [
         ResetDerivationStep {
@@ -5671,6 +5685,39 @@ fn anchored_reset_derivation_replays_committed_prefix_and_rejects_tampering() {
         .unwrap()
         .cursor;
     let key = format!("runtime/fork/{id}/{:020}", head.0).into_bytes();
+    let fork = h.fork_at(id, head).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().messages, before.messages);
+    let revision = h.owner.store().document_cut(&key).unwrap().unwrap();
+    let document_version = h.document(&address).unwrap().unwrap().version;
+    let mut document = crate::document::Transaction::new();
+    document
+        .put(
+            &address,
+            Expected::Version(document_version),
+            serde_json::json!({"version":2}).as_object().unwrap(),
+        )
+        .unwrap();
+    document.commit(h.owner.store()).unwrap();
+    h.submit(id, None, "later".into()).unwrap();
+    assert_eq!(
+        h.document_at_cut(id, head, &address)
+            .unwrap()
+            .unwrap()
+            .value["version"],
+        1
+    );
+    let (historical, cut_revision) = h.authenticated_reset_baseline(id, head.0).unwrap();
+    assert_eq!(cut_revision, revision);
+    assert_eq!(
+        serde_json::to_value(&historical).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    assert_eq!(historical.messages, before.messages);
+    assert_eq!(historical.content_blocks, before.content_blocks);
+    assert_eq!(
+        derive_ordered_reset_states(&historical, &steps).unwrap()[1].content_blocks[&1].message_id,
+        second_ids[0]
+    );
     let entry = h.owner.store().get(&key).unwrap().unwrap();
     h.owner
         .store()
@@ -5682,5 +5729,102 @@ fn anchored_reset_derivation_replays_committed_prefix_and_rejects_tampering() {
             }],
         )
         .unwrap();
-    assert!(h.derive_anchored_reset_states(id, version, &steps).is_err());
+    assert!(h.authenticated_reset_baseline(id, head.0).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_baseline_kill_child() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_RESET_BASELINE_KILL_DB") else {
+        return;
+    };
+    let mut h = Harness::open_paused(path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let (reset, ids) = h
+        .reset_with_blocks(
+            id,
+            Some("handoff".into()),
+            vec![vec![serde_json::json!({"type":"text","text":"saved"})]],
+        )
+        .unwrap();
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    println!(
+        "RESET_BASELINE_COMMITTED {id} {} {reset} {}",
+        head.0, ids[0]
+    );
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_reset_baseline_survives_process_kill_and_reopen() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::runtime_cas_tests::reset_baseline_kill_child",
+            "--nocapture",
+        ])
+        .env("PI_RESET_BASELINE_KILL_DB", &path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, rest)) = line.split_once("RESET_BASELINE_COMMITTED ") {
+                let _ = tx.send(rest.to_string());
+                break;
+            }
+        }
+    });
+    let marker = rx.recv_timeout(Duration::from_secs(20));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let marker = marker.expect("child did not commit baseline");
+    let mut fields = marker.split_whitespace();
+    let id = Uuid::parse_str(fields.next().unwrap()).unwrap();
+    let head: u64 = fields.next().unwrap().parse().unwrap();
+    let reset = Uuid::parse_str(fields.next().unwrap()).unwrap();
+    let occurrence = Uuid::parse_str(fields.next().unwrap()).unwrap();
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let (baseline, _) = h.authenticated_reset_baseline(id, head).unwrap();
+    assert_eq!(baseline.pending_resets[0].id, reset);
+    assert_eq!(
+        baseline.pending_reset_blocks[&reset][0].message_id,
+        occurrence
+    );
+    let steps = [ResetDerivationStep {
+        reset_id: reset,
+        context_generation: Uuid::new_v4(),
+        write_limit: usize::MAX,
+    }];
+    let cuts = derive_ordered_reset_states(&baseline, &steps).unwrap();
+    assert_eq!(cuts[0].content_blocks[&1].message_id, occurrence);
 }

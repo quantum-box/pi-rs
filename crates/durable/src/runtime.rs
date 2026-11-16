@@ -3675,6 +3675,9 @@ impl Harness {
                 .ok_or_else(|| Error::Invalid("invalid observation".into()))?
                 .remove("_transcript");
         }
+        if let Some(object) = value.as_object_mut() {
+            object.remove("_reset_baseline");
+        }
         Ok(())
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
@@ -4528,6 +4531,11 @@ impl Harness {
         };
         let mut fork_value = serde_json::to_value(&fork_snapshot)?;
         fork_value["_transcript"] = serde_json::to_value(&state.transcript)?;
+        // Retain the exact serialized root while block resets are pending so
+        // a later same-commit proof can replay the committed predecessor.
+        if !state.pending_reset_blocks.is_empty() {
+            fork_value["_reset_baseline"] = serde_json::from_slice(&value)?;
+        }
         let mut checks = vec![Check {
             key: key.clone(),
             expected: expected.clone(),
@@ -6563,7 +6571,93 @@ impl Harness {
         {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
-        derive_ordered_reset_states(&baseline, steps)
+        if snapshot.get("_reset_baseline").is_some() {
+            let (historical, _) = self.authenticated_reset_baseline(id, observation)?;
+            if serde_json::to_value(&historical)? != serde_json::to_value(&baseline)?
+                || historical.messages != baseline.messages
+                || historical.content_blocks != baseline.content_blocks
+            {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            derive_ordered_reset_states(&historical, steps)
+        } else {
+            // Existing stores can have pending resets from before capture was
+            // introduced. Current-version derivation remains supported.
+            derive_ordered_reset_states(&baseline, steps)
+        }
+    }
+
+    // Read a captured predecessor after the live root has advanced. The
+    // immutable fork record, observer and root were committed together.
+    fn authenticated_reset_baseline(
+        &self,
+        id: Uuid,
+        observation: u64,
+    ) -> Result<(Conversation, u64), Error> {
+        self.authenticate_fork_anchor(id, observation)?;
+        let key = format!("runtime/fork/{id}/{observation:020}");
+        let store = self.owner.store();
+        let fork = store
+            .get(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&fork.value)?;
+        let value = snapshot
+            .get("_reset_baseline")
+            .cloned()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let mut baseline: Conversation = serde_json::from_value(value)?;
+        // Pending tool-result metadata lives at a separately mutable key and
+        // cannot be reconstructed historically by this baseline format.
+        if baseline.id != id
+            || !baseline.messages.is_empty()
+            || baseline.pending_reset_blocks.is_empty()
+            || matches!(baseline.phase, Phase::ToolFinished { .. })
+            || snapshot.get("conversation_id") != Some(&serde_json::to_value(id)?)
+            || snapshot.get("_transcript") != Some(&serde_json::to_value(&baseline.transcript)?)
+            || snapshot.get("config") != Some(&serde_json::to_value(&baseline.config)?)
+            || snapshot.get("submissions") != Some(&serde_json::to_value(&baseline.submissions)?)
+            || snapshot.get("tool_states") != Some(&serde_json::to_value(&baseline.tool_states)?)
+            || snapshot.get("active") != Some(&serde_json::to_value(baseline.active)?)
+            || snapshot.get("pending_resets")
+                != Some(&serde_json::to_value(&baseline.pending_resets)?)
+            || snapshot.get("phase") != Some(&serde_json::to_value(&baseline.phase)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1queue-modes")
+                != Some(&serde_json::to_value(baseline.queue_modes)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1after-failed-run")
+                != Some(&serde_json::to_value(baseline.after_failed_run)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1extensions")
+                != Some(&serde_json::to_value(&baseline.extensions)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1provider-adapter")
+                != Some(&serde_json::to_value(&baseline.provider_adapter)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1allowed-tools")
+                != Some(&serde_json::to_value(&baseline.allowed_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1model-tools")
+                != Some(&serde_json::to_value(&baseline.model_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-filters")
+                != Some(&serde_json::to_value(&baseline.tool_filters)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-results")
+                != Some(&serde_json::to_value(&baseline.tool_results)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1occurrence-epoch-proven")
+                != Some(&serde_json::to_value(baseline.occurrence_epoch_proven)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1resets")
+                != Some(&serde_json::to_value(&baseline.resets)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1application-writes")
+                != Some(&serde_json::to_value(&baseline.application_writes)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let cursor = baseline
+            .transcript
+            .clone()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let (messages, blocks) = self.read_transcript_blocks(id, cursor)?;
+        baseline.messages = messages;
+        baseline.content_blocks = blocks;
+        validate_pending_reset_blocks(&baseline)?;
+        let revision = store
+            .document_cut(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        Ok((baseline, revision))
     }
 
     // A matching observer payload alone is not evidence of a runtime commit:
