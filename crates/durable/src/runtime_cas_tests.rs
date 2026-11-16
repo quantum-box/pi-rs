@@ -4299,6 +4299,22 @@ async fn continue_failure_boundary_survives_restart_and_historical_forks() {
     finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
     h.save(&state, Expected::Version(version)).unwrap();
     assert!(matches!(h.conversation(id).unwrap().phase, Phase::Idle));
+    assert!(matches!(
+        h.submit_continue(id, None),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    assert!(matches!(
+        h.submit_with_options(
+            id,
+            None,
+            "rejected".into(),
+            AdmissionOptions {
+                reject_when_busy: true,
+                ..Default::default()
+            }
+        ),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
     let old_fork = h.fork_at(id, before).unwrap();
     let configured_fork = h.fork_at(id, configured).unwrap();
     assert_eq!(
@@ -4321,9 +4337,15 @@ async fn continue_failure_boundary_survives_restart_and_historical_forks() {
             .status,
         Status::Queued
     );
+    assert!(matches!(
+        h.submit_continue(id, None),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    assert!(h.conversation(id).unwrap().run_failure.is_some());
     h.resume_conversation(id, &CancellationToken::new())
         .await
         .unwrap();
+    assert!(h.conversation(id).unwrap().run_failure.is_some());
     assert!(matches!(
         h.conversation(id)
             .unwrap()
@@ -4334,6 +4356,174 @@ async fn continue_failure_boundary_survives_restart_and_historical_forks() {
             .status,
         Status::Done { .. }
     ));
+}
+
+#[test]
+fn withdrawn_auto_continuation_does_not_fence_future_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let queued = h.submit(id, None, "queued".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
+    h.save(&state, Expected::Version(version)).unwrap();
+    assert!(matches!(
+        h.submit_continue(id, None),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    assert_eq!(
+        h.withdraw_submission(id, queued).unwrap(),
+        WithdrawResult::Aborted
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.submit_continue(id, None).unwrap();
+    assert!(h.conversation(id).unwrap().run_failure.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn failure_marker_kill_child() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_FAILURE_MARKER_KILL_DB") else {
+        return;
+    };
+    let mut h = Harness::open_paused(path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let queued = h.submit(id, None, "queued".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
+    h.save(&state, Expected::Version(version)).unwrap();
+    println!("FAILURE_MARKER_COMMITTED {id} {queued}");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pending_auto_continuation_fences_continue_after_process_kill() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::runtime_cas_tests::failure_marker_kill_child",
+            "--nocapture",
+        ])
+        .env("PI_FAILURE_MARKER_KILL_DB", &path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, rest)) = line.split_once("FAILURE_MARKER_COMMITTED ") {
+                let _ = tx.send(rest.to_string());
+                break;
+            }
+        }
+    });
+    let marker = rx.recv_timeout(Duration::from_secs(20));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let marker = marker.expect("child did not commit failure");
+    let mut ids = marker
+        .split_whitespace()
+        .map(|v| Uuid::parse_str(v).unwrap());
+    let id = ids.next().unwrap();
+    let queued = ids.next().unwrap();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(matches!(
+        h.submit_continue(id, None),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    assert!(h.conversation(id).unwrap().run_failure.is_some());
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert!(matches!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        Status::Done { .. }
+    ));
+    assert!(c.run_failure.is_some());
+}
+
+#[tokio::test]
+async fn abort_of_pending_auto_continuation_finishes_before_new_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let queued = h.submit(id, None, "queued".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
+    h.save(&state, Expected::Version(version)).unwrap();
+    h.request_abort(id).unwrap();
+    assert!(matches!(
+        h.submit_continue(id, None),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(matches!(
+        h.submit_continue(id, None),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    h.submit_continue(id, None).unwrap();
 }
 
 #[tokio::test]
