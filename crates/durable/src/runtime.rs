@@ -1778,6 +1778,9 @@ impl Conversation {
         }
         self.tool_attempt()
     }
+    pub(crate) fn set_initial_notification(&mut self, id: Uuid, notify: SubmissionNotify) {
+        self.submission_notifications.insert(id, notify);
+    }
     pub(crate) fn admit_initial_input(&mut self, id: Uuid, content: String) {
         self.submissions.push(Submission {
             kind: SubmissionKind::Input,

@@ -907,10 +907,18 @@ Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bin
 initial child allowlist to the durable reservation before submission. For task-owned
 children, `ensure_task_owned_subagent_restricted` and
 `submit_task_owned_subagent_restricted` commit the selection with the child and,
-for submit, its initial input. The selection is part of the reservation identity:
-a retry with a different selection fails, even after reopening. Existing child
-selections may subsequently be changed using the settled-conversation API. This limits tool dispatch, not other effects of trusted tools,
-hooks, or host APIs.
+for submit, its initial input. `submit_task_owned_subagent_notified` creates a
+foreground child and atomically binds its initial submission to a
+`submission_settled_signal()` key on the owning task. A task-backed handler can
+park on that typed signal, then read its settlement after waking. The reservation
+binds the input, tool selection and signal key; retries with different values fail.
+After reopening, the scheduler resumes the committed child and settlement delivers
+the signal in the same transaction. Parent abort still traverses the foreground
+ownership edge. The signal payload uses the pi-rs settlement representation
+(including answer text) rather than upstream's entry-only answer reference.
+Existing child selections may subsequently be changed using the
+settled-conversation API. This limits tool dispatch, not other effects of
+trusted tools, hooks, or host APIs.
 
 An embedding host can opt in to a parent-bound `subagent` extension with
 `Scheduler::open_with_subagent_management(path, options, registry, parent, child_config)`.
@@ -955,7 +963,8 @@ this tool globally or replace the bound extension with another implementation.
 this API cannot verify a caller through independently implemented `ToolHost`s
 or implement task-owner-scoped stop or wait. The upstream Durable background
 example has no `wait` action; its separate foreground waiting example parks on
-a task-owned child's submission signal, which this extension does not support.
+a task-owned child's submission signal. The lower-level task-backed admission API
+supports this signal, but this extension does not expose foreground wait.
 Stop is scoped by the bound parent
 and its named reservation, not by a calling task. The host must trust the configured tools and registry. It must also ensure
 the child configuration is suitable for every child; no per-child model,
