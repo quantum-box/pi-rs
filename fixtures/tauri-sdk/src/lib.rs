@@ -6,15 +6,40 @@ use pi_rs_core::{AgentSession, Model, SessionBuilder, SessionControl};
 use tokio::sync::{Mutex, watch};
 
 pub struct AppState {
-    session: Mutex<AgentSession>,
+    session: Arc<Mutex<Option<AgentSession>>>,
     control: SessionControl,
     closing: watch::Sender<bool>,
+    close_started: std::sync::atomic::AtomicBool,
+    close_result: watch::Sender<Option<Result<(), String>>>,
+    #[cfg(test)]
+    shutdown_abort: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
     #[cfg(test)]
     admissions: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     startup_gate: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     startup_release: tokio::sync::Notify,
+}
+
+struct CloseCompletion {
+    sender: watch::Sender<Option<Result<(), String>>>,
+    completed: bool,
+}
+
+impl CloseCompletion {
+    fn complete(mut self, result: Result<(), String>) {
+        self.completed = true;
+        self.sender.send_replace(Some(result));
+    }
+}
+
+impl Drop for CloseCompletion {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.sender
+                .send_replace(Some(Err("shutdown task did not complete".into())));
+        }
+    }
 }
 
 /// Commands can be composed with application commands in one invoke handler.
@@ -34,6 +59,7 @@ pub mod commands {
             _ = closing.wait_for(|closing| *closing) => return Err(closed()),
             session = state.session.lock() => session,
         };
+        let session = session.as_mut().ok_or_else(closed)?;
         let started = std::sync::atomic::AtomicBool::new(false);
         let run = async {
             #[cfg(test)]
@@ -76,34 +102,82 @@ pub mod commands {
 
     #[tauri::command]
     pub async fn close(state: tauri::State<'_, AppState>) -> Result<(), String> {
-        state.control.request_shutdown();
-        state.closing.send_replace(true);
-        state
-            .session
-            .lock()
+        let mut result = state.close_result.subscribe();
+        if !state
+            .close_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            state.control.request_shutdown();
+            state.closing.send_replace(true);
+            let session = state.session.clone();
+            let worker_session = session.clone();
+            let completion = CloseCompletion {
+                sender: state.close_result.clone(),
+                completed: false,
+            };
+            let worker = tauri::async_runtime::spawn(async move {
+                let mut owned = worker_session.lock().await.take();
+                let outcome = match owned.as_mut() {
+                    Some(session) => session.close().await.map_err(|error| error.to_string()),
+                    None => Ok(()),
+                };
+                drop(owned);
+                outcome
+            });
+            #[cfg(test)]
+            {
+                *state.shutdown_abort.lock().unwrap() = Some(worker.inner().abort_handle());
+            }
+            tauri::async_runtime::spawn(async move {
+                let outcome = match worker.await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        drop(session.lock().await.take());
+                        Err("shutdown task did not complete".to_owned())
+                    }
+                };
+                completion.complete(outcome);
+            });
+        }
+        let completed = result
+            .wait_for(|outcome| outcome.is_some())
             .await
-            .close()
-            .await
-            .map_err(|error| error.to_string())
+            .map_err(|_| "shutdown task ended without a result".to_owned())?;
+        completed
+            .as_ref()
+            .expect("completed shutdown result")
+            .clone()
     }
 }
 
 /// Create state for a Tauri builder without installing an invoke handler.
 pub fn session_state(model: Arc<dyn Model>, model_name: &str) -> pi_rs_core::Result<AppState> {
     let session = SessionBuilder::new(model, model_name).in_memory()?;
+    Ok(session_state_from_session(session))
+}
+
+/// Wrap a host-constructed session without exposing its configuration to IPC.
+/// The host chooses the journal, model, resources and extensions before handing
+/// ownership to the fixture's prompt, abort and close commands.
+pub fn session_state_from_session(session: AgentSession) -> AppState {
     let control = session.controls();
     let (closing, _) = watch::channel(false);
-    Ok(AppState {
-        session: Mutex::new(session),
+    let (close_result, _) = watch::channel(None);
+    AppState {
+        session: Arc::new(Mutex::new(Some(session))),
         control,
         closing,
+        close_started: std::sync::atomic::AtomicBool::new(false),
+        close_result,
+        #[cfg(test)]
+        shutdown_abort: std::sync::Mutex::new(None),
         #[cfg(test)]
         admissions: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(test)]
         startup_gate: std::sync::Mutex::new(None),
         #[cfg(test)]
         startup_release: tokio::sync::Notify::new(),
-    })
+    }
 }
 
 /// Install the fixture's state and a handler containing its three commands.
@@ -201,7 +275,7 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let state = app.state::<AppState>();
             let session = state.session.lock().await;
-            assert_eq!(session.messages().unwrap().len(), 4);
+            assert_eq!(session.as_ref().unwrap().messages().unwrap().len(), 4);
         });
         assert!(
             tauri::test::get_ipc_response(&webview, request("close", serde_json::json!({})))
@@ -229,7 +303,13 @@ mod tests {
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
         let mut events = tauri::async_runtime::block_on(async {
-            app.state::<AppState>().session.lock().await.subscribe()
+            app.state::<AppState>()
+                .session
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .subscribe()
         });
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
@@ -354,5 +434,196 @@ mod tests {
         assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         prompt_thread.join().unwrap();
         close_thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod close_cancellation_test {
+    use super::*;
+    use pi_rs_core::{
+        Extension, ExtensionResult, ExtensionState, LifecycleEvent, ModelEvent, ModelRequest,
+        ModelStream,
+    };
+    use tauri::Manager;
+    struct Fixture;
+    #[async_trait::async_trait]
+    impl Model for Fixture {
+        async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+            Ok(Box::pin(futures_util::stream::iter([Ok(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )])))
+        }
+    }
+    struct BlockingShutdown {
+        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for BlockingShutdown {
+        fn id(&self) -> &str {
+            "blocking-shutdown"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if matches!(event, LifecycleEvent::SessionShutdown { .. }) {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release.notified().await;
+                self.completed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+    #[test]
+    fn cancelling_close_caller_does_not_cancel_shutdown_hook() {
+        let (sender, entered) = std::sync::mpsc::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let extension = Arc::new(BlockingShutdown {
+            entered: std::sync::Mutex::new(Some(sender)),
+            release: release.clone(),
+            completed: completed.clone(),
+        });
+        let mut session = SessionBuilder::new(Arc::new(Fixture), "fixture")
+            .extension(extension)
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tauri::async_runtime::block_on(session.start()).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(session_state_from_session(session))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let handle = app.handle().clone();
+        let task = tauri::async_runtime::spawn(async move {
+            commands::close(handle.state::<AppState>()).await
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        task.abort();
+        release.notify_one();
+        let result = tauri::async_runtime::block_on(commands::close(app.state::<AppState>()));
+        assert!(result.is_ok());
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    struct PanickingShutdown;
+    #[async_trait::async_trait]
+    impl Extension for PanickingShutdown {
+        fn id(&self) -> &str {
+            "panic-shutdown"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            assert!(
+                !matches!(event, LifecycleEvent::SessionShutdown { .. }),
+                "test shutdown panic"
+            );
+            Ok(())
+        }
+    }
+    #[test]
+    fn panicking_shutdown_reports_same_error_to_later_callers() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("pi-tauri-panic-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let mut session = SessionBuilder::new(Arc::new(Fixture), "fixture")
+            .extension(Arc::new(PanickingShutdown))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        tauri::async_runtime::block_on(session.start()).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(session_state_from_session(session))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let first = tauri::async_runtime::block_on(commands::close(app.state::<AppState>()));
+        let second = tauri::async_runtime::block_on(commands::close(app.state::<AppState>()));
+        assert_eq!(first, Err("shutdown task did not complete".to_owned()));
+        assert_eq!(second, first);
+        let reopened = SessionBuilder::new(Arc::new(Fixture), "fixture")
+            .open(&path)
+            .unwrap();
+        drop(reopened);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn aborted_shutdown_worker_releases_waiting_session() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("pi-tauri-abort-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let session = SessionBuilder::new(Arc::new(Fixture), "fixture")
+            .open(&path)
+            .unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(session_state_from_session(session))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        let guard = tauri::async_runtime::block_on(state.session.lock());
+        let handle = app.handle().clone();
+        let caller = tauri::async_runtime::spawn(async move {
+            commands::close(handle.state::<AppState>()).await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let abort = loop {
+            if let Some(abort) = state.shutdown_abort.lock().unwrap().take() {
+                break abort;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown worker was not started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        abort.abort();
+        drop(guard);
+        let result = tauri::async_runtime::block_on(caller).unwrap();
+        assert_eq!(result, Err("shutdown task did not complete".to_owned()));
+        let reopened = SessionBuilder::new(Arc::new(Fixture), "fixture")
+            .open(&path)
+            .unwrap();
+        drop(reopened);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

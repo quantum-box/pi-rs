@@ -46,6 +46,7 @@ impl AppState {
     }
 
     async fn close(&self) -> Result<()> {
+        self.control.request_shutdown();
         self.session.lock().await.close().await
     }
 }
@@ -78,5 +79,31 @@ mod tests {
         assert_eq!(session.messages().unwrap().len(), 4);
         drop(session);
         state.close().await.unwrap();
+    }
+    struct Stalled(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Model for Stalled {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_requests_shutdown_before_waiting_for_the_session_lock() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(AppState::new(Arc::new(Stalled(entered.clone())), "fixture").unwrap());
+        let active = {
+            let state = state.clone();
+            tokio::spawn(async move { state.prompt("waiting".into()).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), state.close())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(active.await.unwrap().is_err());
     }
 }
