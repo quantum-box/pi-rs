@@ -255,7 +255,7 @@ fn turn_strict_tool_preflight(tool: &RegisteredTool) -> Result<()> {
 
 // Preflight the complete direct-call batch before any lifecycle callback: a
 // later invalid call must not let earlier callbacks perform effects either.
-fn turn_preflight_strict_calls(
+fn turn_preflight_decision_calls(
     registry: &Registry,
     advertised: &HashSet<String>,
     invocations: &[Invocation],
@@ -270,30 +270,29 @@ fn turn_preflight_strict_calls(
         )
         .map_err(|_| Error::Session("invalid tool decision".into()))?;
     for invocation in invocations {
-        let Some(effective) = validated
+        let effective = validated
             .effective_tools()
             .iter()
             .find(|entry| entry.spec.name == invocation.call.name)
-        else {
-            continue;
-        };
-        if !matches!(
-            effective.sampling,
-            crate::EffectiveToolSampling::StrictJsonSchema { .. }
-        ) {
-            continue;
-        }
+            .ok_or_else(|| Error::Session("tool is not in the request decision".into()))?;
         let tool = registry
             .tools
             .get(&invocation.call.name)
             .filter(|_| advertised.contains(&invocation.call.name))
-            .ok_or_else(|| Error::Session("strict tool is not registered or advertised".into()))?;
+            .ok_or_else(|| {
+                Error::Session("decision-bound tool is not registered or advertised".into())
+            })?;
         if tool.spec != effective.spec {
             return Err(Error::Session(
-                "strict tool does not match request decision".into(),
+                "tool does not match request decision".into(),
             ));
         }
-        turn_strict_tool_preflight(tool)?;
+        if matches!(
+            effective.sampling,
+            crate::EffectiveToolSampling::StrictJsonSchema { .. }
+        ) {
+            turn_strict_tool_preflight(tool)?;
+        }
     }
     Ok(())
 }
@@ -613,6 +612,20 @@ mod strict_argument_tests {
     }
 
     #[tokio::test]
+    async fn prefer_fallback_does_not_require_recovery_identity() {
+        let (result, _, _, tool) = run_fixture(true, None, false, false).await;
+        result.unwrap();
+        assert_eq!(
+            *tool.seen.lock().unwrap(),
+            vec![json!({"path":"file","limit":null})]
+        );
+        assert_eq!(
+            tool.callbacks.lock().unwrap()[0],
+            ("start".into(), json!({"path":"file","limit":null}))
+        );
+    }
+
+    #[tokio::test]
     async fn pollable_tool_waits_for_snapshot_aware_recovery() {
         let (result, session, invocation, tool) =
             run_fixture(true, Some("backend:v1"), true, false).await;
@@ -650,6 +663,175 @@ mod strict_argument_tests {
                     .any(|record| matches!(record.event, Event::ToolStarted { .. }))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_rejects_changed_fallback_spec_before_any_callback() {
+        struct FallbackTool;
+        #[async_trait::async_trait]
+        impl crate::Tool for FallbackTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "fallback".into(),
+                    description: "registered version".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+                panic!("fallback must not run")
+            }
+        }
+        struct FallbackExtension;
+        #[async_trait::async_trait]
+        impl crate::Extension for FallbackExtension {
+            fn id(&self) -> &str {
+                "fallback-owner"
+            }
+            fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+                vec![Arc::new(FallbackTool)]
+            }
+        }
+
+        let strict_tool = Arc::new(FixtureTool {
+            pollable: false,
+            pending: false,
+            identity: None,
+            seen: Arc::default(),
+            callbacks: Arc::default(),
+        });
+        let strict_spec = crate::Tool::spec(strict_tool.as_ref());
+        let mut fallback_spec = crate::Tool::spec(&FallbackTool);
+        fallback_spec.description = "request version".into();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FixtureExtension(strict_tool.clone())))
+            .unwrap();
+        registry.register(Arc::new(FallbackExtension)).unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let request = ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: vec![strict_spec.clone(), fallback_spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: session.session_id(),
+            external_id: session.external_session_id(),
+            summary: false,
+        };
+        let declaration = |spec: &ToolSpec| crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let declarations = vec![declaration(&strict_spec), declaration(&fallback_spec)];
+        let effective = vec![
+            crate::EffectiveToolDeclaration {
+                spec: strict_spec.clone(),
+                sampling: crate::EffectiveToolSampling::StrictJsonSchema {
+                    original_schema: strict_spec.parameters.clone(),
+                    normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+                },
+            },
+            crate::EffectiveToolDeclaration {
+                spec: fallback_spec,
+                sampling: crate::EffectiveToolSampling::Unconstrained,
+            },
+        ];
+        let decision =
+            crate::ToolDecisionSnapshot::capture(&context, &request, &declarations, &effective)
+                .unwrap();
+        let event = Event::ModelRequested {
+            model: request.model.clone(),
+            messages: 0,
+            tools: 2,
+            max_output_tokens: 10,
+            request_id: Some(context.request_id),
+            context_head: Some(session.head()),
+            context_sha256: Some(decision.request_sha256().into()),
+            context_transformed: Some(false),
+            context_configuration_sha256: None,
+            tool_decision: None,
+        };
+        session
+            .append_tool_decision_request(event, &decision, &request, &request, &declarations)
+            .unwrap();
+        let calls: Vec<_> = ["read", "fallback"]
+            .into_iter()
+            .map(|name| Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: name.into(),
+                    name: name.into(),
+                    arguments: if name == "read" {
+                        r#"{"path":"file","limit":null}"#
+                    } else {
+                        "{}"
+                    }
+                    .into(),
+                },
+            })
+            .collect();
+        session
+            .append(Event::ModelFinished {
+                request_id: context.request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: String::new(),
+                    invocations: calls.clone(),
+                    advertised_tools: vec!["read".into(), "fallback".into()],
+                    max_output_tokens: 10,
+                }),
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: calls.clone(),
+                usage: None,
+                request_id: Some(context.request_id),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &FixtureModel,
+            model_name: "model",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let cancel = CancellationToken::new();
+        let advertised = HashSet::from(["read".into(), "fallback".into()]);
+        let scope = DispatchScope {
+            cancellation: &cancel,
+            advertised: &advertised,
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut observer = |_: Notification<'_>| {};
+        let result = agent
+            .dispatch_turn::<String>(
+                &mut session,
+                &calls,
+                &scope,
+                &mut ExtensionStates::new(),
+                &mut observer,
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(strict_tool.callbacks.lock().unwrap().is_empty());
+        assert!(strict_tool.seen.lock().unwrap().is_empty());
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::ToolStarted { .. }))
+        );
     }
 
     #[test]
@@ -1324,7 +1506,7 @@ impl Agent<'_> {
             None
         };
         if let Some(decision) = turn_decision.as_deref() {
-            turn_preflight_strict_calls(self.registry, scope.advertised, invocations, decision)?;
+            turn_preflight_decision_calls(self.registry, scope.advertised, invocations, decision)?;
         }
         let observe_tools = self.registry.extensions.iter().any(|extension| {
             extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
