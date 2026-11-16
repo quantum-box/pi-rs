@@ -36,6 +36,8 @@ pub struct Check {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expected {
     Missing,
+    /// Key remains absent and has not been put since this global version.
+    MissingUnchangedSince(u64),
     /// Key must remain absent and the monotonic deadline must not elapse.
     MissingBefore(Instant),
     Version(u64),
@@ -1096,6 +1098,22 @@ impl Store {
                 .optional()?;
             let matches = match check.expected {
                 Expected::Missing => version.is_none(),
+                Expected::MissingUnchangedSince(boundary) => {
+                    let current: u64 = tx.query_row(
+                        "SELECT version FROM durable_store_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if boundary > current {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let changed: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM durable_commit_versions WHERE key=?1 AND version>?2)",
+                        params![check.key, boundary],
+                        |r| r.get(0),
+                    )?;
+                    version.is_none() && !changed
+                }
                 Expected::MissingBefore(deadline) => version.is_none() && Instant::now() < deadline,
                 Expected::Version(v) => version == Some(v),
                 Expected::DocumentRevision(revision) => {
@@ -1441,6 +1459,33 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod document_history_tests {
     use super::*;
+
+    #[test]
+    fn missing_unchanged_check_detects_same_commit_aba() {
+        let db = Store::memory().unwrap();
+        let key = vec![0, 255, 0];
+        let boundary = db.put_version().unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: b"other".to_vec(),
+                value: vec![],
+            }],
+        ).unwrap();
+        let check = Check {
+            key: key.clone(),
+            expected: Expected::MissingUnchangedSince(boundary),
+        };
+        db.commit(std::slice::from_ref(&check), &[]).unwrap();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put { key: key.clone(), value: vec![1] },
+                Mutation::Delete { key: key.clone() },
+            ],
+        ).unwrap();
+        assert!(matches!(db.commit(&[check], &[]), Err(Error::Conflict { key: k }) if k == key));
+    }
 
     #[test]
     fn prefix_put_fence_is_atomic_and_survives_reopen() {

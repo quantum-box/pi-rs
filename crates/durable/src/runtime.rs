@@ -3227,6 +3227,16 @@ pub(crate) fn default_subagent_tools(options: &Options) -> Vec<String> {
 }
 
 impl crate::session_transaction::SessionTransaction<'_> {
+    /// Read this transaction's committed conversation before any table write.
+    pub fn conversation(&self) -> Result<Conversation, crate::document::Error> {
+        if self.table_written {
+            return Err(crate::document::Error::ReadAfterWrite);
+        }
+        let mut state = self.state.clone();
+        hide_pending_tool_output(&mut state);
+        Ok(state)
+    }
+
     // Admission reads the submission table even on duplicate/no-op paths.
     fn admission_duplicate(
         &self,
@@ -9015,36 +9025,7 @@ impl Harness {
         // preserve its exact conversation and document checks on conflict.
         let merge = self.merge_admissions;
         self.merge_admissions = false;
-        let saved = if tasks.is_empty() {
-            self.save_composed_locked(
-                &state,
-                Expected::Version(version),
-                None,
-                &[],
-                &[],
-                Some(&documents),
-            )
-        } else {
-            let driver = self
-                .task_driver
-                .lock()
-                .map_err(|_| ())
-                .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
-            match driver {
-                Ok(Some(driver)) => driver.with_admission(&tasks, id, || {
-                    self.save_composed_locked(
-                        &state,
-                        Expected::Version(version),
-                        None,
-                        &tasks,
-                        &[],
-                        Some(&documents),
-                    )
-                }),
-                Ok(None) => Err(Error::Invalid("task driver is not running".into())),
-                Err(_) => Err(Error::Failed),
-            }
-        };
+        let saved = self.commit_session_candidate(id, version, &state, &documents, &tasks);
         self.merge_admissions = merge;
         saved?;
         Ok(result)
@@ -9094,39 +9075,37 @@ impl Harness {
         }
         let merge = self.merge_admissions;
         self.merge_admissions = false;
-        let saved = if tasks.is_empty() {
-            self.save_composed_locked(
-                &state,
-                Expected::Version(version),
-                None,
-                &[],
-                &[],
-                Some(&documents),
-            )
-        } else {
-            let driver = self
-                .task_driver
-                .lock()
-                .map_err(|_| ())
-                .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
-            match driver {
-                Ok(Some(driver)) => driver.with_admission(&tasks, id, || {
-                    self.save_composed_locked(
-                        &state,
-                        Expected::Version(version),
-                        None,
-                        &tasks,
-                        &[],
-                        Some(&documents),
-                    )
-                }),
-                Ok(None) => Err(Error::Invalid("task driver is not running".into())),
-                Err(_) => Err(Error::Failed),
-            }
-        };
+        let saved = self.commit_session_candidate(id, version, &state, &documents, &tasks);
         self.merge_admissions = merge;
         saved?;
         Ok(result)
+    }
+
+    fn commit_session_candidate(
+        &mut self,
+        id: Uuid,
+        version: u64,
+        state: &Conversation,
+        batch: &crate::task_store::OwnedBatch,
+        tasks: &[crate::task::Task],
+    ) -> Result<(), Error> {
+        if tasks.is_empty() {
+            return self.save_composed_locked(
+                state, Expected::Version(version), None, &[], &[], Some(batch),
+            );
+        }
+        let driver = self
+            .task_driver
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .as_ref()
+            .and_then(|driver| driver.upgrade())
+            .ok_or_else(|| Error::Invalid("task driver is not running".into()))?;
+        driver.with_admission(tasks, id, || {
+            self.save_composed_locked(
+                state, Expected::Version(version), None, &[], &[], Some(batch),
+            )
+        })
     }
 
     /// Persist a display-only application entry and return its submission ID.

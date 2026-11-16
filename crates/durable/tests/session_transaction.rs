@@ -54,19 +54,13 @@ fn entries_and_documents_read_your_writes_and_reopen() {
         .session_transaction(conversation, |tx| {
             assert!(tx.document(&address())?.is_none());
             tx.put_document(&address(), object(1))?;
-            let first = tx.append_entry("note", Some(json!({"body":"first"})))?;
+            tx.append_entry("note", Some(json!({"body":"first"})))?;
             assert_eq!(tx.document(&address())?, Some(object(1)));
             tx.delete_document(&address())?;
             assert!(tx.document(&address())?.is_none());
             tx.put_document(&address(), object(2))?;
             let second = tx.append_entry("note", Some(json!({"body":"second"})))?;
-            assert_eq!(
-                tx.entries()
-                    .iter()
-                    .map(|entry| entry.id)
-                    .collect::<Vec<_>>(),
-                vec![first, second]
-            );
+            assert!(matches!(tx.entries(), Err(DocumentError::ReadAfterWrite)));
             assert_eq!(tx.document(&address())?, Some(object(2)));
             Ok(second)
         })
@@ -142,7 +136,7 @@ fn read_only_session_does_not_publish_a_commit() {
     let head = h.history_head(conversation).unwrap();
     h.session_transaction(conversation, |tx| {
         assert!(tx.document(&address())?.is_none());
-        assert!(tx.entries().is_empty());
+        assert!(tx.entries()?.is_empty());
         Ok(())
     })
     .unwrap();
@@ -603,11 +597,8 @@ fn admission_write_atomically_commits_notification_document_and_entries() {
                 Some(json!("submitted")),
                 Some(notification(task)),
             )?;
-            let entry = tx.append_entry("note", Some(json!("staged")))?;
-            assert_eq!(
-                tx.entries().iter().map(|e| e.id).collect::<Vec<_>>(),
-                vec![id, entry]
-            );
+            tx.append_entry("note", Some(json!("staged")))?;
+            assert!(matches!(tx.entries(), Err(DocumentError::ReadAfterWrite)));
             assert_eq!(tx.document(&address())?, Some(object(42)));
             Ok(id)
         })

@@ -30,7 +30,7 @@ pub enum Error {
     InvalidDocument,
     #[error("a batch has duplicate checks or writes, or an unchecked write")]
     InvalidBatch,
-    #[error("document reads must precede all writes")]
+    #[error("read is not permitted after this write")]
     ReadAfterWrite,
     #[error("document must be read before writing, and written at most once")]
     UnreadOrWritten,
@@ -1133,6 +1133,10 @@ pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut Owne
         }
         if let Some(check) = documents.checks.iter_mut().find(|c| c.key == other.key) {
             let expected = match (&check.expected, &other.expected) {
+                (Expected::MissingUnchangedSince(version), Expected::Missing)
+                | (Expected::Missing, Expected::MissingUnchangedSince(version)) => {
+                    Expected::MissingUnchangedSince(*version)
+                }
                 (Expected::Missing, Expected::MissingBefore(deadline))
                 | (Expected::MissingBefore(deadline), Expected::Missing) => {
                     Expected::MissingBefore(*deadline)
@@ -1314,7 +1318,7 @@ impl Transaction {
             graph_key(&check.key)
                 && matches!(
                     check.expected,
-                    Expected::Missing | Expected::MissingBefore(_)
+                    Expected::Missing | Expected::MissingBefore(_) | Expected::MissingUnchangedSince(_)
                 )
                 && ((self.checked.contains(&check.key)
                     && writes.contains(&check.key)

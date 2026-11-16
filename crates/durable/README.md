@@ -1926,8 +1926,18 @@ or display-write admission. Call `tx.submit_input`, `tx.submit_continue`, or
 `tx.submit_write` before the first entry or admission write; an optional
 `SubmissionNotify` is persisted with the admission. A placed display write and
 its settlement signal commit with the entries and documents. Other submissions
-notify on their subsequent settlement. Document reads see staged writes;
-`entries()` also exposes locally staged placed application writes. Duplicate
+notify on their subsequent settlement. Document reads see staged writes.
+`conversation()`, `entry()`, `entries()`, `submission()`,
+`submission_by_request()`, and `task()` read committed records before the
+first table write; after it they return `ReadAfterWrite`. Task reads expose
+only tasks directly owned by this conversation and fence their observed
+version or absence. `create_task()` stages a ready, directly owned task; a
+running task driver with a matching registered kind, version, and replay
+policy must validate and commit it. Task IDs are provisional until commit.
+The task and any immediate settlement notification are committed atomically
+with the conversation, entries and documents. `entries()` now returns a
+`Result` and no longer exposes staged entries; callers upgrading from the
+earlier API should retain the IDs returned by `append_entry` instead. Duplicate
 request IDs return the existing submission without replacing its notification.
 The callback runs once, and conflict, abort races, or callback errors leave its
 candidate changes unpublished. Returned IDs are provisional until commit.
@@ -1959,7 +1969,11 @@ notification are committed atomically with the transaction's other changes.
 Task-owned children and cross-conversation creation are not supported by this
 host API.
 
-This is a subset of upstream session transactions: arbitrary table operations,
-unfitted block admission, entry trees and mutable Chord drafts are not exposed.
+This is a subset of upstream session transactions: cross-conversation and
+task-descendant table access, table scans, raw submission settlement, general
+task updates, and arbitrary table operations are not exposed. In particular,
+the entry APIs above address pi-rs conversation application writes rather than
+the separate task application-entry log or upstream's unified entry tree.
+Other gaps include unfitted block admission and mutable Chord drafts.
 Transactional continue rejects multiple pending block resets when they need
 separate commits. See [the parity notes](../../docs/pi-durable-parity.md).

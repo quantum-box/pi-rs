@@ -12,6 +12,10 @@ Every check observes the state before any mutation. If a check fails,
 applied. Mutations are applied in order. Every put, including an overwrite,
 allocates a new database-wide monotonically increasing version. Deletion does
 not reset the counter. Versions are positive and limited to `i64::MAX`.
+`Expected::MissingUnchangedSince(boundary)` additionally requires that the key
+has had no tracked put after a boundary returned by `put_version()`. This
+detects an intervening create/delete cycle, including one in a single commit.
+It does not track direct SQLite writes outside the Store API.
 `get` after a successful commit can observe a later concurrent commit; it is
 not a receipt for the committed version.
 
