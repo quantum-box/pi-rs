@@ -4643,6 +4643,15 @@ summary requests omit automatic keys and retention. Explicit sampling fields
 retain precedence. Native Ollama keeps long retention disabled by default as a
 pi-rs extension; its explicit compatibility setting can enable it.
 
+### Responses instruction role
+
+Responses requests use `developer` for models marked as reasoning-capable
+unless `supportsDeveloperRole` is false. Other models use `system`. Provider
+and model overrides merge for that compatibility setting. When capabilities
+are unavailable, the standalone adapter defaults to `system`; SDK hosts can
+explicitly select the developer role. This is also the fallback for unknown
+workbench models, whose upstream capabilities cannot be inferred.
+
 ### Responses prompt cache key configuration
 
 Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
