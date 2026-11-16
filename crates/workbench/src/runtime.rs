@@ -555,11 +555,24 @@ async fn standalone_share_snapshot_after(
         return Err(pi_rs::Error::Config("project trust is pending".into()));
     }
     let mut args = args.clone();
-    args.restore_session_model(source);
+    args.restore_session_model(source)?;
     super::thinking::adjust(&mut args);
-    let session = Session::from_records(source.records().to_vec())?;
+    let session = standalone_share_session_copy(source)?;
     let runtime = configure_after(&args, false, before_configure).await?;
     standalone_share_snapshot_with_runtime(&args, source, session, runtime).await
+}
+
+fn standalone_share_session_copy(source: &Session) -> Result<Session> {
+    let metadata = source
+        .records()
+        .iter()
+        .filter_map(|record| {
+            source
+                .record_metadata(record.id)
+                .map(|value| (record.id, value.clone()))
+        })
+        .collect();
+    Session::from_records_with_metadata(source.records().to_vec(), metadata)
 }
 
 async fn standalone_share_snapshot_with_runtime(
@@ -1084,6 +1097,35 @@ impl pi_rs::Extension for LocalCommandPolicy {
 mod standalone_share_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn share_session_copy_preserves_imported_provenance_and_compaction_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"session\",\"version\":3}\n",
+            "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
+            "{\"type\":\"compaction\",\"id\":\"c\",\"parentId\":\"u\",\"firstKeptEntryId\":\"u\",\"summary\":\"summary\",\"tokensBefore\":42,\"fromHook\":true,\"details\":{\"source\":\"extension\"}}\n",
+        )).unwrap();
+        let source = crate::session_import::read(&path).unwrap();
+        let expected_counts = source.validated_pi_conversion_counts().unwrap();
+        let copy = standalone_share_session_copy(&source).unwrap();
+        assert_eq!(copy.session_id(), source.session_id());
+        assert_eq!(copy.head(), source.head());
+        assert_eq!(
+            copy.validated_pi_conversion_counts().unwrap(),
+            expected_counts
+        );
+        let compacted = copy
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, pi_rs::Event::Compacted { .. }))
+            .unwrap();
+        assert_eq!(
+            copy.record_metadata(compacted.id),
+            Some(&serde_json::json!({"fromExtension":true,"details":{"source":"extension"}}))
+        );
+    }
 
     struct LifecycleRecorder {
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
