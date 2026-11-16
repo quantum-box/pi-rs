@@ -88,6 +88,7 @@ pub struct DurableMemo {
     owner: Arc<durable_store::owner::OwnedStore>,
     task: uuid::Uuid,
     failed: Arc<AtomicBool>,
+    fence: Option<crate::nested_fence::Binding>,
 }
 
 impl DurableMemo {
@@ -100,7 +101,13 @@ impl DurableMemo {
             owner,
             task,
             failed,
+            fence: None,
         }
+    }
+
+    pub(crate) fn with_nested_fence(mut self, fence: Option<crate::nested_fence::Binding>) -> Self {
+        self.fence = fence;
+        self
     }
 
     fn key(&self, key: &str) -> Vec<u8> {
@@ -135,24 +142,32 @@ impl Memo for DurableMemo {
             return Ok(existing);
         }
         let encoded = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        match self.owner.store().commit(
-            &[durable_store::Check {
-                key: key.clone(),
-                expected: durable_store::Expected::Missing,
-            }],
-            &[durable_store::Mutation::Put {
-                key: key.clone(),
-                value: encoded,
-            }],
-        ) {
+        let checks = [durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        }];
+        let mutations = [durable_store::Mutation::Put {
+            key: key.clone(),
+            value: encoded,
+        }];
+        let result = match &self.fence {
+            Some(binding) => binding.commit(self.owner.store(), &checks, &mutations),
+            None => self
+                .owner
+                .store()
+                .commit(&checks, &mutations)
+                .map_err(crate::nested_fence::Error::from),
+        };
+        match result {
             Ok(()) => Ok(value),
-            Err(durable_store::Error::Conflict { .. }) => self
+            Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict { .. })) => self
                 .read(&key)?
                 .ok_or_else(|| "memo disappeared after conflict".into()),
-            Err(error) => {
+            Err(crate::nested_fence::Error::Store(error)) => {
                 self.failed.store(true, Ordering::Release);
                 Err(error.to_string())
             }
+            Err(error) => Err(error.to_string()),
         }
     }
 }

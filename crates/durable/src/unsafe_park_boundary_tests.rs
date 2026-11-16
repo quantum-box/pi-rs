@@ -438,6 +438,7 @@ async fn final_resume_retries_parent_and_child_busy_after_last_child_settles() {
             store,
             Harness::key(id),
             conversation_version,
+            None,
             Outcome::Succeeded("result".into()),
             &Default::default(),
         )

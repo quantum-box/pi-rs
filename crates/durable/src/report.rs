@@ -38,6 +38,16 @@ pub(crate) fn index(
     batch: &ExtensionReportBatch,
     legacy: bool,
 ) -> Result<(), Error> {
+    index_with_fence(store, key, batch, legacy, None)
+}
+
+pub(crate) fn index_with_fence(
+    store: &Store,
+    key: Vec<u8>,
+    batch: &ExtensionReportBatch,
+    legacy: bool,
+    fence: Option<&crate::nested_fence::Binding>,
+) -> Result<(), Error> {
     let mark = marker(&key);
     loop {
         if store.get(&mark)?.is_some() {
@@ -47,7 +57,7 @@ pub(crate) fn index(
         if !legacy && let Some(entry) = &existing {
             // Old databases may contain this identity without an index.
             let old: ExtensionReportBatch = serde_json::from_slice(&entry.value)?;
-            return index(store, key, &old, true);
+            return index_with_fence(store, key, &old, true, fence);
         }
         // Migration must append the exact version guarded below, not the value
         // from an earlier page (or from a previous failed attempt).
@@ -87,9 +97,15 @@ pub(crate) fn index(
                 value: serde_json::to_vec(batch)?,
             });
         }
-        match store.commit(&append.checks, &append.mutations) {
+        let result = match fence {
+            Some(binding) => binding.commit(store, &append.checks, &append.mutations),
+            None => store
+                .commit(&append.checks, &append.mutations)
+                .map_err(crate::nested_fence::Error::from),
+        };
+        match result {
             Ok(()) => return Ok(()),
-            Err(durable_store::Error::Conflict { .. }) => {
+            Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict { .. })) => {
                 // An occupied next record with an unchanged head is an orphan,
                 // not contention. Retrying forever would hang the writer.
                 let head = &append.checks[0];
@@ -107,7 +123,9 @@ pub(crate) fn index(
                 }
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(crate::nested_fence::Error::Store(e)) => return Err(e.into()),
+            Err(crate::nested_fence::Error::Stale) => return Err(Error::Interrupted),
+            Err(e) => return Err(Error::Invalid(e.to_string())),
         }
     }
 }

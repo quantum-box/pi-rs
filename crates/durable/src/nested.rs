@@ -170,6 +170,7 @@ impl PendingPoll {
         store: &durable_store::Store,
         conversation_key: Vec<u8>,
         conversation_version: u64,
+        binding: Option<crate::nested_fence::Binding>,
         outcome: Outcome,
         schemas: &std::collections::BTreeMap<String, Value>,
     ) -> Result<(), crate::runtime::Error> {
@@ -198,22 +199,39 @@ impl PendingPoll {
                 cancelled: false,
             });
         }
-        store.commit(
-            &[
-                Check {
-                    key: conversation_key,
-                    expected: Expected::Version(conversation_version),
-                },
-                Check {
-                    key: self.key.clone(),
-                    expected: Expected::Version(self.version),
-                },
-            ],
-            &[Mutation::Put {
-                key: self.key,
-                value: serde_json::to_vec(&record)?,
-            }],
-        )?;
+        let record_check = Check {
+            key: self.key.clone(),
+            expected: Expected::Version(self.version),
+        };
+        let mutations = [Mutation::Put {
+            key: self.key,
+            value: serde_json::to_vec(&record)?,
+        }];
+        if let Some(binding) = binding {
+            match binding.commit(store, &[record_check], &mutations) {
+                Ok(()) => (),
+                Err(crate::nested_fence::Error::Stale) => {
+                    return Err(durable_store::Error::Conflict {
+                        key: conversation_key,
+                    }
+                    .into());
+                }
+                Err(crate::nested_fence::Error::Store(error)) => return Err(error.into()),
+                Err(crate::nested_fence::Error::Json(error)) => return Err(error.into()),
+            }
+        } else {
+            // Legacy records have no attempt identity; keep their exact snapshot fence.
+            store.commit(
+                &[
+                    Check {
+                        key: conversation_key,
+                        expected: Expected::Version(conversation_version),
+                    },
+                    record_check,
+                ],
+                &mutations,
+            )?;
+        }
         Ok(())
     }
 }
@@ -652,6 +670,7 @@ struct Shared {
     tools: HashMap<String, RegisteredTool>,
     output_schemas: std::collections::BTreeMap<String, Value>,
     hooks: Option<NestedHooks>,
+    fence: Option<crate::nested_fence::Binding>,
     cancellation: CancellationToken,
     timeout: Duration,
     max_depth: usize,
@@ -663,6 +682,22 @@ struct Shared {
     parked_checkpoint: Mutex<Option<PendingWake>>,
     resumed_checkpoint: Mutex<Option<PendingWake>>,
     idle: tokio::sync::Notify,
+}
+impl Shared {
+    fn commit(
+        &self,
+        checks: &[Check],
+        mutations: &[Mutation],
+    ) -> Result<(), crate::nested_fence::Error> {
+        match &self.fence {
+            Some(binding) => binding.commit(self.owner.store(), checks, mutations),
+            None => self
+                .owner
+                .store()
+                .commit(checks, mutations)
+                .map_err(Into::into),
+        }
+    }
 }
 pub(crate) struct NestedHooks {
     pub selected: crate::extension::Resolved,
@@ -725,7 +760,7 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
                 diagnostic.clone(),
             )?;
             let value = serde_json::to_vec(&record).map_err(|e| self.storage_error(e))?;
-            match store.commit(
+            match self.shared.commit(
                 &[Check {
                     key: self.key.clone(),
                     expected: Expected::Version(entry.version),
@@ -736,7 +771,9 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
                 }],
             ) {
                 Ok(()) => return Ok(()),
-                Err(durable_store::Error::Conflict { .. }) => continue,
+                Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict {
+                    ..
+                })) => continue,
                 Err(error) => return Err(self.storage_error(error)),
             }
         }
@@ -824,7 +861,7 @@ impl NestedHost {
             cancellation,
             timeout,
             max_depth,
-            (Default::default(), None),
+            (Default::default(), None, None),
         )
     }
     pub(crate) fn new_with_schemas(
@@ -834,9 +871,10 @@ impl NestedHost {
         cancellation: CancellationToken,
         timeout: Duration,
         max_depth: usize,
-        (output_schemas, hooks): (
+        (output_schemas, hooks, fence): (
             std::collections::BTreeMap<String, Value>,
             Option<NestedHooks>,
+            Option<crate::nested_fence::Binding>,
         ),
     ) -> Result<Arc<Self>, InspectionError> {
         let mut registry = HashMap::new();
@@ -857,6 +895,7 @@ impl NestedHost {
                 tools: registry,
                 output_schemas,
                 hooks,
+                fence,
                 cancellation,
                 timeout,
                 max_depth,
@@ -1445,6 +1484,13 @@ impl NestedHost {
             Ok(active) => active,
             Err(outcome) => return outcome,
         };
+        // Reattached terminal or pending children may otherwise bypass all
+        // journal writes before returning or polling.
+        if self.shared.fence.is_some()
+            && let Err(error) = self.shared.commit(&[], &[])
+        {
+            return self.fail(format!("nested root attempt: {error}"));
+        }
         let _serial = if serial_held {
             None
         } else {
@@ -1585,7 +1631,7 @@ impl NestedHost {
                 Ok(v) => v,
                 Err(e) => return self.fail(e.to_string()),
             };
-            if let Err(e) = store.commit(
+            if let Err(e) = self.shared.commit(
                 &[Check {
                     key: key.clone(),
                     expected: Expected::Missing,
@@ -1718,7 +1764,7 @@ impl NestedHost {
                 Ok(v) => v,
                 Err(e) => return self.fail(e.to_string()),
             };
-            match store.commit(
+            match self.shared.commit(
                 &[Check {
                     key: key.clone(),
                     expected: Expected::Version(entry.version),
@@ -1729,7 +1775,9 @@ impl NestedHost {
                 }],
             ) {
                 Ok(()) => break,
-                Err(durable_store::Error::Conflict { .. }) => continue,
+                Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict {
+                    ..
+                })) => continue,
                 Err(e) => return self.fail(format!("nested result commit: {e}")),
             }
         }
@@ -1821,7 +1869,8 @@ impl NestedHost {
             self.shared.owner.clone(),
             record.operation_id,
             hooks.storage_failed.clone(),
-        );
+        )
+        .with_nested_fence(self.shared.fence.clone());
         let mut snapshot = hooks.snapshot.clone();
         if let Some(wake) = record
             .before_gate
@@ -1898,9 +1947,11 @@ impl NestedHost {
                                 key: key.to_vec(),
                                 value,
                             });
-                            match store.commit(&checks, &mutations) {
+                            match self.shared.commit(&checks, &mutations) {
                                 Ok(()) => (),
-                                Err(durable_store::Error::Conflict { .. }) => continue,
+                                Err(crate::nested_fence::Error::Store(
+                                    durable_store::Error::Conflict { .. },
+                                )) => continue,
                                 Err(error) => {
                                     return Err(self.fail(format!("nested gate commit: {error}")));
                                 }
@@ -1974,7 +2025,7 @@ impl NestedHost {
             Ok(value) => value,
             Err(error) => return Err(self.fail(error.to_string())),
         };
-        if let Err(error) = self.shared.owner.store().commit(
+        if let Err(error) = self.shared.commit(
             &[Check {
                 key: key.to_vec(),
                 expected: Expected::Version(entry.version),
@@ -2004,7 +2055,8 @@ impl NestedHost {
             self.shared.owner.clone(),
             record.operation_id,
             hooks.storage_failed.clone(),
-        );
+        )
+        .with_nested_fence(self.shared.fence.clone());
         let context = crate::extension::Context {
             snapshot: record.hook_snapshot.as_ref().unwrap_or(&hooks.snapshot),
             memo: &memo,
@@ -2226,7 +2278,7 @@ impl NestedHost {
                 expected: Expected::Version(*version),
             });
         }
-        if let Err(error) = self.shared.owner.store().commit(
+        if let Err(error) = self.shared.commit(
             &checks,
             &[Mutation::Put {
                 key: key.to_vec(),
@@ -2259,8 +2311,17 @@ impl NestedHost {
             hooks.conversation
         )
         .into_bytes();
-        crate::report::index(self.shared.owner.store(), key, &batch, false).map_err(|error| {
-            hooks.storage_failed.store(true, Ordering::Release);
+        crate::report::index_with_fence(
+            self.shared.owner.store(),
+            key,
+            &batch,
+            false,
+            self.shared.fence.as_ref(),
+        )
+        .map_err(|error| {
+            if !matches!(error, crate::runtime::Error::Interrupted) {
+                hooks.storage_failed.store(true, Ordering::Release);
+            }
             error.to_string()
         })
     }
@@ -2343,7 +2404,7 @@ impl NestedHost {
                 Ok(value) => value,
                 Err(e) => return self.fail(e.to_string()),
             };
-            if let Err(e) = self.shared.owner.store().commit(
+            if let Err(e) = self.shared.commit(
                 &[Check {
                     key: key.to_vec(),
                     expected: Expected::Version(version),
@@ -3611,7 +3672,7 @@ mod tests {
                 CancellationToken::new(),
                 Duration::from_secs(10),
                 2,
-                (schemas, None),
+                (schemas, None, None),
             )
             .unwrap()
         };

@@ -1847,6 +1847,16 @@ impl Conversation {
             .is_some_and(|resume| resume.explicit_suspend)
             && matches!(self.phase, Phase::Blocked { .. })
     }
+    pub(crate) fn suspended_nested_attempt(&self) -> Option<ToolAttempt> {
+        if self.abort_requested || !self.nested_suspended() {
+            return None;
+        }
+        let attempt = self.tool_attempt()?;
+        self.nested_resume
+            .as_ref()
+            .filter(|resume| resume.operation_id == attempt.operation_id)
+            .map(|_| attempt)
+    }
     pub(crate) fn active_tool_attempt(&self) -> Option<ToolAttempt> {
         if self.abort_requested
             || !matches!(
@@ -17579,6 +17589,13 @@ impl Harness {
                                                 conversation_fence: None,
                                             })
                                         },
+                                        Some(crate::nested_fence::Binding {
+                                            conversation: id,
+                                            attempt: c.active_tool_attempt().ok_or_else(|| {
+                                                Error::Invalid("nested root attempt missing".into())
+                                            })?,
+                                            suspended: false,
+                                        }),
                                     ),
                                 ) {
                                     Ok(host) => {
@@ -22121,6 +22138,22 @@ async fn poll_suspended_nested(
     if state.abort_requested || !state.nested_suspended() {
         return Ok(false);
     }
+    // Legacy suspensions without a provable attempt cannot authorize new
+    // nested effects. Leave them for host reconciliation.
+    let Some(suspended_attempt) = state.suspended_nested_attempt() else {
+        return Ok(false);
+    };
+    let binding = crate::nested_fence::Binding {
+        conversation: id,
+        attempt: suspended_attempt,
+        suspended: true,
+    };
+    match binding.commit(worker.owner.store(), &[], &[]) {
+        Ok(()) => (),
+        Err(crate::nested_fence::Error::Stale) => return Ok(false),
+        Err(crate::nested_fence::Error::Store(error)) => return Err(error.into()),
+        Err(crate::nested_fence::Error::Json(error)) => return Err(error.into()),
+    }
     let Phase::Blocked {
         operation_id,
         calls,
@@ -22231,7 +22264,16 @@ async fn poll_suspended_nested(
                     snapshot: serde_json::to_value(&state)?,
                     conversation: id,
                     storage_failed: worker.storage_failed.clone(),
-                    conversation_fence: Some((Harness::key(id), version)),
+                    conversation_fence: None,
+                }),
+                Some(crate::nested_fence::Binding {
+                    conversation: id,
+                    attempt: state.suspended_nested_attempt().ok_or_else(|| {
+                        Error::Invalid(
+                            "legacy suspended nested attempt requires reconciliation".into(),
+                        )
+                    })?,
+                    suspended: true,
                 }),
             ),
         )
@@ -22285,6 +22327,11 @@ async fn poll_suspended_nested(
         let schemas = &state.tool_filters.output_schemas;
         let owner = &worker.owner;
         let unsafe_parent = unsafe_parent.clone();
+        let binding = Some(crate::nested_fence::Binding {
+            conversation: id,
+            attempt: suspended_attempt,
+            suspended: true,
+        });
         polls.push(async move {
             let identity_lease = if let Some(expected) = job.expected_identity() {
                 let lease = match crate::nested_identity::checked_lease(&tool, expected) {
@@ -22360,21 +22407,28 @@ async fn poll_suspended_nested(
                 }
                 _ => return Ok(false),
             };
-            let result =
-                match fenced_poll(
-                    async move {
-                        job.commit(owner.store(), Harness::key(id), version, outcome, schemas)
-                    },
-                    gate,
-                    cancel,
-                )
-                .await
-                {
-                    Some(Ok(()))
-                    | Some(Err(Error::Storage(durable_store::Error::Conflict { .. }))) => Ok(true),
-                    Some(Err(error)) => Err(error),
-                    None => Ok(false),
-                };
+            let result = match fenced_poll(
+                async move {
+                    job.commit(
+                        owner.store(),
+                        Harness::key(id),
+                        version,
+                        binding,
+                        outcome,
+                        schemas,
+                    )
+                },
+                gate,
+                cancel,
+            )
+            .await
+            {
+                Some(Ok(())) | Some(Err(Error::Storage(durable_store::Error::Conflict { .. }))) => {
+                    Ok(true)
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(false),
+            };
             drop(identity_lease);
             result
         });
