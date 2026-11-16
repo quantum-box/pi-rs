@@ -1236,6 +1236,197 @@ async fn write_behind_reset_queues_then_delivers_notification() {
     driver.shutdown().unwrap();
 }
 
+struct TwoResetBatch {
+    fail: bool,
+}
+impl Handler for TwoResetBatch {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        let notify = |key: &str| {
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: key.into(),
+            })
+        };
+        docs.submit_write(
+            "reset-write-a".into(),
+            "app.a".into(),
+            Some(json!(1)),
+            notify("a"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.submit_input_with_options(
+            "reset-input".into(),
+            "after resets".into(),
+            AdmissionOptions::default(),
+            notify("input"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.submit_write(
+            "reset-write-b".into(),
+            "app.b".into(),
+            Some(json!(2)),
+            notify("b"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"reset_batch":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.fail {
+            return Ok(Step::Fail("discard batch".into()));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("input").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn mixed_batch_waits_for_two_resets_and_rolls_back_on_failure() {
+    for fail in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, id) = setup(&path);
+        h.submit(id, None, "initial".into()).unwrap();
+        let first = h.reset(id, None).unwrap();
+        let second = h.reset(id, None).unwrap();
+        let mut registry = Registry::default();
+        registry.register("two-reset-batch", true, TwoResetBatch { fail });
+        let driver = h.start_tasks(registry).unwrap();
+        let task = task(id, "two-reset-batch");
+        driver.submit(&task).unwrap();
+        wait_task(&path, task.id(), |state| {
+            if fail {
+                matches!(state, TaskState::Failed(_))
+            } else {
+                matches!(state, TaskState::Waiting(_))
+            }
+        });
+        let store = Store::open(&path).unwrap();
+        let before = h.conversation(id).unwrap();
+        let pending = serde_json::to_value(&before).unwrap()["pending_resets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pending, [first, second]);
+        assert_eq!(before.submissions.len(), if fail { 1 } else { 2 });
+        assert_eq!(before.application_writes.len(), if fail { 0 } else { 2 });
+        if !fail {
+            assert_eq!(before.submissions[1].status, Status::Queued);
+            assert_eq!(
+                before
+                    .application_writes
+                    .iter()
+                    .map(|w| (w.kind.as_str(), w.placed, w.after_reset))
+                    .collect::<Vec<_>>(),
+                [
+                    ("app.a", false, Some(second)),
+                    ("app.b", false, Some(second))
+                ]
+            );
+        }
+        assert_eq!(
+            Documents::new(&store).get(&address()).unwrap().is_some(),
+            !fail
+        );
+        for key in ["a", "b", "input"] {
+            assert!(
+                TaskStore::new(&store)
+                    .read_typed_signal(task.id(), &submission_settled_signal(), key)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        driver.shutdown().unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let reopened = h.conversation(id).unwrap();
+        let pending = serde_json::to_value(&reopened).unwrap()["pending_resets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pending, [first, second]);
+        assert_eq!(reopened.application_writes.len(), if fail { 0 } else { 2 });
+        let mut registry = Registry::default();
+        registry.register("two-reset-batch", true, TwoResetBatch { fail });
+        let driver = h.start_tasks(registry).unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        if !fail {
+            wait_task(&path, task.id(), |s| matches!(s, TaskState::Succeeded(_)));
+        }
+        let after = h.conversation(id).unwrap();
+        assert_eq!(
+            after.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert!(
+            serde_json::to_value(&after).unwrap()["pending_resets"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(after.application_writes.len(), if fail { 0 } else { 2 });
+        if !fail {
+            assert!(matches!(after.submissions[1].status, Status::Done { .. }));
+            assert!(after.messages.iter().any(|message| matches!(message, pi_rs_core::Message::User { content } if content == "after resets")));
+            assert!(!after.messages.iter().any(|message| matches!(message, pi_rs_core::Message::User { content } if content == "initial")));
+            for (index, key) in ["a", "b"].iter().enumerate() {
+                let write = &after.application_writes[index];
+                assert!(write.placed);
+                assert_eq!(write.after_reset, Some(second));
+                let signal = TaskStore::new(&store)
+                    .read_typed_signal(task.id(), &submission_settled_signal(), *key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(signal["entry"], write.id.to_string());
+                assert_eq!(signal["status"], "done");
+            }
+            let signal = TaskStore::new(&store)
+                .read_typed_signal(task.id(), &submission_settled_signal(), "input")
+                .unwrap()
+                .unwrap();
+            assert_eq!(signal["id"], after.submissions[1].id.to_string());
+        } else {
+            assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+            for key in ["a", "b", "input"] {
+                assert!(
+                    TaskStore::new(&store)
+                        .read_typed_signal(task.id(), &submission_settled_signal(), key)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+        driver.shutdown().unwrap();
+    }
+}
+
 #[cfg(unix)]
 struct KillWrite;
 #[cfg(unix)]
