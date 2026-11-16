@@ -6495,6 +6495,77 @@ impl Harness {
         Ok((active, created))
     }
 
+    // The baseline must be the current committed root at the authenticated
+    // observation; fork snapshots alone omit pending block-reset bindings.
+    fn derive_anchored_reset_states(
+        &self,
+        id: Uuid,
+        expected_version: u64,
+        steps: &[ResetDerivationStep],
+    ) -> Result<Vec<Conversation>, Error> {
+        let (baseline, version) = self.load(id)?;
+        let root = Self::key(id);
+        if version != expected_version {
+            return Err(durable_store::Error::Conflict { key: root }.into());
+        }
+        let store = self.owner.store();
+        let sequence = store
+            .commit_for_version(&root, version)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let prefix = format!("runtime/fork/{id}/");
+        let (_, fork_key) = store
+            .runtime_snapshot_at(&root, prefix.as_bytes(), sequence)?
+            .filter(|(commit, _)| *commit == sequence)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let suffix = fork_key
+            .strip_prefix(prefix.as_bytes())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let observation = std::str::from_utf8(suffix)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        self.authenticate_fork_anchor(id, observation)?;
+        let fork = store
+            .get(&fork_key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&fork.value)?;
+        if snapshot.get("conversation_id") != Some(&serde_json::to_value(id)?)
+            || snapshot.get("_transcript") != Some(&serde_json::to_value(&baseline.transcript)?)
+            || snapshot.get("config") != Some(&serde_json::to_value(&baseline.config)?)
+            || snapshot.get("submissions") != Some(&serde_json::to_value(&baseline.submissions)?)
+            || snapshot.get("tool_states") != Some(&serde_json::to_value(&baseline.tool_states)?)
+            || snapshot.get("active") != Some(&serde_json::to_value(baseline.active)?)
+            || snapshot.get("pending_resets")
+                != Some(&serde_json::to_value(&baseline.pending_resets)?)
+            || snapshot.get("phase") != Some(&serde_json::to_value(&baseline.phase)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1queue-modes")
+                != Some(&serde_json::to_value(baseline.queue_modes)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1after-failed-run")
+                != Some(&serde_json::to_value(baseline.after_failed_run)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1extensions")
+                != Some(&serde_json::to_value(&baseline.extensions)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1provider-adapter")
+                != Some(&serde_json::to_value(&baseline.provider_adapter)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1allowed-tools")
+                != Some(&serde_json::to_value(&baseline.allowed_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1model-tools")
+                != Some(&serde_json::to_value(&baseline.model_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-filters")
+                != Some(&serde_json::to_value(&baseline.tool_filters)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-results")
+                != Some(&serde_json::to_value(&baseline.tool_results)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1occurrence-epoch-proven")
+                != Some(&serde_json::to_value(baseline.occurrence_epoch_proven)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1resets")
+                != Some(&serde_json::to_value(&baseline.resets)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1application-writes")
+                != Some(&serde_json::to_value(&baseline.application_writes)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        derive_ordered_reset_states(&baseline, steps)
+    }
+
     // A matching observer payload alone is not evidence of a runtime commit:
     // both reserved records must be the versions written by the same commit.
     fn authenticate_fork_anchor(&self, origin: Uuid, commit: u64) -> Result<(), Error> {
@@ -9956,8 +10027,25 @@ impl Harness {
             match c.phase.clone() {
                 Phase::Idle => {
                     if !c.pending_resets.is_empty() {
-                        for marker in take_reset_batch(&mut c) {
-                            place_reset(&mut c, marker);
+                        if c.pending_reset_blocks.is_empty() {
+                            for marker in take_reset_batch(&mut c) {
+                                place_reset(&mut c, marker);
+                            }
+                        } else {
+                            let step = ResetDerivationStep {
+                                reset_id: c.pending_resets[0].id,
+                                context_generation: Uuid::new_v4(),
+                                write_limit: usize::MAX,
+                            };
+                            c = match self.derive_anchored_reset_states(id, version, &[step]) {
+                                Ok(mut cuts) => cuts.pop().ok_or_else(|| {
+                                    Error::Invalid("missing reset derivation".into())
+                                })?,
+                                Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                         }
                         let merge = self.merge_admissions;
                         self.merge_admissions = false;
@@ -16011,6 +16099,48 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+// Derive reset cuts from a caller-authenticated baseline without writing storage.
+// A future batch proof can compare each returned state to its committed cut.
+#[derive(Clone, Copy)]
+struct ResetDerivationStep {
+    reset_id: Uuid,
+    context_generation: Uuid,
+    write_limit: usize,
+}
+
+fn derive_ordered_reset_states(
+    baseline: &Conversation,
+    steps: &[ResetDerivationStep],
+) -> Result<Vec<Conversation>, Error> {
+    if steps.is_empty() {
+        return Err(Error::Invalid("empty reset derivation".into()));
+    }
+    validate_pending_reset_blocks(baseline)?;
+    let mut state = baseline.clone();
+    let mut generations = std::collections::HashSet::new();
+    if let Some(generation) = state.context_generation {
+        generations.insert(generation);
+    }
+    let mut cuts = Vec::with_capacity(steps.len());
+    for step in steps {
+        if step.context_generation.is_nil()
+            || !generations.insert(step.context_generation)
+            || state
+                .pending_resets
+                .first()
+                .is_none_or(|reset| reset.id != step.reset_id)
+        {
+            return Err(Error::Invalid("invalid ordered reset derivation".into()));
+        }
+        let marker = state.pending_resets.remove(0);
+        place_reset_before_writes(&mut state, marker, step.write_limit);
+        state.context_generation = Some(step.context_generation);
+        validate_pending_reset_blocks(&state)?;
+        cuts.push(state.clone());
+    }
+    Ok(cuts)
 }
 
 // Each block-bearing reset needs its own durable transcript transition.

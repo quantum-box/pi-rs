@@ -5546,3 +5546,141 @@ fn historical_fork_rejects_anchor_rewritten_in_another_commit() {
         assert!(h.fork_by_entry_id(id, occurrence).is_err());
     }
 }
+
+#[test]
+fn anchored_reset_derivation_replays_committed_prefix_and_rejects_tampering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let blocks1 = vec![serde_json::json!({"type":"text","text":"first"})];
+    let blocks2 = vec![serde_json::json!({"type":"text","text":"second"})];
+    let (r1, first_ids) = h
+        .reset_with_blocks(id, Some("one".into()), vec![blocks1.clone()])
+        .unwrap();
+    let w1 = h
+        .submit_write(id, None, "first.write".into(), None)
+        .unwrap();
+    let (r2, second_ids) = h
+        .reset_with_blocks(id, Some("two".into()), vec![blocks2.clone()])
+        .unwrap();
+    let w2 = h
+        .submit_write(id, None, "second.write".into(), None)
+        .unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let (before, version) = h.load(id).unwrap();
+    let steps = [
+        ResetDerivationStep {
+            reset_id: r1,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        },
+        ResetDerivationStep {
+            reset_id: r2,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        },
+    ];
+    let cuts = h.derive_anchored_reset_states(id, version, &steps).unwrap();
+    assert_eq!(cuts.len(), 2);
+    assert_eq!(
+        cuts[0].resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![r1]
+    );
+    assert_eq!(
+        cuts[0]
+            .pending_resets
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec![r2]
+    );
+    assert_eq!(cuts[0].content_blocks[&1].message_id, first_ids[0]);
+    assert_eq!(cuts[0].content_blocks[&1].blocks, blocks1);
+    assert!(
+        cuts[0]
+            .application_writes
+            .iter()
+            .find(|w| w.id == w1)
+            .unwrap()
+            .placed
+    );
+    assert!(
+        !cuts[0]
+            .application_writes
+            .iter()
+            .find(|w| w.id == w2)
+            .unwrap()
+            .placed
+    );
+    assert_eq!(
+        cuts[1].resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![r1, r2]
+    );
+    assert!(cuts[1].pending_resets.is_empty());
+    assert_eq!(cuts[1].content_blocks[&1].message_id, second_ids[0]);
+    assert_eq!(cuts[1].content_blocks[&1].blocks, blocks2);
+    assert!(
+        cuts[1]
+            .application_writes
+            .iter()
+            .find(|w| w.id == w2)
+            .unwrap()
+            .placed
+    );
+    assert_eq!(h.conversation(id).unwrap().resets, before.resets);
+    assert!(
+        h.derive_anchored_reset_states(id, version, &[steps[1], steps[0]])
+            .is_err()
+    );
+    assert!(
+        h.derive_anchored_reset_states(
+            id,
+            version,
+            &[
+                steps[0],
+                ResetDerivationStep {
+                    context_generation: steps[0].context_generation,
+                    ..steps[1]
+                }
+            ]
+        )
+        .is_err()
+    );
+    assert!(
+        h.derive_anchored_reset_states(id, version + 1, &steps)
+            .is_err()
+    );
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    let key = format!("runtime/fork/{id}/{:020}", head.0).into_bytes();
+    let entry = h.owner.store().get(&key).unwrap().unwrap();
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key,
+                value: entry.value,
+            }],
+        )
+        .unwrap();
+    assert!(h.derive_anchored_reset_states(id, version, &steps).is_err());
+}
