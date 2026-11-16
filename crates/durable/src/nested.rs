@@ -37,6 +37,8 @@ struct Record {
     #[serde(default)]
     before_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_park: Option<ChildPark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     before_gate: Option<BeforeGate>,
     policy: ReplayPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,6 +67,20 @@ struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolution: Option<Resolution>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+struct ChildPark {
+    suspension: Uuid,
+    root_attempt: Uuid,
+    leaf_key: Vec<u8>,
+}
+struct ChildParkRequest {
+    checkpoint: Value,
+    leaf_key: Vec<u8>,
+    leaf_version: u64,
+    operation_id: Uuid,
+    reference: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct BeforeGate {
     signals: Vec<String>,
@@ -145,6 +161,14 @@ fn durable_tool_identity(tool: &std::sync::Arc<dyn pi_rs_core::Tool>) -> Option<
     crate::nested_identity::current(tool)
 }
 
+fn suspension_error(error: crate::nested_suspension::Error) -> crate::runtime::Error {
+    match error {
+        crate::nested_suspension::Error::Store(error) => error.into(),
+        crate::nested_suspension::Error::Json(error) => error.into(),
+        error => crate::runtime::Error::Invalid(error.to_string()),
+    }
+}
+
 impl PendingPoll {
     pub(crate) fn expected_identity(&self) -> Option<&str> {
         self.record.durable_identity.as_deref()
@@ -180,6 +204,10 @@ impl PendingPoll {
             ));
         }
         let reference = self.reference().to_owned();
+        let next_reference = match &outcome {
+            Outcome::Pending { reference } => Some(reference.clone()),
+            _ => None,
+        };
         let outcome = if self.record.hooks_required {
             outcome
         } else {
@@ -194,7 +222,7 @@ impl PendingPoll {
         }
         if !matches!(outcome, Outcome::Pending { .. }) {
             record.resolution = Some(Resolution {
-                reference,
+                reference: reference.clone(),
                 outcome,
                 cancelled: false,
             });
@@ -203,12 +231,66 @@ impl PendingPoll {
             key: self.key.clone(),
             expected: Expected::Version(self.version),
         };
-        let mutations = [Mutation::Put {
-            key: self.key,
+        let mut checks = vec![record_check];
+        let mut mutations = vec![Mutation::Put {
+            key: self.key.clone(),
             value: serde_json::to_vec(&record)?,
         }];
         if let Some(binding) = binding {
-            match binding.commit(store, &[record_check], &mutations) {
+            // A child's pending reference can rotate. Keep the per-child
+            // suspension in the same transaction as the observed leaf result.
+            let mut found = false;
+            for (key, entry) in
+                store.list(format!("nested/{}/", binding.attempt.operation_id).as_bytes())?
+            {
+                let parent: Record = serde_json::from_slice(&entry.value)?;
+                let Some(park) = &parent.child_park else {
+                    continue;
+                };
+                if park.leaf_key != self.key {
+                    continue;
+                }
+                if found {
+                    return Err(crate::runtime::Error::Invalid(
+                        "ambiguous nested child park".into(),
+                    ));
+                }
+                found = true;
+                let suspension = crate::nested_suspension::load(
+                    store,
+                    binding.conversation,
+                    parent.operation_id,
+                )
+                .map_err(suspension_error)?
+                .ok_or_else(|| {
+                    crate::runtime::Error::Invalid("nested suspension missing".into())
+                })?;
+                if suspension.suspension_id() != park.suspension
+                    || suspension.jobs().len() != 1
+                    || suspension.jobs()[0].operation_id != record.operation_id
+                    || suspension.jobs()[0].reference != reference
+                {
+                    return Err(crate::runtime::Error::Invalid(
+                        "nested suspension evidence changed".into(),
+                    ));
+                }
+                checks.push(Check {
+                    key,
+                    expected: Expected::Version(entry.version),
+                });
+                if let Some(next) = &next_reference
+                    && next != &reference
+                {
+                    let batch = suspension
+                        .advance_reference(record.operation_id, &reference, next.clone())
+                        .map_err(suspension_error)?;
+                    checks.extend(batch.checks);
+                    mutations.extend(batch.mutations);
+                } else {
+                    checks.push(suspension.retired_check().map_err(suspension_error)?);
+                }
+            }
+            match binding.commit(store, &checks, &mutations) {
                 Ok(()) => (),
                 Err(crate::nested_fence::Error::Stale) => {
                     return Err(durable_store::Error::Conflict {
@@ -227,7 +309,7 @@ impl PendingPoll {
                         key: conversation_key,
                         expected: Expected::Version(conversation_version),
                     },
-                    record_check,
+                    checks.remove(0),
                 ],
                 &mutations,
             )?;
@@ -243,7 +325,7 @@ pub(crate) fn pending_polls(
     let mut jobs = Vec::new();
     for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
-        if matches!(record.outcome, Some(Outcome::Pending { .. })) {
+        if record.child_park.is_none() && matches!(record.outcome, Some(Outcome::Pending { .. })) {
             jobs.push(PendingPoll {
                 key,
                 version: entry.version,
@@ -261,7 +343,9 @@ pub(crate) fn pending_jobs(
     let mut jobs = Vec::new();
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
-        if let Some(Outcome::Pending { reference }) = record.outcome {
+        if record.child_park.is_none()
+            && let Some(Outcome::Pending { reference }) = record.outcome
+        {
             jobs.push(PendingJob {
                 operation_id: record.operation_id,
                 reference,
@@ -430,6 +514,29 @@ pub(crate) fn resolved_for_replay(
     let mut resolved = false;
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
+        if let Some(park) = &record.child_park {
+            let Some(leaf) = store.get(&park.leaf_key)? else {
+                return Ok(false);
+            };
+            let leaf: Record = serde_json::from_slice(&leaf.value)?;
+            if !matches!(
+                leaf.outcome,
+                Some(
+                    Outcome::Succeeded(_)
+                        | Outcome::SucceededWithDetails { .. }
+                        | Outcome::Failed(_)
+                        | Outcome::Skipped(_)
+                        | Outcome::Truncated { .. }
+                        | Outcome::Structured { .. }
+                )
+            ) || leaf.resolution.is_none()
+                || leaf.staged_outcome.is_some()
+            {
+                return Ok(false);
+            }
+            resolved = true;
+            continue;
+        }
         if record
             .before_gate
             .as_ref()
@@ -710,6 +817,7 @@ struct NestedDiagnostic {
     shared: Arc<Shared>,
     key: Vec<u8>,
     operation: Uuid,
+    claim: Option<Check>,
 }
 impl NestedDiagnostic {
     fn storage_error(&self, error: impl std::fmt::Display) -> String {
@@ -760,20 +868,26 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
                 diagnostic.clone(),
             )?;
             let value = serde_json::to_vec(&record).map_err(|e| self.storage_error(e))?;
+            let mut checks = vec![Check {
+                key: self.key.clone(),
+                expected: Expected::Version(entry.version),
+            }];
+            if let Some(claim) = &self.claim {
+                checks.push(claim.clone());
+            }
             match self.shared.commit(
-                &[Check {
-                    key: self.key.clone(),
-                    expected: Expected::Version(entry.version),
-                }],
+                &checks,
                 &[Mutation::Put {
                     key: self.key.clone(),
                     value,
                 }],
             ) {
                 Ok(()) => return Ok(()),
-                Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict {
-                    ..
-                })) => continue,
+                Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict { key }))
+                    if key == self.key =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(self.storage_error(error)),
             }
         }
@@ -797,6 +911,10 @@ pub struct NestedHost {
     parent: Uuid,
     depth: usize,
     serial: tokio::sync::Mutex<()>,
+    child_park_request: Mutex<Option<ChildParkRequest>>,
+    child_wake: Option<PendingWake>,
+    child_replay_safe: bool,
+    claim: Option<Check>,
 }
 
 struct Active(Arc<Shared>, Uuid);
@@ -910,7 +1028,22 @@ impl NestedHost {
             parent,
             depth: 0,
             serial: tokio::sync::Mutex::new(()),
+            child_park_request: Mutex::new(None),
+            child_wake: None,
+            child_replay_safe: false,
+            claim: None,
         }))
+    }
+    fn commit(
+        &self,
+        checks: &[Check],
+        mutations: &[Mutation],
+    ) -> Result<(), crate::nested_fence::Error> {
+        let mut checks = checks.to_vec();
+        if let Some(claim) = &self.claim {
+            checks.push(claim.clone());
+        }
+        self.shared.commit(&checks, mutations)
     }
     fn prefix(&self) -> Vec<u8> {
         format!("nested/{}/", self.shared.root).into_bytes()
@@ -1000,7 +1133,10 @@ impl NestedHost {
         }) {
             return Err("nested checkpoint exceeds 64 KiB".into());
         }
-        if self.parent != self.shared.root || self.shared.failed.load(Ordering::Acquire) {
+        if self.parent != self.shared.root {
+            return self.request_child_park(checkpoint);
+        }
+        if self.shared.failed.load(Ordering::Acquire) {
             return Err("nested suspension requires a healthy root invocation".into());
         }
         let lifecycle = self
@@ -1012,6 +1148,7 @@ impl NestedHost {
             return Err("nested invocations remain active".into());
         }
         let mut pending = Vec::new();
+        let mut child_parks = Vec::new();
         for (_, entry) in self
             .shared
             .owner
@@ -1020,6 +1157,10 @@ impl NestedHost {
             .map_err(|e| e.to_string())?
         {
             let record: Record = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if let Some(park) = record.child_park {
+                child_parks.push(park);
+                continue;
+            }
             if record
                 .before_gate
                 .as_ref()
@@ -1041,6 +1182,37 @@ impl NestedHost {
                 _ => (),
             }
         }
+        if !child_parks.is_empty() {
+            if child_parks.len() != 1 || pending.len() > 1 || checkpoint.is_none() {
+                return Err("nested child park requires one checkpointed descendant".into());
+            }
+            let leaf = self
+                .shared
+                .owner
+                .store()
+                .get(&child_parks[0].leaf_key)
+                .map_err(|e| e.to_string())?
+                .ok_or("nested park leaf missing")?;
+            let leaf: Record = serde_json::from_slice(&leaf.value).map_err(|e| e.to_string())?;
+            if pending.is_empty() {
+                let Some(resolution) = &leaf.resolution else {
+                    return Err("nested park descendant is not resolved".into());
+                };
+                if leaf.outcome.as_ref() != Some(&resolution.outcome)
+                    || matches!(
+                        resolution.outcome,
+                        Outcome::Pending { .. } | Outcome::Unknown(_)
+                    )
+                {
+                    return Err("nested park descendant is not terminal".into());
+                }
+                // A confirmed wake can race the root's park. Persist the same
+                // checkpoint and wake identity, then claim a fresh root attempt.
+                pending.push(leaf.operation_id);
+            } else if pending[0] != leaf.operation_id {
+                return Err("nested park descendant changed".into());
+            }
+        }
         if pending.is_empty() || pending.len() > 8 {
             return Err("nested suspension requires one to eight pending jobs".into());
         }
@@ -1060,6 +1232,104 @@ impl NestedHost {
         drop(lifecycle);
         Ok(())
     }
+    // Deliberately bounded: only one keyed intermediate, one keyed pending
+    // descendant, replay-safe root and child, with no extension hooks.
+    fn request_child_park(&self, checkpoint: Option<Value>) -> Result<(), String> {
+        let checkpoint = checkpoint.ok_or("nested child park requires a checkpoint")?;
+        if self.depth != 1
+            || self.child_wake.is_some()
+            || !self.child_replay_safe
+            || self.shared.hooks.is_some()
+            || self.shared.failed.load(Ordering::Acquire)
+        {
+            return Err("unsupported nested child park".into());
+        }
+        let binding = self
+            .shared
+            .fence
+            .as_ref()
+            .ok_or("nested child park needs a runtime root")?;
+        if binding.suspended {
+            return Err("nested child park requires live root".into());
+        }
+        let store = self.shared.owner.store();
+        let root = store
+            .get(&crate::runtime::Harness::key(binding.conversation))
+            .map_err(|e| e.to_string())?
+            .ok_or("root missing")?;
+        let state: crate::runtime::Conversation =
+            serde_json::from_slice(&root.value).map_err(|e| e.to_string())?;
+        if !state.active_tool_is_replay_safe()
+            || state.active_tool_attempt() != Some(binding.attempt)
+        {
+            return Err("nested child park requires replay-safe root".into());
+        }
+        let mut lifecycle = self
+            .shared
+            .lifecycle
+            .lock()
+            .map_err(|_| "nested lifecycle lock poisoned")?;
+        if lifecycle.sealed
+            || lifecycle.active != 1
+            || lifecycle.closed.contains(&self.parent)
+            || lifecycle
+                .active_by_parent
+                .get(&self.parent)
+                .copied()
+                .unwrap_or(0)
+                != 0
+        {
+            return Err("nested child executor is not quiescent".into());
+        }
+        let prefix = format!("nested/{}/{}/", self.shared.root, self.parent).into_bytes();
+        let entries = store.list(&prefix).map_err(|e| e.to_string())?;
+        if entries.len() != 1 || !entries[0].0[prefix.len()..].starts_with(b"k") {
+            return Err("nested child park requires one keyed descendant".into());
+        }
+        let (leaf_key, leaf) = &entries[0];
+        let record: Record = serde_json::from_slice(&leaf.value).map_err(|e| e.to_string())?;
+        let Some(Outcome::Pending { reference }) = &record.outcome else {
+            return Err("nested descendant is not pending".into());
+        };
+        if record.before_pending
+            || record.before_gate.is_some()
+            || record.child_park.is_some()
+            || record.staged_outcome.is_some()
+        {
+            return Err("unsupported nested descendant state".into());
+        }
+        let mut request = self
+            .child_park_request
+            .lock()
+            .map_err(|_| "nested park lock poisoned")?;
+        if request.is_some() {
+            return Err("nested child already requested a park".into());
+        }
+        // No other unfinished nested operation may be hidden by this subset.
+        for (_, entry) in store.list(&self.prefix()).map_err(|e| e.to_string())? {
+            let other: Record = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if other.operation_id != self.parent
+                && other.operation_id != record.operation_id
+                && (other.child_park.is_some()
+                    || matches!(
+                        other.outcome,
+                        None | Some(Outcome::Pending { .. }) | Some(Outcome::Unknown(_))
+                    ))
+            {
+                return Err("nested child park requires a single pending descendant".into());
+            }
+        }
+        *request = Some(ChildParkRequest {
+            checkpoint,
+            leaf_key: leaf_key.clone(),
+            leaf_version: leaf.version,
+            operation_id: record.operation_id,
+            reference: reference.clone(),
+        });
+        lifecycle.closed.insert(self.parent);
+        Ok(())
+    }
+
     pub async fn call_keyed_with_diagnostics(
         &self,
         key: &str,
@@ -1308,12 +1578,12 @@ impl NestedHost {
         Ok(())
     }
     pub(crate) fn resumed_checkpoint(&self) -> Option<PendingWake> {
-        if self.parent != self.shared.root {
-            return None;
-        }
         let lifecycle = self.shared.lifecycle.lock().ok()?;
         if lifecycle.sealed || lifecycle.closed.contains(&self.parent) {
             return None;
+        }
+        if self.parent != self.shared.root {
+            return self.child_wake.clone();
         }
         self.shared.resumed_checkpoint.lock().ok()?.clone()
     }
@@ -1487,7 +1757,7 @@ impl NestedHost {
         // Reattached terminal or pending children may otherwise bypass all
         // journal writes before returning or polling.
         if self.shared.fence.is_some()
-            && let Err(error) = self.shared.commit(&[], &[])
+            && let Err(error) = self.commit(&[], &[])
         {
             return self.fail(format!("nested root attempt: {error}"));
         }
@@ -1525,6 +1795,9 @@ impl NestedHost {
             Ok(v) => v,
             Err(e) => return self.fail(e.to_string()),
         };
+        if self.child_wake.is_some() && entry.is_none() {
+            return self.fail("resumed nested child cannot admit another descendant");
+        }
         let reg = match self.shared.tools.get(name) {
             Some(v) => v,
             None => return self.fail(format!("nested tool unavailable: {name}")),
@@ -1537,6 +1810,8 @@ impl NestedHost {
         };
         let dispatch_identity = identity_lease.as_ref().and_then(|guard| (**guard).clone());
         let registered_unset = identity_lease.as_ref().is_some_and(|guard| guard.is_none());
+        let mut resumed_wake = None;
+        let mut resumed_claim = None;
         let (mut record, _version) = if let Some(entry) = entry {
             let record: Record = match serde_json::from_slice(&entry.value) {
                 Ok(v) => v,
@@ -1552,7 +1827,28 @@ impl NestedHost {
             {
                 return self.fail("nested call identity, arguments, or replay policy changed");
             }
-            if let Some(outcome) = &record.outcome {
+            if let Some(park) = &record.child_park {
+                if explicit.is_none()
+                    || self.parent != self.shared.root
+                    || self.shared.hooks.is_some()
+                    || reg.replay != ReplayPolicy::Safe
+                {
+                    return self.fail("unsupported nested child park replay");
+                }
+                match self.claim_child_park(&key, entry.version, &record, park) {
+                    Ok(Some((snapshot, executor, wake))) => {
+                        resumed_wake = Some(wake);
+                        resumed_claim = Some((snapshot, executor));
+                    }
+                    Ok(None) => {
+                        return record
+                            .outcome
+                            .clone()
+                            .unwrap_or_else(|| self.fail("nested park outcome missing"));
+                    }
+                    Err(error) => return self.fail(error),
+                }
+            } else if let Some(outcome) = &record.outcome {
                 if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
                     return self.poll_pending(&key, record, entry.version, reg).await;
                 }
@@ -1567,7 +1863,8 @@ impl NestedHost {
             if registered_unset {
                 return self.fail("registered nested tool identity is unset");
             }
-            if !record.before_pending
+            if resumed_claim.is_none()
+                && !record.before_pending
                 && (record.policy != ReplayPolicy::Safe || reg.replay != ReplayPolicy::Safe)
             {
                 return self.fail("interrupted unsafe nested call requires reconciliation");
@@ -1607,6 +1904,7 @@ impl NestedHost {
                 arguments,
                 prepared: prepared.arguments().clone(),
                 before_pending: self.shared.hooks.is_some(),
+                child_park: None,
                 before_gate: None,
                 policy: reg.replay,
                 durable_identity: dispatch_identity,
@@ -1631,7 +1929,7 @@ impl NestedHost {
                 Ok(v) => v,
                 Err(e) => return self.fail(e.to_string()),
             };
-            if let Err(e) = self.shared.commit(
+            if let Err(e) = self.commit(
                 &[Check {
                     key: key.clone(),
                     expected: Expected::Missing,
@@ -1676,11 +1974,23 @@ impl NestedHost {
             Ok(p) => p,
             Err(_) => return self.fail("stored nested arguments no longer validate"),
         };
+        let execution_claim = if let Some((snapshot, executor)) = &resumed_claim {
+            match snapshot.claim_check(*executor) {
+                Ok(check) => Some(check),
+                Err(error) => return self.fail(error.to_string()),
+            }
+        } else {
+            self.claim.clone()
+        };
         let child = Arc::new(Self {
             shared: self.shared.clone(),
             parent: record.operation_id,
             depth: self.depth + 1,
             serial: tokio::sync::Mutex::new(()),
+            child_park_request: Mutex::new(None),
+            child_wake: resumed_wake,
+            child_replay_safe: reg.replay == ReplayPolicy::Safe,
+            claim: execution_claim,
         });
         if let Ok(mut l) = self.shared.lifecycle.lock() {
             l.counts.insert(record.operation_id, 0);
@@ -1691,25 +2001,48 @@ impl NestedHost {
             shared: self.shared.clone(),
             key: key.clone(),
             operation: record.operation_id,
+            claim: child.claim.clone(),
         });
+        let child_control = Arc::new(Mutex::new(Default::default()));
         let reply = crate::keyed_tool::scope_with_control(
             child.clone(),
             reg.tool.clone(),
             invocation.operation_id,
             child.clone(),
-            Arc::new(Mutex::new(Default::default())),
+            child_control.clone(),
             (Some(sink), None),
             crate::tool::execute(
                 reg.tool.as_ref(),
                 &invocation,
                 prepared,
                 None,
-                child,
+                child.clone(),
                 &self.shared.cancellation,
                 self.shared.timeout,
             ),
         )
         .await;
+        let park_request = match child.child_park_request.lock() {
+            Ok(mut requested) => requested.take(),
+            Err(_) => return self.fail("nested child park lock poisoned"),
+        };
+        if let Some(request) = park_request {
+            if explicit.is_none()
+                || self.parent != self.shared.root
+                || reply.state.is_some()
+                || self.shared.failed.load(Ordering::Acquire)
+                || !matches!(
+                    reply.outcome,
+                    Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }
+                )
+                || child_control.lock().map_or(true, |control| {
+                    *control != crate::reset::ToolControl::default()
+                })
+            {
+                return self.fail("nested child park invocation did not finish cleanly");
+            }
+            return self.commit_child_park(&key, &record, request);
+        }
         let has_state = reply.state.is_some();
         let outcome = if has_state {
             Outcome::Unknown("nested extension state requires reconciliation".into())
@@ -1734,13 +2067,22 @@ impl NestedHost {
                 Err(e) => return self.fail(e.to_string()),
             };
             if current.operation_id != completed.operation_id
-                || current.outcome.is_some()
+                || (current.outcome.is_some() && resumed_claim.is_none())
                 || current.name != completed.name
                 || current.arguments != completed.arguments
             {
                 return self.fail("nested result intent changed");
             }
             completed = current;
+            if resumed_claim.is_some() {
+                if completed.child_park.is_none()
+                    || !matches!(completed.outcome, Some(Outcome::Pending { .. }))
+                {
+                    return self.fail("nested child park changed");
+                }
+                completed.child_park = None;
+                completed.outcome = None;
+            }
             if self.shared.hooks.is_some()
                 && matches!(
                     outcome,
@@ -1764,20 +2106,27 @@ impl NestedHost {
                 Ok(v) => v,
                 Err(e) => return self.fail(e.to_string()),
             };
-            match self.shared.commit(
-                &[Check {
-                    key: key.clone(),
-                    expected: Expected::Version(entry.version),
-                }],
-                &[Mutation::Put {
-                    key: key.clone(),
-                    value,
-                }],
-            ) {
+            let mut checks = vec![Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }];
+            let mut mutations = vec![Mutation::Put {
+                key: key.clone(),
+                value,
+            }];
+            if let Some((snapshot, executor)) = &resumed_claim {
+                let retired = match snapshot.retire(*executor) {
+                    Ok(batch) => batch,
+                    Err(error) => return self.fail(error.to_string()),
+                };
+                checks.extend(retired.checks);
+                mutations.extend(retired.mutations);
+            }
+            match self.commit(&checks, &mutations) {
                 Ok(()) => break,
                 Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict {
-                    ..
-                })) => continue,
+                    key: conflict,
+                })) if conflict == key => continue,
                 Err(e) => return self.fail(format!("nested result commit: {e}")),
             }
         }
@@ -1792,6 +2141,177 @@ impl NestedHost {
             return self.poll_pending(&key, completed, version, reg).await;
         }
         validate_nested_output(&self.shared.output_schemas, name, outcome)
+    }
+
+    fn claim_child_park(
+        &self,
+        journal_key: &[u8],
+        journal_version: u64,
+        record: &Record,
+        park: &ChildPark,
+    ) -> Result<Option<(crate::nested_suspension::Snapshot, Uuid, PendingWake)>, String> {
+        let binding = self
+            .shared
+            .fence
+            .as_ref()
+            .ok_or("nested park root missing")?;
+        if binding.suspended || binding.attempt.attempt_id == park.root_attempt {
+            return Ok(None);
+        }
+        let store = self.shared.owner.store();
+        let prefix = format!("nested/{}/{}/k", self.shared.root, record.operation_id);
+        if !park.leaf_key.starts_with(prefix.as_bytes())
+            || record.outcome
+                != Some(Outcome::Pending {
+                    reference: format!("nested-child-park:{}", park.suspension),
+                })
+        {
+            return Err("invalid nested park binding".into());
+        }
+        let leaf_entry = store
+            .get(&park.leaf_key)
+            .map_err(|e| e.to_string())?
+            .ok_or("nested park leaf missing")?;
+        let leaf: Record = serde_json::from_slice(&leaf_entry.value).map_err(|e| e.to_string())?;
+        if matches!(leaf.outcome, Some(Outcome::Pending { .. })) {
+            return Ok(None);
+        }
+        let Some(resolution) = &leaf.resolution else {
+            return Err("nested park leaf has no terminal evidence".into());
+        };
+        if matches!(
+            resolution.outcome,
+            Outcome::Pending { .. } | Outcome::Unknown(_)
+        ) || leaf.outcome.as_ref() != Some(&resolution.outcome)
+            || leaf.staged_outcome.is_some()
+        {
+            return Err("nested park leaf is not terminal".into());
+        }
+        let mut suspension =
+            crate::nested_suspension::load(store, binding.conversation, record.operation_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("nested suspension missing")?;
+        if suspension.suspension_id() != park.suspension
+            || suspension.abort_requested()
+            || suspension.jobs().len() != 1
+            || suspension.jobs()[0].operation_id != leaf.operation_id
+            || suspension.jobs()[0].reference != resolution.reference
+        {
+            return Err("nested suspension evidence changed".into());
+        }
+        let executor = binding.attempt.attempt_id;
+        if suspension.executor() == executor {
+            return Err("nested executor already claimed".into());
+        }
+        let extra = [
+            Check {
+                key: journal_key.to_vec(),
+                expected: Expected::Version(journal_version),
+            },
+            Check {
+                key: park.leaf_key.clone(),
+                expected: Expected::Version(leaf_entry.version),
+            },
+        ];
+        if !suspension.is_retired() {
+            // A new root attempt can run only after the previous root host was
+            // sealed and joined, or after its process died and ownership reopened.
+            let mut batch = suspension
+                .retire(suspension.executor())
+                .map_err(|e| e.to_string())?;
+            batch.checks.extend_from_slice(&extra);
+            self.commit(&batch.checks, &batch.mutations)
+                .map_err(|e| e.to_string())?;
+            suspension =
+                crate::nested_suspension::load(store, binding.conversation, record.operation_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("nested suspension missing")?;
+        }
+        let wake = PendingWake {
+            checkpoint: suspension.checkpoint().clone(),
+            ended: vec![leaf.operation_id],
+        };
+        let mut batch = suspension.claim(executor).map_err(|e| e.to_string())?;
+        batch.checks.extend_from_slice(&extra);
+        self.commit(&batch.checks, &batch.mutations)
+            .map_err(|e| e.to_string())?;
+        let claimed =
+            crate::nested_suspension::load(store, binding.conversation, record.operation_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("nested claim missing")?;
+        claimed.claim_check(executor).map_err(|e| e.to_string())?;
+        Ok(Some((claimed, executor, wake)))
+    }
+
+    fn commit_child_park(
+        &self,
+        key: &[u8],
+        original: &Record,
+        request: ChildParkRequest,
+    ) -> Outcome {
+        let Some(binding) = &self.shared.fence else {
+            return self.fail("nested park root missing");
+        };
+        let store = self.shared.owner.store();
+        let Some(entry) = store.get(key).ok().flatten() else {
+            return self.fail("nested park intent missing");
+        };
+        let Ok(mut record) = serde_json::from_slice::<Record>(&entry.value) else {
+            return self.fail("invalid nested park intent");
+        };
+        if record.operation_id != original.operation_id
+            || record.outcome.is_some()
+            || record.child_park.is_some()
+            || record.policy != ReplayPolicy::Safe
+        {
+            return self.fail("nested park intent changed");
+        }
+        let suspension = Uuid::new_v4();
+        let batch = match crate::nested_suspension::prepare_retired(
+            binding.conversation,
+            record.operation_id,
+            suspension,
+            binding.attempt.attempt_id,
+            request.checkpoint,
+            vec![crate::nested_suspension::PendingJob {
+                operation_id: request.operation_id,
+                reference: request.reference,
+            }],
+        ) {
+            Ok(batch) => batch,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        let reference = format!("nested-child-park:{suspension}");
+        record.child_park = Some(ChildPark {
+            suspension,
+            root_attempt: binding.attempt.attempt_id,
+            leaf_key: request.leaf_key.clone(),
+        });
+        record.outcome = Some(Outcome::Pending {
+            reference: reference.clone(),
+        });
+        let value = match serde_json::to_vec(&record) {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        let mut checks = batch.checks;
+        checks.push(Check {
+            key: key.to_vec(),
+            expected: Expected::Version(entry.version),
+        });
+        checks.push(Check {
+            key: request.leaf_key,
+            expected: Expected::Version(request.leaf_version),
+        });
+        let mut mutations = batch.mutations;
+        mutations.push(Mutation::Put {
+            key: key.to_vec(),
+            value,
+        });
+        if let Err(error) = self.commit(&checks, &mutations) {
+            return self.fail(format!("nested child park commit: {error}"));
+        }
+        Outcome::Pending { reference }
     }
 
     /// Finalize staged children before waking their suspended parent.
@@ -1947,11 +2467,17 @@ impl NestedHost {
                                 key: key.to_vec(),
                                 value,
                             });
-                            match self.shared.commit(&checks, &mutations) {
+                            match self.commit(&checks, &mutations) {
                                 Ok(()) => (),
                                 Err(crate::nested_fence::Error::Store(
-                                    durable_store::Error::Conflict { .. },
-                                )) => continue,
+                                    durable_store::Error::Conflict { key: conflict },
+                                )) if self
+                                    .claim
+                                    .as_ref()
+                                    .is_none_or(|claim| claim.key != conflict) =>
+                                {
+                                    continue;
+                                }
                                 Err(error) => {
                                     return Err(self.fail(format!("nested gate commit: {error}")));
                                 }
@@ -2025,7 +2551,7 @@ impl NestedHost {
             Ok(value) => value,
             Err(error) => return Err(self.fail(error.to_string())),
         };
-        if let Err(error) = self.shared.commit(
+        if let Err(error) = self.commit(
             &[Check {
                 key: key.to_vec(),
                 expected: Expected::Version(entry.version),
@@ -2278,7 +2804,7 @@ impl NestedHost {
                 expected: Expected::Version(*version),
             });
         }
-        if let Err(error) = self.shared.commit(
+        if let Err(error) = self.commit(
             &checks,
             &[Mutation::Put {
                 key: key.to_vec(),
@@ -2404,7 +2930,7 @@ impl NestedHost {
                 Ok(value) => value,
                 Err(e) => return self.fail(e.to_string()),
             };
-            if let Err(e) = self.shared.commit(
+            if let Err(e) = self.commit(
                 &[Check {
                     key: key.to_vec(),
                     expected: Expected::Version(version),
@@ -2528,6 +3054,7 @@ mod tests {
             arguments: json!({}),
             prepared: json!({}),
             before_pending: true,
+            child_park: None,
             before_gate: Some(BeforeGate {
                 signals: vec!["gate".into()],
                 until_millis: None,
@@ -2624,6 +3151,7 @@ mod tests {
             arguments: serde_json::json!({}),
             prepared: serde_json::json!({}),
             before_pending: false,
+            child_park: None,
             before_gate: None,
             policy: ReplayPolicy::Unsafe,
             durable_identity: None,
@@ -2906,6 +3434,10 @@ mod tests {
             parent: Uuid::new_v4(),
             depth: 1,
             serial: tokio::sync::Mutex::new(()),
+            child_park_request: Mutex::new(None),
+            child_wake: None,
+            child_replay_safe: false,
+            claim: None,
         };
         assert!(child.resumed_checkpoint().is_none());
         drop(InvocationScope(host.clone()));
@@ -3596,6 +4128,7 @@ mod tests {
             arguments: json!({}),
             prepared: json!({}),
             before_pending: false,
+            child_park: None,
             before_gate: None,
             policy: ReplayPolicy::Unsafe,
             durable_identity: None,
@@ -3682,6 +4215,7 @@ mod tests {
             arguments: json!({}),
             prepared: json!({}),
             before_pending: false,
+            child_park: None,
             before_gate: None,
             policy: ReplayPolicy::Unsafe,
             durable_identity: None,

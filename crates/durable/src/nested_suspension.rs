@@ -1,11 +1,9 @@
-//! Private storage protocol for a possible nested-tool suspension.
+//! Private storage protocol for nested-tool suspension.
 //!
-//! This is not wired to a scheduler or tool executor. A record does not prove
-//! that an executor stopped, own an external job, or authorize dispatch. The
-//! integrator must fence and join the previous executor, and compose every
-//! transition and dependent write with conversation/task/abort ownership
-//! checks under the appropriate gates. Storage conflicts and uncertain commits
-//! require reopening or inspecting before retrying.
+//! A record alone does not prove that an executor stopped, own an external job,
+//! or authorize dispatch. The bounded nested-host integration fences and joins
+//! the previous executor and composes transitions with root attempt and abort
+//! checks. Other integrators must establish equivalent ownership guarantees.
 
 use durable_store::{Check, Expected, Mutation, Store};
 use serde::{Deserialize, Serialize};
@@ -143,7 +141,75 @@ pub(crate) fn prepare_create(
     })
 }
 
+/// Create an already-retired claim after the child invocation and all of its
+/// local descendants have returned. The caller composes root and journal checks.
+pub(crate) fn prepare_retired(
+    conversation: Uuid,
+    operation: Uuid,
+    suspension: Uuid,
+    executor: Uuid,
+    checkpoint: Value,
+    jobs: Vec<PendingJob>,
+) -> Result<crate::task_store::OwnedBatch, Error> {
+    let record = Record {
+        format: FORMAT,
+        conversation,
+        operation,
+        suspension,
+        checkpoint,
+        jobs,
+        abort_requested: false,
+        owner: Owner::Retired { executor },
+    };
+    validate(&record)?;
+    let key = key(conversation, operation);
+    Ok(crate::task_store::OwnedBatch {
+        checks: vec![Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        }],
+        mutations: vec![Mutation::Put {
+            key,
+            value: serde_json::to_vec(&record)?,
+        }],
+    })
+}
+
 impl Snapshot {
+    pub(crate) fn retired_check(&self) -> Result<Check, Error> {
+        if self.record.abort_requested {
+            return Err(Error::Aborted);
+        }
+        if !self.is_retired() {
+            return Err(Error::Stale);
+        }
+        Ok(self.check())
+    }
+    pub(crate) fn advance_reference(
+        &self,
+        operation: Uuid,
+        old: &str,
+        new: String,
+    ) -> Result<crate::task_store::OwnedBatch, Error> {
+        self.retired_check()?;
+        if self.record.jobs.len() != 1
+            || self.record.jobs[0].operation_id != operation
+            || self.record.jobs[0].reference != old
+        {
+            return Err(Error::Invalid);
+        }
+        let mut next = self.record.clone();
+        next.jobs[0].reference = new;
+        self.update(next)
+    }
+    pub(crate) fn is_retired(&self) -> bool {
+        matches!(self.record.owner, Owner::Retired { .. })
+    }
+    pub(crate) fn executor(&self) -> Uuid {
+        match self.record.owner {
+            Owner::Active { executor } | Owner::Retired { executor } => executor,
+        }
+    }
     pub(crate) fn jobs(&self) -> &[PendingJob] {
         &self.record.jobs
     }

@@ -2970,3 +2970,501 @@ async fn killed_after_checkpoint_wake_and_new_gate_retains_wake_on_reopen() {
     }
     scheduler.shutdown().await.unwrap();
 }
+
+struct ParkedIntermediate(Arc<AtomicUsize>);
+struct RotatingChild(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for RotatingChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Pending {
+            reference: "first".into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        Some(match reference {
+            "first" => Outcome::Pending {
+                reference: "second".into(),
+            },
+            "second" => Outcome::Succeeded("a".into()),
+            _ => Outcome::Failed("unexpected reference".into()),
+        })
+    }
+}
+#[async_trait]
+impl KeyedTool for ParkedIntermediate {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let wake = host.pending_wake();
+        let leaf = match host
+            .call_keyed_unpolled_with_id("leaf", "child", json!({"job":"a"}))
+            .await
+        {
+            Ok(leaf) => leaf,
+            Err(error) => return Outcome::Failed(error).into(),
+        };
+        match (wake, leaf.outcome) {
+            (None, Outcome::Pending { .. }) => {
+                if let Err(error) = host
+                    .suspend_pending_with_checkpoint(json!({"leaf":leaf.operation_id,"token":42}))
+                {
+                    return Outcome::Failed(error).into();
+                }
+                Outcome::Succeeded("park".into()).into()
+            }
+            (Some(wake), Outcome::Succeeded(value))
+                if wake.checkpoint == json!({"leaf":leaf.operation_id,"token":42})
+                    && wake.ended == vec![leaf.operation_id] =>
+            {
+                Outcome::Succeeded(format!("middle:{value}")).into()
+            }
+            (wake, result) => {
+                Outcome::Failed(format!("unexpected middle: {wake:?} {result:?}")).into()
+            }
+        }
+    }
+}
+struct ParkedRoot;
+#[async_trait]
+impl KeyedTool for ParkedRoot {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let wake = host.pending_wake();
+        let middle = match host
+            .call_keyed_unpolled_with_id("middle", "middle", json!({}))
+            .await
+        {
+            Ok(call) => call,
+            Err(error) => return Outcome::Failed(error).into(),
+        };
+        match (wake, middle.outcome) {
+            (None, Outcome::Pending { .. }) => {
+                if let Err(error) =
+                    host.suspend_pending_with_checkpoint(json!({"middle":middle.operation_id}))
+                {
+                    return Outcome::Failed(error).into();
+                }
+                Outcome::Succeeded("park".into()).into()
+            }
+            (Some(wake), Outcome::Succeeded(result))
+                if wake.checkpoint == json!({"middle":middle.operation_id}) =>
+            {
+                Outcome::Succeeded(result).into()
+            }
+            (wake, outcome) => {
+                Outcome::Failed(format!("unexpected root: {wake:?} {outcome:?}")).into()
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn keyed_intermediate_parks_one_descendant_and_wakes_with_own_checkpoint() {
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_calls = Arc::new(AtomicUsize::new(0));
+    let middle_calls = Arc::new(AtomicUsize::new(0));
+    let root = Arc::new(KeyedToolAdapter::new(ParkedRoot));
+    let middle = Arc::new(KeyedToolAdapter::new(ParkedIntermediate(
+        middle_calls.clone(),
+    )));
+    let child = Arc::new(AutoChild {
+        invoked: child_calls.clone(),
+        polls: Arc::new(AtomicUsize::new(0)),
+        ready_a: ready.clone(),
+        ready_b: ready.clone(),
+    });
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            root.register(ReplayPolicy::Safe),
+            middle.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: child,
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| {
+        scheduler
+            .conversation(id)
+            .is_ok_and(|c| c.nested_suspended())
+    })
+    .await;
+    assert_eq!(child_calls.load(Ordering::SeqCst), 1);
+    scheduler.submit(id, None, "unrelated one".into()).unwrap();
+    scheduler.submit(id, None, "unrelated two".into()).unwrap();
+    ready.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(child_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "middle:a"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn intermediate_wakes_after_descendant_rotates_pending_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let middle_calls = Arc::new(AtomicUsize::new(0));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(ParkedIntermediate(
+                middle_calls.clone(),
+            )))
+            .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(RotatingChild(calls.clone())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "middle:a"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct ChildParkDiskRoot(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for ChildParkDiskRoot {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let wake = host.pending_wake();
+        let middle = match host
+            .call_keyed_unpolled_with_id("middle", "middle", json!({}))
+            .await
+        {
+            Ok(call) => call,
+            Err(error) => return Outcome::Failed(error).into(),
+        };
+        match (wake, middle.outcome) {
+            (None, Outcome::Pending { .. }) => {
+                if self.0.join("stop-before").exists() {
+                    std::fs::write(self.0.join("before-park"), b"ready").unwrap();
+                    std::future::pending::<()>().await;
+                }
+                if let Err(error) =
+                    host.suspend_pending_with_checkpoint(json!({"middle":middle.operation_id}))
+                {
+                    return Outcome::Failed(error).into();
+                }
+                Outcome::Succeeded("park".into()).into()
+            }
+            (Some(wake), Outcome::Succeeded(result))
+                if wake.checkpoint == json!({"middle":middle.operation_id}) =>
+            {
+                Outcome::Succeeded(result).into()
+            }
+            (wake, outcome) => {
+                Outcome::Failed(format!("unexpected root: {wake:?} {outcome:?}")).into()
+            }
+        }
+    }
+}
+struct ChildParkDiskMiddle(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for ChildParkDiskMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if host.pending_wake().is_some() && self.0.join("stop-wake").exists() {
+            std::fs::write(self.0.join("child-wake"), b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        ParkedIntermediate(Arc::new(AtomicUsize::new(0)))
+            .invoke(args, context, state, host)
+            .await
+    }
+}
+fn child_park_disk_options(root: &std::path::Path) -> Options {
+    let parent = Arc::new(KeyedToolAdapter::new(ChildParkDiskRoot(root.into())));
+    let middle = Arc::new(KeyedToolAdapter::new(ChildParkDiskMiddle(root.into())));
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            middle.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(FileChild(root.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn child_park_crash_worker() {
+    let Some(root) = std::env::var_os("PI_CHILD_PARK_CRASH") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mut scheduler = Scheduler::open(root.join("db"), child_park_disk_options(&root)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn child_park_recovers_before_after_and_during_wake() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for stage in ["before", "parked", "wake"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if stage == "before" {
+            std::fs::write(root.join("stop-before"), b"yes").unwrap();
+        }
+        if stage == "wake" {
+            std::fs::write(root.join("stop-wake"), b"yes").unwrap();
+            std::fs::write(root.join("finish"), b"yes").unwrap();
+        }
+        let mut process = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child_park_crash_worker"])
+                .env("PI_CHILD_PARK_CRASH", root)
+                .spawn()
+                .unwrap(),
+        );
+        let marker = match stage {
+            "before" => "before-park",
+            "parked" => "poll-entered",
+            _ => "child-wake",
+        };
+        until(|| root.join(marker).exists()).await;
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        let id = std::fs::read_to_string(root.join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(root.join("stop-before"));
+        let _ = std::fs::remove_file(root.join("stop-wake"));
+        std::fs::write(root.join("finish"), b"yes").unwrap();
+        let mut scheduler =
+            Scheduler::open(root.join("db"), child_park_disk_options(root)).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            scheduler
+                .conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool {content,..} if content == "middle:after-kill")),
+            "stage={stage}, state={:?}",
+            scheduler.conversation(id).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("dispatches"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "{stage}"
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn abort_while_intermediate_parked_prevents_child_wake_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut scheduler = Scheduler::open(root.join("db"), child_park_disk_options(root)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| root.join("poll-entered").exists()).await;
+    scheduler.abort(id).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+    std::fs::write(root.join("finish"), b"yes").unwrap();
+    let mut reopened = Scheduler::open(root.join("db"), child_park_disk_options(root)).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), reopened.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reopened.conversation(id).unwrap().abort_requested);
+    assert!(!root.join("child-wake").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn intermediate_park_rejects_unsafe_root_or_intermediate() {
+    use std::sync::atomic::AtomicBool;
+    for root_unsafe in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let root = Arc::new(KeyedToolAdapter::new(ParkedRoot));
+        let middle = Arc::new(KeyedToolAdapter::new(ParkedIntermediate(Arc::new(
+            AtomicUsize::new(0),
+        ))));
+        let child = Arc::new(AutoChild {
+            invoked: Arc::new(AtomicUsize::new(0)),
+            polls: Arc::new(AtomicUsize::new(0)),
+            ready_a: ready.clone(),
+            ready_b: ready,
+        });
+        let options = Options {
+            model: Arc::new(ModelStub),
+            tools: vec![
+                root.register(if root_unsafe {
+                    ReplayPolicy::Unsafe
+                } else {
+                    ReplayPolicy::Safe
+                }),
+                middle.register(if root_unsafe {
+                    ReplayPolicy::Safe
+                } else {
+                    ReplayPolicy::Unsafe
+                }),
+                RegisteredTool {
+                    tool: child,
+                    replay: ReplayPolicy::Unsafe,
+                },
+            ],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let path = dir.path().join("db");
+        let mut scheduler = Scheduler::open(&path, options).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            durable_store::Store::open(&path)
+                .unwrap()
+                .list(b"durable/nested-suspension/")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!scheduler.conversation(id).unwrap().nested_suspended());
+        scheduler.shutdown().await.unwrap();
+    }
+}

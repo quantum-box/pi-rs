@@ -201,14 +201,20 @@ impl KeyedHost {
     /// Park the root until all accepted pending nested jobs settle, recording a
     /// checkpoint in the same conversation transition. Unsafe registrations
     /// require `KeyedTool::unsafe_park_version` and its replay contract. The
-    /// invocation must return normally without state or controls.
+    /// invocation must return normally without state or controls. A replay-safe,
+    /// keyed direct child of a replay-safe root may also park one keyed pending
+    /// descendant this way, provided hooks are absent. The root must itself
+    /// park with a checkpoint and re-enter that child on wake. This is not an
+    /// independently scheduled child or general nested parking.
     pub fn suspend_pending_with_checkpoint(&self, checkpoint: Value) -> Result<(), String> {
         self.nested
             .suspend_pending_with_checkpoint(Some(checkpoint))
     }
 
     /// Checkpoint and ended nested operation IDs from the preceding park.
-    /// This is an all-pending wake, not an upstream task `any` wake.
+    /// This is an all-pending wake, not an upstream task `any` wake. When a
+    /// direct child forwards its park, the root sees the descendant operation
+    /// ID; the child receives its own checkpoint when re-entered.
     pub fn pending_wake(&self) -> Option<crate::nested::PendingWake> {
         self.nested.resumed_checkpoint()
     }

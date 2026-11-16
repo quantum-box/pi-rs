@@ -577,4 +577,66 @@ mod tests {
                 .is_empty()
         );
     }
+    #[test]
+    fn retired_intermediate_claim_fences_a_stale_effect_with_live_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (_h, id, binding) = fixture(&path);
+        let store = Store::open(&path).unwrap();
+        let child = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let batch = crate::nested_suspension::prepare_retired(
+            id,
+            child,
+            Uuid::new_v4(),
+            old,
+            json!({"saved": 1}),
+            vec![crate::nested_suspension::PendingJob {
+                operation_id: Uuid::new_v4(),
+                reference: "opaque".into(),
+            }],
+        )
+        .unwrap();
+        binding
+            .commit(&store, &batch.checks, &batch.mutations)
+            .unwrap();
+        let retired = crate::nested_suspension::load(&store, id, child)
+            .unwrap()
+            .unwrap();
+        let executor = Uuid::new_v4();
+        let batch = retired.claim(executor).unwrap();
+        binding
+            .commit(&store, &batch.checks, &batch.mutations)
+            .unwrap();
+        let active = crate::nested_suspension::load(&store, id, child)
+            .unwrap()
+            .unwrap();
+        let claim = active.claim_check(executor).unwrap();
+        let task_path = path.clone();
+        BEFORE_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let store = Store::open(task_path).unwrap();
+                let batch = crate::nested_suspension::load(&store, id, child)
+                    .unwrap()
+                    .unwrap()
+                    .retire(executor)
+                    .unwrap();
+                store.commit(&batch.checks, &batch.mutations).unwrap();
+            }))
+        });
+        let effect = b"test/stale-child".to_vec();
+        let result = binding.commit(
+            &store,
+            &[claim],
+            &[Mutation::Put {
+                key: effect.clone(),
+                value: vec![1],
+            }],
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert!(store.get(&effect).unwrap().is_none());
+    }
 }

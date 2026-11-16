@@ -1857,6 +1857,16 @@ impl Conversation {
             .filter(|resume| resume.operation_id == attempt.operation_id)
             .map(|_| attempt)
     }
+    pub(crate) fn active_tool_is_replay_safe(&self) -> bool {
+        self.active_tool_attempt().is_some()
+            && matches!(
+                self.phase,
+                Phase::ToolRunning {
+                    replay: ReplayPolicy::Safe,
+                    ..
+                }
+            )
+    }
     pub(crate) fn active_tool_attempt(&self) -> Option<ToolAttempt> {
         if self.abort_requested
             || !matches!(
