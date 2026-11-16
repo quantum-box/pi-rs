@@ -6274,6 +6274,14 @@ async fn abort_cleanup_conflict_with_withdrawal_keeps_other_retained_input_parke
         .unwrap();
     let c = h.conversation(id).unwrap();
     assert!(matches!(c.phase, Phase::FailedIdle));
+    assert!(
+        c.is_working(),
+        "owned failure must still cascade to queued work"
+    );
+    assert!(
+        !c.is_idle_wait_busy(),
+        "parked input does not prevent an idle wait"
+    );
     assert_eq!(
         c.submissions
             .iter()
