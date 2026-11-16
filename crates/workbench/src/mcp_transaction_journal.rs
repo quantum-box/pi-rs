@@ -1277,6 +1277,27 @@ mod tests {
         }
     }
     #[test]
+    fn admission_reopened_after_failed_journal_sync_detects_visible_record() {
+        for advance in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = Journal::new(dir.path(), test_auth()).unwrap();
+            let record = advance.then(|| journal.begin(target()).unwrap());
+            journal.fail_sync.set(true);
+            if let Some(record) = record {
+                assert!(
+                    journal
+                        .advance(record.identity(), record, Stage::ConfigInProgress)
+                        .is_err()
+                );
+            } else {
+                assert!(journal.begin(target()).is_err());
+            }
+            assert!(journal.needs_reconciliation().is_err());
+            let reopened = Journal::new(dir.path(), test_auth()).unwrap();
+            assert!(reopened.needs_reconciliation().unwrap());
+        }
+    }
+    #[test]
     fn reject_symlink_journal_and_stale_stage() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
