@@ -2546,6 +2546,7 @@ fn task_input_on_reset_fork_fences_original_proof() {
             conversation: fork,
             version: record.version,
             ancestry_checks: Vec::new(),
+            cross_conversation: false,
             snapshot: record.value,
             admissions: vec![crate::document::TaskAdmission {
                 request_id: Some("task-request".into()),
