@@ -633,6 +633,9 @@ pub(crate) fn target_foreground_admission_checks(
                     return Err(Error::Invalid);
                 }
                 let stored = TaskStore::new(store).load(id)?.ok_or(Error::Invalid)?;
+                // A successful terminal task remains an ownership anchor even
+                // above another task. Keep walking and fence its version; failed
+                // or aborting ancestors still block the foreground target.
                 if expected_owner
                     .take()
                     .is_some_and(|owner| owner != *stored.task.owner())
@@ -643,7 +646,6 @@ pub(crate) fn target_foreground_admission_checks(
                             | TaskState::Failed(_)
                             | TaskState::Cancelled
                     )
-                    || (stored.task.is_terminal() && child_task.is_some())
                 {
                     return Err(Error::Invalid);
                 }

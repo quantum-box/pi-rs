@@ -4808,3 +4808,252 @@ fn cross_session_unkeyed_batch_limit_retains_first_sixteen() {
     );
     driver.shutdown().unwrap();
 }
+
+fn cross_two_succeeded_owners(
+    store: &Store,
+    owner: Uuid,
+    target: Uuid,
+    mode: pi_rs_durable::ownership_edge::Mode,
+) -> (Uuid, Uuid) {
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore},
+        task_store::Save,
+    };
+    let root = task(owner, "completed-root");
+    let middle = descendant(root.id(), "completed-middle");
+    let tasks = TaskStore::new(store);
+    tasks
+        .save(&[Save::Create(&root), Save::Create(&middle)])
+        .unwrap();
+    let edge = EdgeStore::new(store)
+        .prepare_create(&Edge {
+            task: middle.id(),
+            task_owner: TaskOwner::Task(root.id()),
+            child: target,
+            mode,
+        })
+        .unwrap();
+    store.commit(&edge.checks, &edge.mutations).unwrap();
+    for id in [middle.id(), root.id()] {
+        let snapshot = tasks.load(id).unwrap().unwrap();
+        tasks
+            .update(&snapshot, |task| {
+                task.start()?;
+                task.succeed(json!("completed"))
+            })
+            .unwrap();
+    }
+    (root.id(), middle.id())
+}
+
+#[tokio::test]
+async fn cross_session_multilevel_successful_target_owners_survive_reopen() {
+    for operation in ["input", "continue", "write"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, owner, target, session) = cross_setup(&path);
+        let store = Store::open(&path).unwrap();
+        let (root, middle) = cross_two_succeeded_owners(
+            &store,
+            owner,
+            target,
+            pi_rs_durable::ownership_edge::Mode::Foreground,
+        );
+        for id in [root, middle] {
+            assert!(matches!(
+                TaskStore::new(&store)
+                    .load(id)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                TaskState::Succeeded(_)
+            ));
+        }
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        pi_rs_durable::session_membership::SessionMembership::new(&store)
+            .authorize_pair(session, owner, target)
+            .unwrap()
+            .commit(&[], &[])
+            .unwrap();
+        let mut registry = Registry::default();
+        if operation == "input" {
+            registry.register("cross", true, cross_handler(target));
+        } else {
+            registry.register("action", true, cross_action(target, operation == "write"));
+        }
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(
+            owner,
+            if operation == "input" {
+                "cross"
+            } else {
+                "action"
+            },
+        );
+        driver.submit(&child).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = TaskStore::new(&store)
+                .load(child.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state()
+                .clone();
+            if matches!(state, TaskState::Waiting(_) | TaskState::Succeeded(_)) {
+                break;
+            }
+            assert!(
+                !matches!(state, TaskState::Failed(_) | TaskState::Cancelled),
+                "{operation} rejected: {state:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{operation} did not settle: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if operation != "write" {
+            h.resume_conversation(target, &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        wait_task(&path, child.id(), |state| {
+            matches!(state, TaskState::Succeeded(_))
+        });
+        let result = h.conversation(target).unwrap();
+        if operation == "write" {
+            assert_eq!(result.application_writes.len(), 1);
+            assert!(result.application_writes[0].placed);
+        } else {
+            assert_eq!(result.submissions.len(), 1);
+            assert!(matches!(
+                result.submissions[0].status,
+                Status::Done { .. } | Status::Unanswered { .. }
+            ));
+        }
+        let key = if operation == "input" {
+            "cross-settled"
+        } else {
+            "action-settled"
+        };
+        let receipt = TaskStore::new(&store)
+            .read_typed_signal(child.id(), &submission_settled_signal(), key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt["conversationId"], target.to_string());
+        assert_eq!(receipt["type"], operation);
+        driver.shutdown().unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        pi_rs_durable::session_membership::SessionMembership::new(&store)
+            .authorize_pair(session, owner, target)
+            .unwrap()
+            .commit(&[], &[])
+            .unwrap();
+        assert_eq!(
+            h.conversation(target).unwrap().application_writes.len(),
+            usize::from(operation == "write")
+        );
+        assert_eq!(
+            h.conversation(target).unwrap().submissions.len(),
+            usize::from(operation != "write")
+        );
+    }
+}
+
+fn cross_rewrite_owner_state(store: &Store, id: Uuid, state: serde_json::Value, abort: bool) {
+    let (key, entry) = store
+        .list(b"durable/task/")
+        .unwrap()
+        .into_iter()
+        .find(|(_, entry)| {
+            serde_json::from_slice::<Task>(&entry.value).is_ok_and(|task| task.id() == id)
+        })
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+    value["state"] = state;
+    value["abort_requested"] = abort.into();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+}
+
+#[test]
+fn cross_session_multilevel_failed_cancelled_and_aborting_ancestors_block() {
+    for index in [0, 1] {
+        for mode in ["failed", "cancelled", "completing", "abort"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (h, owner, target, _) = cross_setup(&path);
+            let store = Store::open(&path).unwrap();
+            let (root, middle) = cross_two_succeeded_owners(
+                &store,
+                owner,
+                target,
+                pi_rs_durable::ownership_edge::Mode::Foreground,
+            );
+            let ancestor = if index == 0 { root } else { middle };
+            let state = match mode {
+                "failed" => json!({"Failed":"failed"}),
+                "cancelled" => json!("Cancelled"),
+                "completing" => json!({"CompletingFailed":"pending"}),
+                "abort" => json!({"Succeeded":null}),
+                _ => unreachable!(),
+            };
+            cross_rewrite_owner_state(&store, ancestor, state, mode == "abort");
+            let mut registry = Registry::default();
+            registry.register("cross", true, cross_handler(target));
+            let driver = h.start_tasks(registry).unwrap();
+            let child = task(owner, "cross");
+            driver.submit(&child).unwrap();
+            wait_task(&path, child.id(), |state| {
+                matches!(state, TaskState::Failed(_) | TaskState::Cancelled)
+            });
+            assert!(
+                h.conversation(target).unwrap().submissions.is_empty(),
+                "{index} {mode}"
+            );
+            assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+            driver.shutdown().unwrap();
+        }
+    }
+}
+
+#[test]
+fn cross_session_multilevel_background_boundary_ignores_failed_outer_owner_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let store = Store::open(&path).unwrap();
+    let (root, _) = cross_two_succeeded_owners(
+        &store,
+        owner,
+        target,
+        pi_rs_durable::ownership_edge::Mode::Background,
+    );
+    cross_rewrite_owner_state(&store, root, json!({"Failed":"outside boundary"}), false);
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |state| {
+        matches!(state, TaskState::Waiting(_))
+    });
+    assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+    driver.shutdown().unwrap();
+}
