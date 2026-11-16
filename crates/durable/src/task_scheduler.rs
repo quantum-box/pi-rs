@@ -1288,6 +1288,8 @@ pub struct Scheduler {
     validator: Option<crate::runtime::Harness>,
     cleanup_jobs: tokio::task::JoinSet<(Uuid, Result<bool, crate::runtime::Error>)>,
     cleanup_running: HashSet<Uuid>,
+    cleanup_cursor: Option<Uuid>,
+    cleanup_timeout: std::time::Duration,
     cleanup_failures: HashMap<Uuid, String>,
     poisoned: Arc<std::sync::atomic::AtomicBool>,
     reservations_stopped: bool,
@@ -2649,6 +2651,8 @@ impl Scheduler {
             validator: None,
             cleanup_jobs: tokio::task::JoinSet::new(),
             cleanup_running: HashSet::new(),
+            cleanup_cursor: None,
+            cleanup_timeout: std::time::Duration::from_secs(30),
             cleanup_failures: HashMap::new(),
             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reservations_stopped: false,
@@ -3268,21 +3272,45 @@ impl Scheduler {
             .unwrap()
             .owned_abort_candidates()
             .map_err(|error| Error::Handler(format!("conversation cleanup discovery: {error}")))?;
-        for id in candidates {
+        let start = self
+            .cleanup_cursor
+            .and_then(|cursor| candidates.iter().position(|id| *id > cursor))
+            .unwrap_or(0);
+        for id in candidates
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(candidates.len())
+            .copied()
+        {
             if self.cleanup_running.len() >= MAX_CLEANUPS {
                 break;
             }
             if self.cleanup_running.contains(&id) || self.cleanup_failures.contains_key(&id) {
                 continue;
             }
+            let control = self.owner().conversation_controls().get(id);
+            let Ok(lock) = control.worker.try_lock_owned() else {
+                continue;
+            };
             let worker = self.validator.as_ref().unwrap().worker();
+            let timeout = self.cleanup_timeout;
             // Keep the scheduler attachment until a cancelled worker has actually stopped.
             let attachment = self.attachment.clone();
             let cancel = cancel.clone();
             self.cleanup_running.insert(id);
+            self.cleanup_cursor = Some(id);
             self.cleanup_jobs.spawn(async move {
                 let _attachment = attachment;
-                (id, worker.settle_owned_abort(id, &cancel).await)
+                let result =
+                    tokio::time::timeout(timeout, worker.settle_owned_abort(id, &cancel, lock))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(crate::runtime::Error::Invalid(
+                                "cleanup timed out; reconcile before reopening".into(),
+                            ))
+                        });
+                (id, result)
             });
             progress = true;
         }
@@ -15428,6 +15456,340 @@ mod standalone_foreground_cleanup_tests {
                     &TaskState::Cancelled
                 );
             }
+        }
+    }
+    #[tokio::test]
+    async fn busy_owned_locks_and_unmarked_invalid_transcript_do_not_starve_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = harness.create_conversation(cfg.clone()).unwrap();
+        let mut children: Vec<_> = (0..10)
+            .map(|_| harness.create_conversation(cfg.clone()).unwrap())
+            .collect();
+        children.sort();
+        let db = Store::open(&path).unwrap();
+        for (i, child) in children.iter().copied().enumerate() {
+            let parent = task((i + 1) as u128, TaskOwner::Conversation(owner), "parent");
+            TaskStore::new(&db).save(&[Save::Create(&parent)]).unwrap();
+            let edge = Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            };
+            let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            let tasks = TaskStore::new(&db);
+            let record = tasks.load(parent.id()).unwrap().unwrap();
+            tasks
+                .update(&record, |task| {
+                    task.start()?;
+                    task.succeed(json!(null))
+                })
+                .unwrap();
+            if i < 9 {
+                harness.request_abort(child).unwrap();
+            }
+        }
+        drop(harness);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        let bad = children[9];
+        let key = format!("runtime/conversation/{bad}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        value["transcript"] = json!("invalid transcript");
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(
+            scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(bad)
+                .is_err()
+        );
+        let mut locks = Vec::new();
+        for child in &children[..8] {
+            locks.push(
+                scheduler
+                    .owner()
+                    .conversation_controls()
+                    .get(*child)
+                    .worker
+                    .lock_owned()
+                    .await,
+            );
+        }
+        for _ in 0..30 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(children[8])
+                .unwrap()
+                .abort_requested
+            {
+                break;
+            }
+        }
+        assert!(
+            !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(children[8])
+                .unwrap()
+                .abort_requested
+        );
+        for child in &children[..8] {
+            assert!(
+                scheduler
+                    .validator
+                    .as_ref()
+                    .unwrap()
+                    .conversation(*child)
+                    .unwrap()
+                    .abort_requested
+            );
+        }
+        drop(locks);
+        // Repair and mark the last conversation. The first eight now return
+        // immediately without progress; rotating candidates must still reach it.
+        let current = db
+            .get(format!("runtime/conversation/{bad}").as_bytes())
+            .unwrap()
+            .unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: format!("runtime/conversation/{bad}").into_bytes(),
+                expected: Expected::Version(current.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: format!("runtime/conversation/{bad}").into_bytes(),
+                value: entry.value,
+            }],
+        )
+        .unwrap();
+        scheduler
+            .validator
+            .as_mut()
+            .unwrap()
+            .request_abort(bad)
+            .unwrap();
+        for child in &children[..8] {
+            let key = format!("runtime/conversation/{child}").into_bytes();
+            let record = db.get(&key).unwrap().unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&record.value).unwrap();
+            value["phase"] = json!({"Blocked": {"turns":0, "calls":[], "index":0, "operation_id":Uuid::new_v4(), "reason":"uncertain"}});
+            db.commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: Expected::Version(record.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
+            )
+            .unwrap();
+        }
+        for _ in 0..40 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(bad)
+                .unwrap()
+                .abort_requested
+            {
+                break;
+            }
+        }
+        assert!(
+            !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(bad)
+                .unwrap()
+                .abort_requested
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_cleanup_slots_release_for_an_unrelated_graph() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Stalled(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for Stalled {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                panic!("model must not run")
+            }
+            async fn record_usage(
+                &self,
+                _: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = harness.create_conversation(cfg.clone()).unwrap();
+        let mut children: Vec<_> = (0..9)
+            .map(|_| harness.create_conversation(cfg.clone()).unwrap())
+            .collect();
+        children.sort();
+        let db = Store::open(&path).unwrap();
+        for (i, child) in children.iter().copied().enumerate() {
+            let parent = task((i + 1) as u128, TaskOwner::Conversation(owner), "parent");
+            TaskStore::new(&db).save(&[Save::Create(&parent)]).unwrap();
+            let edge = Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            };
+            let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            let tasks = TaskStore::new(&db);
+            let record = tasks.load(parent.id()).unwrap().unwrap();
+            tasks
+                .update(&record, |task| {
+                    task.start()?;
+                    task.succeed(json!(null))
+                })
+                .unwrap();
+            harness.request_abort(child).unwrap();
+        }
+        drop(harness);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut opts = options();
+        opts.model = Arc::new(Stalled(entered.clone()));
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), opts).unwrap();
+        scheduler.cleanup_timeout = std::time::Duration::from_millis(250);
+        for child in &children[..8] {
+            let key = format!("runtime/conversation/{child}").into_bytes();
+            let entry = db.get(&key).unwrap().unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+            value["phase"] =
+                json!({"ModelRunning": {"turns":0, "request_id":Uuid::new_v4(), "restarts":0}});
+            db.commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
+            )
+            .unwrap();
+        }
+        scheduler
+            .tick_with_conversation_cleanup(0, &CancellationToken::new())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                scheduler
+                    .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                if !scheduler
+                    .validator
+                    .as_ref()
+                    .unwrap()
+                    .conversation(children[8])
+                    .unwrap()
+                    .abort_requested
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("saturated cleanups starved the ninth graph");
+        assert_eq!(entered.load(Ordering::SeqCst), 8);
+        for child in &children[..8] {
+            assert!(
+                scheduler
+                    .conversation_cleanup_failures()
+                    .contains_key(child)
+            );
+            assert!(
+                scheduler
+                    .validator
+                    .as_ref()
+                    .unwrap()
+                    .conversation(*child)
+                    .unwrap()
+                    .abort_requested
+            );
+        }
+        drop(scheduler);
+        let mut reopened =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        for _ in 0..50 {
+            reopened
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if children[..8].iter().all(|id| {
+                !reopened
+                    .validator
+                    .as_ref()
+                    .unwrap()
+                    .conversation(*id)
+                    .unwrap()
+                    .abort_requested
+            }) {
+                break;
+            }
+        }
+        for id in &children[..8] {
+            assert!(
+                !reopened
+                    .validator
+                    .as_ref()
+                    .unwrap()
+                    .conversation(*id)
+                    .unwrap()
+                    .abort_requested
+            );
         }
     }
 }

@@ -13026,7 +13026,20 @@ impl Harness {
                 if edge.edge.task_owner != *anchor.task.owner() {
                     return Err(Error::Invalid("ownership edge owner mismatch".into()));
                 }
-                if self.load(edge.edge.child)?.0.abort_requested {
+                let key = format!("runtime/conversation/{}", edge.edge.child);
+                let entry = self
+                    .owner
+                    .store()
+                    .get(key.as_bytes())?
+                    .ok_or(Error::NotFound)?;
+                let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+                let marked = match value.get("abort_requested") {
+                    None => false,
+                    Some(value) => value
+                        .as_bool()
+                        .ok_or_else(|| Error::Invalid("invalid abort mark".into()))?,
+                };
+                if marked {
                     candidates.insert(edge.edge.child);
                 }
             }
@@ -13040,14 +13053,12 @@ impl Harness {
         &self,
         id: Uuid,
         cancel: &CancellationToken,
+        _worker: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<bool, Error> {
         if cancel.is_cancelled() {
             return Err(Error::Interrupted);
         }
         let control = self.owner.conversation_controls().get(id);
-        let Ok(_worker) = control.worker.try_lock() else {
-            return Ok(false);
-        };
         let mut worker = self.worker();
         worker.execution_gate = Some(control.gate.clone());
         let (conversation, version) = worker.load(id)?;

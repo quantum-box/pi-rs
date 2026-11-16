@@ -37,20 +37,24 @@ runtime options. It shares one exclusive store owner with its attached harness.
 `tick_with_conversation_cleanup` drives one task step and schedules up to eight
 independent marked task-owned conversation cleanups without executing retained
 queued input. A child marked independently is discovered even if its owner is
-completing successfully. Busy workers are retried. Callback errors are exposed
-by `conversation_cleanup_failures`; that conversation remains marked and is
-retried after reopening, while other graphs continue. Storage failures, cancelled
-or dropped cleanup ticks poison the scheduler and require reopening. Dropping the
-scheduler cancels its cleanup jobs; their attachments remain held until the jobs
-actually stop. Eight indefinitely blocked callbacks can occupy all cleanup slots,
-so the bound does not guarantee progress under arbitrary callback saturation.
+completing successfully. Busy workers consume no slot; candidates rotate so
+repeatedly blocked conversations cannot monopolize admission. Each cleanup step
+has a 30-second timeout. Callback failures and timeouts are exposed by
+`conversation_cleanup_failures`, and the affected conversation stays marked while
+other graphs continue. A timed-out callback may have made an external effect;
+reconcile it before reopening and retrying. Storage failures, worker panics,
+cancelled or dropped cleanup ticks poison the scheduler and require reopening.
+Dropping the scheduler cancels its cleanup jobs; their attachments remain held
+until the jobs actually stop. Timeouts require callbacks to yield to the async
+runtime; synchronous blocking or detached external effects cannot be preempted.
 A reset retained in a failed-idle conversation remains queued for a later boundary
 and does not hold its failed task owner open. Hosts needing
 additional provider or extension configuration can configure a `Harness` and use
 `Harness::attach_tasks` instead; the scheduler retains a shared harness worker.
 A `task_driver::Driver`
 started from that scheduler runs its cleanup coordinator automatically. The
-driver's coordinator still stops the driver on any cleanup failure; per-conversation
+driver's coordinator still stops the driver on any cleanup failure and does not
+apply the manual coordinator's timeout or eight-worker bound; per-conversation
 failure isolation described above applies to manual ticks. Plain `Scheduler::open`
 has no conversation runtime and still rejects foreground aborts.
 
