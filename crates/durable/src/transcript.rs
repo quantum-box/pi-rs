@@ -22,6 +22,30 @@ use std::num::NonZeroUsize;
 use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/transcript/";
+const DISPLAY_FORK_RECORD_LIMIT: usize = 8 * 1024 * 1024;
+
+thread_local! {
+    static BOUNDED_FORK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    pub(crate) static TEST_UNBOUNDED_ENTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    pub(crate) static TEST_ENTRY_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restrict transcript entry reads for the entire synchronous display fork,
+/// including nested hydration and reset proof reconstruction.
+pub(crate) struct BoundedForkReads;
+impl BoundedForkReads {
+    pub(crate) fn enter() -> Self {
+        BOUNDED_FORK_READS.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+impl Drop for BoundedForkReads {
+    fn drop(&mut self) {
+        BOUNDED_FORK_READS.with(|depth| depth.set(depth.get() - 1));
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -144,7 +168,7 @@ impl<'a> Transcript<'a> {
         let key = entry_key(link.id);
         let stored = self
             .store
-            .get_bounded(&key, 8 * 1024 * 1024)?
+            .get_bounded(&key, DISPLAY_FORK_RECORD_LIMIT)?
             .ok_or(Error::Corrupt)?;
         decode_entry(link, &stored.value)?;
         Ok((key, stored.version))
@@ -160,7 +184,10 @@ impl<'a> Transcript<'a> {
         let mut checks = Vec::new();
         while let Some(link) = next {
             let key = entry_key(link.id);
-            let stored = self.store.get(&key)?.ok_or(Error::Corrupt)?;
+            let stored = self
+                .store
+                .get_bounded(&key, DISPLAY_FORK_RECORD_LIMIT)?
+                .ok_or(Error::Corrupt)?;
             let entry = decode_entry(link, &stored.value)?;
             checks.push(Check {
                 key,
@@ -380,8 +407,7 @@ impl<'a> Transcript<'a> {
             }
             let link = position.next.ok_or(Error::Corrupt)?;
             let key = entry_key(link.id);
-            let stored = self.store.get(&key)?.ok_or(Error::Corrupt)?;
-            let entry = decode_entry(link, &stored.value)?;
+            let (entry, stored) = self.load_entry_with_version(link)?;
             if entry.previous != previous
                 || self.store.commit_for_version(&key, stored.version)? != Some(commit)
             {
@@ -644,8 +670,25 @@ impl<'a> Transcript<'a> {
         Ok((head, stored.version))
     }
     fn load_entry(&self, link: Link) -> Result<Entry, Error> {
-        let stored = self.store.get(&entry_key(link.id))?.ok_or(Error::Corrupt)?;
-        decode_entry(link, &stored.value)
+        self.load_entry_with_version(link).map(|(entry, _)| entry)
+    }
+    fn load_entry_with_version(&self, link: Link) -> Result<(Entry, durable_store::Entry), Error> {
+        let key = entry_key(link.id);
+        let bounded = BOUNDED_FORK_READS.with(|depth| depth.get() != 0);
+        #[cfg(test)]
+        if !bounded {
+            TEST_UNBOUNDED_ENTRY_READS.with(|count| count.set(count.get() + 1));
+        }
+        let stored = if bounded {
+            self.store.get_bounded(&key, DISPLAY_FORK_RECORD_LIMIT)?
+        } else {
+            self.store.get(&key)?
+        }
+        .ok_or(Error::Corrupt)?;
+        #[cfg(test)]
+        TEST_ENTRY_DECODES.with(|count| count.set(count.get() + 1));
+        let entry = decode_entry(link, &stored.value)?;
+        Ok((entry, stored))
     }
 }
 

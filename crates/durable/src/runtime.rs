@@ -8295,6 +8295,7 @@ impl Harness {
     /// sole visible change in its tracked runtime commit. Inherited and
     /// ambiguous cuts are rejected until their placement can be authenticated.
     pub fn fork_by_display_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        let _bounded_reads = crate::transcript::BoundedForkReads::enter();
         let _proof_scope = ResetProofScope::enter();
         let (_, root_version) = self.load(id)?;
         let store = self.owner.store();

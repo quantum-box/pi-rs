@@ -277,6 +277,87 @@ fn display_entry_fork_fences_source_transcript_rewrite() {
 }
 
 #[test]
+fn display_entry_fork_bounds_transcript_before_hydration_and_proof() {
+    for ancestor in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let root = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        for text in ["earlier", "latest"] {
+            let (mut state, version) = h.load(root).unwrap();
+            state.messages.push(Message::User {
+                content: text.into(),
+            });
+            h.save(&state, Expected::Version(version)).unwrap();
+        }
+        let display = h.submit_write(root, None, "app.note".into(), None).unwrap();
+        let source = h.load(root).unwrap().0.transcript.unwrap();
+        let transcript = crate::transcript::Transcript::new(h.owner.store(), root);
+        let position = if ancestor {
+            transcript
+                .read_with_blocks(&source, std::num::NonZeroUsize::MIN)
+                .unwrap()
+                .next
+        } else {
+            source.clone()
+        };
+        let (key, _) = transcript.entry_evidence(&position).unwrap();
+        let stored = h.owner.store().get(&key).unwrap().unwrap();
+        let mut oversized = stored.value;
+        // Trailing whitespace preserves valid JSON while exceeding the read cap.
+        oversized.resize(8 * 1024 * 1024 + 1, b' ');
+        h.owner
+            .store()
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(stored.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: oversized,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            transcript.fork_source_checks(&source),
+            Err(crate::transcript::Error::Store(
+                durable_store::Error::DocumentFrameTooLarge
+            ))
+        ));
+        crate::transcript::TEST_UNBOUNDED_ENTRY_READS.with(|count| count.set(0));
+        crate::transcript::TEST_ENTRY_DECODES.with(|count| count.set(0));
+        assert!(matches!(
+            h.fork_by_display_entry_id(root, display),
+            Err(Error::Transcript(crate::transcript::Error::Store(
+                durable_store::Error::DocumentFrameTooLarge
+            )))
+        ));
+        assert_eq!(
+            crate::transcript::TEST_UNBOUNDED_ENTRY_READS.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(
+            crate::transcript::TEST_ENTRY_DECODES.with(std::cell::Cell::get),
+            usize::from(ancestor)
+        );
+        // The scoped limit does not change ordinary transcript reads.
+        crate::transcript::Transcript::new(h.owner.store(), root)
+            .read_with_blocks(&position, std::num::NonZeroUsize::MIN)
+            .unwrap();
+        assert_eq!(
+            crate::transcript::TEST_UNBOUNDED_ENTRY_READS.with(std::cell::Cell::get),
+            1
+        );
+    }
+}
+
+#[test]
 fn display_entry_fork_rejects_unplaced_reset_writes() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
