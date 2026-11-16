@@ -2457,6 +2457,12 @@ pub(crate) struct PreparedConversationSave {
     pub(crate) mutations: Vec<Mutation>,
 }
 
+struct AtomicResetPlan<'a> {
+    steps: &'a [ResetDerivationStep],
+    cuts: &'a [Conversation],
+    failure_base: Option<&'a Conversation>,
+}
+
 impl PreparedConversationSave {
     /// Reject overlapping keys: store checks observe the pre-commit state, so
     /// independently prepared writes to the same key cannot safely be combined.
@@ -3999,7 +4005,71 @@ impl Harness {
             &[],
             &[],
             None,
-            Some((steps, &cuts)),
+            Some(AtomicResetPlan {
+                steps,
+                cuts: &cuts,
+                failure_base: None,
+            }),
+        )
+    }
+
+    /// Test-only: stage a real post-failure candidate, ordered reset cuts and
+    /// the next admitted input in a single save. Reader authorization is separate.
+    #[cfg(test)]
+    fn prepare_atomic_failure_reset_save(
+        &self,
+        failure: &Conversation,
+        version: u64,
+        steps: &[ResetDerivationStep],
+    ) -> Result<PreparedConversationSave, Error> {
+        // Authenticate the actual predecessor before deriving from the caller's
+        // post-failure candidate. This entry point is not a production boundary.
+        self.derive_anchored_reset_states(failure.id, version, steps)?;
+        if !matches!(failure.phase, Phase::FailedIdle)
+            || failure.abort_requested
+            || failure.after_failed_run != AfterFailedRun::Continue
+        {
+            return Err(Error::Invalid("expected a continuing failed run".into()));
+        }
+        let mut base = failure.clone();
+        apply_failed_run_policy(&mut base);
+        let cuts = derive_ordered_reset_states(&base, steps)?;
+        let mut final_state = cuts
+            .last()
+            .ok_or_else(|| Error::Invalid("empty reset batch".into()))?
+            .clone();
+        if !final_state.pending_resets.is_empty()
+            || final_state.pending_independent_summary.is_some()
+            || final_state
+                .application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn)
+        {
+            return Err(Error::Invalid(
+                "pending work prevents atomic continuation".into(),
+            ));
+        }
+        let failure = final_state.run_failure.clone();
+        if !place_queued(&mut final_state, true) {
+            return Err(Error::Invalid("no queued replacement".into()));
+        }
+        final_state.run_failure = failure;
+        final_state.auto_compaction_attempted = false;
+        final_state.retry_state = RetryState::default();
+        final_state.overflow_compaction_attempted = false;
+        final_state.phase = Phase::ModelReady { turns: 0 };
+        self.prepare_conversation_save_impl(
+            &final_state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            None,
+            Some(AtomicResetPlan {
+                steps,
+                cuts: &cuts,
+                failure_base: Some(&base),
+            }),
         )
     }
 
@@ -4012,7 +4082,7 @@ impl Harness {
         children: &[crate::task::Task],
         abort_tasks: &[crate::task_store::StoredTask],
         independent: Option<&crate::compact::CompactionResult>,
-        atomic_resets: Option<(&[ResetDerivationStep], &[Conversation])>,
+        atomic_resets: Option<AtomicResetPlan<'_>>,
     ) -> Result<PreparedConversationSave, Error> {
         #[cfg(not(test))]
         if atomic_resets.is_some() {
@@ -4150,8 +4220,8 @@ impl Harness {
                 if state.pending_reset_blocks.get(id) == Some(expected_blocks) {
                     continue;
                 }
-                let placed = atomic_resets.is_some_and(|(steps, cuts)| {
-                    steps.iter().zip(cuts).any(|(step, cut)| {
+                let placed = atomic_resets.as_ref().is_some_and(|plan| {
+                    plan.steps.iter().zip(plan.cuts).any(|(step, cut)| {
                         step.reset_id == *id
                             && cut
                                 .content_blocks
@@ -4441,7 +4511,9 @@ impl Harness {
             }
         }
         let mut atomic_evidence: Option<(u64, Vec<Check>, Vec<Mutation>)> = None;
-        let prepared = if let Some((steps, cuts)) = atomic_resets {
+        let prepared = if let Some(plan) = atomic_resets {
+            let steps = plan.steps;
+            let cuts = plan.cuts;
             use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
             if steps.len() < 2 || steps.len() != cuts.len() || cuts.len() > 64 {
                 return Err(Error::Invalid("invalid reset batch".into()));
@@ -4486,7 +4558,12 @@ impl Harness {
                 .get(&predecessor_event)?
                 .ok_or(crate::fork::Error::InvalidSnapshot)?
                 .version;
-            let verified_cuts = self.derive_anchored_reset_states(state.id, version, steps)?;
+            let anchored_cuts = self.derive_anchored_reset_states(state.id, version, steps)?;
+            let verified_cuts = if let Some(base) = plan.failure_base {
+                derive_ordered_reset_states(base, steps)?
+            } else {
+                anchored_cuts
+            };
             if verified_cuts.len() != cuts.len() {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
@@ -4519,6 +4596,45 @@ impl Harness {
                 let blocks = (!cut.content_blocks.is_empty())
                     .then(|| cut.content_blocks.values().cloned().collect());
                 records.push((serde_json::to_value(change)?, blocks));
+            }
+            if plan.failure_base.is_some() {
+                let last = cuts.last().ok_or(crate::transcript::Error::Corrupt)?;
+                if !state.messages.starts_with(&last.messages)
+                    || last
+                        .content_blocks
+                        .iter()
+                        .any(|(index, binding)| state.content_blocks.get(index) != Some(binding))
+                {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let messages = state.messages[last.messages.len()..].to_vec();
+                if messages.is_empty() {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let mut ids: Vec<_> = messages.iter().map(|_| Uuid::new_v4()).collect();
+                let blocks: Vec<_> = state
+                    .content_blocks
+                    .range(last.messages.len()..)
+                    .map(|(&index, binding)| {
+                        if let Some(id) = ids.get_mut(index - last.messages.len()) {
+                            *id = binding.message_id;
+                        }
+                        binding.clone()
+                    })
+                    .collect();
+                if ids.iter().any(|id| id.is_nil() || !seen.insert(*id)) {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let change = TranscriptChange::AppendV2 {
+                    messages,
+                    ids,
+                    commit,
+                    origin: state.id,
+                };
+                records.push((
+                    serde_json::to_value(change)?,
+                    (!blocks.is_empty()).then_some(blocks),
+                ));
             }
             let (batch, positions) = crate::transcript::Transcript::new(store, state.id)
                 .prepare_append_batch(&records)?;
@@ -4587,7 +4703,7 @@ impl Harness {
                 },
             ];
             let mut mutations = Vec::new();
-            for position in &positions {
+            for position in positions.iter().take(cuts.len()) {
                 let (entry, sequence) = position
                     .entry_identity()
                     .ok_or(crate::transcript::Error::Corrupt)?;

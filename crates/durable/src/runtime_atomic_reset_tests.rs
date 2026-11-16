@@ -270,3 +270,234 @@ fn atomic_writer_rolls_back_for_document_race_and_tampered_anchor() {
         assert!(h.conversation(id).unwrap().resets.is_empty());
     }
 }
+
+#[test]
+fn post_failure_candidate_places_resets_and_replacement_in_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let failed = h.submit(id, None, "active".into()).unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (first, _) = h
+        .reset_with_blocks(
+            id,
+            Some("first".into()),
+            vec![vec![serde_json::json!({"type":"text","text":"a"})]],
+        )
+        .unwrap();
+    let (second, _) = h
+        .reset_with_blocks(
+            id,
+            Some("second".into()),
+            vec![vec![serde_json::json!({"type":"text","text":"b"})]],
+        )
+        .unwrap();
+    let steps: Vec<_> = [first, second]
+        .into_iter()
+        .map(|reset_id| ResetDerivationStep {
+            reset_id,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        })
+        .collect();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
+    let mut failure_base = failure.clone();
+    apply_failed_run_policy(&mut failure_base);
+    let expected_cuts = derive_ordered_reset_states(&failure_base, &steps).unwrap();
+    let batch = h
+        .prepare_atomic_failure_reset_save(&failure, version, &steps)
+        .unwrap();
+    let entries: Vec<_> = batch
+        .mutations
+        .iter()
+        .filter_map(|m| match m {
+            Mutation::Put { key, .. } if key.starts_with(b"durable/transcript/entry/") => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let manifests: Vec<_> = batch
+        .mutations
+        .iter()
+        .filter_map(|m| match m {
+            Mutation::Put { key, value } if key.starts_with(b"runtime/reset-manifest/") => {
+                Some((key.clone(), value.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(manifests.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|key| h.owner.store().get(key).unwrap().is_none())
+    );
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    h.commit_conversation_save(batch).unwrap();
+    let actual = h.conversation(id).unwrap();
+    assert_eq!(
+        actual.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    assert_eq!(
+        actual
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Running
+    );
+    assert_eq!(actual.run_failure.as_ref().unwrap().inputs, vec![failed]);
+    assert!(matches!(actual.phase, Phase::ModelReady { .. }));
+    assert!(
+        matches!(actual.messages.last(), Some(Message::User { content }) if content == "replacement")
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&manifests[0].1).unwrap();
+    for (saved, expected) in manifest["cuts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(&expected_cuts)
+    {
+        assert_eq!(
+            saved["state_sha256"],
+            reset_baseline_digest(
+                &serde_json::json!({"state":expected,"blocks":expected.content_blocks})
+            )
+            .unwrap()
+        );
+        assert_eq!(expected.run_failure.as_ref().unwrap().inputs, vec![failed]);
+        assert_eq!(
+            expected
+                .submissions
+                .iter()
+                .find(|s| s.id == replacement)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+    }
+    let cursors: Vec<crate::transcript::Cursor> = manifest["cuts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|cut| serde_json::from_value(cut["cursor"].clone()).unwrap())
+        .collect();
+    let anchor: crate::transcript::Cursor =
+        serde_json::from_value(manifest["anchor_cursor"].clone()).unwrap();
+    assert_ne!(anchor, *cursors.last().unwrap());
+    let observation = manifest["anchor_observation"].as_u64().unwrap();
+    let revision = manifest["document_revision"].as_u64().unwrap();
+    for cursor in &cursors {
+        assert!(
+            crate::reset_manifest::lookup_candidate(
+                h.owner.store(),
+                id,
+                cursor,
+                observation,
+                revision
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let actual = h.conversation(id).unwrap();
+    assert_eq!(
+        actual
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Running
+    );
+    assert_eq!(actual.run_failure.unwrap().inputs, vec![failed]);
+    assert!(
+        matches!(actual.messages.last(), Some(Message::User { content }) if content == "replacement")
+    );
+}
+
+#[test]
+fn post_failure_writer_rolls_back_on_document_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup(&path);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
+    let batch = h
+        .prepare_atomic_failure_reset_save(&failure, version, &steps)
+        .unwrap();
+    let unpublished: Vec<_> = batch
+        .mutations
+        .iter()
+        .filter_map(|m| match m {
+            Mutation::Put { key, .. }
+                if key.starts_with(b"durable/transcript/entry/")
+                    || key.starts_with(b"runtime/reset-manifest/") =>
+            {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut tx = crate::document::Transaction::new();
+    tx.put(
+        &crate::document::Address {
+            scope: id.to_string(),
+            name: "race".into(),
+            key: "one".into(),
+        },
+        Expected::Missing,
+        serde_json::json!({"x":1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(h.owner.store()).unwrap();
+    assert!(matches!(
+        h.commit_conversation_save(batch),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(
+        unpublished
+            .iter()
+            .all(|key| h.owner.store().get(key).unwrap().is_none())
+    );
+    let current = h.conversation(id).unwrap();
+    assert!(current.resets.is_empty());
+    assert_eq!(
+        current
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    assert!(current.run_failure.is_none());
+}
