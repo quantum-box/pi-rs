@@ -19,6 +19,9 @@ const MAX_FINITE_WRITE_LIMIT: u64 = 1_000_000;
 /// caller must independently derive and validate its binding before use.
 pub(crate) struct RawCandidate {
     pub(crate) bytes: Vec<u8>,
+    /// Carry these checks into the transaction publishing any dependent fork.
+    /// They include the candidate namespace's put fence.
+    pub(crate) checks: Vec<durable_store::Check>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -147,7 +150,7 @@ pub(crate) fn lookup_candidate(
     {
         return Err(LookupError::Invalid);
     }
-    let checks = [
+    let mut checks = vec![
         Check {
             key: root,
             expected: Expected::Version(root_entry.version),
@@ -173,9 +176,14 @@ pub(crate) fn lookup_candidate(
             expected: Expected::Version(manifest.version),
         },
     ];
-    store.commit_with_prefix_put_fence(&checks, &[], &[&prefix], boundary)?;
+    checks.push(Check {
+        key: prefix,
+        expected: Expected::PrefixUnchangedSince(boundary),
+    });
+    store.commit(&checks, &[])?;
     Ok(Some(RawCandidate {
         bytes: manifest.value,
+        checks,
     }))
 }
 
@@ -541,6 +549,70 @@ mod tests {
         );
         assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision + 1).is_err());
         assert!(lookup_candidate(&f.store, Uuid::new_v4(), &f.cursor, 1, f.revision).is_err());
+    }
+
+    #[test]
+    fn returned_fork_checks_fence_rewrites_and_new_candidate_aba() {
+        use durable_store::Mutation;
+        let valid = lookup_fixture(true);
+        let found = lookup_candidate(&valid.store, valid.id, &valid.cursor, 1, valid.revision)
+            .unwrap()
+            .unwrap();
+        valid
+            .store
+            .commit(
+                &found.checks,
+                &[Mutation::Put {
+                    key: b"fixture/fork".to_vec(),
+                    value: vec![1],
+                }],
+            )
+            .unwrap();
+        for tamper in ["anchor", "candidate", "additional"] {
+            let f = lookup_fixture(true);
+            let found = lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision)
+                .unwrap()
+                .unwrap();
+            let key = match tamper {
+                "anchor" => f.anchor.clone(),
+                "candidate" => f.manifest.clone(),
+                _ => {
+                    let (id, sequence) = f.cursor.entry_identity().unwrap();
+                    let mut key = candidate_prefix(f.id, id, sequence);
+                    key.extend_from_slice(Uuid::new_v4().to_string().as_bytes());
+                    key
+                }
+            };
+            let value = f
+                .store
+                .get(&key)
+                .unwrap()
+                .map_or_else(|| b"other".to_vec(), |v| v.value);
+            f.store
+                .commit(
+                    &[],
+                    &[Mutation::Put {
+                        key: key.clone(),
+                        value,
+                    }],
+                )
+                .unwrap();
+            if tamper == "additional" {
+                f.store.commit(&[], &[Mutation::Delete { key }]).unwrap();
+            }
+            let fork = b"fixture/fork".to_vec();
+            assert!(matches!(
+                f.store.commit(
+                    &found.checks,
+                    &[Mutation::Put {
+                        key: fork.clone(),
+                        value: vec![1]
+                    }]
+                ),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(f.store.get(&fork).unwrap().is_none());
+        }
     }
 
     #[test]

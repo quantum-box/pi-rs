@@ -9,7 +9,7 @@
 pub mod controls;
 pub mod owner;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     fmt,
     path::Path,
@@ -36,6 +36,9 @@ pub struct Check {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expected {
     Missing,
+    /// No put under this byte prefix after the observed database put version.
+    /// Pair this with checks on observed keys to fence deletion.
+    PrefixUnchangedSince(u64),
     Version(u64),
     /// Version must match and the monotonic deadline must not have elapsed.
     VersionBefore(u64, Instant),
@@ -884,11 +887,7 @@ impl Store {
 
     /// Document cut captured for this exact snapshot version. Evidence is
     /// forward-only; older snapshots are not assigned inferred versions.
-    pub fn document_cut_for_version(
-        &self,
-        key: &[u8],
-        version: u64,
-    ) -> Result<Option<u64>, Error> {
+    pub fn document_cut_for_version(&self, key: &[u8], version: u64) -> Result<Option<u64>, Error> {
         if version > i64::MAX as u64 {
             return Ok(None);
         }
@@ -913,11 +912,13 @@ impl Store {
             return Ok(None);
         }
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
-        Ok(conn.query_row(
-            "SELECT revision FROM durable_document_fence_versions WHERE key=?1 AND version=?2",
-            params![key, version],
-            |r| r.get(0),
-        ).optional()?)
+        Ok(conn
+            .query_row(
+                "SELECT revision FROM durable_document_fence_versions WHERE key=?1 AND version=?2",
+                params![key, version],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Bounded, immutable application snapshots in commit order. Missing commit
@@ -1231,6 +1232,27 @@ impl Store {
                 .optional()?;
             let matches = match check.expected {
                 Expected::Missing => version.is_none(),
+                Expected::PrefixUnchangedSince(boundary) => {
+                    let current: u64 = tx.query_row(
+                        "SELECT version FROM durable_store_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    let legacy: u64 = tx.query_row(
+                        "SELECT legacy_version FROM durable_commit_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if boundary > current || boundary < legacy {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let changed: bool = if let Some(end) = prefix_end(&check.key) {
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND key<?2 AND version>?3)", params![check.key, end, boundary], |r| r.get(0))?
+                    } else {
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND version>?2)", params![check.key, boundary], |r| r.get(0))?
+                    };
+                    !changed
+                }
                 Expected::Version(v) => version == Some(v),
                 Expected::DocumentRevision(revision) => {
                     let current: u64 = tx.query_row(
@@ -1795,14 +1817,15 @@ mod document_history_tests {
             b"runtime/fork/kill/first".as_slice(),
             b"runtime/fork/kill/second".as_slice(),
         ] {
-            assert!(db
-                .runtime_snapshot_exact_at(
+            assert!(
+                db.runtime_snapshot_exact_at(
                     b"runtime/conversation/kill",
                     b"runtime/fork/kill/",
                     key,
                     sequence
                 )
-                .unwrap());
+                .unwrap()
+            );
         }
     }
 
@@ -1915,25 +1938,31 @@ mod document_history_tests {
         .unwrap();
         let root_version = db.get(&root).unwrap().unwrap().version;
         let sequence = db.commit_for_version(&root, root_version).unwrap().unwrap();
-        assert!(db
-            .runtime_snapshot_at(&root, prefix, sequence)
-            .unwrap()
-            .is_none());
-        assert!(db
-            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
-            .unwrap());
-        assert!(db
-            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
-            .unwrap());
-        assert!(!db
-            .runtime_snapshot_exact_at(&other_root, prefix, &first, sequence)
-            .unwrap());
-        assert!(!db
-            .runtime_snapshot_exact_at(&root, b"other/", &first, sequence)
-            .unwrap());
-        assert!(!db
-            .runtime_snapshot_exact_at(&root, prefix, &first, 0)
-            .unwrap());
+        assert!(
+            db.runtime_snapshot_at(&root, prefix, sequence)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+                .unwrap()
+        );
+        assert!(
+            db.runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+                .unwrap()
+        );
+        assert!(
+            !db.runtime_snapshot_exact_at(&other_root, prefix, &first, sequence)
+                .unwrap()
+        );
+        assert!(
+            !db.runtime_snapshot_exact_at(&root, b"other/", &first, sequence)
+                .unwrap()
+        );
+        assert!(
+            !db.runtime_snapshot_exact_at(&root, prefix, &first, 0)
+                .unwrap()
+        );
         let revision = db.document_cut(&first).unwrap().unwrap();
         assert_eq!(db.document_cut(&second).unwrap(), Some(revision));
         db.commit(
@@ -1952,9 +1981,10 @@ mod document_history_tests {
         .unwrap();
         drop(db);
         let db = Store::open(&path).unwrap();
-        assert!(db
-            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
-            .unwrap());
+        assert!(
+            db.runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+                .unwrap()
+        );
         assert_eq!(
             db.document_at(&doc, revision).unwrap().unwrap().value,
             b"before"
@@ -1967,12 +1997,14 @@ mod document_history_tests {
             }],
         )
         .unwrap();
-        assert!(!db
-            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
-            .unwrap());
-        assert!(db
-            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
-            .unwrap());
+        assert!(
+            !db.runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+                .unwrap()
+        );
+        assert!(
+            db.runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+                .unwrap()
+        );
         db.commit(
             &[],
             &[Mutation::Delete {
@@ -1980,9 +2012,10 @@ mod document_history_tests {
             }],
         )
         .unwrap();
-        assert!(!db
-            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
-            .unwrap());
+        assert!(
+            !db.runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+                .unwrap()
+        );
     }
 
     #[test]

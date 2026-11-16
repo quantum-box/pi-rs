@@ -310,6 +310,34 @@ impl<'a> Transcript<'a> {
             .map(|_| ())
     }
 
+    /// Return checks for a verified chain so the caller can fence all of its
+    /// evidence in the transaction that publishes the dependent result.
+    #[allow(dead_code)] // Used by the future authenticated fork commit.
+    pub(crate) fn atomic_append_checks(
+        &self,
+        anchor_key: &[u8],
+        prior: &Cursor,
+        positions: &[Cursor],
+    ) -> Result<Vec<Check>, Error> {
+        let (commit, anchor_version) = self.verify_atomic_chain(anchor_key, prior, positions)?;
+        let mut checks = vec![Check {
+            key: anchor_key.to_vec(),
+            expected: Expected::Version(anchor_version),
+        }];
+        for position in positions {
+            let (key, version) = self.entry_evidence(position)?;
+            if self.store.commit_for_version(&key, version)? != Some(commit) {
+                return Err(Error::Corrupt);
+            }
+            checks.push(Check {
+                key,
+                expected: Expected::Version(version),
+            });
+        }
+        self.store.commit(&checks, &[])?;
+        Ok(checks)
+    }
+
     fn verify_atomic_chain(
         &self,
         anchor_key: &[u8],
@@ -835,6 +863,40 @@ mod tests {
             t.verify_atomic_snapshots(&anchor, &prior, &proofs, revision),
             Err(Error::Corrupt)
         ));
+    }
+
+    #[test]
+    fn atomic_append_checks_fence_intermediate_rewrite() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        let prior = t.snapshot().unwrap();
+        let (mut batch, cursors) = t
+            .prepare_append_batch(&[(json!({"a":1}), None), (json!({"b":2}), None)])
+            .unwrap();
+        let anchor = b"proof/anchor".to_vec();
+        batch.mutations.push(Mutation::Put {
+            key: anchor.clone(),
+            value: vec![],
+        });
+        commit(&db, batch);
+        let checks = t.atomic_append_checks(&anchor, &prior, &cursors).unwrap();
+        let (key, _) = t.entry_evidence(&cursors[0]).unwrap();
+        let value = db.get(&key).unwrap().unwrap().value;
+        db.commit(&[], &[Mutation::Put { key, value }]).unwrap();
+        let fork = b"proof/fork".to_vec();
+        assert!(matches!(
+            db.commit(
+                &checks,
+                &[Mutation::Put {
+                    key: fork.clone(),
+                    value: vec![]
+                }]
+            ),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(db.get(&fork).unwrap().is_none());
     }
 
     #[test]
