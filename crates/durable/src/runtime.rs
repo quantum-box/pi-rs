@@ -8284,6 +8284,7 @@ impl Harness {
             return Err(Error::Invalid("empty submission notification key".into()));
         }
         let busy = state.active.is_some()
+            || pending_failure_continuation(&state)
             || matches!(
                 state.phase,
                 Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
@@ -8821,6 +8822,7 @@ impl Harness {
                 return Err(Error::Invalid("empty submission notification key".into()));
             }
             let busy = c.active.is_some()
+                || pending_failure_continuation(&c)
                 || matches!(
                     c.phase,
                     Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
@@ -8989,6 +8991,8 @@ impl Harness {
                 return Err(Error::Invalid("empty submission notification key".into()));
             }
             if c.active.is_some()
+                || c.abort_requested
+                || pending_failure_continuation(&c)
                 || c.pending_independent_summary.is_some()
                 || c.application_writes
                     .iter()
@@ -17476,6 +17480,14 @@ fn append_tool(
     c.auto_compaction_attempted = false;
     Ok(())
 }
+// Only still-queued inputs from the failed settlement reserve the automatic run.
+// Withdrawal or abort can remove them without leaving the conversation busy.
+fn pending_failure_continuation(c: &Conversation) -> bool {
+    c.submissions
+        .iter()
+        .any(|s| s.status == Status::Queued && c.failure_continuation_inputs.contains(&s.id))
+}
+
 // Final boundaries select each mode independently; post-tool boundaries select only steers.
 fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
     let starting_run = c.active.is_none();
