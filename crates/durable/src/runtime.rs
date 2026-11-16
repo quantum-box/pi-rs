@@ -13466,7 +13466,9 @@ impl Harness {
                                         Expected::Version(version),
                                         &[task],
                                         &[adapter.handler()],
-                                    )?;
+                                        cancel,
+                                    )
+                                    .await?;
                                     continue;
                                 }
                                 c.tool_attempt = Some(ToolAttempt {
@@ -13905,7 +13907,9 @@ impl Harness {
                                         Expected::Version(version),
                                         &[task],
                                         &[adapter.handler()],
-                                    )?;
+                                        cancel,
+                                    )
+                                    .await?;
                                     continue;
                                 }
                                 c.tool_attempt = Some(ToolAttempt {
