@@ -155,6 +155,26 @@ async fn background_is_ignored_and_unknown_conversation_errors() {
 }
 
 #[tokio::test]
+async fn all_idle_rejects_unreachable_foreground_task() {
+    use durable_store::Store;
+    use pi_rs_durable::task_store::{Save, TaskStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    {
+        let db = Store::open(&path).unwrap();
+        let orphan = task(Uuid::new_v4(), false);
+        TaskStore::new(&db).save(&[Save::Create(&orphan)]).unwrap();
+    }
+    let scheduler = Scheduler::open(&path, options()).unwrap();
+    assert!(matches!(
+        scheduler.wait_for_all_idle(&CancellationToken::new()).await,
+        Err(Error::Invalid(message)) if message.contains("unreachable foreground")
+    ));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn recovered_live_task_requires_driver_then_settles() {
     use pi_rs_durable::task_scheduler;
     let dir = tempfile::tempdir().unwrap();

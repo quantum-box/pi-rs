@@ -15603,6 +15603,7 @@ impl Scheduler {
             }
         }
         let by_id: HashMap<_, _> = records.iter().map(|r| (r.task.id(), r)).collect();
+        let all_roots = root.is_none();
         let mut conversations = VecDeque::new();
         if let Some(root) = root {
             conversations.push_back(root);
@@ -15667,6 +15668,69 @@ impl Scheduler {
                         conversations.push_back(edge.edge.child);
                     }
                 }
+            }
+        }
+        if all_roots {
+            // Distinguish deliberately excluded background subtrees from broken
+            // ownership chains. An unresolved foreground chain must not make a
+            // harness-wide idle wait succeed.
+            let mut background_tasks: VecDeque<_> = records
+                .iter()
+                .filter(|record| record.task.is_background())
+                .map(|record| record.task.id())
+                .collect();
+            let mut background_conversations = VecDeque::new();
+            for edge in &edges {
+                let record = by_id.get(&edge.edge.task).ok_or(Error::NotFound)?;
+                if edge.edge.task_owner != *record.task.owner()
+                    || !snapshots.contains_key(&Harness::key(edge.edge.child))
+                {
+                    return Err(Error::Invalid("invalid ownership edge".into()));
+                }
+                if edge.edge.mode == Mode::Background {
+                    background_conversations.push_back(edge.edge.child);
+                }
+            }
+            let mut background_seen_tasks = HashSet::new();
+            let mut background_seen_conversations = HashSet::new();
+            while !background_tasks.is_empty() || !background_conversations.is_empty() {
+                while let Some(id) = background_tasks.pop_front() {
+                    if !background_seen_tasks.insert(id) {
+                        continue;
+                    }
+                    for child in &records {
+                        if child.task.owner() == &TaskOwner::Task(id) {
+                            background_tasks.push_back(child.task.id());
+                        }
+                    }
+                    for edge in edges.iter().filter(|edge| edge.edge.task == id) {
+                        background_conversations.push_back(edge.edge.child);
+                    }
+                }
+                while let Some(id) = background_conversations.pop_front() {
+                    if !background_seen_conversations.insert(id) {
+                        continue;
+                    }
+                    for record in &records {
+                        if record.task.owner() == &TaskOwner::Conversation(id) {
+                            background_tasks.push_back(record.task.id());
+                        }
+                    }
+                }
+            }
+            if records.iter().any(|record| {
+                !record.task.is_terminal()
+                    && !seen_tasks.contains(&record.task.id())
+                    && !background_seen_tasks.contains(&record.task.id())
+            }) || snapshots.keys().any(|key| {
+                serde_json::from_slice::<Conversation>(&snapshots[key].value)
+                    .map(|conversation| {
+                        !seen_conversations.contains(&conversation.id)
+                            && !background_seen_conversations.contains(&conversation.id)
+                    })
+                    .unwrap_or(true)
+            }) {
+                return Err(Error::Invalid("unreachable foreground ownership graph".into()));
             }
         }
         Ok((busy || tasks_pending, tasks_pending))
