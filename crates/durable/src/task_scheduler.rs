@@ -17727,6 +17727,228 @@ mod standalone_foreground_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn descendant_submission_waits_for_uncertain_graph_and_is_discarded_on_abort() {
+        use std::{
+            sync::{
+                Mutex,
+                atomic::{AtomicUsize, Ordering},
+                mpsc,
+            },
+            time::Duration,
+        };
+
+        struct Staged {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            calls: Arc<AtomicUsize>,
+            address: Address,
+        }
+        impl Handler for Staged {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.submit_write(
+                    "uncertain-descendant".into(),
+                    "app.note".into(),
+                    Some(json!({"value":1})),
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+                docs.get(&self.address).map_err(|error| error.to_string())?;
+                docs.put(
+                    &self.address,
+                    json!({"committed":true}).as_object().unwrap().clone(),
+                )
+                .map_err(|error| error.to_string())?;
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok(Step::Succeed(json!("should not commit")))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let independent_root = h.create_conversation(cfg.clone()).unwrap();
+        let parent = task(1, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.wait(WaitFor::Signal("hold".into()))
+            })
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(
+                parent.id(),
+                parent.owner().clone(),
+                "child",
+                cfg.clone(),
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let damaged = h
+            .ensure_task_owned_subagent(
+                parent.id(),
+                parent.owner().clone(),
+                "damaged",
+                cfg,
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let intermediate = task(2, TaskOwner::Conversation(child), "parent");
+        let descendant = task(3, TaskOwner::Task(intermediate.id()), "submit");
+        tasks
+            .save(&[Save::Create(&intermediate), Save::Create(&descendant)])
+            .unwrap();
+        tasks
+            .update(&tasks.load(intermediate.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.wait(WaitFor::Signal("hold".into()))
+            })
+            .unwrap();
+        let address = Address {
+            scope: "test".into(),
+            name: "uncertain-descendant".into(),
+            key: "".into(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut registry = Registry::default();
+        registry.register("parent", true, |_: &Task| panic!("waiting parent ran"));
+        registry.register(
+            "submit",
+            true,
+            Staged {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                calls: calls.clone(),
+                address: address.clone(),
+            },
+        );
+        registry.set_abort("parent", |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.set_abort("submit", |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register("work", true, |_: &Task| {
+            Ok(Step::Succeed(json!("independent")))
+        });
+        let scheduler = h.attach_tasks(registry).unwrap();
+        let owner = scheduler.owner();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("descendant did not stage submission");
+        let gate = owner.task_gate().lock().unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.wake()?;
+                task.start()?;
+                task.hold_failure("failed".into())
+            })
+            .unwrap();
+        let key = crate::ownership_edge::edge_key(damaged);
+        let entry = db.get(&key).unwrap().unwrap();
+        let original = entry.value.clone();
+        let mut edge: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        edge["mode"] = json!("corrupt");
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&edge).unwrap(),
+            }],
+        )
+        .unwrap();
+        drop(gate);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !driver.has_pending_task(descendant.id()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant outcome was not retained");
+        assert_eq!(
+            driver.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        assert!(h.conversation(child).unwrap().application_writes.is_empty());
+        assert!(Documents::new(&db).get(&address).unwrap().is_none());
+        let independent = task(4, TaskOwner::Conversation(independent_root), "work");
+        driver.submit(&independent).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !driver.get(independent.id()).unwrap().unwrap().is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("independent task was blocked");
+        assert!(driver.has_pending_task(descendant.id()));
+        assert!(h.conversation(child).unwrap().application_writes.is_empty());
+        assert!(Documents::new(&db).get(&address).unwrap().is_none());
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: original,
+            }],
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while driver.has_pending_task(descendant.id()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("repaired graph did not release the outcome");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !driver.get(descendant.id()).unwrap().unwrap().is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failure cascade did not cancel descendant");
+        assert_eq!(
+            driver.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        driver.shutdown().unwrap();
+        drop(owner);
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(h.conversation(child).unwrap().application_writes.is_empty());
+        assert!(Documents::new(&db).get(&address).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn shutdown_returns_in_flight_result_before_uncertain_graph_is_repaired() {
         exercise_in_flight_uncertain_graph(true).await;
     }
