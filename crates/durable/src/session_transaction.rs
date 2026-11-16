@@ -27,6 +27,7 @@ pub struct SessionTransaction<'a> {
     writes: HashMap<Address, Option<Map<String, Value>>>,
     signals: crate::document::HostTransaction<'a>,
     clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
+    tasks: Vec<crate::task::Task>,
 }
 
 impl<'a> SessionTransaction<'a> {
@@ -53,6 +54,7 @@ impl<'a> SessionTransaction<'a> {
             writes: HashMap::new(),
             signals: crate::document::HostTransaction::new(store),
             clock,
+            tasks: Vec::new(),
         })
     }
 
@@ -110,6 +112,27 @@ impl<'a> SessionTransaction<'a> {
         Ok(result)
     }
 
+    /// Stage a registered task owned by this conversation. Its ID is provisional
+    /// until commit; the active driver validates its definition and policy.
+    pub fn create_task(&mut self, task: crate::task::Task) -> Result<Uuid, Error> {
+        if self.tasks.iter().any(|existing| existing.id() == task.id()) {
+            return Err(Error::DuplicateTask);
+        }
+        if task.owner() != &crate::task::TaskOwner::Conversation(self.state.id)
+            || task.state() != &crate::task::TaskState::Ready
+            || task.abort_requested()
+            || task.kind().is_none()
+        {
+            return Err(Error::InvalidSessionAdmission(
+                "invalid conversation-owned task".into(),
+            ));
+        }
+        let id = task.id();
+        self.tasks.push(task);
+        self.table_written = true;
+        Ok(id)
+    }
+
     /// Return placed application writes, including entries staged by this transaction.
     pub fn entries(&self) -> Vec<ApplicationWrite> {
         self.state
@@ -150,7 +173,9 @@ impl<'a> SessionTransaction<'a> {
         Ok(id)
     }
 
-    pub(crate) fn into_parts(mut self) -> Result<(Conversation, OwnedBatch, bool), Error> {
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> Result<(Conversation, OwnedBatch, bool, Vec<crate::task::Task>), Error> {
         if let Some(profile) = self.image_profile_guard {
             let adapter = self
                 .adapter
@@ -192,6 +217,6 @@ impl<'a> SessionTransaction<'a> {
             }
         }
         self.signals.append(batch)?;
-        Ok((self.state, self.signals.into_batch()?, changed))
+        Ok((self.state, self.signals.into_batch()?, changed, self.tasks))
     }
 }

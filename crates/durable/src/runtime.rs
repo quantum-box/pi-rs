@@ -4479,10 +4479,38 @@ impl Harness {
                 )?
             };
             if let Some(batch) = documents {
-                prepared.extend(PreparedConversationSave {
-                    owner: self.owner.clone(),
+                let mut extra = crate::task_store::OwnedBatch {
                     checks: batch.checks.clone(),
                     mutations: batch.mutations.clone(),
+                };
+                if !children.is_empty() {
+                    let mut graph = crate::task_store::OwnedBatch {
+                        checks: std::mem::take(&mut prepared.checks),
+                        mutations: Vec::new(),
+                    };
+                    crate::document::reconcile_task_checks(&mut extra, &mut graph);
+                    // A signal can have read a task which this commit creates,
+                    // or an existing task on the ownership path. Share only
+                    // reconciled checks; never merge overlapping writes.
+                    extra.checks.retain(|check| {
+                        let task_key = check.key.starts_with(crate::task_store::PREFIX)
+                            || check.key.starts_with(b"durable/signal-revision/");
+                        let no_extra_write =
+                            !extra.mutations.iter().any(|mutation| match mutation {
+                                Mutation::Put { key, .. } | Mutation::Delete { key } => {
+                                    *key == check.key
+                                }
+                            });
+                        !(task_key
+                            && no_extra_write
+                            && graph.checks.iter().any(|other| other == check))
+                    });
+                    prepared.checks = graph.checks;
+                }
+                prepared.extend(PreparedConversationSave {
+                    owner: self.owner.clone(),
+                    checks: extra.checks,
+                    mutations: extra.mutations,
                 })?;
             }
             match self.commit_conversation_save(prepared) {
@@ -8685,7 +8713,7 @@ impl Harness {
             self.clock.clone(),
         )?;
         let result = change(&mut transaction)?;
-        let (state, mut documents, changed) = transaction.into_parts()?;
+        let (state, mut documents, changed, tasks) = transaction.into_parts()?;
         if !changed {
             documents.checks.push(Check {
                 key: Self::key(id),
@@ -8698,14 +8726,36 @@ impl Harness {
         // preserve its exact conversation and document checks on conflict.
         let merge = self.merge_admissions;
         self.merge_admissions = false;
-        let saved = self.save_composed_locked(
-            &state,
-            Expected::Version(version),
-            None,
-            &[],
-            &[],
-            Some(&documents),
-        );
+        let saved = if tasks.is_empty() {
+            self.save_composed_locked(
+                &state,
+                Expected::Version(version),
+                None,
+                &[],
+                &[],
+                Some(&documents),
+            )
+        } else {
+            let driver = self
+                .task_driver
+                .lock()
+                .map_err(|_| ())
+                .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
+            match driver {
+                Ok(Some(driver)) => driver.with_admission(&tasks, id, || {
+                    self.save_composed_locked(
+                        &state,
+                        Expected::Version(version),
+                        None,
+                        &tasks,
+                        &[],
+                        Some(&documents),
+                    )
+                }),
+                Ok(None) => Err(Error::Invalid("task driver is not running".into())),
+                Err(_) => Err(Error::Failed),
+            }
+        };
         self.merge_admissions = merge;
         saved?;
         Ok(result)
@@ -8744,7 +8794,7 @@ impl Harness {
             self.clock.clone(),
         )?;
         let result = change(&mut transaction).await?;
-        let (state, mut documents, changed) = transaction.into_parts()?;
+        let (state, mut documents, changed, tasks) = transaction.into_parts()?;
         if !changed {
             documents.checks.push(Check {
                 key: Self::key(id),
@@ -8755,14 +8805,36 @@ impl Harness {
         }
         let merge = self.merge_admissions;
         self.merge_admissions = false;
-        let saved = self.save_composed_locked(
-            &state,
-            Expected::Version(version),
-            None,
-            &[],
-            &[],
-            Some(&documents),
-        );
+        let saved = if tasks.is_empty() {
+            self.save_composed_locked(
+                &state,
+                Expected::Version(version),
+                None,
+                &[],
+                &[],
+                Some(&documents),
+            )
+        } else {
+            let driver = self
+                .task_driver
+                .lock()
+                .map_err(|_| ())
+                .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
+            match driver {
+                Ok(Some(driver)) => driver.with_admission(&tasks, id, || {
+                    self.save_composed_locked(
+                        &state,
+                        Expected::Version(version),
+                        None,
+                        &tasks,
+                        &[],
+                        Some(&documents),
+                    )
+                }),
+                Ok(None) => Err(Error::Invalid("task driver is not running".into())),
+                Err(_) => Err(Error::Failed),
+            }
+        };
         self.merge_admissions = merge;
         saved?;
         Ok(result)

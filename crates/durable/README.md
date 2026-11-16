@@ -1933,6 +1933,16 @@ provisional. Settlement notifications are assembled against the same candidate
 and commit atomically with signal and document changes. The API does not expose
 concurrent table operations.
 
+`tx.create_task(task)` stages a ready, registered generic task owned by the
+bound conversation. The active task driver validates its kind, definition
+version, replay policy, ownership and unused ID while holding the admission
+gate through commit. Tasks may follow an entry, signal, or submission; their
+creation is itself a table write, so later explicit signal or submission reads
+are rejected. New task IDs are provisional. Task records and any settlement
+notification are committed atomically with the transaction's other changes.
+Task-owned children and cross-conversation creation are not supported by this
+host API.
+
 This is a subset of upstream session transactions: arbitrary table operations,
 unfitted block admission, entry trees and mutable Chord drafts are not exposed.
 Transactional continue rejects multiple pending block resets when they need
