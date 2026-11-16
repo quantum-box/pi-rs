@@ -55,6 +55,8 @@ pub struct Google {
     reasoning_supported: Option<bool>,
     strict_tool_support: Option<bool>,
     strict_tool_models: BTreeMap<String, bool>,
+    strict_tool_route_default: bool,
+    strict_tool_routes: BTreeMap<String, bool>,
     bound_tools: Option<(Vec<Value>, bool)>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
@@ -104,6 +106,8 @@ impl Google {
             reasoning_supported: None,
             strict_tool_support: None,
             strict_tool_models: BTreeMap::new(),
+            strict_tool_route_default: true,
+            strict_tool_routes: BTreeMap::new(),
             bound_tools: None,
             progress: None,
             reasoning: None,
@@ -183,6 +187,8 @@ impl Google {
     pub fn with_strict_tool_support(mut self, supported: Option<bool>) -> Self {
         self.strict_tool_support = supported;
         self.strict_tool_models.clear();
+        self.strict_tool_route_default = true;
+        self.strict_tool_routes.clear();
         self
     }
 
@@ -194,6 +200,17 @@ impl Google {
     ) -> Self {
         self.strict_tool_support = default;
         self.strict_tool_models = models;
+        self
+    }
+
+    /// Bind effective route eligibility for each model and unknown model IDs.
+    pub fn with_strict_tool_routes(
+        mut self,
+        default: bool,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.strict_tool_route_default = default;
+        self.strict_tool_routes = models;
         self
     }
 
@@ -213,6 +230,19 @@ impl Google {
             return Err(Error::Config(
                 "tool declarations do not match the effective request".into(),
             ));
+        }
+        if declarations.iter().any(|declaration| {
+            matches!(
+                declaration.constrained_sampling,
+                Some(pi_rs_core::ToolConstraint::JsonSchema { .. })
+            )
+        }) && !self
+            .strict_tool_routes
+            .get(&request.model)
+            .copied()
+            .unwrap_or(self.strict_tool_route_default)
+        {
+            return Err(Error::Config("Google strict-tool capability cannot be resolved for the final request model and route".into()));
         }
         let supported = self
             .strict_tool_models
@@ -1725,6 +1755,85 @@ mod tests {
             expected_fallback
         );
         assert_eq!(expected_fallback["properties"]["tag"]["enum"], json!(["a"]));
+    }
+
+    #[test]
+    fn google_route_guard_preserves_unknown_inference_and_provider_defaults() {
+        use pi_rs_core::{
+            EffectiveToolSampling, StrictToolPolicy, ToolConstraint, ToolDeclaration,
+            ToolDispatchContext, ToolSpec,
+        };
+        let base = Google::new("http://localhost:9", "key")
+            .unwrap()
+            .with_strict_tool_routes(
+                true,
+                [
+                    ("models/elsewhere".into(), false),
+                    ("elsewhere".into(), false),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        let spec = ToolSpec {
+            name: "t".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        };
+        let decl = ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Prefer,
+            }),
+        };
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        for (id, strict) in [
+            ("gemini-3-uncatalogued", true),
+            ("gemini-2-uncatalogued", false),
+        ] {
+            let request = ModelRequest {
+                model: id.into(),
+                messages: vec![],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let dispatch = base
+                .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&decl), &context)
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    dispatch.effective_tools()[0].sampling,
+                    EffectiveToolSampling::StrictJsonSchema { .. }
+                ),
+                strict
+            );
+            let forced = base
+                .clone()
+                .with_strict_tool_policy(Some(true), BTreeMap::new());
+            let dispatch = forced
+                .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&decl), &context)
+                .unwrap();
+            assert!(matches!(
+                dispatch.effective_tools()[0].sampling,
+                EffectiveToolSampling::StrictJsonSchema { .. }
+            ));
+        }
+        for id in ["elsewhere", "models/elsewhere"] {
+            let request = ModelRequest {
+                model: id.into(),
+                messages: vec![],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            assert!(
+                base.prepare_bound_tool_dispatch(&request, std::slice::from_ref(&decl), &context)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

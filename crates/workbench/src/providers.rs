@@ -1151,9 +1151,44 @@ impl Client {
                 let (strict_default, strict_models) = args
                     .model_profiles
                     .google_strict_tool_policy(&args.provider);
+                // The final model still dispatches on the selected client's route.
+                let selected_endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
+                let same_route = |id: &str| {
+                    args.model_profiles.model_adapter(&args.provider, id) == Adapter::Google
+                        && args.model_endpoint_for(&args.provider, Some(id)) == selected_endpoint
+                };
+                let unknown_route = args.provider.adapter() == Adapter::Google
+                    && args.model_endpoint_for(&args.provider, None) == selected_endpoint;
+                let mut route_models: std::collections::BTreeSet<String> = args
+                    .model_profiles
+                    .model_ids(&args.provider)
+                    .into_iter()
+                    .collect();
+                route_models.extend(strict_models.keys().cloned());
+                let mut route_names = route_models.clone();
+                for id in &route_models {
+                    let canonical = id.strip_prefix("models/").unwrap_or(id);
+                    route_names.insert(canonical.to_owned());
+                    route_names.insert(format!("models/{canonical}"));
+                }
+                let routes = route_names
+                    .into_iter()
+                    .map(|id| {
+                        let canonical = id.strip_prefix("models/").unwrap_or(&id);
+                        // The adapter falls back to a canonical model-specific override;
+                        // that override must also belong to this route.
+                        let inherited_override_safe = id == canonical
+                            || strict_models.contains_key(&id)
+                            || !strict_models.contains_key(canonical)
+                            || same_route(canonical);
+                        let allowed = same_route(&id) && inherited_override_safe;
+                        (id, allowed)
+                    })
+                    .collect();
                 Self::Google(
                     client
                         .with_strict_tool_policy(strict_default, strict_models)
+                        .with_strict_tool_routes(unknown_route, routes)
                         .with_thinking(mapped.as_deref().or(selected))
                         .with_disabled_thinking_fallback(fallback.as_deref())
                         .with_reasoning_support(metadata.as_ref().and_then(|model| model.reasoning))
@@ -2108,6 +2143,123 @@ mod contention_tests {
                     prepared.effective_tools()[0].sampling,
                     pi_rs::EffectiveToolSampling::Unconstrained
                 ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn google_strict_rewrites_require_matching_effective_route() {
+        use clap::Parser;
+        let route_a = "http://127.0.0.1:9876/v1beta";
+        let route_b = "http://127.0.0.1:9877/v1beta";
+        for deferred in [false, true] {
+            for explicit in [false, true] {
+                for (selected, other) in [("a", "b"), ("b", "a")] {
+                    let mut args = super::super::Cli::parse_from(["pi"]);
+                    args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+                        "api":"google-generative-ai", "baseUrl":route_a,
+                        "compat":{"supportsStrictMode":true},
+                        "models":[
+                            {"id":"a", "baseUrl":route_a, "compat":{"supportsStrictMode":false}},
+                            {"id":"b", "baseUrl":route_b, "compat":{"supportsStrictMode":true}},
+                            {"id":"chat", "api":"openai-completions", "baseUrl":route_a, "compat":{"supportsStrictMode":true}}
+                        ],
+                        "modelOverrides":{"unknown-partial":{"reasoning":false}}
+                    }}})).unwrap();
+                    args.provider = args.model_profiles.provider("fixture").unwrap();
+                    args.model = selected.into();
+                    args.endpoint = route_a.into();
+                    if explicit {
+                        args.endpoint_explicit = true;
+                        let endpoint = if selected == "b" { route_b } else { route_a };
+                        args.initial_connection = Some((args.provider.clone(), endpoint.into()));
+                    }
+                    let actual = args
+                        .model_endpoint_for(&args.provider, Some(selected))
+                        .to_owned();
+                    let client = if deferred {
+                        Client::deferred(
+                            args.provider.clone(),
+                            Adapter::Google,
+                            &actual,
+                            Some(Credential::Literal("key".into())),
+                            RequestHeaders::default(),
+                        )
+                    } else {
+                        Client::Google(pi_rs::google::Google::new(&actual, "key").unwrap())
+                    }
+                    .with_model_options(&args, false)
+                    .unwrap()
+                    .with_context_probes(false);
+                    let model = super::super::image_policy::WorkbenchModel {
+                        client,
+                        block_images: false,
+                        supports_images: None,
+                        session_affinity: &[],
+                        price: None,
+                    };
+                    let spec = pi_rs::ToolSpec {
+                        name: "t".into(),
+                        description: "".into(),
+                        parameters: json!({"type":"object"}),
+                    };
+                    for (target, allowed, strict) in [
+                        (selected, true, selected == "b"),
+                        (other, explicit, other == "b"),
+                        ("chat", false, false),
+                        ("unknown-partial", explicit || selected == "a", true),
+                        ("gemini-3-unknown", explicit || selected == "a", true),
+                        ("models/a", explicit || selected == "a", false),
+                        ("models/b", explicit, true),
+                    ] {
+                        let request = ModelRequest {
+                            model: target.into(),
+                            messages: vec![],
+                            tools: vec![spec.clone()],
+                            max_output_tokens: 10,
+                        };
+                        let context = pi_rs::ToolDispatchContext {
+                            request_id: uuid::Uuid::new_v4(),
+                            session_id: uuid::Uuid::new_v4(),
+                            external_id: "s".into(),
+                            summary: false,
+                        };
+                        let bound = model.prepare_context(&request).await.unwrap().unwrap();
+                        for policy in [
+                            pi_rs::StrictToolPolicy::Prefer,
+                            pi_rs::StrictToolPolicy::Require,
+                        ] {
+                            let decl = pi_rs::ToolDeclaration {
+                                spec: spec.clone(),
+                                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                                    strict: policy,
+                                }),
+                            };
+                            let result = bound
+                                .prepare_tool_dispatch(&request, &[decl], &context)
+                                .await;
+                            if !allowed {
+                                let error = result.err().expect("different route must fail closed");
+                                assert!(
+                                    error.to_string().contains("final request model and route")
+                                );
+                            } else if !strict && matches!(policy, pi_rs::StrictToolPolicy::Require)
+                            {
+                                assert!(result.is_err());
+                            } else {
+                                let prepared = result.unwrap().unwrap();
+                                assert_eq!(
+                                    matches!(
+                                        prepared.effective_tools()[0].sampling,
+                                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                    ),
+                                    strict,
+                                    "{selected}->{target} explicit={explicit} deferred={deferred}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }

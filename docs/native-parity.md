@@ -5438,4 +5438,11 @@ identity is versioned for the `const` wire conversion, so usage measured with
 the previous declaration format is not reused as a budget anchor.
 Google resolves provider and per-model strict-support overrides against the final
 request model after `before_request` hooks, including for deferred clients; an
-unconfigured final model uses the provider default or Gemini-version inference.
+unconfigured final model on the selected route uses the provider default or
+Gemini-version inference.
+For a final model configured on a different API or endpoint, Workbench rejects
+constrained Google dispatch instead of applying that model's capability to the
+selected connection. An explicit endpoint is used when comparing effective
+routes. Unconfigured and override-only models must resolve to the selected route; when
+they do, they retain provider-default or Gemini-version inference. Standalone
+Google SDK capability overrides remain endpoint-wide.
