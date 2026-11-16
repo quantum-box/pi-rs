@@ -173,14 +173,29 @@ settings scope, matching Pi.
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
 An invalid file URL in a package settings filter reports an error when
-reached against an available native resource candidate. For a local directory
+reached against an available native or Pi manifest diagnostic candidate. For a local directory
 package it stops the current declaration at that resource type, retaining
 earlier resources and processing later declarations. Remote errors propagate.
 Startup theme discovery uses cached candidates when available. Single-file
 sources and other resource filter paths still treat invalid URLs as non-matches.
-Diagnostic candidates for unsupported upstream Pi package resources remain
-incomplete. Package resources are evaluated in
-settings order, with project sources first.
+Pi-only extensions, skills and prompts are scanned only for filter diagnostics;
+they are not loaded as native resources. Diagnostic scans are bounded and fall
+back to native candidates on cycles, excessive traversal, unsafe ignore files,
+unsupported absolute/parent globs, potentially traversed directory symlinks,
+or unsupported
+extglob forms. Diagnostic
+extglob discovery supports bounded ASCII positive groups and a single negated
+group with literal alternatives and a supported suffix; complex negation,
+suffixes ending in wildcards, extglob overrides, non-ASCII
+paths, and combinations with classes, braces, or globstars fall back, so errors
+can still be missed in those
+cases. Package resources are evaluated in settings order, with project sources
+first.
+
+Diagnostic manifest globs expand bounded numeric and same-case ASCII letter
+brace ranges, including descending ranges, signed steps and padded numbers,
+and include the starting directory for a trailing directory globstar. Complex,
+invalid or oversized brace expansions fall back to native candidates.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
