@@ -2177,6 +2177,45 @@ fn task_input_on_reset_fork_fences_original_proof() {
     }
 }
 
+fn task_input_reset_fork(path: &std::path::Path) -> (Harness, Uuid, Uuid) {
+    let (mut h, origin, _, steps) = setup_with_adapter(path, true);
+    h.set_after_failed_run(origin, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(origin, None, "replacement".into()).unwrap();
+    let (mut checkpoint, version) = h.load(origin).unwrap();
+    let occurrence = checkpoint.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+    checkpoint.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "error".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&checkpoint, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(origin).unwrap();
+    finish_failure(&mut failure, "error".into(), FailureCause::ModelError);
+    h.save(&failure, Expected::Version(version)).unwrap();
+    let fork = h.fork_by_entry_id(origin, occurrence).unwrap();
+    let (mut state, version) = h.load(fork).unwrap();
+    state.messages.push(Message::User {
+        content: "one".into(),
+    });
+    state.messages.push(Message::User {
+        content: "two".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let state = h.conversation(fork).unwrap();
+    let child = h
+        .fork_at_position(
+            fork,
+            ViewCursor {
+                cursor: state.transcript.unwrap(),
+                remaining: Some(1),
+            },
+        )
+        .unwrap();
+    (h, origin, child)
+}
+
 #[test]
 fn task_input_retries_origin_advance_during_fork_proof() {
     use crate::document::{Address, Documents, TaskDocuments};
@@ -2245,41 +2284,7 @@ fn task_input_retries_origin_advance_during_fork_proof() {
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
-        let (mut h, origin, _, steps) = setup_with_adapter(&path, true);
-        h.set_after_failed_run(origin, AfterFailedRun::Continue)
-            .unwrap();
-        h.submit(origin, None, "replacement".into()).unwrap();
-        let (mut checkpoint, version) = h.load(origin).unwrap();
-        let occurrence = checkpoint.pending_reset_blocks[&steps[0].reset_id][0].message_id;
-        checkpoint.phase = Phase::FailedModel {
-            turns: 0,
-            request_id: Uuid::new_v4(),
-            reason: "error".into(),
-            decision: ModelFailureDecision::Stop,
-        };
-        h.save(&checkpoint, Expected::Version(version)).unwrap();
-        let (mut failure, version) = h.load(origin).unwrap();
-        finish_failure(&mut failure, "error".into(), FailureCause::ModelError);
-        h.save(&failure, Expected::Version(version)).unwrap();
-        let fork = h.fork_by_entry_id(origin, occurrence).unwrap();
-        let (mut state, version) = h.load(fork).unwrap();
-        state.messages.push(Message::User {
-            content: "one".into(),
-        });
-        state.messages.push(Message::User {
-            content: "two".into(),
-        });
-        h.save(&state, Expected::Version(version)).unwrap();
-        let state = h.conversation(fork).unwrap();
-        let child = h
-            .fork_at_position(
-                fork,
-                ViewCursor {
-                    cursor: state.transcript.unwrap(),
-                    remaining: Some(1),
-                },
-            )
-            .unwrap();
+        let (h, origin, child) = task_input_reset_fork(&path);
         let calls = Arc::new(AtomicUsize::new(0));
         let mut registry = Registry::default();
         registry.register(
@@ -2357,4 +2362,200 @@ fn task_input_retries_origin_advance_during_fork_proof() {
             assert!(Documents::new(&store).get(&address).unwrap().is_some());
         }
     }
+}
+
+#[test]
+fn task_input_proof_store_failures_remain_storage_errors() {
+    use crate::document::{Address, Documents, TaskDocuments};
+    use crate::task::scheduler::{Handler, Registry, Step};
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn inject(transcript: bool, io_error: bool) {
+        let error = if io_error {
+            durable_store::Error::Storage(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("injected I/O failure".into()),
+            ))
+        } else {
+            durable_store::Error::LockPoisoned
+        };
+        let error = if transcript {
+            crate::reset_manifest::LookupError::Transcript(crate::transcript::Error::Store(error))
+        } else {
+            crate::reset_manifest::LookupError::Store(error)
+        };
+        crate::reset_manifest::CANDIDATE_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
+    }
+    struct Submit {
+        during_prepare: bool,
+        transcript: bool,
+        io_error: bool,
+        saw_storage: Arc<AtomicBool>,
+    }
+    impl Handler for Submit {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            let result = docs.submit_input("storage".into(), "hello".into());
+            if !self.during_prepare {
+                self.saw_storage.store(
+                    matches!(result, Err(crate::document::Error::TaskInputStore(_))),
+                    Ordering::SeqCst,
+                );
+                // A handler cannot turn an indeterminate storage failure into success.
+                return Ok(Step::Succeed(serde_json::json!(null)));
+            }
+            result.map_err(|e| e.to_string())?;
+            let address = Address {
+                scope: "test".into(),
+                name: "proof-storage".into(),
+                key: "".into(),
+            };
+            docs.get(&address).map_err(|e| e.to_string())?;
+            docs.put(
+                &address,
+                serde_json::json!({"ok":true}).as_object().unwrap().clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            inject(self.transcript, self.io_error);
+            Ok(Step::Succeed(serde_json::json!(null)))
+        }
+    }
+    assert!(matches!(
+        reset_manifest_lookup_error(crate::reset_manifest::LookupError::Invalid),
+        Error::Fork(crate::fork::Error::InvalidSnapshot)
+    ));
+    assert!(matches!(
+        reset_manifest_lookup_error(crate::reset_manifest::LookupError::Transcript(
+            crate::transcript::Error::Corrupt
+        )),
+        Error::Fork(crate::fork::Error::InvalidSnapshot)
+    ));
+    for (during_prepare, transcript, io_error) in [
+        (false, false, false),
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, _, child) = task_input_reset_fork(&path);
+        let record = h.owner.store().get(&Harness::key(child)).unwrap().unwrap();
+        inject(transcript, io_error);
+        let error = h
+            .validate_task_input_context(child, &record.value)
+            .unwrap_err();
+        if io_error {
+            assert!(
+                matches!(error, crate::document::Error::Store(durable_store::Error::Storage(rusqlite::Error::SqliteFailure(code, _))) if code.extended_code == rusqlite::ffi::SQLITE_IOERR)
+            );
+        } else {
+            assert!(matches!(
+                error,
+                crate::document::Error::Store(durable_store::Error::LockPoisoned)
+            ));
+        }
+        let saw_storage = Arc::new(AtomicBool::new(false));
+        let mut registry = Registry::default();
+        registry.register(
+            "submit",
+            true,
+            Submit {
+                during_prepare,
+                transcript,
+                io_error,
+                saw_storage: saw_storage.clone(),
+            },
+        );
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("submit".into(), true);
+        scheduler.submit(&task).unwrap();
+        if !during_prepare {
+            inject(transcript, io_error);
+        }
+        let error = scheduler.tick(0).unwrap_err();
+        let storage = match error {
+            crate::task_scheduler::Error::Document(crate::document::Error::TaskInputStore(
+                error,
+            )) => error,
+            crate::task_scheduler::Error::Document(crate::document::Error::Store(error)) => {
+                Arc::new(error)
+            }
+            other => panic!("expected storage error, got {other:?}"),
+        };
+        if io_error {
+            assert!(
+                matches!(&*storage, durable_store::Error::Storage(rusqlite::Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_IOERR)
+            );
+        } else {
+            assert!(matches!(&*storage, durable_store::Error::LockPoisoned));
+        }
+        assert_eq!(saw_storage.load(Ordering::SeqCst), !during_prepare);
+        let store = durable_store::Store::open(&path).unwrap();
+        let task = crate::task_store::TaskStore::new(&store)
+            .load(task.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.task.state(), &TaskState::Running);
+        assert!(h.conversation(child).unwrap().submissions.is_empty());
+        let address = Address {
+            scope: "test".into(),
+            name: "proof-storage".into(),
+            key: "".into(),
+        };
+        assert!(Documents::new(&store).get(&address).unwrap().is_none());
+        assert!(matches!(
+            scheduler.tick(0),
+            Err(crate::task_scheduler::Error::Poisoned)
+        ));
+    }
+}
+
+#[test]
+fn task_input_rejects_tampered_reset_proof_as_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, _, child) = task_input_reset_fork(&path);
+    let record = h.owner.store().get(&Harness::key(child)).unwrap().unwrap();
+    let (key, entry) = h
+        .owner
+        .store()
+        .list(b"runtime/reset-manifest/")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    h.owner
+        .store()
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: b"{}".to_vec(),
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        h.validate_task_input_context(child, &record.value),
+        Err(crate::document::Error::InvalidSessionAdmission(_))
+    ));
 }

@@ -17,6 +17,9 @@ const POLICY_PREFIX: &[u8] = b"durable/document-policy/";
 pub enum Error {
     #[error(transparent)]
     Store(#[from] durable_store::Error),
+    /// A task handler and scheduler share this storage failure until settlement.
+    #[error("storage: {0}")]
+    TaskInputStore(#[source] std::sync::Arc<durable_store::Error>),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -2063,6 +2066,7 @@ pub struct TaskDocuments<'a> {
     runtime_config: Option<crate::runtime::Config>,
     task_input: Option<TaskInputIntent>,
     pub(crate) task_input_conflict: Option<Vec<u8>>,
+    pub(crate) task_input_storage: Option<std::sync::Arc<durable_store::Error>>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -2088,6 +2092,7 @@ pub struct DetachedTaskDocuments {
     runtime_config: Option<crate::runtime::Config>,
     task_input: Option<TaskInputIntent>,
     pub(crate) task_input_conflict: Option<Vec<u8>>,
+    pub(crate) task_input_storage: Option<std::sync::Arc<durable_store::Error>>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -2205,6 +2210,9 @@ impl DetachedTaskDocuments {
                 key: crate::task_store::key(self.reservation.task.id()),
             }));
         }
+        if let Some(error) = &self.task_input_storage {
+            return Err(Error::TaskInputStore(error.clone()));
+        }
         if let Some(key) = &self.task_input_conflict {
             return Err(Error::Store(durable_store::Error::Conflict {
                 key: key.clone(),
@@ -2223,6 +2231,7 @@ impl DetachedTaskDocuments {
             runtime_config,
             task_input,
             task_input_conflict,
+            task_input_storage,
             signals,
             child_reads,
             mut keyed_children,
@@ -2242,6 +2251,7 @@ impl DetachedTaskDocuments {
             runtime_config,
             task_input: None,
             task_input_conflict,
+            task_input_storage,
             signals,
             child_reads,
             keyed_children: Vec::new(),
@@ -2314,6 +2324,7 @@ impl<'a> TaskDocuments<'a> {
             runtime_config,
             task_input,
             task_input_conflict,
+            task_input_storage,
             signals,
             child_reads,
             keyed_children,
@@ -2332,6 +2343,7 @@ impl<'a> TaskDocuments<'a> {
             runtime_config,
             task_input,
             task_input_conflict,
+            task_input_storage,
             signals,
             child_reads,
             keyed_children,
@@ -2354,6 +2366,7 @@ impl<'a> TaskDocuments<'a> {
             runtime_config: None,
             task_input: None,
             task_input_conflict: None,
+            task_input_storage: None,
             signals: StagedSignals::new(),
             child_reads: HashMap::new(),
             keyed_children: Vec::new(),
@@ -2427,6 +2440,24 @@ impl<'a> TaskDocuments<'a> {
         )
     }
 
+    fn remember_task_input_error(&mut self, error: Error) -> Error {
+        match error {
+            Error::Store(durable_store::Error::Conflict { key })
+            | Error::Signal(crate::task_store::Error::Store(durable_store::Error::Conflict {
+                key,
+            })) => {
+                self.task_input_conflict = Some(key.clone());
+                Error::Store(durable_store::Error::Conflict { key })
+            }
+            Error::Store(error) | Error::Signal(crate::task_store::Error::Store(error)) => {
+                let error = std::sync::Arc::new(error);
+                self.task_input_storage = Some(error.clone());
+                Error::TaskInputStore(error)
+            }
+            error => error,
+        }
+    }
+
     fn stage_submission(
         &mut self,
         request_id: String,
@@ -2441,18 +2472,22 @@ impl<'a> TaskDocuments<'a> {
         {
             return Err(Error::ReadAfterWrite);
         }
-        let crate::task::TaskOwner::Conversation(conversation) = self.task.owner() else {
-            return Err(Error::InvalidSessionAdmission(
-                "task must be directly conversation-owned".into(),
-            ));
+        let conversation = match self.task.owner() {
+            crate::task::TaskOwner::Conversation(id) => *id,
+            _ => {
+                return Err(Error::InvalidSessionAdmission(
+                    "task must be directly conversation-owned".into(),
+                ));
+            }
         };
         if request_id.is_empty() {
             return Err(Error::InvalidSessionAdmission("request ID required".into()));
         }
-        let key = crate::runtime::Harness::key(*conversation);
+        let key = crate::runtime::Harness::key(conversation);
         let record = self
             .store
-            .get(&key)?
+            .get(&key)
+            .map_err(|error| self.remember_task_input_error(Error::Store(error)))?
             .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
         after_snapshot();
         let validation = (|| {
@@ -2470,7 +2505,7 @@ impl<'a> TaskDocuments<'a> {
                             "task submission requires an attached harness".into(),
                         )
                     })?
-                    .validate_task_input_context(*conversation, &record.value)?;
+                    .validate_task_input_context(conversation, &record.value)?;
             } else if self.input_validator.is_none() {
                 return Err(Error::InvalidSessionAdmission(
                     "task submission requires an attached harness".into(),
@@ -2478,10 +2513,7 @@ impl<'a> TaskDocuments<'a> {
             }
             Ok(is_new)
         })();
-        if let Err(Error::Store(durable_store::Error::Conflict { key })) = &validation {
-            self.task_input_conflict = Some(key.clone());
-        }
-        let is_new = validation?;
+        let is_new = validation.map_err(|error| self.remember_task_input_error(error))?;
         let notification_binding = if is_new {
             notify
                 .as_ref()
@@ -2490,7 +2522,7 @@ impl<'a> TaskDocuments<'a> {
             None
         };
         self.task_input = Some(TaskInputIntent {
-            conversation: *conversation,
+            conversation,
             version: record.version,
             request_id,
             draft,
@@ -4172,6 +4204,7 @@ mod detached_task_documents_tests {
             runtime_config: docs.runtime_config.clone(),
             task_input: docs.task_input.clone(),
             task_input_conflict: docs.task_input_conflict.clone(),
+            task_input_storage: docs.task_input_storage.clone(),
             signals: StagedSignals {
                 batch: OwnedBatch {
                     checks: docs.signals.batch.checks.clone(),

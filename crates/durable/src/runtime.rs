@@ -4000,12 +4000,10 @@ fn check_task_notification_binding(
 
 fn reset_manifest_lookup_error(error: crate::reset_manifest::LookupError) -> Error {
     match error {
-        crate::reset_manifest::LookupError::Store(
-            error @ durable_store::Error::Conflict { .. },
-        )
-        | crate::reset_manifest::LookupError::Transcript(crate::transcript::Error::Store(
-            error @ durable_store::Error::Conflict { .. },
-        )) => Error::Storage(error),
+        crate::reset_manifest::LookupError::Store(error)
+        | crate::reset_manifest::LookupError::Transcript(crate::transcript::Error::Store(error)) => {
+            Error::Storage(error)
+        }
         _ => Error::Fork(crate::fork::Error::InvalidSnapshot),
     }
 }
@@ -4013,19 +4011,23 @@ fn reset_manifest_lookup_error(error: crate::reset_manifest::LookupError) -> Err
 fn task_input_admission_error(error: Error) -> crate::document::Error {
     use crate::document::Error as DError;
     match error {
-        Error::Storage(error @ durable_store::Error::Conflict { .. })
-        | Error::Transcript(crate::transcript::Error::Store(
-            error @ durable_store::Error::Conflict { .. },
+        Error::Storage(error)
+        | Error::Owner(OwnerError::Store(error))
+        | Error::Transcript(crate::transcript::Error::Store(error))
+        | Error::Progress(crate::progress::Error::Store(error))
+        | Error::ToolProgress(crate::tool_progress::Error::Store(error))
+        | Error::Signal(crate::conversation_signal::Error::Store(error))
+        | Error::Observer(crate::observer::Error::Store(error))
+        | Error::Fork(crate::fork::Error::Observer(crate::observer::Error::Store(error)))
+        | Error::Document(DError::Store(error))
+        | Error::Document(DError::Signal(crate::task_store::Error::Store(error)))
+        | Error::TaskScheduler(crate::task_scheduler::Error::Store(
+            crate::task_store::Error::Store(error),
         ))
-        | Error::Observer(crate::observer::Error::Store(
-            error @ durable_store::Error::Conflict { .. },
-        ))
-        | Error::Fork(crate::fork::Error::Observer(crate::observer::Error::Store(
-            error @ durable_store::Error::Conflict { .. },
-        )))
-        | Error::Document(DError::Store(error @ durable_store::Error::Conflict { .. })) => {
+        | Error::TaskScheduler(crate::task_scheduler::Error::Document(DError::Store(error))) => {
             DError::Store(error)
         }
+        Error::Document(DError::TaskInputStore(error)) => DError::TaskInputStore(error),
         other => DError::InvalidSessionAdmission(other.to_string()),
     }
 }

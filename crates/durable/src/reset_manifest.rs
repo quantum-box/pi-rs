@@ -37,6 +37,7 @@ pub(crate) enum LookupError {
 #[cfg(test)]
 thread_local! {
     pub(crate) static BEFORE_CANDIDATE_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static CANDIDATE_ERROR: std::cell::RefCell<Option<LookupError>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn candidate_prefix(id: Uuid, entry: Uuid, sequence: u64) -> Vec<u8> {
@@ -191,6 +192,10 @@ pub(crate) fn lookup_candidate(
             hook();
         }
     });
+    #[cfg(test)]
+    if let Some(error) = CANDIDATE_ERROR.with(|slot| slot.borrow_mut().take()) {
+        return Err(error);
+    }
     store.commit(&checks, &[])?;
     Ok(Some(RawCandidate {
         bytes: manifest.value,

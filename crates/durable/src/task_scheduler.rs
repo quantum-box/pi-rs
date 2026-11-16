@@ -1045,7 +1045,9 @@ impl DetachedInvocation {
             let documents = documents.detach(owner.clone(), &running)?;
             // A checked input proof invalidates the entire attempt even when
             // a handler stringifies or ignores the document error.
-            let result = if documents.task_input_conflict.is_some() {
+            let result = if documents.task_input_conflict.is_some()
+                || documents.task_input_storage.is_some()
+            {
                 Ok(Step::Continue(running.task.checkpoint().clone()))
             } else {
                 result
@@ -1065,6 +1067,11 @@ impl DetachedInvocation {
             let mut state = lease.state.lock().map_err(|_| Error::Poisoned)?;
             let abort_intent = match &result {
                 InvocationResult::Abort(_) => true,
+                InvocationResult::Handler(_, documents)
+                    if documents.task_input_storage.is_some() =>
+                {
+                    true
+                }
                 // A non-replay-safe input conflict will settle as an owned
                 // failure, so publish its fence before dependent work can run.
                 InvocationResult::Handler(_, documents)
@@ -3643,6 +3650,9 @@ impl Scheduler {
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
         let owner = self.owner();
+        if let Some(error) = &documents.task_input_storage {
+            return Err(crate::document::Error::TaskInputStore(error.clone()).into());
+        }
         #[cfg(test)]
         if let Some(hook) = &self.after_order_hook {
             hook(0, owner.store());
