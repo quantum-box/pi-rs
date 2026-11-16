@@ -174,60 +174,6 @@ pub(crate) fn lookup_candidate(
     if store.commit_for_version(&anchor, anchor_entry.version)? != Some(reference_sequence) {
         return Err(LookupError::Invalid);
     }
-    let shared_reference = serde_json::from_slice::<SharedReference>(&reference.value).ok();
-    let mut chunks = Vec::new();
-    let mut chunked_bytes = None;
-    let shared = match serde_json::from_slice::<SharedReference>(&reference.value) {
-        Ok(reference)
-            if (reference.version == 2 || reference.version == 3) && !reference.batch.is_nil() =>
-        {
-            let batch_key = shared_key(id, reference.batch);
-            let entry = store
-                .get_bounded(&batch_key, MAX_SHARED_MANIFEST_BYTES)?
-                .ok_or(LookupError::Invalid)?;
-            if store.commit_for_version(&batch_key, entry.version)? != Some(reference_sequence) {
-                return Err(LookupError::Invalid);
-            }
-            if reference.version == 3 {
-                let header: ChunkHeader =
-                    serde_json::from_slice(&entry.value).map_err(|_| LookupError::Invalid)?;
-                if header.version != 3 || header.chunks == 0 {
-                    return Err(LookupError::Invalid);
-                }
-                let mut bytes = Vec::new();
-                for index in 0..header.chunks {
-                    #[cfg(test)]
-                    RESET_MANIFEST_CHUNK_READS.with(|count| count.set(count.get() + 1));
-                    let chunk_key = chunk_key(id, reference.batch, index);
-                    let chunk = store
-                        .get_bounded(&chunk_key, MANIFEST_CHUNK_BYTES)?
-                        .ok_or(LookupError::Invalid)?;
-                    if store.commit_for_version(&chunk_key, chunk.version)?
-                        != Some(reference_sequence)
-                        || chunk.value.is_empty()
-                        || (index + 1 < header.chunks && chunk.value.len() != MANIFEST_CHUNK_BYTES)
-                    {
-                        return Err(LookupError::Invalid);
-                    }
-                    bytes.extend_from_slice(&chunk.value);
-                    chunks.push((chunk_key, chunk.version));
-                }
-                chunked_bytes = Some(bytes);
-            }
-            Some((batch_key, entry))
-        }
-        Ok(_) => return Err(LookupError::Invalid),
-        Err(_) => None,
-    };
-    if chunked_bytes.is_none()
-        && let Some((_, batch)) = &shared
-    {
-        let header: serde_json::Value =
-            serde_json::from_slice(&batch.value).map_err(|_| LookupError::Invalid)?;
-        if header.get("version") != Some(&serde_json::json!(2)) {
-            return Err(LookupError::Invalid);
-        }
-    }
     let root = format!("runtime/conversation/{id}").into_bytes();
     // These are runtime-owned snapshots, whose size scales with the admitted
     // conversation. They are already read by the runtime without a fixed cap;
@@ -289,6 +235,109 @@ pub(crate) fn lookup_candidate(
         .ok_or(LookupError::Invalid)?;
     if reference_sequence != sequence {
         return Err(LookupError::Invalid);
+    }
+    // Prove the anchor, event, root commit and transcript evidence before
+    // reading even the first manifest chunk.
+    if store.commit_for_version(&event_key, event.version)? != Some(sequence)
+        || store.commit_for_version(&entry_key, entry_version)? != Some(sequence)
+        || store.commit_for_version(&anchor_entry_key, anchor_entry_version)? != Some(sequence)
+        || !store.runtime_snapshot_exact_at(&root, fork_prefix.as_bytes(), &anchor, sequence)?
+    {
+        return Err(LookupError::Invalid);
+    }
+    // Each cut occupies one distinct transcript sequence and its canonical
+    // encoding is below 512 bytes. Retain an 8 MiB allowance for fixed fields
+    // and existing v3 encodings while bounding work by authenticated history.
+    let anchor_sequence = anchor_cursor
+        .entry_identity()
+        .ok_or(LookupError::Invalid)?
+        .1;
+    let manifest_limit = usize::try_from(anchor_sequence)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(512)
+        .saturating_add(MAX_SHARED_MANIFEST_BYTES);
+    let shared_reference = serde_json::from_slice::<SharedReference>(&reference.value).ok();
+    let mut chunks = Vec::new();
+    let mut chunked_bytes = None;
+    let shared = match serde_json::from_slice::<SharedReference>(&reference.value) {
+        Ok(reference)
+            if (reference.version == 2 || reference.version == 3) && !reference.batch.is_nil() =>
+        {
+            let batch_key = shared_key(id, reference.batch);
+            let entry = store
+                .get_bounded(&batch_key, MAX_SHARED_MANIFEST_BYTES)?
+                .ok_or(LookupError::Invalid)?;
+            if store.commit_for_version(&batch_key, entry.version)? != Some(reference_sequence) {
+                return Err(LookupError::Invalid);
+            }
+            if reference.version == 3 {
+                let resets = anchor_json
+                    .pointer("/documents/pi-rs~1runtime~1resets")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or(LookupError::Invalid)?;
+                if event_json
+                    .get("resets")
+                    .and_then(serde_json::Value::as_array)
+                    != Some(resets)
+                {
+                    return Err(LookupError::Invalid);
+                }
+                // Each batch cut also places a reset in this authenticated
+                // snapshot. Bound by both independently committed counts.
+                let manifest_limit = manifest_limit.min(
+                    resets
+                        .len()
+                        .saturating_mul(512)
+                        .saturating_add(MAX_SHARED_MANIFEST_BYTES),
+                );
+                let header: ChunkHeader =
+                    serde_json::from_slice(&entry.value).map_err(|_| LookupError::Invalid)?;
+                if header.version != 3
+                    || header.chunks == 0
+                    || header
+                        .chunks
+                        .saturating_sub(1)
+                        .saturating_mul(MANIFEST_CHUNK_BYTES)
+                        >= manifest_limit
+                {
+                    return Err(LookupError::Invalid);
+                }
+                let mut bytes = Vec::new();
+                for index in 0..header.chunks {
+                    #[cfg(test)]
+                    RESET_MANIFEST_CHUNK_READS.with(|count| count.set(count.get() + 1));
+                    let chunk_key = chunk_key(id, reference.batch, index);
+                    let chunk = store
+                        .get_bounded(&chunk_key, MANIFEST_CHUNK_BYTES)?
+                        .ok_or(LookupError::Invalid)?;
+                    if store.commit_for_version(&chunk_key, chunk.version)?
+                        != Some(reference_sequence)
+                        || chunk.value.is_empty()
+                        || (index + 1 < header.chunks && chunk.value.len() != MANIFEST_CHUNK_BYTES)
+                    {
+                        return Err(LookupError::Invalid);
+                    }
+                    if bytes.len().saturating_add(chunk.value.len()) > manifest_limit {
+                        return Err(LookupError::Invalid);
+                    }
+                    bytes.extend_from_slice(&chunk.value);
+                    chunks.push((chunk_key, chunk.version));
+                }
+                chunked_bytes = Some(bytes);
+            }
+            Some((batch_key, entry))
+        }
+        Ok(_) => return Err(LookupError::Invalid),
+        Err(_) => None,
+    };
+    if chunked_bytes.is_none()
+        && let Some((_, batch)) = &shared
+    {
+        let header: serde_json::Value =
+            serde_json::from_slice(&batch.value).map_err(|_| LookupError::Invalid)?;
+        if header.get("version") != Some(&serde_json::json!(2)) {
+            return Err(LookupError::Invalid);
+        }
     }
     let shared_sequence = shared
         .as_ref()
@@ -711,6 +760,20 @@ mod tests {
         revision: u64,
     }
 
+    fn fixture_with_reset_evidence(f: &LookupFixture, key: &[u8]) -> Vec<u8> {
+        let value = f.store.get(key).unwrap().unwrap().value;
+        if key != f.anchor && key != f.event {
+            return value;
+        }
+        let mut json: serde_json::Value = serde_json::from_slice(&value).unwrap();
+        if key == f.anchor {
+            json["documents"] = serde_json::json!({"pi-rs/runtime/resets": [{}, {}]});
+        } else {
+            json["resets"] = serde_json::json!([{}, {}]);
+        }
+        serde_json::to_vec(&json).unwrap()
+    }
+
     fn lookup_fixture(include_root: bool) -> LookupFixture {
         use durable_store::Mutation;
         let dir = tempfile::tempdir().unwrap();
@@ -1114,7 +1177,7 @@ mod tests {
             .iter()
             .map(|key| Mutation::Put {
                 key: (*key).clone(),
-                value: f.store.get(key).unwrap().unwrap().value,
+                value: fixture_with_reset_evidence(&f, key),
             })
             .collect();
         mutations.push(Mutation::Put {
@@ -1173,6 +1236,177 @@ mod tests {
     }
 
     #[test]
+    fn valid_manifest_over_eight_mib_survives_bounded_lookup() {
+        use durable_store::{Check, Expected, Mutation};
+        let f = lookup_fixture(true);
+        let transcript = crate::transcript::Transcript::new(&f.store, f.id);
+        let (entry, _) = transcript.entry_evidence(&f.cursor).unwrap();
+        let (last, _) = transcript.entry_evidence(&f.final_cursor).unwrap();
+        let count = 40_000u64;
+        let mut cursor_json = serde_json::to_value(&f.final_cursor).unwrap();
+        cursor_json["next"]["sequence"] = serde_json::json!(count + 10);
+        let mut entry_json: serde_json::Value =
+            serde_json::from_slice(&f.store.get(&last).unwrap().unwrap().value).unwrap();
+        entry_json["sequence"] = serde_json::json!(count + 10);
+        entry_json["previous"]["sequence"] = serde_json::json!(count + 9);
+        let resets = vec![serde_json::json!({}); count as usize];
+        let mut anchor: serde_json::Value =
+            serde_json::from_slice(&f.store.get(&f.anchor).unwrap().unwrap().value).unwrap();
+        anchor["_transcript"] = cursor_json.clone();
+        anchor["documents"] = serde_json::json!({"pi-rs/runtime/resets": resets});
+        let mut event: serde_json::Value =
+            serde_json::from_slice(&f.store.get(&f.event).unwrap().unwrap().value).unwrap();
+        event["_transcript"] = cursor_json;
+        event["resets"] = anchor["documents"]["pi-rs/runtime/resets"].clone();
+
+        let (mut manifest, mut binding) = fixture();
+        manifest.version = 3;
+        manifest.cuts = (0..count)
+            .map(|i| ResetCut {
+                reset_id: id(100_000 + i as u128),
+                context_generation: id(200_000 + i as u128),
+                write_limit: u64::MAX,
+                cursor: cursor(manifest.conversation_id, 300_000 + i as u128, i + 8),
+                state_sha256: "a".repeat(64),
+            })
+            .collect();
+        manifest.anchor_cursor = manifest.cuts.last().unwrap().cursor.clone();
+        binding.cuts = manifest.cuts.clone();
+        binding.anchor_cursor = manifest.anchor_cursor.clone();
+        let bytes = manifest.encode(&binding).unwrap();
+        assert!(bytes.len() > MAX_SHARED_MANIFEST_BYTES);
+
+        let batch = Uuid::new_v4();
+        let mut mutations = vec![
+            Mutation::Put {
+                key: f.root.clone(),
+                value: f.store.get(&f.root).unwrap().unwrap().value,
+            },
+            Mutation::Put {
+                key: f.anchor.clone(),
+                value: serde_json::to_vec(&anchor).unwrap(),
+            },
+            Mutation::Put {
+                key: f.event.clone(),
+                value: serde_json::to_vec(&event).unwrap(),
+            },
+            Mutation::Put {
+                key: entry.clone(),
+                value: f.store.get(&entry).unwrap().unwrap().value,
+            },
+            Mutation::Put {
+                key: last,
+                value: serde_json::to_vec(&entry_json).unwrap(),
+            },
+            Mutation::Put {
+                key: f.manifest.clone(),
+                value: serde_json::to_vec(&SharedReference { version: 3, batch }).unwrap(),
+            },
+            Mutation::Put {
+                key: shared_key(f.id, batch),
+                value: serde_json::to_vec(&ChunkHeader {
+                    version: 3,
+                    chunks: bytes.len().div_ceil(MANIFEST_CHUNK_BYTES),
+                })
+                .unwrap(),
+            },
+        ];
+        mutations.extend(
+            bytes
+                .chunks(MANIFEST_CHUNK_BYTES)
+                .enumerate()
+                .map(|(i, chunk)| Mutation::Put {
+                    key: chunk_key(f.id, batch, i),
+                    value: chunk.to_vec(),
+                }),
+        );
+        f.store
+            .commit(
+                &[Check {
+                    key: b"durable/document-fork-revision".to_vec(),
+                    expected: Expected::DocumentRevision(f.revision),
+                }],
+                &mutations,
+            )
+            .unwrap();
+        let found = lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ResetManifest::decode(&found.bytes, &binding).unwrap(),
+            manifest
+        );
+    }
+
+    #[test]
+    fn chunked_lookup_rejects_forged_anchor_before_reading_chunks() {
+        use durable_store::{Check, Expected, Mutation};
+        for missing in ["root", "observer", "mismatch", "none"] {
+            let f = lookup_fixture(true);
+            let transcript = crate::transcript::Transcript::new(&f.store, f.id);
+            let (entry, _) = transcript.entry_evidence(&f.cursor).unwrap();
+            let (last, _) = transcript.entry_evidence(&f.final_cursor).unwrap();
+            let batch = Uuid::new_v4();
+            let mut mutations: Vec<_> = [&f.root, &f.anchor, &f.event, &entry, &last]
+                .into_iter()
+                .filter(|key| {
+                    !(missing == "root" && *key == &f.root)
+                        && !(missing == "observer" && *key == &f.event)
+                })
+                .map(|key| {
+                    let mut value = fixture_with_reset_evidence(&f, key);
+                    if missing == "mismatch" && key == &f.event {
+                        let mut event: serde_json::Value = serde_json::from_slice(&value).unwrap();
+                        event["resets"] = serde_json::json!([]);
+                        value = serde_json::to_vec(&event).unwrap();
+                    }
+                    Mutation::Put {
+                        key: key.clone(),
+                        value,
+                    }
+                })
+                .collect();
+            mutations.extend([
+                Mutation::Put {
+                    key: f.manifest.clone(),
+                    value: serde_json::to_vec(&SharedReference { version: 3, batch }).unwrap(),
+                },
+                Mutation::Put {
+                    key: shared_key(f.id, batch),
+                    value: serde_json::to_vec(&ChunkHeader {
+                        version: 3,
+                        chunks: 1_000_000,
+                    })
+                    .unwrap(),
+                },
+                Mutation::Put {
+                    key: chunk_key(f.id, batch, 0),
+                    value: vec![b'x'; MANIFEST_CHUNK_BYTES],
+                },
+            ]);
+            f.store
+                .commit(
+                    &[Check {
+                        key: b"durable/document-fork-revision".to_vec(),
+                        expected: Expected::DocumentRevision(f.revision),
+                    }],
+                    &mutations,
+                )
+                .unwrap();
+            RESET_MANIFEST_CHUNK_READS.with(|count| count.set(0));
+            assert!(
+                lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err(),
+                "{missing}"
+            );
+            assert_eq!(
+                RESET_MANIFEST_CHUNK_READS.with(std::cell::Cell::get),
+                0,
+                "{missing}"
+            );
+        }
+    }
+
+    #[test]
     fn chunked_lookup_rejects_foreign_reference_before_reading_chunks() {
         let f = lookup_fixture(true);
         let batch = Uuid::new_v4();
@@ -1202,6 +1436,15 @@ mod tests {
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)
+    }
+
+    #[test]
+    fn canonical_cut_fits_assembly_budget() {
+        let (manifest, _) = fixture();
+        let mut cut = manifest.cuts[0].clone();
+        cut.write_limit = u64::MAX;
+        cut.cursor.next.as_mut().unwrap().sequence = u64::MAX;
+        assert!(serde_json::to_vec(&cut).unwrap().len() < 512);
     }
 
     fn cursor(conversation: Uuid, entry: u128, sequence: u64) -> ManifestCursor {

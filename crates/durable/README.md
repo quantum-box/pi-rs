@@ -1751,6 +1751,8 @@ Display forks validate transcript occurrence and reset provenance even when the 
 
 This is a fail-closed subset: a valid conversation with a root or historical snapshot over 8 MiB, including one produced by a large reset batch, cannot use display-entry forks. Ordinary occurrence-based forks retain their large-reset support.
 
+Chunked reset proof lookup authenticates the root, anchor, observer, document fence and transcript entries before reading chunks. Assembly is limited to 8 MiB plus 512 bytes per reset, bounded also by the authenticated transcript sequence; normal writer-produced manifests above 8 MiB remain supported.
+
 A task handler can call `TaskDocuments::checkpoint_runtime()` after staging an entry and before staging further entries. It writes a fresh observation and fork snapshot of the unchanged runtime state, plus an ordered proof identifying entries on either side of that checkpoint, in the task settlement transaction. The task, ancestry, conversation version, observer head, entries and document writes remain fenced together. Forks at those entries use the proven snapshot; document state is the final state of that commit. A concurrent runtime change causes the normal task replay or reconciliation policy to apply. This checkpoint does not itself change model context or configuration.
 
 The verifier checks that the proof starts at the preceding application-log length and names the immediately preceding runtime snapshot. The proof is a trusted runtime record, not a cryptographic attestation: a caller that writes directly into reserved storage namespaces can forge an internally consistent checkpoint and ordering claim.
