@@ -17,6 +17,28 @@ const SIGNAL_REVISION_PREFIX: &[u8] = b"durable/signal-revision/";
 const SUBMISSION_SETTLED_NAME: &str = "pi.submission-settled";
 const SUBMISSION_SETTLED_VERSION: u32 = 1;
 
+fn is_submission_settled(token: &SignalToken) -> bool {
+    token.name() == SUBMISSION_SETTLED_NAME && token.version() == SUBMISSION_SETTLED_VERSION
+}
+
+fn validate_builtin_receipt(signal: &Signal) -> Result<(), Error> {
+    let typed = signal.typed.as_ref().ok_or(Error::InvalidSignalToken)?;
+    if signal.name != SUBMISSION_SETTLED_NAME {
+        return Err(Error::InvalidSignalToken);
+    }
+    if typed.version != SUBMISSION_SETTLED_VERSION {
+        return Err(Error::NewerSignalVersion {
+            stored: typed.version,
+            current: SUBMISSION_SETTLED_VERSION,
+        });
+    }
+    if !signal.expired {
+        crate::runtime::submission_settled_signal()
+            .read_value(signal.payload.clone(), typed.version)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -292,8 +314,7 @@ impl Signal {
         let payload = token.read_value(payload, token.version)?;
         // A caller can construct an unconstrained token with the built-in
         // identity. Never let it bypass the built-in payload schema.
-        if token.name() == SUBMISSION_SETTLED_NAME && token.version() == SUBMISSION_SETTLED_VERSION
-        {
+        if is_submission_settled(token) {
             crate::runtime::submission_settled_signal()
                 .read_value(payload.clone(), SUBMISSION_SETTLED_VERSION)?;
         }
@@ -609,12 +630,25 @@ impl<'a> TaskStore<'a> {
     /// Durably enqueue a signal. The same task/ID/content can be retried safely.
     /// A conflicting ID returns SignalMismatch. Signals are retained as receipts.
     pub fn send_signal(&self, signal: &Signal) -> Result<(), Error> {
+        let builtin = signal.typed.as_ref().is_some_and(|typed| {
+            typed.key.signal == SUBMISSION_SETTLED_NAME
+                && typed.version == SUBMISSION_SETTLED_VERSION
+        });
+        if builtin {
+            // Incoming expiry is not authoritative: delivery recalculates it.
+            let mut candidate = signal.clone();
+            candidate.expired = false;
+            validate_builtin_receipt(&candidate)?;
+        }
         let k = signal_key(signal.task_id, signal.id);
         let mut fresh = signal.clone();
         fresh.consumed = false;
         loop {
             if let Some(entry) = self.store.get(&k)? {
                 let old: Signal = serde_json::from_slice(&entry.value)?;
+                if builtin {
+                    validate_builtin_receipt(&old)?;
+                }
                 if old.expired {
                     return Err(Error::SignalKeyConsumed);
                 }
@@ -643,6 +677,9 @@ impl<'a> TaskStore<'a> {
                 for (_, entry) in self.store.list(&signal_task_prefix(signal.task_id))? {
                     let old: Signal = serde_json::from_slice(&entry.value)?;
                     if old.typed_key() == Some(typed_key) {
+                        if builtin {
+                            validate_builtin_receipt(&old)?;
+                        }
                         if old.expired {
                             return Err(Error::SignalKeyConsumed);
                         }
@@ -878,17 +915,7 @@ impl<'a> TaskStore<'a> {
                 // built-in key. Do not let an incompatible value silently
                 // impersonate a settled submission during notification.
                 if builtin {
-                    let version = old.typed.as_ref().expect("matching typed key").version;
-                    if version != SUBMISSION_SETTLED_VERSION {
-                        return Err(Error::NewerSignalVersion {
-                            stored: version,
-                            current: SUBMISSION_SETTLED_VERSION,
-                        });
-                    }
-                    if !old.expired {
-                        crate::runtime::submission_settled_signal()
-                            .read_value(old.payload.clone(), version)?;
-                    }
+                    validate_builtin_receipt(old)?;
                 }
                 return Ok((
                     if old.expired {
@@ -1132,9 +1159,15 @@ impl<'a> TaskStore<'a> {
     ) -> Result<Option<Value>, Error> {
         let key = token.key(key)?;
         let mut found = None;
-        for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
+        for (receipt_key, entry) in self.store.list(&signal_task_prefix(task_id))? {
             let signal: Signal = serde_json::from_slice(&entry.value)?;
             if signal.typed_key() == Some(&key) {
+                if is_submission_settled(token) {
+                    if signal.task_id != task_id || receipt_key != signal_key(task_id, signal.id) {
+                        return Err(Error::InvalidKey);
+                    }
+                    validate_builtin_receipt(&signal)?;
+                }
                 // Historical duplicate keys are ambiguous and must not silently
                 // select an arbitrary value.
                 if found.is_some() {
@@ -1165,9 +1198,15 @@ impl<'a> TaskStore<'a> {
     ) -> Result<Option<SignalState>, Error> {
         let key = token.key(key)?;
         let mut found = None;
-        for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
+        for (receipt_key, entry) in self.store.list(&signal_task_prefix(task_id))? {
             let signal: Signal = serde_json::from_slice(&entry.value)?;
             if signal.typed_key() == Some(&key) {
+                if is_submission_settled(token) {
+                    if signal.task_id != task_id || receipt_key != signal_key(task_id, signal.id) {
+                        return Err(Error::InvalidKey);
+                    }
+                    validate_builtin_receipt(&signal)?;
+                }
                 if found.is_some() {
                     return Err(Error::SignalKeyMismatch);
                 }
@@ -1676,6 +1715,52 @@ mod tests {
     }
 
     #[test]
+    fn builtin_send_and_reads_reject_tampered_payloads() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let t = task(1, 3);
+        ts.save(&[Save::Create(&t)]).unwrap();
+        let builtin = crate::runtime::submission_settled_signal();
+        let unconstrained = SignalToken::new(SUBMISSION_SETTLED_NAME, 1).unwrap();
+        let generic = SignalToken::new(SUBMISSION_SETTLED_NAME, 2).unwrap();
+        let valid = json!({"id":Uuid::new_v4(), "conversationId":Uuid::new_v4(), "type":"input", "status":"unanswered", "reason":"failed"});
+        let mut receipt =
+            Signal::new_typed(Uuid::new_v4(), t.id(), &builtin, "tampered", valid).unwrap();
+        receipt.payload = json!({"id":"not-a-uuid"});
+        assert!(matches!(
+            ts.send_signal(&receipt),
+            Err(Error::InvalidSignalPayload)
+        ));
+        assert!(ts.signal(t.id(), receipt.id).unwrap().is_none());
+        // A pre-hardening record remains readable by unrelated generic v2,
+        // but neither form of the builtin v1 token may read its payload.
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: signal_key(t.id(), receipt.id),
+                value: serde_json::to_vec(&receipt).unwrap(),
+            }],
+        )
+        .unwrap();
+        for token in [&builtin, &unconstrained] {
+            assert!(matches!(
+                ts.read_typed_signal(t.id(), token, "tampered"),
+                Err(Error::InvalidSignalPayload)
+            ));
+            assert!(matches!(
+                ts.read_typed_signal_state(t.id(), token, "tampered"),
+                Err(Error::InvalidSignalPayload)
+            ));
+        }
+        // The legacy v2 reader needs its usual migration to read a v1 value.
+        let generic = generic.with_migration(|value, _| Ok(value));
+        assert_eq!(
+            ts.read_typed_signal(t.id(), &generic, "tampered").unwrap(),
+            Some(receipt.payload)
+        );
+    }
+
+    #[test]
     fn builtin_expired_receipts_require_version_one() {
         for version in [0, 1, 2, u32::MAX] {
             let db = Store::memory().unwrap();
@@ -1707,9 +1792,24 @@ mod tests {
             let result = ts.deliver_signal_at(t.id(), &token, "expired", value, 0);
             if version == 1 {
                 assert_eq!(result.unwrap(), SignalResult::Closed);
+                assert_eq!(
+                    ts.read_typed_signal_state(t.id(), &token, "expired")
+                        .unwrap(),
+                    Some(SignalState::Expired)
+                );
+                assert!(matches!(
+                    ts.read_typed_signal(t.id(), &token, "expired"),
+                    Err(Error::SignalKeyConsumed)
+                ));
             } else {
                 assert!(
                     matches!(result, Err(Error::NewerSignalVersion { stored, current: 1 }) if stored == version)
+                );
+                assert!(
+                    matches!(ts.read_typed_signal_state(t.id(), &token, "expired"), Err(Error::NewerSignalVersion { stored, current: 1 }) if stored == version)
+                );
+                assert!(
+                    matches!(ts.read_typed_signal(t.id(), &token, "expired"), Err(Error::NewerSignalVersion { stored, current: 1 }) if stored == version)
                 );
             }
             let generic = SignalToken::new(SUBMISSION_SETTLED_NAME, 2).unwrap();
@@ -1717,6 +1817,11 @@ mod tests {
                 ts.deliver_signal_at(t.id(), &generic, "expired", json!(null), 0)
                     .unwrap(),
                 SignalResult::Closed
+            );
+            assert_eq!(
+                ts.read_typed_signal_state(t.id(), &generic, "expired")
+                    .unwrap(),
+                Some(SignalState::Expired)
             );
         }
     }
