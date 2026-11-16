@@ -15,7 +15,7 @@ jsonschema = { version = "0.33", default-features = false }
 regex = "1"
 ryu-js = "1.0.3"
 pi-rs-tool-arguments = { path = "../tool-arguments", version = "0.1.0" }
-serde = { version = "1", features = ["derive", "rc"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
@@ -23,7 +23,6 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 hmac = "0.12"
-im = { version = "15", features = ["serde"] }
 tempfile = "3"
 
 [dev-dependencies]

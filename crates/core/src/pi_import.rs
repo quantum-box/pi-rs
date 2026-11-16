@@ -1,9 +1,26 @@
 //! Pi session conversion shared by the importer and journal validation.
+use crate::persistent_map::PersistentMap;
 use crate::{Error, Event, Invocation, Outcome, Result, ToolCall, Usage};
 use base64::Engine;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+struct StoreView<'a>(&'a PersistentMap<Arc<str>, Arc<Value>>);
+
+impl serde::Serialize for StoreView<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in self.0.iter() {
+            map.serialize_entry(key.as_ref(), value.as_ref())?;
+        }
+        map.end()
+    }
+}
 use uuid::Uuid;
 
 // Mirrors the Google adapter without making core depend on a provider crate.
@@ -82,14 +99,14 @@ pub struct Branch {
     pub head: u64,
     pub entry_start: u64,
     pub context_target: Option<u64>,
-    pub calls: im::OrdMap<Arc<str>, Uuid>,
-    pub ambiguous_calls: im::OrdSet<Arc<str>>,
+    pub(crate) calls: PersistentMap<Arc<str>, Uuid>,
+    pub(crate) ambiguous_calls: PersistentMap<Arc<str>, ()>,
     pub missing_ancestors: bool,
     pub ancestry_index: usize,
     pub model: Arc<str>,
     pub provider: Option<Arc<str>>,
     pub thinking: Option<Arc<str>>,
-    pub store: im::OrdMap<Arc<str>, Arc<Value>>,
+    pub(crate) store: PersistentMap<Arc<str>, Arc<Value>>,
 }
 
 /// A buffering hint only. Ownership must still be established by replay.
@@ -152,14 +169,14 @@ pub fn conversion_count_hint(entry: &Value) -> Option<u64> {
 fn conversion_equal(
     expected: &Event,
     actual: &Event,
-    ids: &mut im::OrdMap<Uuid, Uuid>,
-    reverse: &mut im::OrdMap<Uuid, Uuid>,
+    ids: &mut PersistentMap<Uuid, Uuid>,
+    reverse: &mut PersistentMap<Uuid, Uuid>,
 ) -> Result<bool> {
     fn bind(
         expected: Uuid,
         actual: Uuid,
-        ids: &mut im::OrdMap<Uuid, Uuid>,
-        reverse: &mut im::OrdMap<Uuid, Uuid>,
+        ids: &mut PersistentMap<Uuid, Uuid>,
+        reverse: &mut PersistentMap<Uuid, Uuid>,
     ) -> bool {
         if ids.get(&expected).is_some_and(|value| *value != actual)
             || reverse.get(&actual).is_some_and(|value| *value != expected)
@@ -218,8 +235,8 @@ pub struct StreamVerifier {
     states: BTreeMap<u64, Branch>,
     branches: BTreeMap<String, Branch>,
     names: Vec<Option<String>>,
-    ids: im::OrdMap<Uuid, Uuid>,
-    reverse: im::OrdMap<Uuid, Uuid>,
+    ids: PersistentMap<Uuid, Uuid>,
+    reverse: PersistentMap<Uuid, Uuid>,
     legacy: bool,
     counts: BTreeMap<u64, u64>,
     new_counts: BTreeMap<u64, u64>,
@@ -282,8 +299,8 @@ impl StreamVerifier {
                 && conversion_equal(
                     expected,
                     &record.event,
-                    &mut im::OrdMap::new(),
-                    &mut im::OrdMap::new(),
+                    &mut PersistentMap::new(),
+                    &mut PersistentMap::new(),
                 )?
             {
                 return Err(Error::Session(
@@ -665,8 +682,8 @@ pub(crate) fn validate_conversions(
     }
     let mut states = BTreeMap::<u64, Branch>::new();
     let mut branches = BTreeMap::<String, Branch>::new();
-    let mut ids = im::OrdMap::new();
-    let mut reverse = im::OrdMap::new();
+    let mut ids = PersistentMap::new();
+    let mut reverse = PersistentMap::new();
     let mut verified = BTreeMap::new();
     for record in records {
         let parent_source = record.parent.and_then(|id| nearest[id as usize]);
@@ -737,8 +754,8 @@ pub(crate) fn validate_conversions(
         let events = convert(&migrated, &mut branch, &branches)?;
         let mut count = events.len() as u64;
         if marker.is_none() {
-            let mut local_ids = im::OrdMap::new();
-            let mut local_reverse = im::OrdMap::new();
+            let mut local_ids = PersistentMap::new();
+            let mut local_reverse = PersistentMap::new();
             let mut parent = record.id;
             let mut matches = count <= records.len() as u64 - record.id;
             for (offset, event) in
@@ -784,8 +801,8 @@ pub(crate) fn validate_conversions(
                         && conversion_equal(
                             &events[0],
                             &candidate.event,
-                            &mut im::OrdMap::new(),
-                            &mut im::OrdMap::new(),
+                            &mut PersistentMap::new(),
+                            &mut PersistentMap::new(),
                         )?
                     {
                         matches = false;
@@ -799,8 +816,8 @@ pub(crate) fn validate_conversions(
                         && reverse.get(actual).is_none_or(|old| old == expected)
                 })
             {
-                ids.extend(local_ids);
-                reverse.extend(local_reverse);
+                ids.extend(local_ids.iter().map(|(key, value)| (*key, *value)));
+                reverse.extend(local_reverse.iter().map(|(key, value)| (*key, *value)));
                 verified.insert(record.id, count);
             } else if entry["type"] == "model_change"
                 && records.get(record.id as usize).is_some_and(|next| {
@@ -1139,7 +1156,7 @@ pub fn convert(
                                 .insert(Arc::from(id.as_str()), operation_id)
                                 .is_some()
                             {
-                                branch.ambiguous_calls.insert(Arc::from(id.as_str()));
+                                branch.ambiguous_calls.insert(Arc::from(id.as_str()), ());
                             }
                             invocations.push(Invocation {
                                 operation_id,
@@ -1263,7 +1280,7 @@ pub fn convert(
                     } else {
                         Outcome::Succeeded(text.clone())
                     };
-                    if branch.ambiguous_calls.contains(id) {
+                    if branch.ambiguous_calls.contains_key(id) {
                         let content = if let Some(blocks) = message["content"].as_array() {
                             crate::ContextContent::Blocks(
                                 blocks
@@ -1484,7 +1501,7 @@ pub fn convert(
                     set.iter()
                         .map(|(key, value)| (Arc::from(key.as_str()), Arc::new(value.clone()))),
                 );
-                let data = serde_json::to_value(&branch.store)?;
+                let data = serde_json::to_value(StoreView(&branch.store))?;
                 if data.to_string().len() > 4 * 1024 * 1024 {
                     return Err(Error::Session(
                         "imported codemode store exceeds size limit".into(),
