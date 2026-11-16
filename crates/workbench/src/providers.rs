@@ -1282,8 +1282,88 @@ impl Client {
     }
 }
 
+/// Route declaration-aware streams through the same request-bound decisions as
+/// prepared dispatch, retaining the legacy fallback for unsupported adapters.
+pub(super) async fn stream_with_declarations(
+    model: &dyn Model,
+    request: ModelRequest,
+    declarations: &[pi_rs::ToolDeclaration],
+    context: pi_rs::ToolDispatchContext,
+) -> Result<pi_rs::DetailedModelStream> {
+    if let Some(prepared) = model
+        .prepare_tool_dispatch(&request, declarations, &context)
+        .await?
+    {
+        pi_rs::validate_prepared_tool_dispatch(
+            prepared.as_ref(),
+            &context,
+            &request,
+            declarations,
+        )?;
+        prepared.dispatch().await
+    } else if context.summary {
+        pi_rs::validate_legacy_tool_declarations(&request, declarations)?;
+        model
+            .stream_detailed_for_summary(context.request_id, context.session_id, request.clone())
+            .await
+    } else {
+        pi_rs::validate_legacy_tool_declarations(&request, declarations)?;
+        model
+            .stream_detailed_in_session_with_identity(
+                context.request_id,
+                context.session_id,
+                &context.external_id,
+                request.clone(),
+            )
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for Client {
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: external_id.into(),
+                summary: false,
+            },
+        )
+        .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: session_id.to_string(),
+                summary: true,
+            },
+        )
+        .await
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -1777,6 +1857,443 @@ mod contention_tests {
             let _ = prepared.dispatch().await;
             let (headers, body) = server.join().unwrap();
             assert_eq!(body["tools"][0]["function"]["strict"], true);
+            assert_eq!(body["tools"][0]["function"]["parameters"], expected_schema);
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+            assert!(body.get("prompt_cache_retention").is_none());
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session-fixture")
+            );
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: session-fixture"),
+                !summary && path != 0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn declaration_responses_stream_preserves_dispatch_policy() {
+        use clap::Parser;
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        for (deferred, summary, path, prefer, supported) in
+            [false, true].into_iter().flat_map(|deferred| {
+                [false, true].into_iter().flat_map(move |summary| {
+                    [0, 1, 2].into_iter().flat_map(move |path| {
+                        [false, true].into_iter().flat_map(move |prefer| {
+                            [false, true]
+                                .into_iter()
+                                .filter(move |supported| *supported || prefer)
+                                .map(move |supported| (deferred, summary, path, prefer, supported))
+                        })
+                    })
+                })
+            })
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/responses");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"openai-responses","baseUrl":endpoint,"compat":{"supportsStrictMode":supported},"models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::OpenAiResponses,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap(),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let direct_client = client.clone();
+            let model = super::super::image_policy::WorkbenchModel {
+                client,
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let declaration = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: if prefer {
+                        pi_rs::StrictToolPolicy::Prefer
+                    } else {
+                        pi_rs::StrictToolPolicy::Require
+                    },
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected = if path == 2 {
+                model.prepare_context(&req).await.unwrap()
+            } else {
+                None
+            };
+            let selected: &dyn Model = match path {
+                0 => &direct_client,
+                1 => &model,
+                _ => selected.as_deref().unwrap(),
+            };
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                prepared
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &req,
+                        prepared.dispatch_request(),
+                        std::slice::from_ref(&declaration)
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                prepared.decision_snapshot().request_sha256()
+                    != prepared.decision_snapshot().dispatch_sha256(),
+                path != 0
+            );
+            assert_eq!(
+                matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                ),
+                supported
+            );
+            drop(prepared);
+            let result = if summary {
+                selected
+                    .stream_detailed_summary_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            } else {
+                selected
+                    .stream_detailed_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        &context.external_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            };
+            assert!(result.is_err());
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(
+                body["tools"][0].get("strict").and_then(Value::as_bool),
+                supported.then_some(true)
+            );
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session-fixture")
+            );
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: session-fixture"),
+                !summary
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn declaration_chat_stream_preserves_dispatch_policy() {
+        use clap::Parser;
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        for (deferred, summary, path, prefer, supported) in
+            [false, true].into_iter().flat_map(|deferred| {
+                [false, true].into_iter().flat_map(move |summary| {
+                    [0, 1, 2].into_iter().flat_map(move |path| {
+                        [false, true].into_iter().flat_map(move |prefer| {
+                            [false, true]
+                                .into_iter()
+                                .filter(move |supported| *supported || prefer)
+                                .map(move |supported| (deferred, summary, path, prefer, supported))
+                        })
+                    })
+                })
+            })
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/v1/chat/completions");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"openai-completions","baseUrl":endpoint,"compat":{"supportsStrictMode":supported,"promptCacheKeyMode":"enabled","cacheControlFormat":"anthropic","supportsLongCacheRetention":false},"models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::ChatCompletions,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                        .unwrap()
+                        .with_provider("test")
+                        .with_native_probes(false),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let direct_client = client.clone();
+            let model = super::super::image_policy::WorkbenchModel {
+                client,
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object", "properties":{"optional":{"type":"string"}}}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let declaration = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: if prefer {
+                        pi_rs::StrictToolPolicy::Prefer
+                    } else {
+                        pi_rs::StrictToolPolicy::Require
+                    },
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected = if path == 2 {
+                model.prepare_context(&req).await.unwrap()
+            } else {
+                None
+            };
+            let selected: &dyn Model = match path {
+                0 => &direct_client,
+                1 => &model,
+                _ => selected.as_deref().unwrap(),
+            };
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                prepared
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &req,
+                        prepared.dispatch_request(),
+                        std::slice::from_ref(&declaration)
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                prepared.decision_snapshot().request_sha256()
+                    != prepared.decision_snapshot().dispatch_sha256(),
+                path != 0
+            );
+            assert_eq!(
+                matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                ),
+                supported
+            );
+            let expected_schema = prepared.reservation_request().tools[0].parameters.clone();
+            drop(prepared);
+            let result = if summary {
+                selected
+                    .stream_detailed_summary_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            } else {
+                selected
+                    .stream_detailed_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        &context.external_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            };
+            assert!(result.is_err());
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(
+                body["tools"][0]["function"]
+                    .get("strict")
+                    .and_then(Value::as_bool),
+                supported.then_some(true)
+            );
             assert_eq!(body["tools"][0]["function"]["parameters"], expected_schema);
             assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
             assert!(body.get("prompt_cache_retention").is_none());

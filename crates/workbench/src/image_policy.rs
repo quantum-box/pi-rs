@@ -8,7 +8,10 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{model_profiles::ChatPrice, providers::Client};
+use super::{
+    model_profiles::ChatPrice,
+    providers::{Client, stream_with_declarations},
+};
 
 pub(super) const BLOCKED_IMAGE: &str = "Image reading is disabled.";
 const NON_VISION_USER_IMAGE: &str = "(image omitted: model does not support images)";
@@ -25,6 +28,49 @@ pub(super) struct WorkbenchModel {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: external_id.into(),
+                summary: false,
+            },
+        )
+        .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: session_id.to_string(),
+                summary: true,
+            },
+        )
+        .await
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -268,6 +314,49 @@ impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
 
 #[async_trait::async_trait]
 impl Model for PreparedWorkbenchModel {
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: external_id.into(),
+                summary: false,
+            },
+        )
+        .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: session_id.to_string(),
+                summary: true,
+            },
+        )
+        .await
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
