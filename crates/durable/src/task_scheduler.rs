@@ -356,6 +356,19 @@ pub struct CompletedInvocation {
     lease: InvocationLease,
 }
 
+// Own the exact checked transaction and the observations needed to revalidate
+// it after graph-only conflicts. The invocation lease remains with its caller.
+struct PreparedSettlement {
+    transaction: crate::document::Transaction,
+    running: task_store::StoredTask,
+    candidate: task_store::StoredTask,
+    wait_targets: Vec<Uuid>,
+    staged_children: HashMap<Uuid, Task>,
+    conflict_keys: HashSet<Vec<u8>>,
+    graph_version: u64,
+    attempts: usize,
+}
+
 impl std::fmt::Debug for CompletedInvocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompletedInvocation")
@@ -1645,7 +1658,7 @@ impl Scheduler {
         // Admission may have rewritten an identical reservation while the
         // handler ran. The gate keeps cooperating admissions out until commit.
         let original_version = running.version;
-        let mut running = current.clone();
+        let running = current.clone();
         if let Some(root) =
             pending_abort_root_for_running(&self.ts(), running.task.id(), self.validator.is_none())?
         {
@@ -1910,15 +1923,37 @@ impl Scheduler {
         transaction.append(document_batch)?;
         transaction.append(graph)?;
         let _ = wait_graph_fence;
+        self.commit_prepared_settlement(
+            PreparedSettlement {
+                transaction,
+                running,
+                candidate: next,
+                wait_targets: retry_wait,
+                staged_children: retry_children,
+                conflict_keys: document_keys,
+                graph_version: success_graph_version,
+                attempts: 0,
+            },
+            &owner,
+            _gate,
+        )
+    }
+
+    fn commit_prepared_settlement(
+        &mut self,
+        mut prepared: PreparedSettlement,
+        owner: &Arc<OwnedStore>,
+        _gate: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, Error> {
         const GRAPH_RETRIES: usize = 8;
-        let mut graph_version = success_graph_version;
-        let mut attempt = 0;
         let committed = loop {
             #[cfg(test)]
             if let Some(hook) = &self.result_commit_hook {
-                hook(attempt, owner.store());
+                hook(prepared.attempts, owner.store());
             }
-            let result = transaction.commit_task_graph(owner.store(), graph_version);
+            let result = prepared
+                .transaction
+                .commit_task_graph(owner.store(), prepared.graph_version);
             let Err(crate::document::Error::Store(durable_store::Error::Conflict { ref key })) =
                 result
             else {
@@ -1927,33 +1962,36 @@ impl Scheduler {
             if !(key == task_store::PREFIX
                 || key == crate::ownership_edge::PREFIX
                 || key == b"runtime/conversation/")
-                || attempt >= GRAPH_RETRIES
+                || prepared.attempts >= GRAPH_RETRIES
             {
                 break result;
             }
-            graph_version = owner
+            prepared.graph_version = owner
                 .store()
                 .put_version()
                 .map_err(task_store::Error::from)?;
             if let Some(root) = pending_abort_root_for_running(
                 &self.ts(),
-                running.task.id(),
+                prepared.running.task.id(),
                 self.validator.is_none(),
             )? {
-                self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
+                self.abort_failed_running(owner, root, prepared.running.task.id(), _gate)?;
                 self.poisoned = false;
                 return Ok(true);
             }
-            let latest = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+            let latest = self
+                .ts()
+                .load(prepared.running.task.id())?
+                .ok_or(Error::Ownership)?;
             if latest.task.abort_requested() {
                 self.ts().update(&latest, |task| task.yield_ready())?;
                 self.poisoned = false;
                 return Ok(true);
             }
-            if latest.task != running.task {
+            if latest.task != prepared.running.task {
                 break result;
             }
-            let mut candidate = next.task.clone();
+            let mut candidate = prepared.candidate.task.clone();
             if matches!(candidate.state(), TaskState::Succeeded(_))
                 && has_live_owned(owner.store(), candidate.id(), &self.ts().list()?)?
             {
@@ -1961,23 +1999,29 @@ impl Scheduler {
                     .hold_prepared_success()
                     .map_err(Error::Transition)?;
             }
-            if latest.version != running.version || candidate != next.task {
-                transaction.rebase_task_candidate(
-                    running.task.id(),
-                    running.version,
+            if latest.version != prepared.running.version || candidate != prepared.candidate.task {
+                prepared.transaction.rebase_task_candidate(
+                    prepared.running.task.id(),
+                    prepared.running.version,
                     latest.version,
-                    &next.task,
+                    &prepared.candidate.task,
                     &candidate,
                 )?;
-                running = latest;
-                next.task = candidate;
+                prepared.running = latest;
+                prepared.candidate.task = candidate;
             }
-            let refs: HashMap<_, _> = retry_children
+            let refs: HashMap<_, _> = prepared
+                .staged_children
                 .iter()
                 .map(|(id, task)| (*id, task))
                 .collect();
-            if !retry_wait.is_empty() {
-                match validate_wait_graph(owner.store(), next.task.id(), &retry_wait, &refs) {
+            if !prepared.wait_targets.is_empty() {
+                match validate_wait_graph(
+                    owner.store(),
+                    prepared.candidate.task.id(),
+                    &prepared.wait_targets,
+                    &refs,
+                ) {
                     Ok(()) => (),
                     Err(Error::Ownership) => break result,
                     Err(e) => return Err(e),
@@ -1985,13 +2029,18 @@ impl Scheduler {
             }
             if !refs.is_empty() {
                 let targets: Vec<_> = refs.keys().copied().collect();
-                match validate_wait_graph(owner.store(), next.task.id(), &targets, &refs) {
+                match validate_wait_graph(
+                    owner.store(),
+                    prepared.candidate.task.id(),
+                    &targets,
+                    &refs,
+                ) {
                     Ok(()) => (),
                     Err(Error::Ownership) => break result,
                     Err(e) => return Err(e),
                 }
             }
-            attempt += 1;
+            prepared.attempts += 1;
         };
         #[cfg(test)]
         if committed.is_ok() && self.inject_post_commit_error {
@@ -2002,15 +2051,18 @@ impl Scheduler {
             Err(crate::document::Error::Store(durable_store::Error::Conflict { key })) => {
                 if let Some(root) = pending_abort_root_for_running(
                     &self.ts(),
-                    running.task.id(),
+                    prepared.running.task.id(),
                     self.validator.is_none(),
                 )? {
-                    self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
+                    self.abort_failed_running(owner, root, prepared.running.task.id(), _gate)?;
                     self.poisoned = false;
                     return Ok(true);
                 }
-                let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
-                if current.version != running.version {
+                let current = self
+                    .ts()
+                    .load(prepared.running.task.id())?
+                    .ok_or(Error::Ownership)?;
+                if current.version != prepared.running.version {
                     if current.task.abort_requested() {
                         self.ts().update(&current, |task| task.yield_ready())?;
                     } else {
@@ -2019,20 +2071,22 @@ impl Scheduler {
                         )
                         .into());
                     }
-                } else if document_keys.contains(&key)
+                } else if prepared.conflict_keys.contains(&key)
                     || key == task_store::PREFIX
                     || key == crate::ownership_edge::PREFIX
                     || key == b"runtime/conversation/"
                 {
                     // The checked batch definitely did not commit. Only registered
                     // replay-safe invocations may be run again after external effects.
-                    if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+                    if prepared.running.task.replay_safe()
+                        && self.registered(&prepared.running.task)?.replay_safe
+                    {
                         self.ts().update(&current, |task| task.yield_ready())?;
                     } else {
                         return self.finish_running_conflict(
                             &current,
                             "document conflict: execution outcome requires reconciliation".into(),
-                            &owner,
+                            owner,
                             _gate,
                         );
                     }
@@ -6512,6 +6566,133 @@ mod tests {
                 .unwrap(),
             Some(json!(2))
         );
+    }
+
+    #[test]
+    fn prepared_settlement_retains_effects_across_graph_conflict() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::task_store::{SignalResult, SignalToken};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Staging {
+            calls: Arc<AtomicUsize>,
+            address: Address,
+        }
+        impl Handler for Staging {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                parent: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.acquire_owned(&self.address).unwrap();
+                docs.put(
+                    &self.address,
+                    json!({"value": "retained"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                let token = SignalToken::new("answer", 1).unwrap();
+                assert_eq!(
+                    docs.signal_at(Uuid::from_u128(3), &token, "key", json!(7), 0)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+                let keyed = task(4, TaskOwner::Task(parent.id()), "child", false, 3);
+                docs.stage_keyed_child("keyed", "tool", keyed.input(), keyed.clone())
+                    .unwrap();
+                let direct = task(5, TaskOwner::Task(parent.id()), "child", false, 3);
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![keyed.id(), direct.id()]),
+                    children: vec![direct],
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let address = Address {
+            scope: "prepared".into(),
+            name: "document".into(),
+            key: "".into(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "parent",
+            false,
+            Staging {
+                calls: calls.clone(),
+                address: address.clone(),
+            },
+        );
+        registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&task(1, owner.clone(), "parent", false, 3)),
+                Save::Create(&task(2, owner.clone(), "other", false, 3)),
+                Save::Create(&task(3, owner, "receiver", false, 3)),
+            ])
+            .unwrap();
+        let observed = attempts.clone();
+        scheduler.result_commit_hook = Some(Arc::new(move |attempt, store| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                let ts = TaskStore::new(store);
+                let other = ts.load(Uuid::from_u128(2)).unwrap().unwrap();
+                ts.update(&other, |task| {
+                    task.start()?;
+                    task.yield_ready()
+                })
+                .unwrap();
+            }
+        }));
+        scheduler.tick(0).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Waiting(WaitFor::TasksAny(vec![
+                Uuid::from_u128(4),
+                Uuid::from_u128(5)
+            ]))
+        );
+        assert_eq!(
+            Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap()
+                .unwrap()
+                .value["value"],
+            "retained"
+        );
+        assert_eq!(
+            scheduler
+                .owner()
+                .store()
+                .task_document_owner(&address.storage_key().unwrap())
+                .unwrap(),
+            Some(Uuid::from_u128(1))
+        );
+        let token = SignalToken::new("answer", 1).unwrap();
+        assert_eq!(
+            scheduler
+                .ts()
+                .read_typed_signal(Uuid::from_u128(3), &token, "key")
+                .unwrap(),
+            Some(json!(7))
+        );
+        for id in [4, 5] {
+            assert_eq!(
+                scheduler.get(Uuid::from_u128(id)).unwrap().unwrap().owner(),
+                &TaskOwner::Task(Uuid::from_u128(1))
+            );
+        }
     }
 
     #[test]
