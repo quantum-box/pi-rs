@@ -2529,33 +2529,47 @@ fn task_input_proof_store_failures_remain_storage_errors() {
 
 #[test]
 fn task_input_rejects_tampered_reset_proof_as_invalid() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db");
-    let (h, _, child) = task_input_reset_fork(&path);
-    let record = h.owner.store().get(&Harness::key(child)).unwrap().unwrap();
-    let (key, entry) = h
-        .owner
-        .store()
-        .list(b"runtime/reset-manifest/")
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-    h.owner
-        .store()
-        .commit(
-            &[Check {
-                key: key.clone(),
-                expected: Expected::Version(entry.version),
-            }],
-            &[Mutation::Put {
-                key,
-                value: b"{}".to_vec(),
-            }],
-        )
-        .unwrap();
-    assert!(matches!(
-        h.validate_task_input_context(child, &record.value),
-        Err(crate::document::Error::InvalidSessionAdmission(_))
-    ));
+    for _ in 0..16 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, _, child) = task_input_reset_fork(&path);
+        let record = h.owner.store().get(&Harness::key(child)).unwrap().unwrap();
+        // The store can contain several reset manifests, and UUID ordering does
+        // not identify the one reachable from this fork. Capture the actual proof
+        // dependencies before tampering with one of them.
+        let scope = ResetProofScope::enter();
+        h.validate_task_input_context(child, &record.value).unwrap();
+        let checks = cached_reset_proof_checks(&h.owner);
+        drop(scope);
+        let key = checks
+            .into_iter()
+            .find(|check| {
+                check.key.starts_with(b"runtime/reset-manifest/")
+                    && matches!(check.expected, Expected::Version(_))
+            })
+            .expect("fork validation must authenticate a reset manifest")
+            .key;
+        let entry = h.owner.store().get(&key).unwrap().unwrap();
+        h.owner
+            .store()
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: b"{}".to_vec(),
+                }],
+            )
+            .unwrap();
+        let result = h.validate_task_input_context(child, &record.value);
+        assert!(
+            matches!(
+                result,
+                Err(crate::document::Error::InvalidSessionAdmission(_))
+            ),
+            "tampered reset proof must be rejected as invalid: {result:?}"
+        );
+    }
 }
