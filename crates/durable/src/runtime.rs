@@ -307,6 +307,15 @@ enum Phase {
         reason: String,
         decision: ModelFailureDecision,
     },
+    /// Independently persisted host configuration and its source counter.
+    /// A terminal decision must bind to this checkpoint, never to its own bound.
+    LimitEvidence {
+        kind: LimitFailureKind,
+        count: u32,
+        limit: u32,
+        source_observation: u64,
+        source_root_version: u64,
+    },
     /// A host-selected terminal limit decision. The configured bound is
     /// retained so recovery and historical replay do not infer it from a counter.
     LimitFailure {
@@ -484,7 +493,7 @@ fn dispatch_identity(tool: &Arc<dyn pi_rs_core::Tool>) -> Result<DispatchIdentit
         None => Ok(DispatchIdentity::Other),
     }
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum LimitFailureKind {
     Turn,
     Restart,
@@ -1257,6 +1266,7 @@ pub fn conversation_wake(
         | Phase::AbandonedModel { .. }
         | Phase::FailedModel { .. }
         | Phase::LimitFailure { .. }
+        | Phase::LimitEvidence { .. }
         | Phase::CompactionHook { .. }
         | Phase::CompactionReady { .. }
         | Phase::CompactionAbandoned { .. }
@@ -3866,6 +3876,79 @@ impl Harness {
             if failed_transition {
                 apply_failed_run_policy(&mut committed);
             }
+            let transition_checks = if let Expected::Version(version) = expected {
+                let loaded = self.loaded.lock().map_err(|_| Error::Failed)?;
+                if let Some((loaded_version, baseline)) = loaded.get(&state.id) {
+                    if *loaded_version == version
+                        && matches!(baseline.phase, Phase::LimitEvidence { .. })
+                        && matches!(state.phase, Phase::LimitEvidence { .. })
+                    {
+                        self.validate_limit_source(baseline, version)?
+                    } else if *loaded_version == version
+                        && matches!(state.phase, Phase::LimitEvidence { .. })
+                    {
+                        self.validate_limit_evidence_admission(baseline, &state, version)?
+                    } else if *loaded_version == version
+                        && matches!(
+                            baseline.phase,
+                            Phase::LimitEvidence { .. } | Phase::LimitFailure { .. }
+                        )
+                        && (matches!(state.phase, Phase::LimitFailure { .. }) || failed_transition)
+                    {
+                        if matches!(baseline.phase, Phase::LimitEvidence { .. })
+                            && failed_transition
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        if matches!(baseline.phase, Phase::LimitFailure { .. })
+                            && matches!(state.phase, Phase::LimitFailure { .. })
+                            && serde_json::to_value(&baseline.phase)?
+                                != serde_json::to_value(&state.phase)?
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        if let (
+                            Phase::LimitEvidence {
+                                kind, count, limit, ..
+                            },
+                            Phase::LimitFailure {
+                                kind: next_kind,
+                                count: next_count,
+                                limit: next_limit,
+                                source_observation,
+                                source_root_version,
+                            },
+                        ) = (&baseline.phase, &state.phase)
+                            && (kind != next_kind
+                                || count != next_count
+                                || limit != next_limit
+                                || *source_root_version != version
+                                || self.limit_source_observation(state.id, version)?
+                                    != Some(*source_observation))
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        if matches!(baseline.phase, Phase::LimitFailure { .. }) && failed_transition
+                        {
+                            let replay = replay_checkpoint_failure(baseline)
+                                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                            if serde_json::to_value(&replay)? != serde_json::to_value(&state)?
+                                || replay.messages != state.messages
+                                || replay.content_blocks != state.content_blocks
+                            {
+                                return Err(crate::fork::Error::InvalidSnapshot.into());
+                            }
+                        }
+                        self.validate_limit_source(baseline, version)?
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             let state_for_commit = &committed;
             let atomic = if failed_transition
                 && wake.is_none()
@@ -3904,6 +3987,7 @@ impl Harness {
                     abort_tasks,
                 )?
             };
+            merge_reset_proof_checks(&mut prepared.checks, transition_checks);
             if let Some(batch) = documents {
                 prepared.extend(PreparedConversationSave {
                     owner: self.owner.clone(),
@@ -7805,6 +7889,90 @@ impl Harness {
         }
     }
 
+    // The runtime, not the later decision, chooses and persists this bound.
+    // Fence the source snapshot in the evidence checkpoint itself.
+    fn validate_limit_evidence_admission(
+        &self,
+        baseline: &Conversation,
+        state: &Conversation,
+        version: u64,
+    ) -> Result<Vec<Check>, Error> {
+        let Phase::LimitEvidence {
+            kind,
+            count,
+            limit,
+            source_observation,
+            source_root_version,
+        } = &state.phase
+        else {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        };
+        let actual = match kind {
+            LimitFailureKind::Turn => self.options.max_turns,
+            LimitFailureKind::Restart => self.options.restart_limit,
+        };
+        let eligible = match (kind, &baseline.phase) {
+            (LimitFailureKind::Turn, Phase::ModelReady { turns }) => {
+                *turns == *count
+                    && matches!(
+                        baseline
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| !matches!(m, Message::System { .. })),
+                        Some(
+                            Message::User { .. }
+                                | Message::UserWithImages { .. }
+                                | Message::Tool { .. }
+                        )
+                    )
+                    && self.supports_context_blocks(baseline)
+            }
+            (LimitFailureKind::Restart, Phase::AbandonedModel { restarts, .. }) => {
+                *restarts == *count
+            }
+            _ => false,
+        };
+        let mut expected = baseline.clone();
+        expected.phase = state.phase.clone();
+        if !eligible
+            || actual == 0
+            || *limit != actual
+            || *count < *limit
+            || *source_root_version != version
+            || self.limit_source_observation(state.id, version)? != Some(*source_observation)
+            || serde_json::to_value(&expected)? != serde_json::to_value(state)?
+            || expected.messages != state.messages
+            || expected.content_blocks != state.content_blocks
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let store = self.owner.store();
+        let key = format!("runtime/fork/{}/{source_observation:020}", state.id).into_bytes();
+        let source_version = store
+            .get(&key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        let mut event = b"durable/observer/".to_vec();
+        event.extend_from_slice(state.id.as_bytes());
+        event.extend_from_slice(b"/r");
+        event.extend_from_slice(&source_observation.to_be_bytes());
+        let event_version = store
+            .get(&event)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        Ok(vec![
+            Check {
+                key,
+                expected: Expected::Version(source_version),
+            },
+            Check {
+                key: event,
+                expected: Expected::Version(event_version),
+            },
+        ])
+    }
+
     // Bind the terminal decision to an earlier authenticated runtime snapshot
     // with the same transcript and actual counter. Fence that evidence with
     // any fork authorized by the decision.
@@ -7813,16 +7981,38 @@ impl Harness {
         baseline: &Conversation,
         version: u64,
     ) -> Result<Vec<Check>, Error> {
-        let Phase::LimitFailure {
-            kind,
-            count,
-            limit,
-            source_observation,
-            source_root_version,
-        } = &baseline.phase
-        else {
-            return Ok(Vec::new());
-        };
+        let (kind, count, limit, source_observation, source_root_version, is_terminal_decision) =
+            match &baseline.phase {
+                Phase::LimitEvidence {
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                } => (
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                    false,
+                ),
+                Phase::LimitFailure {
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                } => (
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                    true,
+                ),
+                _ => return Ok(Vec::new()),
+            };
         if *limit == 0 || count < limit {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
@@ -7890,14 +8080,46 @@ impl Harness {
                 .cloned()
                 .ok_or(crate::fork::Error::InvalidSnapshot)?,
         )?;
-        let same_counter = match (kind, phase) {
-            (LimitFailureKind::Turn, Phase::ModelReady { turns }) => turns == *count,
-            (LimitFailureKind::Restart, Phase::AbandonedModel { restarts, .. }) => {
-                restarts == *count
+        let mut prior_checks = Vec::new();
+        let valid_source = if is_terminal_decision {
+            if let Phase::LimitEvidence {
+                kind: prior_kind,
+                count: prior_count,
+                limit: prior_limit,
+                ..
+            } = &phase
+            {
+                if prior_kind != kind || prior_count != count || prior_limit != limit {
+                    false
+                } else {
+                    let mut evidence = baseline.clone();
+                    evidence.phase = phase.clone();
+                    prior_checks = self.validate_limit_source(&evidence, *source_root_version)?;
+                    true
+                }
+            } else {
+                false
             }
-            _ => false,
+        } else {
+            match (kind, phase) {
+                (LimitFailureKind::Turn, Phase::ModelReady { turns }) => turns == *count,
+                (LimitFailureKind::Restart, Phase::AbandonedModel { restarts, .. }) => {
+                    restarts == *count
+                }
+                _ => false,
+            }
         };
-        if !same_counter
+        let turn_has_input = !matches!(kind, LimitFailureKind::Turn)
+            || matches!(
+                baseline
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| !matches!(m, Message::System { .. })),
+                Some(Message::User { .. } | Message::UserWithImages { .. } | Message::Tool { .. })
+            );
+        if !valid_source
+            || !turn_has_input
             || snapshot.get("_transcript") != Some(&serde_json::to_value(&baseline.transcript)?)
         {
             return Err(crate::fork::Error::InvalidSnapshot.into());
@@ -7910,24 +8132,28 @@ impl Harness {
             .get(&event)?
             .ok_or(crate::fork::Error::InvalidSnapshot)?
             .version;
-        Ok(vec![
-            Check {
-                key,
-                expected: Expected::Version(source.version),
-            },
-            Check {
-                key: event,
-                expected: Expected::Version(event_version),
-            },
-            Check {
-                key: decision_key,
-                expected: Expected::Version(decision.version),
-            },
-            Check {
-                key: decision_event,
-                expected: Expected::Version(decision_event_version),
-            },
-        ])
+        merge_reset_proof_checks(
+            &mut prior_checks,
+            vec![
+                Check {
+                    key,
+                    expected: Expected::Version(source.version),
+                },
+                Check {
+                    key: event,
+                    expected: Expected::Version(event_version),
+                },
+                Check {
+                    key: decision_key,
+                    expected: Expected::Version(decision.version),
+                },
+                Check {
+                    key: decision_event,
+                    expected: Expected::Version(decision_event_version),
+                },
+            ],
+        );
+        Ok(prior_checks)
     }
 
     // A matching observer payload alone is not evidence of a runtime commit:
@@ -11720,7 +11946,7 @@ impl Harness {
                         if let Some(source_observation) =
                             self.limit_source_observation(id, version)?
                         {
-                            c.phase = Phase::LimitFailure {
+                            c.phase = Phase::LimitEvidence {
                                 kind: LimitFailureKind::Turn,
                                 count: turns,
                                 limit: self.options.max_turns,
@@ -11807,7 +12033,7 @@ impl Harness {
                             restarts: 0,
                         };
                     }
-                    if matches!(c.phase, Phase::LimitFailure { .. }) {
+                    if matches!(c.phase, Phase::LimitEvidence { .. }) {
                         match self.save_limit_checkpoint(&c, version) {
                             Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
                                 continue;
@@ -12194,6 +12420,27 @@ impl Harness {
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
+                Phase::LimitEvidence {
+                    kind, count, limit, ..
+                } => {
+                    self.validate_limit_source(&c, version)?;
+                    let source_observation = self
+                        .limit_source_observation(id, version)?
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    c.phase = Phase::LimitFailure {
+                        kind,
+                        count,
+                        limit,
+                        source_observation,
+                        source_root_version: version,
+                    };
+                    match self.save_limit_checkpoint(&c, version) {
+                        Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 Phase::LimitFailure {
                     kind, count, limit, ..
                 } => {
@@ -12256,7 +12503,7 @@ impl Harness {
                         if let Some(source_observation) =
                             self.limit_source_observation(id, version)?
                         {
-                            c.phase = Phase::LimitFailure {
+                            c.phase = Phase::LimitEvidence {
                                 kind: LimitFailureKind::Restart,
                                 count: restarts,
                                 limit: self.options.restart_limit,
@@ -12277,7 +12524,7 @@ impl Harness {
                             restarts,
                         };
                     }
-                    if matches!(c.phase, Phase::LimitFailure { .. }) {
+                    if matches!(c.phase, Phase::LimitEvidence { .. }) {
                         match self.save_limit_checkpoint(&c, version) {
                             Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
                                 continue;

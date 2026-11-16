@@ -72,6 +72,52 @@ fn options() -> Options {
         uncertain_policy: UncertainPolicy::InterruptedResult,
     }
 }
+fn stage_limit_evidence(
+    h: &mut Harness,
+    id: Uuid,
+    kind: LimitFailureKind,
+    count: u32,
+    limit: u32,
+) -> (Conversation, u64, u64) {
+    let (mut evidence, version) = h.load(id).unwrap();
+    let source_observation = h.limit_source_observation(id, version).unwrap().unwrap();
+    evidence.phase = Phase::LimitEvidence {
+        kind,
+        count,
+        limit,
+        source_observation,
+        source_root_version: version,
+    };
+    h.save(&evidence, Expected::Version(version)).unwrap();
+    let (evidence, version) = h.load(id).unwrap();
+    let observation = h.limit_source_observation(id, version).unwrap().unwrap();
+    (evidence, version, observation)
+}
+// Build runtime-shaped forged evidence while bypassing its production gate.
+fn forge_limit_evidence(
+    h: &mut Harness,
+    id: Uuid,
+    kind: LimitFailureKind,
+    count: u32,
+    limit: u32,
+) -> (Conversation, u64, u64) {
+    let (mut evidence, version) = h.load(id).unwrap();
+    let source_observation = h.limit_source_observation(id, version).unwrap().unwrap();
+    evidence.phase = Phase::LimitEvidence {
+        kind,
+        count,
+        limit,
+        source_observation,
+        source_root_version: version,
+    };
+    let staged = h
+        .prepare_save(&evidence, Expected::Version(version))
+        .unwrap();
+    h.commit_conversation_save(staged).unwrap();
+    let (evidence, version) = h.load(id).unwrap();
+    let observation = h.limit_source_observation(id, version).unwrap().unwrap();
+    (evidence, version, observation)
+}
 fn setup(path: &std::path::Path) -> (Harness, Uuid, u64, Vec<ResetDerivationStep>) {
     setup_with_adapter(path, false)
 }
@@ -1417,20 +1463,28 @@ fn limit_decision_kill_child() {
         Phase::ModelReady { turns: 5 }
     };
     h.save(&checkpoint, Expected::Version(version)).unwrap();
-    let (mut checkpoint, version) = h.load(id).unwrap();
-    let source_observation = h.limit_source_observation(id, version).unwrap().unwrap();
-    checkpoint.phase = Phase::LimitFailure {
-        kind: if restart {
-            LimitFailureKind::Restart
-        } else {
-            LimitFailureKind::Turn
-        },
-        count: if restart { 3 } else { 5 },
-        limit: if restart { 3 } else { 5 },
-        source_observation,
-        source_root_version: version,
+    let kind = if restart {
+        LimitFailureKind::Restart
+    } else {
+        LimitFailureKind::Turn
     };
-    h.save(&checkpoint, Expected::Version(version)).unwrap();
+    let count = if restart { 3 } else { 5 };
+    let (mut checkpoint, version, source_observation) =
+        stage_limit_evidence(&mut h, id, kind, count, count);
+    if std::env::var("PI_LIMIT_DECISION_STAGE").unwrap_or_default() != "evidence" {
+        checkpoint.phase = Phase::LimitFailure {
+            kind: if restart {
+                LimitFailureKind::Restart
+            } else {
+                LimitFailureKind::Turn
+            },
+            count: if restart { 3 } else { 5 },
+            limit: if restart { 3 } else { 5 },
+            source_observation,
+            source_root_version: version,
+        };
+        h.save(&checkpoint, Expected::Version(version)).unwrap();
+    }
     println!("LIMIT_DECISION_COMMITTED {id} {occurrence} {replacement}");
     std::io::stdout().flush().unwrap();
     loop {
@@ -1444,62 +1498,65 @@ async fn killed_limit_decision_resumes_with_saved_limit_and_forks() {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
     for kind in ["turn", "restart"] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runtime::runtime_atomic_reset_tests::limit_decision_kill_child",
-                "--nocapture",
-            ])
-            .env("PI_LIMIT_DECISION_KILL_DB", &path)
-            .env("PI_LIMIT_DECISION_KIND", kind)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some((_, rest)) = line.split_once("LIMIT_DECISION_COMMITTED ") {
-                    let _ = tx.send(rest.to_owned());
-                    break;
+        for stage in ["evidence", "decision"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::runtime_atomic_reset_tests::limit_decision_kill_child",
+                    "--nocapture",
+                ])
+                .env("PI_LIMIT_DECISION_KILL_DB", &path)
+                .env("PI_LIMIT_DECISION_KIND", kind)
+                .env("PI_LIMIT_DECISION_STAGE", stage)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Some((_, rest)) = line.split_once("LIMIT_DECISION_COMMITTED ") {
+                        let _ = tx.send(rest.to_owned());
+                        break;
+                    }
                 }
-            }
-        });
-        let marker = rx.recv_timeout(std::time::Duration::from_secs(20));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        let marker = marker.expect("child did not commit decision");
-        let mut fields = marker.split_whitespace();
-        let id = Uuid::parse_str(fields.next().unwrap()).unwrap();
-        let occurrence = Uuid::parse_str(fields.next().unwrap()).unwrap();
-        let replacement = Uuid::parse_str(fields.next().unwrap()).unwrap();
-        let mut changed = options();
-        changed.max_turns = 100;
-        changed.restart_limit = 100;
-        let mut h = Harness::open_paused(&path, changed).unwrap();
-        h.install_provider_adapter(Arc::new(BlockAdapter)).unwrap();
-        h.submit(id, None, "after decision".into()).unwrap();
-        h.reset_with_blocks(
-            id,
-            Some("later reset".into()),
-            vec![vec![serde_json::json!({"type":"text","text":"later"})]],
-        )
-        .unwrap();
-        h.drive(id, &CancellationToken::new()).await.unwrap();
-        assert!(matches!(
-            h.conversation(id)
-                .unwrap()
-                .submissions
-                .iter()
-                .find(|s| s.id == replacement)
-                .unwrap()
-                .status,
-            Status::Done { .. }
-        ));
-        let fork = h.fork_by_entry_id(id, occurrence).unwrap();
-        assert_eq!(h.conversation(fork).unwrap().resets.len(), 1);
+            });
+            let marker = rx.recv_timeout(std::time::Duration::from_secs(20));
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let marker = marker.expect("child did not commit decision");
+            let mut fields = marker.split_whitespace();
+            let id = Uuid::parse_str(fields.next().unwrap()).unwrap();
+            let occurrence = Uuid::parse_str(fields.next().unwrap()).unwrap();
+            let replacement = Uuid::parse_str(fields.next().unwrap()).unwrap();
+            let mut changed = options();
+            changed.max_turns = 100;
+            changed.restart_limit = 100;
+            let mut h = Harness::open_paused(&path, changed).unwrap();
+            h.install_provider_adapter(Arc::new(BlockAdapter)).unwrap();
+            h.submit(id, None, "after decision".into()).unwrap();
+            h.reset_with_blocks(
+                id,
+                Some("later reset".into()),
+                vec![vec![serde_json::json!({"type":"text","text":"later"})]],
+            )
+            .unwrap();
+            h.drive(id, &CancellationToken::new()).await.unwrap();
+            assert!(matches!(
+                h.conversation(id)
+                    .unwrap()
+                    .submissions
+                    .iter()
+                    .find(|s| s.id == replacement)
+                    .unwrap()
+                    .status,
+                Status::Done { .. }
+            ));
+            let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+            assert_eq!(h.conversation(fork).unwrap().resets.len(), 1);
+        }
     }
 }
 
@@ -1698,11 +1755,8 @@ fn limit_failure_atomic_save_fences_counter_source() {
     let (mut source, version) = h.load(id).unwrap();
     source.phase = Phase::ModelReady { turns: 5 };
     h.save(&source, Expected::Version(version)).unwrap();
-    let (mut decision, source_version) = h.load(id).unwrap();
-    let source_observation = h
-        .limit_source_observation(id, source_version)
-        .unwrap()
-        .unwrap();
+    let (mut decision, source_version, source_observation) =
+        stage_limit_evidence(&mut h, id, LimitFailureKind::Turn, 5, 5);
     decision.phase = Phase::LimitFailure {
         kind: LimitFailureKind::Turn,
         count: 5,
@@ -1750,4 +1804,198 @@ fn limit_failure_atomic_save_fences_counter_source() {
     drop(h);
     let h = Harness::open_paused(&path, options()).unwrap();
     assert_eq!(h.conversation(id).unwrap().pending_resets.len(), 2);
+}
+
+#[test]
+fn forged_lower_bound_and_wrong_turn_branch_fail_closed() {
+    for wrong_branch in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, id, _, steps) = setup(&path);
+        h.set_after_failed_run(id, AfterFailedRun::Continue)
+            .unwrap();
+        h.submit(id, None, "replacement".into()).unwrap();
+        let (mut original, version) = h.load(id).unwrap();
+        let count = if wrong_branch { 5 } else { 1 };
+        original.phase = Phase::ModelReady { turns: count };
+        if wrong_branch {
+            original.messages.push(Message::Assistant {
+                content: "already answered".into(),
+                calls: vec![],
+                replay: None,
+            });
+        }
+        h.save(&original, Expected::Version(version)).unwrap();
+        let (mut forged_evidence, version) = h.load(id).unwrap();
+        let original_observation = h.limit_source_observation(id, version).unwrap().unwrap();
+        forged_evidence.phase = Phase::LimitEvidence {
+            kind: LimitFailureKind::Turn,
+            count,
+            limit: if wrong_branch { 5 } else { 1 },
+            source_observation: original_observation,
+            source_root_version: version,
+        };
+        assert!(
+            h.save(&forged_evidence, Expected::Version(version))
+                .is_err()
+        );
+        let (mut decision, source_version, source_observation) =
+            forge_limit_evidence(&mut h, id, LimitFailureKind::Turn, count, 5);
+        decision.phase = Phase::LimitFailure {
+            kind: LimitFailureKind::Turn,
+            count,
+            limit: if wrong_branch { 5 } else { 1 },
+            source_observation,
+            source_root_version: source_version,
+        };
+        // Forge a same-commit runtime-shaped record without going through the
+        // production transition guard.
+        let staged = h
+            .prepare_save(&decision, Expected::Version(source_version))
+            .unwrap();
+        h.commit_conversation_save(staged).unwrap();
+        let (mut failure, version) = h.load(id).unwrap();
+        finish_failure(
+            &mut failure,
+            "turn limit".into(),
+            FailureCause::TurnLimit(count),
+        );
+        assert!(h.save(&failure, Expected::Version(version)).is_err());
+        let batch = h
+            .prepare_atomic_failure_reset_save(&failure, version, &steps)
+            .unwrap();
+        let bytes = batch
+            .mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                Mutation::Put { key, value } if key.starts_with(b"runtime/reset-manifest/") => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let cursor = serde_json::from_value(manifest["cuts"][0]["cursor"].clone()).unwrap();
+        let observation = manifest["anchor_observation"].as_u64().unwrap();
+        h.commit_conversation_save(batch).unwrap();
+        assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+    }
+}
+
+#[test]
+fn staged_limit_failure_fences_independent_source_before_commit() {
+    for policy in [
+        AfterFailedRun::Keep,
+        AfterFailedRun::Withdraw,
+        AfterFailedRun::Continue,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, id, _, _) = setup(&path);
+        h.set_after_failed_run(id, policy).unwrap();
+        h.submit(id, None, "replacement".into()).unwrap();
+        if policy == AfterFailedRun::Continue {
+            for _ in 0..63 {
+                h.reset(id, None).unwrap();
+            }
+        }
+        let (mut source, version) = h.load(id).unwrap();
+        source.phase = Phase::ModelReady { turns: 5 };
+        h.save(&source, Expected::Version(version)).unwrap();
+        let (mut decision, evidence_version, evidence_observation) =
+            stage_limit_evidence(&mut h, id, LimitFailureKind::Turn, 5, 5);
+        decision.phase = Phase::LimitFailure {
+            kind: LimitFailureKind::Turn,
+            count: 5,
+            limit: 5,
+            source_observation: evidence_observation,
+            source_root_version: evidence_version,
+        };
+        h.save(&decision, Expected::Version(evidence_version))
+            .unwrap();
+        let (mut failure, version) = h.load(id).unwrap();
+        finish_failure(
+            &mut failure,
+            "turn limit".into(),
+            FailureCause::TurnLimit(5),
+        );
+        assert!(
+            h.atomic_failure_reset_steps(&failure, &Expected::Version(version))
+                .unwrap()
+                .is_none()
+        );
+        let key = format!("runtime/fork/{id}/{evidence_observation:020}").into_bytes();
+        let owner = h.owner.clone();
+        RESET_PROOF_BEFORE_SAVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    let value = owner.store().get(&key).unwrap().unwrap().value;
+                    owner
+                        .store()
+                        .commit(&[], &[Mutation::Put { key, value }])
+                        .unwrap();
+                })
+                .join()
+                .unwrap();
+            }))
+        });
+        assert!(matches!(
+            h.save(&failure, Expected::Version(version)),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        let state = h.conversation(id).unwrap();
+        assert!(matches!(state.phase, Phase::LimitFailure { .. }));
+        assert!(state.run_failure.is_none());
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(matches!(
+            h.conversation(id).unwrap().phase,
+            Phase::LimitFailure { .. }
+        ));
+    }
+}
+
+#[test]
+fn limit_configuration_checkpoint_fences_source_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, _) = setup(&path);
+    let (mut source, version) = h.load(id).unwrap();
+    source.phase = Phase::ModelReady { turns: 5 };
+    h.save(&source, Expected::Version(version)).unwrap();
+    let (mut evidence, version) = h.load(id).unwrap();
+    let source_observation = h.limit_source_observation(id, version).unwrap().unwrap();
+    evidence.phase = Phase::LimitEvidence {
+        kind: LimitFailureKind::Turn,
+        count: 5,
+        limit: 5,
+        source_observation,
+        source_root_version: version,
+    };
+    let key = format!("runtime/fork/{id}/{source_observation:020}").into_bytes();
+    let owner = h.owner.clone();
+    RESET_PROOF_BEFORE_SAVE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                let value = owner.store().get(&key).unwrap().unwrap().value;
+                owner
+                    .store()
+                    .commit(&[], &[Mutation::Put { key, value }])
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        }))
+    });
+    assert!(matches!(
+        h.save(&evidence, Expected::Version(version)),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(matches!(
+        h.conversation(id).unwrap().phase,
+        Phase::ModelReady { turns: 5 }
+    ));
 }
