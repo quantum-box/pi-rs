@@ -3156,6 +3156,14 @@ CLI, terminal and RPC fork/clone operations record their immediate source as the
 parent, replacing inherited ancestry metadata when a child is forked again.
 This preserves the copied conversation while retaining the correct origin path.
 
+Selected-branch forks resolve labels across the source journal, including
+updates and clears made on other branches, and retain the latest label timestamp.
+Imported Pi label entries are removed from the copied path and retained labels
+are recreated; compaction boundaries and retained record metadata are remapped.
+New Pi imports record conversion provenance. Forking rejects ambiguous legacy
+ownership or inconsistent provenance when it cannot safely reconstruct the
+selected history.
+
 ### Session-name validation checkpoint
 
 CLI `--name`, the native `name` command and RPC `set_session_name` reject empty

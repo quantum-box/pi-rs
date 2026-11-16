@@ -631,7 +631,7 @@ pub(super) fn run(
             && let Some(previous) = previous_records
             && let Ok(session) = Session::snapshot(&args.session)
         {
-            for entry in super::rpc_entries::changes(&session, previous) {
+            for entry in super::rpc_entries::changes(&session, previous)? {
                 emit(json!({"type":"entry_appended","entry":entry}))?;
             }
         }
@@ -1379,13 +1379,15 @@ fn command_cancellable(
         }
         "fork" | "clone" => {
             let session = Session::open(&args.session)?;
+            let entries = super::rpc_entries::Entries::new(&session);
+            entries.ensure_valid()?;
             let (entry_id, position, target, text) = if name == "fork" {
                 let invalid = || Error::Config("Invalid entry ID for forking".into());
                 let entry = record_id(&request["entryId"]).map_err(|_| invalid())?;
-                if !super::rpc_entries::Entries::new(&session).is_user_message(entry) {
+                if !entries.is_user_message(entry) {
                     return Err(invalid());
                 }
-                let id = super::rpc_entries::editable_record(&session, entry);
+                let id = super::rpc_entries::editable_record(&session, entry)?;
                 let record = session
                     .records()
                     .iter()
@@ -1405,7 +1407,7 @@ fn command_cancellable(
                     _ => return Err(invalid()),
                 }
             } else {
-                if !super::rpc_entries::Entries::new(&session).has_leaf() {
+                if !entries.has_leaf() {
                     return Err(Error::Config(
                         "Cannot clone session: no current entry selected".into(),
                     ));
@@ -1554,7 +1556,7 @@ fn command_cancellable(
             let target = super::rpc_entries::editable_record(
                 session,
                 record_id(request.get("targetId").unwrap_or(&request["target"]))?,
-            );
+            )?;
             let replacement = request
                 .get("replacement")
                 .ok_or_else(|| Error::Config("replacement is required".into()))?;
@@ -1719,14 +1721,20 @@ pub(super) fn snapshot_response(
             Ok(result)
         }
         "get_tree" => {
-            let mut result = super::rpc_entries::Entries::new(session).tree();
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            let mut result = entries.tree();
             if request["includeNative"] == true {
                 result["nativeTree"] = json!(session_tree(session));
                 result["nativeLeafId"] = json!(session.head().to_string());
             }
             Ok(result)
         }
-        "get_fork_messages" => Ok(super::rpc_entries::Entries::new(session).fork_messages()),
+        "get_fork_messages" => {
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            Ok(entries.fork_messages())
+        }
         "get_last_assistant_text" => Ok(super::rpc_messages::last_assistant_text(session)
             .map_or_else(|| json!({}), |text| json!({"text":text}))),
         "get_messages" => {
@@ -1742,7 +1750,9 @@ pub(super) fn snapshot_response(
         }
         "get_session_stats" => {
             let mut native = session.statistics();
-            super::rpc_entries::Entries::new(session).apply_message_counts(&mut native);
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            entries.apply_message_counts(&mut native);
             let operations = super::sessions::model_operation_usage(session.records());
             native.tokens.input = native.tokens.input.saturating_add(operations.input);
             native.tokens.output = native.tokens.output.saturating_add(operations.output);
@@ -2152,7 +2162,7 @@ fn finish_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
     if let Some(parent) = parent {
         session.set_parent_session(parent)?;
     }
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     super::thinking::adjust(args);
     args.record_automatic_model_selection(&mut session)?;
     Ok(())
