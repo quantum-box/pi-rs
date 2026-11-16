@@ -83,22 +83,27 @@ pub(crate) fn check_inheritance_provenance(
     store: &durable_store::Store,
 ) -> Result<bool, durable_store::Error> {
     for (key, entry) in store.list(b"durable/owned-subagent/")? {
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
+        let Ok(admission) = serde_json::from_slice::<Admission>(&entry.value) else {
             return Ok(false);
         };
-        let Some(object) = value.as_object() else {
+        if admission.key.is_empty()
+            || key != reservation_key(admission.task, &admission.key)
+            || admission.task_owner == TaskOwner::Conversation(admission.child)
+            || crate::runtime::validate_config(&admission.config).is_err()
+            || crate::runtime::validate_allowed_tools(&admission.allowed_tools).is_err()
+            || admission.submission.as_ref().is_some_and(|submission| {
+                submission.content.trim().is_empty()
+                    || submission.notify.as_ref().is_some_and(|notify| {
+                        admission.mode != Mode::Foreground
+                            || notify.task_id != admission.task
+                            || notify.key.is_empty()
+                    })
+            })
+        {
             return Ok(false);
-        };
-        match object.get("inherit_parent_tools") {
-            None | Some(serde_json::Value::Bool(false)) => continue,
-            Some(serde_json::Value::Bool(true)) => {}
-            _ => return Ok(false),
         }
-        let Ok(admission) = serde_json::from_value::<Admission>(value) else {
-            return Ok(false);
-        };
-        if key != reservation_key(admission.task, &admission.key) {
-            return Ok(false);
+        if !admission.inherit_parent_tools {
+            continue;
         }
         let Some(entry) = store.get(&inheritance_v2_key(admission.task, &admission.key))? else {
             return Ok(false);
@@ -1025,6 +1030,113 @@ mod tests {
             h.ensure_task_owned_subagent(task, owner, "stray", config(), Mode::Background)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn malformed_or_miskeyed_reservations_quarantine_both_recovery_paths() {
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"inherit_parent_tools": false}),
+            serde_json::json!({"task": Uuid::new_v4()}),
+            serde_json::json!({"inherit_parent_tools": "false"}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            let (task, owner) = setup(&mut h);
+            h.submit_task_owned_subagent(
+                task,
+                owner,
+                "legacy",
+                config(),
+                Mode::Foreground,
+                "queued".into(),
+            )
+            .unwrap();
+            let store = h.subagent_store().unwrap();
+            let key = reservation_key(task, "legacy");
+            let entry = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[Check {
+                        key: key.clone(),
+                        expected: Expected::Version(entry.version),
+                    }],
+                    &[Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&bad).unwrap(),
+                    }],
+                )
+                .unwrap();
+            drop(h);
+            assert!(
+                matches!(
+                    Harness::open_paused(&path, options()),
+                    Err(Error::UntrustedToolInheritance)
+                ),
+                "{bad}"
+            );
+            assert!(
+                matches!(
+                    crate::task_scheduler::Scheduler::open(&path, Default::default()),
+                    Err(crate::task_scheduler::Error::UntrustedToolInheritance)
+                ),
+                "{bad}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let admission = h
+            .ensure_task_owned_subagent(task, owner, "legacy", config(), Mode::Background)
+            .unwrap();
+        let store = h.subagent_store().unwrap();
+        let key = reservation_key(task, "legacy");
+        let entry = store.get(&key).unwrap().unwrap();
+        let mut wrong = admission;
+        wrong.key = "different".into();
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&wrong).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(h);
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
+        assert!(matches!(
+            crate::task_scheduler::Scheduler::open(&path, Default::default()),
+            Err(crate::task_scheduler::Error::UntrustedToolInheritance)
+        ));
+    }
+
+    #[test]
+    fn valid_unmarked_legacy_reservation_allows_both_recovery_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let admission = h
+            .ensure_task_owned_subagent(task, owner.clone(), "legacy", config(), Mode::Background)
+            .unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            h.ensure_task_owned_subagent(task, owner, "legacy", config(), Mode::Background)
+                .unwrap(),
+            admission
+        );
+        drop(h);
+        assert!(crate::task_scheduler::Scheduler::open(&path, Default::default()).is_ok());
     }
 
     #[test]
