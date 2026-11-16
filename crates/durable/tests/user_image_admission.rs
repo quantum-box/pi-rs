@@ -909,3 +909,62 @@ async fn fitted_input_notification_survives_reopen_and_withdrawal() {
     assert_eq!(value["id"], json!(result.submission_id));
     assert_eq!(value["reason"], "aborted");
 }
+
+#[tokio::test]
+async fn scheduler_fitted_input_delivers_settlement_notification() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        runtime::{AdmissionOptions, Scheduler, SubmissionNotify, submission_settled_signal},
+        task::{Checkpoint, Task, TaskOwner},
+        task_store::{Save, TaskStore},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(Adapter::default());
+    let mut scheduler =
+        Scheduler::open_with_provider_adapter(&path, options(), Default::default(), adapter)
+            .unwrap();
+    let conversation = scheduler.create_conversation(config("first")).unwrap();
+    let owner = scheduler.create_conversation(config("first")).unwrap();
+    scheduler
+        .select_provider_adapter(conversation, true)
+        .unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(owner),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    let store = Store::open(&path).unwrap();
+    TaskStore::new(&store).save(&[Save::Create(&task)]).unwrap();
+    drop(store);
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    let submission = scheduler
+        .submit_fitted_user_blocks_with_notification(
+            conversation,
+            None,
+            vec![image_block()],
+            &fit,
+            AdmissionOptions::default(),
+            SubmissionNotify {
+                task_id: task.id(),
+                key: "image".into(),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    scheduler.wait(conversation).await.unwrap();
+    scheduler.shutdown().await.unwrap();
+    let store = Store::open(&path).unwrap();
+    let value = TaskStore::new(&store)
+        .read_typed_signal(task.id(), &submission_settled_signal(), "image")
+        .unwrap()
+        .unwrap();
+    assert_eq!(value["id"], json!(submission.submission_id));
+    assert_eq!(value["status"], "done");
+}
