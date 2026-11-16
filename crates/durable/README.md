@@ -1564,6 +1564,15 @@ Stores with any pre-sequence versions fail closed unless `unified_history_start(
 
 ### Host submission settlement waits
 
+For a durable task notification, use the `*_with_notification` admission
+variants with `SubmissionNotify { task_id, key }`. The settlement commit
+delivers the typed `submission_settled_signal()` to that task and key together
+with the submission's final state. A missing or closed task and an already-used
+key do not prevent settlement; the existing signal is retained. Destinations are
+persisted for reopen and are not copied to forks. The signal uses pi-rs UUIDs
+and answer text rather than upstream entry identifiers; see the
+[parity notes](../../docs/pi-durable-parity.md) for the exact boundary.
+
 `Scheduler::wait_for_submission(conversation_id, submission_id, &cancel)` waits
 for the specific committed submission, including queued work and work recovered
 after reopening. Input and continue results include the stored answer text and
