@@ -770,6 +770,15 @@ impl Scheduler {
                 std::panic::resume_unwind(payload);
             }
         };
+        if result.is_ok() {
+            let mut state = self
+                .live_invocations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.failed_handlers.remove(&lease.id) {
+                state.handler_failed = !state.failed_handlers.is_empty();
+            }
+        }
         if result.is_err() && !reported_handler_failure {
             self.live_invocations
                 .lock()
@@ -2780,6 +2789,103 @@ mod tests {
                 .state(),
             &TaskState::Succeeded(json!("done"))
         );
+    }
+
+    #[test]
+    fn abort_supersedes_reported_handler_failure_and_resumes_cleanup() {
+        for ancestor in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::default();
+            registry.register("fails", false, |_: &Task| Err("failed".into()));
+            registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+            registry.set_abort("fails", |_: &Task| Ok(Step::Succeed(json!(null))));
+            registry.set_abort("parent", |_: &Task| Ok(Step::Succeed(json!(null))));
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let conversation = TaskOwner::Conversation(Uuid::from_u128(9));
+            if ancestor {
+                scheduler
+                    .submit(&task(3, conversation.clone(), "parent", false, 3))
+                    .unwrap();
+            }
+            let owner = if ancestor {
+                TaskOwner::Task(Uuid::from_u128(3))
+            } else {
+                conversation
+            };
+            scheduler
+                .ts()
+                .save(&[Save::Create(&task(1, owner, "fails", false, 3))])
+                .unwrap();
+            let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+                panic!("invocation")
+            };
+            let completed = invocation.execute().unwrap();
+            assert!(matches!(scheduler.reserve_tick(0), Err(Error::Stopped)));
+            request_abort_subtree(
+                &scheduler.ts(),
+                Uuid::from_u128(if ancestor { 3 } else { 1 }),
+            )
+            .unwrap();
+            scheduler.settle_invocation(completed).unwrap();
+            assert!(scheduler.check().is_ok());
+            for _ in 0..4 {
+                scheduler.tick(0).unwrap();
+                if scheduler
+                    .get(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .is_terminal()
+                {
+                    break;
+                }
+            }
+            assert_eq!(
+                scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn abort_clears_only_its_own_failed_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("fails", false, |_: &Task| Err("failed".into()));
+        registry.set_abort("fails", |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .submit(&task(1, owner.clone(), "fails", false, 3))
+            .unwrap();
+        scheduler
+            .submit(&task(2, owner, "fails", false, 3))
+            .unwrap();
+        let TickReservation::Invocation(a) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("A")
+        };
+        let TickReservation::Invocation(b) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("B")
+        };
+        let a = a.execute().unwrap();
+        let b = b.execute().unwrap();
+        request_abort_subtree(&scheduler.ts(), Uuid::from_u128(1)).unwrap();
+        scheduler.settle_invocation(a).unwrap();
+        assert!(matches!(scheduler.reserve_tick(0), Err(Error::Stopped)));
+        assert_eq!(
+            scheduler.live_invocations.lock().unwrap().failed_handlers,
+            HashSet::from([Uuid::from_u128(2)])
+        );
+        request_abort_subtree(&scheduler.ts(), Uuid::from_u128(2)).unwrap();
+        scheduler.settle_invocation(b).unwrap();
+        assert!(scheduler.check().is_ok());
+        scheduler.tick(0).unwrap();
+        scheduler.tick(0).unwrap();
+        for id in [1, 2] {
+            assert_eq!(
+                scheduler.get(Uuid::from_u128(id)).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+        }
     }
 
     #[test]
