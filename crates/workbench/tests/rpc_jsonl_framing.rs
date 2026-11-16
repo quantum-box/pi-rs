@@ -102,7 +102,7 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
     input
         .write_all(b"{\"type\":\"get_state\",\"id\":\"last\"}\r\n")
         .unwrap();
-    input.write_all(b"{\"id\":\"object\",\"type\":{\"x\":1}}\n{\"id\":\"array\",\"type\":[1,null,[true,2],{}]}\n{\"id\":\"number\",\"type\":1.0}\n{\"id\":\"shadow\",\"type\":{\"toString\":0}}\n{\"id\":\"missing\"}\r").unwrap();
+    input.write_all(b"{\"id\":\"object\",\"type\":{\"x\":1}}\n{\"id\":\"array\",\"type\":[1,null,[true,2],{}]}\n{\"id\":\"number\",\"type\":1.0}\n{\"id\":\"shadow\",\"type\":{\"toString\":0}}\n{\"id\":\"missing\"}\n[]\n123\n\"text\"\ntrue\nnull\n{\"type\":\"get_state\",\"id\":\"after\"}\r").unwrap();
     drop(input);
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
@@ -126,7 +126,7 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 9, "{responses:?}");
+    assert_eq!(responses.len(), 15, "{responses:?}");
     assert_eq!(responses[0]["id"], "bad�id");
     assert_eq!(responses[0]["success"], true);
     assert_eq!(responses[0]["data"]["messageCount"], 0);
@@ -160,4 +160,15 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
         responses[5]["command"],
         serde_json::json!([1, null, [true, 2], {}])
     );
+    for response in &responses[9..13] {
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["error"], "Unknown command: undefined");
+        assert!(response.get("command").is_none());
+        assert!(response.get("id").is_none());
+    }
+    assert_eq!(responses[13]["command"], "parse");
+    assert_eq!(responses[13]["success"], false);
+    assert_eq!(responses[14]["id"], "after");
+    assert_eq!(responses[14]["success"], true);
 }

@@ -531,6 +531,9 @@ command to finish, even if an internal agent-settled event arrives first.
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID and original type when present. Object, array and numeric types use
 JavaScript string conversion in the diagnostic, including null array elements.
+Non-null JSON values without a command type also return `Unknown command:
+undefined`, as in Pi. Native rejects a top-level `null` as a parse response;
+Pi instead attempts to access command properties on it.
 RPC `set_model` rejects non-string `provider` and `modelId` fields using Pi's
 diagnostic conversion. Missing `provider` still selects within the current
 provider as a native extension.
