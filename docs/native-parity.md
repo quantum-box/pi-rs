@@ -177,7 +177,9 @@ reached against an available native or Pi manifest diagnostic candidate. For a l
 package it stops the current declaration at that resource type, retaining
 earlier resources and processing later declarations. Remote errors propagate.
 Startup theme discovery uses cached candidates when available. Single-file
-sources and other resource filter paths still treat invalid URLs as non-matches.
+sources load only the selected executable and bypass package filters, as in Pi;
+the native executable must pass protocol validation. Other resource filter
+paths still treat invalid URLs as non-matches.
 Pi-only extensions, skills and prompts are scanned only for filter diagnostics;
 they are not loaded as native resources. Diagnostic scans are bounded and fall
 back to native candidates on cycles, excessive traversal, unsafe ignore files,
