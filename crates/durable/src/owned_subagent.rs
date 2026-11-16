@@ -2362,6 +2362,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_scheduler_attaches_tasks_before_recovered_tool_dispatch() {
+        use futures_util::{StreamExt, stream};
+        use pi_rs_core::{Message, ModelEvent, ToolCall, ToolSpec};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Gate {
+            entered: Arc<tokio::sync::Semaphore>,
+            release: Arc<tokio::sync::Semaphore>,
+        }
+        #[async_trait]
+        impl crate::model::ProviderAdapter for Gate {
+            fn id(&self) -> &str {
+                "guarded/v1"
+            }
+            async fn prepare(
+                &self,
+                _: &crate::model::ProviderAttempt,
+                request: &ModelRequest,
+            ) -> Result<serde_json::Value, ModelError> {
+                let done = request
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::Tool { .. }));
+                Ok(serde_json::json!({"done":done,"auth":"allowed","budget":1,"endpoint":"safe"}))
+            }
+            fn validate(
+                &self,
+                _: &crate::model::ProviderAttempt,
+                _: &ModelRequest,
+                body: &serde_json::Value,
+            ) -> Result<(), ModelError> {
+                if body["auth"] != "allowed" || body["budget"] != 1 || body["endpoint"] != "safe" {
+                    return Err(ModelError::Config("policy rejected request".into()));
+                }
+                Ok(())
+            }
+            async fn dispatch(
+                &self,
+                _: &crate::model::ProviderAttempt,
+                _: &ModelRequest,
+                body: serde_json::Value,
+            ) -> Result<ModelStream, ModelError> {
+                let done = body["done"].as_bool().unwrap();
+                if !done {
+                    self.entered.add_permits(1);
+                    self.release.acquire().await.unwrap().forget();
+                }
+                let mut events = Vec::new();
+                if done {
+                    events.push(Ok(ModelEvent::Text("done".into())));
+                }
+                events.push(Ok(ModelEvent::Complete {
+                    calls: if done {
+                        vec![]
+                    } else {
+                        vec![ToolCall {
+                            id: "call".into(),
+                            name: "job".into(),
+                            arguments: "{}".into(),
+                        }]
+                    },
+                    usage: None,
+                }));
+                Ok(stream::iter(events).boxed())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider: Arc<dyn crate::model::ProviderAdapter> = Arc::new(Gate {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let handler: Arc<dyn crate::task_scheduler::Handler> = Arc::new(move |_: &Task| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::task_scheduler::Step::Succeed(serde_json::json!(
+                "task result"
+            )))
+        });
+        let task_tool = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "job".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            "job-task",
+            true,
+            1,
+            handler.clone(),
+        ));
+        let opts = || {
+            let mut options = options();
+            options.max_turns = 3;
+            options.tools.push(task_tool.register());
+            options
+        };
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        h.install_provider_adapter(provider.clone()).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        let submission = h.submit(id, None, "recover".into()).unwrap();
+        drop(h);
+        let mut tasks = crate::task_scheduler::Registry::default();
+        tasks.register_shared("job-task", true, handler);
+        let (mut scheduler, driver) = Scheduler::open_with_pinned_provider_adapter_and_tasks(
+            &path,
+            opts(),
+            Default::default(),
+            provider,
+            tasks,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let mut worker = scheduler.subagent_harness().worker();
+        assert!(
+            worker
+                .install_provider_adapter(Arc::new(GuardedAdapter))
+                .is_err()
+        );
+        drop(worker);
+        release.add_permits(1);
+        let cancel = pi_rs_core::CancellationToken::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scheduler.wait_for_submission(id, submission, &cancel),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            scheduler
+                .conversation(id)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == submission)
+                .unwrap()
+                .status,
+            crate::runtime::Status::Done { .. }
+        ));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn ordinary_scheduler_adapter_start_remains_unpinned() {
         let dir = tempfile::tempdir().unwrap();
         let mut scheduler = Scheduler::open_with_provider_adapter(

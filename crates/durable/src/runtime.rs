@@ -19055,6 +19055,32 @@ impl Scheduler {
         .map(|(scheduler, _)| scheduler)
     }
 
+    /// Install and pin the adapter and attach the task registry before any
+    /// recovered conversation is scheduled. Keep the returned driver alive.
+    pub fn open_with_pinned_provider_adapter_and_tasks(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+        tasks: crate::task_scheduler::Registry,
+    ) -> Result<(Self, crate::task_driver::Driver), Error> {
+        let (scheduler, driver) = Self::open_configured_with_tasks_and_adapter_pin(
+            path,
+            options,
+            registry,
+            None,
+            Some(adapter),
+            Some(tasks),
+            None,
+            None,
+            true,
+        )?;
+        Ok((
+            scheduler,
+            driver.ok_or_else(|| Error::Invalid("task driver was not installed".into()))?,
+        ))
+    }
+
     /// Opt into bounded recovery of independent summaries. The identity is a
     /// host assertion about `options.model`, including the service that handles
     /// its usage receipts. It must be stable across restarts and changed when
