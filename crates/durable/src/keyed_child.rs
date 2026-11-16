@@ -219,9 +219,10 @@ pub(crate) fn prepare(
         || positive_integer
         || tool.is_empty()
         || child.owner() != &TaskOwner::Task(parent.task.id())
+        || child.id().is_nil()
         || child.id() == parent.task.id()
-        || child.state() != &TaskState::Ready
-        || child.abort_requested()
+        || !child.is_fresh_admission()
+        || child.is_background()
         || child.input() != arguments
     {
         return Err(Error::Invalid);
@@ -305,6 +306,41 @@ pub(crate) fn prepare(
         checks: batch.checks,
         mutations: batch.mutations,
     })
+}
+
+/// Prepare an unkeyed direct child and advance the live parent's graph fence.
+pub(crate) fn prepare_unkeyed(
+    store: &Store,
+    parent: &StoredTask,
+    child: &Task,
+) -> Result<crate::task_store::OwnedBatch, Error> {
+    if child.owner() != &TaskOwner::Task(parent.task.id())
+        || child.id().is_nil()
+        || child.id() == parent.task.id()
+        || !child.is_fresh_admission()
+        || child.is_background()
+        || child.kind().is_none_or(str::is_empty)
+    {
+        return Err(Error::Invalid);
+    }
+    let tasks = TaskStore::new(store);
+    let current = tasks.load(parent.task.id())?.ok_or(Error::ParentClosed)?;
+    if current != *parent
+        || current.task.state() != &TaskState::Running
+        || current.task.abort_requested()
+    {
+        return Err(Error::ParentClosed);
+    }
+    let mut batch = tasks.prepare_save(&[Save::Create(child)])?;
+    batch.checks.push(Check {
+        key: crate::task_store::key(parent.task.id()),
+        expected: Expected::Version(parent.version),
+    });
+    batch.mutations.push(Mutation::Put {
+        key: crate::task_store::key(parent.task.id()),
+        value: serde_json::to_vec(&parent.task)?,
+    });
+    Ok(batch)
 }
 
 #[cfg(test)]

@@ -693,6 +693,153 @@ impl Shared {
         }
         result
     }
+    /// Validate a live parent attempt, registry and ownership graph while holding
+    /// the same admission gate used by executor finalization.
+    pub(crate) fn with_session_child<T>(
+        &self,
+        intents: &[crate::session_transaction::SessionChild],
+        conversation: Uuid,
+        f: impl FnOnce(u64) -> Result<T, crate::runtime::Error>,
+    ) -> Result<T, crate::runtime::Error> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        let parent = &intents
+            .first()
+            .ok_or_else(|| crate::runtime::Error::Invalid("missing owned task admission".into()))?
+            .parent;
+        if state.stop
+            || intents.iter().any(|intent| {
+                let child = &intent.child;
+                intent.parent != *parent
+                    || child
+                        .kind()
+                        .and_then(|kind| state.policies.get(kind))
+                        .copied()
+                        != Some((child.replay_safe(), child.definition_version()))
+                    || child.owner() != &TaskOwner::Task(parent.task.id())
+                    || !child.is_fresh_admission()
+                    || child.id().is_nil()
+                    || child.is_background()
+                    || child.is_task_tool()
+            })
+            || parent
+                .task
+                .kind()
+                .and_then(|kind| state.policies.get(kind))
+                .copied()
+                != Some((parent.task.replay_safe(), parent.task.definition_version()))
+            || parent.task.state() != &TaskState::Running
+            || parent.task.abort_requested()
+            || parent.task.attempt_id().is_none()
+            || parent.task.is_task_tool()
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "invalid owned task admission".into(),
+            ));
+        }
+        let _gate = self
+            .owner
+            .task_gate()
+            .lock()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        let store = self.owner.store();
+        let tasks = TaskStore::new(store);
+        let boundary = store.put_version()?;
+        // A task-owned conversation requires validating its owner's complete
+        // abort chain. Until that path is available, reject it explicitly.
+        if crate::ownership_edge::EdgeStore::new(store)
+            .get(conversation)
+            .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+            .is_some()
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "owned conversation child admission is unsupported".into(),
+            ));
+        }
+        let mut owner = parent.task.owner().clone();
+        let mut seen = std::collections::HashSet::from([parent.task.id()]);
+        loop {
+            match owner {
+                TaskOwner::Conversation(id) if id == conversation => break,
+                TaskOwner::Conversation(_) => {
+                    return Err(crate::runtime::Error::Invalid(
+                        "parent belongs to another conversation".into(),
+                    ));
+                }
+                TaskOwner::Task(id) => {
+                    if !seen.insert(id) {
+                        return Err(crate::runtime::Error::Invalid(
+                            "cyclic task ownership".into(),
+                        ));
+                    }
+                    let ancestor = tasks
+                        .load(id)
+                        .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+                        .ok_or_else(|| {
+                            crate::runtime::Error::Invalid("missing parent ancestor".into())
+                        })?;
+                    if ancestor.task.abort_requested()
+                        || ancestor.task.is_terminal()
+                        || matches!(ancestor.task.state(), TaskState::CompletingFailed(_))
+                    {
+                        return Err(crate::runtime::Error::Invalid(
+                            "parent ancestor is closed or aborting".into(),
+                        ));
+                    }
+                    owner = ancestor.task.owner().clone();
+                }
+            }
+        }
+        if tasks
+            .load(parent.task.id())
+            .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+            .as_ref()
+            != Some(parent)
+            || crate::task_scheduler::pending_abort_root_for_running(
+                &tasks,
+                parent.task.id(),
+                false,
+            )
+            .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+            .is_some()
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "parent attempt changed or is aborting".into(),
+            ));
+        }
+        let mut children = std::collections::HashMap::new();
+        for intent in intents.iter().filter(|intent| intent.creating) {
+            let child = &intent.child;
+            if tasks
+                .load(child.id())
+                .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+                .is_some()
+                || children.insert(child.id(), child).is_some()
+            {
+                return Err(crate::runtime::Error::Invalid(
+                    "child task ID already exists".into(),
+                ));
+            }
+        }
+        if !children.is_empty() {
+            let targets: Vec<_> = children.keys().copied().collect();
+            crate::task_scheduler::validate_wait_graph(
+                store,
+                parent.task.id(),
+                &targets,
+                &children,
+            )
+            .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?;
+        }
+        let result = f(boundary);
+        if result.is_ok() {
+            self.notify_work();
+        }
+        result
+    }
+
     // Called while the conversation execution gate may be held. Match the
     // admission lock order: state before task gate, never scheduler or a
     // conversation gate while holding state. Replacement holds state while

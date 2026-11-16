@@ -9,7 +9,7 @@
 pub mod controls;
 pub mod owner;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     fmt,
     path::Path,
@@ -38,6 +38,8 @@ pub enum Expected {
     Missing,
     /// Key remains absent and has not been put since this global version.
     MissingUnchangedSince(u64),
+    /// The same absence history fence with a monotonic deadline.
+    MissingUnchangedSinceBefore(u64, Instant),
     /// Key must remain absent and the monotonic deadline must not elapse.
     MissingBefore(Instant),
     Version(u64),
@@ -1098,13 +1100,19 @@ impl Store {
                 .optional()?;
             let matches = match check.expected {
                 Expected::Missing => version.is_none(),
-                Expected::MissingUnchangedSince(boundary) => {
+                Expected::MissingUnchangedSince(boundary)
+                | Expected::MissingUnchangedSinceBefore(boundary, _) => {
                     let current: u64 = tx.query_row(
                         "SELECT version FROM durable_store_meta WHERE id=1",
                         [],
                         |r| r.get(0),
                     )?;
-                    if boundary > current {
+                    let legacy: u64 = tx.query_row(
+                        "SELECT legacy_version FROM durable_commit_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if boundary > current || boundary < legacy {
                         return Err(Error::InvalidSnapshot);
                     }
                     let changed: bool = tx.query_row(
@@ -1112,7 +1120,13 @@ impl Store {
                         params![check.key, boundary],
                         |r| r.get(0),
                     )?;
-                    version.is_none() && !changed
+                    let before = match check.expected {
+                        Expected::MissingUnchangedSinceBefore(_, deadline) => {
+                            Instant::now() < deadline
+                        }
+                        _ => true,
+                    };
+                    version.is_none() && !changed && before
                 }
                 Expected::MissingBefore(deadline) => version.is_none() && Instant::now() < deadline,
                 Expected::Version(v) => version == Some(v),
@@ -1427,8 +1441,9 @@ impl Store {
         // Recheck time after assembling writes, while still holding the write lock.
         // A failure drops the transaction and rolls back every mutation.
         for check in checks {
-            if let Expected::VersionBefore(_, deadline) | Expected::MissingBefore(deadline) =
-                check.expected
+            if let Expected::VersionBefore(_, deadline)
+            | Expected::MissingBefore(deadline)
+            | Expected::MissingUnchangedSinceBefore(_, deadline) = check.expected
             {
                 if Instant::now() >= deadline {
                     return Err(Error::Conflict {
@@ -1459,6 +1474,58 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod document_history_tests {
     use super::*;
+
+    #[test]
+    fn missing_unchanged_since_detects_exact_key_aba_and_deadline() {
+        let db = Store::memory().unwrap();
+        let boundary = db.put_version().unwrap();
+        let key = b"durable/task/observed".to_vec();
+        let other = b"durable/task/other".to_vec();
+        let check = Check {
+            key: key.clone(),
+            expected: Expected::MissingUnchangedSince(boundary),
+        };
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: other,
+                value: vec![1],
+            }],
+        )
+        .unwrap();
+        db.commit(std::slice::from_ref(&check), &[]).unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: vec![1],
+            }],
+        )
+        .unwrap();
+        db.commit(&[], &[Mutation::Delete { key: key.clone() }])
+            .unwrap();
+        assert!(matches!(
+            db.commit(std::slice::from_ref(&check), &[]),
+            Err(Error::Conflict { .. })
+        ));
+        let current = db.put_version().unwrap();
+        let expired = Check {
+            key: key.clone(),
+            expected: Expected::MissingUnchangedSinceBefore(current, Instant::now()),
+        };
+        assert!(matches!(
+            db.commit(&[expired], &[]),
+            Err(Error::Conflict { .. })
+        ));
+        let future = Check {
+            key,
+            expected: Expected::MissingUnchangedSince(current + 1),
+        };
+        assert!(matches!(
+            db.commit(&[future], &[]),
+            Err(Error::InvalidSnapshot)
+        ));
+    }
 
     #[test]
     fn missing_unchanged_check_detects_same_commit_aba() {

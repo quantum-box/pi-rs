@@ -1124,6 +1124,39 @@ pub struct Transaction {
 // Independently prepared task and signal-revision observations can race.
 // Compose their fences before appending batches so disagreement becomes a
 // normal commit conflict.
+fn merge_task_expected(a: &Expected, b: &Expected) -> Expected {
+    use Expected::*;
+    match (a, b) {
+        (Missing, MissingBefore(d)) | (MissingBefore(d), Missing) => MissingBefore(*d),
+        (MissingBefore(a), MissingBefore(b)) => MissingBefore((*a).min(*b)),
+        (Missing, MissingUnchangedSince(v)) | (MissingUnchangedSince(v), Missing) => {
+            MissingUnchangedSince(*v)
+        }
+        (MissingUnchangedSince(a), MissingUnchangedSince(b)) => MissingUnchangedSince((*a).min(*b)),
+        (MissingBefore(d), MissingUnchangedSince(v))
+        | (MissingUnchangedSince(v), MissingBefore(d)) => MissingUnchangedSinceBefore(*v, *d),
+        (Missing, MissingUnchangedSinceBefore(v, d))
+        | (MissingUnchangedSinceBefore(v, d), Missing) => MissingUnchangedSinceBefore(*v, *d),
+        (MissingBefore(a), MissingUnchangedSinceBefore(v, b))
+        | (MissingUnchangedSinceBefore(v, b), MissingBefore(a)) => {
+            MissingUnchangedSinceBefore(*v, (*a).min(*b))
+        }
+        (MissingUnchangedSince(a), MissingUnchangedSinceBefore(b, d))
+        | (MissingUnchangedSinceBefore(b, d), MissingUnchangedSince(a)) => {
+            MissingUnchangedSinceBefore((*a).min(*b), *d)
+        }
+        (MissingUnchangedSinceBefore(a, x), MissingUnchangedSinceBefore(b, y)) => {
+            MissingUnchangedSinceBefore((*a).min(*b), (*x).min(*y))
+        }
+        (Version(a), VersionBefore(b, d)) | (VersionBefore(b, d), Version(a)) if a == b => {
+            VersionBefore(*a, *d)
+        }
+        (VersionBefore(a, x), VersionBefore(b, y)) if a == b => VersionBefore(*a, (*x).min(*y)),
+        (a, b) if a == b => a.clone(),
+        _ => VersionBefore(0, std::time::Instant::now()),
+    }
+}
+
 pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut OwnedBatch) {
     for other in &mut graph.checks {
         if !other.key.starts_with(crate::task_store::PREFIX)
@@ -1132,30 +1165,7 @@ pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut Owne
             continue;
         }
         if let Some(check) = documents.checks.iter_mut().find(|c| c.key == other.key) {
-            let expected = match (&check.expected, &other.expected) {
-                (Expected::MissingUnchangedSince(version), Expected::Missing)
-                | (Expected::Missing, Expected::MissingUnchangedSince(version)) => {
-                    Expected::MissingUnchangedSince(*version)
-                }
-                (Expected::Missing, Expected::MissingBefore(deadline))
-                | (Expected::MissingBefore(deadline), Expected::Missing) => {
-                    Expected::MissingBefore(*deadline)
-                }
-                (Expected::MissingBefore(a), Expected::MissingBefore(b)) => {
-                    Expected::MissingBefore((*a).min(*b))
-                }
-                (Expected::Version(a), Expected::VersionBefore(b, deadline))
-                | (Expected::VersionBefore(b, deadline), Expected::Version(a))
-                    if a == b =>
-                {
-                    Expected::VersionBefore(*a, *deadline)
-                }
-                (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
-                    Expected::VersionBefore(*a, (*x).min(*y))
-                }
-                (a, b) if a == b => a.clone(),
-                _ => Expected::VersionBefore(0, std::time::Instant::now()),
-            };
+            let expected = merge_task_expected(&check.expected, &other.expected);
             check.expected = expected.clone();
             other.expected = expected;
         }
@@ -1321,6 +1331,7 @@ impl Transaction {
                     Expected::Missing
                         | Expected::MissingBefore(_)
                         | Expected::MissingUnchangedSince(_)
+                        | Expected::MissingUnchangedSinceBefore(_, _)
                 )
                 && ((self.checked.contains(&check.key)
                     && writes.contains(&check.key)
@@ -1462,6 +1473,7 @@ impl<'a> HostTransaction<'a> {
         &mut self,
         batch: OwnedBatch,
         created: &[crate::task::Task],
+        parents: &[crate::task_store::StoredTask],
     ) -> Result<(), Error> {
         for mutation in &batch.mutations {
             let key = match mutation {
@@ -1479,9 +1491,33 @@ impl<'a> HostTransaction<'a> {
                         .any(|task| crate::task_store::key(task.id()) == *key)
                     && batch.checks.iter().any(|check| {
                         check.key == *key
-                            && matches!(check.expected, Expected::MissingUnchangedSince(_))
+                            && matches!(
+                                check.expected,
+                                Expected::MissingUnchangedSince(_)
+                                    | Expected::MissingUnchangedSinceBefore(_, _)
+                            )
                     });
-                if !allowed {
+                let same_parent = match mutation {
+                    Mutation::Put { key, value }
+                        if !self.missing_signal_targets.contains(key)
+                            && !self.wake_targets.contains(key) =>
+                    {
+                        parents.iter().any(|parent| {
+                            crate::task_store::key(parent.task.id()) == *key
+                                && serde_json::to_vec(&parent.task).is_ok_and(|old| old == *value)
+                                && batch.checks.iter().any(|check| {
+                                    check.key == *key
+                                        && match check.expected {
+                                            Expected::Version(v)
+                                            | Expected::VersionBefore(v, _) => v == parent.version,
+                                            _ => false,
+                                        }
+                                })
+                        })
+                    }
+                    _ => false,
+                };
+                if !allowed && !same_parent {
                     return Err(Error::InvalidBatch);
                 }
             }
@@ -1862,28 +1898,7 @@ impl StagedSignals {
             if shared.contains(&check.key)
                 && let Some(existing) = self.batch.checks.iter_mut().find(|c| c.key == check.key)
             {
-                existing.expected = match (&existing.expected, &check.expected) {
-                    (Expected::Missing, Expected::MissingBefore(deadline))
-                    | (Expected::MissingBefore(deadline), Expected::Missing) => {
-                        Expected::MissingBefore(*deadline)
-                    }
-                    (Expected::MissingBefore(a), Expected::MissingBefore(b)) => {
-                        Expected::MissingBefore((*a).min(*b))
-                    }
-                    (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
-                        Expected::VersionBefore(*a, (*x).min(*y))
-                    }
-                    (Expected::Version(a), Expected::VersionBefore(b, x))
-                    | (Expected::VersionBefore(b, x), Expected::Version(a))
-                        if a == b =>
-                    {
-                        Expected::VersionBefore(*a, *x)
-                    }
-                    (a, b) if a == b => a.clone(),
-                    // Observations disagreed during staging. Force a commit conflict
-                    // so the normal replay-safe retry policy handles the race.
-                    _ => Expected::VersionBefore(0, std::time::Instant::now()),
-                };
+                existing.expected = merge_task_expected(&existing.expected, &check.expected);
                 continue;
             }
             self.batch.checks.push(check);
@@ -2518,6 +2533,42 @@ mod nested_entry_tests {
     use crate::task_store::{Save, TaskStore};
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn missing_aba_fences_compose_with_earliest_deadline() {
+        use std::time::{Duration, Instant};
+        let earlier = Instant::now() + Duration::from_secs(10);
+        let later = earlier + Duration::from_secs(10);
+        let strict = Expected::MissingUnchangedSinceBefore(4, earlier);
+        let cases = [
+            (
+                Expected::MissingUnchangedSince(4),
+                Expected::MissingBefore(earlier),
+            ),
+            (
+                Expected::MissingBefore(earlier),
+                Expected::MissingUnchangedSince(4),
+            ),
+            (
+                Expected::MissingUnchangedSinceBefore(9, later),
+                Expected::MissingUnchangedSinceBefore(4, earlier),
+            ),
+            (
+                Expected::MissingUnchangedSinceBefore(4, earlier),
+                Expected::Missing,
+            ),
+        ];
+        for (a, b) in cases {
+            assert_eq!(merge_task_expected(&a, &b), strict);
+        }
+        assert_eq!(
+            merge_task_expected(
+                &Expected::MissingUnchangedSince(4),
+                &Expected::MissingUnchangedSince(9)
+            ),
+            Expected::MissingUnchangedSince(4)
+        );
+    }
 
     #[test]
     fn late_child_rebase_keeps_original_deadline_and_task_version_fence() {

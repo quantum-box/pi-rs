@@ -12,6 +12,15 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+pub(crate) struct SessionChild {
+    pub parent: crate::task_store::StoredTask,
+    pub child: crate::task::Task,
+    pub batch: OwnedBatch,
+    pub creating: bool,
+    key: Option<String>,
+    result_id: Uuid,
+}
+
 /// The candidate state of one host-initiated session transaction.
 pub struct SessionTransaction<'a> {
     store: &'a Store,
@@ -29,6 +38,7 @@ pub struct SessionTransaction<'a> {
     tasks: Vec<crate::task::Task>,
     signals: crate::document::HostTransaction<'a>,
     clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
+    children: Vec<SessionChild>,
 }
 
 impl<'a> SessionTransaction<'a> {
@@ -57,6 +67,7 @@ impl<'a> SessionTransaction<'a> {
             tasks: Vec::new(),
             signals: crate::document::HostTransaction::new(store),
             clock,
+            children: Vec::new(),
         })
     }
 
@@ -127,6 +138,11 @@ impl<'a> SessionTransaction<'a> {
     pub fn create_task(&mut self, task: crate::task::Task) -> Result<Uuid, Error> {
         if self.tasks.iter().any(|existing| existing.id() == task.id()) {
             return Err(Error::DuplicateTask);
+        }
+        if !self.children.is_empty() {
+            return Err(Error::InvalidSessionAdmission(
+                "mixing child and root task creation is unsupported".into(),
+            ));
         }
         if task.id().is_nil()
             || task.owner() != &crate::task::TaskOwner::Conversation(self.state.id)
@@ -236,6 +252,157 @@ impl<'a> SessionTransaction<'a> {
         Ok(result)
     }
 
+    fn validate_child_parent(&self, parent: &crate::task_store::StoredTask) -> Result<(), Error> {
+        if !self.tasks.is_empty() || self.children.iter().any(|item| item.parent != *parent) {
+            return Err(Error::InvalidSessionAdmission(
+                "child tasks must share one parent and cannot be mixed with root tasks".into(),
+            ));
+        }
+        if parent.task.state() != &crate::task::TaskState::Running
+            || parent.task.abort_requested()
+            || parent.task.attempt_id().is_none()
+            || parent.task.is_task_tool()
+        {
+            return Err(Error::InvalidSessionAdmission(
+                "parent must be a live generic task attempt in this conversation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_child_candidate(
+        parent: &crate::task_store::StoredTask,
+        child: &crate::task::Task,
+    ) -> Result<(), Error> {
+        let invalid = || Error::InvalidSessionAdmission("invalid owned task candidate".into());
+        let kind = child
+            .kind()
+            .filter(|kind| !kind.is_empty())
+            .ok_or_else(invalid)?;
+        if child.id().is_nil() || child.owner() != &crate::task::TaskOwner::Task(parent.task.id()) {
+            return Err(invalid());
+        }
+        let fresh = crate::task::Task::new(
+            child.id(),
+            child.owner().clone(),
+            child.checkpoint().clone(),
+            child.restart_limit(),
+        )
+        .map_err(|_| invalid())?
+        .registered_versioned(
+            kind.to_owned(),
+            child.replay_safe(),
+            child.definition_version(),
+            child.input().clone(),
+        )
+        .map_err(|_| invalid())?;
+        if fresh != *child {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    /// Stage an unkeyed child of an exact running task attempt.
+    pub fn create_child_task(
+        &mut self,
+        parent: &crate::task_store::StoredTask,
+        child: crate::task::Task,
+    ) -> Result<Uuid, Error> {
+        self.validate_child_parent(parent)?;
+        Self::validate_child_candidate(parent, &child)?;
+        if self
+            .children
+            .iter()
+            .any(|item| item.creating && item.child.id() == child.id())
+        {
+            return Err(Error::DuplicateTask);
+        }
+        let batch = crate::keyed_child::prepare_unkeyed(self.store, parent, &child)
+            .map_err(|e| Error::InvalidSessionAdmission(e.to_string()))?;
+        let id = child.id();
+        self.children.push(SessionChild {
+            parent: parent.clone(),
+            child,
+            batch,
+            creating: true,
+            key: None,
+            result_id: id,
+        });
+        self.table_written = true;
+        Ok(id)
+    }
+
+    /// Stage or find a keyed generic child of an exact running task attempt.
+    pub fn create_keyed_child(
+        &mut self,
+        parent: &crate::task_store::StoredTask,
+        key: &str,
+        child: crate::task::Task,
+    ) -> Result<Uuid, Error> {
+        Self::validate_child_candidate(parent, &child)?;
+        if let Some(existing) = self
+            .children
+            .iter()
+            .find(|existing| existing.key.as_deref() == Some(key))
+        {
+            if !child.is_fresh_admission()
+                || child.id().is_nil()
+                || child.is_background()
+                || child.id() == parent.task.id()
+            {
+                return Err(Error::InvalidSessionAdmission(
+                    "invalid child candidate".into(),
+                ));
+            }
+            let same = existing.key.as_deref() == Some(key)
+                && existing.parent == *parent
+                && existing.child.owner() == child.owner()
+                && existing.child.kind() == child.kind()
+                && existing.child.input() == child.input()
+                && existing.child.replay_safe() == child.replay_safe()
+                && existing.child.definition_version() == child.definition_version()
+                && existing.child.checkpoint() == child.checkpoint()
+                && existing.child.restart_limit() == child.restart_limit()
+                && existing.child.is_task_tool() == child.is_task_tool();
+            return if same {
+                Ok(existing.result_id)
+            } else {
+                Err(Error::InvalidSessionAdmission(
+                    "key already belongs to a different child identity".into(),
+                ))
+            };
+        }
+        self.validate_child_parent(parent)?;
+        if self
+            .children
+            .iter()
+            .any(|item| item.creating && item.child.id() == child.id())
+        {
+            return Err(Error::DuplicateTask);
+        }
+        let kind = child
+            .kind()
+            .ok_or_else(|| Error::InvalidSessionAdmission("missing task kind".into()))?;
+        let prepared =
+            crate::keyed_child::prepare(self.store, parent, key, kind, child.input(), &child)
+                .map_err(|e| Error::InvalidSessionAdmission(e.to_string()))?;
+        let id = prepared.child;
+        let creating = !prepared.mutations.is_empty();
+        self.children.push(SessionChild {
+            parent: parent.clone(),
+            child,
+            batch: OwnedBatch {
+                checks: prepared.checks,
+                mutations: prepared.mutations,
+            },
+            creating,
+            key: Some(key.to_owned()),
+            result_id: id,
+        });
+        self.table_written |= creating;
+        Ok(id)
+    }
+
     /// Preview placed application writes, including entries staged in this transaction.
     pub fn entries(&self) -> Vec<ApplicationWrite> {
         self.state
@@ -284,7 +451,16 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn into_parts(
         mut self,
-    ) -> Result<(Conversation, OwnedBatch, bool, Vec<crate::task::Task>), Error> {
+    ) -> Result<
+        (
+            Conversation,
+            OwnedBatch,
+            bool,
+            Vec<crate::task::Task>,
+            Vec<SessionChild>,
+        ),
+        Error,
+    > {
         if let Some(profile) = self.image_profile_guard {
             let adapter = self
                 .adapter
@@ -349,7 +525,53 @@ impl<'a> SessionTransaction<'a> {
                 });
             }
         }
-        self.signals.append_session_candidate(batch, &self.tasks)?;
-        Ok((self.state, self.signals.into_batch()?, changed, self.tasks))
+        for child in &mut self.children {
+            crate::document::reconcile_task_checks(&mut batch, &mut child.batch);
+            for check in &child.batch.checks {
+                if let Some(old) = batch.checks.iter().find(|c| c.key == check.key) {
+                    if old != check {
+                        return Err(Error::InvalidBatch);
+                    }
+                } else {
+                    batch.checks.push(check.clone());
+                }
+            }
+            for mutation in &child.batch.mutations {
+                let key = match mutation {
+                    Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+                };
+                if let Some(old) = batch.mutations.iter().find(|m| match m {
+                    Mutation::Put { key: k, .. } | Mutation::Delete { key: k } => k == key,
+                }) {
+                    let parent_key = crate::task_store::key(child.parent.task.id());
+                    if key == &parent_key && old == mutation {
+                        continue;
+                    }
+                    return Err(Error::InvalidBatch);
+                }
+                batch.mutations.push(mutation.clone());
+            }
+        }
+        let mut created = self.tasks.clone();
+        created.extend(
+            self.children
+                .iter()
+                .filter(|child| child.creating)
+                .map(|child| child.child.clone()),
+        );
+        let parents: Vec<_> = self
+            .children
+            .iter()
+            .map(|child| child.parent.clone())
+            .collect();
+        self.signals
+            .append_session_candidate(batch, &created, &parents)?;
+        Ok((
+            self.state,
+            self.signals.into_batch()?,
+            changed,
+            self.tasks,
+            self.children,
+        ))
     }
 }

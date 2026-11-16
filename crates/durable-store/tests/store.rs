@@ -325,6 +325,11 @@ fn legacy_versions_have_an_explicit_boundary() {
     drop(conn);
     let store = Store::open(&path).unwrap();
     assert_eq!(store.legacy_version_boundary().unwrap(), 7);
+    assert!(matches!(
+        store.commit(&[check(b"missing", Expected::MissingUnchangedSince(6))], &[]),
+        Err(Error::InvalidSnapshot)
+    ));
+    store.commit(&[check(b"missing", Expected::MissingUnchangedSince(7))], &[]).unwrap();
     assert_eq!(store.commit_for_version(b"a", 7).unwrap(), None);
     store.commit(&[], &[put(b"a", b"new")]).unwrap();
     drop(store);

@@ -1977,7 +1977,7 @@ pub(crate) fn failed_sibling_to_abort(
 
 // Locate a pending cancellation root that owns this invocation. The caller holds
 // the task gate and fences graph puts through the result commit.
-fn pending_abort_root_for_running(
+pub(crate) fn pending_abort_root_for_running(
     ts: &TaskStore<'_>,
     running: Uuid,
     include_background: bool,
@@ -2060,7 +2060,7 @@ fn pending_abort_root_for_running(
 
 // Follow durable waits and live foreground ownership from every target. The
 // caller fences graph puts between this scan and the waiting commit.
-fn validate_wait_graph(
+pub(crate) fn validate_wait_graph(
     store: &durable_store::Store,
     waiter: Uuid,
     targets: &[Uuid],

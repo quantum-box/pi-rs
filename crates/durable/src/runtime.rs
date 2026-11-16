@@ -111,6 +111,28 @@ fn notification_deadline_only_conflict(
     assembled: &Expected,
 ) -> Result<bool, durable_store::Error> {
     let now = Instant::now();
+    let guarded_missing = match (original, assembled) {
+        (
+            Expected::MissingUnchangedSince(a),
+            Expected::MissingUnchangedSinceBefore(b, deadline),
+        ) => a == b && now >= *deadline,
+        (
+            Expected::MissingUnchangedSinceBefore(a, original_deadline),
+            Expected::MissingUnchangedSinceBefore(b, deadline),
+        ) => a == b && deadline < original_deadline && now >= *deadline && now < *original_deadline,
+        _ => false,
+    };
+    if guarded_missing {
+        let check = Check {
+            key: key.to_vec(),
+            expected: original.clone(),
+        };
+        return match store.commit(&[check], &[]) {
+            Ok(()) => Ok(true),
+            Err(durable_store::Error::Conflict { .. }) => Ok(false),
+            Err(error) => Err(error),
+        };
+    }
     let expected_version = match (original, assembled) {
         (Expected::Missing, Expected::MissingBefore(deadline)) if now >= *deadline => None,
         (Expected::MissingBefore(original), Expected::MissingBefore(deadline))
@@ -4693,6 +4715,26 @@ impl Harness {
         abort_tasks: &[crate::task_store::StoredTask],
         documents: Option<&crate::task_store::OwnedBatch>,
     ) -> Result<(), Error> {
+        self.save_composed_locked_with_fence(
+            state,
+            expected,
+            wake,
+            children,
+            abort_tasks,
+            documents,
+            None,
+        )
+    }
+    fn save_composed_locked_with_fence(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+        children: &[crate::task::Task],
+        abort_tasks: &[crate::task_store::StoredTask],
+        documents: Option<&crate::task_store::OwnedBatch>,
+        fence: Option<u64>,
+    ) -> Result<(), Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
             || self.storage_failed.load(Ordering::Acquire)
@@ -4764,7 +4806,7 @@ impl Harness {
                     mutations: extra.mutations,
                 })?;
             }
-            match self.commit_conversation_save(prepared) {
+            match self.commit_conversation_save_inner(prepared, fence) {
                 Ok(()) => break,
                 Err(Error::Storage(durable_store::Error::Conflict { key: conflict }))
                     if conflict.starts_with(b"durable/tool-progress/")
@@ -9012,8 +9054,8 @@ impl Harness {
             self.clock.clone(),
         )?;
         let result = change(&mut transaction)?;
-        let (state, mut documents, changed, tasks) = transaction.into_parts()?;
-        if !changed {
+        let (state, mut documents, changed, tasks, children) = transaction.into_parts()?;
+        if !changed && children.is_empty() {
             documents.checks.push(Check {
                 key: Self::key(id),
                 expected: Expected::Version(version),
@@ -9021,11 +9063,51 @@ impl Harness {
             owner.store().commit(&documents.checks, &[])?;
             return Ok(result);
         }
+        if !changed {
+            documents.checks.push(Check {
+                key: Self::key(id),
+                expected: Expected::Version(version),
+            });
+        }
         // Do not merge concurrent admissions into a callback's observed state:
         // preserve its exact conversation and document checks on conflict.
         let merge = self.merge_admissions;
         self.merge_admissions = false;
-        let saved = self.commit_session_candidate(id, version, &state, &documents, &tasks);
+
+        let saved = if !children.is_empty() {
+            let driver = self
+                .task_driver
+                .lock()
+                .map_err(|_| ())
+                .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
+            match driver {
+                Ok(Some(driver)) => driver.with_session_child(&children, id, |boundary| {
+                    if !changed {
+                        owner.store().commit_with_prefix_put_fence(
+                            &documents.checks,
+                            &[],
+                            &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                            boundary,
+                        )?;
+                        return Ok(());
+                    }
+                    self.save_composed_locked_with_fence(
+                        &state,
+                        Expected::Version(version),
+                        None,
+                        &[],
+                        &[],
+                        Some(&documents),
+                        Some(boundary),
+                    )
+                }),
+                Ok(None) => Err(Error::Invalid("task driver is not running".into())),
+                Err(_) => Err(Error::Failed),
+            }
+        } else {
+            self.commit_session_candidate(id, version, &state, &documents, &tasks)
+        };
+
         self.merge_admissions = merge;
         saved?;
         Ok(result)
@@ -9064,8 +9146,8 @@ impl Harness {
             self.clock.clone(),
         )?;
         let result = change(&mut transaction).await?;
-        let (state, mut documents, changed, tasks) = transaction.into_parts()?;
-        if !changed {
+        let (state, mut documents, changed, tasks, children) = transaction.into_parts()?;
+        if !changed && children.is_empty() {
             documents.checks.push(Check {
                 key: Self::key(id),
                 expected: Expected::Version(version),
@@ -9073,9 +9155,48 @@ impl Harness {
             owner.store().commit(&documents.checks, &[])?;
             return Ok(result);
         }
+        if !changed {
+            documents.checks.push(Check {
+                key: Self::key(id),
+                expected: Expected::Version(version),
+            });
+        }
         let merge = self.merge_admissions;
         self.merge_admissions = false;
-        let saved = self.commit_session_candidate(id, version, &state, &documents, &tasks);
+
+        let saved = if !children.is_empty() {
+            let driver = self
+                .task_driver
+                .lock()
+                .map_err(|_| ())
+                .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
+            match driver {
+                Ok(Some(driver)) => driver.with_session_child(&children, id, |boundary| {
+                    if !changed {
+                        owner.store().commit_with_prefix_put_fence(
+                            &documents.checks,
+                            &[],
+                            &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                            boundary,
+                        )?;
+                        return Ok(());
+                    }
+                    self.save_composed_locked_with_fence(
+                        &state,
+                        Expected::Version(version),
+                        None,
+                        &[],
+                        &[],
+                        Some(&documents),
+                        Some(boundary),
+                    )
+                }),
+                Ok(None) => Err(Error::Invalid("task driver is not running".into())),
+                Err(_) => Err(Error::Failed),
+            }
+        } else {
+            self.commit_session_candidate(id, version, &state, &documents, &tasks)
+        };
         self.merge_admissions = merge;
         saved?;
         Ok(result)
@@ -18942,6 +19063,39 @@ fn valid_schema(schema: &serde_json::Value, arguments: &serde_json::Value) -> bo
 
 #[cfg(test)]
 mod scheduler_tests {
+    #[test]
+    fn notification_deadline_retry_preserves_missing_aba_fence() {
+        use super::*;
+        let store = durable_store::Store::memory().unwrap();
+        let key = b"durable/task/deadline-retry".to_vec();
+        let version = store.put_version().unwrap();
+        let original = Expected::MissingUnchangedSince(version);
+        let deadline = std::time::Instant::now();
+        let assembled = Expected::MissingUnchangedSinceBefore(version, deadline);
+        assert!(notification_deadline_only_conflict(&store, &key, &original, &assembled).unwrap());
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: vec![1],
+                }],
+            )
+            .unwrap();
+        store
+            .commit(&[], &[Mutation::Delete { key: key.clone() }])
+            .unwrap();
+        assert!(!notification_deadline_only_conflict(&store, &key, &original, &assembled).unwrap());
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let original_timed =
+            Expected::MissingUnchangedSinceBefore(store.put_version().unwrap(), future);
+        let assembled_early =
+            Expected::MissingUnchangedSinceBefore(store.put_version().unwrap(), deadline);
+        assert!(
+            notification_deadline_only_conflict(&store, &key, &original_timed, &assembled_early)
+                .unwrap()
+        );
+    }
     use super::*;
     use futures_util::{StreamExt, stream};
     use pi_rs_core::{ModelEvent, ModelRequest, ModelStream};

@@ -1967,8 +1967,17 @@ gate through commit. Tasks may follow an entry, signal, or submission; their
 creation is itself a table write, so later explicit signal or submission reads
 are rejected. New task IDs are provisional. Task records and any settlement
 notification are committed atomically with the transaction's other changes.
-Task-owned children and cross-conversation creation are not supported by this
-host API.
+`tx.create_child_task(&parent_snapshot, child)` and
+`tx.create_keyed_child(&parent_snapshot, key, child)` stage registered children
+of the same live generic task attempt. The latter returns the existing ID for a
+matching key and rejects identity changes, including definition version, replay
+policy, initial checkpoint and restart limit as well as kind and input. These
+extra identity checks are a pi-rs extension. The driver validates the exact parent
+reservation, registry and pending abort under the admission gate, and fences the
+ownership graph through commit. Multiple children of that parent may be staged.
+This slice rejects task-tool parents, task-owned conversations, multiple parents and mixing root-task and child creation. Ordinary nested-tool
+keys use a separate journal, so upstream shared cross-kind key semantics are not
+implemented. Cross-conversation creation is also unsupported.
 
 This is a subset of upstream session transactions: cross-conversation and
 task-descendant table access, table scans, raw submission settlement, general

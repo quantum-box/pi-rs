@@ -128,6 +128,19 @@ impl Task {
         self.abort_requested
     }
 
+    /// Whether all scheduler-owned lifecycle fields are in their initial state.
+    pub(crate) fn is_fresh_admission(&self) -> bool {
+        self.state == TaskState::Ready
+            && !self.abort_requested
+            && self.restarts == 0
+            && self.attempt_id.is_none()
+            && self.retired_attempt_id.is_none()
+            && self.delivered_signal.is_none()
+            && self.typed_wake.is_none()
+            && self.ended_children.is_none()
+            && self.wake_children.is_none()
+    }
+
     pub(crate) fn request_abort(&mut self) -> Result<(), TransitionError> {
         if self.is_terminal() {
             return Err(TransitionError::InvalidState);
@@ -458,6 +471,44 @@ mod tests {
             phase: phase.into(),
             data: json!(data),
         }
+    }
+
+    #[test]
+    fn fresh_admission_requires_all_initial_lifecycle_fields() {
+        let base = task(3)
+            .registered_versioned("job".into(), false, 7, json!({"x":1}))
+            .unwrap();
+        assert!(base.is_fresh_admission());
+        let mut cases = Vec::new();
+        let mut t = base.clone();
+        t.attempt_id = Some(Uuid::new_v4());
+        cases.push(t);
+        let mut t = base.clone();
+        t.retired_attempt_id = Some(Uuid::new_v4());
+        cases.push(t);
+        let mut t = base.clone();
+        t.restarts = 1;
+        cases.push(t);
+        let mut t = base.clone();
+        t.delivered_signal = Some(Uuid::new_v4());
+        cases.push(t);
+        let mut t = base.clone();
+        t.typed_wake = Some(TypedWake::Time);
+        cases.push(t);
+        let mut t = base.clone();
+        t.ended_children = Some(vec![]);
+        cases.push(t);
+        let mut t = base.clone();
+        t.wake_children = Some(vec![]);
+        cases.push(t);
+        let mut t = base.clone();
+        t.abort_requested = true;
+        cases.push(t);
+        let mut t = base.clone();
+        t.state = TaskState::Running;
+        cases.push(t);
+        assert!(cases.iter().all(|t| !t.is_fresh_admission()));
+        assert!(base.clone().background().unwrap().is_fresh_admission());
     }
 
     #[test]

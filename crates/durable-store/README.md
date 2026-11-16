@@ -15,7 +15,8 @@ not reset the counter. Versions are positive and limited to `i64::MAX`.
 `Expected::MissingUnchangedSince(boundary)` additionally requires that the key
 has had no tracked put after a boundary returned by `put_version()`. This
 detects an intervening create/delete cycle, including one in a single commit.
-It does not track direct SQLite writes outside the Store API.
+Boundaries preceding the migration's legacy version are rejected because their
+put history is incomplete. It does not track direct SQLite writes outside the Store API.
 `get` after a successful commit can observe a later concurrent commit; it is
 not a receipt for the committed version.
 
