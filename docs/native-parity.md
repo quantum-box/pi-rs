@@ -490,9 +490,9 @@ is rejected before its hook runs. A prompt that runs an extension command return
 Idle extension commands
 take precedence over valid attached images in RPC; the
 attachments are not sent to the model even when the command triggers a turn.
-RPC validates images before command dispatch. Unlike Pi, a command that
-triggers a model turn reports `started`, and commands submitted while a turn
-is active cannot yet execute immediately. A model turn returns
+RPC validates images before command dispatch. An idle command that triggers a
+model turn reports `handled` before that turn completes, as in Pi. Commands
+submitted while a turn is active cannot yet execute immediately. A normal model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
