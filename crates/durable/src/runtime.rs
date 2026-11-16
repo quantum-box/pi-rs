@@ -2457,6 +2457,38 @@ pub(crate) struct PreparedConversationSave {
     pub(crate) mutations: Vec<Mutation>,
 }
 
+// A proof traversal may encounter the same earlier reset through several
+// branches of the transcript. Cache only while this synchronous traversal is
+// active; never reuse evidence across operations or across store owners.
+type ResetProofKey = (usize, Uuid, Uuid, u64, u64);
+type ResetProofValue = (Conversation, u64, Vec<Check>);
+thread_local! {
+    static RESET_PROOF_MEMO: std::cell::RefCell<Option<HashMap<ResetProofKey, ResetProofValue>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static RESET_PROOF_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+struct ResetProofScope(bool);
+impl ResetProofScope {
+    fn enter() -> Self {
+        Self(RESET_PROOF_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.is_some() {
+                false
+            } else {
+                *memo = Some(HashMap::new());
+                true
+            }
+        }))
+    }
+}
+impl Drop for ResetProofScope {
+    fn drop(&mut self) {
+        if self.0 {
+            RESET_PROOF_MEMO.with(|memo| *memo.borrow_mut() = None);
+        }
+    }
+}
+
 struct AtomicResetPlan<'a> {
     steps: &'a [ResetDerivationStep],
     cuts: &'a [Conversation],
@@ -6053,6 +6085,7 @@ impl Harness {
     /// Interior positions require proof of unchanged fork state or a tool-free
     /// append changing only config; incomplete tool transcripts are rejected.
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
+        let _proof_scope = ResetProofScope::enter();
         self.load(id)?;
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let page = transcript.read_with_blocks(&position.cursor, std::num::NonZeroUsize::MIN)?;
@@ -6330,6 +6363,7 @@ impl Harness {
     /// be visible in the captured shared chain and have an origin snapshot.
     /// Local retained observations are scanned across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        let _proof_scope = ResetProofScope::enter();
         self.load(id)?;
         if entry_id.is_nil() {
             return Err(crate::fork::Error::InvalidCursor.into());
@@ -6945,6 +6979,7 @@ impl Harness {
         id: Uuid,
         mut cursor: crate::transcript::Cursor,
     ) -> Result<ResolvedOccurrences, Error> {
+        let _proof_scope = ResetProofScope::enter();
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let mut changes = Vec::new();
         loop {
@@ -7230,6 +7265,42 @@ impl Harness {
     // Prove a failure/reset cut from independently authenticated predecessor
     // state. The returned checks must be committed with any dependent fork.
     fn prove_failure_reset_cut(
+        &self,
+        id: Uuid,
+        target: &crate::transcript::Cursor,
+        observation: u64,
+    ) -> Result<(Conversation, u64, Vec<Check>), Error> {
+        let _scope = ResetProofScope::enter();
+        if target.transcript_id() != id {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let (entry, sequence) = target
+            .entry_identity()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let key = (
+            Arc::as_ptr(&self.owner) as usize,
+            id,
+            entry,
+            sequence,
+            observation,
+        );
+        if let Some(value) =
+            RESET_PROOF_MEMO.with(|memo| memo.borrow().as_ref().and_then(|m| m.get(&key).cloned()))
+        {
+            return Ok(value);
+        }
+        #[cfg(test)]
+        RESET_PROOF_REPLAYS.with(|count| count.set(count.get() + 1));
+        let value = self.prove_failure_reset_cut_uncached(id, target, observation)?;
+        RESET_PROOF_MEMO.with(|memo| {
+            if let Some(memo) = memo.borrow_mut().as_mut() {
+                memo.insert(key, value.clone());
+            }
+        });
+        Ok(value)
+    }
+
+    fn prove_failure_reset_cut_uncached(
         &self,
         id: Uuid,
         target: &crate::transcript::Cursor,

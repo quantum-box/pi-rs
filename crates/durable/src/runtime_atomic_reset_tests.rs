@@ -1155,3 +1155,65 @@ fn production_replays_nothing_to_answer_failure() {
         steps[0].reset_id
     );
 }
+
+#[test]
+fn reset_proof_replays_each_prior_cut_once_per_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, _) = setup_with_adapter(&path, true);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let batches = 6;
+    for index in 0..batches {
+        h.submit(id, None, format!("replacement {index}")).unwrap();
+        if index > 0 {
+            for part in 0..2 {
+                h.reset_with_blocks(
+                    id,
+                    Some(format!("{index}-{part}")),
+                    vec![vec![serde_json::json!({"type":"text","text":"block"})]],
+                )
+                .unwrap();
+            }
+        }
+        let (mut checkpoint, version) = h.load(id).unwrap();
+        checkpoint.phase = Phase::FailedModel {
+            turns: 0,
+            request_id: Uuid::new_v4(),
+            reason: "error".into(),
+            decision: ModelFailureDecision::Stop,
+        };
+        h.save(&checkpoint, Expected::Version(version)).unwrap();
+        let (mut failure, version) = h.load(id).unwrap();
+        finish_failure(&mut failure, "error".into(), FailureCause::ModelError);
+        h.save(&failure, Expected::Version(version)).unwrap();
+    }
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let (state, _) = h.load(id).unwrap();
+    let observation = crate::observer::Observer::new(h.owner.store(), id)
+        .head()
+        .unwrap()
+        .0;
+    let transcript = crate::transcript::Transcript::new(h.owner.store(), id);
+    let tail = transcript
+        .read_with_blocks(
+            state.transcript.as_ref().unwrap(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .unwrap();
+    let second = transcript
+        .read_with_blocks(&tail.next, std::num::NonZeroUsize::MIN)
+        .unwrap();
+    let first = second.next;
+    RESET_PROOF_REPLAYS.with(|count| count.set(0));
+    let (cut, _, _) = h.prove_failure_reset_cut(id, &first, observation).unwrap();
+    let replay_count = RESET_PROOF_REPLAYS.with(std::cell::Cell::get);
+    assert!(
+        replay_count <= 2 * batches,
+        "{replay_count} replays for {batches} batches"
+    );
+    let occurrence = cut.content_blocks.values().next().unwrap().message_id;
+    let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().resets.len(), 2 * batches - 1);
+}
