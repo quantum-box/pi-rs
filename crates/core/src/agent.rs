@@ -2729,6 +2729,7 @@ impl Agent<'_> {
                 context_sha256: Some(context_sha256),
                 context_transformed: Some(transformed),
                 context_configuration_sha256: request_configuration_hash(self.model, &request),
+                tool_decision: None,
             },
             observer,
         )?;
@@ -8883,6 +8884,7 @@ mod tree_tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             })
             .unwrap();
         session
@@ -8923,6 +8925,7 @@ mod tree_tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             })
             .unwrap();
         assert!(overflow_recovery_state(&session, run_id).is_none());
@@ -8965,6 +8968,7 @@ mod tree_tests {
                     context_sha256: None,
                     context_transformed: None,
                     context_configuration_sha256: None,
+                    tool_decision: None,
                 })
                 .unwrap();
             session
@@ -9056,6 +9060,7 @@ mod tree_tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             })
             .unwrap();
         drop(session);
@@ -9243,6 +9248,7 @@ mod tree_tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             })
             .unwrap();
         session
@@ -9286,6 +9292,7 @@ mod tree_tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             })
             .unwrap();
         session
@@ -9700,6 +9707,7 @@ mod tree_tests {
                     context_sha256: None,
                     context_transformed: None,
                     context_configuration_sha256: None,
+                    tool_decision: None,
                 })
                 .unwrap();
             session

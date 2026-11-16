@@ -264,6 +264,11 @@ impl ToolDecisionSnapshot {
         Ok(ValidatedToolDecisionSnapshot { snapshot: self })
     }
 
+    /// Original dispatch identity captured with this snapshot.
+    pub fn context(&self) -> &crate::ToolDispatchContext {
+        &self.context
+    }
+
     /// Digest of the exact request used to capture this snapshot.
     pub fn request_sha256(&self) -> &str {
         &self.request_sha256

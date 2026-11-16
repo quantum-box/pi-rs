@@ -1494,6 +1494,7 @@ mod tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             },
             Event::ModelFinished {
                 request_id,
@@ -1576,6 +1577,7 @@ mod tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             },
             Event::ModelFinished {
                 request_id,
