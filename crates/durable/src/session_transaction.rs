@@ -29,7 +29,6 @@ pub struct SessionTransaction<'a> {
     tasks: Vec<crate::task::Task>,
     signals: crate::document::HostTransaction<'a>,
     clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
-    tasks: Vec<crate::task::Task>,
 }
 
 impl<'a> SessionTransaction<'a> {
@@ -58,7 +57,6 @@ impl<'a> SessionTransaction<'a> {
             tasks: Vec::new(),
             signals: crate::document::HostTransaction::new(store),
             clock,
-            tasks: Vec::new(),
         })
     }
 
