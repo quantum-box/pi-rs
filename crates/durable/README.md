@@ -912,7 +912,9 @@ foreground child and atomically binds its initial submission to a
 `submission_settled_signal()` key on the owning task. A task-backed handler can
 park on that typed signal, then read its settlement after waking. The reservation
 binds the input, tool selection and signal key; retries with different values fail.
-After reopening, the scheduler resumes the committed child and settlement delivers
+The destination key is permanently reserved for that child submission. A different
+submission, existing legacy notification, or existing signal receipt using the same
+key is rejected, including across concurrent admission and reopening. After reopening, the scheduler resumes the committed child and settlement delivers
 the signal in the same transaction. Parent abort still traverses the foreground
 ownership edge. The signal payload uses the pi-rs settlement representation
 (including answer text) rather than upstream's entry-only answer reference.

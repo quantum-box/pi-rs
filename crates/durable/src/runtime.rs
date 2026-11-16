@@ -1778,6 +1778,11 @@ impl Conversation {
         }
         self.tool_attempt()
     }
+    pub(crate) fn has_submission_notification(&self, notify: &SubmissionNotify) -> bool {
+        self.submission_notifications
+            .values()
+            .any(|existing| existing == notify)
+    }
     pub(crate) fn set_initial_notification(&mut self, id: Uuid, notify: SubmissionNotify) {
         self.submission_notifications.insert(id, notify);
     }
@@ -5579,6 +5584,35 @@ impl Harness {
             key: key.clone(),
             expected: expected.clone(),
         }];
+        // A task-owned foreground admission can reserve its settlement key.
+        // Every later notification admission fences that reservation, including
+        // ordinary submissions and application writes.
+        if !state.submission_notifications.is_empty() {
+            let previous: Option<Conversation> = self
+                .owner
+                .store()
+                .get(&key)?
+                .map(|entry| serde_json::from_slice(&entry.value))
+                .transpose()?;
+            for (id, notify) in &state.submission_notifications {
+                if previous
+                    .as_ref()
+                    .is_some_and(|old| old.submission_notifications.get(id) == Some(notify))
+                {
+                    continue;
+                }
+                let binding = crate::owned_subagent::notification_binding_key(notify);
+                if self.owner.store().get(&binding)?.is_some() {
+                    return Err(Error::Invalid(
+                        "submission notification key is reserved".into(),
+                    ));
+                }
+                checks.push(Check {
+                    key: binding,
+                    expected: Expected::Missing,
+                });
+            }
+        }
         let transcript_mutations = if let Some(batch) = prepared {
             checks.extend(batch.checks);
             batch.mutations

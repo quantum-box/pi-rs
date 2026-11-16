@@ -627,6 +627,37 @@ impl<'a> TaskStore<'a> {
         self.save(&[Save::Update(&next)])
     }
 
+    // Fence a foreground submission's exclusive destination against any
+    // typed-signal writer, including an already prepared concurrent delivery.
+    fn foreground_binding_check(&self, signal: &Signal) -> Result<Option<Check>, Error> {
+        let Some(typed) = signal
+            .typed
+            .as_ref()
+            .filter(|typed| typed.key.signal == SUBMISSION_SETTLED_NAME)
+        else {
+            return Ok(None);
+        };
+        let notify = crate::runtime::SubmissionNotify {
+            task_id: signal.task_id,
+            key: typed.key.key.clone(),
+        };
+        let key = crate::owned_subagent::notification_binding_key(&notify);
+        let entry = self.store.get(&key)?;
+        if let Some(entry) = &entry {
+            let (conversation, submission): (Uuid, Uuid) = serde_json::from_slice(&entry.value)?;
+            if signal.payload.get("id") != Some(&serde_json::json!(submission))
+                || signal.payload.get("conversationId") != Some(&serde_json::json!(conversation))
+                || typed.version != SUBMISSION_SETTLED_VERSION
+            {
+                return Err(Error::SignalKeyMismatch);
+            }
+        }
+        Ok(Some(Check {
+            key,
+            expected: entry.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+        }))
+    }
+
     /// Durably enqueue a signal. The same task/ID/content can be retried safely.
     /// A conflicting ID returns SignalMismatch. Signals are retained as receipts.
     pub fn send_signal(&self, signal: &Signal) -> Result<(), Error> {
@@ -644,6 +675,7 @@ impl<'a> TaskStore<'a> {
         let mut fresh = signal.clone();
         fresh.consumed = false;
         loop {
+            let binding = self.foreground_binding_check(&fresh)?;
             if let Some(entry) = self.store.get(&k)? {
                 let old: Signal = serde_json::from_slice(&entry.value)?;
                 if builtin {
@@ -692,25 +724,24 @@ impl<'a> TaskStore<'a> {
                 if found {
                     // Validate the snapshot even for a no-op: the caller's ID
                     // may have been claimed while the key was being scanned.
-                    match self.store.commit(
-                        &[
-                            Check {
-                                key: k.clone(),
-                                expected: Expected::Missing,
-                            },
-                            Check {
-                                key: revision_key.clone(),
-                                expected: revision.as_ref().map_or(Expected::Missing, |entry| {
-                                    Expected::Version(entry.version)
-                                }),
-                            },
-                            Check {
-                                key: key(signal.task_id),
-                                expected: Expected::Version(target.version),
-                            },
-                        ],
-                        &[],
-                    ) {
+                    let mut checks = vec![
+                        Check {
+                            key: k.clone(),
+                            expected: Expected::Missing,
+                        },
+                        Check {
+                            key: revision_key.clone(),
+                            expected: revision.as_ref().map_or(Expected::Missing, |entry| {
+                                Expected::Version(entry.version)
+                            }),
+                        },
+                        Check {
+                            key: key(signal.task_id),
+                            expected: Expected::Version(target.version),
+                        },
+                    ];
+                    checks.extend(binding.clone());
+                    match self.store.commit(&checks, &[]) {
                         Ok(()) => return Ok(()),
                         Err(durable_store::Error::Conflict { .. }) => continue,
                         Err(e) => return Err(e.into()),
@@ -718,22 +749,24 @@ impl<'a> TaskStore<'a> {
                 }
             }
             fresh.expired = fresh.typed_key().is_some_and(|key| matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if crate::runtime::wall_time_millis() >= *deadline && signals.contains(key)));
+            let mut checks = vec![
+                Check {
+                    key: revision_key,
+                    expected: revision
+                        .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+                },
+                Check {
+                    key: k.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: key(signal.task_id),
+                    expected: Expected::Version(target.version),
+                },
+            ];
+            checks.extend(binding);
             match self.store.commit(
-                &[
-                    Check {
-                        key: revision_key,
-                        expected: revision
-                            .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
-                    },
-                    Check {
-                        key: k.clone(),
-                        expected: Expected::Missing,
-                    },
-                    Check {
-                        key: key(signal.task_id),
-                        expected: Expected::Version(target.version),
-                    },
-                ],
+                &checks,
                 &[
                     Mutation::Put {
                         key: k.clone(),
@@ -863,6 +896,9 @@ impl<'a> TaskStore<'a> {
             Err(Error::InvalidSignalPayload) => return Ok((SignalResult::Invalid, batch)),
             Err(error) => return Err(error),
         };
+        if let Some(check) = self.foreground_binding_check(&signal)? {
+            batch.checks.push(check);
+        }
         let revision_key = signal_revision_key(task_id);
         let revision = self.store.get(&revision_key)?;
         batch.checks.push(Check {
