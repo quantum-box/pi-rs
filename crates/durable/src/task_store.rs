@@ -269,6 +269,7 @@ pub enum Save<'a> {
 
 /// Checks and writes for one owned checkpoint, to be included intact in a
 /// single host transaction alongside any transcript and observation writes.
+#[derive(Clone)]
 pub struct OwnedBatch {
     pub checks: Vec<Check>,
     pub mutations: Vec<Mutation>,
