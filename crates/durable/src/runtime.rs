@@ -9091,7 +9091,12 @@ impl Harness {
     ) -> Result<(), Error> {
         if tasks.is_empty() {
             return self.save_composed_locked(
-                state, Expected::Version(version), None, &[], &[], Some(batch),
+                state,
+                Expected::Version(version),
+                None,
+                &[],
+                &[],
+                Some(batch),
             );
         }
         let driver = self
@@ -9103,7 +9108,12 @@ impl Harness {
             .ok_or_else(|| Error::Invalid("task driver is not running".into()))?;
         driver.with_admission(tasks, id, || {
             self.save_composed_locked(
-                state, Expected::Version(version), None, &[], &[], Some(batch),
+                state,
+                Expected::Version(version),
+                None,
+                &[],
+                &[],
+                Some(batch),
             )
         })
     }

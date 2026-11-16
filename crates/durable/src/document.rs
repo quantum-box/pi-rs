@@ -1318,7 +1318,9 @@ impl Transaction {
             graph_key(&check.key)
                 && matches!(
                     check.expected,
-                    Expected::Missing | Expected::MissingBefore(_) | Expected::MissingUnchangedSince(_)
+                    Expected::Missing
+                        | Expected::MissingBefore(_)
+                        | Expected::MissingUnchangedSince(_)
                 )
                 && ((self.checked.contains(&check.key)
                     && writes.contains(&check.key)

@@ -1471,7 +1471,8 @@ mod document_history_tests {
                 key: b"other".to_vec(),
                 value: vec![],
             }],
-        ).unwrap();
+        )
+        .unwrap();
         let check = Check {
             key: key.clone(),
             expected: Expected::MissingUnchangedSince(boundary),
@@ -1480,10 +1481,14 @@ mod document_history_tests {
         db.commit(
             &[],
             &[
-                Mutation::Put { key: key.clone(), value: vec![1] },
+                Mutation::Put {
+                    key: key.clone(),
+                    value: vec![1],
+                },
                 Mutation::Delete { key: key.clone() },
             ],
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(db.commit(&[check], &[]), Err(Error::Conflict { key: k }) if k == key));
     }
 
