@@ -6727,9 +6727,7 @@ impl Harness {
         }
         let root = format!("runtime/conversation/{origin}");
         let prefix = format!("runtime/fork/{origin}/");
-        if store.runtime_snapshot_at(root.as_bytes(), prefix.as_bytes(), sequence)?
-            != Some((sequence, fork))
-        {
+        if !store.runtime_snapshot_exact_at(root.as_bytes(), prefix.as_bytes(), &fork, sequence)? {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
         Ok(())
@@ -16727,6 +16725,90 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+
+    #[test]
+    fn fork_anchor_accepts_other_snapshots_in_same_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.submit(id, None, "active".into()).unwrap();
+        let (reset, _) = h
+            .reset_with_blocks(
+                id,
+                None,
+                vec![vec![serde_json::json!({"type":"text", "text":"block"})]],
+            )
+            .unwrap();
+        let head = h.history_head(id).unwrap().0;
+        let root = Harness::key(id);
+        let fork = format!("runtime/fork/{id}/{head:020}").into_bytes();
+        let extra = format!("runtime/fork/{id}/intermediate").into_bytes();
+        let mut event = b"durable/observer/".to_vec();
+        event.extend_from_slice(id.as_bytes());
+        event.extend_from_slice(b"/r");
+        event.extend_from_slice(&head.to_be_bytes());
+        let store = h.owner.store();
+        let root_value = store.get(&root).unwrap().unwrap().value;
+        let fork_value = store.get(&fork).unwrap().unwrap().value;
+        let event_value = store.get(&event).unwrap().unwrap().value;
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: root,
+                        value: root_value,
+                    },
+                    Mutation::Put {
+                        key: fork.clone(),
+                        value: fork_value,
+                    },
+                    Mutation::Put {
+                        key: event,
+                        value: event_value,
+                    },
+                    Mutation::Put {
+                        key: extra,
+                        value: b"untrusted".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        h.authenticate_fork_anchor(id, head).unwrap();
+        let (_, version) = h.load(id).unwrap();
+        // The anchored derivation still relies on the unique-snapshot lookup.
+        // Until that lookup is replaced with authenticated cut selection it
+        // cannot derive a baseline from a multi-snapshot commit.
+        assert!(
+            h.derive_anchored_reset_states(
+                id,
+                version,
+                &[ResetDerivationStep {
+                    reset_id: reset,
+                    context_generation: Uuid::new_v4(),
+                    write_limit: usize::MAX,
+                }]
+            )
+            .is_err()
+        );
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        h.authenticate_fork_anchor(id, head).unwrap();
+        // Rewriting the selected snapshot alone must still invalidate it.
+        let value = h.owner.store().get(&fork).unwrap().unwrap().value;
+        h.owner
+            .store()
+            .commit(&[], &[Mutation::Put { key: fork, value }])
+            .unwrap();
+        assert!(h.authenticate_fork_anchor(id, head).is_err());
     }
 
     #[test]
