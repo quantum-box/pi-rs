@@ -814,6 +814,67 @@ async fn prepared_projection_controls_budget_and_is_prepared_once() {
     );
 }
 
+struct DeclineCompaction(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl Extension for DeclineCompaction {
+    fn id(&self) -> &str {
+        "decline-compaction"
+    }
+    fn handles_before_summary_compaction(&self) -> bool {
+        true
+    }
+    async fn before_summary_compaction(
+        &self,
+        _: &pi_rs_core::CompactionPreparation,
+        _: Option<&ExtensionState>,
+        _: Arc<dyn pi_rs_core::ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::BeforeSummaryCompactionResult>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn optional_noop_compaction_retains_the_prepared_dispatch() {
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let compactions = Arc::new(AtomicUsize::new(0));
+    let model = Arc::new(ProjectedModel {
+        prepares: prepares.clone(),
+        dispatches: dispatches.clone(),
+        large: Arc::new(AtomicBool::new(false)),
+        strict: Arc::new(AtomicBool::new(false)),
+        large_prompt: Arc::new(AtomicBool::new(false)),
+        estimates: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ConstrainedExtension(StrictToolPolicy::Prefer)))
+        .unwrap();
+    registry
+        .register(Arc::new(DeclineCompaction(compactions.clone())))
+        .unwrap();
+    let mut session = SessionBuilder::new(model, "fixture")
+        .registry(registry)
+        .limits(pi_rs_core::Limits {
+            model_requests: 1,
+            context_window: Some(1000),
+            output_tokens_per_request: 16,
+            compaction_tokens: Some(pi_rs_core::CompactionTokens {
+                reserve_tokens: Some(1000),
+                keep_recent_tokens: None,
+            }),
+            ..Default::default()
+        })
+        .in_memory()
+        .unwrap();
+    assert_eq!(session.prompt("first").await.unwrap(), "done");
+    assert_eq!(session.prompt("second").await.unwrap(), "done");
+    assert_eq!(compactions.load(Ordering::SeqCst), 1);
+    assert_eq!(prepares.load(Ordering::SeqCst), 2);
+    assert_eq!(dispatches.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn prepared_projection_changes_configuration_identity() {
     let prepares = Arc::new(AtomicUsize::new(0));
