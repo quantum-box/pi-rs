@@ -3850,7 +3850,21 @@ impl Scheduler {
         if self.inject_preparation_error == 1 {
             return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
         }
-        let document_result = documents.prepare(&running);
+        let document_result = documents.prepare(&running).and_then(|mut prepared| {
+            if let Some(intent) = &prepared.task_input {
+                let harness = self.validator.as_ref().ok_or_else(|| {
+                    crate::document::Error::InvalidSessionAdmission(
+                        "task input requires an attached harness".into(),
+                    )
+                })?;
+                let batch = harness.prepare_task_input(intent)?;
+                let mut combined = crate::document::Transaction::new();
+                combined.append(prepared.document_batch)?;
+                combined.append(batch)?;
+                prepared.document_batch = combined.into_owned_batch()?;
+            }
+            Ok(prepared)
+        });
         #[cfg(test)]
         if self.inject_preparation_error == 2 {
             return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());

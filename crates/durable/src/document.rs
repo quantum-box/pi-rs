@@ -1346,6 +1346,15 @@ impl Transaction {
         self.mutations.extend(batch.mutations);
         Ok(())
     }
+    pub(crate) fn into_owned_batch(self) -> Result<OwnedBatch, Error> {
+        if !self.acquisitions.is_empty() {
+            return Err(Error::InvalidBatch);
+        }
+        Ok(OwnedBatch {
+            checks: self.checks,
+            mutations: self.mutations,
+        })
+    }
     pub fn commit(self, store: &Store) -> Result<(), Error> {
         store.commit_with_task_documents(&self.checks, &self.mutations, &self.acquisitions)?;
         Ok(())
@@ -1969,6 +1978,14 @@ impl StagedSignals {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct TaskInputIntent {
+    pub conversation: uuid::Uuid,
+    pub version: u64,
+    pub request_id: String,
+    pub content: String,
+}
+
 /// Checked document operations at one invocation-wide immutable revision.
 /// Staged values are visible to later reads. A staged new document has version
 /// zero; existing staged documents retain their original version until commit.
@@ -1983,6 +2000,7 @@ pub struct TaskDocuments<'a> {
     entry_initial_len: usize,
     runtime_cut: Option<usize>,
     runtime_config: Option<crate::runtime::Config>,
+    task_input: Option<TaskInputIntent>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -2006,6 +2024,7 @@ pub struct DetachedTaskDocuments {
     entry_initial_len: usize,
     runtime_cut: Option<usize>,
     runtime_config: Option<crate::runtime::Config>,
+    task_input: Option<TaskInputIntent>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -2099,6 +2118,7 @@ pub(crate) struct PreparedTaskDocuments {
     pub(crate) reservation: crate::task_store::StoredTask,
     pub(crate) transaction: Transaction,
     pub(crate) document_batch: OwnedBatch,
+    pub(crate) task_input: Option<TaskInputIntent>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
     pub(crate) keyed_child_handlers:
         HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
@@ -2133,6 +2153,7 @@ impl DetachedTaskDocuments {
             entry_initial_len,
             runtime_cut,
             runtime_config,
+            task_input,
             signals,
             child_reads,
             mut keyed_children,
@@ -2149,6 +2170,7 @@ impl DetachedTaskDocuments {
             entry_initial_len,
             runtime_cut,
             runtime_config,
+            task_input: None,
             signals,
             child_reads,
             keyed_children: Vec::new(),
@@ -2185,6 +2207,7 @@ impl DetachedTaskDocuments {
             reservation: current.clone(),
             transaction,
             document_batch,
+            task_input,
             keyed_children,
             keyed_child_handlers,
         })
@@ -2217,6 +2240,7 @@ impl<'a> TaskDocuments<'a> {
             entry_initial_len,
             runtime_cut,
             runtime_config,
+            task_input,
             signals,
             child_reads,
             keyed_children,
@@ -2233,6 +2257,7 @@ impl<'a> TaskDocuments<'a> {
             entry_initial_len,
             runtime_cut,
             runtime_config,
+            task_input,
             signals,
             child_reads,
             keyed_children,
@@ -2252,6 +2277,7 @@ impl<'a> TaskDocuments<'a> {
             entry_initial_len: 0,
             runtime_cut: None,
             runtime_config: None,
+            task_input: None,
             signals: StagedSignals::new(),
             child_reads: HashMap::new(),
             keyed_children: Vec::new(),
@@ -2261,6 +2287,40 @@ impl<'a> TaskDocuments<'a> {
             writes: HashMap::new(),
         })
     }
+    /// Stage an idle input for the task's directly owning conversation.
+    /// The request ID is required for recovery; the result is provisional until
+    /// the task transition commits. At most one admission is allowed per step.
+    pub fn submit_input(&mut self, request_id: String, content: String) -> Result<(), Error> {
+        if self.task_input.is_some()
+            || !self.keyed_children.is_empty()
+            || self.entries.as_ref().is_some_and(|entry| entry.4)
+            || !self.signals.batch.mutations.is_empty()
+        {
+            return Err(Error::ReadAfterWrite);
+        }
+        let crate::task::TaskOwner::Conversation(conversation) = self.task.owner() else {
+            return Err(Error::InvalidSessionAdmission(
+                "task must be directly conversation-owned".into(),
+            ));
+        };
+        if request_id.is_empty() {
+            return Err(Error::InvalidSessionAdmission("request ID required".into()));
+        }
+        let key = crate::runtime::Harness::key(*conversation);
+        let record = self
+            .store
+            .get(&key)?
+            .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
+        crate::runtime::validate_task_input(self.store, &record.value, &request_id, &content)?;
+        self.task_input = Some(TaskInputIntent {
+            conversation: *conversation,
+            version: record.version,
+            request_id,
+            content,
+        });
+        Ok(())
+    }
+
     /// Stage a keyed direct child for this invocation. Nothing is persisted until
     /// the scheduler commits the handler's transition and documents. The returned
     /// ID is stable for an existing matching key; candidate IDs need not match.

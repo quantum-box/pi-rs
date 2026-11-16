@@ -3817,6 +3817,120 @@ impl crate::session_transaction::SessionTransaction<'_> {
     }
 }
 
+pub(crate) fn validate_task_input(
+    store: &durable_store::Store,
+    bytes: &[u8],
+    request_id: &str,
+    content: &str,
+) -> Result<(), crate::document::Error> {
+    let state: Conversation = serde_json::from_slice(bytes)?;
+    let idle = !state.abort_requested
+        && matches!(state.phase, Phase::Idle)
+        && state.active.is_none()
+        && state.pending_resets.is_empty()
+        && state.pending_independent_summary.is_none()
+        && !state
+            .application_writes
+            .iter()
+            .any(|w| !w.placed && !w.withdrawn)
+        && !state
+            .submissions
+            .iter()
+            .any(|s| matches!(s.status, Status::Queued | Status::Running));
+    let mut tx = crate::session_transaction::SessionTransaction::new(
+        store,
+        state,
+        None,
+        true,
+        true,
+        None,
+        Arc::new(|| 0),
+    )?;
+    tx.submit_input(
+        Some(request_id.to_owned()),
+        content.to_owned(),
+        AdmissionOptions::default(),
+        None,
+    )?;
+    if tx.table_written && !idle {
+        return Err(crate::document::Error::InvalidSessionAdmission(
+            "conversation is not idle".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl Harness {
+    pub(crate) fn prepare_task_input(
+        &self,
+        intent: &crate::document::TaskInputIntent,
+    ) -> Result<crate::task_store::OwnedBatch, crate::document::Error> {
+        use crate::document::Error as DError;
+        let key = Self::key(intent.conversation);
+        let (state, version) = self
+            .load(intent.conversation)
+            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+        if version != intent.version {
+            return Err(durable_store::Error::Conflict { key }.into());
+        }
+        // Recheck the exact persisted state and the selected adapter's capabilities.
+        let record = self
+            .owner
+            .store()
+            .get(&key)?
+            .ok_or_else(|| DError::InvalidSessionAdmission("conversation missing".into()))?;
+        if record.version != version {
+            return Err(durable_store::Error::Conflict { key }.into());
+        }
+        validate_task_input(
+            self.owner.store(),
+            &record.value,
+            &intent.request_id,
+            &intent.content,
+        )?;
+        let supports = self.supports_context_blocks(&state);
+        let mut tx = crate::session_transaction::SessionTransaction::new(
+            self.owner.store(),
+            state,
+            None,
+            true,
+            supports,
+            self.provider_adapter.clone(),
+            self.clock.clone(),
+        )?;
+        tx.submit_input(
+            Some(intent.request_id.clone()),
+            intent.content.clone(),
+            AdmissionOptions::default(),
+            None,
+        )?;
+        let (state, batch, changed, tasks, children) = tx.into_parts()?;
+        if !tasks.is_empty()
+            || !children.is_empty()
+            || !batch.checks.is_empty()
+            || !batch.mutations.is_empty()
+        {
+            return Err(DError::InvalidBatch);
+        }
+        if !changed {
+            return Ok(crate::task_store::OwnedBatch {
+                checks: vec![Check {
+                    key,
+                    expected: Expected::Version(version),
+                }],
+                mutations: vec![],
+            });
+        }
+        let prepared = self
+            .prepare_save(&state, Expected::Version(version))
+            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+        Ok(crate::task_store::OwnedBatch {
+            checks: prepared.checks,
+            mutations: prepared.mutations,
+        })
+    }
+}
+
 impl Harness {
     /// Read committed extension error batches. Batches remain available after reopening.
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
