@@ -2345,7 +2345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_constrained_responses_request_sends_strict_schema() {
+    async fn sdk_preferred_fallback_stream_preserves_raw_arguments() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2528,6 +2528,9 @@ mod tests {
             body
         });
         let mut req = request();
+        req.messages = vec![Message::System {
+            content: "rules".into(),
+        }];
         req.tools[0].parameters = json!({"type":"object","properties":{"path":{"type":"string"}}});
         let declaration = pi_rs_core::ToolDeclaration {
             spec: req.tools[0].clone(),
