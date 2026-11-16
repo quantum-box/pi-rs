@@ -776,6 +776,7 @@ impl<'a> TaskStore<'a> {
 
     /// Prepare against the transaction's candidate target and signal writes,
     /// while retaining checks against the original committed records.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_signal_at_overlay(
         &self,
         task_id: Uuid,

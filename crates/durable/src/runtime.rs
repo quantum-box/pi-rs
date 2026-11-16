@@ -8194,6 +8194,7 @@ impl Harness {
         .await
     }
     /// Fit and admit input blocks with a durable task settlement notification.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_fitted_user_blocks_with_notification(
         &mut self,
         id: Uuid,
@@ -8215,6 +8216,7 @@ impl Harness {
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn submit_fitted_user_blocks_inner(
         &mut self,
         id: Uuid,
@@ -8735,6 +8737,7 @@ impl Harness {
             Some(notify),
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn submit_internal_with_options(
         &mut self,
         id: Uuid,
@@ -15030,6 +15033,7 @@ impl Scheduler {
         Ok(result)
     }
     /// Fit input blocks with a task notification and schedule the conversation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_fitted_user_blocks_with_notification(
         &mut self,
         id: Uuid,
