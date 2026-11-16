@@ -1677,6 +1677,11 @@ image encodings and oversized input are rejected before that entry is written.
 CLI, RPC and a real terminal
 fixture verify the new input paths.
 
+RPC user `message_start` and `message_end` events and reconstructed native user
+messages use Pi's ordered content blocks: a text block first, including for
+image-only input, followed by image blocks. Unedited imported Pi messages retain
+their original representation; native model-facing messages are unchanged.
+
 ### Multimodal tool event checkpoint
 
 Live JSON/RPC tool completion events and reconstructed RPC tool messages

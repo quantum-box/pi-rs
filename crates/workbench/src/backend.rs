@@ -2421,7 +2421,10 @@ mod share_context_tests {
         assert!(snapshot.record(&final_conversion).is_empty());
         let emitted = snapshot.record(&later);
         assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0]["message"]["content"], "later");
+        assert_eq!(
+            emitted[0]["message"]["content"],
+            json!([{ "type":"text", "text":"later" }])
+        );
         assert!(snapshot.record(&later).is_empty());
     }
 
@@ -2891,7 +2894,10 @@ mod share_context_tests {
         let entries = worker.record(session.records().last().unwrap());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["id"], session.head().to_string());
-        assert_eq!(entries[0]["message"]["content"], "later event");
+        assert_eq!(
+            entries[0]["message"]["content"],
+            json!([{ "type":"text", "text":"later event" }])
+        );
         assert_eq!(worker.share_snapshot().unwrap().head, session.head());
     }
 
