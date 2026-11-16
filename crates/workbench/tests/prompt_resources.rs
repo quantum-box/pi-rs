@@ -268,3 +268,133 @@ fn context_read_failure_does_not_return_partial_snapshot() {
         .is_err()
     );
 }
+
+#[test]
+fn nested_worktree_context_shadows_matching_main_filename_only() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("worktrees/feature");
+    let other = main.join("worktrees");
+    let sibling = temp.path().join("sibling");
+    for dir in [&main, &nested, &other, &sibling] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(main.join("AGENTS.md"), "main").unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "worktree").unwrap();
+    std::fs::write(other.join("AGENTS.md"), "ancestor").unwrap();
+    std::fs::write(sibling.join("AGENTS.md"), "sibling").unwrap();
+    let grants = ContextReadGrants {
+        directories: vec![main.clone(), other.clone(), nested.clone(), sibling.clone()],
+    };
+    let snapshot = grants
+        .load_with_nested_worktree(&main, &nested, None)
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>(),
+        ["ancestor", "worktree", "sibling"]
+    );
+    assert_eq!(
+        grants
+            .load_with_nested_worktree(&main, &sibling, None)
+            .unwrap()
+            .files
+            .len(),
+        4
+    );
+    assert!(
+        grants
+            .load_with_nested_worktree(&main, temp.path(), None)
+            .is_err()
+    );
+    std::fs::remove_file(nested.join("AGENTS.md")).unwrap();
+    std::fs::write(nested.join("CLAUDE.md"), "different").unwrap();
+    assert_eq!(
+        grants
+            .load_with_nested_worktree(&main, &nested, None)
+            .unwrap()
+            .files
+            .len(),
+        4
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_context_symlink_shadows_main_by_directory_not_file_target() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("worktrees/feature");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(main.join("AGENTS.md"), "instructions").unwrap();
+    std::os::unix::fs::symlink(main.join("AGENTS.md"), nested.join("AGENTS.md")).unwrap();
+    let grants = ContextReadGrants {
+        directories: vec![main.clone(), nested.clone()],
+    };
+    let result = grants
+        .load_with_nested_worktree(&main, &nested, None)
+        .unwrap();
+    assert_eq!(result.files.len(), 1);
+    assert_eq!(result.files[0].path, nested.join("AGENTS.md"));
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_shadow_preserves_separately_granted_main_alias() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let alias = temp.path().join("global");
+    let nested = main.join("worktrees/feature");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(main.join("AGENTS.md"), "global and main").unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "worktree").unwrap();
+    std::os::unix::fs::symlink(&main, &alias).unwrap();
+    for directories in [
+        vec![alias.clone(), main.clone(), nested.clone()],
+        vec![main.clone(), alias.clone(), nested.clone()],
+    ] {
+        let result = ContextReadGrants { directories }
+            .load_with_nested_worktree(&main, &nested, None)
+            .unwrap();
+        assert_eq!(
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            [&alias.join("AGENTS.md"), &nested.join("AGENTS.md")]
+        );
+    }
+}
+
+#[test]
+fn worktree_shadow_preserves_global_role_with_identical_path() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("worktree");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(main.join("AGENTS.md"), "global").unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "worktree").unwrap();
+    let grants = ContextReadGrants {
+        directories: vec![main.clone(), main.clone(), nested.clone()],
+    };
+    let result = grants
+        .load_with_nested_worktree(&main, &nested, Some(&main))
+        .unwrap();
+    assert_eq!(
+        result
+            .files
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>(),
+        ["global", "worktree"]
+    );
+    assert!(
+        grants
+            .load_with_nested_worktree(&main, &nested, Some(temp.path()))
+            .is_err()
+    );
+}

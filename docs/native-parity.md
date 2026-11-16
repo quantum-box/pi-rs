@@ -698,10 +698,14 @@ paths require an explicit absolute base; parent components and non-UTF-8 paths
 are rejected so rendering cannot change the file selected by the host. Hidden
 model-invocation skills remain in the snapshot for explicit use. Reads follow
 symlinks and do not grant later file access; no directories, packages or settings
-are discovered implicitly. Each file is capped at 256 KiB. Read, parse and
-duplicate-name errors fail the entire
-load, unlike Pi's per-file warnings and continuation. Hosts own skill invocation
-and must authorize each later file read independently.
+are discovered implicitly. Hosts can explicitly grant recursive directories;
+scans read local ignore files, skip hidden entries and node_modules, and stop at
+an unignored SKILL.md. Directory grants authorize enumeration and ignore-file
+reads and discovered skill-file contents throughout the granted subtree, including symlink targets outside it; they
+are not a sandbox. Scans bound file, entry, ignore-byte, ignore-line and depth
+counts. Each file is capped at 256 KiB. Read, ignore, parse and duplicate-name
+errors fail the entire load, unlike Pi's per-file warnings and continuation.
+Hosts own skill invocation and must authorize each later file read independently.
 
 Native SDK hosts can load prompt template snapshots from explicitly granted `.md`
 files or direct children of explicitly granted directories. No directories,
@@ -1921,6 +1925,15 @@ Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
 Consecutive paragraphs retain a single separating blank line, including inside
 block quotes; hard line breaks do not add paragraph spacing.
+Top-level tables are separated from a preceding rendered block by a blank line.
+Inline and display LaTeX use a native port of the pinned Pi terminal renderer,
+including fractions, operators, scripts and matrix environments. Math can occur
+in list items and quotes; unsupported or incomplete expressions retain their
+source. Oversized or deeply nested expressions and exhausted rendering budgets
+fall back to source text. These limits are intentional native safeguards and
+may preserve an expression that Pi would render. A pinned reference fixture
+checks 3,474 expression renderings; Markdown tests cover delimiters, code,
+links, list indentation, streaming and narrow display widths.
 
 Unit tests cover these layouts and Unicode widths. A PTY fixture verifies both
 terminal modes, heading decoration, code fences, nested quotes and clean exit.
@@ -1932,6 +1945,8 @@ numbers, and highlight changed words for one-line replacements. Added, removed
 and context lines use their dedicated theme colors. Tabs expand to three spaces,
 and word comparison follows Pi's `diffWords` token grouping and whitespace
 deduplication, including the first changed fragment's indentation treatment.
+Numbered diff gutters use JavaScript's whitespace and line-terminator rules,
+including its treatment of BOM and U+0085.
 Comparison has a shared 100 ms budget per render; oversized or unfinished
 comparisons retain line-level highlighting. The Rust word-diff implementation
 derives from jsdiff 8.0.4; its BSD license is in
@@ -5118,6 +5133,12 @@ loaded once. Hosts choose directories and
 when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
 follow symlinks, fail atomically on errors, and use the prompt resource size limit.
 Unlike Pi, unreadable higher-priority files fail rather than falling through.
+Hosts that have verified a nested linked worktree can opt into Pi's matching-name
+shadowing by supplying both explicitly granted roots. The selected main-root
+entry is suppressed when the nested worktree has the same selected filename;
+separate directory aliases remain available for global context. Hosts identify
+the global role explicitly when it shares the main-root path. The host verifies
+the repository relationship, and no Git metadata or additional paths are read.
 
 The SDK model catalog can enumerate its host-registered provider/model identities
 in deterministic order for host model pickers. This lists the immutable catalog

@@ -109,6 +109,56 @@ impl ContextReadGrants {
         }
         Ok(ContextResources { files })
     }
+
+    /// Apply Pi's nested linked-worktree shadowing to two explicitly granted
+    /// directories. The host must verify that these are the main and linked
+    /// worktree roots of the same repository; no Git metadata is inspected.
+    /// Both paths must occur in `directories`. Directory canonicalization follows
+    /// symlinks and is used only to compare roots, never context-file targets.
+    /// Only the supplied main-root entry is shadowed; other aliases remain.
+    /// Supply `global_context` when that role uses the same path as the main
+    /// root, so its deduplicated entry remains in the snapshot. As with `load`, any
+    /// unreadable context or root canonicalization error rejects the snapshot.
+    pub fn load_with_nested_worktree(
+        &self,
+        main_root: &Path,
+        worktree_root: &Path,
+        global_context: Option<&Path>,
+    ) -> Result<ContextResources> {
+        if !self.directories.iter().any(|path| path == main_root)
+            || !self.directories.iter().any(|path| path == worktree_root)
+        {
+            return Err(Error::Config(
+                "worktree roots must both be granted context directories".into(),
+            ));
+        }
+        if global_context.is_some_and(|global| !self.directories.iter().any(|path| path == global))
+        {
+            return Err(Error::Config(
+                "global context must be a granted directory".into(),
+            ));
+        }
+        let main = std::fs::canonicalize(main_root)?;
+        let worktree = std::fs::canonicalize(worktree_root)?;
+        let mut resources = self.load()?;
+        if worktree == main || !worktree.starts_with(&main) || global_context == Some(main_root) {
+            return Ok(resources);
+        }
+        let selected = resources
+            .files
+            .iter()
+            .find(|file| file.path.parent() == Some(worktree_root));
+        if let Some(name) = selected
+            .and_then(|file| file.path.file_name())
+            .map(|name| name.to_owned())
+        {
+            resources.files.retain(|file| {
+                file.path.parent() != Some(main_root)
+                    || file.path.file_name() != Some(name.as_os_str())
+            });
+        }
+        Ok(resources)
+    }
 }
 
 impl ContextResources {
