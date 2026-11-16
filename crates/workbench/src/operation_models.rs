@@ -1098,9 +1098,16 @@ impl Operations {
                     "id":id,
                     "name":metadata.as_ref().and_then(|metadata| metadata.name.as_deref()).unwrap_or(&id),
                     "api":adapter.api(),
-                    "input":if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] },
+                    "input":metadata.as_ref().and_then(|model| model.input_modalities())
+                        .unwrap_or_else(|| if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] }),
                 });
                 if let Some(metadata) = metadata {
+                    if let Some(reasoning) = metadata.reasoning {
+                        model["reasoning"] = json!(reasoning);
+                    }
+                    if let Some(max_tokens) = metadata.max_tokens {
+                        model["maxTokens"] = json!(max_tokens);
+                    }
                     metadata.apply_catalog_metadata(&mut model);
                 }
                 if let Some(window) = detail.context_window {
@@ -1869,6 +1876,53 @@ mod tests {
             panic!("chat model accepted")
         };
         assert!(wrong_type.contains("is a chat model, not an image model"));
+    }
+
+    #[test]
+    fn chat_catalogue_preserves_declared_capabilities() {
+        use clap::Parser;
+        let config = json!({"providers":{"relay":{"baseUrl":"http://127.0.0.1:1/v1", "api":"openai-completions", "models":[
+            {"id":"fixture", "name":"Fixture", "reasoning":true, "input":["image"], "contextWindow":4096, "maxTokens":1024, "thinkingLevelMap":{"low":"lite","high":"deep","xhigh":null}},
+            {"id":"plain", "reasoning":false, "input":["text"], "contextWindow":2048, "maxTokens":512}
+        ]}}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let fixture = operation
+            .chat_models(Some("relay"), Some("fixture"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(fixture["input"], json!(["image"]));
+        assert_eq!(fixture["reasoning"], true);
+        assert_eq!(fixture["maxTokens"], 1024);
+        assert_eq!(fixture["contextWindow"], 4096);
+        assert_eq!(
+            fixture["thinkingLevelMap"],
+            json!({"low":"lite","high":"deep","xhigh":null})
+        );
+        let plain = operation
+            .chat_models(Some("relay"), Some("plain"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(plain["input"], json!(["text"]));
+        assert_eq!(plain["reasoning"], false);
+        assert_eq!(plain["maxTokens"], 512);
+        let built_in = operation
+            .chat_models(Some("openai"), Some("chat-latest"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(built_in["input"], json!(["text", "image"]));
+        assert_eq!(built_in["reasoning"], true);
+        assert_eq!(built_in["maxTokens"], 128000);
+        let mapped = operation
+            .chat_models(Some("openai"), Some("gpt-5"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(mapped["thinkingLevelMap"]["high"], "high");
+        assert!(mapped["thinkingLevelMap"]["xhigh"].is_null());
     }
 
     #[tokio::test]
