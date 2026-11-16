@@ -19,6 +19,8 @@ pub struct SessionTransaction<'a> {
     pub(crate) state: Conversation,
     pub(crate) table_written: bool,
     pub(crate) supports_context: bool,
+    pub(crate) adapter: Option<std::sync::Arc<dyn crate::model::ProviderAdapter>>,
+    pub(crate) image_profile_guard: Option<Option<crate::images::ModelImageProfile>>,
     pub(crate) after_reset: Option<Uuid>,
     pub(crate) entries_allowed: bool,
     reads: HashMap<Address, Option<Map<String, Value>>>,
@@ -32,6 +34,7 @@ impl<'a> SessionTransaction<'a> {
         after_reset: Option<Uuid>,
         entries_allowed: bool,
         supports_context: bool,
+        adapter: Option<std::sync::Arc<dyn crate::model::ProviderAdapter>>,
     ) -> Result<Self, Error> {
         Ok(Self {
             store,
@@ -39,6 +42,8 @@ impl<'a> SessionTransaction<'a> {
             state,
             table_written: false,
             supports_context,
+            adapter,
+            image_profile_guard: None,
             after_reset,
             entries_allowed,
             reads: HashMap::new(),
@@ -120,6 +125,25 @@ impl<'a> SessionTransaction<'a> {
     }
 
     pub(crate) fn into_parts(self) -> Result<(Conversation, OwnedBatch, bool), Error> {
+        if let Some(profile) = self.image_profile_guard {
+            let adapter = self
+                .adapter
+                .as_ref()
+                .filter(|adapter| {
+                    self.state.provider_adapter.as_deref() == Some(adapter.id())
+                        && adapter.supports_durable_blocks()
+                })
+                .ok_or_else(|| {
+                    Error::InvalidSessionAdmission(
+                        "block adapter changed during transaction".into(),
+                    )
+                })?;
+            if adapter.image_profile(&self.state.config.model) != profile {
+                return Err(Error::InvalidSessionAdmission(
+                    "model image profile changed during transaction".into(),
+                ));
+            }
+        }
         let changed = self.table_written || !self.writes.is_empty();
         let mut batch = OwnedBatch {
             checks: Vec::new(),

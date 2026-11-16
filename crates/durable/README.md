@@ -1921,7 +1921,17 @@ request IDs return the existing submission without replacing its notification.
 The callback runs once, and conflict, abort races, or callback errors leave its
 candidate changes unpublished. Returned IDs are provisional until commit.
 
-This is a subset of upstream session transactions: fitted/block input, arbitrary
-table/signal operations, entry trees and mutable Chord drafts are not exposed.
+`session_transaction_async` accepts a boxed asynchronous callback. Its
+`submit_fitted_user_blocks` fits ordered text/image blocks with the selected
+block-aware adapter, records fitting notes, and composes admission and optional
+notification with staged document and entry changes. The model profile is
+checked after fitting and immediately before commit; hosts should keep adapter
+profile state stable during admission. Duplicate requests reuse stored notes
+without fitting again. A cancellation or failed validation discards the
+candidate if the callback returns that error.
+
+This is a subset of upstream session transactions: arbitrary table/signal
+operations, unfitted block admission, entry trees and mutable Chord drafts are
+not exposed.
 Transactional continue rejects multiple pending block resets when they need
 separate commits. See [the parity notes](../../docs/pi-durable-parity.md).

@@ -3157,6 +3157,133 @@ impl crate::session_transaction::SessionTransaction<'_> {
         Ok(id)
     }
 
+    /// Fit and admit ordered user blocks before the first table write.
+    /// The returned ID and notes are provisional until the enclosing commit succeeds.
+    pub async fn submit_fitted_user_blocks(
+        &mut self,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        options: AdmissionOptions,
+        notify: Option<SubmissionNotify>,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, crate::document::Error> {
+        use crate::document::Error as DError;
+        if let Some(id) =
+            self.admission_duplicate(request_id.as_deref(), Some(SubmissionKind::Input))?
+        {
+            let notes = self
+                .state
+                .submissions
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.image_notes.clone())
+                .unwrap_or_default();
+            return Ok(crate::images::ImageAdmissionResult {
+                submission_id: id,
+                notes,
+            });
+        }
+        Self::validate_admission_notify(&notify)?;
+        let busy = self.state.active.is_some()
+            || pending_failure_continuation(&self.state)
+            || matches!(
+                self.state.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            );
+        if busy && options.reject_when_busy {
+            return Err(AdmissionError::Busy.into());
+        }
+        if !busy && options.reject_when_idle {
+            return Err(AdmissionError::Idle.into());
+        }
+        let adapter = self
+            .adapter
+            .as_ref()
+            .filter(|a| {
+                self.state.provider_adapter.as_deref() == Some(a.id())
+                    && a.supports_durable_blocks()
+            })
+            .ok_or_else(|| {
+                DError::InvalidSessionAdmission(
+                    "image admission requires a selected block-aware adapter".into(),
+                )
+            })?
+            .clone();
+        if !self.supports_context {
+            return Err(DError::InvalidSessionAdmission(
+                "unsupported context blocks".into(),
+            ));
+        }
+        if blocks.is_empty()
+            || crate::content::UserContent::from_yield(
+                serde_json::Value::Array(blocks.clone()),
+                false,
+            )
+            .is_none()
+        {
+            return Err(DError::InvalidSessionAdmission(
+                "invalid or empty user content blocks".into(),
+            ));
+        }
+        let profile = adapter.image_profile(&self.state.config.model);
+        let limits = profile.map(|p| p.limits).unwrap_or_default();
+        let (output, notes) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(DError::InvalidSessionAdmission("image admission interrupted".into())),
+            result = admission.prepare_blocks(&blocks, limits) => result.map_err(DError::InvalidSessionAdmission)?,
+        };
+        if cancel.is_cancelled() {
+            return Err(DError::InvalidSessionAdmission(
+                "image admission interrupted".into(),
+            ));
+        }
+        if adapter.image_profile(&self.state.config.model) != profile
+            || !adapter.supports_durable_blocks()
+        {
+            return Err(DError::InvalidSessionAdmission(
+                "model image profile changed during admission".into(),
+            ));
+        }
+        if output.is_empty()
+            || crate::content::UserContent::from_yield(
+                serde_json::Value::Array(output.clone()),
+                false,
+            )
+            .is_none()
+        {
+            return Err(DError::InvalidSessionAdmission(
+                "image admission produced invalid or empty content".into(),
+            ));
+        }
+        let id = self.submit_input(request_id, "blocks".into(), options, notify)?;
+        let submission = self
+            .state
+            .submissions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .expect("new submission");
+        submission.content.clear();
+        submission.image_notes = notes.clone();
+        let binding = crate::transcript::MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: output,
+        };
+        submission.input_blocks = Some(binding.clone());
+        if submission.status == Status::Running {
+            let index = self.state.messages.len() - 1;
+            self.state.messages[index] = Message::User {
+                content: String::new(),
+            };
+            self.state.content_blocks.insert(index, binding);
+        }
+        self.image_profile_guard = Some(profile);
+        Ok(crate::images::ImageAdmissionResult {
+            submission_id: id,
+            notes,
+        })
+    }
+
     /// Admit one continuation before the transaction's first table write.
     pub fn submit_continue(
         &mut self,
@@ -8554,6 +8681,7 @@ impl Harness {
             after_reset,
             entries_allowed,
             supports_context,
+            self.provider_adapter.clone(),
         )?;
         let result = change(&mut transaction)?;
         let (state, mut documents, changed) = transaction.into_parts()?;
@@ -8567,6 +8695,62 @@ impl Harness {
         }
         // Do not merge concurrent admissions into a callback's observed state:
         // preserve its exact conversation and document checks on conflict.
+        let merge = self.merge_admissions;
+        self.merge_admissions = false;
+        let saved = self.save_composed_locked(
+            &state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            Some(&documents),
+        );
+        self.merge_admissions = merge;
+        saved?;
+        Ok(result)
+    }
+
+    /// Run an asynchronous checked session transaction without replaying its callback.
+    pub async fn session_transaction_async<T>(
+        &mut self,
+        id: Uuid,
+        change: impl for<'tx> FnOnce(
+            &'tx mut crate::session_transaction::SessionTransaction<'_>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, crate::document::Error>> + 'tx>,
+        >,
+    ) -> Result<T, Error> {
+        let (state, version) = self.load(id)?;
+        if state.abort_requested {
+            return Err(Error::Invalid("abort in progress".into()));
+        }
+        let entries_allowed = state.pending_resets.is_empty()
+            && state.pending_independent_summary.is_none()
+            && !state
+                .application_writes
+                .iter()
+                .any(|write| !write.placed && !write.withdrawn);
+        let supports_context = self.supports_context_blocks(&state);
+        let after_reset = state.resets.last().map(|reset| reset.id);
+        let owner = self.owner.clone();
+        let mut transaction = crate::session_transaction::SessionTransaction::new(
+            owner.store(),
+            state,
+            after_reset,
+            entries_allowed,
+            supports_context,
+            self.provider_adapter.clone(),
+        )?;
+        let result = change(&mut transaction).await?;
+        let (state, mut documents, changed) = transaction.into_parts()?;
+        if !changed {
+            documents.checks.push(Check {
+                key: Self::key(id),
+                expected: Expected::Version(version),
+            });
+            owner.store().commit(&documents.checks, &[])?;
+            return Ok(result);
+        }
         let merge = self.merge_admissions;
         self.merge_admissions = false;
         let saved = self.save_composed_locked(
@@ -15353,6 +15537,20 @@ impl Scheduler {
         ) -> Result<T, crate::document::Error>,
     ) -> Result<T, Error> {
         let result = self.harness.session_transaction(id, change)?;
+        self.schedule(id);
+        Ok(result)
+    }
+    /// Run an asynchronous checked host transaction and schedule its conversation.
+    pub async fn session_transaction_async<T>(
+        &mut self,
+        id: Uuid,
+        change: impl for<'tx> FnOnce(
+            &'tx mut crate::session_transaction::SessionTransaction<'_>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, crate::document::Error>> + 'tx>,
+        >,
+    ) -> Result<T, Error> {
+        let result = self.harness.session_transaction_async(id, change).await?;
         self.schedule(id);
         Ok(result)
     }

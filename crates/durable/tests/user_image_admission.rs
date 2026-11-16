@@ -968,3 +968,530 @@ async fn scheduler_fitted_input_delivers_settlement_notification() {
     assert_eq!(value["id"], json!(submission.submission_id));
     assert_eq!(value["status"], "done");
 }
+
+fn tx_address() -> pi_rs_durable::document::Address {
+    pi_rs_durable::document::Address {
+        scope: "session".into(),
+        name: "fitted".into(),
+        key: "".into(),
+    }
+}
+
+#[tokio::test]
+async fn transaction_fits_blocks_with_documents_entries_notification_and_reopen() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        document::Documents,
+        runtime::{AdmissionOptions, SubmissionNotify, submission_settled_signal},
+        task::{Checkpoint, Task, TaskOwner},
+        task_store::{Save, TaskStore},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(Adapter::default());
+    let processor = Arc::new(Processor::default());
+    let fit = Arc::new(UserImageAdmission::new(processor.clone()));
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    let c = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(c, true).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(c),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    TaskStore::new(&Store::open(&path).unwrap())
+        .save(&[Save::Create(&task)])
+        .unwrap();
+    let task_id = task.id();
+    let result = h
+        .session_transaction_async(c, move |tx| {
+            Box::pin(async move {
+                tx.put_document(&tx_address(), json!({"n":1}).as_object().unwrap().clone())?;
+                let result = tx
+                    .submit_fitted_user_blocks(
+                        Some("fitted".into()),
+                        vec![json!({"type":"text","text":"look"}), image_block()],
+                        &fit,
+                        AdmissionOptions::default(),
+                        Some(SubmissionNotify {
+                            task_id,
+                            key: "done".into(),
+                        }),
+                        &CancellationToken::new(),
+                    )
+                    .await?;
+                tx.append_entry("note", Some(json!("after")))?;
+                assert_eq!(tx.document(&tx_address())?.unwrap()["n"], 1);
+                Ok(result)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(*processor.0.lock().unwrap(), vec![12]);
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter).unwrap();
+    let state = h.conversation(c).unwrap();
+    assert_eq!(state.application_writes.len(), 1);
+    assert_eq!(
+        state.content_blocks.values().next().unwrap().blocks[1]["data"],
+        "bmV3"
+    );
+    assert_eq!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&tx_address())
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        1
+    );
+    h.resume_conversation(c, &CancellationToken::new())
+        .await
+        .unwrap();
+    let store = Store::open(&path).unwrap();
+    let signal = TaskStore::new(&store)
+        .read_typed_signal(task_id, &submission_settled_signal(), "done")
+        .unwrap()
+        .unwrap();
+    assert_eq!(signal["id"], json!(result.submission_id));
+    assert_eq!(signal["status"], "done");
+}
+
+#[tokio::test]
+async fn transaction_fitted_duplicate_preserves_notes_and_skips_processing() {
+    use pi_rs_durable::{document::Error as DError, runtime::AdmissionOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let processor = Arc::new(Processor::default());
+    let fit = Arc::new(UserImageAdmission::new(processor.clone()));
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    h.install_provider_adapter(Arc::new(Adapter::default()))
+        .unwrap();
+    let c = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(c, true).unwrap();
+    let first = h
+        .submit_fitted_user_blocks(
+            c,
+            Some("same".into()),
+            vec![json!({"type":"image","data":"YmFk","mimeType":"image/png"})],
+            &fit,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let duplicate_fit = fit.clone();
+    let duplicate = h
+        .session_transaction_async(c, move |tx| {
+            Box::pin(async move {
+                let result = tx
+                    .submit_fitted_user_blocks(
+                        Some("same".into()),
+                        vec![],
+                        &duplicate_fit,
+                        AdmissionOptions::default(),
+                        None,
+                        &CancellationToken::new(),
+                    )
+                    .await?;
+                tx.append_entry("note", None)?;
+                assert!(matches!(
+                    tx.submit_fitted_user_blocks(
+                        Some("same".into()),
+                        vec![],
+                        &duplicate_fit,
+                        AdmissionOptions::default(),
+                        None,
+                        &CancellationToken::new()
+                    )
+                    .await,
+                    Err(DError::ReadAfterWrite)
+                ));
+                Ok(result)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(first, duplicate);
+    assert_eq!(processor.0.lock().unwrap().len(), 1);
+}
+
+struct MutableProfileAdapter(std::sync::atomic::AtomicU32);
+#[async_trait]
+impl ProviderAdapter for MutableProfileAdapter {
+    fn id(&self) -> &str {
+        "mutable-profile/v1"
+    }
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    fn image_profile(&self, _: &str) -> Option<ModelImageProfile> {
+        Some(ModelImageProfile {
+            supports_images: true,
+            limits: ImageLimits {
+                max_width: self.0.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            },
+        })
+    }
+    async fn prepare(&self, _: &ProviderAttempt, _: &ModelRequest) -> Result<Value, Error> {
+        Ok(json!({}))
+    }
+    fn validate(&self, _: &ProviderAttempt, _: &ModelRequest, _: &Value) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: &ProviderAttempt,
+        _: &ModelRequest,
+        _: Value,
+    ) -> Result<ModelStream, Error> {
+        panic!("unexpected dispatch")
+    }
+}
+
+#[tokio::test]
+async fn transaction_profile_change_after_fit_rolls_back_entire_candidate() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        document::{Documents, Error as DError},
+        runtime::{AdmissionOptions, Error as RError},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(MutableProfileAdapter(12.into()));
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    let c = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(c, true).unwrap();
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    let result = h
+        .session_transaction_async(c, move |tx| {
+            Box::pin(async move {
+                tx.put_document(&tx_address(), json!({"n":1}).as_object().unwrap().clone())?;
+                tx.submit_fitted_user_blocks(
+                    None,
+                    vec![image_block()],
+                    &fit,
+                    AdmissionOptions::default(),
+                    None,
+                    &CancellationToken::new(),
+                )
+                .await?;
+                tx.append_entry("note", None)?;
+                adapter.0.store(25, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(RError::Document(DError::InvalidSessionAdmission(_)))
+    ));
+    let state = h.conversation(c).unwrap();
+    assert!(state.submissions.is_empty() && state.application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&tx_address())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn transaction_abort_race_fences_fitted_input_and_documents() {
+    use durable_store::{Check, Expected, Mutation, Store};
+    use pi_rs_durable::{
+        document::Documents,
+        runtime::{AdmissionOptions, Error as RError},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(Adapter::default()))
+        .unwrap();
+    let c = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(c, true).unwrap();
+    let other = Store::open(&path).unwrap();
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    let result = h
+        .session_transaction_async(c, move |tx| {
+            Box::pin(async move {
+                tx.put_document(&tx_address(), json!({"n":1}).as_object().unwrap().clone())?;
+                tx.submit_fitted_user_blocks(
+                    Some("abort".into()),
+                    vec![image_block()],
+                    &fit,
+                    AdmissionOptions::default(),
+                    None,
+                    &CancellationToken::new(),
+                )
+                .await?;
+                tx.append_entry("note", None)?;
+                let key = format!("runtime/conversation/{c}").into_bytes();
+                let entry = other.get(&key)?.unwrap();
+                let mut state: Value = serde_json::from_slice(&entry.value)?;
+                state["abort_requested"] = json!(true);
+                other.commit(
+                    &[Check {
+                        key: key.clone(),
+                        expected: Expected::Version(entry.version),
+                    }],
+                    &[Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&state)?,
+                    }],
+                )?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(RError::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(c).unwrap();
+    assert!(state.submissions.is_empty() && state.application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&tx_address())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn transaction_invalid_blocks_and_cancellation_leave_no_writes() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        document::Documents,
+        runtime::{AdmissionOptions, Error as RError},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(Adapter::default()))
+        .unwrap();
+    let c = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(c, true).unwrap();
+    for invalid in [true, false] {
+        let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+        let result = h
+            .session_transaction_async(c, move |tx| {
+                Box::pin(async move {
+                    tx.put_document(&tx_address(), json!({"n":1}).as_object().unwrap().clone())?;
+                    let cancel = CancellationToken::new();
+                    if !invalid {
+                        cancel.cancel();
+                    }
+                    let blocks = if invalid {
+                        vec![json!({"type":"unknown"})]
+                    } else {
+                        vec![image_block()]
+                    };
+                    tx.submit_fitted_user_blocks(
+                        None,
+                        blocks,
+                        &fit,
+                        AdmissionOptions::default(),
+                        None,
+                        &cancel,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await;
+        assert!(matches!(result, Err(RError::Document(_))));
+    }
+    assert!(h.conversation(c).unwrap().submissions.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&tx_address())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fitted_transaction_kill_fixture() {
+    use pi_rs_durable::runtime::AdmissionOptions;
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_FITTED_TX_KILL_DB") else {
+        return;
+    };
+    let mut h = Harness::open_paused(path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(Adapter::default()))
+        .unwrap();
+    let c = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(c, true).unwrap();
+    use pi_rs_durable::{
+        runtime::SubmissionNotify,
+        task::{Checkpoint, Task, TaskOwner},
+        task_store::{Save, TaskStore},
+    };
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(c),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    TaskStore::new(
+        &durable_store::Store::open(std::env::var("PI_FITTED_TX_KILL_DB").unwrap()).unwrap(),
+    )
+    .save(&[Save::Create(&task)])
+    .unwrap();
+    let task_id = task.id();
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    let id = h
+        .session_transaction_async(c, move |tx| {
+            Box::pin(async move {
+                tx.put_document(&tx_address(), json!({"n":7}).as_object().unwrap().clone())?;
+                let id = tx
+                    .submit_fitted_user_blocks(
+                        Some("kill".into()),
+                        vec![image_block()],
+                        &fit,
+                        AdmissionOptions::default(),
+                        Some(SubmissionNotify {
+                            task_id,
+                            key: "done".into(),
+                        }),
+                        &CancellationToken::new(),
+                    )
+                    .await?
+                    .submission_id;
+                tx.append_entry("note", None)?;
+                Ok(id)
+            })
+        })
+        .await
+        .unwrap();
+    println!("FITTED_TX_COMMITTED {c} {id} {task_id}");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fitted_transaction_survives_process_kill() {
+    use durable_store::Store;
+    use pi_rs_durable::document::Documents;
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+        time::Duration,
+    };
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "fitted_transaction_kill_fixture", "--nocapture"])
+            .env("PI_FITTED_TX_KILL_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let output = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let line = line.unwrap();
+            if let Some((_, ids)) = line.split_once("FITTED_TX_COMMITTED ") {
+                let _ = tx.send(ids.to_string());
+                break;
+            }
+        }
+    });
+    let ids = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let ids = ids
+        .split_whitespace()
+        .map(|s| Uuid::parse_str(s).unwrap())
+        .collect::<Vec<_>>();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(Adapter::default()))
+        .unwrap();
+    let state = h.conversation(ids[0]).unwrap();
+    assert_eq!(state.submissions[0].id, ids[1]);
+    assert_eq!(
+        state.submission_notification(ids[1]).unwrap().task_id,
+        ids[2]
+    );
+    assert_eq!(
+        state.content_blocks.values().next().unwrap().blocks[0]["data"],
+        "bmV3"
+    );
+    assert_eq!(state.application_writes.len(), 1);
+    assert_eq!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&tx_address())
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        7
+    );
+}
+
+#[tokio::test]
+async fn scheduler_async_transaction_fits_and_schedules() {
+    use pi_rs_durable::runtime::{AdmissionOptions, Scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(Adapter::default());
+    let mut scheduler = Scheduler::open_with_provider_adapter(
+        &path,
+        options(),
+        Default::default(),
+        adapter.clone(),
+    )
+    .unwrap();
+    let c = scheduler.create_conversation(config("first")).unwrap();
+    scheduler.select_provider_adapter(c, true).unwrap();
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    scheduler
+        .session_transaction_async(c, move |tx| {
+            Box::pin(async move {
+                tx.put_document(&tx_address(), json!({"n":2}).as_object().unwrap().clone())?;
+                tx.submit_fitted_user_blocks(
+                    None,
+                    vec![image_block()],
+                    &fit,
+                    AdmissionOptions::default(),
+                    None,
+                    &CancellationToken::new(),
+                )
+                .await?;
+                tx.append_entry("note", None)?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    scheduler.wait(c).await.unwrap();
+    assert!(!adapter.0.lock().unwrap().is_empty());
+    scheduler.shutdown().await.unwrap();
+}
