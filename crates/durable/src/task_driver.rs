@@ -1115,6 +1115,19 @@ impl Shared {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty();
+            if stopping && active == 0 && remaining && !self.cleanup_stop.is_cancelled() {
+                let uncertain = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|pending| pending.waits_for_uncertain_graph(self.harness.is_none()));
+                if uncertain {
+                    // The caller must repair this graph; retrying cannot drain
+                    // the lease. Stop cleanup before joining the coordinator.
+                    self.cleanup_stop.cancel();
+                }
+            }
             if stopping
                 && active == 0
                 && (failed_now

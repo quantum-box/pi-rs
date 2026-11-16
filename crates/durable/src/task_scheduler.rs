@@ -657,6 +657,24 @@ impl std::fmt::Debug for PendingSettlement {
 }
 
 impl PendingSettlement {
+    // Distinguish durable ownership uncertainty from a temporarily busy poll
+    // fence during graceful driver shutdown. This only observes the graph;
+    // the returned settlement retains its lease and is always revalidated.
+    pub(crate) fn waits_for_uncertain_graph(&self, include_background: bool) -> bool {
+        let owner = &self.lease().attachment.owner;
+        let Ok(_gate) = owner.task_gate().lock() else {
+            return false;
+        };
+        matches!(
+            pending_abort_root_for_running(
+                &TaskStore::new(owner.store()),
+                self.task_id(),
+                include_background,
+            ),
+            Err(Error::Busy)
+        )
+    }
+
     /// Borrow the original completed invocation without releasing its lease.
     pub fn completed(&self) -> Option<&CompletedInvocation> {
         match self {
@@ -17515,8 +17533,7 @@ mod standalone_foreground_cleanup_tests {
         assert!(scheduler.get(good.id()).unwrap().unwrap().is_terminal());
     }
 
-    #[tokio::test]
-    async fn in_flight_result_waits_for_uncertain_failed_graph_without_stopping_driver() {
+    async fn exercise_in_flight_uncertain_graph(shutdown_before_repair: bool) {
         use std::{
             sync::{
                 atomic::{AtomicUsize, Ordering},
@@ -17635,6 +17652,36 @@ mod standalone_foreground_cleanup_tests {
             driver.get(descendant.id()).unwrap().unwrap().state(),
             &TaskState::Running
         );
+        if shutdown_before_repair {
+            let attempt = tasks
+                .load(descendant.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .attempt_id();
+            let (shutdown_tx, shutdown_rx) = mpsc::channel();
+            let shutdown = std::thread::spawn(move || {
+                shutdown_tx.send(driver.shutdown_with_pending()).unwrap();
+            });
+            let report = shutdown_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shutdown must return a pending uncertain settlement")
+                .unwrap();
+            shutdown.join().unwrap();
+            assert!(report.failure().is_none());
+            assert_eq!(report.pending().len(), 1);
+            let pending = &report.pending()[0];
+            assert_eq!(pending.task_id(), descendant.id());
+            assert_eq!(pending.attempt_id(), attempt);
+            assert!(pending.completed().is_some());
+            assert_eq!(
+                pending.observed_task().unwrap().unwrap().state(),
+                &TaskState::Running
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            drop(report);
+            return;
+        }
         let entry = db.get(&key).unwrap().unwrap();
         db.commit(
             &[durable_store::Check {
@@ -17660,6 +17707,16 @@ mod standalone_foreground_cleanup_tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         driver.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_flight_result_waits_for_uncertain_failed_graph_without_stopping_driver() {
+        exercise_in_flight_uncertain_graph(false).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_in_flight_result_before_uncertain_graph_is_repaired() {
+        exercise_in_flight_uncertain_graph(true).await;
     }
 
     #[test]
