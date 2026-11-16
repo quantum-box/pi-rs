@@ -882,3 +882,107 @@ fn staged_signal_wins_over_duplicate_write_notification() {
     });
     driver.shutdown().unwrap();
 }
+
+#[test]
+fn ignored_write_validation_storage_error_discards_staged_effects() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct IgnoreWriteError {
+        path: std::path::PathBuf,
+        saw_storage_error: Arc<AtomicBool>,
+    }
+    impl Handler for IgnoreWriteError {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            task: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.get(&address()).map_err(|e| e.to_string())?;
+            docs.put(
+                &address(),
+                json!({"must_not_commit": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            let conn = rusqlite::Connection::open(&self.path).map_err(|e| e.to_string())?;
+            conn.execute_batch(
+                "ALTER TABLE durable_document_history_meta RENAME TO disabled_document_history_meta",
+            )
+            .map_err(|e| e.to_string())?;
+            // The conversation lookup succeeds, then the write draft's validation
+            // fails when it opens a document-history snapshot.
+            let result = docs.submit_write(
+                "write-storage-failure".into(),
+                "app.note".into(),
+                Some(json!({"must_not_commit": true})),
+                Some(SubmissionNotify {
+                    task_id: task.id(),
+                    key: "settled".into(),
+                }),
+            );
+            self.saw_storage_error.store(
+                matches!(&result, Err(pi_rs_durable::document::Error::TaskInputStore(error))
+                    if matches!(error.as_ref(), durable_store::Error::Storage(_))
+                        && error.to_string().contains("durable_document_history_meta")),
+                Ordering::SeqCst,
+            );
+            conn.execute_batch(
+                "ALTER TABLE disabled_document_history_meta RENAME TO durable_document_history_meta",
+            )
+            .map_err(|e| e.to_string())?;
+            // Intentionally ignore the failure and claim success.
+            Ok(Step::Succeed(json!({"must_not_commit": true})))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, conversation) = setup(&path);
+    let saw_storage_error = Arc::new(AtomicBool::new(false));
+    let mut registry = Registry::default();
+    registry.register(
+        "write-storage-error",
+        true,
+        IgnoreWriteError {
+            path: path.clone(),
+            saw_storage_error: saw_storage_error.clone(),
+        },
+    );
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let task = task(conversation, "write-storage-error");
+    scheduler.submit(&task).unwrap();
+    let error = scheduler.tick(0).unwrap_err();
+    assert!(saw_storage_error.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        pi_rs_durable::task::scheduler::Error::Document(
+            pi_rs_durable::document::Error::TaskInputStore(error)
+        ) if matches!(error.as_ref(), durable_store::Error::Storage(_))
+            && error.to_string().contains("durable_document_history_meta")
+    ));
+    let store = Store::open(&path).unwrap();
+    let tasks = TaskStore::new(&store);
+    assert_eq!(
+        tasks.load(task.id()).unwrap().unwrap().task.state(),
+        &TaskState::Running
+    );
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    let state = h.conversation(conversation).unwrap();
+    assert!(state.application_writes.is_empty());
+    assert!(state.submissions.is_empty());
+    assert!(
+        tasks
+            .read_typed_signal(task.id(), &submission_settled_signal(), "settled")
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        scheduler.tick(0),
+        Err(pi_rs_durable::task::scheduler::Error::Poisoned)
+    ));
+}
