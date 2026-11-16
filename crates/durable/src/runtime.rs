@@ -800,6 +800,8 @@ pub struct Conversation {
     pub tool_results: Vec<ToolResultMetadata>,
     #[serde(skip)]
     pending_tool_result: Option<ToolResultMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_diagnostic_provenance: Option<PendingDiagnosticProvenance>,
     pub messages: Vec<Message>,
     /// Lossless user or tool block arrays indexed by active message position.
     /// Reconstructed from the transcript; never serialized in the snapshot.
@@ -882,6 +884,12 @@ pub struct Conversation {
     phase: Phase,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingDiagnosticProvenance {
+    operation_id: Uuid,
+    derived_indices: Vec<usize>,
+}
+
 /// A diagnostic associated with a finalized tool result. Diagnostics are also
 /// projected into model-visible tool content after hooks and redaction.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -962,12 +970,14 @@ fn record_tool_result(
         }
         _ => (None, None, Vec::new()),
     };
+    let mut derived_indices = Vec::new();
     if let Outcome::Failed(reason) | Outcome::Skipped(reason) = outcome {
         let code = if matches!(outcome, Outcome::Skipped(_)) {
             "tool_skipped"
         } else {
             "tool_failed"
         };
+        derived_indices.push(diagnostics.len());
         diagnostics.push(ToolDiagnostic {
             severity: DiagnosticSeverity::Error,
             message: reason.clone(),
@@ -975,6 +985,7 @@ fn record_tool_result(
         });
     }
     if let Outcome::Truncated { original_bytes } = outcome {
+        derived_indices.push(diagnostics.len());
         diagnostics.push(ToolDiagnostic {
             severity: DiagnosticSeverity::Warn,
             message: format!("tool output omitted ({original_bytes} bytes)"),
@@ -989,12 +1000,17 @@ fn record_tool_result(
         structured_output = None;
         attachments.clear();
         diagnostics.clear();
+        derived_indices.clear();
         diagnostics.push(ToolDiagnostic {
             severity: DiagnosticSeverity::Warn,
             message: "tool result metadata exceeded 65536 bytes".into(),
             code: Some("metadata_truncated".into()),
         });
     }
+    c.pending_diagnostic_provenance = Some(PendingDiagnosticProvenance {
+        operation_id,
+        derived_indices,
+    });
     c.tool_results.push(ToolResultMetadata {
         operation_id,
         call_id: call.id.clone(),
@@ -1338,6 +1354,58 @@ fn append_diagnostic_text(content: &mut String, diagnostic: &str) {
         content.push('\n');
     }
     content.push_str(diagnostic);
+}
+
+fn diagnostic_origins(
+    c: &Conversation,
+    operation_id: Uuid,
+    diagnostics: &[ToolDiagnostic],
+) -> (Vec<ToolDiagnostic>, Vec<ToolDiagnostic>) {
+    let Some(provenance) = c
+        .pending_diagnostic_provenance
+        .as_ref()
+        .filter(|p| p.operation_id == operation_id)
+    else {
+        // Legacy pending records lack proof; withhold them on redaction.
+        return (diagnostics.to_vec(), Vec::new());
+    };
+    if provenance
+        .derived_indices
+        .iter()
+        .any(|index| *index >= diagnostics.len())
+        || provenance
+            .derived_indices
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return (diagnostics.to_vec(), Vec::new());
+    }
+    let mut derived = Vec::new();
+    let mut explicit = Vec::new();
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if provenance.derived_indices.contains(&index) {
+            derived.push(diagnostic.clone());
+        } else {
+            explicit.push(diagnostic.clone());
+        }
+    }
+    (derived, explicit)
+}
+
+fn remove_derived_diagnostics(
+    diagnostics: &mut Vec<ToolDiagnostic>,
+    derived: &[ToolDiagnostic],
+    explicit: &[ToolDiagnostic],
+) {
+    for item in derived {
+        let retained = diagnostics.iter().filter(|d| *d == item).count();
+        let explicit_count = explicit.iter().filter(|d| *d == item).count();
+        if retained > explicit_count
+            && let Some(index) = diagnostics.iter().rposition(|d| d == item)
+        {
+            diagnostics.remove(index);
+        }
+    }
 }
 
 fn append_harness_diagnostic(metadata: &mut ToolResultMetadata, diagnostic: ToolDiagnostic) {
@@ -4897,6 +4965,9 @@ impl Harness {
         {
             state.pending_tool_result = Some(state.tool_results.remove(position));
         }
+        if !matches!(state.phase, Phase::ToolFinished { .. }) {
+            state.pending_diagnostic_provenance = None;
+        }
         if !matches!(state.phase, Phase::ToolFinished { .. })
             && let Some(prior) = old
         {
@@ -6003,6 +6074,7 @@ impl Harness {
             tool_filters: ToolFilters::default(),
             tool_results: Vec::new(),
             pending_tool_result: None,
+            pending_diagnostic_provenance: None,
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,
@@ -6301,6 +6373,7 @@ impl Harness {
                 .transpose()?
                 .unwrap_or_default(),
             pending_tool_result: None,
+            pending_diagnostic_provenance: None,
             messages: point.messages,
             content_blocks: blocks,
             block_reset_proof: None,
@@ -11107,6 +11180,8 @@ impl Harness {
                     None
                 };
                 if let Some(mut metadata) = c.pending_tool_result.take() {
+                    let (derived, explicit_diagnostics) =
+                        diagnostic_origins(&c, operation_id, &metadata.diagnostics);
                     if !metadata.is_error
                         && let Some(diagnostic) = truncation
                     {
@@ -11125,12 +11200,11 @@ impl Harness {
                         if let Some(diagnostic) =
                             bound_tool_output(&mut blocks, limits.limits, limits.prebounded)
                         {
-                            metadata.diagnostics.retain(|item| {
-                                !matches!(
-                                    item.code.as_deref(),
-                                    Some("tool_failed" | "tool_skipped")
-                                )
-                            });
+                            remove_derived_diagnostics(
+                                &mut metadata.diagnostics,
+                                &derived,
+                                &explicit_diagnostics,
+                            );
                             append_harness_diagnostic(&mut metadata, diagnostic);
                         }
                         content = blocks[0]["text"].as_str().unwrap_or_default().to_owned();
@@ -11152,6 +11226,7 @@ impl Harness {
                         );
                     }
                 }
+                c.pending_diagnostic_provenance = None;
                 // The effect already committed; retain its result even if an
                 // after-tool hook was interrupted by the abort.
                 self.append_tool_with_status(&mut c, &calls, index, operation_id, content)?;
@@ -14157,24 +14232,10 @@ impl Harness {
                             .cloned()
                     });
                     let mut derived = Vec::new();
+                    let mut explicit_diagnostics = Vec::new();
                     if let Some(mut metadata) = metadata {
-                        for diagnostic in &metadata.diagnostics {
-                            if diagnostic.severity == DiagnosticSeverity::Error
-                                && (content == diagnostic.message
-                                    || content.strip_prefix("Tool failed: ")
-                                        == Some(diagnostic.message.as_str())
-                                    || content.strip_prefix("Tool skipped: ")
-                                        == Some(diagnostic.message.as_str())
-                                    || (diagnostic.code.as_deref() == Some("tool_failed")
-                                        && diagnostic.message
-                                            == "tool interrupted and may have partially run"
-                                        && content
-                                            .strip_suffix(&diagnostic.message)
-                                            .is_some_and(|prefix| prefix.ends_with('\n'))))
-                            {
-                                derived.push(diagnostic.clone());
-                            }
-                        }
+                        (derived, explicit_diagnostics) =
+                            diagnostic_origins(&c, operation_id, &metadata.diagnostics);
                         if let Some(diagnostic) = &interrupted_truncation
                             && let Some(index) = metadata
                                 .diagnostics
@@ -14184,6 +14245,7 @@ impl Harness {
                             metadata.diagnostics.remove(index);
                         }
                         if replaced {
+                            derived.clear();
                             redact_tool_metadata(
                                 &mut metadata,
                                 "output_redacted",
@@ -14196,12 +14258,12 @@ impl Harness {
                                     .dropped_bytes
                                     > 0)
                         {
-                            metadata.diagnostics.retain(|item| {
-                                !matches!(
-                                    item.code.as_deref(),
-                                    Some("tool_failed" | "tool_skipped")
-                                )
-                            });
+                            remove_derived_diagnostics(
+                                &mut metadata.diagnostics,
+                                &derived,
+                                &explicit_diagnostics,
+                            );
+                            derived.clear();
                         }
                         let value = crate::extension::ToolResult {
                             output: content.clone(),
@@ -14233,6 +14295,15 @@ impl Harness {
                         )?;
                         if result_changed {
                             retained_output_unchanged &= !explicitly_replaced;
+                            if explicitly_replaced {
+                                derived.clear();
+                            } else {
+                                derived = crate::extension::remaining_derived_diagnostics(
+                                    &metadata.diagnostics,
+                                    &value.diagnostics,
+                                    &derived,
+                                );
+                            }
                             content = value.output;
                             metadata.is_error = value.is_error;
                             metadata.details = value.details;
@@ -14254,6 +14325,7 @@ impl Harness {
                             *existing = metadata;
                         }
                     }
+                    c.pending_diagnostic_provenance = None;
                     let metadata = c
                         .tool_results
                         .iter()
@@ -14341,6 +14413,9 @@ impl Harness {
                         metadata.diagnostics = block_result.diagnostics;
                     }
                     retained_output_unchanged &= !blocks_replaced;
+                    if blocks_replaced {
+                        derived.clear();
+                    }
                     let bounded = result_limits.and_then(|proof| {
                         bound_tool_output(
                             &mut block_result.output,
@@ -14363,12 +14438,11 @@ impl Harness {
                             append_harness_diagnostic(metadata, diagnostic);
                         }
                         if let Some(diagnostic) = bounded {
-                            metadata.diagnostics.retain(|item| {
-                                !matches!(
-                                    item.code.as_deref(),
-                                    Some("tool_failed" | "tool_skipped")
-                                )
-                            });
+                            remove_derived_diagnostics(
+                                &mut metadata.diagnostics,
+                                &derived,
+                                &explicit_diagnostics,
+                            );
                             append_harness_diagnostic(metadata, diagnostic);
                         }
                         if let Some(diagnostic) = render_tool_diagnostics(&metadata.diagnostics) {
@@ -24317,6 +24391,7 @@ mod scheduler_tests {
             tool_filters: ToolFilters::default(),
             tool_results: Vec::new(),
             pending_tool_result: None,
+            pending_diagnostic_provenance: None,
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,

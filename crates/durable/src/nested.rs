@@ -2062,7 +2062,8 @@ impl NestedHost {
                 message: "tool metadata withheld after output replacement".into(),
             }];
         }
-        let (result, rich_rewritten, _, reports) = hooks
+        let before_rich_diagnostics = result.diagnostics.clone();
+        let (result, rich_rewritten, rich_output_replaced, reports) = hooks
             .selected
             .after_tool_result_with_derived(&call, result, &context, &derived)
             .await;
@@ -2073,6 +2074,15 @@ impl NestedHost {
         }
         if self.shared.cancellation.is_cancelled() {
             return self.fail("nested result hooks cancelled");
+        }
+        if rich_output_replaced {
+            derived.clear();
+        } else {
+            derived = crate::extension::remaining_derived_diagnostics(
+                &before_rich_diagnostics,
+                &result.diagnostics,
+                &derived,
+            );
         }
         let outcome = if !rewritten && !rich_rewritten {
             original

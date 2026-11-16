@@ -4034,3 +4034,313 @@ async fn bounded_errors_and_hook_redactions_do_not_leak_derived_diagnostics_to_m
         );
     }
 }
+
+#[tokio::test]
+async fn top_level_derived_diagnostics_are_fenced_without_losing_equal_explicit_events() {
+    use pi_rs_durable::extension::{
+        Context, Extension, Hook, ToolBlockResult, ToolCall as HookCall, ToolResult,
+    };
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    use pi_rs_durable::runtime::{DiagnosticSeverity, ToolDiagnostic};
+    struct Tool {
+        skipped: bool,
+        code: Option<&'static str>,
+        long: bool,
+    }
+    #[async_trait]
+    impl BoundedStreamedTool for Tool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: KeyedHost,
+            _: BoundedStreamOutput,
+        ) -> StreamedReply {
+            let reason = if self.long {
+                "public".repeat(20)
+            } else if self.code.is_some() {
+                "public".into()
+            } else {
+                "private skip".into()
+            };
+            if let Some(code) = self.code {
+                host.diagnostic(ToolDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    message: reason.clone(),
+                    code: Some(code.into()),
+                })
+                .unwrap();
+            }
+            StreamedReply::Explicit(
+                if self.skipped {
+                    Outcome::Skipped(reason)
+                } else {
+                    Outcome::Failed(reason)
+                }
+                .into(),
+            )
+        }
+    }
+    struct Rewrite(&'static str);
+    #[async_trait]
+    impl Hook for Rewrite {
+        async fn after_tool_result(
+            &self,
+            _: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            if self.0 == "chain" {
+                let mut result = result.clone();
+                result.diagnostics.pop();
+                return Ok(Some(result));
+            }
+            if self.0 != "rich" {
+                return Ok(None);
+            }
+            let mut result = result.clone();
+            result.output = "redacted".into();
+            Ok(Some(result))
+        }
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            self.0 == "blocks" || self.0 == "chain"
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &HookCall,
+            result: &ToolBlockResult,
+            _: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            let mut result = result.clone();
+            result.output = vec![json!({"type":"text","text":"redacted"})];
+            Ok(Some(result))
+        }
+    }
+    for (skipped, code, long, hook) in [
+        (true, None, false, "rich"),
+        (true, None, false, "blocks"),
+        (true, Some("tool_skipped"), false, "rich"),
+        (true, Some("tool_skipped"), false, "blocks"),
+        (true, Some("tool_skipped"), false, "chain"),
+        (false, Some("tool_failed"), false, "rich"),
+        (false, Some("custom"), false, "blocks"),
+        (false, Some("tool_failed"), true, "none"),
+        (false, Some("custom"), true, "none"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = || Options {
+            model: Arc::new(RecordingModel {
+                inner: FakeModel {
+                    calls: AtomicUsize::new(0),
+                    fail_first: false,
+                },
+                observed_tools: observed.clone(),
+            }),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                    tool: Tool {
+                        skipped,
+                        code,
+                        long,
+                    },
+                    limits: OutputLimits {
+                        max_bytes: if long { 10 } else { 1024 },
+                        max_lines: 100,
+                        retain: Retain::Tail,
+                    },
+                }))
+                .register(ReplayPolicy::Unsafe),
+            ],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        h.install_extension(Extension {
+            name: "rewrite".into(),
+            hooks: vec![Arc::new(Rewrite(hook))],
+            ..Default::default()
+        })
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["rewrite".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &cancel)
+            .await
+            .unwrap();
+        let messages = observed.lock().unwrap().clone();
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].contains("private skip"));
+        let state = h.conversation(id).unwrap();
+        let diagnostics = &state.tool_results[0].diagnostics;
+        if let Some(code) = code {
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|d| d.code.as_deref() == Some(code))
+                    .count(),
+                1,
+                "{code} {hook}"
+            );
+            assert!(messages[0].contains("[error] public"));
+        }
+        if long {
+            assert_eq!(messages[0].matches("Output truncated").count(), 1);
+        }
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let reopened = h.conversation(id).unwrap();
+        assert_eq!(reopened.tool_results, state.tool_results);
+        assert!(
+            reopened
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { content,.. } if content == &messages[0]))
+        );
+    }
+}
+
+#[tokio::test]
+async fn top_level_diagnostic_provenance_survives_process_crash_before_hook() {
+    use pi_rs_durable::extension::{Context, Extension, Hook, ToolCall as HookCall, ToolResult};
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    use pi_rs_durable::runtime::{DiagnosticSeverity, ToolDiagnostic};
+    use std::io::Write;
+    struct Tool(std::path::PathBuf);
+    #[async_trait]
+    impl BoundedStreamedTool for Tool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: KeyedHost,
+            _: BoundedStreamOutput,
+        ) -> StreamedReply {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.0)
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+            host.diagnostic(ToolDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                message: "public".into(),
+                code: Some("tool_skipped".into()),
+            })
+            .unwrap();
+            StreamedReply::Explicit(Outcome::Skipped("public".into()).into())
+        }
+    }
+    struct Crash(bool);
+    #[async_trait]
+    impl Hook for Crash {
+        async fn after_tool_result(
+            &self,
+            _: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            assert_eq!(result.diagnostics.len(), 2);
+            if self.0 {
+                std::process::abort();
+            }
+            let mut result = result.clone();
+            result.output = "redacted".into();
+            Ok(Some(result))
+        }
+    }
+    let inherited = std::env::var_os("PI_DIAGNOSTIC_ORIGIN_CRASH_PATH");
+    let dir = tempfile::tempdir().unwrap();
+    let path = inherited
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.path().join("db"));
+    let effect = path.with_extension("effects");
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let options = || Options {
+        model: Arc::new(RecordingModel {
+            inner: FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            },
+            observed_tools: observed.clone(),
+        }),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                tool: Tool(effect.clone()),
+                limits: OutputLimits {
+                    max_bytes: 100,
+                    max_lines: 10,
+                    retain: Retain::Head,
+                },
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let extension = |crash| Extension {
+        name: "rewrite".into(),
+        hooks: vec![Arc::new(Crash(crash))],
+        ..Default::default()
+    };
+    if inherited.is_some() {
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        h.install_extension(extension(true)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["rewrite".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &cancel)
+            .await
+            .unwrap();
+        panic!("hook did not crash");
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "top_level_diagnostic_provenance_survives_process_crash_before_hook",
+            "--nocapture",
+        ])
+        .env("PI_DIAGNOSTIC_ORIGIN_CRASH_PATH", &path)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert_eq!(std::fs::read(&effect).unwrap(), b"x");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_extension(extension(false)).unwrap();
+    h.resume(&CancellationToken::new()).await.unwrap();
+    assert_eq!(std::fs::read(&effect).unwrap(), b"x");
+    let messages = observed.lock().unwrap().clone();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].starts_with("redacted"));
+    assert_eq!(messages[0].matches("[error] public").count(), 1);
+}

@@ -207,7 +207,40 @@ fn remove_cloned_derived_diagnostics(
     after: &mut Vec<crate::runtime::ToolDiagnostic>,
     derived: &[crate::runtime::ToolDiagnostic],
 ) {
-    after.retain(|diagnostic| !derived.contains(diagnostic) || !before.contains(diagnostic));
+    for item in derived {
+        let before_count = before.iter().filter(|d| *d == item).count();
+        let derived_count = derived.iter().filter(|d| *d == item).count();
+        let explicit_count = before_count.saturating_sub(derived_count);
+        if after.iter().filter(|d| *d == item).count() > explicit_count
+            && let Some(index) = after.iter().rposition(|d| d == item)
+        {
+            after.remove(index);
+        }
+    }
+}
+
+pub(crate) fn remaining_derived_diagnostics(
+    before: &[crate::runtime::ToolDiagnostic],
+    after: &[crate::runtime::ToolDiagnostic],
+    derived: &[crate::runtime::ToolDiagnostic],
+) -> Vec<crate::runtime::ToolDiagnostic> {
+    let mut remaining = Vec::new();
+    for item in derived {
+        let explicit_count = before
+            .iter()
+            .filter(|d| *d == item)
+            .count()
+            .saturating_sub(derived.iter().filter(|d| *d == item).count());
+        let available = after
+            .iter()
+            .filter(|d| *d == item)
+            .count()
+            .saturating_sub(explicit_count);
+        if remaining.iter().filter(|d| *d == item).count() < available {
+            remaining.push(item.clone());
+        }
+    }
+    remaining
 }
 
 /// A block-aware tool result for hosts that can persist and deliver ordered output.
@@ -789,6 +822,7 @@ impl Resolved {
         ctx: &Context<'_>,
         derived: &[crate::runtime::ToolDiagnostic],
     ) -> (ToolResult, bool, bool, Vec<Report>) {
+        let mut remaining_derived = derived.to_vec();
         let mut reports = Vec::new();
         let mut replaced = false;
         let mut output_changed = false;
@@ -807,7 +841,7 @@ impl Resolved {
                             remove_cloned_derived_diagnostics(
                                 &result.diagnostics,
                                 &mut value.diagnostics,
-                                derived,
+                                &remaining_derived,
                             );
                         }
                         let valid_diagnostics = value.diagnostics.len() <= 32
@@ -823,6 +857,15 @@ impl Resolved {
                         ))
                         .is_ok_and(|bytes| bytes.len() <= 65_536);
                         if valid_diagnostics && bounded {
+                            if output_is_replaced {
+                                remaining_derived.clear();
+                            } else {
+                                remaining_derived = remaining_derived_diagnostics(
+                                    &result.diagnostics,
+                                    &value.diagnostics,
+                                    &remaining_derived,
+                                );
+                            }
                             output_changed |= output_is_replaced;
                             result = value;
                             replaced = true;
@@ -885,6 +928,7 @@ impl Resolved {
         if !result.valid() {
             return Err("invalid tool output blocks".into());
         }
+        let mut remaining_derived = derived.to_vec();
         let mut reports = vec![];
         let mut replaced = false;
         for extension in &self.extensions {
@@ -908,7 +952,16 @@ impl Resolved {
                             remove_cloned_derived_diagnostics(
                                 &result.diagnostics,
                                 &mut value.diagnostics,
-                                derived,
+                                &remaining_derived,
+                            );
+                        }
+                        if output_is_replaced {
+                            remaining_derived.clear();
+                        } else {
+                            remaining_derived = remaining_derived_diagnostics(
+                                &result.diagnostics,
+                                &value.diagnostics,
+                                &remaining_derived,
                             );
                         }
                         result = value;
