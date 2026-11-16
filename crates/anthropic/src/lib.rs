@@ -1623,10 +1623,10 @@ impl Anthropic {
             &edited_scope,
             self.allow_empty_signature,
         )?;
-        if let Some(tools) = wire_tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(tools);
-            }
+        if let Some(tools) = wire_tools
+            && !tools.is_empty()
+        {
+            body["tools"] = json!(tools);
         }
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if self.oauth {
