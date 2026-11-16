@@ -15844,7 +15844,7 @@ mod standalone_foreground_cleanup_tests {
             max_output_tokens: 10,
         };
         let owner = h.create_conversation(cfg.clone()).unwrap();
-        let children: Vec<_> = (0..3)
+        let children: Vec<_> = (0..4)
             .map(|_| h.create_conversation(cfg.clone()).unwrap())
             .collect();
         let db = Store::open(&path).unwrap();
@@ -15894,6 +15894,19 @@ mod standalone_foreground_cleanup_tests {
             &[durable_store::Mutation::Put {
                 key: invalid,
                 value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+        let malformed = crate::ownership_edge::edge_key(children[3]);
+        let entry = db.get(&malformed).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: malformed.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: malformed,
+                value: b"not-json".to_vec(),
             }],
         )
         .unwrap();

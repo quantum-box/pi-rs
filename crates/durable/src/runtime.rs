@@ -13054,33 +13054,37 @@ impl Harness {
         let tasks = crate::task_store::TaskStore::new(self.owner.store())
             .list()
             .map_err(|error| Error::Invalid(format!("task lookup: {error}")))?;
-        let edges = crate::ownership_edge::EdgeStore::new(self.owner.store());
+        let anchors: HashMap<_, _> = tasks
+            .iter()
+            .map(|task| (task.task.id(), &task.task))
+            .collect();
         let mut candidates = std::collections::BTreeSet::new();
-        for anchor in &tasks {
-            for edge in edges
-                .children(anchor.task.id())
-                .map_err(|error| Error::Invalid(format!("ownership edges: {error}")))?
-            {
-                if edge.edge.task_owner != *anchor.task.owner() {
-                    continue;
-                }
-                let key = format!("runtime/conversation/{}", edge.edge.child);
-                let Some(entry) = self.owner.store().get(key.as_bytes())? else {
-                    continue;
-                };
-                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
-                    continue;
-                };
-                let marked = match value.get("abort_requested") {
-                    None => false,
-                    Some(value) => match value.as_bool() {
-                        Some(value) => value,
-                        None => continue,
-                    },
-                };
-                if marked {
-                    candidates.insert(edge.edge.child);
-                }
+        for (key, entry) in self.owner.store().list(crate::ownership_edge::PREFIX)? {
+            let Ok(edge) = crate::ownership_edge::decode(&key, entry) else {
+                continue;
+            };
+            let Some(anchor) = anchors.get(&edge.edge.task) else {
+                continue;
+            };
+            if edge.edge.task_owner != *anchor.owner() {
+                continue;
+            }
+            let key = format!("runtime/conversation/{}", edge.edge.child);
+            let Some(entry) = self.owner.store().get(key.as_bytes())? else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
+                continue;
+            };
+            let marked = match value.get("abort_requested") {
+                None => false,
+                Some(value) => match value.as_bool() {
+                    Some(value) => value,
+                    None => continue,
+                },
+            };
+            if marked {
+                candidates.insert(edge.edge.child);
             }
         }
         Ok(candidates.into_iter().collect())

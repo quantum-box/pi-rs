@@ -44,12 +44,14 @@ has a 30-second timeout. Callback failures and timeouts are exposed by
 other graphs continue. Before each standalone cleanup step, the runtime commits an attempt marker
 fenced by the conversation version. Timeout, cancellation, crash, callback
 failure, or a crash after the callback succeeds can leave the marker and block
-all subsequent abort cleanup for that conversation, including after reopen.
+all subsequent abort cleanup and independent-summary execution for that conversation,
+including automatic recovery and explicit resume after reopen. Blocked summaries
+appear in `blocked_summary_recovery`.
 The host must determine whether external effects occurred, make retry safe, then
 call `reconcile_owned_cleanup` on the task scheduler or harness. Reconciliation
 requires the cleanup worker to be stopped; it does not itself inspect or reverse
 external effects. Even a crash before dispatch can require reconciliation. An
-unrelated missing owned conversation or invalid abort mark is skipped during
+unrelated missing owned conversation, malformed edge, or invalid abort mark is skipped during
 candidate discovery; the affected graph requires separate repair. Storage failures, worker panics,
 cancelled or dropped cleanup ticks poison the scheduler and require reopening.
 Dropping the scheduler cancels its cleanup jobs; their attachments remain held
