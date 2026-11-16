@@ -4218,9 +4218,21 @@ impl Scheduler {
                         "task input requires an attached harness".into(),
                     )
                 })?;
-                let batch = harness.prepare_task_input(intent)?;
+                let mut batch = harness.prepare_task_input(intent)?;
+                let mut ancestry = crate::task_store::OwnedBatch {
+                    checks: intent.ancestry_checks.clone(),
+                    mutations: Vec::new(),
+                };
+                // Any of these independently captured batches may fence the
+                // same ancestor. Preserve deadlines and turn disagreement
+                // into a commit conflict so the task's replay policy applies.
+                crate::document::reconcile_task_checks(&mut prepared.document_batch, &mut ancestry);
+                crate::document::reconcile_task_checks(&mut ancestry, &mut batch);
+                crate::document::reconcile_task_checks(&mut prepared.document_batch, &mut batch);
+                crate::document::reconcile_task_checks(&mut prepared.document_batch, &mut ancestry);
                 let mut combined = crate::document::Transaction::new();
                 combined.append(prepared.document_batch)?;
+                combined.append(ancestry)?;
                 combined.append(batch)?;
                 prepared.document_batch = combined.into_owned_batch()?;
             }

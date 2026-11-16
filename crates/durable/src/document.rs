@@ -2031,6 +2031,7 @@ impl StagedSignals {
 pub(crate) struct TaskInputIntent {
     pub conversation: uuid::Uuid,
     pub version: u64,
+    pub ancestry_checks: Vec<Check>,
     pub request_id: String,
     pub draft: TaskSubmissionDraft,
     pub notify: Option<crate::runtime::SubmissionNotify>,
@@ -2379,7 +2380,7 @@ impl<'a> TaskDocuments<'a> {
     pub(crate) fn set_input_validator(&mut self, validator: Option<&'a crate::runtime::Harness>) {
         self.input_validator = validator;
     }
-    /// Stage a text input in the directly owning conversation. The request ID
+    /// Stage a text input in the task's owning conversation. The request ID
     /// is required; all effects remain provisional until the task step commits.
     pub fn submit_input(&mut self, request_id: String, content: String) -> Result<(), Error> {
         self.submit_input_with_options(
@@ -2472,17 +2473,43 @@ impl<'a> TaskDocuments<'a> {
         {
             return Err(Error::ReadAfterWrite);
         }
-        let conversation = match self.task.owner() {
-            crate::task::TaskOwner::Conversation(id) => *id,
-            _ => {
-                return Err(Error::InvalidSessionAdmission(
-                    "task must be directly conversation-owned".into(),
-                ));
-            }
-        };
         if request_id.is_empty() {
             return Err(Error::InvalidSessionAdmission("request ID required".into()));
         }
+        let mut owner = self.task.owner().clone();
+        let mut seen = HashSet::from([self.task.id()]);
+        let mut ancestry_checks = Vec::new();
+        let conversation = loop {
+            match owner {
+                crate::task::TaskOwner::Conversation(id) => break id,
+                crate::task::TaskOwner::Task(id) => {
+                    if !seen.insert(id) {
+                        return Err(Error::InvalidSessionAdmission(
+                            "cyclic task ancestry".into(),
+                        ));
+                    }
+                    let key = crate::task_store::key(id);
+                    let record = self
+                        .store
+                        .get(&key)
+                        .map_err(|error| self.remember_task_input_error(Error::Store(error)))?
+                        .ok_or_else(|| {
+                            Error::InvalidSessionAdmission("task ancestor missing".into())
+                        })?;
+                    let ancestor: crate::task::Task = serde_json::from_slice(&record.value)?;
+                    if ancestor.id() != id || ancestor.is_terminal() || ancestor.abort_requested() {
+                        return Err(Error::InvalidSessionAdmission(
+                            "task ancestor is inactive".into(),
+                        ));
+                    }
+                    ancestry_checks.push(Check {
+                        key,
+                        expected: Expected::Version(record.version),
+                    });
+                    owner = ancestor.owner().clone();
+                }
+            }
+        };
         let key = crate::runtime::Harness::key(conversation);
         let record = self
             .store
@@ -2491,6 +2518,12 @@ impl<'a> TaskDocuments<'a> {
             .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
         after_snapshot();
         let validation = (|| {
+            let state: crate::runtime::Conversation = serde_json::from_slice(&record.value)?;
+            if state.id != conversation || state.abort_requested {
+                return Err(Error::InvalidSessionAdmission(
+                    "conversation is aborting or invalid".into(),
+                ));
+            }
             let is_new = crate::runtime::validate_task_submission(
                 self.store,
                 &record.value,
@@ -2524,6 +2557,7 @@ impl<'a> TaskDocuments<'a> {
         self.task_input = Some(TaskInputIntent {
             conversation,
             version: record.version,
+            ancestry_checks,
             request_id,
             draft,
             notify,
@@ -3088,6 +3122,61 @@ mod nested_entry_tests {
     use crate::task_store::{Save, TaskStore};
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn task_submission_rejects_missing_inactive_and_cyclic_ancestors() {
+        let db = Store::memory().unwrap();
+        let author = task(3, TaskOwner::Task(Uuid::from_u128(1)));
+        let check = || {
+            let mut docs = TaskDocuments::new(&db, &author).unwrap();
+            assert!(matches!(
+                docs.submit_write("request".into(), "app.test".into(), None, None),
+                Err(Error::InvalidSessionAdmission(_))
+            ));
+        };
+        check();
+        let mut inactive = task(1, TaskOwner::Conversation(Uuid::from_u128(99)));
+        inactive.request_abort().unwrap();
+        let key = crate::task_store::key(inactive.id());
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&inactive).unwrap(),
+            }],
+        )
+        .unwrap();
+        check();
+        let mut terminal = task(1, TaskOwner::Conversation(Uuid::from_u128(99)));
+        terminal.start().unwrap();
+        terminal.succeed(json!(null)).unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&terminal).unwrap(),
+            }],
+        )
+        .unwrap();
+        check();
+        let first = task(1, TaskOwner::Task(Uuid::from_u128(2)));
+        let second = task(2, TaskOwner::Task(first.id()));
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&first).unwrap(),
+                },
+                Mutation::Put {
+                    key: crate::task_store::key(second.id()),
+                    value: serde_json::to_vec(&second).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+        check();
+    }
 
     #[test]
     fn missing_aba_fences_compose_with_earliest_deadline() {

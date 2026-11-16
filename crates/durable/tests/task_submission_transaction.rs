@@ -70,7 +70,11 @@ fn wait_task(path: &std::path::Path, id: Uuid, predicate: impl Fn(&TaskState) ->
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let store = Store::open(path).unwrap();
-        let state = TaskStore::new(&store).load(id).unwrap().unwrap();
+        let Some(state) = TaskStore::new(&store).load(id).unwrap() else {
+            assert!(Instant::now() < deadline, "task was not created");
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
         if predicate(state.task.state()) {
             return;
         }
@@ -151,6 +155,277 @@ fn setup(path: &std::path::Path) -> (Harness, Uuid) {
         })
         .unwrap();
     (h, id)
+}
+
+struct Hold(std::collections::HashMap<Uuid, Vec<Task>>);
+impl Handler for Hold {
+    fn run(&self, task: &Task) -> Result<Step, String> {
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "hold".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("hold").unwrap()],
+            },
+            children: self.0.get(&task.id()).cloned().unwrap_or_default(),
+        })
+    }
+}
+
+struct DescendantWrite;
+impl Handler for DescendantWrite {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        docs.submit_write(
+            "write-request".into(),
+            "app.note".into(),
+            Some(json!({"v":1})),
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: "settled".into(),
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("settled").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+
+fn descendant(parent: Uuid, kind: &str) -> Task {
+    Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Task(parent),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered(kind.into(), true)
+}
+
+#[tokio::test]
+async fn descendant_input_and_write_commit_notify_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id) = setup(&path);
+    h.submit(id, None, "first".into()).unwrap();
+    let root = task(id, "hold");
+    let middle = descendant(root.id(), "hold");
+    let input = descendant(middle.id(), "input");
+    let write = descendant(middle.id(), "write");
+    let mut registry = Registry::default();
+    registry.register(
+        "hold",
+        true,
+        Hold(std::collections::HashMap::from([
+            (root.id(), vec![middle.clone()]),
+            (middle.id(), vec![input.clone(), write.clone()]),
+        ])),
+    );
+    registry.register(
+        "input",
+        true,
+        Stage {
+            write: false,
+            fail: false,
+        },
+    );
+    registry.register("write", true, DescendantWrite);
+    let driver = h.start_tasks(registry).unwrap();
+    driver.submit(&root).unwrap();
+    wait_task(&path, input.id(), |s| matches!(s, TaskState::Waiting(_)));
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 2);
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    wait_task(&path, input.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    wait_task(&path, write.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    let store = Store::open(&path).unwrap();
+    for id in [input.id(), write.id()] {
+        assert!(
+            TaskStore::new(&store)
+                .read_typed_signal(id, &submission_settled_signal(), "settled")
+                .unwrap()
+                .is_some()
+        );
+    }
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.application_writes.len(), 1);
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+}
+
+struct RacingDescendant {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    staged: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl Handler for RacingDescendant {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        docs.submit_write("ancestry-race".into(), "app.race".into(), None, None)
+            .map_err(|e| e.to_string())?;
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"committed":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.staged.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+
+#[test]
+fn descendant_ancestry_rewrite_replays_without_partial_effects() {
+    use durable_store::{Check, Expected, Mutation};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, original) = setup(&path);
+    let other = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let root = task(original, "hold");
+    let child = descendant(root.id(), "race");
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry.register(
+        "hold",
+        true,
+        Hold(std::collections::HashMap::from([(
+            root.id(),
+            vec![child.clone()],
+        )])),
+    );
+    registry.register(
+        "race",
+        true,
+        RacingDescendant {
+            calls: calls.clone(),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    driver.submit(&root).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    let mut key = b"durable/task/".to_vec();
+    key.extend_from_slice(root.id().as_bytes());
+    let entry = store.get(&key).unwrap().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+    // Simulate an out-of-band reparent: the public task store rejects it.
+    value["owner"] = json!({"Conversation": other});
+    store
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(
+        h.conversation(original)
+            .unwrap()
+            .application_writes
+            .is_empty()
+    );
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        h.conversation(original)
+            .unwrap()
+            .application_writes
+            .is_empty()
+    );
+    assert_eq!(h.conversation(other).unwrap().application_writes.len(), 1);
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn ancestor_abort_discards_staged_descendant_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let root = task(id, "hold");
+    let child = descendant(root.id(), "race");
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register(
+        "hold",
+        true,
+        Hold(std::collections::HashMap::from([(root.id(), vec![child])])),
+    );
+    registry.register(
+        "race",
+        true,
+        RacingDescendant {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    driver.submit(&root).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    driver.request_abort(root.id()).unwrap();
+    release_tx.send(()).unwrap();
+    driver.shutdown().unwrap();
+    assert!(h.conversation(id).unwrap().application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
 }
 #[tokio::test]
 async fn busy_input_and_notification_commit_with_task_effects() {

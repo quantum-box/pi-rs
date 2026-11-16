@@ -2540,6 +2540,7 @@ fn task_input_on_reset_fork_fences_original_proof() {
         let intent = crate::document::TaskInputIntent {
             conversation: fork,
             version: record.version,
+            ancestry_checks: Vec::new(),
             request_id: "task-request".into(),
             draft: crate::document::TaskSubmissionDraft::Input {
                 content: "input".into(),

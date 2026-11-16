@@ -324,6 +324,24 @@ fn abort_discards_staged_input_and_document() {
 #[cfg(unix)]
 struct KillAfterStage;
 #[cfg(unix)]
+struct SpawnKill(Task);
+#[cfg(unix)]
+impl Handler for SpawnKill {
+    fn run(&self, task: &Task) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: pi_rs_durable::task::WaitFor::Tasks(vec![self.0.id()]),
+            children: vec![self.0.clone()],
+        })
+    }
+}
+#[cfg(unix)]
 impl Handler for KillAfterStage {
     fn run(&self, _: &Task) -> Result<Step, String> {
         unreachable!()
@@ -355,12 +373,10 @@ fn task_input_kill_child() {
     let conversation =
         Uuid::parse_str(&std::env::var("PI_TASK_INPUT_KILL_CONVERSATION").unwrap()).unwrap();
     let h = Harness::open_paused(path, options()).unwrap();
-    let mut registry = Registry::default();
-    registry.register("submit", true, KillAfterStage);
-    let driver = h.start_tasks(registry).unwrap();
+    let parent = Uuid::from_u128(1000);
     let task = Task::new(
         Uuid::from_u128(1001),
-        TaskOwner::Conversation(conversation),
+        TaskOwner::Task(parent),
         Checkpoint {
             phase: "start".into(),
             data: json!(null),
@@ -369,7 +385,22 @@ fn task_input_kill_child() {
     )
     .unwrap()
     .registered("submit".into(), true);
-    driver.submit(&task).unwrap();
+    let mut registry = Registry::default();
+    registry.register("submit", true, KillAfterStage);
+    registry.register("spawn", true, SpawnKill(task));
+    let driver = h.start_tasks(registry).unwrap();
+    let root = Task::new(
+        parent,
+        TaskOwner::Conversation(conversation),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("spawn".into(), true);
+    driver.submit(&root).unwrap();
     loop {
         std::thread::park();
     }
@@ -425,6 +456,20 @@ fn killed_staged_input_recovers_once() {
     );
     let mut registry = Registry::default();
     registry.register("submit", true, Submit { fail: false });
+    // The root stays parked until its child finishes; register its definition
+    // for the wake following recovery.
+    let child = Task::new(
+        Uuid::from_u128(1001),
+        TaskOwner::Task(Uuid::from_u128(1000)),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("submit".into(), true);
+    registry.register("spawn", true, SpawnKill(child));
     let driver = h.start_tasks(registry).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
