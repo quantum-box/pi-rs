@@ -2032,6 +2032,12 @@ pub(crate) struct TaskInputIntent {
     pub conversation: uuid::Uuid,
     pub version: u64,
     pub ancestry_checks: Vec<Check>,
+    pub snapshot: Vec<u8>,
+    pub admissions: Vec<TaskAdmission>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TaskAdmission {
     pub request_id: String,
     pub draft: TaskSubmissionDraft,
     pub notify: Option<crate::runtime::SubmissionNotify>,
@@ -2466,8 +2472,7 @@ impl<'a> TaskDocuments<'a> {
         notify: Option<crate::runtime::SubmissionNotify>,
         after_snapshot: impl FnOnce(),
     ) -> Result<(), Error> {
-        if self.task_input.is_some()
-            || !self.keyed_children.is_empty()
+        if !self.keyed_children.is_empty()
             || self.entries.as_ref().is_some_and(|entry| entry.4)
             || !self.signals.batch.mutations.is_empty()
         {
@@ -2475,6 +2480,41 @@ impl<'a> TaskDocuments<'a> {
         }
         if request_id.is_empty() {
             return Err(Error::InvalidSessionAdmission("request ID required".into()));
+        }
+        if let Some(intent) = &self.task_input {
+            if intent.admissions.len() >= 16 {
+                return Err(Error::InvalidSessionAdmission(
+                    "at most 16 task admissions per step".into(),
+                ));
+            }
+            let mut admissions = intent.admissions.clone();
+            admissions.push(TaskAdmission {
+                request_id,
+                draft,
+                notify,
+                notification_binding: None,
+            });
+            let snapshot = intent.snapshot.clone();
+            let conversation = intent.conversation;
+            let result =
+                crate::runtime::validate_task_submissions(self.store, &snapshot, &mut admissions);
+            result.map_err(|error| self.remember_task_input_error(error))?;
+            if admissions
+                .iter()
+                .any(|item| matches!(item.draft, TaskSubmissionDraft::Input { .. }))
+            {
+                let validation = self
+                    .input_validator
+                    .ok_or_else(|| {
+                        Error::InvalidSessionAdmission(
+                            "task submission requires an attached harness".into(),
+                        )
+                    })?
+                    .validate_task_input_context(conversation, &snapshot);
+                validation.map_err(|error| self.remember_task_input_error(error))?;
+            }
+            self.task_input.as_mut().unwrap().admissions = admissions;
+            return Ok(());
         }
         let mut owner = self.task.owner().clone();
         let mut seen = HashSet::from([self.task.id()]);
@@ -2524,14 +2564,14 @@ impl<'a> TaskDocuments<'a> {
                     "conversation is aborting or invalid".into(),
                 ));
             }
-            let is_new = crate::runtime::validate_task_submission(
-                self.store,
-                &record.value,
-                &request_id,
-                &draft,
-                &notify,
-            )?;
-            if matches!(draft, TaskSubmissionDraft::Input { .. }) {
+            let mut admissions = vec![TaskAdmission {
+                request_id,
+                draft,
+                notify,
+                notification_binding: None,
+            }];
+            crate::runtime::validate_task_submissions(self.store, &record.value, &mut admissions)?;
+            if matches!(admissions[0].draft, TaskSubmissionDraft::Input { .. }) {
                 self.input_validator
                     .ok_or_else(|| {
                         Error::InvalidSessionAdmission(
@@ -2544,24 +2584,15 @@ impl<'a> TaskDocuments<'a> {
                     "task submission requires an attached harness".into(),
                 ));
             }
-            Ok(is_new)
+            Ok(admissions)
         })();
-        let is_new = validation.map_err(|error| self.remember_task_input_error(error))?;
-        let notification_binding = if is_new {
-            notify
-                .as_ref()
-                .map(crate::owned_subagent::notification_binding_key)
-        } else {
-            None
-        };
+        let admissions = validation.map_err(|error| self.remember_task_input_error(error))?;
         self.task_input = Some(TaskInputIntent {
             conversation,
             version: record.version,
             ancestry_checks,
-            request_id,
-            draft,
-            notify,
-            notification_binding,
+            snapshot: record.value,
+            admissions,
         });
         Ok(())
     }

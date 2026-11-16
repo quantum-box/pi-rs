@@ -4120,13 +4120,11 @@ fn admit_task_draft(
     }
 }
 
-pub(crate) fn validate_task_submission(
+pub(crate) fn validate_task_submissions(
     store: &durable_store::Store,
     bytes: &[u8],
-    request_id: &str,
-    draft: &crate::document::TaskSubmissionDraft,
-    notify: &Option<SubmissionNotify>,
-) -> Result<bool, crate::document::Error> {
+    admissions: &mut [crate::document::TaskAdmission],
+) -> Result<(), crate::document::Error> {
     let state: Conversation = serde_json::from_slice(bytes)?;
     let mut tx = crate::session_transaction::SessionTransaction::new(
         store,
@@ -4137,31 +4135,42 @@ pub(crate) fn validate_task_submission(
         None,
         Arc::new(|| 0),
     )?;
-    admit_task_draft(&mut tx, request_id, draft, notify)?;
-    if tx.table_written
-        && let Some(notify) = notify
-    {
-        let binding = crate::owned_subagent::notification_binding_key(notify);
-        if store.get(&binding)?.is_some() {
+    for item in admissions {
+        // Task admission evaluates each draft against the preceding candidate,
+        // without exposing that staged table state through the session API.
+        tx.table_written = false;
+        admit_task_draft(&mut tx, &item.request_id, &item.draft, &item.notify)?;
+        item.notification_binding = if tx.table_written {
+            item.notify
+                .as_ref()
+                .map(crate::owned_subagent::notification_binding_key)
+        } else {
+            None
+        };
+        if let Some(binding) = &item.notification_binding
+            && store.get(binding)?.is_some()
+        {
             return Err(crate::document::Error::InvalidSessionAdmission(
                 "submission notification key is reserved".into(),
             ));
         }
     }
-    Ok(tx.table_written)
+    Ok(())
 }
 
 fn check_task_notification_binding(
     store: &durable_store::Store,
     intent: &crate::document::TaskInputIntent,
 ) -> Result<(), crate::document::Error> {
-    if let Some(binding) = &intent.notification_binding
-        && store.get(binding)?.is_some()
-    {
-        return Err(durable_store::Error::Conflict {
-            key: binding.clone(),
+    for item in &intent.admissions {
+        if let Some(binding) = &item.notification_binding
+            && store.get(binding)?.is_some()
+        {
+            return Err(durable_store::Error::Conflict {
+                key: binding.clone(),
+            }
+            .into());
         }
-        .into());
     }
     Ok(())
 }
@@ -4250,12 +4259,10 @@ impl Harness {
             return Err(durable_store::Error::Conflict { key }.into());
         }
         check_task_notification_binding(self.owner.store(), intent)?;
-        if let Err(error) = validate_task_submission(
+        if let Err(error) = validate_task_submissions(
             self.owner.store(),
             &record.value,
-            &intent.request_id,
-            &intent.draft,
-            &intent.notify,
+            &mut intent.admissions.clone(),
         ) {
             check_task_notification_binding(self.owner.store(), intent)?;
             return Err(error);
@@ -4270,7 +4277,13 @@ impl Harness {
             self.provider_adapter.clone(),
             self.clock.clone(),
         )?;
-        admit_task_draft(&mut tx, &intent.request_id, &intent.draft, &intent.notify)?;
+        let mut changed = false;
+        for item in &intent.admissions {
+            tx.table_written = false;
+            admit_task_draft(&mut tx, &item.request_id, &item.draft, &item.notify)?;
+            changed |= tx.table_written;
+        }
+        tx.table_written = changed;
         let (state, batch, changed, tasks, children) = tx.into_parts()?;
         if !tasks.is_empty()
             || !children.is_empty()

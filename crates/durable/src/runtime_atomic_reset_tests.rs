@@ -2541,13 +2541,16 @@ fn task_input_on_reset_fork_fences_original_proof() {
             conversation: fork,
             version: record.version,
             ancestry_checks: Vec::new(),
-            request_id: "task-request".into(),
-            draft: crate::document::TaskSubmissionDraft::Input {
-                content: "input".into(),
-                options: Default::default(),
-            },
-            notify: None,
-            notification_binding: None,
+            snapshot: record.value,
+            admissions: vec![crate::document::TaskAdmission {
+                request_id: "task-request".into(),
+                draft: crate::document::TaskSubmissionDraft::Input {
+                    content: "input".into(),
+                    options: Default::default(),
+                },
+                notify: None,
+                notification_binding: None,
+            }],
         };
         // Reuse an active traversal, as happens when task admission is composed
         // with a caller that has already authenticated a nested reset cut.

@@ -157,6 +157,475 @@ fn setup(path: &std::path::Path) -> (Harness, Uuid) {
     (h, id)
 }
 
+struct Multiple {
+    fail: bool,
+    notify: bool,
+}
+impl Handler for Multiple {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        let destination = |key: &str| {
+            self.notify.then(|| SubmissionNotify {
+                task_id: task.id(),
+                key: key.into(),
+            })
+        };
+        docs.submit_input_with_options(
+            "first".into(),
+            "first".into(),
+            AdmissionOptions::default(),
+            destination("input"),
+        )
+        .map_err(|e| e.to_string())?;
+        let reject = AdmissionOptions {
+            reject_when_busy: true,
+            ..Default::default()
+        };
+        assert!(
+            docs.submit_input_with_options("reject".into(), "must reject".into(), reject, None)
+                .is_err()
+        );
+        docs.submit_input("second".into(), "second".into())
+            .map_err(|e| e.to_string())?;
+        docs.submit_input("first".into(), "ignored duplicate".into())
+            .map_err(|e| e.to_string())?;
+        assert!(
+            docs.submit_write("first".into(), "app.wrong-type".into(), None, None)
+                .is_err()
+        );
+        docs.submit_write(
+            "write".into(),
+            "app.multi".into(),
+            Some(json!(1)),
+            destination("write"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.submit_write("write".into(), "pi.ignored".into(), None, None)
+            .map_err(|e| e.to_string())?;
+        docs.submit_write(
+            "write2".into(),
+            "app.second".into(),
+            Some(json!(2)),
+            destination("write2"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"batch":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.fail {
+            return Ok(Step::Fail("rollback".into()));
+        }
+        if !self.notify {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("input").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn multiple_mixed_admissions_deduplicate_notify_and_drive_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id) = setup(&path);
+    let parent = task(id, "hold");
+    let task = descendant(parent.id(), "multiple");
+    let mut registry = Registry::default();
+    registry.register(
+        "hold",
+        true,
+        Hold(std::collections::HashMap::from([(
+            parent.id(),
+            vec![task.clone()],
+        )])),
+    );
+    registry.register(
+        "multiple",
+        true,
+        Multiple {
+            fail: false,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    driver.submit(&parent).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Waiting(_)));
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.submissions[0].content, "first");
+    assert_eq!(state.submissions[0].status, Status::Running);
+    assert_eq!(state.submissions[1].content, "second");
+    assert_eq!(state.submissions[1].status, Status::Queued);
+    assert_eq!(state.application_writes.len(), 2);
+    assert_eq!(state.application_writes[0].data, Some(json!(1)));
+    assert_eq!(state.application_writes[1].data, Some(json!(2)));
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        TaskStore::new(&store)
+            .read_typed_signal(task.id(), &submission_settled_signal(), "write")
+            .unwrap()
+            .unwrap()["status"],
+        "done"
+    );
+    assert_eq!(
+        TaskStore::new(&store)
+            .read_typed_signal(task.id(), &submission_settled_signal(), "write2")
+            .unwrap()
+            .unwrap()["entry"],
+        state.application_writes[1].id.to_string()
+    );
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    assert_eq!(
+        TaskStore::new(&store)
+            .read_typed_signal(task.id(), &submission_settled_signal(), "input")
+            .unwrap()
+            .unwrap()["id"],
+        state.submissions[0].id.to_string()
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.application_writes.len(), 2);
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+}
+
+#[test]
+fn multiple_admissions_roll_back_with_failed_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let mut registry = Registry::default();
+    registry.register(
+        "multiple",
+        true,
+        Multiple {
+            fail: true,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "multiple");
+    driver.submit(&task).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Failed(_)));
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions.is_empty());
+    assert!(state.application_writes.is_empty());
+    let store = Store::open(&path).unwrap();
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    for key in ["input", "write", "write2"] {
+        assert!(
+            TaskStore::new(&store)
+                .read_typed_signal(task.id(), &submission_settled_signal(), key)
+                .unwrap()
+                .is_none()
+        );
+    }
+    driver.shutdown().unwrap();
+}
+
+struct MultipleRace {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    staged: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+struct AdmissionLimit;
+impl Handler for AdmissionLimit {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        for n in 0..16 {
+            docs.submit_write(
+                format!("limit-{n}"),
+                "app.limit".into(),
+                Some(json!(n)),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        assert!(
+            docs.submit_write("overflow".into(), "app.limit".into(), None, None)
+                .is_err()
+        );
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+
+#[test]
+fn admission_batch_bound_preserves_first_sixteen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let mut registry = Registry::default();
+    registry.register("limit", true, AdmissionLimit);
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "limit");
+    driver.submit(&task).unwrap();
+    wait_task(&path, task.id(), |state| {
+        matches!(state, TaskState::Succeeded(_))
+    });
+    let writes = h.conversation(id).unwrap().application_writes;
+    assert_eq!(writes.len(), 16);
+    for (n, write) in writes.iter().enumerate() {
+        assert_eq!(write.data, Some(json!(n)));
+    }
+    driver.shutdown().unwrap();
+}
+impl Handler for MultipleRace {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        let result = Multiple {
+            fail: false,
+            notify: false,
+        }
+        .run_with_documents(task, docs)?;
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.staged.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(result)
+    }
+}
+
+#[test]
+fn multiple_admissions_replay_as_one_after_conversation_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id) = setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry.register(
+        "race",
+        true,
+        MultipleRace {
+            calls: calls.clone(),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "race");
+    driver.submit(&task).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    h.submit_write(id, None, "app.concurrent".into(), None)
+        .unwrap();
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+    release_tx.send(()).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.application_writes.len(), 3);
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_some()
+    );
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn abort_discards_all_staged_admissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register(
+        "race",
+        true,
+        MultipleRace {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "race");
+    driver.submit(&task).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    driver.request_abort(task.id()).unwrap();
+    release_tx.send(()).unwrap();
+    driver.shutdown().unwrap();
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions.is_empty());
+    assert!(state.application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+struct KillMultiple;
+#[cfg(unix)]
+impl Handler for KillMultiple {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        use std::io::Write;
+        Multiple {
+            fail: false,
+            notify: false,
+        }
+        .run_with_documents(task, docs)?;
+        println!("MULTIPLE_STAGED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn multiple_kill_worker() {
+    let Ok(path) = std::env::var("PI_MULTI_KILL_DB") else {
+        return;
+    };
+    let id = Uuid::parse_str(&std::env::var("PI_MULTI_KILL_CONVERSATION").unwrap()).unwrap();
+    let h = Harness::open_paused(path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("multiple", true, KillMultiple);
+    let driver = h.start_tasks(registry).unwrap();
+    let task = Task::new(
+        Uuid::from_u128(8844),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("multiple".into(), true);
+    driver.submit(&task).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_multiple_admissions_replay_once_after_reopen() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    drop(h);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "multiple_kill_worker", "--nocapture"])
+        .env("PI_MULTI_KILL_DB", &path)
+        .env("PI_MULTI_KILL_CONVERSATION", id.to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if line.contains("MULTIPLE_STAGED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    let reached = rx.recv_timeout(Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    reached.expect("worker did not stage admissions");
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    assert!(h.conversation(id).unwrap().application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+    let mut registry = Registry::default();
+    registry.register(
+        "multiple",
+        true,
+        Multiple {
+            fail: false,
+            notify: false,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    wait_task(&path, Uuid::from_u128(8844), |s| {
+        matches!(s, TaskState::Succeeded(_))
+    });
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 2);
+    assert_eq!(h.conversation(id).unwrap().application_writes.len(), 2);
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_some()
+    );
+}
+
 struct Hold(std::collections::HashMap<Uuid, Vec<Task>>);
 impl Handler for Hold {
     fn run(&self, task: &Task) -> Result<Step, String> {
