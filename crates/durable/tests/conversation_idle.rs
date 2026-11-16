@@ -207,6 +207,52 @@ async fn all_idle_ignores_orphan_background_task_and_its_child() {
 }
 
 #[tokio::test]
+async fn all_idle_rejects_cycle_through_background_task() {
+    use durable_store::{Mutation, Store};
+    use pi_rs_durable::task_store::{Save, TaskStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    {
+        let db = Store::open(&path).unwrap();
+        let background = task(Uuid::new_v4(), true);
+        let child = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Task(background.id()),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            5,
+        )
+        .unwrap();
+        TaskStore::new(&db)
+            .save(&[Save::Create(&background), Save::Create(&child)])
+            .unwrap();
+        // Simulate damaged storage: the validated writer refuses this cycle.
+        let mut key = b"durable/task/".to_vec();
+        key.extend_from_slice(background.id().as_bytes());
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        value["owner"] = json!({"Task": child.id()});
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+    }
+    let scheduler = Scheduler::open(&path, options()).unwrap();
+    assert!(matches!(
+        scheduler.wait_for_all_idle(&CancellationToken::new()).await,
+        Err(Error::Invalid(message)) if message.contains("cyclic ownership")
+    ));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn recovered_live_task_requires_driver_then_settles() {
     use pi_rs_durable::task_scheduler;
     let dir = tempfile::tempdir().unwrap();
