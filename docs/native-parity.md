@@ -3691,8 +3691,9 @@ preferred constraints.
 The Responses SDK can also prepare a request once and inspect the effective
 strict-or-fallback decision bound to its wire tools before dispatch.
 Workbench and AIP prepared-dispatch wrappers preserve that decision, routing,
-and budget the transformed tool schemas. The native agent does not yet use
-this path or persist the decision for recovery.
+and budget the transformed tool schemas. A versioned snapshot can bind the
+decision to a request and context, but the native agent does not yet use this
+path or persist the decision for recovery.
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier

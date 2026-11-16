@@ -1,6 +1,7 @@
 //! Conversion of tool schemas to the strict subset used by model providers.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// A tool schema cannot be represented in the provider's strict subset.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -104,6 +105,179 @@ pub enum EffectiveToolSampling {
 pub struct EffectiveToolDeclaration {
     pub spec: crate::ToolSpec,
     pub sampling: EffectiveToolSampling,
+}
+
+/// Versioned decisions bound to the exact model request and dispatch context.
+/// This value must be committed atomically with the request record before it
+/// can be used for recovery; serialization alone is not a durable commit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDecisionSnapshot {
+    version: u32,
+    context: crate::ToolDispatchContext,
+    request_sha256: String,
+    dispatch_sha256: String,
+    binding_sha256: String,
+    declarations: Vec<ToolDeclaration>,
+    effective: Vec<EffectiveToolDeclaration>,
+}
+
+/// A decision snapshot checked against its request and binding.
+pub struct ValidatedToolDecisionSnapshot<'a> {
+    snapshot: &'a ToolDecisionSnapshot,
+}
+
+impl ValidatedToolDecisionSnapshot<'_> {
+    pub fn effective_tools(&self) -> &[EffectiveToolDeclaration] {
+        &self.snapshot.effective
+    }
+}
+
+impl ToolDecisionSnapshot {
+    /// Validate and capture a decision against its final request.
+    pub fn capture(
+        context: &crate::ToolDispatchContext,
+        request: &crate::ModelRequest,
+        declarations: &[ToolDeclaration],
+        effective: &[EffectiveToolDeclaration],
+    ) -> Result<Self, StrictSchemaError> {
+        Self::capture_dispatch(context, request, request, declarations, effective)
+    }
+
+    /// Bind both the caller's request and the request after host filtering.
+    pub fn capture_dispatch(
+        context: &crate::ToolDispatchContext,
+        request: &crate::ModelRequest,
+        dispatch_request: &crate::ModelRequest,
+        declarations: &[ToolDeclaration],
+        effective: &[EffectiveToolDeclaration],
+    ) -> Result<Self, StrictSchemaError> {
+        validate_effective_tool_declarations(request, declarations, effective)?;
+        validate_effective_tool_declarations(dispatch_request, declarations, effective)?;
+        let request_bytes = serde_json::to_vec(request)
+            .map_err(|error| StrictSchemaError(format!("cannot encode model request: {error}")))?;
+        let request_sha256 = format!("{:x}", Sha256::digest(request_bytes));
+        let dispatch_bytes = serde_json::to_vec(dispatch_request).map_err(|error| {
+            StrictSchemaError(format!("cannot encode dispatch request: {error}"))
+        })?;
+        let dispatch_sha256 = format!("{:x}", Sha256::digest(dispatch_bytes));
+        let binding = serde_json::to_vec(&(
+            1_u32,
+            context,
+            &request_sha256,
+            &dispatch_sha256,
+            declarations,
+            effective,
+        ))
+        .map_err(|error| {
+            StrictSchemaError(format!("cannot encode tool decision binding: {error}"))
+        })?;
+        Ok(Self {
+            version: 1,
+            context: context.clone(),
+            request_sha256,
+            dispatch_sha256,
+            binding_sha256: format!("{:x}", Sha256::digest(binding)),
+            declarations: declarations.to_vec(),
+            effective: effective.to_vec(),
+        })
+    }
+
+    /// Check the request, context and effective decisions before use.
+    pub fn validate(
+        &self,
+        context: &crate::ToolDispatchContext,
+        request: &crate::ModelRequest,
+        dispatch_request: &crate::ModelRequest,
+        declarations: &[ToolDeclaration],
+    ) -> Result<ValidatedToolDecisionSnapshot<'_>, StrictSchemaError> {
+        if self.version != 1 || &self.context != context || self.declarations != declarations {
+            return Err(StrictSchemaError(
+                "tool decision snapshot context or version mismatch".into(),
+            ));
+        }
+        let expected = Self::capture_dispatch(
+            context,
+            request,
+            dispatch_request,
+            declarations,
+            &self.effective,
+        )?;
+        if self.request_sha256 != expected.request_sha256
+            || self.dispatch_sha256 != expected.dispatch_sha256
+            || self.binding_sha256 != expected.binding_sha256
+        {
+            return Err(StrictSchemaError(
+                "tool decision snapshot binding mismatch".into(),
+            ));
+        }
+        Ok(ValidatedToolDecisionSnapshot { snapshot: self })
+    }
+
+    /// Verify against digests retained independently in a durable request record.
+    /// Passing the snapshot's own digests does not establish its association.
+    /// This detects inconsistent records; it does not authenticate a journal.
+    pub fn validate_recorded(
+        &self,
+        context: &crate::ToolDispatchContext,
+        request_sha256: &str,
+        dispatch_sha256: &str,
+        expected_binding_sha256: &str,
+    ) -> Result<ValidatedToolDecisionSnapshot<'_>, StrictSchemaError> {
+        if self.version != 1
+            || &self.context != context
+            || self.request_sha256 != request_sha256
+            || self.dispatch_sha256 != dispatch_sha256
+            || self.binding_sha256 != expected_binding_sha256
+        {
+            return Err(StrictSchemaError(
+                "tool decision snapshot context or request mismatch".into(),
+            ));
+        }
+        let request = crate::ModelRequest {
+            model: String::new(),
+            messages: vec![],
+            tools: self
+                .declarations
+                .iter()
+                .map(|entry| entry.spec.clone())
+                .collect(),
+            max_output_tokens: 1,
+        };
+        validate_effective_tool_declarations(&request, &self.declarations, &self.effective)?;
+        let binding = serde_json::to_vec(&(
+            self.version,
+            &self.context,
+            &self.request_sha256,
+            &self.dispatch_sha256,
+            &self.declarations,
+            &self.effective,
+        ))
+        .map_err(|error| {
+            StrictSchemaError(format!("cannot encode tool decision binding: {error}"))
+        })?;
+        if self.binding_sha256 != format!("{:x}", Sha256::digest(binding)) {
+            return Err(StrictSchemaError(
+                "tool decision snapshot binding mismatch".into(),
+            ));
+        }
+        Ok(ValidatedToolDecisionSnapshot { snapshot: self })
+    }
+
+    /// Digest of the exact request used to capture this snapshot.
+    pub fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    /// Digest of the request after host filtering.
+    pub fn dispatch_sha256(&self) -> &str {
+        &self.dispatch_sha256
+    }
+
+    /// Digest to commit independently with the durable request record.
+    pub fn binding_sha256(&self) -> &str {
+        &self.binding_sha256
+    }
 }
 
 /// Validate effective decisions against the final request and declarations.
@@ -513,6 +687,266 @@ fn make_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decision_snapshot_rejects_changed_request_context_and_version() {
+        let spec = crate::ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let mut request = crate::ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let mut context = crate::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "external".into(),
+            summary: false,
+        };
+        let declaration = ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Require,
+            }),
+        };
+        let effective = EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling: EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters,
+                normalization_version: STRICT_TOOL_NORMALIZATION_VERSION,
+            },
+        };
+        let snapshot = ToolDecisionSnapshot::capture(
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+            &[effective],
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        let decoded: ToolDecisionSnapshot = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(
+            decoded
+                .validate(
+                    &context,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration)
+                )
+                .is_ok()
+        );
+        assert!(
+            decoded
+                .validate_recorded(
+                    &context,
+                    snapshot.request_sha256(),
+                    snapshot.dispatch_sha256(),
+                    snapshot.binding_sha256()
+                )
+                .is_ok()
+        );
+        assert!(
+            decoded
+                .validate_recorded(
+                    &context,
+                    "wrong",
+                    snapshot.dispatch_sha256(),
+                    snapshot.binding_sha256()
+                )
+                .is_err()
+        );
+        context.summary = true;
+        assert!(
+            decoded
+                .validate(
+                    &context,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration)
+                )
+                .is_err()
+        );
+        context.summary = false;
+        request.max_output_tokens += 1;
+        assert!(
+            decoded
+                .validate(
+                    &context,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration)
+                )
+                .is_err()
+        );
+        request.max_output_tokens -= 1;
+        let mut changed = encoded;
+        changed["version"] = json!(2);
+        let decoded: ToolDecisionSnapshot = serde_json::from_value(changed).unwrap();
+        assert!(
+            decoded
+                .validate(
+                    &context,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration)
+                )
+                .is_err()
+        );
+        let mut changed = serde_json::to_value(&snapshot).unwrap();
+        changed["context"]["external_id"] = json!("changed");
+        let decoded: ToolDecisionSnapshot = serde_json::from_value(changed).unwrap();
+        assert!(
+            decoded
+                .validate(
+                    &context,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decision_snapshot_detects_a_valid_but_changed_effective_choice() {
+        let spec = crate::ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let request = crate::ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 1,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let declaration = ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Prefer,
+            }),
+        };
+        let effective = EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling: EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters,
+                normalization_version: STRICT_TOOL_NORMALIZATION_VERSION,
+            },
+        };
+        let snapshot = ToolDecisionSnapshot::capture(
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+            &[effective],
+        )
+        .unwrap();
+        let fallback = EffectiveToolDeclaration {
+            spec: declaration.spec.clone(),
+            sampling: EffectiveToolSampling::Unconstrained,
+        };
+        let fallback_snapshot =
+            ToolDecisionSnapshot::capture(&context, &request, &[declaration], &[fallback]).unwrap();
+        assert!(
+            fallback_snapshot
+                .validate_recorded(
+                    &context,
+                    snapshot.request_sha256(),
+                    snapshot.dispatch_sha256(),
+                    snapshot.binding_sha256()
+                )
+                .is_err()
+        );
+        assert!(
+            fallback_snapshot
+                .validate_recorded(
+                    &context,
+                    fallback_snapshot.request_sha256(),
+                    fallback_snapshot.dispatch_sha256(),
+                    fallback_snapshot.binding_sha256()
+                )
+                .is_ok()
+        );
+        let required = ToolDeclaration {
+            spec: request.tools[0].clone(),
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Require,
+            }),
+        };
+        assert!(
+            fallback_snapshot
+                .validate(&context, &request, &request, &[required])
+                .is_err()
+        );
+        let mut altered = serde_json::to_value(&snapshot).unwrap();
+        altered["effective"][0]["sampling"] = json!({"type":"unconstrained"});
+        let altered: ToolDecisionSnapshot = serde_json::from_value(altered).unwrap();
+        assert!(
+            altered
+                .validate_recorded(
+                    &context,
+                    snapshot.request_sha256(),
+                    snapshot.dispatch_sha256(),
+                    snapshot.binding_sha256()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decision_snapshot_binds_caller_and_filtered_requests() {
+        let request = crate::ModelRequest {
+            model: "m".into(),
+            messages: vec![crate::Message::User {
+                content: "before filtering".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let mut filtered = request.clone();
+        filtered.messages = vec![crate::Message::User {
+            content: "after filtering".into(),
+        }];
+        let context = crate::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let snapshot =
+            ToolDecisionSnapshot::capture_dispatch(&context, &request, &filtered, &[], &[])
+                .unwrap();
+        assert_ne!(snapshot.request_sha256(), snapshot.dispatch_sha256());
+        assert!(
+            snapshot
+                .validate(&context, &request, &filtered, &[])
+                .is_ok()
+        );
+        assert!(
+            snapshot
+                .validate(&context, &request, &request, &[])
+                .is_err()
+        );
+        assert!(
+            snapshot
+                .validate_recorded(
+                    &context,
+                    snapshot.request_sha256(),
+                    snapshot.dispatch_sha256(),
+                    snapshot.binding_sha256()
+                )
+                .is_ok()
+        );
+    }
 
     #[test]
     fn effective_decisions_cannot_downgrade_or_change_tool_identity() {

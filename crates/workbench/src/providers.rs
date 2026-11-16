@@ -1435,7 +1435,7 @@ mod contention_tests {
             let direct_client = client.clone();
             let model = super::super::image_policy::WorkbenchModel {
                 client,
-                block_images: false,
+                block_images: true,
                 supports_images: None,
                 session_affinity: &["session-id"],
                 price: None,
@@ -1447,7 +1447,13 @@ mod contention_tests {
             };
             let req = ModelRequest {
                 model: "m".into(),
-                messages: vec![],
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
                 tools: vec![spec.clone()],
                 max_output_tokens: 10,
             };
@@ -1470,10 +1476,26 @@ mod contention_tests {
             };
             let selected: &dyn Model = selected.as_deref().unwrap_or(&direct_client);
             let prepared = selected
-                .prepare_tool_dispatch(&req, &[declaration], &context)
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
                 .await
                 .unwrap()
                 .unwrap();
+            assert!(
+                prepared
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &req,
+                        prepared.dispatch_request(),
+                        std::slice::from_ref(&declaration)
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                prepared.decision_snapshot().request_sha256()
+                    != prepared.decision_snapshot().dispatch_sha256(),
+                !direct
+            );
             assert!(matches!(
                 prepared.effective_tools()[0].sampling,
                 pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }

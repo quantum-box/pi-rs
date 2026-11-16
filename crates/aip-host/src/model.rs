@@ -44,6 +44,14 @@ impl pi_rs_core::PreparedToolDispatch for PreparedBudgetDispatch<'_> {
         self.inner.effective_tools()
     }
 
+    fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+        self.inner.decision_snapshot()
+    }
+
+    fn dispatch_request(&self) -> &ModelRequest {
+        self.inner.dispatch_request()
+    }
+
     fn reservation_request(&self) -> &ModelRequest {
         self.inner.reservation_request()
     }
@@ -64,20 +72,28 @@ impl Model for BudgetedModel<'_> {
         declarations: &[pi_rs_core::ToolDeclaration],
         context: &pi_rs_core::ToolDispatchContext,
     ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
-        Ok(self
+        let Some(inner) = self
             .inner
             .prepare_tool_dispatch(request, declarations, context)
             .await?
-            .map(|inner| {
-                let request = inner.reservation_request().clone();
-                Box::new(PreparedBudgetDispatch {
-                    inner,
-                    scope: self.scope,
-                    budget: self.budget,
-                    request,
-                    request_id: context.request_id,
-                }) as Box<dyn pi_rs_core::PreparedToolDispatch + 'a>
-            }))
+        else {
+            pi_rs_core::validate_legacy_tool_declarations(request, declarations)?;
+            return Ok(None);
+        };
+        pi_rs_core::validate_prepared_tool_dispatch(
+            inner.as_ref(),
+            context,
+            request,
+            declarations,
+        )?;
+        let request = inner.reservation_request().clone();
+        Ok(Some(Box::new(PreparedBudgetDispatch {
+            inner,
+            scope: self.scope,
+            budget: self.budget,
+            request,
+            request_id: context.request_id,
+        })))
     }
 
     async fn prepare_context<'a>(
@@ -265,20 +281,28 @@ impl Model for PreparedBudgetedModel<'_, '_> {
         declarations: &[pi_rs_core::ToolDeclaration],
         context: &pi_rs_core::ToolDispatchContext,
     ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
-        Ok(self
+        let Some(inner) = self
             .inner
             .prepare_tool_dispatch(request, declarations, context)
             .await?
-            .map(|inner| {
-                let request = inner.reservation_request().clone();
-                Box::new(PreparedBudgetDispatch {
-                    inner,
-                    scope: self.parent.scope,
-                    budget: self.parent.budget,
-                    request,
-                    request_id: context.request_id,
-                }) as Box<dyn pi_rs_core::PreparedToolDispatch + 'a>
-            }))
+        else {
+            pi_rs_core::validate_legacy_tool_declarations(request, declarations)?;
+            return Ok(None);
+        };
+        pi_rs_core::validate_prepared_tool_dispatch(
+            inner.as_ref(),
+            context,
+            request,
+            declarations,
+        )?;
+        let request = inner.reservation_request().clone();
+        Ok(Some(Box::new(PreparedBudgetDispatch {
+            inner,
+            scope: self.parent.scope,
+            budget: self.parent.budget,
+            request,
+            request_id: context.request_id,
+        })))
     }
 
     fn context_identity(&self) -> Option<String> {
@@ -546,12 +570,93 @@ mod external_identity_tests {
         context: pi_rs_core::ToolDispatchContext,
         calls: Arc<Mutex<Vec<(Uuid, Uuid, String)>>>,
         request: ModelRequest,
+        dispatch_request: ModelRequest,
         effective: Vec<pi_rs_core::EffectiveToolDeclaration>,
+        snapshot: pi_rs_core::ToolDecisionSnapshot,
+    }
+
+    struct InvalidNoneModel;
+    #[async_trait::async_trait]
+    impl Model for InvalidNoneModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("must not dispatch")
+        }
+        async fn prepare_tool_dispatch<'a>(
+            &'a self,
+            _: &ModelRequest,
+            _: &[pi_rs_core::ToolDeclaration],
+            _: &pi_rs_core::ToolDispatchContext,
+        ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_wrappers_reject_required_constraint_when_inner_returns_none() {
+        let scope = RunScope {
+            tenant: "t".into(),
+            actor: "a".into(),
+            workspace: "w".into(),
+            journal_run_id: Uuid::new_v4(),
+            aip_run: "r".into(),
+            parent_run: None,
+            audit_id: "audit".into(),
+        };
+        let budget = Budget::default();
+        let inner = InvalidNoneModel;
+        let wrapper = BudgetedModel {
+            scope: &scope,
+            inner: &inner,
+            budget: &budget,
+            recorded_usage: Mutex::default(),
+        };
+        let prepared = PreparedBudgetedModel {
+            parent: &wrapper,
+            inner: Arc::new(InvalidNoneModel),
+        };
+        let spec = pi_rs_core::ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 1,
+        };
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec,
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Require,
+            }),
+        };
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        for model in [&wrapper as &dyn Model, &prepared as &dyn Model] {
+            assert!(
+                model
+                    .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(budget.reservations.lock().unwrap().is_empty());
     }
     #[async_trait::async_trait]
     impl pi_rs_core::PreparedToolDispatch for TestPreparedDispatch {
         fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
             &self.effective
+        }
+        fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+            &self.snapshot
+        }
+        fn dispatch_request(&self) -> &ModelRequest {
+            &self.dispatch_request
         }
         fn reservation_request(&self) -> &ModelRequest {
             &self.request
@@ -574,14 +679,14 @@ mod external_identity_tests {
         async fn prepare_tool_dispatch<'a>(
             &'a self,
             request: &ModelRequest,
-            _: &[pi_rs_core::ToolDeclaration],
+            declarations: &[pi_rs_core::ToolDeclaration],
             context: &pi_rs_core::ToolDispatchContext,
         ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
             let mut reservation = request.clone();
             if let Some(tool) = reservation.tools.first_mut() {
                 tool.parameters["required"] = serde_json::json!(["path"]);
             }
-            let effective = request
+            let effective: Vec<_> = request
                 .tools
                 .iter()
                 .map(|spec| pi_rs_core::EffectiveToolDeclaration {
@@ -589,11 +694,20 @@ mod external_identity_tests {
                     sampling: pi_rs_core::EffectiveToolSampling::Unconstrained,
                 })
                 .collect();
+            let snapshot = pi_rs_core::ToolDecisionSnapshot::capture(
+                context,
+                request,
+                declarations,
+                &effective,
+            )
+            .map_err(|error| Error::Config(error.to_string()))?;
             Ok(Some(Box::new(TestPreparedDispatch {
                 context: context.clone(),
                 calls: self.enriched.clone(),
                 request: reservation,
+                dispatch_request: request.clone(),
                 effective,
+                snapshot,
             })))
         }
         async fn prepare_context<'a>(
@@ -738,6 +852,17 @@ mod external_identity_tests {
                 .await
                 .unwrap()
                 .unwrap();
+            assert!(
+                dispatch
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &request,
+                        dispatch.dispatch_request(),
+                        &declarations
+                    )
+                    .is_ok()
+            );
             assert_eq!(
                 budget.reservations.lock().unwrap().as_slice(),
                 ids.as_slice()

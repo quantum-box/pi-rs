@@ -126,12 +126,21 @@ impl PreparedResponsesRequest {
 struct PreparedResponsesDispatch {
     request: PreparedResponsesRequest,
     context: pi_rs_core::ToolDispatchContext,
+    snapshot: pi_rs_core::ToolDecisionSnapshot,
 }
 
 #[async_trait::async_trait]
 impl pi_rs_core::PreparedToolDispatch for PreparedResponsesDispatch {
     fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
         self.request.effective_tools()
+    }
+
+    fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.request.request
     }
 
     fn reservation_request(&self) -> &ModelRequest {
@@ -157,9 +166,18 @@ impl OpenAiResponses {
         declarations: &[pi_rs_core::ToolDeclaration],
         context: &pi_rs_core::ToolDispatchContext,
     ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        let prepared = self.prepare_tool_request(request.clone(), declarations)?;
+        let snapshot = pi_rs_core::ToolDecisionSnapshot::capture(
+            context,
+            request,
+            declarations,
+            prepared.effective_tools(),
+        )
+        .map_err(|error| Error::Config(error.to_string()))?;
         Ok(Box::new(PreparedResponsesDispatch {
-            request: self.prepare_tool_request(request.clone(), declarations)?,
+            request: prepared,
             context: context.clone(),
+            snapshot,
         }))
     }
 

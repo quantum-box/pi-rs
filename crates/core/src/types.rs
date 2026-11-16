@@ -698,7 +698,8 @@ impl From<EnrichedModelEvent> for DetailedModelEvent {
 pub type DetailedModelStream = futures_util::stream::BoxStream<'static, Result<DetailedModelEvent>>;
 
 /// Identity and cache purpose fixed when preparing a model dispatch.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolDispatchContext {
     pub request_id: Uuid,
     pub session_id: Uuid,
@@ -710,9 +711,33 @@ pub struct ToolDispatchContext {
 #[async_trait::async_trait]
 pub trait PreparedToolDispatch: Send {
     fn effective_tools(&self) -> &[crate::EffectiveToolDeclaration];
+    /// Snapshot bound to the final request, decisions and dispatch context.
+    fn decision_snapshot(&self) -> &crate::ToolDecisionSnapshot;
+    /// Request after host filtering and before tool-schema transformation.
+    fn dispatch_request(&self) -> &ModelRequest;
     /// Request with the tool schemas actually sent, for budget estimation.
     fn reservation_request(&self) -> &ModelRequest;
     async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream>;
+}
+
+/// Verify a prepared adapter's snapshot and exposed decisions against the
+/// caller's final declarations before recording or dispatching it.
+pub fn validate_prepared_tool_dispatch<'a>(
+    prepared: &'a dyn PreparedToolDispatch,
+    context: &ToolDispatchContext,
+    request: &ModelRequest,
+    declarations: &[crate::ToolDeclaration],
+) -> Result<crate::ValidatedToolDecisionSnapshot<'a>> {
+    let validated = prepared
+        .decision_snapshot()
+        .validate(context, request, prepared.dispatch_request(), declarations)
+        .map_err(|error| Error::Config(error.to_string()))?;
+    if validated.effective_tools() != prepared.effective_tools() {
+        return Err(Error::Config(
+            "prepared tool decisions do not match snapshot".into(),
+        ));
+    }
+    Ok(validated)
 }
 
 #[async_trait::async_trait]
@@ -955,11 +980,86 @@ mod declaration_dispatch_tests {
     use super::*;
 
     struct LegacyModel;
+    struct InconsistentDispatch {
+        snapshot: crate::ToolDecisionSnapshot,
+        request: ModelRequest,
+        effective: Vec<crate::EffectiveToolDeclaration>,
+    }
+    #[async_trait::async_trait]
+    impl PreparedToolDispatch for InconsistentDispatch {
+        fn effective_tools(&self) -> &[crate::EffectiveToolDeclaration] {
+            &self.effective
+        }
+        fn decision_snapshot(&self) -> &crate::ToolDecisionSnapshot {
+            &self.snapshot
+        }
+        fn dispatch_request(&self) -> &ModelRequest {
+            &self.request
+        }
+        fn reservation_request(&self) -> &ModelRequest {
+            &self.request
+        }
+        async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream> {
+            panic!("must not dispatch")
+        }
+    }
     #[async_trait::async_trait]
     impl Model for LegacyModel {
         async fn stream(&self, _request: ModelRequest) -> Result<ModelStream> {
             Ok(Box::pin(futures_util::stream::empty()))
         }
+    }
+
+    #[test]
+    fn prepared_dispatch_rejects_decisions_that_disagree_with_snapshot() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 1,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let strict = crate::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling: crate::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+            },
+        };
+        let context = ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let snapshot = crate::ToolDecisionSnapshot::capture(
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+            &[strict],
+        )
+        .unwrap();
+        let dispatch = InconsistentDispatch {
+            snapshot,
+            request: request.clone(),
+            effective: vec![crate::EffectiveToolDeclaration {
+                spec,
+                sampling: crate::EffectiveToolSampling::Unconstrained,
+            }],
+        };
+        assert!(
+            validate_prepared_tool_dispatch(&dispatch, &context, &request, &[declaration]).is_err()
+        );
     }
 
     #[tokio::test]

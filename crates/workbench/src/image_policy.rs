@@ -40,16 +40,28 @@ impl Model for WorkbenchModel {
         } else {
             self.affinity_headers(&context.external_id).await?
         };
-        let request = self.filtered(request.clone());
-        Ok(client
-            .prepare_tool_dispatch_with_headers(&request, declarations, context, &headers, true)
+        let filtered = self.filtered(request.clone());
+        let Some(inner) = client
+            .prepare_tool_dispatch_with_headers(&filtered, declarations, context, &headers, true)
             .await?
-            .map(|inner| {
-                Box::new(PreparedWorkbenchToolDispatch {
-                    inner,
-                    owner: self.clone(),
-                }) as Box<dyn pi_rs::PreparedToolDispatch>
-            }))
+        else {
+            pi_rs::validate_legacy_tool_declarations(request, declarations)?;
+            return Ok(None);
+        };
+        pi_rs::validate_prepared_tool_dispatch(inner.as_ref(), context, &filtered, declarations)?;
+        let snapshot = pi_rs::ToolDecisionSnapshot::capture_dispatch(
+            context,
+            request,
+            inner.dispatch_request(),
+            declarations,
+            inner.effective_tools(),
+        )
+        .map_err(|error| pi_rs::Error::Config(error.to_string()))?;
+        Ok(Some(Box::new(PreparedWorkbenchToolDispatch {
+            inner,
+            owner: self.clone(),
+            snapshot,
+        })))
     }
 
     async fn prepare_context<'a>(
@@ -226,12 +238,21 @@ struct PreparedWorkbenchModel {
 struct PreparedWorkbenchToolDispatch {
     inner: Box<dyn pi_rs::PreparedToolDispatch>,
     owner: WorkbenchModel,
+    snapshot: pi_rs::ToolDecisionSnapshot,
 }
 
 #[async_trait::async_trait]
 impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
     fn effective_tools(&self) -> &[pi_rs::EffectiveToolDeclaration] {
         self.inner.effective_tools()
+    }
+
+    fn decision_snapshot(&self) -> &pi_rs::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+
+    fn dispatch_request(&self) -> &ModelRequest {
+        self.inner.dispatch_request()
     }
 
     fn reservation_request(&self) -> &ModelRequest {
