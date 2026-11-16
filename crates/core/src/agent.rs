@@ -1758,13 +1758,80 @@ impl Agent<'_> {
                     limits: active.limits.clone(),
                     ..active
                 };
-                let capacity = active.context_capacity(&request, cancel).await?;
+                let attempt = match active
+                    .prepare_attempt(
+                        session,
+                        request,
+                        true,
+                        transformed,
+                        cancel,
+                        observer,
+                        Some(followups),
+                    )
+                    .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(Error::RetryableModel(message))
+                        if session.retry_control().settings().enabled
+                            && retry_attempt < session.retry_control().settings().max_retries
+                            && request_index + 1 < active.limits.model_requests =>
+                    {
+                        if lifecycle && retry_attempt == 0 {
+                            active
+                                .observe_active_lifecycle_with_inputs(
+                                    session,
+                                    turn_start(false),
+                                    &states,
+                                    cancel,
+                                    observer,
+                                    Some(followups),
+                                )
+                                .await?;
+                        }
+                        let control = session.retry_control();
+                        let settings = control.settings();
+                        retry_attempt += 1;
+                        let delay_ms = settings.delay_ms(retry_attempt);
+                        let retry_wait = control.begin_wait();
+                        observer(Notification::Retry(crate::RetryEvent::Start {
+                            attempt: retry_attempt,
+                            max_attempts: settings.max_retries,
+                            delay_ms,
+                            error_message: message,
+                        }));
+                        let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
+                        tokio::pin!(sleep);
+                        let waited = loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = retry_wait.cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = &mut sleep => break Ok(()),
+                                Some(input) = followups.recv() => {
+                                    if let Err(error) = queue_input(session, input.into(), observer) { break Err(error); }
+                                }
+                            }
+                        };
+                        drop(retry_wait);
+                        waited?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let budget_request = attempt.reservation_request();
+                let capacity = active.context_capacity(budget_request, cancel).await?;
                 let input_tokens = capacity.map_or(0, |_| {
                     let estimate = session.context_budget_estimate();
-                    active.request_budget_tokens(session, &request, estimate, transformed)
+                    active.request_budget_tokens(
+                        session,
+                        budget_request,
+                        estimate,
+                        transformed,
+                        attempt.configuration.as_deref(),
+                    )
                 });
                 let exceeds = capacity.is_some_and(|window| {
-                    input_tokens.saturating_add(u64::from(request.max_output_tokens))
+                    input_tokens.saturating_add(u64::from(attempt.request.max_output_tokens))
                         > u64::from(window)
                 });
                 let control = session.auto_compaction_control();
@@ -1843,10 +1910,19 @@ impl Agent<'_> {
                         }
                         continue;
                     }
+                    if exceeds {
+                        return Err(Error::Model(
+                            "context does not fit after compaction produced no summary".into(),
+                        ));
+                    }
                 }
-                let advertised: HashSet<_> =
-                    request.tools.iter().map(|spec| spec.name.clone()).collect();
-                let allowance = request.max_output_tokens;
+                let advertised: HashSet<_> = attempt
+                    .request
+                    .tools
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect();
+                let allowance = attempt.request.max_output_tokens;
                 if lifecycle && retry_attempt == 0 {
                     active
                         .observe_active_lifecycle_with_inputs(
@@ -1860,15 +1936,7 @@ impl Agent<'_> {
                         .await?;
                 }
                 let attempt = active
-                    .reply(
-                        session,
-                        request,
-                        true,
-                        transformed,
-                        cancel,
-                        observer,
-                        Some(followups),
-                    )
+                    .reply(session, attempt, true, cancel, observer, Some(followups))
                     .await?;
                 let result = attempt.outcome;
                 if let Err(Error::Model(message) | Error::RetryableModel(message)) = &result
@@ -2640,6 +2708,7 @@ impl Agent<'_> {
         request: &ModelRequest,
         estimate: crate::ContextUsageEstimate,
         transformed: bool,
+        configuration: Option<&str>,
     ) -> u64 {
         let Some(anchor) = estimate.last_usage_record.filter(|_| !transformed) else {
             return self.model.estimate_request_tokens(request);
@@ -2656,8 +2725,7 @@ impl Agent<'_> {
                 _ => None,
             })
             .unwrap_or((None, 0));
-        let configuration = request_configuration_hash(self.model, request);
-        let safe = configuration.as_ref().is_some_and(|configuration| {
+        let safe = configuration.is_some_and(|configuration| {
             request_id.is_some_and(|id| branch.iter().any(|record| matches!(&record.event,
                 Event::ModelRequested { request_id: Some(request_id), context_transformed: Some(false), context_configuration_sha256: Some(previous), .. }
                     if *request_id == id && previous == configuration)))
@@ -2688,9 +2756,8 @@ impl Agent<'_> {
             .saturating_add(trailing)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn reply<T: Into<AgentInput> + Send>(
-        &self,
+    async fn prepare_attempt<'a, T: Into<AgentInput> + Send>(
+        &'a self,
         session: &mut Session,
         request: ModelRequest,
         retain_reply: bool,
@@ -2698,7 +2765,7 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<ReplyAttempt> {
+    ) -> Result<PreparedAttempt<'a>> {
         let declarations = self.registry.declarations_for_request(&request);
         let request_id = Uuid::new_v4();
         let dispatch_context = crate::ToolDispatchContext {
@@ -2742,6 +2809,39 @@ impl Agent<'_> {
         } else {
             None
         };
+        let configuration = prepared_configuration_hash(self.model, &request, prepared.as_deref());
+        Ok(PreparedAttempt {
+            request,
+            declarations,
+            dispatch_context,
+            prepared,
+            transformed,
+            configuration,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reply<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        attempt: PreparedAttempt<'_>,
+        retain_reply: bool,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<ReplyAttempt> {
+        let PreparedAttempt {
+            request,
+            declarations,
+            dispatch_context,
+            prepared,
+            transformed,
+            configuration,
+        } = attempt;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let request_id = dispatch_context.request_id;
         let allowance = request.max_output_tokens;
         let advertised_tools =
             retain_reply.then(|| request.tools.iter().map(|tool| tool.name.clone()).collect());
@@ -2759,7 +2859,7 @@ impl Agent<'_> {
             context_head: Some(context_head),
             context_sha256: Some(context_sha256),
             context_transformed: Some(transformed),
-            context_configuration_sha256: request_configuration_hash(self.model, &request),
+            context_configuration_sha256: configuration,
             tool_decision: None,
         };
         if let Some(prepared) = &prepared {
@@ -4467,15 +4567,20 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 break Err(Error::Cancelled);
             }
-            let attempt = match Box::pin(self.reply::<AgentInput>(
-                session,
-                request.clone(),
-                false,
-                false,
-                cancel,
-                observer,
-                None,
-            ))
+            let prepared = self
+                .prepare_attempt::<AgentInput>(
+                    session,
+                    request.clone(),
+                    false,
+                    false,
+                    cancel,
+                    observer,
+                    None,
+                )
+                .await?;
+            let attempt = match Box::pin(
+                self.reply::<AgentInput>(session, prepared, false, cancel, observer, None),
+            )
             .await
             {
                 Ok(attempt) => attempt.outcome,
@@ -4845,7 +4950,21 @@ impl Agent<'_> {
             limits: self.limits.clone(),
             ..*self
         };
-        if active.exceeds_context(&request, cancel).await? {
+        let attempt = active
+            .prepare_attempt(
+                session,
+                request,
+                false,
+                transformed,
+                cancel,
+                observer,
+                inputs.as_deref_mut(),
+            )
+            .await?;
+        if active
+            .exceeds_context(attempt.reservation_request(), cancel)
+            .await?
+        {
             return Err(Error::Model(
                 "older context does not fit the summary request".into(),
             ));
@@ -4860,13 +4979,12 @@ impl Agent<'_> {
                 observer,
             )?;
         }
-        let allowance = request.max_output_tokens;
+        let allowance = attempt.request.max_output_tokens;
         let reply = active
             .reply(
                 session,
-                request,
+                attempt,
                 false,
-                transformed,
                 cancel,
                 observer,
                 inputs.as_deref_mut(),
@@ -6328,6 +6446,23 @@ impl ToolHost for NestedHost {
 }
 
 // Journal and accounting failures stay outside the retryable provider outcome.
+struct PreparedAttempt<'a> {
+    request: ModelRequest,
+    declarations: Vec<crate::ToolDeclaration>,
+    dispatch_context: crate::ToolDispatchContext,
+    prepared: Option<Box<dyn crate::PreparedToolDispatch + 'a>>,
+    transformed: bool,
+    configuration: Option<String>,
+}
+
+impl PreparedAttempt<'_> {
+    fn reservation_request(&self) -> &ModelRequest {
+        self.prepared
+            .as_ref()
+            .map_or(&self.request, |prepared| prepared.reservation_request())
+    }
+}
+
 struct ReplyAttempt {
     outcome: Result<Reply>,
 }
@@ -7080,6 +7215,23 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
 
 // Fingerprint only stable request configuration, excluding conversation and
 // output allowance, which legitimately change between turns.
+fn prepared_configuration_hash(
+    model: &dyn Model,
+    request: &ModelRequest,
+    prepared: Option<&dyn crate::PreparedToolDispatch>,
+) -> Option<String> {
+    let base = request_configuration_hash(model, request)?;
+    match prepared {
+        None => Some(base),
+        Some(dispatch) => crate::protected_model_fingerprint(&(
+            "prepared-tool-configuration-v1",
+            base,
+            dispatch.effective_tools(),
+            &dispatch.reservation_request().tools,
+        )),
+    }
+}
+
 fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Option<String> {
     let identity = model.context_identity()?;
     let systems: Vec<_> = request

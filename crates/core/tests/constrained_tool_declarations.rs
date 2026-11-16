@@ -654,3 +654,177 @@ async fn strict_pending_reopens_with_original_authorized_arguments() {
         Some(json!({"path":"authorized"}))
     );
 }
+
+struct ProjectedModel {
+    prepares: Arc<AtomicUsize>,
+    dispatches: Arc<AtomicUsize>,
+    large: Arc<AtomicBool>,
+    strict: Arc<AtomicBool>,
+}
+struct ProjectedDispatch {
+    inner: FallbackDispatch,
+    reservation: ModelRequest,
+}
+#[async_trait::async_trait]
+impl PreparedToolDispatch for ProjectedDispatch {
+    fn effective_tools(&self) -> &[EffectiveToolDeclaration] {
+        &self.inner.effective
+    }
+    fn decision_snapshot(&self) -> &ToolDecisionSnapshot {
+        &self.inner.snapshot
+    }
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.inner.request
+    }
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.reservation
+    }
+    async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream> {
+        Box::new(self.inner).dispatch().await
+    }
+}
+#[async_trait::async_trait]
+impl Model for ProjectedModel {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+        panic!("prepared dispatch required")
+    }
+    fn context_identity(&self) -> Option<String> {
+        Some("projection-test".into())
+    }
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        if request
+            .tools
+            .first()
+            .is_some_and(|t| t.description == "large-projection")
+        {
+            1000
+        } else {
+            1
+        }
+    }
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[ToolDeclaration],
+        context: &ToolDispatchContext,
+    ) -> Result<Option<Box<dyn PreparedToolDispatch + 'a>>> {
+        self.prepares.fetch_add(1, Ordering::SeqCst);
+        let effective = declarations
+            .iter()
+            .map(|d| EffectiveToolDeclaration {
+                spec: d.spec.clone(),
+                sampling: if self.strict.load(Ordering::SeqCst) {
+                    EffectiveToolSampling::StrictJsonSchema {
+                        original_schema: d.spec.parameters.clone(),
+                        normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+                    }
+                } else {
+                    EffectiveToolSampling::Unconstrained
+                },
+            })
+            .collect::<Vec<_>>();
+        let snapshot = ToolDecisionSnapshot::capture(context, request, declarations, &effective)
+            .map_err(|e| pi_rs_core::Error::Config(e.to_string()))?;
+        let mut reservation = request.clone();
+        if self.large.load(Ordering::SeqCst) {
+            reservation.tools[0].description = "large-projection".into();
+        }
+        Ok(Some(Box::new(ProjectedDispatch {
+            inner: FallbackDispatch {
+                calls: self.dispatches.clone(),
+                committed: None,
+                request: request.clone(),
+                snapshot,
+                effective,
+            },
+            reservation,
+        })))
+    }
+}
+
+#[tokio::test]
+async fn prepared_projection_controls_budget_and_is_prepared_once() {
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let large = Arc::new(AtomicBool::new(true));
+    let model = Arc::new(ProjectedModel {
+        prepares: prepares.clone(),
+        dispatches: dispatches.clone(),
+        large: large.clone(),
+        strict: Arc::new(AtomicBool::new(false)),
+    });
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ConstrainedExtension(StrictToolPolicy::Prefer)))
+        .unwrap();
+    let mut session = SessionBuilder::new(model, "fixture")
+        .registry(registry)
+        .limits(pi_rs_core::Limits {
+            context_window: Some(100),
+            output_tokens_per_request: 1,
+            ..Default::default()
+        })
+        .in_memory()
+        .unwrap();
+    assert!(session.prompt("oversize").await.is_err());
+    assert_eq!(prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert!(
+        !session
+            .journal()
+            .unwrap()
+            .records()
+            .iter()
+            .any(|r| matches!(r.event, Event::ModelRequested { .. }))
+    );
+}
+
+#[tokio::test]
+async fn prepared_projection_changes_configuration_identity() {
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let large = Arc::new(AtomicBool::new(false));
+    let strict = Arc::new(AtomicBool::new(false));
+    let model = Arc::new(ProjectedModel {
+        prepares: prepares.clone(),
+        dispatches: dispatches.clone(),
+        large: large.clone(),
+        strict: strict.clone(),
+    });
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ConstrainedExtension(StrictToolPolicy::Prefer)))
+        .unwrap();
+    let mut session = SessionBuilder::new(model, "fixture")
+        .registry(registry)
+        .limits(pi_rs_core::Limits {
+            context_window: Some(5000),
+            output_tokens_per_request: 1,
+            ..Default::default()
+        })
+        .in_memory()
+        .unwrap();
+    assert_eq!(session.prompt("first").await.unwrap(), "done");
+    large.store(true, Ordering::SeqCst);
+    assert_eq!(session.prompt("second").await.unwrap(), "done");
+    strict.store(true, Ordering::SeqCst);
+    assert_eq!(session.prompt("third").await.unwrap(), "done");
+    let hashes: Vec<_> = session
+        .journal()
+        .unwrap()
+        .records()
+        .iter()
+        .filter_map(|r| match &r.event {
+            Event::ModelRequested {
+                context_configuration_sha256: Some(hash),
+                ..
+            } => Some(hash.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hashes.len(), 3);
+    assert_ne!(hashes[0], hashes[1]);
+    assert_ne!(hashes[1], hashes[2]);
+    assert_eq!(prepares.load(Ordering::SeqCst), 3);
+    assert_eq!(dispatches.load(Ordering::SeqCst), 3);
+}
