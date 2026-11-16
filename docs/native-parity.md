@@ -566,6 +566,8 @@ Pi instead attempts to access command properties on it.
 RPC `set_model` rejects non-string `provider` and `modelId` fields using Pi's
 diagnostic conversion. Missing `provider` still selects within the current
 provider as a native extension.
+RPC `set_session_name` uses Pi's diagnostics for missing, null, non-string,
+and empty names.
 The echoed JSON value retains Rust's parsed integer precision, which can differ
 from JavaScript for integers outside the safe range; out-of-range JSON numbers
 such as `1e400` are rejected by the native parser.

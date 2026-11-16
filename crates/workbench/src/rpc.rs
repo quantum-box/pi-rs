@@ -2268,9 +2268,20 @@ fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>
 }
 
 fn session_name(request: &Value) -> Result<String> {
-    let name = request["name"]
-        .as_str()
-        .ok_or_else(|| Error::Config("name is required".into()))?;
+    let name = match request.get("name") {
+        None => {
+            return Err(Error::Config(
+                "Cannot read properties of undefined (reading 'trim')".into(),
+            ));
+        }
+        Some(Value::Null) => {
+            return Err(Error::Config(
+                "Cannot read properties of null (reading 'trim')".into(),
+            ));
+        }
+        Some(Value::String(name)) => name,
+        Some(_) => return Err(Error::Config("command.name.trim is not a function".into())),
+    };
     sessions::validate_name(name).map_err(Error::Config)
 }
 
@@ -2648,6 +2659,36 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn session_name_type_errors_match_pi() {
+        for (request, expected) in [
+            (
+                json!({}),
+                "Cannot read properties of undefined (reading 'trim')",
+            ),
+            (
+                json!({"name":null}),
+                "Cannot read properties of null (reading 'trim')",
+            ),
+            (json!({"name":42}), "command.name.trim is not a function"),
+            (json!({"name":false}), "command.name.trim is not a function"),
+            (json!({"name":[]}), "command.name.trim is not a function"),
+            (json!({"name":{}}), "command.name.trim is not a function"),
+            (
+                json!({"name":"  \u{feff}  "}),
+                "Session name cannot be empty",
+            ),
+        ] {
+            assert!(
+                matches!(session_name(&request), Err(Error::Config(message)) if message == expected)
+            );
+        }
+        assert_eq!(
+            session_name(&json!({"name":"  example  "})).unwrap(),
+            "example"
+        );
+    }
 
     #[test]
     fn command_catalog_encodes_only_recorded_surrogates() {
