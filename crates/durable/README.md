@@ -2042,7 +2042,7 @@ settlement waits for owned work; failure and explicit abort cascade through it. 
 slice supports child admission in task-owned conversations, validating and
 fencing the ownership chain, pending aborts and failure publication through
 commit. Foreground cancellation stops at a background boundary; successful
-conversation-owner tasks may remain anchors. Interrupted attempts must recover
+task ancestors may remain anchors throughout the ownership chain. Interrupted attempts must recover
 before their descendants can execute. TaskTool children through these host
 methods remain unsupported. Ordinary nested-tool
 keys use a separate journal, so upstream shared cross-kind key semantics are not

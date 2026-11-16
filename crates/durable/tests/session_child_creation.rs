@@ -1634,3 +1634,122 @@ async fn async_owned_conversation_transaction_commits_child_and_document() {
     release.send(()).unwrap();
     driver.shutdown().unwrap();
 }
+
+#[test]
+fn succeeded_multilevel_owners_allow_admission_after_reopen() {
+    use durable_store::{Check, Expected, Mutation};
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore, Mode},
+        task_store::Save,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let root = h.create_conversation(config()).unwrap();
+    let conversation = h.create_conversation(config()).unwrap();
+    let store = Store::open(&path).unwrap();
+    let tasks = TaskStore::new(&store);
+    let ancestor = task(TaskOwner::Conversation(root), "unknown", 0);
+    let owner = task(TaskOwner::Task(ancestor.id()), "unknown", 1);
+    tasks
+        .save(&[Save::Create(&ancestor), Save::Create(&owner)])
+        .unwrap();
+    let edge = Edge {
+        task: owner.id(),
+        task_owner: owner.owner().clone(),
+        child: conversation,
+        mode: Mode::Foreground,
+    };
+    let prepared = EdgeStore::new(&store).prepare_create(&edge).unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    for id in [owner.id(), ancestor.id()] {
+        let snapshot = tasks.load(id).unwrap().unwrap();
+        tasks.update(&snapshot, |task| task.start()).unwrap();
+        let snapshot = tasks.load(id).unwrap().unwrap();
+        tasks
+            .update(&snapshot, |task| task.succeed(json!(null)))
+            .unwrap();
+    }
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let (driver, started, release) = driver(&h);
+    let parent = task(TaskOwner::Conversation(conversation), "parent", 0);
+    driver.submit(&parent).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+    let child = task(TaskOwner::Task(parent.id()), "child", 1);
+    let mut ancestor_key = b"durable/task/".to_vec();
+    ancestor_key.extend_from_slice(ancestor.id().as_bytes());
+    for mode in 0..3 {
+        let original = store.get(&ancestor_key).unwrap().unwrap();
+        let result = h.session_transaction(conversation, |tx| {
+            tx.create_child_task(&snapshot, child.clone())?;
+            tx.put_document(
+                &address(),
+                json!({"staged": true}).as_object().unwrap().clone(),
+            )?;
+            let value = match mode {
+                0 => {
+                    let mut bad = ancestor.clone();
+                    bad.start().unwrap();
+                    bad.fail("failure".into()).unwrap();
+                    serde_json::to_vec(&bad)?
+                }
+                1 => {
+                    let mut bad = ancestor.clone();
+                    bad.cancel().unwrap();
+                    serde_json::to_vec(&bad)?
+                }
+                _ => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&original.value)?;
+                    value["abort_requested"] = json!(true);
+                    serde_json::to_vec(&value)?
+                }
+            };
+            store.commit(
+                &[Check {
+                    key: ancestor_key.clone(),
+                    expected: Expected::Version(original.version),
+                }],
+                &[Mutation::Put {
+                    key: ancestor_key.clone(),
+                    value,
+                }],
+            )?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(tasks.load(child.id()).unwrap().is_none());
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        let current = store.get(&ancestor_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: ancestor_key.clone(),
+                    expected: Expected::Version(current.version),
+                }],
+                &[Mutation::Put {
+                    key: ancestor_key.clone(),
+                    value: original.value,
+                }],
+            )
+            .unwrap();
+    }
+    h.session_transaction(conversation, |tx| {
+        tx.create_child_task(&snapshot, child.clone())?;
+        tx.put_document(
+            &address(),
+            json!({"saved": true}).as_object().unwrap().clone(),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(tasks.load(child.id()).unwrap().is_some());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+    drop(h);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    assert!(reopened.conversation(conversation).is_ok());
+    assert!(tasks.load(child.id()).unwrap().is_some());
+}

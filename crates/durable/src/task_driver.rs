@@ -1293,7 +1293,6 @@ impl Shared {
         let mut seen = std::collections::HashSet::new();
         let mut checks = Vec::new();
         let mut foreground = true;
-        let mut from_conversation = false;
         loop {
             let identity = match &next {
                 TaskOwner::Task(id) => (true, *id),
@@ -1348,13 +1347,12 @@ impl Shared {
                         foreground = false;
                     }
                     next = TaskOwner::Task(edge.edge.task);
-                    from_conversation = true;
                 }
                 TaskOwner::Task(id) => {
                     let stored = tasks.load(id).map_err(|_| invalid())?.ok_or_else(invalid)?;
                     if foreground {
-                        let successful_anchor = from_conversation
-                            && matches!(stored.task.state(), TaskState::Succeeded(_));
+                        let successful_anchor =
+                            matches!(stored.task.state(), TaskState::Succeeded(_));
                         if stored.task.abort_requested()
                             || matches!(stored.task.state(), TaskState::CompletingFailed(_))
                             || (stored.task.is_terminal() && !successful_anchor)
@@ -1373,7 +1371,6 @@ impl Shared {
                         foreground = false;
                     }
                     next = stored.task.owner().clone();
-                    from_conversation = false;
                 }
             }
         }
