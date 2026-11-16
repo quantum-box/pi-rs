@@ -1374,6 +1374,35 @@ impl Transaction {
         &self.checks
     }
 
+    // Only used after a reservation-only receipt scan is repeated. A handler's
+    // own signal observation, including a deadline, must never be rebased.
+    pub(crate) fn refresh_reservation_revision(
+        &mut self,
+        key: &[u8],
+        old: &Expected,
+        new: Expected,
+    ) -> bool {
+        if !matches!(old, Expected::Missing | Expected::Version(_))
+            || !matches!(new, Expected::Missing | Expected::Version(_))
+            || self.mutations.iter().any(|mutation| match mutation {
+                Mutation::Put { key: written, .. }
+                | Mutation::Delete { key: written } => written == key,
+            })
+        {
+            return false;
+        }
+        let Some(check) =
+            self.checks.iter_mut().find(|check| check.key == key)
+        else {
+            return false;
+        };
+        if &check.expected != old {
+            return false;
+        }
+        check.expected = new;
+        true
+    }
+
     pub(crate) fn assemble_submission_notifications(
         self,
         store: &Store,
@@ -3119,13 +3148,12 @@ impl<'a> TaskDocuments<'a> {
     ) -> Result<crate::task_store::SignalResult, Error> {
         if token.name() == crate::runtime::submission_settled_signal().name()
             && self.task_input.as_ref().is_some_and(|intent| {
-                intent.cross_conversation
-                    && intent.admissions.iter().any(|item| {
-                        item.notification_binding.is_some()
-                            && item.notify.as_ref().is_some_and(|notify| {
-                                notify.task_id == task_id && notify.key == key
-                            })
-                    })
+                intent.admissions.iter().any(|item| {
+                    item.notification_binding.is_some()
+                        && item.notify.as_ref().is_some_and(|notify| {
+                            notify.task_id == task_id && notify.key == key
+                        })
+                })
             })
         {
             return Err(Error::SignalComposition);

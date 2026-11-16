@@ -1818,6 +1818,8 @@ fn failed_write_discards_admission_notification_and_documents() {
         matches!(state, TaskState::Failed(_))
     });
     let store = Store::open(&path).unwrap();
+    let binding = format!("durable/owned-subagent-notify/{}/736574746c6564", task.id());
+    assert!(store.get(binding.as_bytes()).unwrap().is_none());
     assert!(h.conversation(id).unwrap().application_writes.is_empty());
     assert!(
         TaskStore::new(&store)
@@ -2346,6 +2348,8 @@ fn killed_staged_write_recovers_once_with_notification() {
     let h = Harness::open_paused(&path, options()).unwrap();
     assert!(h.conversation(id).unwrap().application_writes.is_empty());
     let store = Store::open(&path).unwrap();
+    let binding = format!("durable/owned-subagent-notify/{}/736574746c6564", Uuid::from_u128(2001));
+    assert!(store.get(binding.as_bytes()).unwrap().is_none());
     assert!(Documents::new(&store).get(&address()).unwrap().is_none());
     drop(store);
     let mut registry = Registry::default();
@@ -2368,6 +2372,9 @@ fn killed_staged_write_recovers_once_with_notification() {
     assert_eq!(writes.len(), 1);
     assert!(writes[0].placed);
     let store = Store::open(&path).unwrap();
+    let binding = store.get(binding.as_bytes()).unwrap().unwrap();
+    let bound: (Uuid, Uuid) = serde_json::from_slice(&binding.value).unwrap();
+    assert_eq!(bound, (id, writes[0].id));
     let value = TaskStore::new(&store)
         .read_typed_signal(
             Uuid::from_u128(2001),
@@ -2584,8 +2591,7 @@ impl Handler for ConflictingSignal {
         )
         .map_err(|e| e.to_string())?;
         let value = json!({"id":id,"conversationId":conversation,"type":"write","status":"done","entry":id});
-        docs.signal_at(task.id(), &submission_settled_signal(), "settled", value, 0)
-            .map_err(|e| e.to_string())?;
+        assert!(docs.signal_at(task.id(), &submission_settled_signal(), "settled", value, 0).is_err());
         Ok(Step::Wait {
             checkpoint: Checkpoint {
                 phase: "waiting".into(),
@@ -2600,7 +2606,7 @@ impl Handler for ConflictingSignal {
     }
 }
 #[test]
-fn staged_signal_wins_over_duplicate_write_notification() {
+fn staged_signal_cannot_replace_write_notification() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (h, id) = setup(&path);
@@ -2619,7 +2625,7 @@ fn staged_signal_wins_over_duplicate_write_notification() {
         .read_typed_signal(task.id(), &submission_settled_signal(), "settled")
         .unwrap()
         .unwrap();
-    assert_eq!(receipt["id"], Uuid::from_u128(777).to_string());
+    assert_eq!(receipt["id"], h.conversation(id).unwrap().application_writes[0].id.to_string());
     let other = Task::new(
         Uuid::new_v4(),
         TaskOwner::Conversation(id),
@@ -5358,4 +5364,387 @@ fn task_notification_reservation_races_retained_signal() {
     );
     assert!(Documents::new(&store).get(&address()).unwrap().is_none());
     driver.shutdown().unwrap();
+}
+
+struct LocalReservationSteps;
+impl Handler for LocalReservationSteps {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        let notify = |key: &str| {
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: key.into(),
+            })
+        };
+        if task.checkpoint().phase == "start" {
+            docs.submit_write(
+                "local-stable".into(),
+                "app.first".into(),
+                None,
+                notify("receipt"),
+            )
+            .map_err(|e| e.to_string())?;
+            docs.submit_input_without_request_id(
+                "pending".into(),
+                AdmissionOptions::default(),
+                notify("pending"),
+            )
+            .map_err(|e| e.to_string())?;
+            let id = Uuid::new_v4();
+            let owner = match task.owner() {
+                TaskOwner::Conversation(id) => *id,
+                _ => unreachable!(),
+            };
+            let value = json!({"id":id,"conversationId":owner,"type":"write","status":"done","entry":id});
+            docs.signal_at(
+                task.id(),
+                &submission_settled_signal(),
+                "unrelated",
+                value,
+                0,
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(Step::Continue(Checkpoint {
+                phase: "second".into(),
+                data: json!(null),
+            }));
+        }
+        for key in ["receipt", "pending", "unrelated"] {
+            assert!(
+                docs.submit_write_without_request_id(
+                    "app.collision".into(),
+                    None,
+                    notify(key)
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        docs.submit_write(
+            "local-stable".into(),
+            "app.ignored".into(),
+            None,
+            notify("receipt"),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+
+#[test]
+fn local_notification_reservations_survive_steps_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, conversation) = setup(&path);
+    let mut registry = Registry::default();
+    registry.register(
+        "local-reservations",
+        true,
+        LocalReservationSteps,
+    );
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let child = task(conversation, "local-reservations");
+    scheduler.submit(&child).unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    let store = Store::open(&path).unwrap();
+    let before = h.conversation(conversation).unwrap();
+    assert_eq!(before.application_writes.len(), 1);
+    assert_eq!(before.submissions.len(), 1);
+    for key in ["receipt", "unrelated"] {
+        assert!(
+            TaskStore::new(&store)
+                .read_typed_signal(
+                    child.id(),
+                    &submission_settled_signal(),
+                    key
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(
+                child.id(),
+                &submission_settled_signal(),
+                "pending"
+            )
+            .unwrap()
+            .is_none()
+    );
+    drop(scheduler);
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register(
+        "local-reservations",
+        true,
+        LocalReservationSteps,
+    );
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    assert!(matches!(
+        TaskStore::new(&store)
+            .load(child.id())
+            .unwrap()
+            .unwrap()
+            .task
+            .state(),
+        TaskState::Succeeded(_)
+    ));
+    let state = h.conversation(conversation).unwrap();
+    assert_eq!(state.application_writes.len(), 1);
+    assert_eq!(state.submissions.len(), 1);
+}
+
+struct LocalReservationRace {
+    staged: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Handler for LocalReservationRace {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        let result = docs.submit_write_without_request_id(
+            "app.race".into(),
+            None,
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: "local-race".into(),
+            }),
+        );
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            assert!(result.is_err());
+            return Ok(Step::Succeed(json!(null)));
+        }
+        result.map_err(|e| e.to_string())?;
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"no":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        self.staged.send(()).unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| e.to_string())?;
+        Ok(Step::Succeed(json!("unexpected")))
+    }
+}
+#[test]
+fn local_reservation_races_existing_pending_and_receipt() {
+    for receipt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, conversation) = setup(&path);
+        let (staged, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "local-race",
+            true,
+            LocalReservationRace {
+                staged,
+                release: std::sync::Mutex::new(wait),
+                calls: calls.clone(),
+            },
+        );
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(conversation, "local-race");
+        driver.submit(&child).unwrap();
+        observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let store = Store::open(&path).unwrap();
+        if receipt {
+            let id = Uuid::new_v4();
+            let value = json!({"id":id,"conversationId":conversation,"type":"write","status":"done","entry":id});
+            let signal = pi_rs_durable::task_store::Signal::new_typed(
+                Uuid::new_v4(),
+                child.id(),
+                &submission_settled_signal(),
+                "local-race",
+                value,
+            )
+            .unwrap();
+            TaskStore::new(&store).send_signal(&signal).unwrap();
+        } else {
+            h.submit_with_notification(
+                conversation,
+                None,
+                "pending".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: child.id(),
+                    key: "local-race".into(),
+                },
+            )
+            .unwrap();
+        }
+        release.send(()).unwrap();
+        wait_task(&path, child.id(), |state| {
+            matches!(state, TaskState::Succeeded(_))
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            h.conversation(conversation)
+                .unwrap()
+                .application_writes
+                .is_empty()
+        );
+        assert!(
+            Documents::new(&store).get(&address()).unwrap().is_none()
+        );
+        driver.shutdown().unwrap();
+    }
+}
+
+struct LegacyDuplicate;
+impl Handler for LegacyDuplicate {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        docs.submit_write(
+            "legacy-key".into(),
+            "app.ignored".into(),
+            None,
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: "changed".into(),
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+#[test]
+fn local_keyed_duplicate_preserves_legacy_notification_without_binding()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, conversation) = setup(&path);
+    let mut registry = Registry::default();
+    registry.register("legacy-duplicate", true, LegacyDuplicate);
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let child = task(conversation, "legacy-duplicate");
+    scheduler.submit(&child).unwrap();
+    let original = h
+        .submit_write_with_notification(
+            conversation,
+            Some("legacy-key".into()),
+            "app.original".into(),
+            None,
+            SubmissionNotify {
+                task_id: child.id(),
+                key: "legacy".into(),
+            },
+        )
+        .unwrap();
+    let store = Store::open(&path).unwrap();
+    let key = format!(
+        "durable/owned-subagent-notify/{}/6c6567616379",
+        child.id()
+    );
+    assert!(store.get(key.as_bytes()).unwrap().is_none());
+    assert!(scheduler.tick(0).unwrap());
+    assert!(matches!(
+        scheduler.get(child.id()).unwrap().unwrap().state(),
+        TaskState::Succeeded(_)
+    ));
+    let state = h.conversation(conversation).unwrap();
+    assert_eq!(state.application_writes.len(), 1);
+    assert_eq!(state.application_writes[0].id, original);
+    assert_eq!(
+        state.submission_notification(original).unwrap().key,
+        "legacy"
+    );
+    assert!(store.get(key.as_bytes()).unwrap().is_none());
+}
+
+struct RejectMalformedReceipt;
+impl Handler for RejectMalformedReceipt {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        assert!(
+            docs.submit_write_without_request_id(
+                "app.must-not-commit".into(),
+                None,
+                Some(SubmissionNotify {
+                    task_id: task.id(),
+                    key: "malformed".into()
+                })
+            )
+            .is_err()
+        );
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+#[test]
+fn local_reservation_fails_closed_on_malformed_signal_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, conversation) = setup(&path);
+    let mut registry = Registry::default();
+    registry.register(
+        "malformed-receipt",
+        true,
+        RejectMalformedReceipt,
+    );
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let child = task(conversation, "malformed-receipt");
+    scheduler.submit(&child).unwrap();
+    let store = Store::open(&path).unwrap();
+    let mut signal_key = b"durable/signal/".to_vec();
+    signal_key.extend_from_slice(child.id().as_bytes());
+    signal_key.extend_from_slice(Uuid::new_v4().as_bytes());
+    store
+        .commit(
+            &[durable_store::Check {
+                key: signal_key.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key: signal_key,
+                value: b"{".to_vec(),
+            }],
+        )
+        .unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    assert!(
+        h.conversation(conversation)
+            .unwrap()
+            .application_writes
+            .is_empty()
+    );
+    let binding = format!(
+        "durable/owned-subagent-notify/{}/6d616c666f726d6564",
+        child.id()
+    );
+    assert!(store.get(binding.as_bytes()).unwrap().is_none());
 }

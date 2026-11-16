@@ -557,11 +557,59 @@ pub struct CompletedInvocation {
 struct TaskNotificationAssembly {
     original: crate::document::Transaction,
     settlements: Vec<crate::runtime::SettlementNotification>,
+    reservation_only: HashMap<Uuid, Vec<crate::runtime::SubmissionNotify>>,
     clocks: Vec<Option<(i64, std::time::Instant)>>,
     retries: usize,
 }
 
 impl TaskNotificationAssembly {
+    fn refresh_reservation_revision(
+        &mut self,
+        store: &durable_store::Store,
+        key: &[u8],
+    ) -> Result<bool, crate::document::Error> {
+        let Some((task, destinations)) =
+            self.reservation_only.iter().find(|(task, _)| {
+                task_store::signal_revision_key(**task) == key
+            })
+        else {
+            return Ok(false);
+        };
+        let Some(old) = self
+            .original
+            .checks()
+            .iter()
+            .find(|check| check.key == key)
+            .map(|check| check.expected.clone())
+        else {
+            return Ok(false);
+        };
+        let revision = store.get(key)?;
+        let tasks = task_store::TaskStore::new(store);
+        for notify in destinations {
+            match tasks.read_typed_signal_state(
+                *task,
+                &crate::runtime::submission_settled_signal(),
+                &notify.key,
+            ) {
+                Ok(None) => {}
+                Ok(Some(_)) => return Ok(false),
+                Err(task_store::Error::Store(error)) => {
+                    return Err(error.into());
+                }
+                // Ambiguous or malformed receipts cannot prove the key free.
+                Err(_) => return Ok(false),
+            }
+        }
+        let expected = revision
+            .map_or(durable_store::Expected::Missing, |entry| {
+                durable_store::Expected::Version(entry.version)
+            });
+        Ok(self
+            .original
+            .refresh_reservation_revision(key, &old, expected))
+    }
+
     fn assemble(
         &mut self,
         store: &durable_store::Store,
@@ -4211,8 +4259,19 @@ impl Scheduler {
         if self.inject_preparation_error == 1 {
             return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
         }
+        let mut reservation_only = HashMap::<Uuid, Vec<crate::runtime::SubmissionNotify>>::new();
         let document_result = documents.prepare(&running).and_then(|mut prepared| {
             if let Some(intent) = &prepared.task_input {
+                for item in &intent.admissions {
+                    if item.notification_binding.is_none() {
+                        continue;
+                    }
+                    let Some(notify) = &item.notify else { continue };
+                    let revision = task_store::signal_revision_key(notify.task_id);
+                    if !prepared.document_batch.checks.iter().chain(prepared.transaction.checks()).any(|check| check.key == revision) {
+                        reservation_only.entry(notify.task_id).or_default().push(notify.clone());
+                    }
+                }
                 let harness = self.validator.as_ref().ok_or_else(|| {
                     crate::document::Error::InvalidSessionAdmission(
                         "task input requires an attached harness".into(),
@@ -4342,6 +4401,12 @@ impl Scheduler {
                 }
             }
         }
+        // A separately prepared graph participant may also have observed a
+        // signal revision. Such an observation remains an original fence.
+        reservation_only.retain(|task, _| {
+            let key = task_store::signal_revision_key(*task);
+            !graph.checks.iter().any(|check| check.key == key)
+        });
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;
@@ -4357,6 +4422,7 @@ impl Scheduler {
                     original: transaction.clone(),
                     clocks: vec![None; settlements.len()],
                     settlements,
+                    reservation_only,
                     retries: 0,
                 };
                 transaction = match assembly.assemble(owner.store(), harness) {
@@ -4453,6 +4519,7 @@ impl Scheduler {
                         || task_store::signal_revision_key(notify.task_id) == *key
                 })
             {
+                let refreshed = assembly.refresh_reservation_revision(owner.store(), key)?;
                 let old = assembly
                     .original
                     .checks()
@@ -4463,7 +4530,7 @@ impl Scheduler {
                     .checks()
                     .iter()
                     .find(|check| check.key == *key);
-                let retry = match (old, new) {
+                let retry = refreshed || match (old, new) {
                     (None, Some(_)) => true,
                     (Some(old), Some(new))
                         if assembly
@@ -18552,7 +18619,7 @@ mod standalone_foreground_cleanup_tests {
     }
 
     #[test]
-    fn cross_notification_reservation_fences_signal_at_commit() {
+    fn task_notification_reservation_fences_signal_at_commit() {
         use crate::document::{Address, Documents, TaskDocuments};
         use crate::runtime::{
             Config, Harness, Options, SubmissionNotify, submission_settled_signal,
@@ -18570,6 +18637,7 @@ mod standalone_foreground_cleanup_tests {
         }
         struct Writer {
             target: Uuid,
+            local: bool,
             calls: Arc<AtomicUsize>,
         }
         impl Handler for Writer {
@@ -18582,15 +18650,19 @@ mod standalone_foreground_cleanup_tests {
                 docs: &mut TaskDocuments<'_>,
             ) -> Result<Step, String> {
                 let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
-                let result = docs.submit_write_to_session_conversation_without_request_id(
-                    self.target,
-                    "app.reservation".into(),
-                    None,
-                    Some(SubmissionNotify {
-                        task_id: task.id(),
-                        key: "collision".into(),
-                    }),
-                );
+                let notify = Some(SubmissionNotify {
+                    task_id: task.id(),
+                    key: "collision".into(),
+                });
+                let result = if self.local {
+                    docs.submit_write_without_request_id(
+                        "app.reservation".into(),
+                        None,
+                        notify,
+                    )
+                } else {
+                    docs.submit_write_to_session_conversation_without_request_id(self.target, "app.reservation".into(), None, notify)
+                };
                 if attempt > 0 {
                     assert!(result.is_err());
                     return Ok(Step::Succeed(json!(null)));
@@ -18613,57 +18685,67 @@ mod standalone_foreground_cleanup_tests {
                 }))
             }
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        let mut harness = Harness::open_paused(
-            &path,
-            Options {
-                model: Arc::new(Stub),
-                tools: vec![],
-                restart_limit: 3,
-                max_turns: 3,
-                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
-            },
-        )
-        .unwrap();
-        let config = || Config {
-            model: "test".into(),
-            system_prompt: String::new(),
-            max_output_tokens: 10,
-        };
-        let owner = harness.create_conversation(config()).unwrap();
-        let target = harness.create_conversation(config()).unwrap();
-        let store = durable_store::Store::open(&path).unwrap();
-        let sessions = crate::session_membership::SessionMembership::new(&store);
-        let session = sessions.create().unwrap();
-        sessions.enroll(session, owner).unwrap();
-        sessions.enroll(session, target).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut registry = Registry::default();
-        registry.register(
-            "reservation-fence",
-            true,
-            Writer {
-                target,
-                calls: calls.clone(),
-            },
-        );
-        let mut scheduler = harness.attach_tasks(registry).unwrap();
-        let writer = Task::new(
-            Uuid::new_v4(),
-            TaskOwner::Conversation(owner),
-            Checkpoint {
-                phase: "start".into(),
-                data: json!(null),
-            },
-            3,
-        )
-        .unwrap()
-        .registered("reservation-fence".into(), true);
-        scheduler.submit(&writer).unwrap();
-        let once = Arc::new(AtomicBool::new(false));
-        let writer_id = writer.id();
-        scheduler.set_result_commit_hook(Arc::new(move |_, store| {
+        for local in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(
+                &path,
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy:
+                        crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            let config = || Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            };
+            let owner = harness.create_conversation(config()).unwrap();
+            let target = if local {
+                owner
+            } else {
+                harness.create_conversation(config()).unwrap()
+            };
+            let store = durable_store::Store::open(&path).unwrap();
+            let sessions =
+                crate::session_membership::SessionMembership::new(&store);
+            let session = sessions.create().unwrap();
+            sessions.enroll(session, owner).unwrap();
+            if !local {
+                sessions.enroll(session, target).unwrap();
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register(
+                "reservation-fence",
+                true,
+                Writer {
+                    target,
+                    local,
+                    calls: calls.clone(),
+                },
+            );
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            let writer = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(owner),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("reservation-fence".into(), true);
+            scheduler.submit(&writer).unwrap();
+            let once = Arc::new(AtomicBool::new(false));
+            let writer_id = writer.id();
+            scheduler.set_result_commit_hook(Arc::new(move |_, store| {
             if !once.swap(true, Ordering::SeqCst) {
                 let id = Uuid::new_v4();
                 let value = json!({"id":id,"conversationId":owner,"type":"write","status":"done","entry":id});
@@ -18671,35 +18753,53 @@ mod standalone_foreground_cleanup_tests {
                 TaskStore::new(store).send_signal(&signal).unwrap();
             }
         }));
-        for _ in 0..8 {
-            scheduler.tick(0).unwrap();
-            if scheduler.get(writer.id()).unwrap().unwrap().is_terminal() {
-                break;
+            for _ in 0..8 {
+                scheduler.tick(0).unwrap();
+                if scheduler
+                    .get(writer.id())
+                    .unwrap()
+                    .unwrap()
+                    .is_terminal()
+                {
+                    break;
+                }
             }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(matches!(
+                scheduler.get(writer.id()).unwrap().unwrap().state(),
+                TaskState::Succeeded(_)
+            ));
+            assert!(
+                harness
+                    .conversation(target)
+                    .unwrap()
+                    .application_writes
+                    .is_empty()
+            );
+            let address = Address {
+                scope: "test".into(),
+                name: "reservation-fence".into(),
+                key: "".into(),
+            };
+            assert!(
+                Documents::new(&store).get(&address).unwrap().is_none()
+            );
+            let binding = format!(
+                "durable/owned-subagent-notify/{}/636f6c6c6973696f6e",
+                writer.id()
+            );
+            assert!(store.get(binding.as_bytes()).unwrap().is_none());
+            assert!(
+                TaskStore::new(&store)
+                    .read_typed_signal(
+                        writer.id(),
+                        &submission_settled_signal(),
+                        "collision"
+                    )
+                    .unwrap()
+                    .is_some()
+            );
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(matches!(
-            scheduler.get(writer.id()).unwrap().unwrap().state(),
-            TaskState::Succeeded(_)
-        ));
-        assert!(
-            harness
-                .conversation(target)
-                .unwrap()
-                .application_writes
-                .is_empty()
-        );
-        let address = Address {
-            scope: "test".into(),
-            name: "reservation-fence".into(),
-            key: "".into(),
-        };
-        assert!(Documents::new(&store).get(&address).unwrap().is_none());
-        assert!(
-            TaskStore::new(&store)
-                .read_typed_signal(writer.id(), &submission_settled_signal(), "collision")
-                .unwrap()
-                .is_some()
-        );
     }
+
 }

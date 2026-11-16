@@ -4213,8 +4213,7 @@ pub(crate) fn validate_task_submissions(
             &item.draft,
             &item.notify,
         )?;
-        if cross_conversation
-            && tx.table_written
+        if tx.table_written
             && let Some(notify) = &item.notify
         {
             let key = (notify.task_id, notify.key.clone());
@@ -4238,8 +4237,7 @@ pub(crate) fn validate_task_submissions(
                 "submission notification key is reserved".into(),
             ));
         }
-        if cross_conversation
-            && tx.table_written
+        if tx.table_written
             && let Some(notify) = &item.notify
             && !check_submission_destination(store, notify)?
         {
@@ -4352,11 +4350,7 @@ impl Harness {
             return Err(durable_store::Error::Conflict { key }.into());
         }
         check_task_notification_binding(self.owner.store(), intent)?;
-        let reservation_boundary = if intent.cross_conversation {
-            Some(self.owner.store().put_version()?)
-        } else {
-            None
-        };
+        let reservation_boundary = self.owner.store().put_version()?;
         if let Err(error) = validate_task_submissions(
             self.owner.store(),
             &record.value,
@@ -4393,8 +4387,7 @@ impl Harness {
                 &item.draft,
                 &item.notify,
             )?;
-            if intent.cross_conversation
-                && tx.table_written
+            if tx.table_written
                 && let Some(notify) = &item.notify
             {
                 reservations.push((id, notify.clone()));
@@ -4437,7 +4430,7 @@ impl Harness {
             checks.push(Check {
                 key: b"runtime/conversation/".to_vec(),
                 expected: Expected::PrefixUnchangedSince(
-                    reservation_boundary.expect("cross-session reservation"),
+                    reservation_boundary,
                 ),
             });
             for (id, notify) in reservations {
