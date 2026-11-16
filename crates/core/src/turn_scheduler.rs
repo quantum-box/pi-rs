@@ -242,6 +242,62 @@ fn turn_is_strict(decision: &crate::ToolDecisionSnapshot, spec: &ToolSpec) -> Re
     ))
 }
 
+fn turn_strict_tool_preflight(tool: &RegisteredTool) -> Result<()> {
+    turn_recovery_identity(tool)?;
+    // Remove only when both pending recovery paths consume the durable snapshot.
+    if tool.tool.can_poll() {
+        return Err(Error::Session(
+            "strict pollable tools require snapshot-aware recovery".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Preflight the complete direct-call batch before any lifecycle callback: a
+// later invalid call must not let earlier callbacks perform effects either.
+fn turn_preflight_strict_calls(
+    registry: &Registry,
+    advertised: &HashSet<String>,
+    invocations: &[Invocation],
+    decision: &crate::ToolDecisionSnapshot,
+) -> Result<()> {
+    let validated = decision
+        .validate_recorded(
+            decision.context(),
+            decision.request_sha256(),
+            decision.dispatch_sha256(),
+            decision.binding_sha256(),
+        )
+        .map_err(|_| Error::Session("invalid tool decision".into()))?;
+    for invocation in invocations {
+        let Some(effective) = validated
+            .effective_tools()
+            .iter()
+            .find(|entry| entry.spec.name == invocation.call.name)
+        else {
+            continue;
+        };
+        if !matches!(
+            effective.sampling,
+            crate::EffectiveToolSampling::StrictJsonSchema { .. }
+        ) {
+            continue;
+        }
+        let tool = registry
+            .tools
+            .get(&invocation.call.name)
+            .filter(|_| advertised.contains(&invocation.call.name))
+            .ok_or_else(|| Error::Session("strict tool is not registered or advertised".into()))?;
+        if tool.spec != effective.spec {
+            return Err(Error::Session(
+                "strict tool does not match request decision".into(),
+            ));
+        }
+        turn_strict_tool_preflight(tool)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod strict_argument_tests {
     use super::*;
@@ -252,6 +308,7 @@ mod strict_argument_tests {
         pending: bool,
         identity: Option<&'static str>,
         seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        callbacks: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     }
 
     #[async_trait::async_trait]
@@ -297,6 +354,26 @@ mod strict_argument_tests {
         fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
             vec![self.0.clone()]
         }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if let crate::LifecycleEvent::ToolExecutionStart { args, .. } = event {
+                self.0
+                    .callbacks
+                    .lock()
+                    .unwrap()
+                    .push(("start".into(), args.clone()));
+            }
+            Ok(())
+        }
         async fn tool_call(
             &self,
             _: &str,
@@ -304,6 +381,11 @@ mod strict_argument_tests {
             _: &ToolContext,
             _: Option<&crate::ExtensionState>,
         ) -> crate::ExtensionResult<Decision> {
+            self.0
+                .callbacks
+                .lock()
+                .unwrap()
+                .push(("authorize".into(), args.clone()));
             args["path"] = json!("authorized");
             Ok(Decision::Allow)
         }
@@ -408,18 +490,37 @@ mod strict_argument_tests {
         strict: bool,
         pending: bool,
     ) -> (Result<()>, Session, Invocation, Arc<FixtureTool>) {
+        run_fixture_with(pollable, identity, strict, pending, false, false).await
+    }
+
+    async fn run_fixture_with(
+        pollable: bool,
+        identity: Option<&'static str>,
+        strict: bool,
+        pending: bool,
+        mismatched_spec: bool,
+        forged: bool,
+    ) -> (Result<()>, Session, Invocation, Arc<FixtureTool>) {
         let tool = Arc::new(FixtureTool {
             pollable,
             pending,
             identity,
             seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            callbacks: Arc::default(),
         });
         let mut registry = Registry::default();
         registry
             .register(Arc::new(FixtureExtension(tool.clone())))
             .unwrap();
         let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
-        let invocation = recorded_turn(&mut session, crate::Tool::spec(tool.as_ref()), strict);
+        let mut spec = crate::Tool::spec(tool.as_ref());
+        if mismatched_spec {
+            spec.description = "different registered tool".into();
+        }
+        let mut invocation = recorded_turn(&mut session, spec, strict);
+        if forged {
+            invocation.call.arguments = "{}".into();
+        }
         let agent = Agent {
             model: &FixtureModel,
             model_name: "model",
@@ -458,6 +559,13 @@ mod strict_argument_tests {
             vec![json!({"path":"file"}), json!({"path":"authorized"})]
         );
         assert!(invocation.call.arguments.contains("null"));
+        assert_eq!(
+            *tool.callbacks.lock().unwrap(),
+            vec![
+                ("start".into(), json!({"path":"file","limit":null})),
+                ("authorize".into(), json!({"path":"file"}))
+            ]
+        );
         let start = session.records().iter().find(|record| matches!(&record.event, Event::ToolStarted { operation_id, .. } if *operation_id == invocation.operation_id)).unwrap();
         assert_eq!(
             session
@@ -478,6 +586,7 @@ mod strict_argument_tests {
             let (result, session, _, tool) = run_fixture(true, identity, true, false).await;
             assert!(result.is_err());
             assert!(tool.seen.lock().unwrap().is_empty());
+            assert!(tool.callbacks.lock().unwrap().is_empty());
             assert!(
                 !session
                     .records()
@@ -509,6 +618,7 @@ mod strict_argument_tests {
             run_fixture(true, Some("backend:v1"), true, false).await;
         assert!(result.is_err());
         assert!(tool.seen.lock().unwrap().is_empty());
+        assert!(tool.callbacks.lock().unwrap().is_empty());
         assert!(!session.records().iter().any(|record| matches!(&record.event, Event::ToolStarted { operation_id, .. } if *operation_id == invocation.operation_id)));
     }
 
@@ -525,6 +635,23 @@ mod strict_argument_tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_strict_provenance_or_spec_rejects_before_callbacks() {
+        for (mismatched_spec, forged) in [(true, false), (false, true)] {
+            let (result, session, _, tool) =
+                run_fixture_with(false, None, true, false, mismatched_spec, forged).await;
+            assert!(result.is_err());
+            assert!(tool.callbacks.lock().unwrap().is_empty());
+            assert!(tool.seen.lock().unwrap().is_empty());
+            assert!(
+                !session
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::ToolStarted { .. }))
+            );
+        }
+    }
+
     #[test]
     fn rejects_forged_invocation_and_superseded_turn_before_hooks() {
         let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
@@ -533,6 +660,7 @@ mod strict_argument_tests {
             pending: false,
             identity: None,
             seen: Arc::default(),
+            callbacks: Arc::default(),
         };
         let invocation = recorded_turn(&mut session, crate::Tool::spec(&tool), true);
         assert!(
@@ -759,14 +887,7 @@ impl Agent<'_> {
         if let Some(decision) = decision
             && turn_is_strict(decision, &tool.spec)?
         {
-            // Fail before launching any member of a prepared parallel group.
-            turn_recovery_identity(&tool)?;
-            // Remove only when pending recovery consumes the durable snapshot.
-            if tool.tool.can_poll() {
-                return Err(Error::Session(
-                    "strict pollable tools require snapshot-aware recovery".into(),
-                ));
-            }
+            turn_strict_tool_preflight(&tool)?;
         }
         let args = match turn_model_arguments(invocation, &tool.spec, validated.as_ref()) {
             Ok(arguments) => arguments,
@@ -1202,6 +1323,9 @@ impl Agent<'_> {
         } else {
             None
         };
+        if let Some(decision) = turn_decision.as_deref() {
+            turn_preflight_strict_calls(self.registry, scope.advertised, invocations, decision)?;
+        }
         let observe_tools = self.registry.extensions.iter().any(|extension| {
             extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
         });
@@ -1403,6 +1527,8 @@ impl Agent<'_> {
                     futures.push(async move {
                         let mut errors = Vec::new();
                         if observe_tools {
+                            // Upstream Pi emits raw model arguments here before
+                            // prepareToolCall; strict normalization is for execution.
                             let event = crate::LifecycleEvent::ToolExecutionStart {
                                 tool_call_id: invocation.call.id.clone(), tool_name: invocation.call.name.clone(),
                                 args: crate::parse_tool_arguments(&invocation.call.arguments).unwrap_or(serde_json::Value::Null),
