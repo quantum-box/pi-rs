@@ -13902,8 +13902,7 @@ impl Harness {
         match (marker, cleanup_attempt) {
             (None, None) => (),
             (Some(marker), Some(attempt))
-                if serde_json::from_slice::<Uuid>(&marker.value)? == attempt =>
-            {}
+                if serde_json::from_slice::<Uuid>(&marker.value)? == attempt => {}
             _ => {
                 return Err(Error::Invalid(
                     "standalone cleanup outcome uncertain; reconcile before retry".into(),
