@@ -4030,6 +4030,14 @@ impl Harness {
         worker.merged_source = None;
         worker
     }
+    pub(crate) fn bind_task_driver(
+        &self,
+        driver: std::sync::Weak<crate::task_driver::Shared>,
+    ) -> Result<(), Error> {
+        *self.task_driver.lock().map_err(|_| Error::Failed)? = Some(driver);
+        Ok(())
+    }
+
     pub(crate) async fn drive_owned_cleanup(
         &mut self,
         id: Uuid,
@@ -12992,6 +13000,34 @@ impl Harness {
         }
         Ok(())
     }
+    // Drive only already-marked abort cleanup, never retained queued input.
+    pub(crate) async fn settle_one_owned_abort(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<bool, Error> {
+        for id in self.conversations()? {
+            let (observed, _) = self.load(id)?;
+            if !observed.abort_requested {
+                continue;
+            }
+            let control = self.owner.conversation_controls().get(id);
+            let _worker = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Interrupted),
+                guard = control.worker.lock() => guard,
+            };
+            let mut worker = self.worker();
+            worker.execution_gate = Some(control.gate.clone());
+            let (conversation, version) = worker.load(id)?;
+            if conversation.abort_requested
+                && worker.settle_abort(conversation, version, cancel).await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn task_tool_result(
         &self,
         conversation: Uuid,

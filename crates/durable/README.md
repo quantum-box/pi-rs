@@ -31,8 +31,17 @@ noncooperating writers or processes. A task driver started through the harness
 atomically marks its foreground owned graph, cancels active conversation workers,
 and drives cleanup using the harness registrations. Pending cleanup is discovered
 again when the driver is restarted. Shutdown can interrupt cleanup; blocked effects
-still require reconciliation. A driver started directly from a standalone task
-scheduler has no conversation runtime and continues to reject foreground aborts.
+still require reconciliation. To enable the same cleanup from the standalone task
+scheduler, use `task_scheduler::Scheduler::open_with_conversation_runtime` with
+runtime options. It shares one exclusive store owner with its attached harness.
+`tick_with_conversation_cleanup` drives one task step and at most one marked
+conversation cleanup step without executing retained queued input. A cleanup error or cancelled
+cleanup or a dropped cleanup future poisons the task scheduler; drop it and reopen before retrying. Hosts needing
+additional provider or extension configuration can configure a `Harness` and use
+`Harness::attach_tasks` instead; the scheduler retains a shared harness worker.
+A `task_driver::Driver`
+started from that scheduler runs its cleanup coordinator automatically. Plain
+`Scheduler::open` has no conversation runtime and still rejects foreground aborts.
 
 Model requests, completed responses, tool intents and results are committed
 before the next effect. Interrupted model requests settle as unconfirmed before
@@ -580,10 +589,11 @@ descendants. Task-owned foreground subagent conversations are marked and
 scheduled for cleanup by the conversation scheduler; background edges are boundaries.
 Task cleanup waits until each foreground child conversation has settled its abort,
 including that conversation's foreground tasks. `Scheduler::abort_and_wait` joins
-workers for the entire affected foreground scope. Standalone task-driver aborts
-still reject foreground conversation children because they cannot drive or cancel
-their workers. A blocked uncertain operation requires reconciliation, and a task
-driver must be running to drain tasks.
+workers for the entire affected foreground scope. Standalone task schedulers can
+attach a conversation runtime using `open_with_conversation_runtime`; manually
+driven callers use `tick_with_conversation_cleanup` and drivers run cleanup in the
+background. Plain `open` still rejects foreground conversation aborts. A blocked
+uncertain operation requires reconciliation.
 
 Inputs parked after a failed child run do not hold their task owner open. Before
 a failed owner finishes, its foreground cascade withdraws parked inputs unless
@@ -1610,8 +1620,9 @@ a task commit and become stale as soon as it returns. Signal and child wait eval
 driver and scheduler signal delivery is fenced by the task gate; direct unfenced
 TaskStore writers are outside the consistency protocol. Abort
 cleanup may still depend on foreground conversations. A standalone scheduler
-cannot abort a task with foreground owned conversations; use the attached driver
-for that ownership graph. Unlike upstream `onWake`, hints are
+opened with `open_with_conversation_runtime` can mark them and use
+`tick_with_conversation_cleanup` to drain them; a driver started from it drives
+cleanup automatically. Plain `open` still rejects such aborts. Unlike upstream `onWake`, hints are
 not a change-only `{active, at}` callback, and the snapshot covers generic tasks
 only. The driver continues polling; this is not a host-managed alarm or a
 conversation scheduling snapshot.

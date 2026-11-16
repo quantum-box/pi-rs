@@ -130,7 +130,8 @@ impl Driver {
         )
     }
     pub fn start(scheduler: task_scheduler::Scheduler) -> Self {
-        Self::start_inner(scheduler, None)
+        let harness = scheduler.conversation_harness();
+        Self::start_inner(scheduler, harness)
     }
     pub(crate) fn start_with_harness(
         scheduler: task_scheduler::Scheduler,
@@ -171,6 +172,16 @@ impl Driver {
             notifications: Mutex::new(Some(notify_tx)),
             subscription: Mutex::new(Some(notify_rx)),
         });
+        if let Some(harness) = &shared.harness {
+            let bound = harness.lock().map_err(|_| ()).and_then(|harness| {
+                harness
+                    .bind_task_driver(Arc::downgrade(&shared))
+                    .map_err(|_| ())
+            });
+            if bound.is_err() {
+                shared.stop_for_failure("conversation driver binding failed".into());
+            }
+        }
         let task_shared = shared.clone();
         let worker = thread::spawn(move || {
             // Close the host channel even if a handler panics.
