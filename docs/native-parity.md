@@ -134,6 +134,10 @@ without `defaultProvider` are still accepted.
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+Package list emits native JSON events for every configured entry in user then
+trusted-project order, including duplicates, with `scope` and `filtered` fields.
+Transient `-e` sources are excluded, as in Pi's configured-package list.
+
 Local package `file://` sources ignore URL query and fragment components and
 reject malformed path escapes and encoded separators, as Pi does.
 
@@ -706,6 +710,21 @@ reasoning, a local read tool, theme and session-name persistence, native branch
 cloning, HTML/JSONL exports, model discovery/selection and terminal restoration.
 
 ### Resources checkpoint
+
+Native SDK hosts can explicitly load skill metadata snapshots from granted files
+and format the visible skills with Pi's reader hint and XML escaping. Relative
+paths require an explicit absolute base; parent components and non-UTF-8 paths
+are rejected so rendering cannot change the file selected by the host. Hidden
+model-invocation skills remain in the snapshot for explicit use. Reads follow
+symlinks and do not grant later file access; no directories, packages or settings
+are discovered implicitly. Hosts can explicitly grant recursive directories;
+scans read local ignore files, skip hidden entries and node_modules, and stop at
+an unignored SKILL.md. Directory grants authorize enumeration and ignore-file
+reads and discovered skill-file contents throughout the granted subtree, including symlink targets outside it; they
+are not a sandbox. Scans bound file, entry, ignore-byte, ignore-line and depth
+counts. Each file is capped at 256 KiB. Read, ignore, parse and duplicate-name
+errors fail the entire load, unlike Pi's per-file warnings and continuation.
+Hosts own skill invocation and must authorize each later file read independently.
 
 Native SDK hosts can load prompt template snapshots from explicitly granted `.md`
 files or direct children of explicitly granted directories. No directories,
@@ -1911,6 +1930,15 @@ Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
 Consecutive paragraphs retain a single separating blank line, including inside
 block quotes; hard line breaks do not add paragraph spacing.
+Top-level tables are separated from a preceding rendered block by a blank line.
+Inline and display LaTeX use a native port of the pinned Pi terminal renderer,
+including fractions, operators, scripts and matrix environments. Math can occur
+in list items and quotes; unsupported or incomplete expressions retain their
+source. Oversized or deeply nested expressions and exhausted rendering budgets
+fall back to source text. These limits are intentional native safeguards and
+may preserve an expression that Pi would render. A pinned reference fixture
+checks 3,474 expression renderings; Markdown tests cover delimiters, code,
+links, list indentation, streaming and narrow display widths.
 
 Unit tests cover these layouts and Unicode widths. A PTY fixture verifies both
 terminal modes, heading decoration, code fences, nested quotes and clean exit.
@@ -1922,6 +1950,8 @@ numbers, and highlight changed words for one-line replacements. Added, removed
 and context lines use their dedicated theme colors. Tabs expand to three spaces,
 and word comparison follows Pi's `diffWords` token grouping and whitespace
 deduplication, including the first changed fragment's indentation treatment.
+Numbered diff gutters use JavaScript's whitespace and line-terminator rules,
+including its treatment of BOM and U+0085.
 Comparison has a shared 100 ms budget per render; oversized or unfinished
 comparisons retain line-level highlighting. The Rust word-diff implementation
 derives from jsdiff 8.0.4; its BSD license is in
@@ -3538,11 +3568,12 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
-payload for provider replay. The current RPC event representation emits an
-extra placeholder delta for redacted blocks and does not expose the redacted
-flag or signature in partial messages; Pi includes them at block start. RPC
-`get_messages` reconstructs signed Anthropic block order from validated replay;
-unsigned text-only responses are still collapsed into one text block.
+payload for provider replay. Live Pi RPC thinking-start partial messages include
+the redacted flag without a synthetic delta. Unlike Pi, they omit the opaque
+thinking signature. Legacy model and agent observers continue to receive the
+placeholder delta. RPC `get_messages` reconstructs signed Anthropic block order
+from validated replay, retains the redacted flag, and omits opaque signatures
+from history. Unsigned text-only responses are still collapsed into one text block.
 Unlike Pi, the native agent has separate 1 MiB cumulative budgets for reasoning
 deltas and provider-supplied finalized reasoning. When the finalized budget is
 exceeded, block-end notifications contain only that block's observed deltas;
@@ -4046,9 +4077,9 @@ is acknowledged after the entry is committed; the entry does not enter model
 context.
 Idle session start, shutdown, and name-change notifications delivered through
 the session-owned lifecycle API also support custom entries. Single-command
-workbench startup and shutdown use this path. Other callback types, persistent
-workers, and the owned SDK's scoped startup use their existing host paths and
-do not yet expose it.
+workbench startup and shutdown use this path. The owned SDK also exposes entry
+access to scoped startup and idle input callbacks through their session owner.
+Persistent workers and other callback types do not yet expose it.
 These callbacks can read active-branch custom entries, optionally filtered
 by type, including entries appended earlier in the callback. Responses over
 8 MiB are rejected. An executable
@@ -4533,6 +4564,15 @@ them, using the active model. Loopback checks covered a raw RPC prompt,
 a follow-up queued during streaming, the journaled resized bytes, and
 rejection of invalid image data before any model request.
 
+### Responses prompt cache key configuration
+
+Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
+`enabled`, or `disabled`, with model settings overriding provider settings.
+`auto` and `enabled` use the session-derived cache key when caching is active;
+`disabled` omits the automatic key. An explicit sampling field can still
+supply a key, matching the upstream request merge order. The setting does not
+disable session routing headers or prompt caching itself.
+
 ### Responses cache retention checkpoint
 
 For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
@@ -4579,8 +4619,13 @@ Pi-compatible Anthropic subscription credentials already present in
 `auth.json` are bound to the official Messages endpoint and refreshed under
 the auth lock. OAuth requests use Pi's subscription headers, identity and
 tool-name mapping. To avoid ambiguous dispatch, native rejects tool names
-that differ only in case. Interactive Anthropic OAuth login and live
-subscription acceptance remain open.
+that differ only in case. `/login anthropic` supports browser and copy-code
+authorization; `pi login anthropic --copy-code` enables the headless flow.
+The browser callback binds and advertises IPv4 loopback and uses a state
+independent of the PKCE verifier, unlike upstream's `localhost` callback and
+shared state/verifier. Live subscription login and acceptance remain open.
+Native token exchanges have a 30-second HTTP timeout; upstream bounds stored
+OAuth refresh to 15 seconds.
 Opaque Anthropic replay is shared between API-key and OAuth authentication
 at the official endpoint, while custom endpoints use separate replay scopes;
 legacy custom-endpoint replay without a matching scope falls back to the
@@ -5093,6 +5138,12 @@ loaded once. Hosts choose directories and
 when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
 follow symlinks, fail atomically on errors, and use the prompt resource size limit.
 Unlike Pi, unreadable higher-priority files fail rather than falling through.
+Hosts that have verified a nested linked worktree can opt into Pi's matching-name
+shadowing by supplying both explicitly granted roots. The selected main-root
+entry is suppressed when the nested worktree has the same selected filename;
+separate directory aliases remain available for global context. Hosts identify
+the global role explicitly when it shares the main-root path. The host verifies
+the repository relationship, and no Git metadata or additional paths are read.
 
 The SDK model catalog can enumerate its host-registered provider/model identities
 in deterministic order for host model pickers. This lists the immutable catalog

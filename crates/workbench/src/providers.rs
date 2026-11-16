@@ -726,6 +726,62 @@ impl Client {
         }
     }
 
+    pub async fn stream_detailed_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+        cache_disabled: bool,
+        session_cache_key: Option<&str>,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        match self {
+            Self::Anthropic(client) => {
+                if cache_disabled {
+                    client
+                        .clone()
+                        .without_cache()
+                        .stream_detailed_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else {
+                    let client = if defaults.is_empty() {
+                        client.clone()
+                    } else {
+                        client.clone().with_default_headers(defaults)
+                    };
+                    client
+                        .stream_detailed_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            session_cache_key.unwrap_or_default(),
+                            request,
+                        )
+                        .await
+                }
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(client.resolve().await?.stream_detailed_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                ))
+                .await
+            }
+            _ => Ok(Box::pin(
+                self.stream_enriched_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                )
+                .await?
+                .map(|event| event.map(Into::into)),
+            )),
+        }
+    }
+
     pub fn aliases(&self) -> Vec<(String, String)> {
         match self {
             Self::PiMessages(client) => client.aliases(),
@@ -1025,6 +1081,10 @@ impl Client {
                     .responses_cache_support(&args.provider, metadata.as_ref());
                 let client = client
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
+                    .with_prompt_cache_key_enabled(
+                        args.model_profiles
+                            .responses_prompt_cache_key_enabled(&args.provider, metadata.as_ref()),
+                    )
                     .with_thinking(thinking)
                     .with_sampling(sampling)
                     .map_err(|error| {
@@ -1170,6 +1230,26 @@ impl Model for Client {
             Self::Bedrock(client) => client.context_window(model).await,
             Self::Deferred(client) => client.resolve().await.ok()?.context_window(model).await,
         }
+    }
+
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.stream_detailed_with_headers(request, &HeaderMap::new(), false, Some(external_id))
+            .await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.stream_detailed_with_headers(request, &HeaderMap::new(), true, None)
+            .await
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
@@ -1420,6 +1500,96 @@ mod estimation_tests {
                 .with_thinking(Some("high")),
         );
         assert_eq!(reset.context_identity(), expected.context_identity());
+    }
+
+    #[tokio::test]
+    async fn responses_cache_key_modes_reach_workbench_requests() {
+        use std::io::{Read, Write};
+        for (mode, expected) in [("disabled", None), ("enabled", Some("external-session"))] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let endpoint = format!("http://{address}/responses");
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"test":{
+                "api":"openai-responses", "baseUrl":endpoint, "compat":{"promptCacheKeyMode":"disabled"},
+                "models":[{"id":"m", "compat":{"promptCacheKeyMode":mode}}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = Client::OpenAi(
+                pi_rs::openai::OpenAiResponses::new_api_provider(
+                    &endpoint,
+                    "fixture".into(),
+                    "test",
+                )
+                .unwrap(),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let model = super::super::image_policy::WorkbenchModel {
+                client,
+                block_images: false,
+                supports_images: None,
+                session_affinity: &[],
+                price: None,
+            };
+            let _ = model
+                .stream_enriched_in_session_with_identity(
+                    uuid::Uuid::new_v4(),
+                    uuid::Uuid::new_v4(),
+                    "external-session",
+                    ModelRequest {
+                        model: "m".into(),
+                        messages: vec![],
+                        tools: vec![],
+                        max_output_tokens: 10,
+                    },
+                )
+                .await;
+            let body = server.join().unwrap();
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(|v| v.as_str()),
+                expected
+            );
+        }
     }
 
     #[tokio::test]

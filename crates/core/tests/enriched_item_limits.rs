@@ -447,3 +447,125 @@ async fn reasoning_closures_use_each_items_observed_deltas_after_cumulative_limi
         ]
     );
 }
+
+struct RedactedDetails;
+
+#[async_trait::async_trait]
+impl Model for RedactedDetails {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+        unreachable!()
+    }
+
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: &str,
+        _: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let events = vec![
+            pi_rs_core::DetailedModelEvent::redacted_start(4),
+            EnrichedModelEvent::ReasoningDelta {
+                index: 4,
+                delta: "[Reasoning redacted]".into(),
+            }
+            .into(),
+            EnrichedModelEvent::ReasoningEnd {
+                index: 4,
+                content: "[Reasoning redacted]".into(),
+            }
+            .into(),
+            pi_rs_core::DetailedModelEvent::redacted_start(5),
+            EnrichedModelEvent::ReasoningDelta {
+                index: 5,
+                delta: "[Reasoning redacted]".into(),
+            }
+            .into(),
+            EnrichedModelEvent::ReasoningEnd {
+                index: 5,
+                content: "[Reasoning redacted]".into(),
+            }
+            .into(),
+            EnrichedModelEvent::Legacy(ModelEvent::Text("answer".into())).into(),
+            EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                calls: vec![],
+                usage: Some(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }),
+            })
+            .into(),
+        ];
+        Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn redacted_start_details_are_scoped_and_legacy_events_remain() {
+    let registry = Registry::default();
+    let agent = Agent {
+        model: &RedactedDetails,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: Limits::default(),
+    };
+    let mut session = Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+    let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut seen = Vec::new();
+    agent
+        .run_with_events(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| match event {
+                AgentEvent::ReasoningStart { index: 4 | 5 } => {
+                    seen.push(("start", pi_rs_core::redacted_reasoning_start()))
+                }
+                AgentEvent::ReasoningDelta {
+                    index: 4 | 5,
+                    delta,
+                } => {
+                    assert_eq!(delta, "[Reasoning redacted]");
+                    seen.push(("delta", pi_rs_core::redacted_reasoning_start()));
+                }
+                AgentEvent::ReasoningEnd { index: 4 | 5, .. } => {
+                    seen.push(("end", pi_rs_core::redacted_reasoning_start()))
+                }
+                _ => {}
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seen,
+        [
+            ("start", true),
+            ("delta", false),
+            ("end", false),
+            ("start", true),
+            ("delta", false),
+            ("end", false)
+        ]
+    );
+    assert!(!pi_rs_core::redacted_reasoning_start());
+    let mut session = Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+    let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut legacy = String::new();
+    agent
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| {
+                if let pi_rs_core::Notification::Reasoning(delta) = event {
+                    legacy.push_str(delta);
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy, "[Reasoning redacted][Reasoning redacted]");
+}

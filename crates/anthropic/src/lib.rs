@@ -1323,13 +1323,41 @@ impl Model for Anthropic {
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         self.stream_enriched(request).await
     }
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        _external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_detailed(request).await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_detailed(request).await
+    }
 }
 
 impl Anthropic {
     async fn stream_enriched(
         &self,
-        mut request: ModelRequest,
+        request: ModelRequest,
     ) -> Result<pi_rs_core::EnrichedModelStream> {
+        Ok(Box::pin(
+            self.stream_detailed(request)
+                .await?
+                .map(|event| event.map(|event| event.event)),
+        ))
+    }
+
+    async fn stream_detailed(
+        &self,
+        mut request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
         let discovered = if self.thinking_level.is_some() {
             self.model(&request.model).await
         } else {
@@ -1497,32 +1525,36 @@ impl Anthropic {
                                 fragments: String::new(), complete: false,
                             });
                             report(Progress::PreparingTool);
-                            yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                            yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
                                 index,
                                 id: id.into(),
                                 name: name.into(),
                                 arguments: block["input"].as_object().filter(|input| !input.is_empty())
                                     .map_or_else(String::new, |input| Value::Object(input.clone()).to_string()),
-                            }));
+                            })));
                         } else {
                             let captured = ResponseBlock::new(block);
                             match block["type"].as_str() {
                                 Some("text") => {
                                     report(Progress::Generating);
-                                    yield pi_rs_core::EnrichedModelEvent::TextStart { index };
-                                    if !captured.text.is_empty() { yield pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: captured.text.clone() }; }
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextStart { index });
+                                    if !captured.text.is_empty() { yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: captured.text.clone() }); }
                                 }
                                 Some("thinking" | "redacted_thinking") => {
                                     report(Progress::Thinking);
-                                    yield pi_rs_core::EnrichedModelEvent::ReasoningStart { index };
+                                    yield if block["type"] == "redacted_thinking" {
+                                        pi_rs_core::DetailedModelEvent::redacted_start(index)
+                                    } else {
+                                        pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningStart { index })
+                                    };
                                     if block["type"] == "redacted_thinking" {
                                         let text = "[Reasoning redacted]";
                                         if let Some(observer) = &reasoning { observer(text); }
-                                        yield pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: text.into() };
+                                        yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: text.into() });
                                     }
                                     if !captured.text.is_empty() && block["type"] == "thinking" {
                                         if let Some(observer) = &reasoning { observer(&captured.text); }
-                                        yield pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: captured.text.clone() };
+                                        yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: captured.text.clone() });
                                     }
                                 }
                                 _ => {}
@@ -1541,7 +1573,7 @@ impl Anthropic {
                                 if let Some(text) = delta["text"].as_str().filter(|text| !text.is_empty()) {
                                     captured.text.push_str(text);
                                     report(Progress::Generating);
-                                    yield pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: text.into() };
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: text.into() });
                                 }
                             }
                             Some("thinking_delta") => {
@@ -1551,7 +1583,7 @@ impl Anthropic {
                                     captured.text.push_str(text);
                                     report(Progress::Thinking);
                                     if let Some(observer) = &reasoning { observer(text); }
-                                    yield pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: text.into() };
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: text.into() });
                                 }
                             }
                             Some("signature_delta") => {
@@ -1573,9 +1605,9 @@ impl Anthropic {
                                     .ok_or_else(|| Error::Model("Anthropic tool input has no open block".into()))?;
                                 if let Some(arguments) = delta["partial_json"].as_str().filter(|text| !text.is_empty()) {
                                     call.fragments.push_str(arguments);
-                                    yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
                                         index, id: String::new(), name: String::new(), arguments: arguments.into(),
-                                    }));
+                                    })));
                                 }
                             }
                             _ => {}
@@ -1589,9 +1621,9 @@ impl Anthropic {
                         if let Some(block) = blocks.get_mut(&index) {
                             if !block.complete {
                                 match block.raw["type"].as_str() {
-                                    Some("text") => yield pi_rs_core::EnrichedModelEvent::TextEnd { index, content: block.text.clone() },
-                                    Some("thinking") => yield pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content: block.text.clone() },
-                                    Some("redacted_thinking") => yield pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content: "[Reasoning redacted]".into() },
+                                    Some("text") => yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextEnd { index, content: block.text.clone() }),
+                                    Some("thinking") => yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content: block.text.clone() }),
+                                    Some("redacted_thinking") => yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content: "[Reasoning redacted]".into() }),
                                     _ => {}
                                 }
                             }
@@ -1661,9 +1693,9 @@ impl Anthropic {
                             }));
                         }
                         if metadata != previous {
-                            yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata));
+                            yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)));
                         }
-                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls: completed_calls, usage: usage.finish() });
+                        yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls: completed_calls, usage: usage.finish() }));
                         return;
                     }
                     Some("error") => {
@@ -1681,7 +1713,7 @@ impl Anthropic {
                     _ => {}
                 }
                 if metadata != previous {
-                    yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata.clone()));
+                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata.clone())));
                 }
             }
             Err(Error::RetryableModel("Anthropic stream ended before message_stop".into()))?;
@@ -1869,7 +1901,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
                 let _ = socket.read(&mut request).unwrap();
@@ -1965,6 +1997,38 @@ mod tests {
         assert_eq!(replay.blocks[2]["signature"], "sig");
         assert_eq!(replay.blocks[3]["signature"], "sig2");
         assert_eq!(replay.blocks[4]["data"], "opaque");
+        for summary in [false, true] {
+            let detailed = if summary {
+                model
+                    .stream_detailed_for_summary(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        request.clone(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                model
+                    .stream_detailed_in_session_with_identity(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        "session",
+                        request.clone(),
+                    )
+                    .await
+                    .unwrap()
+            }
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+            assert!(detailed.iter().any(|event| matches!(
+                event.event,
+                E::ReasoningStart { index: 4 }
+            ) && event.is_redacted_start()));
+            assert!(detailed.iter().any(|event| matches!(&event.event, E::ReasoningDelta { index: 4, delta } if delta == "[Reasoning redacted]")));
+        }
         let legacy = model
             .stream(request)
             .await

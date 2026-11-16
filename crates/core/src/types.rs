@@ -670,6 +670,33 @@ pub enum EnrichedModelEvent {
 
 pub type EnrichedModelStream = futures_util::stream::BoxStream<'static, Result<EnrichedModelEvent>>;
 
+/// An enriched event with an optional redacted-thinking start marker.
+#[derive(Clone)]
+pub struct DetailedModelEvent {
+    pub event: EnrichedModelEvent,
+    redacted: bool,
+}
+impl DetailedModelEvent {
+    pub fn redacted_start(index: u64) -> Self {
+        Self {
+            event: EnrichedModelEvent::ReasoningStart { index },
+            redacted: true,
+        }
+    }
+    pub fn is_redacted_start(&self) -> bool {
+        self.redacted
+    }
+}
+impl From<EnrichedModelEvent> for DetailedModelEvent {
+    fn from(event: EnrichedModelEvent) -> Self {
+        Self {
+            event,
+            redacted: false,
+        }
+    }
+}
+pub type DetailedModelStream = futures_util::stream::BoxStream<'static, Result<DetailedModelEvent>>;
+
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
     /// Resolve a request-specific adapter once for estimation and dispatch.
@@ -780,6 +807,37 @@ pub trait Model: Send + Sync {
             .stream_for_summary(request_id, session_id, request)
             .await?
             .map(|event| event.map(EnrichedModelEvent::Legacy))
+            .boxed())
+    }
+
+    /// Enriched stream with optional redacted-thinking start marker.
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<DetailedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_enriched_in_session_with_identity(request_id, session_id, external_id, request)
+            .await?
+            .map(|event| event.map(Into::into))
+            .boxed())
+    }
+
+    /// Summary counterpart of the detailed stream.
+    async fn stream_detailed_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<DetailedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_enriched_for_summary(request_id, session_id, request)
+            .await?
+            .map(|event| event.map(Into::into))
             .boxed())
     }
 

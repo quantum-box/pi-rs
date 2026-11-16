@@ -168,7 +168,6 @@ fn initial_appearance_report_keeps_late_color_replies() {
         },
         0
     );
-    let mut master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
     let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
     assert_eq!(
@@ -205,6 +204,10 @@ fn initial_appearance_report_keeps_late_color_replies() {
             .spawn()
             .unwrap(),
     );
+    // The command retains copies of the slave descriptors. Drop them and let
+    // the PTY master close before the child guard waits, including on panic.
+    drop(command);
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
     output_until_with_timeout(&mut master, Duration::from_secs(30), |text| {
         assert!(!text.contains("\x1b[38;2;"));
         text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
