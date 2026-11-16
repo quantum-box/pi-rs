@@ -15,6 +15,136 @@ pub(crate) fn open() -> io::Result<File> {
     open_in_profile(&profile)
 }
 
+/// WIP: serializes participating processes only. No crash recovery is wired in.
+/// Older/non-cooperating readers and OAuth transactions remain non-atomic.
+pub(crate) struct AccountGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    file: File,
+    #[cfg(windows)]
+    _mutex: windows_mutex::Guard,
+}
+
+impl AccountGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn file(&self) -> Option<&File> {
+        Some(&self.file)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn file(&self) -> Option<&File> {
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn acquire(credential: Option<&File>) -> io::Result<AccountGuard> {
+    let file = open_off_runtime(open).await?;
+    acquire_checked(file, credential).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn open_off_runtime<F>(open_file: F) -> io::Result<File>
+where
+    F: FnOnce() -> io::Result<File> + Send + 'static,
+{
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+    open_off_runtime_with_timeout(&SLOTS, open_file, std::time::Duration::from_secs(10)).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn open_off_runtime_with_timeout<F>(
+    slots: &'static tokio::sync::Semaphore,
+    open_file: F,
+    timeout: std::time::Duration,
+) -> io::Result<File>
+where
+    F: FnOnce() -> io::Result<File> + Send + 'static,
+{
+    tokio::time::timeout(timeout, open_off_runtime_with_slots(slots, open_file))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MCP account lookup timed out"))?
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn open_off_runtime_with_slots<F>(
+    slots: &'static tokio::sync::Semaphore,
+    open_file: F,
+) -> io::Result<File>
+where
+    F: FnOnce() -> io::Result<File> + Send + 'static,
+{
+    // NSS can block indefinitely. A detached thread avoids blocking runtime
+    // shutdown; it opens the file but never acquires its lock. Cancellation can
+    // still leave that lookup running and it may create the gate file later.
+    // Bound leaked workers if the account service never responds. A permit
+    // stays occupied after cancellation until its lookup actually ends.
+    let slot = slots
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("MCP account lookup slots unavailable"))?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("mcp-account-lookup".into())
+        .spawn(move || {
+            let _slot = slot;
+            let _ = send.send(open_file());
+        })?;
+    receive
+        .await
+        .map_err(|_| io::Error::other("MCP account lookup failed"))?
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn acquire_checked(file: File, credential: Option<&File>) -> io::Result<AccountGuard> {
+    if let Some(credential) = credential {
+        if same_file::Handle::from_file(file.try_clone()?)?
+            == same_file::Handle::from_file(credential.try_clone()?)?
+        {
+            return Err(io::Error::other("MCP account gate aliases credential lock"));
+        }
+    }
+    acquire_file(file).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn acquire_file(file: File) -> io::Result<AccountGuard> {
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(AccountGuard { file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn acquire_for_test(
+    profile: &Path,
+    credential: Option<&File>,
+) -> io::Result<AccountGuard> {
+    acquire_checked(open_in_profile(profile)?, credential).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn acquire(_credential: Option<&File>) -> io::Result<AccountGuard> {
+    let guard = windows_mutex::acquire().await?;
+    if guard.abandoned {
+        return Err(io::Error::other(
+            "abandoned MCP gate requires recovery; recovery is not implemented",
+        ));
+    }
+    Ok(AccountGuard { _mutex: guard })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) async fn acquire(_credential: Option<&File>) -> io::Result<AccountGuard> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "shared MCP gate unavailable",
+    ))
+}
+
 #[cfg(unix)]
 fn account_profile() -> io::Result<PathBuf> {
     use std::{
@@ -270,6 +400,75 @@ fn open_in_profile(_profile: &Path) -> io::Result<File> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[tokio::test]
+    async fn blocked_account_lookup_can_be_cancelled() {
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("gate");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut lookup = Box::pin(open_off_runtime_with_slots(&SLOTS, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            let result = File::create(path);
+            let _ = finished_tx.send(());
+            result
+        }));
+        tokio::select! {
+            _ = started_rx => (),
+            _ = &mut lookup => panic!("lookup unexpectedly completed"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut lookup)
+                .await
+                .is_err()
+        );
+        drop(lookup);
+        assert!(SLOTS.try_acquire().is_err());
+        let waiting = open_off_runtime_with_timeout(
+            &SLOTS,
+            || panic!("no slot was available"),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(waiting.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), SLOTS.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_account_lookup_times_out_without_releasing_worker_slot() {
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("gate");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let result = open_off_runtime_with_timeout(
+            &SLOTS,
+            move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                File::create(path)
+            },
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        started_rx.await.unwrap();
+        assert!(SLOTS.try_acquire().is_err());
+        release_tx.send(()).unwrap();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), SLOTS.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
         fn drop(&mut self) {

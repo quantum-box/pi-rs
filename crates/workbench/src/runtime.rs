@@ -216,7 +216,7 @@ impl Runtime {
             }
         }
         let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
-        let (selection, _, hidden) = tool_discovery(args, &servers)?;
+        let (selection, _, hidden) = tool_discovery(args, &servers).await?;
         self.system_prompt = select_tools(
             &mut self.registry,
             &selection,
@@ -604,7 +604,7 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
             registry.replace(refreshed.clone())?;
             servers.push(refreshed);
         }
-        let (selection, documents, hidden) = tool_discovery(&self.args, &servers)?;
+        let (selection, documents, hidden) = tool_discovery(&self.args, &servers).await?;
         registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
             documents,
         )))?;
@@ -641,7 +641,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     let discovered = mcp_config::discover(args, false, interactive_mcp).await?;
     let mcp_connections = discovered.connected;
     let result = async {
-        let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;
+        let (selection, documents, hidden) = tool_discovery(args, &mcp_connections).await?;
         let only_code = match args.settings.value()["codemode"]["mode"]
             .as_str()
             .unwrap_or("on")
@@ -891,7 +891,7 @@ pub(super) fn model_client(
     })
 }
 
-fn tool_discovery(
+async fn tool_discovery(
     args: &Cli,
     mcp_connections: &[Arc<pi_rs_workbench::mcp::McpExtension>],
 ) -> Result<(
@@ -935,7 +935,7 @@ fn tool_discovery(
     if mcp_connections
         .iter()
         .any(|connection| connection.has_codemode())
-        && mcp_config::auto_enable_codemode(args)?
+        && mcp_config::auto_enable_codemode(args).await?
     {
         selection.enable_automatic("codemode");
     }
