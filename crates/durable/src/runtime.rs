@@ -14057,8 +14057,8 @@ impl Harness {
     ) -> Result<bool, Error> {
         let marker = self.owner.store().get(&owned_cleanup_key(c.id))?;
         match (marker, cleanup_attempt) {
-            (Some(marker), Some(attempt))
-                if cleanup_attempt_id(&marker.value) == Some(attempt) => {}
+            (Some(marker), Some(attempt)) if cleanup_attempt_id(&marker.value) == Some(attempt) => {
+            }
             _ => return Err(Error::Invalid("cleanup marker missing or changed".into())),
         }
         // Keep the conversation marked until all owned cleanup has finished.
