@@ -3233,13 +3233,181 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let prepared = Self::turn_poll_normalize(
-                self.registry,
-                self.limits.tool_timeout,
-                &invocation,
-                cancel,
-            )
-            .await?;
+            let starts = session
+                .branch()
+                .into_iter()
+                .filter(|record| matches!(&record.event, Event::ToolStarted { operation_id, .. } if *operation_id == invocation.operation_id))
+                .collect::<Vec<_>>();
+            if starts.len() > 1 {
+                return Err(Error::PendingOperation(invocation.operation_id));
+            }
+            let marked = starts.first().is_some_and(|record| {
+                matches!(
+                    &record.event,
+                    Event::ToolStarted {
+                        tool_execution: Some(_),
+                        ..
+                    }
+                )
+            });
+            let prepared = if marked {
+                let tool = self
+                    .registry
+                    .tools
+                    .get(&invocation.call.name)
+                    .filter(|tool| tool.tool.can_poll())
+                    .cloned()
+                    .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                let identity = tool
+                    .tool
+                    .recovery_identity()
+                    .filter(|value| !value.is_empty())
+                    .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                let arguments = session
+                    .recorded_tool_execution(starts[0].id, &tool.owner, &tool.spec, &identity)
+                    .map_err(|_| Error::PendingOperation(invocation.operation_id))?
+                    .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                (tool, arguments)
+            } else {
+                if starts.first().is_some_and(|record| {
+                    session
+                        .record_metadata(record.id)
+                        .is_some_and(|metadata| metadata.get("toolExecution").is_some())
+                }) {
+                    return Err(Error::PendingOperation(invocation.operation_id));
+                }
+                // A request with a durable decision must not be recovered by
+                // re-preparing its raw arguments if its start metadata is lost.
+                let branch = session.branch();
+                let origins = branch
+                    .iter()
+                    .flat_map(|record| {
+                        let (items, request_id, nested): (&[Invocation], Option<Uuid>, bool) =
+                            match &record.event {
+                                Event::Assistant {
+                                    invocations,
+                                    request_id,
+                                    ..
+                                } => (invocations, *request_id, false),
+                                Event::ToolPlanned { invocation, .. } => {
+                                    (std::slice::from_ref(invocation), None, true)
+                                }
+                                _ => (&[], None, false),
+                            };
+                        items
+                            .iter()
+                            .filter(move |item| item.operation_id == invocation.operation_id)
+                            .map(move |item| {
+                                (
+                                    record.id,
+                                    item,
+                                    request_id,
+                                    record.version,
+                                    nested,
+                                    record.run_id,
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if origins.len() != 1
+                    || origins[0].1 != &invocation
+                    || starts.first().is_some_and(|start| origins[0].0 >= start.id)
+                {
+                    return Err(Error::PendingOperation(invocation.operation_id));
+                }
+                let request_id = if let Some(id) = origins[0].2 {
+                    let requests = branch.iter().filter(|record| {
+                        matches!(&record.event, Event::ModelRequested { request_id: Some(request), .. } if *request == id)
+                    }).collect::<Vec<_>>();
+                    if requests.len() > 1
+                        || requests.first().is_some_and(|request| {
+                            request.id >= origins[0].0 || request.run_id != origins[0].5
+                        })
+                    {
+                        return Err(Error::PendingOperation(invocation.operation_id));
+                    }
+                    (!requests.is_empty()).then_some(id)
+                } else {
+                    None
+                };
+                if request_id.is_none() && !origins[0].4 {
+                    let old_record = origins[0].3 < crate::journal::TOOL_DECISION_JOURNAL_VERSION;
+                    let imported = if old_record {
+                        false
+                    } else {
+                        session
+                            .validated_pi_conversion_counts()
+                            .map_err(|_| Error::PendingOperation(invocation.operation_id))?
+                            .into_iter()
+                            .any(|(source, count)| {
+                                source < origins[0].0
+                                    && origins[0].0 <= source.saturating_add(count)
+                            })
+                    };
+                    if !old_record && !imported {
+                        return Err(Error::PendingOperation(invocation.operation_id));
+                    }
+                }
+                if let Some(request_id) = request_id {
+                    match session
+                        .active_tool_decision(request_id)
+                        .map_err(|_| Error::PendingOperation(invocation.operation_id))?
+                    {
+                        crate::RecordedToolDecision::Legacy => {}
+                        crate::RecordedToolDecision::Current(snapshot) => {
+                            let start = starts
+                                .first()
+                                .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                            let tool = self
+                                .registry
+                                .tools
+                                .get(&invocation.call.name)
+                                .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                            let (proven, _) = session
+                                .execution_provenance(
+                                    request_id,
+                                    invocation.operation_id,
+                                    start.id,
+                                    start.run_id,
+                                    &tool.spec,
+                                )
+                                .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
+                            if proven != invocation {
+                                return Err(Error::PendingOperation(invocation.operation_id));
+                            }
+                            // active_tool_decision already verified these digests
+                            // against the separately recorded request marker.
+                            let validated = snapshot
+                                .validate_recorded(
+                                    snapshot.context(),
+                                    snapshot.request_sha256(),
+                                    snapshot.dispatch_sha256(),
+                                    snapshot.binding_sha256(),
+                                )
+                                .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
+                            if !validated.effective_tools().iter().any(|entry| {
+                                entry.spec.name == invocation.call.name
+                                    && matches!(
+                                        entry.sampling,
+                                        crate::EffectiveToolSampling::Unconstrained
+                                    )
+                            }) {
+                                return Err(Error::PendingOperation(invocation.operation_id));
+                            }
+                        }
+                        crate::RecordedToolDecision::Historical(_) => {
+                            return Err(Error::PendingOperation(invocation.operation_id));
+                        }
+                    }
+                }
+                Self::turn_poll_normalize(
+                    self.registry,
+                    self.limits.tool_timeout,
+                    &invocation,
+                    cancel,
+                )
+                .await?
+            };
             let (sender, mut incoming) = mpsc::channel(32);
             let host = Arc::new(LifecycleMessageHost {
                 sender: sender.clone(),
@@ -12686,5 +12854,687 @@ mod request_privacy_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_decision_recovery_tests {
+    use super::*;
+
+    struct NoModel;
+    #[async_trait::async_trait]
+    impl Model for NoModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            panic!("model must not run during pending recovery")
+        }
+    }
+    struct PollTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::Tool for PollTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "job".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn can_poll(&self) -> bool {
+            true
+        }
+        fn recovery_identity(&self) -> Option<String> {
+            Some("backend-v1".into())
+        }
+        async fn prepare_arguments(
+            &self,
+            _: serde_json::Value,
+        ) -> crate::ExtensionResult<serde_json::Value> {
+            Ok(serde_json::json!({"reprepared": true}))
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            panic!("must poll")
+        }
+        async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(Outcome::Succeeded("done".into()))
+        }
+    }
+    struct PollExtension(Arc<AtomicUsize>);
+    impl crate::Extension for PollExtension {
+        fn id(&self) -> &str {
+            "poll"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(PollTool(self.0.clone()))]
+        }
+    }
+
+    struct CaptureHook(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
+    #[async_trait::async_trait]
+    impl crate::Extension for CaptureHook {
+        fn id(&self) -> &str {
+            "capture"
+        }
+        async fn before_tool(
+            &self,
+            _: &str,
+            args: &serde_json::Value,
+            _: &ToolContext,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Decision> {
+            *self.0.lock().unwrap() = Some(args.clone());
+            Ok(Decision::Allow)
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_pending_restores_exact_authorized_arguments() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        registry
+            .register(Arc::new(CaptureHook(observed.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let spec = registry.tools.get("job").unwrap().spec.clone();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: session.session_id(),
+            external_id: session.external_session_id(),
+            summary: false,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Require,
+            }),
+        };
+        let effective = crate::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling: crate::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+            },
+        };
+        let decision = crate::ToolDecisionSnapshot::capture(
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+            &[effective],
+        )
+        .unwrap();
+        let request_hash = decision.request_sha256().to_owned();
+        session
+            .append_tool_decision_request(
+                Event::ModelRequested {
+                    model: request.model.clone(),
+                    messages: 0,
+                    tools: 1,
+                    max_output_tokens: 10,
+                    request_id: Some(context.request_id),
+                    context_head: Some(session.head()),
+                    context_sha256: Some(request_hash),
+                    context_transformed: Some(false),
+                    context_configuration_sha256: None,
+                    tool_decision: None,
+                },
+                &decision,
+                &request,
+                &request,
+                &[declaration],
+            )
+            .unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::ModelFinished {
+                request_id: context.request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    advertised_tools: vec!["job".into()],
+                    max_output_tokens: 10,
+                }),
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: Some(context.request_id),
+            })
+            .unwrap();
+        let execution = crate::ToolExecutionSnapshot::capture(
+            context.request_id,
+            &invocation,
+            "poll",
+            &spec,
+            "backend-v1",
+            decision.binding_sha256(),
+            serde_json::json!({"authorized":true}),
+        )
+        .unwrap();
+        session
+            .append_tool_execution_started(
+                context.request_id,
+                invocation.operation_id,
+                &execution,
+                "poll",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .poll_pending(
+                &mut session,
+                &mut ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(serde_json::json!({"authorized":true}))
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(invocation.call.arguments, "{}");
+    }
+
+    #[tokio::test]
+    async fn imported_pending_with_no_request_record_uses_legacy_recovery() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: Some(Uuid::new_v4()),
+            })
+            .unwrap();
+        session
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        for clear_request_id in [false, true] {
+            let mut newer_records = session.records().to_vec();
+            for record in &mut newer_records {
+                record.version = crate::journal::TOOL_DECISION_JOURNAL_VERSION;
+                if clear_request_id && let Event::Assistant { request_id, .. } = &mut record.event {
+                    *request_id = None;
+                }
+            }
+            let mut suspicious = Session::from_records(newer_records).unwrap();
+            assert!(matches!(
+                agent
+                    .poll_pending(
+                        &mut suspicious,
+                        &mut ExtensionStates::new(),
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                        None
+                    )
+                    .await,
+                Err(Error::PendingOperation(_))
+            ));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        agent
+            .poll_pending(
+                &mut session,
+                &mut ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn verified_pi_conversion_allows_pending_recovery_in_newer_journal() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let entry = serde_json::json!({"type":"message", "id":"m1", "parentId":null, "message":{"role":"assistant", "content":[{"type":"toolCall", "id":"call", "name":"job", "arguments":{}}], "stopReason":"toolUse"}});
+        let events = crate::pi_import::convert(
+            &entry,
+            &mut crate::pi_import::Branch::default(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let source = session
+            .append_with_record_metadata(
+                Event::SourceEntry {
+                    format: "pi".into(),
+                    entry,
+                },
+                serde_json::json!({"pi_rs_import_conversion_count_v1":events.len()}),
+            )
+            .unwrap()
+            .id;
+        let invocation = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Assistant { invocations, .. } => invocations.first().cloned(),
+                _ => None,
+            })
+            .unwrap();
+        for event in events {
+            session.append(event).unwrap();
+        }
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let metadata = [(source, session.record_metadata(source).unwrap().clone())]
+            .into_iter()
+            .collect();
+        let mut records = session.records().to_vec();
+        for record in &mut records {
+            record.version = crate::journal::TOOL_DECISION_JOURNAL_VERSION;
+            record.timestamp = None;
+        }
+        let mut imported = Session::from_records_with_metadata(records, metadata).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .poll_pending(
+                &mut imported,
+                &mut ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_operation_origins_cannot_select_a_fallback_decision() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        for _ in 0..2 {
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    usage: None,
+                    request_id: Some(Uuid::new_v4()),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(matches!(
+            agent
+                .poll_pending(
+                    &mut session,
+                    &mut ExtensionStates::new(),
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    None
+                )
+                .await,
+            Err(Error::PendingOperation(_))
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_rejects_later_or_other_run_request() {
+        for later in [false, true] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(PollExtension(count.clone())))
+                .unwrap();
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let request_id = Uuid::new_v4();
+            let invocation = Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: "call".into(),
+                    name: "job".into(),
+                    arguments: "{}".into(),
+                },
+            };
+            let make_request = || Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 0,
+                tools: 1,
+                max_output_tokens: 10,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            };
+            if !later {
+                session.set_run_id(Some(Uuid::new_v4()));
+                session.append(make_request()).unwrap();
+                session.set_run_id(None);
+            }
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap();
+            session
+                .append(Event::ToolStarted {
+                    operation_id: invocation.operation_id,
+                    tool_execution: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id: invocation.operation_id,
+                    outcome: Outcome::Pending {
+                        reference: "job".into(),
+                    },
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+            if later {
+                session.append(make_request()).unwrap();
+            }
+            let agent = Agent {
+                model: &NoModel,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            assert!(matches!(
+                agent
+                    .poll_pending(
+                        &mut session,
+                        &mut ExtensionStates::new(),
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                        None
+                    )
+                    .await,
+                Err(Error::PendingOperation(_))
+            ));
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_fallback_cannot_use_superseded_request_decision() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let spec = registry.tools.get("job").unwrap().spec.clone();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut first = None;
+        for strict in [false, true] {
+            let context = crate::ToolDispatchContext {
+                request_id: Uuid::new_v4(),
+                session_id: session.session_id(),
+                external_id: session.external_session_id(),
+                summary: false,
+            };
+            let sampling = if strict {
+                crate::EffectiveToolSampling::StrictJsonSchema {
+                    original_schema: spec.parameters.clone(),
+                    normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+                }
+            } else {
+                crate::EffectiveToolSampling::Unconstrained
+            };
+            let decision = crate::ToolDecisionSnapshot::capture(
+                &context,
+                &request,
+                std::slice::from_ref(&declaration),
+                &[crate::EffectiveToolDeclaration {
+                    spec: spec.clone(),
+                    sampling,
+                }],
+            )
+            .unwrap();
+            session
+                .append_tool_decision_request(
+                    Event::ModelRequested {
+                        model: request.model.clone(),
+                        messages: 0,
+                        tools: 1,
+                        max_output_tokens: 10,
+                        request_id: Some(context.request_id),
+                        context_head: Some(session.head()),
+                        context_sha256: Some(decision.request_sha256().into()),
+                        context_transformed: Some(false),
+                        context_configuration_sha256: None,
+                        tool_decision: None,
+                    },
+                    &decision,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration),
+                )
+                .unwrap();
+            if !strict {
+                first = Some(context.request_id);
+                session
+                    .append(Event::ModelFinished {
+                        request_id: context.request_id,
+                        metadata: ModelMetadata::default(),
+                        usage: UsageReport::Unconfirmed,
+                        failure: None,
+                        partial: String::new(),
+                        reply: Some(RecordedReply {
+                            content: String::new(),
+                            invocations: vec![invocation.clone()],
+                            advertised_tools: vec!["job".into()],
+                            max_output_tokens: 10,
+                        }),
+                    })
+                    .unwrap();
+            }
+        }
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: first,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(
+            agent
+                .poll_pending(
+                    &mut session,
+                    &mut ExtensionStates::new(),
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let (_sender, mut receiver) = mpsc::channel::<String>(1);
+        assert!(matches!(
+            agent
+                .run(
+                    &mut session,
+                    None,
+                    &mut receiver,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await,
+            Err(Error::PendingOperation(_))
+        ));
+        assert!(session.records().iter().rev().any(|record| matches!(
+            record.event,
+            Event::Run {
+                state: RunState::WaitingForOperation,
+                ..
+            }
+        )));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }

@@ -14,7 +14,7 @@ use crate::{
 
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
 const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
-const TOOL_DECISION_JOURNAL_VERSION: u32 = 5;
+pub(crate) const TOOL_DECISION_JOURNAL_VERSION: u32 = 5;
 const TOOL_EXECUTION_JOURNAL_VERSION: u32 = 6;
 const FORMAT_VERSION: u32 = TOOL_EXECUTION_JOURNAL_VERSION;
 const MAX_TOOL_DECISION_METADATA_BYTES: usize = 4 * 1024 * 1024;
@@ -1028,7 +1028,7 @@ impl Session {
 
     // Resolve an unambiguous direct model invocation. Nested tool-planned calls
     // do not carry a request ID and are deliberately rejected here.
-    fn execution_provenance(
+    pub(crate) fn execution_provenance(
         &self,
         request_id: Uuid,
         operation_id: Uuid,
