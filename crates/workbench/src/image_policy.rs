@@ -145,6 +145,37 @@ impl Model for WorkbenchModel {
         Ok(self.estimate_enriched_usage(stream))
     }
 
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        let (client, headers) = self.affinity_headers(external_id).await?;
+        let stream = client
+            .stream_detailed_with_headers(
+                self.filtered(request),
+                &headers,
+                false,
+                Some(external_id),
+            )
+            .await?;
+        Ok(self.estimate_detailed_usage(stream))
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        let stream = self
+            .client
+            .stream_detailed_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
+            .await?;
+        Ok(self.estimate_detailed_usage(stream))
+    }
+
     async fn stream_enriched_for_summary(
         &self,
         _request_id: Uuid,
@@ -224,6 +255,28 @@ impl Model for PreparedWorkbenchModel {
             .await
     }
 
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.inner
+            .stream_detailed_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.inner
+            .stream_detailed_for_summary(request_id, session_id, request)
+            .await
+    }
+
     async fn stream_enriched_for_summary(
         &self,
         request_id: Uuid,
@@ -278,6 +331,32 @@ impl WorkbenchModel {
             }
         }
         Ok((client, headers))
+    }
+
+    fn estimate_detailed_usage(
+        &self,
+        mut stream: pi_rs::DetailedModelStream,
+    ) -> pi_rs::DetailedModelStream {
+        let Some(price) = self.price.clone() else {
+            return stream;
+        };
+        Box::pin(async_stream::try_stream! {
+            let mut metadata = ModelMetadata::default();
+            while let Some(event) = stream.next().await {
+                let event = event?;
+                if let EnrichedModelEvent::Legacy(ModelEvent::Metadata(current)) = &event.event { metadata.clone_from(current); }
+                if let EnrichedModelEvent::Legacy(ModelEvent::Complete { usage: Some(usage), .. }) = &event.event
+                    && metadata.cost_breakdown.is_none()
+                    && let Some(breakdown) = price.estimate(*usage, &metadata)
+                    && let Some(total) = breakdown.total()
+                {
+                    metadata.cost_breakdown = Some(breakdown);
+                    if metadata.cost_usd.is_none() { metadata.cost_usd = Some(total); metadata.cost_from_provider = Some(false); }
+                    yield pi_rs::DetailedModelEvent::from(EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata.clone())));
+                }
+                yield event;
+            }
+        })
     }
 
     fn estimate_enriched_usage(&self, mut stream: EnrichedModelStream) -> EnrichedModelStream {
@@ -441,6 +520,26 @@ mod tests {
                 pi_rs::ModelEvent::Complete { .. }
             ))
         ));
+        let events = vec![
+            Ok(pi_rs::DetailedModelEvent::redacted_start(3)),
+            Ok(pi_rs::DetailedModelEvent::from(
+                pi_rs::EnrichedModelEvent::Legacy(pi_rs::ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(pi_rs::Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                    }),
+                }),
+            )),
+        ];
+        let events: Vec<_> = model
+            .estimate_detailed_usage(Box::pin(futures_util::stream::iter(events)))
+            .collect()
+            .await;
+        assert!(events[0].as_ref().unwrap().is_redacted_start());
+        assert!(
+            matches!(&events[1].as_ref().unwrap().event, pi_rs::EnrichedModelEvent::Legacy(pi_rs::ModelEvent::Metadata(metadata)) if metadata.cost_breakdown.is_some())
+        );
     }
     use super::*;
 
@@ -464,8 +563,22 @@ mod tests {
             for enriched in [false, true] {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let address = listener.local_addr().unwrap();
+                listener.set_nonblocking(true).unwrap();
                 let server = std::thread::spawn(move || {
-                    let (mut socket, _) = listener.accept().unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10))
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                         .unwrap();

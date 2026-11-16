@@ -36,6 +36,11 @@ impl Reader {
         })
     }
 
+    // Console input is already read one record at a time.
+    pub fn new_for_handoff() -> io::Result<Self> {
+        Self::new()
+    }
+
     pub fn drain(&mut self, max: Duration, idle: Duration) -> io::Result<()> {
         super::drain_console_records(max, idle, wait_for_console, || {
             // Discard raw records rather than decoding them: partial VT replies,

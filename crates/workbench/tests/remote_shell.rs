@@ -17,6 +17,30 @@ struct Remote {
     calls: Mutex<Vec<(String, PathBuf)>>,
 }
 
+#[tokio::test]
+async fn pre_cancelled_remote_shell_keeps_existing_cancellation_result() {
+    let remote = Arc::new(Remote::default());
+    let tool = create_bash_tool(
+        std::env::temp_dir().as_path(),
+        ShellConfig::default(),
+        remote.clone(),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let result = tool
+        .invoke(
+            json!({"command":"test"}),
+            ToolContext {
+                operation_id: uuid::Uuid::nil(),
+                cancellation,
+            },
+        )
+        .await;
+    assert!(matches!(result, Outcome::Failed(message) if message == "execution cancelled"));
+    assert!(remote.calls.lock().unwrap().is_empty());
+}
+
 #[derive(Default)]
 struct EnvironmentCapture(
     Mutex<Vec<std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>>>,

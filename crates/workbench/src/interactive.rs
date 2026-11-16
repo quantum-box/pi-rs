@@ -134,11 +134,7 @@ struct Terminal {
     images: Cleanup,
     progress: Option<Instant>,
     #[cfg(any(unix, windows))]
-    color_queries: std::collections::VecDeque<ColorQuery>,
-    #[cfg(any(unix, windows))]
-    color_requery: bool,
-    #[cfg(any(unix, windows))]
-    completed_color_markers: usize,
+    colors: ColorQueries,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -157,21 +153,34 @@ struct ColorQuery {
     started: Instant,
     replied: u32,
     quarantined: bool,
+    batch: crate::ui::terminal_color_batch::ColorBatch,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct ColorQueries {
+    initial_started: Option<Instant>,
+    color_queries: std::collections::VecDeque<ColorQuery>,
+    color_requery: bool,
+    disabled: bool,
+    last_appearance_report: Option<bool>,
 }
 
 impl Terminal {
-    fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
+    fn enter(
+        mode: Option<TuiMode>,
+        images: Cleanup,
+        #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
+    ) -> Result<Self> {
         terminal::enable_raw_mode()?;
+        #[cfg(any(unix, windows))]
+        let initial_colors = previous_colors.is_none();
         let mut guard = Self {
             alternate: mode != Some(TuiMode::Regular),
             images,
             progress: None,
             #[cfg(any(unix, windows))]
-            color_queries: std::collections::VecDeque::new(),
-            #[cfg(any(unix, windows))]
-            color_requery: false,
-            #[cfg(any(unix, windows))]
-            completed_color_markers: 0,
+            colors: previous_colors.unwrap_or_default(),
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -188,9 +197,17 @@ impl Terminal {
         execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u"))?;
         #[cfg(any(unix, windows))]
         {
-            crate::ui::theme::reset_terminal_background();
+            if initial_colors {
+                crate::ui::theme::reset_terminal_background();
+            }
             execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
-            guard.query_terminal_colors()?;
+            guard.colors.query_terminal_colors(&mut std::io::stdout())?;
+        }
+        // Reentry disables color queries, so no DA1 will trigger the usual
+        // Xterm keyboard fallback. A later Kitty reply can still upgrade it.
+        #[cfg(unix)]
+        if guard.colors.disabled {
+            guard.keyboard_reply(false)?;
         }
         Ok(guard)
     }
@@ -224,82 +241,6 @@ impl Terminal {
         view.scrollbar_dragging = false;
         Ok(())
     }
-    #[cfg(any(unix, windows))]
-    fn query_terminal_colors(&mut self) -> Result<()> {
-        // Never overlap an incomplete query with a new request; OSC replies
-        // contain no query identifier. A complete query may precede its DA1.
-        if let Some(query) = self.color_queries.front() {
-            self.color_requery = true;
-            if query.replied == (1 << 18) - 1 {
-                self.completed_color_markers = self.completed_color_markers.saturating_add(1);
-                return self.finish_color_query();
-            }
-            return Ok(());
-        }
-        crate::ui::theme::begin_terminal_palette_query();
-        self.color_queries.push_back(ColorQuery {
-            started: Instant::now(),
-            replied: 0,
-            quarantined: false,
-        });
-        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
-        for index in 0..16 {
-            query.push_str(&format!("\x1b]4;{index};?\x07"));
-        }
-        query.push_str("\x1b[c");
-        execute!(std::io::stdout(), Print(query))?;
-        Ok(())
-    }
-
-    #[cfg(any(unix, windows))]
-    fn accepts_color_reply(&mut self, target: u8) -> Result<bool> {
-        let Some(query) = self.color_queries.front_mut() else {
-            return Ok(false);
-        };
-        let is_latest = !self.color_requery && !query.quarantined;
-        let flag = 1_u32 << target;
-        let fresh = query.replied & flag == 0;
-        query.replied |= flag;
-        if query.replied == (1 << 18) - 1 && self.color_requery {
-            self.completed_color_markers = self.completed_color_markers.saturating_add(1);
-            self.finish_color_query()?;
-        }
-        Ok(is_latest && fresh)
-    }
-
-    #[cfg(any(unix, windows))]
-    fn finish_color_query(&mut self) -> Result<()> {
-        self.color_queries.pop_front();
-        if std::mem::take(&mut self.color_requery) {
-            self.query_terminal_colors()?;
-        }
-        Ok(())
-    }
-
-    #[cfg(any(unix, windows))]
-    fn receive_color_marker(&mut self) -> Result<()> {
-        if self.completed_color_markers > 0 {
-            self.completed_color_markers -= 1;
-            Ok(())
-        } else {
-            self.finish_color_query()
-        }
-    }
-
-    #[cfg(any(unix, windows))]
-    fn poll_color_timeout(&mut self) -> Result<()> {
-        if self.color_requery
-            && let Some(query) = self.color_queries.front_mut()
-            && !query.quarantined
-            && query.started.elapsed() >= Duration::from_secs(2)
-        {
-            // An incomplete query remains isolated until DA1 or all targets
-            // have replied; a timeout alone cannot identify late OSC replies.
-            query.quarantined = true;
-        }
-        Ok(())
-    }
-
     fn update_progress(&mut self, active: bool) -> Result<()> {
         if active
             && self
@@ -340,6 +281,11 @@ impl Terminal {
     }
     #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
+        let colors = guard.as_mut().map(|terminal| {
+            let mut colors = std::mem::take(&mut terminal.colors);
+            colors.disable_after_handoff();
+            colors
+        });
         drop(guard.take());
         // The foreground job owns this process group, including its frontend worker.
         let result = unsafe {
@@ -363,10 +309,159 @@ impl Terminal {
                 }
             }
         };
-        *guard = Some(Self::enter(mode, images)?);
+        *guard = Some(Self::enter(mode, images, colors)?);
         result.map_err(Error::Io)
     }
 }
+#[cfg(any(unix, windows))]
+impl ColorQueries {
+    fn query_terminal_colors(&mut self, output: &mut dyn Write) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        // Only DA1 separates consecutive queries. All color replies alone do not
+        // establish whether a late marker belongs to this request or the next.
+        if let Some(query) = self.color_queries.front() {
+            if !query.quarantined {
+                self.color_requery = true;
+            }
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.initial_started.get_or_insert(started);
+        self.color_queries.push_back(ColorQuery {
+            started,
+            replied: 0,
+            quarantined: false,
+            batch: crate::ui::terminal_color_batch::ColorBatch::new(started),
+        });
+        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
+        for index in 0..16 {
+            query.push_str(&format!("\x1b]4;{index};?\x07"));
+        }
+        query.push_str("\x1b[c");
+        output.write_all(query.as_bytes())?;
+        output.flush()?;
+        Ok(())
+    }
+
+    fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
+        let previous = self.last_appearance_report.replace(dark);
+        // The first report may be the response to ?996n sent at startup.
+        // It cannot be distinguished from a simultaneous notification.
+        let initial_report = previous.is_none()
+            && self
+                .color_queries
+                .front()
+                .is_some_and(|query| Some(query.started) == self.initial_started);
+        if !initial_report {
+            self.query_terminal_colors(output)?;
+        }
+        Ok(previous.is_some_and(|value| value != dark))
+    }
+
+    fn accepts_color_reply(&mut self, target: u8, _output: &mut dyn Write) -> Result<bool> {
+        let Some(query) = self.color_queries.front_mut() else {
+            return Ok(false);
+        };
+        let is_latest = !self.color_requery && !query.quarantined;
+        let flag = 1_u32 << target;
+        let fresh = query.replied & flag == 0;
+        query.replied |= flag;
+        Ok(is_latest && fresh)
+    }
+
+    fn record_color(
+        &mut self,
+        target: u8,
+        rgb: [u8; 3],
+        output: &mut dyn Write,
+    ) -> Result<Option<crate::ui::terminal_color_batch::ColorSnapshot>> {
+        if !self.accepts_color_reply(target, output)? {
+            return Ok(None);
+        }
+        Ok(self
+            .color_queries
+            .front_mut()
+            .and_then(|query| query.batch.record(target, Some(rgb))))
+    }
+
+    fn record_invalid_color(
+        &mut self,
+        target: u8,
+        output: &mut dyn Write,
+    ) -> Result<Option<crate::ui::terminal_color_batch::ColorSnapshot>> {
+        if !self.accepts_color_reply(target, output)? {
+            return Ok(None);
+        }
+        Ok(self
+            .color_queries
+            .front_mut()
+            .and_then(|query| query.batch.record(target, None)))
+    }
+
+    fn timeout_color_batch(
+        &mut self,
+        now: Instant,
+    ) -> Option<crate::ui::terminal_color_batch::ColorSnapshot> {
+        let query = self.color_queries.front_mut()?;
+        let snapshot = query.batch.timeout(now);
+        if self.color_requery || query.quarantined {
+            None
+        } else {
+            snapshot
+        }
+    }
+
+    fn finish_color_query(&mut self, output: &mut dyn Write) -> Result<()> {
+        self.color_queries.pop_front();
+        if std::mem::take(&mut self.color_requery) {
+            self.query_terminal_colors(output)?;
+        }
+        Ok(())
+    }
+
+    fn receive_color_marker(
+        &mut self,
+        output: &mut dyn Write,
+    ) -> Result<Option<crate::ui::terminal_color_batch::ColorSnapshot>> {
+        if self.disabled {
+            return Ok(None);
+        }
+        let snapshot = self.color_queries.front_mut().and_then(|query| {
+            let snapshot = query.batch.finish();
+            if self.color_requery || query.quarantined {
+                None
+            } else {
+                snapshot
+            }
+        });
+        self.finish_color_query(output)?;
+        Ok(snapshot)
+    }
+
+    fn disable_after_handoff(&mut self) {
+        // Another terminal owner may consume our marker or leave its own.
+        // Neither can be attributed reliably once ownership has changed.
+        self.color_queries.clear();
+        self.color_requery = false;
+        self.disabled = true;
+    }
+
+    fn poll_color_timeout(&mut self) -> Result<()> {
+        if self.color_requery
+            && let Some(query) = self.color_queries.front_mut()
+            && !query.quarantined
+            && query.started.elapsed() >= Duration::from_secs(2)
+        {
+            // A timeout is not a response boundary. Keep the refresh queued
+            // until DA1, and reject stale color replies in the meantime.
+            query.quarantined = true;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.update_progress(false);
@@ -376,7 +471,9 @@ impl Drop for Terminal {
         #[cfg(unix)]
         self.disable_keyboard_protocol();
         #[cfg(any(unix, windows))]
-        let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+        {
+            let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+        }
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
             let _ = execute!(
@@ -494,6 +591,7 @@ enum LocalEditor {
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
+    AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -550,6 +648,7 @@ enum RemoteEvent {
     Notice(String),
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
+    AnthropicCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -757,6 +856,8 @@ fn start_share_upload(
 enum TranscriptPanel {
     Summary(u64),
     Skill(usize),
+    Thinking(usize),
+    StreamingThinking,
 }
 
 #[derive(Default)]
@@ -795,6 +896,7 @@ struct View {
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
     thinking: String,
+    thinking_expanded: Option<bool>,
     thinking_items: std::collections::BTreeMap<u64, String>,
     text_items: std::collections::BTreeMap<u64, String>,
     thinking_items_consistent: bool,
@@ -1271,6 +1373,16 @@ impl View {
         }
     }
 
+    fn set_hide_thinking(&mut self, hidden: bool) {
+        self.hide_thinking = hidden;
+        self.thinking_expanded = None;
+        for entry in &mut self.lines {
+            if let Entry::Thinking { expanded, .. } = entry {
+                *expanded = None;
+            }
+        }
+    }
+
     fn panel_at(&self, row: u16) -> Option<TranscriptPanel> {
         self.panel_rows
             .iter()
@@ -1278,14 +1390,21 @@ impl View {
     }
 
     fn panel_expansion(&mut self, panel: TranscriptPanel) -> Option<&mut Option<bool>> {
+        if panel == TranscriptPanel::StreamingThinking {
+            return (!self.thinking.trim().is_empty()).then_some(&mut self.thinking_expanded);
+        }
         let entry = match panel {
             TranscriptPanel::Summary(id) => self.lines.iter_mut().find(
                 |entry| matches!(entry, Entry::Summary { id: candidate, .. } if *candidate == id),
             ),
             TranscriptPanel::Skill(index) => self.lines.get_mut(index),
+            TranscriptPanel::Thinking(index) => self.lines.get_mut(index),
+            TranscriptPanel::StreamingThinking => unreachable!(),
         }?;
-        match entry {
-            Entry::Summary { expanded, .. } | Entry::Skill { expanded, .. } => Some(expanded),
+        match (panel, entry) {
+            (TranscriptPanel::Summary(_), Entry::Summary { expanded, .. })
+            | (TranscriptPanel::Skill(_), Entry::Skill { expanded, .. })
+            | (TranscriptPanel::Thinking(_), Entry::Thinking { expanded, .. }) => Some(expanded),
             _ => None,
         }
     }
@@ -1412,6 +1531,7 @@ impl View {
         self.text_items.clear();
         self.streaming_tools.clear();
         self.thinking.clear();
+        self.thinking_expanded = None;
         self.thinking_items.clear();
         self.draft_images.clear();
         self.clipboard = None;
@@ -1464,6 +1584,28 @@ impl View {
                         self.add_images(images);
                     }
                 }
+                pi_rs::Event::ImportedUnattributedToolResult {
+                    call_id,
+                    tool_name,
+                    content,
+                    is_error,
+                    details,
+                    ..
+                } => {
+                    let outcome = sessions::unattributed_outcome(content, *is_error, details);
+                    let id = format!("unattributed-{}", record.id);
+                    self.lines.push(Entry::Tool {
+                        id: id.clone(),
+                        name: format!("{tool_name} (unattributed, call {call_id})"),
+                        arguments: String::new(),
+                        output: String::new(),
+                        failed: false,
+                        finished: false,
+                        parts: Vec::new(),
+                        numbered_diff: false,
+                    });
+                    self.finish_tool(&id, &outcome);
+                }
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
                         id: format!("shell-{}", record.id),
@@ -1498,7 +1640,10 @@ impl View {
                     if !summary_requests.contains(request_id)
                         && let Some(reasoning) = &metadata.reasoning
                     {
-                        self.lines.push(Entry::Thinking(reasoning.clone()));
+                        self.lines.push(Entry::Thinking {
+                            text: reasoning.clone(),
+                            expanded: None,
+                        });
                     }
                     if let pi_rs::UsageReport::Measured { usage } = usage {
                         self.tokens = self
@@ -1737,6 +1882,7 @@ impl View {
             Some("summary_request_start") => {
                 self.summarizing = true;
                 self.thinking.clear();
+                self.thinking_expanded = None;
                 self.thinking_items.clear();
                 self.streaming.clear();
                 self.text_items.clear();
@@ -1827,7 +1973,9 @@ impl View {
                         let thinking = std::mem::take(&mut self.thinking);
                         self.thinking_items.clear();
                         if !thinking.is_empty() {
-                            self.lines.push(Entry::Thinking(thinking));
+                            self.lines.push(Entry::Thinking { text: thinking, expanded: self.thinking_expanded.take() });
+                        } else {
+                            self.thinking_expanded = None;
                         }
                         let content = event["content"].as_str().unwrap_or_default();
                         if !content.is_empty() {
@@ -1905,8 +2053,12 @@ impl View {
         self.text_items.clear();
         self.streaming_tools.clear();
         if !self.thinking.is_empty() {
-            self.lines
-                .push(Entry::Thinking(std::mem::take(&mut self.thinking)));
+            self.lines.push(Entry::Thinking {
+                text: std::mem::take(&mut self.thinking),
+                expanded: self.thinking_expanded.take(),
+            });
+        } else {
+            self.thinking_expanded = None;
         }
         if !self.streaming.is_empty() {
             self.lines
@@ -2016,7 +2168,8 @@ impl View {
                 self.mouse.drag(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if self.search.is_none() => {
-                let default_expanded = self.expand_tools;
+                let tools_expanded = self.expand_tools;
+                let thinking_expanded = !self.hide_thinking;
                 if let Some(url) = self.released_link(event.column, event.row) {
                     self.panel_press = None;
                     self.mouse.clear_gesture();
@@ -2028,6 +2181,12 @@ impl View {
                     && self.panel_at(row) == Some(panel)
                     && let Some(expanded) = self.panel_expansion(panel)
                 {
+                    let default_expanded = match panel {
+                        TranscriptPanel::Thinking(_) | TranscriptPanel::StreamingThinking => {
+                            thinking_expanded
+                        }
+                        _ => tools_expanded,
+                    };
                     *expanded = Some(!expanded.unwrap_or(default_expanded));
                     self.mouse.clear();
                 } else if self.mouse.release(event.column, event.row)
@@ -2163,16 +2322,31 @@ impl View {
                         .count();
                     panels.push((start..start + panel_height, TranscriptPanel::Skill(index)));
                 }
+                Entry::Thinking { .. } => panels.push((
+                    start..lines.len().saturating_sub(1),
+                    TranscriptPanel::Thinking(index),
+                )),
                 _ => {}
             }
         }
         if !self.thinking.is_empty() {
-            lines.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                body_width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
+            let start = lines.len();
+            lines.extend(
+                Entry::Thinking {
+                    text: self.thinking.clone(),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    body_width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
+            panels.push((
+                start..lines.len().saturating_sub(1),
+                TranscriptPanel::StreamingThinking,
             ));
         }
         if !self.streaming.is_empty() {
@@ -2457,13 +2631,19 @@ impl View {
             })
             .collect();
         if !self.thinking.is_empty() {
-            lines.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
-            ));
+            lines.extend(
+                Entry::Thinking {
+                    text: self.thinking.clone(),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
         }
         if !self.streaming.is_empty() {
             lines.extend(Entry::Assistant(self.streaming.clone()).render(
@@ -2608,13 +2788,19 @@ impl View {
         let mut active = Vec::new();
         if !committing {
             active.extend(pending());
-            active.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
-            ));
+            active.extend(
+                Entry::Thinking {
+                    text: self.thinking.clone(),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
             active.extend(Entry::Assistant(self.streaming.clone()).render(
                 theme,
                 width,
@@ -3064,6 +3250,20 @@ fn slash(
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("anthropic") => show_anthropic_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("anthropic browser") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::Browser,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic copy-code") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::CopyCode,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic api-key") => {
+            edit_provider_key(super::Provider::Anthropic, view)
+        }
         "/login" if rest.eq_ignore_ascii_case("xai") => start_xai_login(view, &args.settings),
         "/login" if rest.eq_ignore_ascii_case("xai api-key") => {
             edit_provider_key(super::Provider::named("xai").expect("xAI provider"), view)
@@ -3134,7 +3334,7 @@ fn slash(
                     .collect::<Vec<_>>();
                 if login
                     || radius_auth::Gateway::configured_with_settings(&args.settings)
-                        .and_then(|gateway| gateway.has_credential())
+                        .and_then(|gateway| gateway.has_stored_credential())
                         .unwrap_or(false)
                 {
                     items.push(Item {
@@ -3147,6 +3347,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "anthropic · Subscription OAuth".into(),
+                            selection: Selection::AnthropicMethods,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -3542,7 +3749,9 @@ fn slash(
                         pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
                             TreeEntryKind::User
                         }
-                        pi_rs::Event::ToolFinished { .. } | pi_rs::Event::ToolReconciled { .. } => {
+                        pi_rs::Event::ToolFinished { .. }
+                        | pi_rs::Event::ToolReconciled { .. }
+                        | pi_rs::Event::ImportedUnattributedToolResult { .. } => {
                             TreeEntryKind::Tool
                         }
                         pi_rs::Event::Assistant { content, .. }
@@ -3628,6 +3837,98 @@ fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
     (changed, redraw_system)
 }
 
+#[cfg(any(unix, windows))]
+fn handle_terminal_appearance(
+    colors: &mut ColorQueries,
+    theme: &mut Theme,
+    dark: bool,
+    output: &mut dyn Write,
+) -> Result<(bool, bool)> {
+    let changed_report = colors.appearance_report(dark, output)?;
+    let invalidate = colors.disabled && changed_report;
+    if invalidate {
+        crate::ui::theme::invalidate_terminal_default_colors();
+        crate::ui::theme::clear_terminal_palette();
+    }
+    let (changed, redraw) = apply_terminal_appearance(theme, dark);
+    if invalidate && theme.name == "system" && !redraw {
+        *theme = Theme::system();
+    }
+    Ok((
+        changed || invalidate,
+        redraw || (invalidate && theme.name == "system"),
+    ))
+}
+
+#[cfg(any(unix, windows))]
+fn apply_terminal_color_snapshot(
+    snapshot: crate::ui::terminal_color_batch::ColorSnapshot,
+    theme: &mut Theme,
+) -> (bool, bool) {
+    let mut appearance_changed = false;
+    let mut colors_reported = false;
+    if let Some([red, green, blue]) = snapshot.foreground {
+        appearance_changed |= crate::ui::theme::set_terminal_color(true, red, green, blue);
+        colors_reported = true;
+    }
+    if let Some([red, green, blue]) = snapshot.background {
+        appearance_changed |= crate::ui::theme::set_terminal_color(false, red, green, blue);
+        colors_reported = true;
+    }
+    if let Some(palette) = snapshot.palette {
+        crate::ui::theme::begin_terminal_palette_query();
+        for (index, [red, green, blue]) in palette.into_iter().enumerate() {
+            crate::ui::theme::set_terminal_palette(index as u8, red, green, blue);
+        }
+        colors_reported = true;
+    }
+    let redraw_system = colors_reported && theme.name == "system";
+    if redraw_system {
+        *theme = Theme::system();
+    }
+    (appearance_changed, redraw_system)
+}
+
+#[cfg(any(unix, windows))]
+fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut Theme) {
+    let selection = args.use_theme.as_deref().unwrap_or("system");
+    if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
+        if let Ok(next) = settings.preview(picker, args) {
+            *theme = next;
+        }
+    } else if selection.contains('/') {
+        match load_resolved_theme(selection, &args.theme_paths, &args.workspace, args.trusted) {
+            Ok(next) => *theme = next,
+            Err(error) => view.append(&format!("Theme reload: {error}")),
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
+    if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
+        *theme = Theme::system();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn expire_initial_terminal_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
+    colors
+        .initial_started
+        .is_some_and(|started| started.elapsed() >= Duration::from_millis(100))
+        && finish_initial_terminal_colors(theme)
+}
+
+#[cfg(any(unix, windows))]
+fn settle_complete_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
+    colors.color_queries.front().is_some_and(|query| {
+        !colors.color_requery && !query.quarantined && query.replied == (1 << 18) - 1
+    }) && finish_initial_terminal_colors(theme)
+}
+
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
@@ -3662,11 +3963,15 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         }
         Box::new(std::io::stderr())
     };
-    struct PickerTerminal(Box<dyn Write>);
+    struct PickerTerminal {
+        output: Box<dyn Write>,
+        input: Option<crate::ui::input::Reader>,
+    }
     impl Drop for PickerTerminal {
         fn drop(&mut self) {
+            // Preserve input queued for the next terminal owner.
             let _ = execute!(
-                self.0,
+                self.output,
                 ResetColor,
                 Show,
                 DisableBracketedPaste,
@@ -3676,9 +3981,17 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         }
     }
     terminal::enable_raw_mode()?;
-    let mut screen = PickerTerminal(output);
-    execute!(screen.0, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
-    let mut input = crate::ui::input::Reader::new()?;
+    let mut screen = PickerTerminal {
+        output,
+        input: None,
+    };
+    execute!(
+        screen.output,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    screen.input = Some(crate::ui::input::Reader::new_for_handoff()?);
     let keys = Keys::load()?;
     let mut theme = startup_picker_theme(args)?;
     let mut view = View::default();
@@ -3688,7 +4001,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     loop {
         if dirty {
             let (width, height) = terminal::size().unwrap_or((80, 24));
-            execute!(screen.0, MoveTo(0, 0), Clear(ClearType::All))?;
+            execute!(screen.output, MoveTo(0, 0), Clear(ClearType::All))?;
             if let Some(picker) = &view.picker {
                 for (row, line) in picker
                     .render(&theme, width as usize, height as usize, &keys)
@@ -3698,14 +4011,19 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
                     if row >= height as usize {
                         break;
                     }
-                    queue!(screen.0, MoveTo(0, row as u16))?;
-                    line.draw(&mut screen.0, width as usize)?;
+                    queue!(screen.output, MoveTo(0, row as u16))?;
+                    line.draw(&mut screen.output, width as usize)?;
                 }
             }
-            screen.0.flush()?;
+            screen.output.flush()?;
             dirty = false;
         }
-        match input.next(Duration::from_millis(100))? {
+        match screen
+            .input
+            .as_mut()
+            .expect("picker input")
+            .next(Duration::from_millis(40))?
+        {
             Some(crate::ui::input::InputEvent::Event(Event::Resize(..))) => dirty = true,
             Some(crate::ui::input::InputEvent::Event(Event::Paste(text))) => {
                 if let Some(picker) = &mut view.picker {
@@ -3766,6 +4084,8 @@ pub(super) async fn run(
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
+    #[cfg(any(unix, windows))]
+    let _pending_colors = crate::ui::theme::PendingTerminalColors::new();
     let mut deferred_theme_error = None;
     let mut theme = match load_resolved_theme(
         args.use_theme.as_deref().unwrap_or("system"),
@@ -3800,7 +4120,12 @@ pub(super) async fn run(
         slash("/resume", &mut args, &mut view, None)?;
     }
     let mut keys = Keys::load()?;
-    let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+    let mut _terminal = Some(Terminal::enter(
+        args.tui_mode,
+        view.graphics.cleanup(),
+        #[cfg(any(unix, windows))]
+        None,
+    )?);
     let mut input = crate::ui::input::Reader::new()?;
     let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     install_terminal_signal(terminal_signal.clone())?;
@@ -4269,6 +4594,13 @@ pub(super) async fn run(
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::AnthropicCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::AnthropicCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret("Anthropic code or redirect URL".into()),
+                    ));
+                    dirty = true;
+                }
                 Ok(RemoteEvent::ForgetModelKey(provider)) => {
                     args.model_keys.forget(provider);
                     view.invalidate_model_catalog();
@@ -4367,7 +4699,16 @@ pub(super) async fn run(
         }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
-            terminal.poll_color_timeout()?;
+            terminal.colors.poll_color_timeout()?;
+            if let Some(snapshot) = terminal.colors.timeout_color_batch(Instant::now()) {
+                let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                dirty |= redraw;
+                if changed {
+                    refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                    dirty = true;
+                }
+            }
+            dirty |= expire_initial_terminal_colors(&terminal.colors, &mut theme);
         }
         let input_wait = if dirty {
             frame_interval.saturating_sub(last_frame.elapsed())
@@ -4404,7 +4745,20 @@ pub(super) async fn run(
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.receive_color_marker()?;
+                    if let Some(snapshot) = terminal
+                        .colors
+                        .receive_color_marker(&mut std::io::stdout())?
+                    {
+                        let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                        dirty |= redraw;
+                        if changed {
+                            refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                            dirty = true;
+                        }
+                    }
+                    if !terminal.colors.color_requery && terminal.colors.color_queries.is_empty() {
+                        dirty |= finish_initial_terminal_colors(&mut theme);
+                    }
                     #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
@@ -4420,7 +4774,18 @@ pub(super) async fn run(
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::TerminalColorInvalid { target }) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.accepts_color_reply(target)?;
+                    if let Some(snapshot) = terminal
+                        .colors
+                        .record_invalid_color(target, &mut std::io::stdout())?
+                    {
+                        let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                        dirty |= redraw;
+                        if changed {
+                            refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                            dirty = true;
+                        }
+                    }
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
                 }
                 continue;
             }
@@ -4431,16 +4796,24 @@ pub(super) async fn run(
                 green,
                 blue,
             }) => {
-                let accepted = match &mut _terminal {
-                    Some(terminal) => terminal.accepts_color_reply(index)?,
-                    None => false,
+                let snapshot = match &mut _terminal {
+                    Some(terminal) => terminal.colors.record_color(
+                        index,
+                        [red, green, blue],
+                        &mut std::io::stdout(),
+                    )?,
+                    None => None,
                 };
-                if accepted
-                    && crate::ui::theme::set_terminal_palette(index, red, green, blue)
-                    && theme.name == "system"
-                {
-                    theme = Theme::system();
-                    dirty = true;
+                if let Some(snapshot) = snapshot {
+                    let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                    dirty |= redraw;
+                    if changed {
+                        refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                        dirty = true;
+                    }
+                }
+                if let Some(terminal) = &mut _terminal {
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
                 }
                 continue;
             }
@@ -4451,11 +4824,17 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        let (changed, redraw_system) = apply_terminal_appearance(&mut theme, dark);
+                        let (changed, redraw_system) = if let Some(terminal) = &mut _terminal {
+                            handle_terminal_appearance(
+                                &mut terminal.colors,
+                                &mut theme,
+                                dark,
+                                &mut std::io::stdout(),
+                            )?
+                        } else {
+                            apply_terminal_appearance(&mut theme, dark)
+                        };
                         dirty |= redraw_system;
-                        if let Some(terminal) = &mut _terminal {
-                            terminal.query_terminal_colors()?;
-                        }
                         changed
                     }
                     crate::ui::input::InputEvent::TerminalColor {
@@ -4464,39 +4843,30 @@ pub(super) async fn run(
                         green,
                         blue,
                     } => {
-                        let accepted = match &mut _terminal {
-                            Some(terminal) => {
-                                terminal.accepts_color_reply(if foreground { 16 } else { 17 })?
-                            }
-                            None => false,
+                        let snapshot = match &mut _terminal {
+                            Some(terminal) => terminal.colors.record_color(
+                                if foreground { 16 } else { 17 },
+                                [red, green, blue],
+                                &mut std::io::stdout(),
+                            )?,
+                            None => None,
                         };
-                        let changed = accepted
-                            && crate::ui::theme::set_terminal_color(foreground, red, green, blue);
-                        if accepted && theme.name == "system" {
-                            theme = Theme::system();
-                            dirty = true;
+                        if let Some(snapshot) = snapshot {
+                            let (changed, redraw) =
+                                apply_terminal_color_snapshot(snapshot, &mut theme);
+                            dirty |= redraw;
+                            changed
+                        } else {
+                            false
                         }
-                        changed
                     }
                     _ => unreachable!(),
                 };
+                if let Some(terminal) = &mut _terminal {
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
+                }
                 if changed {
-                    let selection = args.use_theme.as_deref().unwrap_or("system");
-                    if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
-                        if let Ok(next) = settings.preview(picker, &args) {
-                            theme = next;
-                        }
-                    } else if selection.contains('/') {
-                        match load_resolved_theme(
-                            selection,
-                            &args.theme_paths,
-                            &args.workspace,
-                            args.trusted,
-                        ) {
-                            Ok(next) => theme = next,
-                            Err(error) => view.append(&format!("Theme reload: {error}")),
-                        }
-                    }
+                    refresh_terminal_theme_selection(&args, &mut view, &mut theme);
                     dirty = true;
                 }
                 continue;
@@ -4706,6 +5076,10 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
+                                LocalEditor::AnthropicCode(sender) => {
+                                    if let Some(sender) = sender.take() { let _ = sender.send(text); }
+                                    Ok(())
+                                }
                                 LocalEditor::BedrockChain => super::model_auth::save_bedrock_profile(None)
                                     .and_then(|()| super::model_auth::Keys::load())
                                     .map(|keys| { args.model_keys = keys; view.invalidate_model_catalog(); view.append("Using existing AWS credential chain for amazon-bedrock"); }),
@@ -4745,6 +5119,8 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
+                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                                interrupt_remote_task(&mut view);
                             }
                         }
                         None => view.local_editor = Some((editor, dialog)),
@@ -5304,7 +5680,15 @@ pub(super) async fn run(
                         }
                     }
                     "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
-                    "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
+                    "app.thinking.toggle" => {
+                        let hidden = !view.hide_thinking;
+                        view.set_hide_thinking(hidden);
+                        if let Err(error) =
+                            args.settings.set_user("hideThinkingBlock", json!(hidden))
+                        {
+                            view.append(&error.to_string());
+                        }
+                    }
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.clear" => {
                         if clear_editor_or_exit(&mut view, &mut last_clear, Instant::now()) {
@@ -5316,9 +5700,20 @@ pub(super) async fn run(
                         if args.tui_mode == Some(TuiMode::Regular) {
                             view.finish_regular()?;
                         }
+                        #[cfg(any(unix, windows))]
+                        let colors = _terminal.as_mut().map(|terminal| {
+                            let mut colors = std::mem::take(&mut terminal.colors);
+                            colors.disable_after_handoff();
+                            colors
+                        });
                         drop(_terminal.take());
                         let result = external_editor(&args, &mut view.editor);
-                        _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+                        _terminal = Some(Terminal::enter(
+                            args.tui_mode,
+                            view.graphics.cleanup(),
+                            #[cfg(any(unix, windows))]
+                            colors,
+                        )?);
                         if view.graphics.enabled() {
                             images::query_cell_size()?;
                         }
@@ -5831,6 +6226,49 @@ fn show_radius_methods(view: &mut View) {
     ));
 }
 
+fn show_anthropic_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Sign in to Anthropic",
+        vec![
+            Item {
+                label: "Browser login".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::Browser),
+            },
+            Item {
+                label: "Copy code login (headless)".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::CopyCode),
+            },
+        ],
+    ));
+}
+
+fn start_anthropic_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::anthropic_auth::LoginMethod,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to Anthropic",
+        "Anthropic login cancelled",
+        move |sender| async move {
+            super::anthropic_auth::login(&settings, method, task_control, |url, manual| {
+                let _ = sender.send(RemoteEvent::Notice(format!(
+                    "Continue in your browser: {url}"
+                )));
+                let _ = sender.send(RemoteEvent::AnthropicCode(manual));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Anthropic".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_kimi_logout(view: &mut View) {
     view.remote_task = Some(RemoteTask::start(
         "Signing out of Kimi Code",
@@ -6012,6 +6450,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to Anthropic" {
+            "Anthropic sign-in is completing; waiting for the result"
         } else {
             "Meta sign-in is completing; waiting for the result"
         });
@@ -6021,7 +6461,13 @@ fn interrupt_remote_task(view: &mut View) {
 }
 
 fn clear_openrouter_editor(view: &mut View) {
-    if matches!(view.local_editor, Some((LocalEditor::OpenRouterCode(_), _))) {
+    if matches!(
+        view.local_editor,
+        Some((
+            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            _
+        ))
+    ) {
         view.local_editor = None;
     }
 }
@@ -6662,7 +7108,8 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
                 json!(
                     [3, 5, 7, 10, 15, 20]
                         .into_iter()
-                        .find(|count| *count > autocomplete_items)
+                        .skip_while(|count| *count != autocomplete_items)
+                        .nth(1)
                         .unwrap_or(3)
                 ),
             ),
@@ -6970,6 +7417,8 @@ fn select(
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
+        Selection::AnthropicMethods => show_anthropic_methods(view),
+        Selection::LoginAnthropic(method) => start_anthropic_login(view, &args.settings, method),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
         Selection::LoginChatGptNew => start_chatgpt_login(view, &args.settings, true, None),
         Selection::LoginChatGptAccount(id) => {
@@ -7107,7 +7556,7 @@ fn select(
             }
             match key.as_str() {
                 "expandTools" => view.set_expand_tools(value.as_bool().unwrap_or(false)),
-                "hideThinkingBlock" => view.hide_thinking = value.as_bool().unwrap_or(false),
+                "hideThinkingBlock" => view.set_hide_thinking(value.as_bool().unwrap_or(false)),
                 "tuiMode" => {
                     args.tui_mode = Some(if value == "regular" {
                         TuiMode::Regular
@@ -7615,6 +8064,102 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn restored_unattributed_result_renders_image_parts_when_graphics_enabled() {
+        use super::*;
+        use base64::Engine;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = initial.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: pi_rs::Event::ImportedUnattributedToolResult {
+                call_id: "reused".into(),
+                tool_name: "read".into(),
+                is_error: false,
+                details: None,
+                content: pi_rs::ContextContent::Blocks(vec![
+                    pi_rs::ContentBlock::Text {
+                        text: "before".into(),
+                        text_signature: None,
+                    },
+                    pi_rs::ContentBlock::Image {
+                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        mime_type: "image/png".into(),
+                    },
+                    pi_rs::ContentBlock::Text {
+                        text: "after".into(),
+                        text_signature: None,
+                    },
+                ]),
+            },
+        });
+        Session::from_records(records)
+            .unwrap()
+            .export_jsonl(&path)
+            .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path;
+        for enabled in [true, false] {
+            let mut view = View {
+                graphics: Renderer::test_with_protocol(enabled.then_some(images::Protocol::Kitty)),
+                ..View::default()
+            };
+            view.restore(&args).unwrap();
+            let entry = view.lines.iter().find(|entry| matches!(entry, Entry::Tool { name, .. } if name.contains("unattributed"))).unwrap();
+            let Entry::Tool {
+                parts,
+                output,
+                finished,
+                ..
+            } = entry
+            else {
+                unreachable!()
+            };
+            assert!(*finished);
+            if enabled {
+                assert!(
+                    matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
+                );
+            } else {
+                assert!(parts.is_empty());
+                assert!(output.contains("[image · image/png]"));
+            }
+        }
+    }
+
+    #[test]
+    fn unattributed_text_block_result_displays_patch_details() {
+        let content = pi_rs::ContextContent::Blocks(vec![pi_rs::ContentBlock::Text {
+            text: "applied".into(),
+            text_signature: None,
+        }]);
+        let outcome = super::sessions::unattributed_outcome(
+            &content,
+            false,
+            &Some(serde_json::json!({"patch":"+new line"})),
+        );
+        assert_eq!(super::display_tool_result(&outcome), "applied\n+new line");
+    }
+
+    #[test]
     fn indexed_delta_append_handles_interleaving_and_legacy_text() {
         let mut items = std::collections::BTreeMap::new();
         let mut combined = String::new();
@@ -7666,6 +8211,111 @@ mod tests {
         assert_eq!(view.thinking, "summaryother");
         view.settle();
         assert!(view.thinking_items.is_empty());
+    }
+
+    #[test]
+    fn thinking_visibility_overrides_survive_settle_and_reset_globally() {
+        use crate::ui::render::Entry;
+        let mut view = super::View::default();
+        view.lines.push(Entry::Thinking {
+            text: "first".into(),
+            expanded: None,
+        });
+        view.lines.push(Entry::Thinking {
+            text: "second".into(),
+            expanded: None,
+        });
+        *view
+            .panel_expansion(super::TranscriptPanel::Thinking(0))
+            .unwrap() = Some(false);
+        assert!(matches!(
+            &view.lines[0],
+            Entry::Thinking {
+                expanded: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.thinking = "streamed".into();
+        *view
+            .panel_expansion(super::TranscriptPanel::StreamingThinking)
+            .unwrap() = Some(false);
+        view.settle();
+        assert!(
+            matches!(&view.lines[2], Entry::Thinking { text, expanded: Some(false) } if text == "streamed")
+        );
+        assert!(
+            view.panel_expansion(super::TranscriptPanel::StreamingThinking)
+                .is_none()
+        );
+        view.set_hide_thinking(true);
+        assert!(view.hide_thinking);
+        assert!(
+            view.lines
+                .iter()
+                .all(|e| matches!(e, Entry::Thinking { expanded: None, .. }))
+        );
+        assert!(view.thinking_expanded.is_none());
+    }
+
+    #[test]
+    fn thinking_mouse_click_toggles_only_the_pressed_panel() {
+        use crate::ui::render::Entry;
+        use clap::Parser;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let args = super::Cli::parse_from(["pi"]);
+        let mut view = super::View::default();
+        view.lines.push(Entry::Thinking {
+            text: "first".into(),
+            expanded: None,
+        });
+        view.lines.push(Entry::Thinking {
+            text: "second".into(),
+            expanded: None,
+        });
+        view.panel_rows
+            .push((2..3, super::TranscriptPanel::Thinking(0)));
+        view.panel_rows
+            .push((4..5, super::TranscriptPanel::Thinking(1)));
+        let event = |kind, row| MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 2), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 2), &args);
+        assert!(matches!(
+            &view.lines[0],
+            Entry::Thinking {
+                expanded: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 4), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Drag(MouseButton::Left), 5), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 5), &args);
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.set_hide_thinking(true);
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 4), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 4), &args);
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking {
+                expanded: Some(true),
+                ..
+            }
+        ));
     }
     #[test]
     fn external_editor_selects_first_nonempty_command() {
@@ -10396,6 +11046,109 @@ exit {exit}
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn initial_theme_query_settles_on_timeout_or_marker() {
+        const CHILD: &str = "PI_RS_INITIAL_THEME_QUERY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::initial_theme_query_settles_on_timeout_or_marker",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
+        };
+        use crossterm::style::Color;
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let mut terminal = super::ColorQueries {
+            initial_started: Some(std::time::Instant::now()),
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: 0,
+                quarantined: false,
+                batch: crate::ui::terminal_color_batch::ColorBatch::new(std::time::Instant::now()),
+            }]),
+            color_requery: false,
+            disabled: false,
+            last_appearance_report: None,
+        };
+        assert!(!super::expire_initial_terminal_colors(
+            &terminal, &mut theme
+        ));
+        assert_eq!(theme.color("accent"), Color::Reset);
+        *terminal.initial_started.as_mut().unwrap() -= std::time::Duration::from_millis(101);
+        assert!(super::expire_initial_terminal_colors(&terminal, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        mark_terminal_colors_pending();
+        theme = super::Theme::system();
+        assert!(super::finish_initial_terminal_colors(&mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!super::finish_initial_terminal_colors(&mut theme));
+
+        // An early error drops the owner even before Terminal::enter succeeds.
+        let failed_start = || -> pi_rs::Result<()> {
+            let _pending = crate::ui::theme::PendingTerminalColors::new();
+            Err(pi_rs::Error::Config("startup failed".into()))
+        };
+        assert!(failed_start().is_err());
+        assert!(matches!(
+            super::Theme::system().color("accent"),
+            Color::Rgb { .. }
+        ));
+
+        // Suspending or launching an external editor drops the terminal, not the
+        // pending owner. The replacement query can still settle normally.
+        let _pending = crate::ui::theme::PendingTerminalColors::new();
+        let guard = super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            colors: super::ColorQueries::default(),
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Disabled,
+        };
+        drop(guard);
+        theme = super::Theme::system();
+        assert_eq!(theme.color("accent"), Color::Reset);
+        let resumed = super::ColorQueries {
+            initial_started: Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(101),
+            ),
+            ..Default::default()
+        };
+        assert!(super::expire_initial_terminal_colors(&resumed, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+
+        // The final target, including an invalid response, settles without DA1.
+        mark_terminal_colors_pending();
+        theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        colors.query_terminal_colors(&mut std::io::sink()).unwrap();
+        for target in 0..18 {
+            assert!(
+                colors
+                    .accepts_color_reply(target, &mut std::io::sink())
+                    .unwrap()
+            );
+            if target < 17 {
+                assert!(!super::settle_complete_colors(&colors, &mut theme));
+            }
+        }
+        assert!(super::settle_complete_colors(&colors, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!super::settle_complete_colors(&colors, &mut theme));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn appearance_event_retains_colors_during_partial_requery() {
         const CHILD: &str = "PI_RS_SYSTEM_APPEARANCE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -10439,108 +11192,306 @@ exit {exit}
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn timed_out_color_query_quarantines_old_replies_until_marker() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now() - std::time::Duration::from_secs(3),
-                replied: 1 << 1,
-                quarantined: false,
-            }]),
-            color_requery: true,
-            completed_color_markers: 0,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        terminal.poll_color_timeout().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(terminal.color_queries[0].quarantined);
-        // Late replies from the old request are never accepted into a new palette.
-        let mut accepted = Vec::new();
-        for index in 0..16 {
-            if terminal.accepts_color_reply(index).unwrap() {
-                accepted.push((index, "old"));
+    fn initial_appearance_report_does_not_discard_initial_colors() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        let initial_len = output.len();
+        // A late initial appearance response may follow an OSC reply.
+        assert!(colors.accepts_color_reply(16, &mut output).unwrap());
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(2);
+        colors.initial_started = Some(colors.color_queries.front().unwrap().started);
+        assert!(!colors.appearance_report(true, &mut output).unwrap());
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        assert_eq!(output.len(), initial_len);
+        // A subsequent appearance report must still schedule a refresh.
+        assert!(colors.appearance_report(false, &mut output).unwrap());
+        assert!(colors.color_requery);
+        assert!(!colors.accepts_color_reply(1, &mut output).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn handoff_appearance_change_invalidates_only_on_new_report() {
+        const CHILD: &str = "PI_RS_HANDOFF_APPEARANCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::handoff_appearance_change_invalidates_only_on_new_report",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{reset_terminal_background, set_terminal_color};
+        use crossterm::style::Color;
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let original = theme.color("accent");
+        assert!(matches!(original, Color::Rgb { .. }));
+        // The terminal's dark background can differ from its light OS appearance.
+        let mut colors = super::ColorQueries {
+            last_appearance_report: Some(false),
+            ..Default::default()
+        };
+        colors.disable_after_handoff();
+        let (_, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut std::io::sink())
+                .unwrap();
+        assert!(!redraw);
+        assert_eq!(theme.color("accent"), original);
+        // A changed report invalidates the stale background even when the new
+        // report happens to match the old background's inferred appearance.
+        let (changed, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, true, &mut std::io::sink())
+                .unwrap();
+        assert!(changed && redraw);
+        assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn color_snapshot_applies_foreground_and_background_together() {
+        const CHILD: &str = "PI_RS_COLOR_BATCH_ATOMIC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::color_snapshot_applies_foreground_and_background_together",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        crate::ui::theme::reset_terminal_background();
+        crate::ui::theme::set_terminal_color(true, 255, 255, 255);
+        crate::ui::theme::set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let original = theme.color("accent");
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_color(17, [255, 255, 255], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(super::Theme::system().color("accent"), original);
+        assert!(
+            colors
+                .record_color(16, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(super::Theme::system().color("accent"), original);
+        let snapshot = colors.receive_color_marker(&mut output).unwrap().unwrap();
+        super::apply_terminal_color_snapshot(snapshot, &mut theme);
+        assert_ne!(theme.color("accent"), original);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn invalid_color_response_completes_and_delivers_valid_colors() {
+        for invalid_first in [true, false] {
+            for after_timeout in [true, false] {
+                let mut colors = super::ColorQueries::default();
+                let mut output = Vec::new();
+                colors.query_terminal_colors(&mut output).unwrap();
+                if invalid_first {
+                    assert!(
+                        colors
+                            .record_invalid_color(2, &mut output)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                let mut completed = None;
+                for target in 0..18 {
+                    if target == 2 {
+                        continue;
+                    }
+                    if after_timeout && target == 8 {
+                        let deadline =
+                            colors.initial_started.unwrap() + std::time::Duration::from_millis(101);
+                        assert!(colors.timeout_color_batch(deadline).is_some());
+                    }
+                    let snapshot = colors
+                        .record_color(target, [target, 1, 2], &mut output)
+                        .unwrap();
+                    if snapshot.is_some() {
+                        completed = snapshot;
+                    }
+                }
+                if !invalid_first {
+                    completed = colors.record_invalid_color(2, &mut output).unwrap();
+                }
+                let snapshot = completed.expect("all responses should complete the query");
+                assert_eq!(snapshot.foreground, Some([16, 1, 2]));
+                assert_eq!(snapshot.background, Some([17, 1, 2]));
+                assert!(snapshot.palette.is_none());
+                assert!(
+                    colors
+                        .record_color(2, [2, 3, 4], &mut output)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(colors.receive_color_marker(&mut output).unwrap().is_none());
             }
         }
-        assert!(accepted.is_empty());
-        assert!(!terminal.accepts_color_reply(16).unwrap());
-        assert!(terminal.color_requery);
-        // Seventeen replies are insufficient to start the queued query.
-        assert!(terminal.color_queries[0].quarantined);
-        assert!(!terminal.accepts_color_reply(17).unwrap());
-        assert!(!terminal.color_requery);
-        assert_eq!(terminal.completed_color_markers, 1);
-        // The old marker must not finish the newly issued query.
-        terminal.receive_color_marker().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(!terminal.color_requery);
-        for index in 0..18 {
-            assert!(terminal.accepts_color_reply(index).unwrap());
-            accepted.push((index, "new"));
-            assert!(!terminal.accepts_color_reply(index).unwrap());
-        }
-        assert_eq!(accepted.len(), 18);
-        assert!(accepted.iter().all(|(_, source)| *source == "new"));
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.color_queries.is_empty());
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn complete_color_query_allows_requery_without_da1() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: (1 << 18) - 1,
-                quarantined: false,
-            }]),
-            color_requery: false,
-            completed_color_markers: 0,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        terminal.query_terminal_colors().unwrap();
-        assert_eq!(terminal.completed_color_markers, 1);
-        assert_eq!(terminal.color_queries[0].replied, 0);
-        // A late marker for the completed request cannot end the new query.
-        terminal.receive_color_marker().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        for index in 0..18 {
-            assert!(terminal.accepts_color_reply(index).unwrap());
+    fn invalid_partial_batch_preserves_previous_colors_and_finishes_pending() {
+        const CHILD: &str = "PI_RS_INVALID_PARTIAL_BATCH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "interactive::tests::invalid_partial_batch_preserves_previous_colors_and_finishes_pending"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
         }
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.color_queries.is_empty());
+        use crate::ui::theme::{
+            begin_terminal_palette_query, mark_terminal_colors_pending, reset_terminal_background,
+            set_terminal_color, set_terminal_palette,
+        };
+        reset_terminal_background();
+        set_terminal_color(true, 255, 255, 255);
+        set_terminal_color(false, 0, 0, 0);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index * 10, 20, 30);
+        }
+        let original = super::Theme::system().color("accent");
+        mark_terminal_colors_pending();
+        let mut theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_invalid_color(16, &mut output)
+                .unwrap()
+                .is_none()
+        );
+        // A duplicate valid reply cannot replace the invalid response.
+        assert!(
+            colors
+                .record_color(16, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            colors
+                .record_color(17, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = colors.receive_color_marker(&mut output).unwrap().unwrap();
+        assert!(snapshot.foreground.is_none() && snapshot.palette.is_none());
+        super::apply_terminal_color_snapshot(snapshot, &mut theme);
+        assert!(super::finish_initial_terminal_colors(&mut theme));
+        assert_eq!(theme.color("accent"), original);
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn missing_old_color_marker_does_not_end_incomplete_new_query() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: (1 << 18) - 1,
-                quarantined: false,
-            }]),
-            color_requery: false,
-            completed_color_markers: 0,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        terminal.query_terminal_colors().unwrap();
-        assert!(terminal.accepts_color_reply(0).unwrap());
-        // The marker could belong to either request; keep the new query open.
-        terminal.receive_color_marker().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(!terminal.accepts_color_reply(0).unwrap());
-        assert!(terminal.accepts_color_reply(1).unwrap());
+    fn superseded_partial_snapshot_is_not_delivered() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_color(17, [255, 255, 255], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_color(16, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert!(colors.receive_color_marker(&mut output).unwrap().is_none());
+        assert!(
+            colors
+                .record_color(17, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        let fresh = colors.receive_color_marker(&mut output).unwrap().unwrap();
+        assert_eq!(fresh.background, Some([0, 0, 0]));
+        assert_eq!(fresh.foreground, None);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn color_requery_waits_for_marker_even_after_all_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        for target in 0..18 {
+            assert!(colors.accepts_color_reply(target, &mut output).unwrap());
+        }
+        let first_len = output.len();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        assert!(colors.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn terminal_handoff_rejects_unattributable_markers_and_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.disable_after_handoff();
+        let before = output.len();
+        // The marker may be ours or the external owner's; neither may reopen
+        // queries. Old or external colors must not be applied on return.
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), before);
+        assert!(!colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.disabled);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn missing_marker_preserves_queued_retry_until_boundary_returns() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(3);
+        colors.poll_color_timeout().unwrap();
+        let first_len = output.len();
+        assert!(colors.color_queries[0].quarantined);
+        assert!(colors.color_requery);
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        // The late boundary releases the queued refresh exactly once.
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
     }
 
     #[test]

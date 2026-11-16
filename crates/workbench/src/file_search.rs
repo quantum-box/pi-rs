@@ -1,5 +1,5 @@
 //! Bounded, streaming grep with matching and context line markers.
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use encoding_rs::{CoderResult, Encoding, UTF_8, UTF_16BE, UTF_16LE};
@@ -18,6 +18,10 @@ pub(super) struct Grep {
     context: u64,
 }
 impl Grep {
+    pub fn with_numeric_limit(mut self, limit: f64) -> Self {
+        self.output.numeric_limit = Some(limit.max(1.0));
+        self
+    }
     pub fn new(args: &Value, limit: usize) -> Result<Self> {
         let pattern = args["pattern"]
             .as_str()
@@ -77,32 +81,34 @@ impl Grep {
             file: std::fs::File::open(path)?,
             cancellation,
         };
-        let mut matches = Vec::new();
+        let mut matches = None;
         let result = self.searcher.search_reader(
             &self.matcher,
             file,
             MatchSink {
                 display,
                 output: &mut self.output,
-                matches: &mut matches,
-                with_context: self.context != 0,
+                matches: (self.context != 0).then_some(&mut matches),
+                cancellation,
+                new_spool: MatchSpool::new,
             },
         );
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
         result?;
-        if self.context != 0 && !matches.is_empty() {
+        if let Some(mut matches) = matches.filter(|m| m.count > 0) {
+            matches.rewind()?;
             render_context_or_unavailable(
                 path,
                 display,
-                &matches,
+                &mut matches,
                 self.context,
                 &mut self.output,
                 cancellation,
             )?;
         }
-        Ok(self.output.matches < self.output.limit)
+        Ok(!self.output.limit_reached())
     }
     pub fn finish(self) -> Outcome {
         let output = self.output;
@@ -112,12 +118,29 @@ impl Grep {
         let text = output.lines.join("\n");
         let mut details = Map::new();
         let mut notices = Vec::new();
-        if output.matches == output.limit {
-            details.insert("matchLimitReached".into(), json!(output.limit));
+        if output.limit_reached() {
+            let effective = output.numeric_limit.unwrap_or(output.limit as f64);
+            details.insert(
+                "matchLimitReached".into(),
+                output
+                    .numeric_limit
+                    .map_or_else(|| json!(output.limit), |n| json!(n)),
+            );
+            let mut first = ryu_js::Buffer::new();
+            let mut second = ryu_js::Buffer::new();
+            let (value, next) = if output.numeric_limit.is_some() {
+                (
+                    first.format(effective).to_owned(),
+                    second.format(effective * 2.0).to_owned(),
+                )
+            } else {
+                (
+                    output.limit.to_string(),
+                    output.limit.saturating_mul(2).to_string(),
+                )
+            };
             notices.push(format!(
-                "{} matches limit reached. Use limit={} for more, or refine pattern",
-                output.limit,
-                output.limit.saturating_mul(2)
+                "{value} matches limit reached. Use limit={next} for more, or refine pattern"
             ));
         }
         if output.total_bytes > MAX_BYTES as u64 {
@@ -169,11 +192,18 @@ struct Output {
     total_lines: u64,
     matches: usize,
     limit: usize,
+    numeric_limit: Option<f64>,
     long_lines: bool,
     kept_bytes: usize,
     prefix_full: bool,
 }
 impl Output {
+    fn limit_reached(&self) -> bool {
+        self.numeric_limit
+            .map_or(self.matches >= self.limit, |limit| {
+                (self.matches as f64) >= limit
+            })
+    }
     fn render(&mut self, display: &str, line: &ContextLine, matched: bool) {
         if self.prefix_full {
             return;
@@ -235,21 +265,38 @@ impl ContextLine {
 struct MatchSink<'a> {
     display: &'a str,
     output: &'a mut Output,
-    matches: &'a mut Vec<u64>,
-    with_context: bool,
+    matches: Option<&'a mut Option<MatchSpool>>,
+    cancellation: &'a CancellationToken,
+    new_spool: fn() -> io::Result<MatchSpool>,
+}
+impl MatchSink<'_> {
+    fn record_match(&mut self, number: u64, bytes: &[u8]) -> io::Result<bool> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Operation aborted",
+            ));
+        }
+        self.output.matches += 1;
+        if let Some(matches) = &mut self.matches {
+            if matches.is_none() {
+                **matches = Some((self.new_spool)()?);
+            }
+            matches.as_mut().expect("spool initialized").push(number)?;
+        } else {
+            self.output
+                .line(self.display, &ContextLine::new(number, bytes), true);
+        }
+        Ok(!self.output.limit_reached())
+    }
 }
 impl Sink for MatchSink<'_> {
     type Error = io::Error;
     fn matched(&mut self, _: &Searcher, found: &SinkMatch<'_>) -> io::Result<bool> {
-        let number = found.line_number().expect("line numbers enabled");
-        self.output.matches += 1;
-        if self.with_context {
-            self.matches.push(number);
-        } else {
-            self.output
-                .line(self.display, &ContextLine::new(number, found.bytes()), true);
-        }
-        Ok(self.output.matches < self.output.limit)
+        self.record_match(
+            found.line_number().expect("line numbers enabled"),
+            found.bytes(),
+        )
     }
 }
 
@@ -336,36 +383,84 @@ fn read_context_line(
     }
 }
 
-// Prefix totals at interval boundaries let overlapping blocks be counted in
-// a linear scan after sorting the boundaries, even after the display prefix is full.
+// The match and boundary streams are monotonic. Store fixed-size records on
+// disk so neither match count nor context radius determines resident memory.
+struct MatchSpool {
+    starts: BufWriter<std::fs::File>,
+    ends: BufWriter<std::fs::File>,
+    count: u64,
+}
+impl MatchSpool {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            starts: BufWriter::new(tempfile::tempfile()?),
+            ends: BufWriter::new(tempfile::tempfile()?),
+            count: 0,
+        })
+    }
+    fn push(&mut self, number: u64) -> io::Result<()> {
+        write_u64(&mut self.starts, number)?;
+        write_u64(&mut self.ends, number)?;
+        self.count += 1;
+        Ok(())
+    }
+    fn rewind(&mut self) -> io::Result<()> {
+        self.starts.flush()?;
+        self.ends.flush()?;
+        self.starts.seek(SeekFrom::Start(0))?;
+        self.ends.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+}
+fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
 #[derive(Clone, Copy, Default)]
 struct Prefix {
     lines: u64,
     bytes: u64,
     long: u64,
 }
-#[derive(Default)]
-struct Block {
-    start: u64,
-    end: u64,
-    offset: u64,
-    before: Prefix,
-    after: Prefix,
+impl Prefix {
+    fn write(self, writer: &mut impl Write) -> io::Result<()> {
+        write_u64(writer, self.lines)?;
+        write_u64(writer, self.bytes)?;
+        write_u64(writer, self.long)
+    }
+    fn read(reader: &mut impl Read) -> io::Result<Self> {
+        Ok(Self {
+            lines: read_u64(reader)?,
+            bytes: read_u64(reader)?,
+            long: read_u64(reader)?,
+        })
+    }
 }
 
-// Pi keeps the match if a subsequent context read fails. Preserve prior
-// results and discard any partial context produced before an I/O failure.
+// Source errors retain pi's unavailable-file fallback; spool errors must be
+// propagated, since treating them as an unavailable source would lose data.
+enum ContextError {
+    Source(Error),
+    Spool(io::Error),
+}
+impl From<io::Error> for ContextError {
+    fn from(error: io::Error) -> Self {
+        Self::Spool(error)
+    }
+}
+
 fn render_context_or_unavailable(
     path: &Path,
     display: &str,
-    matches: &[u64],
+    matches: &mut MatchSpool,
     context: u64,
     output: &mut Output,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    if cancellation.is_cancelled() {
-        return Err(Error::Cancelled);
-    }
     let before = (
         output.lines.len(),
         output.total_bytes,
@@ -376,17 +471,21 @@ fn render_context_or_unavailable(
     );
     match render_context(path, display, matches, context, output, cancellation) {
         Ok(()) => Ok(()),
-        Err(Error::Io(_)) if !cancellation.is_cancelled() => {
+        Err(_) if cancellation.is_cancelled() => Err(Error::Cancelled),
+        Err(ContextError::Source(Error::Io(_))) => {
             output.lines.truncate(before.0);
             output.total_bytes = before.1;
             output.total_lines = before.2;
             output.long_lines = before.3;
             output.kept_bytes = before.4;
             output.prefix_full = before.5;
-            for &number in matches {
+            matches.starts.seek(SeekFrom::Start(0))?;
+            let mut match_reader = BufReader::new(matches.starts.get_mut());
+            for _ in 0..matches.count {
                 if cancellation.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
+                let number = read_u64(&mut match_reader)?;
                 output.line(
                     display,
                     &ContextLine {
@@ -399,60 +498,93 @@ fn render_context_or_unavailable(
             }
             Ok(())
         }
-        Err(_) if cancellation.is_cancelled() => Err(Error::Cancelled),
-        Err(error) => Err(error),
+        Err(ContextError::Source(error)) => Err(error),
+        Err(ContextError::Spool(error)) => Err(error.into()),
     }
 }
 
 fn render_context(
     path: &Path,
     display: &str,
-    matches: &[u64],
+    matches: &mut MatchSpool,
     context: u64,
     output: &mut Output,
     cancellation: &CancellationToken,
-) -> Result<()> {
-    let mut blocks: Vec<Block> = matches
-        .iter()
-        .map(|&number| Block {
-            start: number.saturating_sub(context).max(1),
-            end: number.saturating_add(context),
-            ..Block::default()
-        })
-        .collect();
-    let mut events = Vec::with_capacity(blocks.len() * 2);
-    for (index, block) in blocks.iter().enumerate() {
-        events.push((block.start, index, false));
-        events.push((block.end.saturating_add(1), index, true));
-    }
-    events.sort_unstable();
-    let mut reader = BufReader::new(std::fs::File::open(path)?);
-    // Pi reads context with readFile(path, "utf-8"), even when ripgrep
-    // detected a UTF-16 BOM while finding the match.
-    let encoding = UTF_8;
+) -> std::result::Result<(), ContextError> {
+    let mut before = BufWriter::new(tempfile::tempfile()?);
+    let mut after = BufWriter::new(tempfile::tempfile()?);
+    let mut reader =
+        BufReader::new(std::fs::File::open(path).map_err(|e| ContextError::Source(e.into()))?);
+    let mut start_reader = BufReader::new(matches.starts.get_mut());
+    let mut end_reader = BufReader::new(matches.ends.get_mut());
+    let mut starts_left = matches.count;
+    let mut ends_left = matches.count;
+    let mut start = if starts_left > 0 {
+        Some(read_u64(&mut start_reader)?)
+    } else {
+        None
+    };
+    let mut end = if ends_left > 0 {
+        Some(read_u64(&mut end_reader)?)
+    } else {
+        None
+    };
     let mut prefix = Prefix::default();
-    let mut event = 0;
     let mut number = 1u64;
     let mut previous_newline = false;
-    loop {
-        while event < events.len() && events[event].0 <= number {
-            let (_, index, end) = events[event];
-            if end {
-                blocks[index].after = prefix;
-            } else {
-                blocks[index].before = prefix;
-                blocks[index].offset = reader.stream_position()?;
+    let mut eof = false;
+    while start.is_some() || end.is_some() {
+        if cancellation.is_cancelled() {
+            return Err(ContextError::Source(Error::Cancelled));
+        }
+        while let Some(center) = start {
+            if cancellation.is_cancelled() {
+                return Err(ContextError::Source(Error::Cancelled));
             }
-            event += 1;
+            if !eof && center.saturating_sub(context).max(1) > number {
+                break;
+            }
+            write_u64(
+                &mut before,
+                reader
+                    .stream_position()
+                    .map_err(|e| ContextError::Source(e.into()))?,
+            )?;
+            prefix.write(&mut before)?;
+            starts_left -= 1;
+            start = if starts_left > 0 {
+                Some(read_u64(&mut start_reader)?)
+            } else {
+                None
+            };
         }
-        if event == events.len() {
+        while let Some(center) = end {
+            if cancellation.is_cancelled() {
+                return Err(ContextError::Source(Error::Cancelled));
+            }
+            if !eof && center.saturating_add(context).saturating_add(1) > number {
+                break;
+            }
+            prefix.write(&mut after)?;
+            ends_left -= 1;
+            end = if ends_left > 0 {
+                Some(read_u64(&mut end_reader)?)
+            } else {
+                None
+            };
+        }
+        if start.is_none() && end.is_none() {
             break;
         }
-        // Pi's context read is independent of the matcher's binary detection.
+        if eof {
+            continue;
+        }
         let (line, has_bytes, newline) =
-            read_context_line(&mut reader, number, encoding, cancellation)?;
+            read_context_line(&mut reader, number, UTF_8, cancellation)
+                .map_err(ContextError::Source)?;
         if !has_bytes && number > 1 && !previous_newline {
-            break;
+            eof = true;
+            continue;
         }
         prefix.lines = prefix.lines.saturating_add(1);
         prefix.bytes = prefix
@@ -462,39 +594,44 @@ fn render_context(
         number = number.saturating_add(1);
         previous_newline = newline;
         if !has_bytes {
-            break;
+            eof = true;
         }
     }
-    while event < events.len() {
-        let (_, index, end) = events[event];
-        if end {
-            blocks[index].after = prefix;
-        } else {
-            blocks[index].before = prefix;
-            blocks[index].offset = reader.stream_position()?;
-        }
-        event += 1;
-    }
-    for (block, &center) in blocks.iter().zip(matches) {
+    before.flush()?;
+    after.flush()?;
+    before.seek(SeekFrom::Start(0))?;
+    after.seek(SeekFrom::Start(0))?;
+    start_reader.seek(SeekFrom::Start(0))?;
+    let mut before = BufReader::new(before.into_inner().map_err(|e| e.into_error())?);
+    let mut after = BufReader::new(after.into_inner().map_err(|e| e.into_error())?);
+    for _ in 0..matches.count {
         if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
+            return Err(ContextError::Source(Error::Cancelled));
         }
-        let lines = block.after.lines - block.before.lines;
-        let bytes = block.after.bytes - block.before.bytes;
+        let center = read_u64(&mut start_reader)?;
+        let offset = read_u64(&mut before)?;
+        let first = Prefix::read(&mut before)?;
+        let last = Prefix::read(&mut after)?;
+        let lines = last.lines - first.lines;
+        let bytes = last.bytes - first.bytes;
         if lines > 0 {
             output.total_bytes = output
                 .total_bytes
                 .saturating_add(bytes - u64::from(output.total_lines == 0));
             output.total_lines = output.total_lines.saturating_add(lines);
-            output.long_lines |= block.after.long > block.before.long;
+            output.long_lines |= last.long > first.long;
         }
         if output.prefix_full {
             continue;
         }
-        reader.seek(SeekFrom::Start(block.offset))?;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| ContextError::Source(e.into()))?;
+        let block_start = center.saturating_sub(context).max(1);
         for index in 0..lines {
-            let number = block.start + index;
-            let (line, _, _) = read_context_line(&mut reader, number, encoding, cancellation)?;
+            let number = block_start + index;
+            let (line, _, _) = read_context_line(&mut reader, number, UTF_8, cancellation)
+                .map_err(ContextError::Source)?;
             output.render(display, &line, number == center);
             if output.prefix_full {
                 break;
@@ -507,6 +644,20 @@ fn render_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn numeric_limit_notices_use_javascript_number_formatting() {
+        let mut grep = Grep::new(&json!({"pattern":"match"}), 100)
+            .unwrap()
+            .with_numeric_limit(9_007_199_254_740_992.0);
+        grep.output.matches = 9_007_199_254_740_992;
+        grep.output.lines.push("fixture:1: match".into());
+        let output = grep.finish().tool_content();
+        assert!(
+            output.contains("9007199254740992 matches limit reached. Use limit=18014398509481984")
+        );
+    }
 
     #[test]
     fn single_line_patterns_follow_ripgrep_newline_rules() {
@@ -586,6 +737,46 @@ mod tests {
     }
     use serde_json::json;
     #[test]
+    fn context_spool_is_lazy_and_cancellation_stops_matching() {
+        fn unavailable() -> io::Result<MatchSpool> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no temporary storage",
+            ))
+        }
+        let token = CancellationToken::new();
+        let mut output = Output {
+            limit: 1_000,
+            ..Output::default()
+        };
+        let mut spool = None;
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 1_000).unwrap();
+        let mut sink = MatchSink {
+            display: "fixture",
+            output: &mut output,
+            matches: Some(&mut spool),
+            cancellation: &token,
+            new_spool: unavailable,
+        };
+        grep.searcher
+            .search_slice(&grep.matcher, b"no result\n", &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.record_match(1, b"match").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        sink.new_spool = MatchSpool::new;
+        for number in 1..100 {
+            assert!(sink.record_match(number, b"match").unwrap());
+        }
+        token.cancel();
+        assert_eq!(
+            sink.record_match(100, b"match").unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(sink.output.matches, 100);
+    }
+    #[test]
     fn unavailable_context_keeps_matches_and_prior_output() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("removed");
@@ -596,7 +787,11 @@ mod tests {
             ..Output::default()
         };
         output.line("earlier", &ContextLine::new(1, b"earlier match"), true);
-        render_context_or_unavailable(&missing, "removed", &[2, 5], 1, &mut output, &token)
+        let mut matches = MatchSpool::new().unwrap();
+        matches.push(2).unwrap();
+        matches.push(5).unwrap();
+        matches.rewind().unwrap();
+        render_context_or_unavailable(&missing, "removed", &mut matches, 1, &mut output, &token)
             .unwrap();
         assert_eq!(
             output.lines.join("\n"),
@@ -613,11 +808,14 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
         let mut output = Output::default();
+        let mut matches = MatchSpool::new().unwrap();
+        matches.push(1).unwrap();
+        matches.rewind().unwrap();
         assert!(matches!(
             render_context_or_unavailable(
                 &directory.path().join("removed"),
                 "removed",
-                &[1],
+                &mut matches,
                 1,
                 &mut output,
                 &token
@@ -806,6 +1004,61 @@ mod tests {
     }
 
     #[test]
+    fn uncapped_many_overlapping_matches_count_all_blocks() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let count = 20_000u64;
+        std::fs::write(file.path(), "match\n".repeat(count as usize)).unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), usize::MAX).unwrap();
+        grep.search(file.path(), "f", &CancellationToken::new())
+            .unwrap();
+        match grep.finish() {
+            Outcome::SucceededWithDetails { details, .. } => {
+                // First block has two lines; the last includes the trailing empty line.
+                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+                let total_bytes: u64 = (1..=count)
+                    .map(|center| {
+                        let start = center.saturating_sub(1).max(1);
+                        let end = (center + 1).min(count + 1);
+                        (start..=end)
+                            .map(|n| {
+                                let text_len = if n <= count { 5 } else { 0 };
+                                (1 + 1 + n.to_string().len() + 2 + text_len + 1) as u64
+                            })
+                            .sum::<u64>()
+                    })
+                    .sum::<u64>()
+                    - 1;
+                assert_eq!(details["truncation"]["totalBytes"], total_bytes);
+            }
+            other => panic!("expected truncation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_spool_processing_honors_cancellation() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "match\n").unwrap();
+        let mut matches = MatchSpool::new().unwrap();
+        matches.push(1).unwrap();
+        matches.rewind().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut output = Output::default();
+        assert!(matches!(
+            render_context_or_unavailable(
+                file.path(),
+                "f",
+                &mut matches,
+                1,
+                &mut output,
+                &cancellation
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(output.lines.is_empty());
+    }
+
+    #[test]
     fn utf8_context_preserves_overlaps() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let text = "\u{0a01} first 🦀\r\nneedle one\nneedle two\nafter\n";
@@ -900,10 +1153,13 @@ mod tests {
             limit: 100,
             ..Output::default()
         };
-        render_context(
+        let mut matches = MatchSpool::new().unwrap();
+        matches.push(1).unwrap();
+        matches.rewind().unwrap();
+        render_context_or_unavailable(
             file.path(),
             "f",
-            &[1],
+            &mut matches,
             2,
             &mut output,
             &CancellationToken::new(),

@@ -10,6 +10,7 @@ pub struct Reader {
     file: File,
     decoder: Decoder,
     size: Option<(u16, u16, u16, u16)>,
+    read_one: bool,
 }
 impl Reader {
     pub fn new() -> io::Result<Self> {
@@ -31,8 +32,17 @@ impl Reader {
             file,
             decoder: Decoder::default(),
             size: terminal_size(),
+            read_one: false,
         })
     }
+
+    // Avoid pulling input intended for the next terminal owner into our decoder.
+    pub fn new_for_handoff() -> io::Result<Self> {
+        let mut reader = Self::new()?;
+        reader.read_one = true;
+        Ok(reader)
+    }
+
     pub fn drain(&mut self, max: Duration, idle: Duration) -> io::Result<()> {
         // Read bytes directly: an incomplete escape sequence is still activity,
         // even when the event decoder cannot yet produce an event.
@@ -114,7 +124,8 @@ impl Reader {
         }
         if result > 0 {
             let mut buffer = [0_u8; 1024];
-            let count = match self.file.read(&mut buffer) {
+            let length = if self.read_one { 1 } else { buffer.len() };
+            let count = match self.file.read(&mut buffer[..length]) {
                 Ok(count) => count,
                 Err(error)
                     if matches!(
@@ -164,6 +175,7 @@ mod tests {
             file: unsafe { File::from_raw_fd(reader.into_raw_fd()) },
             decoder: Decoder::default(),
             size: None,
+            read_one: false,
         };
         // Force the raw reader to make multiple reads, with an incomplete
         // escape sequence crossing its 1024-byte buffer boundary.

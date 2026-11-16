@@ -2721,22 +2721,26 @@ impl Agent<'_> {
         )?;
         observer(Notification::Request(&portable_request(&request)));
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+        const MAX_ENRICHED_ITEMS: usize = 256;
+        const MAX_LEGACY_TEXT_SEGMENTS: usize = 128;
         let mut metadata = ModelMetadata::default();
         let mut tool_delta_bytes = 0_usize;
         let mut reasoning_delta_bytes = 0_usize;
         let mut text_item_ids = std::collections::HashMap::<u64, usize>::new();
         let mut text_parts = Vec::<String>::new();
         let mut legacy_text_slot = None;
+        let mut legacy_text_segments = 0usize;
         let mut text_len = 0usize;
         let mut text_delta_bytes = 0usize;
         let mut text_final_bytes = 0usize;
         let mut reasoning_item_ids = HashSet::new();
+        let mut observed_reasoning = std::collections::HashMap::<u64, String>::new();
         let mut reasoning_final_bytes = 0_usize;
         let collect = async {
             let session_id = session.session_id();
             let external_id = session.external_session_id();
             let opening = if retain_reply {
-                self.model.stream_enriched_in_session_with_identity(
+                self.model.stream_detailed_in_session_with_identity(
                     request_id,
                     session_id,
                     &external_id,
@@ -2744,7 +2748,7 @@ impl Agent<'_> {
                 )
             } else {
                 self.model
-                    .stream_enriched_for_summary(request_id, session_id, request)
+                    .stream_detailed_for_summary(request_id, session_id, request)
             };
             tokio::pin!(opening);
             let mut stream = loop {
@@ -2764,7 +2768,9 @@ impl Agent<'_> {
                 let Some(event) = event else {
                     break;
                 };
-                match event? {
+                let event = event?;
+                let redacted_start = event.is_redacted_start();
+                match event.event {
                     EnrichedModelEvent::Legacy(ModelEvent::Text(delta)) => {
                         text_delta_bytes = text_delta_bytes.saturating_add(delta.len());
                         if text_delta_bytes > MAX_RESPONSE_BYTES
@@ -2772,14 +2778,13 @@ impl Agent<'_> {
                         {
                             return Err(Error::Model("response exceeds size limit".into()));
                         }
-                        observer(Notification::Text(&delta));
-                        text_len += delta.len();
                         let slot = match legacy_text_slot {
                             Some(slot) => slot,
                             None => {
-                                if text_parts.len() >= 128 {
+                                if legacy_text_segments >= MAX_LEGACY_TEXT_SEGMENTS {
                                     return Err(Error::Model("too many text segments".into()));
                                 }
+                                legacy_text_segments += 1;
                                 let slot = text_parts.len();
                                 text_parts.push(String::new());
                                 legacy_text_slot = Some(slot);
@@ -2787,11 +2792,13 @@ impl Agent<'_> {
                             }
                         };
                         text_parts[slot].push_str(&delta);
+                        text_len += delta.len();
+                        observer(Notification::Text(&delta));
                     }
                     EnrichedModelEvent::TextStart { index } => {
                         legacy_text_slot = None;
                         if !text_item_ids.contains_key(&index) {
-                            if text_item_ids.len() >= 64 {
+                            if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
                                 return Err(Error::Model("too many text items".into()));
                             }
                             text_item_ids.insert(index, text_parts.len());
@@ -2810,7 +2817,7 @@ impl Agent<'_> {
                         let slot = match text_item_ids.get(&index) {
                             Some(slot) => *slot,
                             None => {
-                                if text_item_ids.len() >= 64 {
+                                if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
                                     return Err(Error::Model("too many text items".into()));
                                 }
                                 let slot = text_parts.len();
@@ -2840,7 +2847,7 @@ impl Agent<'_> {
                         let slot = match text_item_ids.get(&index) {
                             Some(slot) => *slot,
                             None => {
-                                if text_item_ids.len() >= 64 {
+                                if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
                                     return Err(Error::Model("too many text items".into()));
                                 }
                                 let slot = text_parts.len();
@@ -2874,11 +2881,15 @@ impl Agent<'_> {
                     }
                     EnrichedModelEvent::ReasoningDelta { index, delta } => {
                         reasoning_item_ids.insert(index);
-                        if reasoning_item_ids.len() > 64 {
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("too many reasoning items".into()));
                         }
                         reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
                         if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            observed_reasoning
+                                .entry(index)
+                                .or_default()
+                                .push_str(&delta);
                             with_reasoning_event_metadata(
                                 ReasoningEventMetadata::Delta { index },
                                 || observer(Notification::Reasoning(&delta)),
@@ -2887,22 +2898,30 @@ impl Agent<'_> {
                     }
                     EnrichedModelEvent::ReasoningStart { index } => {
                         reasoning_item_ids.insert(index);
-                        if reasoning_item_ids.len() > 64 {
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("too many reasoning items".into()));
                         }
-                        with_reasoning_event_metadata(
-                            ReasoningEventMetadata::Start { index },
-                            || observer(Notification::Reasoning("")),
-                        );
+                        with_redacted_reasoning_start(redacted_start, || {
+                            with_reasoning_event_metadata(
+                                ReasoningEventMetadata::Start { index },
+                                || observer(Notification::Reasoning("")),
+                            );
+                        });
                     }
                     EnrichedModelEvent::ReasoningEnd { index, content } => {
                         reasoning_item_ids.insert(index);
                         reasoning_final_bytes = reasoning_final_bytes.saturating_add(content.len());
-                        if reasoning_item_ids.len() > 64
-                            || reasoning_final_bytes > MAX_RESPONSE_BYTES
-                        {
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("reasoning items exceed size limit".into()));
                         }
+                        // Always close the item. If the final-content budget is
+                        // exhausted, use only deltas already delivered for this item.
+                        let observed = observed_reasoning.remove(&index).unwrap_or_default();
+                        let content = if reasoning_final_bytes <= MAX_RESPONSE_BYTES {
+                            content
+                        } else {
+                            observed
+                        };
                         with_reasoning_event_metadata(
                             ReasoningEventMetadata::End { index, content },
                             || observer(Notification::Reasoning("")),
@@ -6174,6 +6193,7 @@ thread_local! {
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
     static REASONING_EVENT_METADATA: std::cell::RefCell<Vec<ReasoningEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
+    static REDACTED_REASONING_START: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6197,6 +6217,25 @@ fn with_text_event_metadata<T>(value: TextEventMetadata, f: impl FnOnce() -> T) 
         }
     }
     TEXT_EVENT_METADATA.with(|stack| stack.borrow_mut().push(value));
+    let _guard = Pop;
+    f()
+}
+
+/// Whether the current synchronous reasoning-start callback is redacted.
+#[doc(hidden)]
+pub fn redacted_reasoning_start() -> bool {
+    REDACTED_REASONING_START.with(|stack| stack.borrow().last().copied().unwrap_or(false))
+}
+fn with_redacted_reasoning_start<T>(value: bool, f: impl FnOnce() -> T) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            REDACTED_REASONING_START.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    REDACTED_REASONING_START.with(|stack| stack.borrow_mut().push(value));
     let _guard = Pop;
     f()
 }

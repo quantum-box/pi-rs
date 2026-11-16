@@ -188,6 +188,14 @@ enum CacheControlFormat {
     Anthropic,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PromptCacheKeyMode {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelCompatibility {
@@ -197,6 +205,7 @@ struct ModelCompatibility {
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
+    prompt_cache_key_mode: Option<PromptCacheKeyMode>,
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
@@ -217,6 +226,7 @@ impl ModelCompatibility {
             session_affinity_format: newer
                 .session_affinity_format
                 .or(self.session_affinity_format),
+            prompt_cache_key_mode: newer.prompt_cache_key_mode.or(self.prompt_cache_key_mode),
             supports_long_cache_retention: newer
                 .supports_long_cache_retention
                 .or(self.supports_long_cache_retention),
@@ -1098,6 +1108,18 @@ impl Profiles {
         )
     }
 
+    pub fn responses_prompt_cache_key_enabled(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        !matches!(
+            self.cache_compatibility(provider, model)
+                .prompt_cache_key_mode,
+            Some(PromptCacheKeyMode::Disabled)
+        )
+    }
+
     pub fn chat_cache_support(
         &self,
         provider: &Provider,
@@ -1238,9 +1260,16 @@ impl Profiles {
 
     pub fn model(&self, provider: &Provider, id: &str) -> Option<ModelMetadata> {
         let profile = self.entries.get(provider.id());
-        let model = self
+        let mut model = self
             .definition(provider, id)
             .map(|model| model.metadata.clone().with_model_defaults());
+        // Pi applies provider compatibility over bundled model defaults, while
+        // explicitly configured models and modelOverrides take precedence.
+        if let (Some(profile), Some(model)) = (profile, &mut model)
+            && !profile.models.iter().any(|configured| configured.id == id)
+        {
+            model.compat = model.compat.clone().overlay(profile.compat.clone());
+        }
         match profile.and_then(|profile| profile.overrides.get(id)) {
             Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
             None => model,
@@ -1701,6 +1730,24 @@ mod tests {
     }
 
     #[test]
+    fn responses_prompt_cache_key_mode_inherits_and_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"example":{
+            "baseUrl":"https://example.com/v1", "api":"openai-responses",
+            "compat":{"promptCacheKeyMode":"disabled"},
+            "models":[{"id":"inherited"},{"id":"auto","compat":{"promptCacheKeyMode":"auto"}},{"id":"enabled","compat":{"promptCacheKeyMode":"enabled"}}]
+        }}})).unwrap();
+        let provider = profiles.provider("example").unwrap();
+        for (id, expected) in [("inherited", false), ("auto", true), ("enabled", true)] {
+            let model = profiles.model(&provider, id).unwrap();
+            assert_eq!(
+                profiles.responses_prompt_cache_key_enabled(&provider, Some(&model)),
+                expected
+            );
+        }
+        assert!(Profiles::parse(&json!({"providers":{"example":{"baseUrl":"https://example.com/v1", "api":"openai-responses", "compat":{"promptCacheKeyMode":"unknown"}}}})).is_err());
+    }
+
+    #[test]
     fn responses_cache_compatibility_merges_provider_and_model() {
         let profiles = Profiles::parse(&json!({"providers":{"example":{
             "baseUrl":"https://example.com/v1", "api":"openai-responses",
@@ -1723,6 +1770,37 @@ mod tests {
         assert_eq!(
             profiles.responses_cache_support(&openai, Some(&model)),
             (true, true)
+        );
+    }
+
+    #[test]
+    fn builtin_provider_compatibility_precedes_catalog_but_not_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"openai":{
+            "compat":{"supportsLongCacheRetention":false},
+            "modelOverrides":{"gpt-6-sol":{"compat":{"supportsLongCacheRetention":true}}},
+            "models":[{"id":"custom","compat":{"supportsLongCacheRetention":true}}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("openai").unwrap();
+        let builtin = profiles.model(&provider, "gpt-6-sol").unwrap();
+        assert!(
+            profiles
+                .responses_cache_support(&provider, Some(&builtin))
+                .0
+        );
+        let custom = profiles.model(&provider, "custom").unwrap();
+        assert!(profiles.responses_cache_support(&provider, Some(&custom)).0);
+
+        let without_override = Profiles::parse(&json!({"providers":{"openai":{
+            "compat":{"supportsLongCacheRetention":false}
+        }}}))
+        .unwrap();
+        let provider = without_override.provider("openai").unwrap();
+        let builtin = without_override.model(&provider, "gpt-6-sol").unwrap();
+        assert!(
+            !without_override
+                .responses_cache_support(&provider, Some(&builtin))
+                .0
         );
     }
 

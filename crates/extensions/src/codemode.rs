@@ -676,7 +676,17 @@ fn install_globals(
             async move {
                 let result = match serde_json::from_str::<Value>(&arguments) {
                     Ok(args) if has_operations => {
-                        let _permit = slots.acquire().await.expect("model operation slots");
+                        // Only inference consumes Pi's four model-call slots.
+                        // Discovery and model resolution must remain available
+                        // while slow classifier or image requests are in flight.
+                        let _permit = if matches!(
+                            args["action"].as_str(),
+                            Some("classify" | "generateImages")
+                        ) {
+                            Some(slots.acquire().await.expect("model operation slots"))
+                        } else {
+                            None
+                        };
                         if model_usage.lock().expect("codemode output").limit_exceeded {
                             return Ok::<_, rquickjs::Error>(
                                 json!({"ok":false,"error":"Script output limit exceeded"})
@@ -1631,6 +1641,88 @@ mod tests {
     }
 
     struct Host;
+    #[tokio::test]
+    async fn model_discovery_remains_available_when_inference_slots_are_full() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ModelHost {
+            started: AtomicUsize,
+            changed: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for ModelHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                match args["action"].as_str() {
+                    Some("resolve") => Outcome::Structured {
+                        data: json!(true),
+                        attachments: vec![],
+                    },
+                    Some("classify") => {
+                        self.started.fetch_add(1, Ordering::SeqCst);
+                        self.changed.notify_one();
+                        let _permit = self.release.acquire().await.unwrap();
+                        Outcome::Structured {
+                            data: json!({"stopReason":"stop","answers":{}}),
+                            attachments: vec![],
+                        }
+                    }
+                    Some("list") => {
+                        while self.started.load(Ordering::SeqCst) < 4 {
+                            self.changed.notified().await;
+                        }
+                        self.release.add_permits(4);
+                        Outcome::Structured {
+                            data: json!([]),
+                            attachments: vec![],
+                        }
+                    }
+                    _ => Outcome::Failed("unexpected action".into()),
+                }
+            }
+        }
+        let host = Arc::new(ModelHost {
+            started: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let code = r#"
+            const model = {provider:'fixture', id:'fixture'};
+            const context = {state:{}, questions:{x:{type:'bool', instructions:'test', criteria:{true:'yes', false:'no'}}}};
+            const calls = Array.from({length:4}, () => models.classify(model, context));
+            await models.getModelsOfType('classifier');
+            await Promise.all(calls);
+            text('discovery completed');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(3)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            host,
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected completed script")
+        };
+        assert_eq!(data["isError"], false, "{data}");
+        assert!(data["content"].to_string().contains("discovery completed"));
+    }
+
     #[tokio::test]
     async fn model_calls_validate_before_host_and_preserve_provider_errors() {
         use std::sync::atomic::{AtomicUsize, Ordering};
