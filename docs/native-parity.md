@@ -3870,7 +3870,8 @@ forward prepared requests with their effective decisions, transformed reservatio
 schemas, configured headers, session affinity and summary cache policy. If a
 before-request hook changes the selected model, Anthropic prepared dispatch
 uses a frozen map of catalog and profile capabilities for models on the same
-route. An uncatalogued selected model uses its provider capability or the
+route. An explicit endpoint applies to both the selected and rewritten model
+when comparing routes. An uncatalogued selected model uses its provider capability or the
 unsupported default; a rewrite to an unknown model or a model configured for
 another route fails closed. A partial model override alone does not establish a
 routable model for a rewrite. Direct Anthropic declaration-aware streams reject
