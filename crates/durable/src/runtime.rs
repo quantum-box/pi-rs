@@ -3817,6 +3817,11 @@ impl crate::session_transaction::SessionTransaction<'_> {
     }
 }
 
+const TASK_INPUT_WAKE_PREFIX: &[u8] = b"runtime/task-input-wake/";
+fn task_input_wake_key(id: Uuid) -> Vec<u8> {
+    format!("runtime/task-input-wake/{id}").into_bytes()
+}
+
 pub(crate) fn validate_task_input(
     store: &durable_store::Store,
     bytes: &[u8],
@@ -3861,6 +3866,25 @@ pub(crate) fn validate_task_input(
 }
 
 impl Harness {
+    pub(crate) fn validate_task_input_context(
+        &self,
+        id: Uuid,
+        version: u64,
+    ) -> Result<(), crate::document::Error> {
+        use crate::document::Error as DError;
+        let (state, current) = self
+            .load(id)
+            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+        if current != version {
+            return Err(durable_store::Error::Conflict { key: Self::key(id) }.into());
+        }
+        if !self.supports_context_blocks(&state) {
+            return Err(DError::InvalidSessionAdmission(
+                "unsupported context blocks".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn prepare_task_input(
         &self,
         intent: &crate::document::TaskInputIntent,
@@ -3924,10 +3948,19 @@ impl Harness {
         let prepared = self
             .prepare_save(&state, Expected::Version(version))
             .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
-        Ok(crate::task_store::OwnedBatch {
-            checks: prepared.checks,
-            mutations: prepared.mutations,
-        })
+        let wake_key = task_input_wake_key(intent.conversation);
+        let wake = self.owner.store().get(&wake_key)?;
+        let mut checks = prepared.checks;
+        let mut mutations = prepared.mutations;
+        checks.push(Check {
+            key: wake_key.clone(),
+            expected: wake.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+        });
+        mutations.push(Mutation::Put {
+            key: wake_key,
+            value: Vec::new(),
+        });
+        Ok(crate::task_store::OwnedBatch { checks, mutations })
     }
 }
 
@@ -17976,6 +18009,8 @@ impl Scheduler {
         self.reporter = Some(tokio::spawn(async move {
             let mut active: HashMap<Vec<u8>, tokio::task::JoinHandle<Result<(), Error>>> =
                 HashMap::new();
+            let mut wake_versions: HashMap<Vec<u8>, u64> = HashMap::new();
+            let mut blocked_wakes: HashMap<Vec<u8>, u64> = HashMap::new();
             loop {
                 let done: Vec<_> = active
                     .iter()
@@ -17984,22 +18019,100 @@ impl Scheduler {
                     .collect();
                 for key in done {
                     if let Some(task) = active.remove(&key) {
+                        let version = wake_versions.remove(&key);
                         match task.await {
-                            Ok(Ok(())) => (),
+                            Ok(Ok(())) => {
+                                blocked_wakes.remove(&key);
+                            }
                             Ok(Err(Error::Interrupted)) if cancel.is_cancelled() => (),
                             Ok(Err(e)) => {
+                                if let Some(version) = version {
+                                    blocked_wakes.insert(key, version);
+                                }
                                 *errors.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(e.to_string())
+                                    Some(e.to_string());
                             }
                             Err(e) => {
+                                if let Some(version) = version {
+                                    blocked_wakes.insert(key, version);
+                                }
                                 *errors.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(e.to_string())
+                                    Some(e.to_string());
                             }
                         }
                     }
                 }
                 if cancel.is_cancelled() {
                     break;
+                }
+                // Task-side admission persists a wake in the same commit as the
+                // input. Retain it until the worker has driven the conversation;
+                // startup can therefore recover even if this process dies here.
+                match source.owner.store().list(TASK_INPUT_WAKE_PREFIX) {
+                    Ok(pending) => {
+                        for (key, entry) in pending {
+                            if active.contains_key(&key)
+                                || blocked_wakes.get(&key) == Some(&entry.version)
+                            {
+                                continue;
+                            }
+                            let Some(id) = key
+                                .strip_prefix(TASK_INPUT_WAKE_PREFIX)
+                                .and_then(|suffix| std::str::from_utf8(suffix).ok())
+                                .and_then(|text| Uuid::parse_str(text).ok())
+                            else {
+                                continue;
+                            };
+                            let mut worker = source.worker();
+                            let worker_errors = worker_errors.clone();
+                            let reporter_stop = cancel.clone();
+                            let wake_key = key.clone();
+                            wake_versions.insert(key.clone(), entry.version);
+                            active.insert(
+                                key,
+                                tokio::spawn(async move {
+                                    let control = worker.owner.conversation_controls().get(id);
+                                    let lock = control.worker;
+                                    worker.execution_gate = Some(control.gate);
+                                    let activity = worker.activity.enter_at(
+                                        crate::worker_activity::WorkerKind::Conversation,
+                                        id,
+                                        crate::worker_activity::WorkerPhase::Queued,
+                                    );
+                                    let mut guard = Some(tokio::select! {
+                                        biased;
+                                        _ = reporter_stop.cancelled() => return Ok(()),
+                                        guard = lock.lock() => guard,
+                                    });
+                                    drive_scheduled(
+                                        &mut worker,
+                                        id,
+                                        &control.cancel,
+                                        &lock,
+                                        &mut guard,
+                                        Some(&worker_errors),
+                                        activity,
+                                    )
+                                    .await?;
+                                    match worker.owner.store().commit(
+                                        &[Check {
+                                            key: wake_key.clone(),
+                                            expected: Expected::Version(entry.version),
+                                        }],
+                                        &[Mutation::Delete { key: wake_key }],
+                                    ) {
+                                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                            Ok(())
+                                        }
+                                        Err(error) => Err(error.into()),
+                                    }
+                                }),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        *errors.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string())
+                    }
                 }
                 match source.pending_reporters() {
                     Ok(pending) => {

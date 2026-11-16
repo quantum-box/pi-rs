@@ -529,6 +529,7 @@ pub struct DetachedInvocation {
     running: task_store::StoredTask,
     handler: Arc<dyn Handler>,
     abort: bool,
+    validator: Option<crate::runtime::Harness>,
     lease: InvocationLease,
 }
 
@@ -955,6 +956,7 @@ impl DetachedInvocation {
             running,
             handler,
             abort,
+            validator,
             lease,
         } = self;
         let result = if abort {
@@ -975,6 +977,7 @@ impl DetachedInvocation {
         } else {
             let owner = &lease.attachment.owner;
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
+            documents.set_input_validator(validator.as_ref());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler.run_with_documents(&running.task, &mut documents)
             }));
@@ -1341,6 +1344,7 @@ impl Scheduler {
             running,
             handler,
             abort,
+            validator: self.validator.as_ref().map(|harness| harness.worker()),
             lease: InvocationLease {
                 attachment: self.attachment.clone(),
                 state: self.live_invocations.clone(),

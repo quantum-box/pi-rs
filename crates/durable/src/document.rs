@@ -1991,6 +1991,7 @@ pub(crate) struct TaskInputIntent {
 /// zero; existing staged documents retain their original version until commit.
 pub struct TaskDocuments<'a> {
     store: &'a Store,
+    input_validator: Option<&'a crate::runtime::Harness>,
     revision: u64,
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
@@ -2161,6 +2162,7 @@ impl DetachedTaskDocuments {
         } = self;
         let mut docs = TaskDocuments {
             store: owner.store(),
+            input_validator: None,
             revision,
             reads,
             writes,
@@ -2231,6 +2233,7 @@ impl<'a> TaskDocuments<'a> {
         }
         let Self {
             store: _,
+            input_validator: _,
             revision,
             reads,
             writes,
@@ -2271,6 +2274,7 @@ impl<'a> TaskDocuments<'a> {
     pub(crate) fn new(store: &'a Store, task: &crate::task::Task) -> Result<Self, Error> {
         Ok(Self {
             store,
+            input_validator: None,
             task: task.clone(),
             acquired: HashSet::new(),
             entries: None,
@@ -2286,6 +2290,9 @@ impl<'a> TaskDocuments<'a> {
             reads: HashMap::new(),
             writes: HashMap::new(),
         })
+    }
+    pub(crate) fn set_input_validator(&mut self, validator: Option<&'a crate::runtime::Harness>) {
+        self.input_validator = validator;
     }
     /// Stage an idle input for the task's directly owning conversation.
     /// The request ID is required for recovery; the result is provisional until
@@ -2312,6 +2319,11 @@ impl<'a> TaskDocuments<'a> {
             .get(&key)?
             .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
         crate::runtime::validate_task_input(self.store, &record.value, &request_id, &content)?;
+        self.input_validator
+            .ok_or_else(|| {
+                Error::InvalidSessionAdmission("task input requires an attached harness".into())
+            })?
+            .validate_task_input_context(*conversation, record.version)?;
         self.task_input = Some(TaskInputIntent {
             conversation: *conversation,
             version: record.version,
@@ -2571,6 +2583,9 @@ impl<'a> TaskDocuments<'a> {
     /// effects commit with the task step. The runtime version and observer head
     /// are fenced, so a concurrent runtime change causes the whole step to retry.
     pub fn checkpoint_runtime(&mut self) -> Result<(), Error> {
+        if self.task_input.is_some() {
+            return Err(Error::InvalidApplicationEntry);
+        }
         let Some((_, _, entries, _, true)) = &self.entries else {
             return Err(Error::InvalidApplicationEntry);
         };

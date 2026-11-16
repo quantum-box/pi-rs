@@ -1495,3 +1495,75 @@ async fn scheduler_async_transaction_fits_and_schedules() {
     assert!(!adapter.0.lock().unwrap().is_empty());
     scheduler.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn task_input_rejects_unsupported_existing_block_context_before_settlement() {
+    use pi_rs_durable::{
+        document::{Error as DError, TaskDocuments},
+        task::{
+            Checkpoint, Task, TaskOwner, TaskState,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    struct Reject;
+    impl Handler for Reject {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            assert!(
+                matches!(docs.submit_input("new".into(), "hello".into()), Err(DError::InvalidSessionAdmission(reason)) if reason.contains("unsupported context"))
+            );
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(Adapter::default());
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter).unwrap();
+    let id = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    h.submit_fitted_user_blocks(
+        id,
+        None,
+        vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})],
+        &fit,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("reject", true, Reject);
+    let mut tasks = h.attach_tasks(registry).unwrap();
+    for _ in 0..2 {
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(id),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("reject".into(), true);
+        tasks.submit(&task).unwrap();
+        assert!(tasks.tick(0).unwrap());
+        assert!(matches!(
+            tasks.get(task.id()).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
+    }
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 1);
+}
