@@ -911,10 +911,50 @@ Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bin
 initial child allowlist to the durable reservation before submission. For task-owned
 children, `ensure_task_owned_subagent_restricted` and
 `submit_task_owned_subagent_restricted` commit the selection with the child and,
-for submit, its initial input. The selection is part of the reservation identity:
-a retry with a different selection fails, even after reopening. Existing child
-selections may subsequently be changed using the settled-conversation API. This limits tool dispatch, not other effects of trusted tools,
-hooks, or host APIs.
+for submit, its initial input. `submit_task_owned_subagent_notified` creates a
+foreground child and atomically binds its initial submission to a
+`submission_settled_signal()` key on the owning task. A task-backed handler can
+park on that typed signal, then read its settlement after waking. The reservation
+binds the input, tool selection and signal key; retries with different values fail.
+The destination key is permanently reserved for that child submission. A different
+submission, existing legacy notification, or existing signal receipt using the same
+key is rejected, including across concurrent admission and reopening. Public signal
+writers cannot populate a reserved destination, even with the correct child and
+submission IDs; only the runtime settlement transaction can deliver it. After reopening, the scheduler resumes the committed child and settlement delivers
+the signal in the same transaction. Parent abort still traverses the foreground
+ownership edge. While an attached task scheduler has published a related failure
+but has not settled it, owned-child admission returns `Error::TaskPublicationBusy`
+without creating a child; retry outside the task gate. New admissions are also
+rejected below a persisted failing or aborting foreground ancestor. The built-in
+foreground tool parks and retries the admission. A background ownership boundary
+keeps independent work separate. The signal payload uses the pi-rs settlement representation
+(including answer text) rather than upstream's entry-only answer reference.
+Existing child selections may subsequently be changed using the
+settled-conversation API. This limits tool dispatch, not other effects of
+trusted tools, hooks, or host APIs.
+
+An embedding host can instead install a foreground `subagent` extension with
+`RuntimeOwner::open_with_foreground_subagent(path, options, extensions, tasks,
+parent, child_config, allowed_tools)`. Create the parent first with a paused
+harness, then select `foreground_subagent::extension_name(parent)` on that
+settled conversation. The model calls `subagent` with `{ "task": "..." }`.
+The task accepts up to 65,536 Unicode characters; whitespace-only text returns
+a known tool error without creating a child. The runtime admits a task-backed
+invocation directly after the before-tool hooks and schema validation; it does not dispatch or replay an ordinary tool
+invocation. The task owns a foreground child conversation and waits on its
+submission settlement signal. A successful child answer becomes the tool result;
+an unanswered child becomes a tool error. Child work may itself park on a
+task signal, allowing the parent and child to survive a shutdown and reopen.
+Reopen with the same parent, child configuration, tool allowlist, extension
+registry and task definitions. The child configuration must have a nonempty
+model and a positive output-token limit; invalid configurations are rejected
+when opening the runtime. A changed foreground binding is rejected while
+an invocation is pending. The child starts with the supplied tool allowlist and
+no selected extensions; `None` leaves global tools unrestricted. Parent abort
+crosses the foreground ownership edge. This is separate from the named
+background management extension below and cannot be selected on a different
+conversation. Scheduler-only hosts can use `Scheduler::open_with_foreground_subagent`
+and must retain and shut down its returned task driver.
 
 An embedding host can opt in to a parent-bound `subagent` extension with
 `Scheduler::open_with_subagent_management(path, options, registry, parent, child_config)`.
@@ -959,7 +999,8 @@ this tool globally or replace the bound extension with another implementation.
 this API cannot verify a caller through independently implemented `ToolHost`s
 or implement task-owner-scoped stop or wait. The upstream Durable background
 example has no `wait` action; its separate foreground waiting example parks on
-a task-owned child's submission signal, which this extension does not support.
+a task-owned child's submission signal. The foreground extension described above provides that separate wait path; the
+background management extension does not expose a wait action.
 Stop is scoped by the bound parent
 and its named reservation, not by a calling task. The host must trust the configured tools and registry. It must also ensure
 the child configuration is suitable for every child; no per-child model,
@@ -1982,13 +2023,24 @@ are rejected. New task IDs are provisional. Task records and any settlement
 notification are committed atomically with the transaction's other changes.
 `tx.create_child_task(&parent_snapshot, child)` and
 `tx.create_keyed_child(&parent_snapshot, key, child)` stage registered children
-of the same live generic task attempt. The latter returns the existing ID for a
+of a live generic or TaskTool attempt. The latter returns the existing ID for a
 matching key and rejects identity changes, including definition version, replay
 policy, initial checkpoint and restart limit as well as kind and input. These
 extra identity checks are a pi-rs extension. The driver validates the exact parent
 reservation, registry and pending abort under the admission gate, and fences the
-ownership graph through commit. Multiple children of that parent may be staged.
-This slice rejects task-tool parents, task-owned conversations, multiple parents and mixing root-task and child creation. Ordinary nested-tool
+ownership graph through commit. Multiple parents and children, including
+children of tasks staged earlier in the transaction, may be combined with
+root-task creation. A generic child can execute while its TaskTool parent is
+running, provided the attached driver still owns the parent invocation. The
+driver reserves one additional worker for direct generic children of live
+TaskTool parents when its four ordinary workers are busy. Unrelated work cannot
+use this reserved worker and waits for ordinary capacity. A blocking generic
+child can occupy the reserved worker; this fixed bound does not guarantee
+progress for arbitrary recursively blocking handlers. Handlers must remain
+cooperative. An interrupted parent must recover before its descendants run. Successful TaskTool
+settlement waits for owned work; failure and explicit abort cascade through it. This
+slice rejects task-owned conversations and TaskTool children through these host
+methods. Ordinary nested-tool
 keys use a separate journal, so upstream shared cross-kind key semantics are not
 implemented. Cross-conversation creation is also unsupported.
 

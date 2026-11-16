@@ -13,6 +13,7 @@ pub struct TaskTool {
     replay_safe: bool,
     definition_version: u32,
     handler: Arc<dyn crate::task_scheduler::Handler>,
+    direct_binding: Option<Value>,
 }
 /// Handle for a keyed task-backed nested tool. It can be stored in a checkpoint
 /// and resolved after a child wake. The child is admitted only when the parent
@@ -75,7 +76,15 @@ impl TaskTool {
             replay_safe,
             definition_version,
             handler,
+            direct_binding: None,
         }
+    }
+    pub(crate) fn with_direct_binding(mut self, binding: Value) -> Self {
+        self.direct_binding = Some(binding);
+        self
+    }
+    pub(crate) fn is_direct(&self) -> bool {
+        self.direct_binding.is_some()
     }
     /// Register this exact adapter. The same handler must be registered with the task driver.
     pub fn register(self: &Arc<Self>) -> crate::runtime::RegisteredTool {
@@ -196,6 +205,7 @@ impl TaskTool {
             kind: self.kind.clone(),
             definition_version: self.definition_version,
             replay_safe: self.replay_safe,
+            direct_binding: self.direct_binding.clone(),
         })
     }
     pub(crate) fn task(
@@ -238,6 +248,8 @@ pub(crate) struct Identity {
     pub(crate) kind: String,
     pub(crate) definition_version: u32,
     pub(crate) replay_safe: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_binding: Option<Value>,
 }
 #[async_trait::async_trait]
 impl Tool for TaskTool {
@@ -245,6 +257,9 @@ impl Tool for TaskTool {
         self.spec.clone()
     }
     async fn invoke(&self, _: Value, context: ToolContext) -> Outcome {
+        if self.is_direct() {
+            return Outcome::Skipped("foreground task requires direct durable admission".into());
+        }
         if !DISPATCH
             .try_with(|(adapter, operation)| {
                 std::ptr::eq(self, adapter.as_ref()) && *operation == context.operation_id
