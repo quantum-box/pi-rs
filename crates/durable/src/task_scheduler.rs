@@ -1404,19 +1404,20 @@ impl Scheduler {
                 .and_then(|state| {
                     if self.poisoned.load(std::sync::atomic::Ordering::Acquire) || state.poisoned {
                         Err(Error::Poisoned)
-                    } else if state.handler_failed && !state.failed_handlers.contains(&lease.id) {
-                        Err(Error::Busy)
                     } else {
-                        Ok(())
+                        Ok(state.handler_failed && !state.failed_handlers.contains(&lease.id))
                     }
                 })
         };
-        if let Err(error) = health {
-            return Err(SettlementError::RejectedPrepared {
-                error,
-                pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
-            });
-        }
+        let after_other_failure = match health {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(SettlementError::RejectedPrepared {
+                    error,
+                    pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+                });
+            }
+        };
         let owner = self.owner();
         let gate = match owner.task_gate().lock() {
             Ok(gate) => gate,
@@ -1427,6 +1428,12 @@ impl Scheduler {
                 });
             }
         };
+        if after_other_failure && !Self::independent_root(&owner, &settlement.running.task) {
+            return Err(SettlementError::RejectedPrepared {
+                error: Error::Busy,
+                pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+            });
+        }
         let mut deferred = None;
         let mut precommit_rejection = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1569,20 +1576,21 @@ impl Scheduler {
                 .and_then(|state| {
                     if self.poisoned.load(std::sync::atomic::Ordering::Acquire) || state.poisoned {
                         Err(Error::Poisoned)
-                    } else if state.handler_failed && !state.failed_handlers.contains(&lease.id) {
-                        Err(Error::Busy)
                     } else {
-                        Ok(())
+                        Ok(state.handler_failed && !state.failed_handlers.contains(&lease.id))
                     }
                 })
         };
-        if let Err(error) = health {
-            drop(guard);
-            return Err(SettlementError::RejectedPrepared {
-                error,
-                pending: Box::new(pending!()),
-            });
-        }
+        let after_other_failure = match health {
+            Ok(value) => value,
+            Err(error) => {
+                drop(guard);
+                return Err(SettlementError::RejectedPrepared {
+                    error,
+                    pending: Box::new(pending!()),
+                });
+            }
+        };
         let owner = self.owner();
         let gate = match owner.task_gate().lock() {
             Ok(g) => g,
@@ -1594,6 +1602,14 @@ impl Scheduler {
                 });
             }
         };
+        if after_other_failure && !Self::independent_root(&owner, &running.task) {
+            drop(gate);
+            drop(guard);
+            return Err(SettlementError::RejectedPrepared {
+                error: Error::Busy,
+                pending: Box::new(pending!()),
+            });
+        }
         let mut rejected = false;
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool, Error> {
@@ -1693,6 +1709,15 @@ impl Scheduler {
         drop(guard);
         drop(lease);
         result.map_err(SettlementError::Indeterminate)
+    }
+
+    fn independent_root(owner: &OwnedStore, task: &Task) -> bool {
+        match task.owner() {
+            TaskOwner::Conversation(id) => crate::ownership_edge::EdgeStore::new(owner.store())
+                .get(*id)
+                .is_ok_and(|edge| edge.is_none()),
+            TaskOwner::Task(_) => false,
+        }
     }
 
     /// Stop admitting new reservations. Existing completed invocations can
@@ -5226,6 +5251,81 @@ mod tests {
                 .unwrap()
                 .value["value"],
             json!("retained")
+        );
+    }
+
+    #[test]
+    fn prepared_independent_result_drains_after_handler_panic() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        struct Staged(Address);
+        impl Handler for Staged {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                docs.get(&self.0).unwrap();
+                docs.put(
+                    &self.0,
+                    json!({"value": "prepared"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("done")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let address = Address {
+            scope: "panic".into(),
+            name: "prepared".into(),
+            key: "".into(),
+        };
+        let mut registry = Registry::default();
+        registry.register("panic", false, |_: &Task| -> Result<Step, String> {
+            panic!("handler panic")
+        });
+        registry.register("work", false, Staged(address.clone()));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&task(1, owner.clone(), "panic", false, 3)),
+                Save::Create(&task(2, owner.clone(), "work", false, 3)),
+                Save::Create(&task(3, owner, "missing", false, 3)),
+            ])
+            .unwrap();
+        let TickReservation::Invocation(a) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("A")
+        };
+        let TickReservation::Invocation(b) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("B")
+        };
+        scheduler.yield_after_graph_conflict = true;
+        scheduler.result_commit_hook = Some(Arc::new(|_, store| {
+            let tasks = TaskStore::new(store);
+            let other = tasks.load(Uuid::from_u128(3)).unwrap().unwrap();
+            tasks.update(&other, |_| Ok(())).unwrap();
+        }));
+        let pending = match scheduler.settle_invocation(b.execute().unwrap()) {
+            Err(SettlementError::Yielded { pending }) => *pending,
+            result => panic!("expected prepared yield: {result:?}"),
+        };
+        assert!(matches!(pending, PendingSettlement::Prepared { .. }));
+        scheduler.yield_after_graph_conflict = false;
+        scheduler.result_commit_hook = None;
+        assert!(std::thread::spawn(move || a.execute()).join().is_err());
+        assert!(matches!(scheduler.reserve_tick(0), Err(Error::Stopped)));
+        scheduler.try_resume_pending(pending).unwrap();
+        assert_eq!(
+            Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap()
+                .unwrap()
+                .value["value"],
+            json!("prepared")
         );
     }
 
