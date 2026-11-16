@@ -4122,10 +4122,10 @@ impl Scheduler {
             prepared.commit_uncertain = false;
             if let Some(assembly) = &mut prepared.notifications
                 && assembly.retries < 3
-                && assembly
-                    .settlements
-                    .iter()
-                    .any(|(notify, _, _)| task_store::key(notify.task_id) == *key)
+                && assembly.settlements.iter().any(|(notify, _, _)| {
+                    task_store::key(notify.task_id) == *key
+                        || task_store::signal_revision_key(notify.task_id) == *key
+                })
             {
                 let old = assembly
                     .original
@@ -4139,13 +4139,20 @@ impl Scheduler {
                     .find(|check| check.key == *key);
                 let retry = match (old, new) {
                     (None, Some(_)) => true,
-                    (Some(old), Some(new)) => crate::runtime::notification_deadline_only_conflict(
-                        owner.store(),
-                        key,
-                        &old.expected,
-                        &new.expected,
-                    )
-                    .map_err(task_store::Error::from)?,
+                    (Some(old), Some(new))
+                        if assembly
+                            .settlements
+                            .iter()
+                            .any(|(notify, _, _)| task_store::key(notify.task_id) == *key) =>
+                    {
+                        crate::runtime::notification_deadline_only_conflict(
+                            owner.store(),
+                            key,
+                            &old.expected,
+                            &new.expected,
+                        )
+                        .map_err(task_store::Error::from)?
+                    }
                     _ => false,
                 };
                 if retry {
@@ -5142,6 +5149,212 @@ mod tests {
         Checkpoint {
             phase: phase.into(),
             data: json!(null),
+        }
+    }
+
+    #[test]
+    fn task_notification_revision_race_preserves_original_signal_fences() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{
+            Config, Harness, Options, SubmissionNotify, submission_settled_signal,
+        };
+        use crate::task_store::{Save, SignalResult, SignalToken, TaskStore};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Write {
+            target: Uuid,
+            original_signal: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Write {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.submit_write(
+                    "revision-write".into(),
+                    "app.note".into(),
+                    None,
+                    Some(SubmissionNotify {
+                        task_id: self.target,
+                        key: "settled".into(),
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+                if self.original_signal {
+                    docs.signal_at(
+                        self.target,
+                        &SignalToken::new("original", 1).unwrap(),
+                        "key",
+                        json!(1),
+                        0,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                let address = Address {
+                    scope: "test".into(),
+                    name: "revision".into(),
+                    key: "".into(),
+                };
+                docs.get(&address).map_err(|e| e.to_string())?;
+                docs.put(&address, json!({"done":true}).as_object().unwrap().clone())
+                    .map_err(|e| e.to_string())?;
+                Ok(Step::Succeed(json!(null)))
+            }
+        }
+        for original_signal in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(
+                &path,
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            let conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let target = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("target"),
+                3,
+            )
+            .unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            let tasks = TaskStore::new(&store);
+            tasks.save(&[Save::Create(&target)]).unwrap();
+            tasks
+                .reserve(&tasks.load(target.id()).unwrap().unwrap())
+                .unwrap();
+            tasks
+                .update(&tasks.load(target.id()).unwrap().unwrap(), |task| {
+                    task.wait(WaitFor::TypedSleep {
+                        until_millis: None,
+                        signals: vec![submission_settled_signal().key("settled").unwrap()],
+                    })
+                })
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register(
+                "revision-write",
+                false,
+                Write {
+                    target: target.id(),
+                    original_signal,
+                    calls: calls.clone(),
+                },
+            );
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            let writer = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("writer"),
+                3,
+            )
+            .unwrap()
+            .registered("revision-write".into(), false);
+            scheduler.submit(&writer).unwrap();
+            let commits = Arc::new(AtomicUsize::new(0));
+            let observed = commits.clone();
+            let target_id = target.id();
+            scheduler.set_result_commit_hook(Arc::new(move |_, store| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(
+                        TaskStore::new(store)
+                            .deliver_signal_at(
+                                target_id,
+                                &SignalToken::new("concurrent", 1).unwrap(),
+                                "key",
+                                json!(7),
+                                0
+                            )
+                            .unwrap(),
+                        SignalResult::Delivered
+                    );
+                }
+            }));
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let current = scheduler.get(writer.id()).unwrap().unwrap();
+            let address = Address {
+                scope: "test".into(),
+                name: "revision".into(),
+                key: "".into(),
+            };
+            let document = Documents::new(&store).get(&address).unwrap();
+            let notification = tasks
+                .read_typed_signal(target.id(), &submission_settled_signal(), "settled")
+                .unwrap();
+            assert_eq!(
+                tasks
+                    .read_typed_signal(
+                        target.id(),
+                        &SignalToken::new("concurrent", 1).unwrap(),
+                        "key"
+                    )
+                    .unwrap(),
+                Some(json!(7))
+            );
+            if original_signal {
+                assert!(matches!(current.state(), TaskState::Failed(_)));
+                assert!(document.is_none());
+                assert!(notification.is_none());
+                assert!(
+                    tasks
+                        .read_typed_signal(
+                            target.id(),
+                            &SignalToken::new("original", 1).unwrap(),
+                            "key"
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .is_empty()
+                );
+                assert_eq!(commits.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(current.state(), TaskState::Succeeded(_)));
+                assert!(document.is_some());
+                assert!(notification.is_some());
+                assert_eq!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .len(),
+                    1
+                );
+                assert_eq!(commits.load(Ordering::SeqCst), 2);
+            }
         }
     }
 
