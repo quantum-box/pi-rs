@@ -11,6 +11,89 @@ use super::{ResourceFilter, parse_manifest_object, read_optional_manifest};
 const MAX_ENTRIES: usize = 10_000;
 const MAX_DEPTH: usize = 64;
 const MAX_IGNORE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXTGLOB_PATTERN: usize = 1024;
+const MAX_EXTGLOB_DEPTH: usize = 16;
+const MAX_EXTGLOB_INPUT: usize = 16 * 1024;
+
+// This deliberately supports a bounded subset. In particular negated extglobs,
+// classes, braces and globstars require Node-specific semantics; falling back
+// is preferable to reporting a partial or incorrectly empty candidate set.
+fn extglob_regex(pattern: &str) -> Option<Option<regex::Regex>> {
+    let bytes = pattern.as_bytes();
+    if !has_extglob(pattern) {
+        return Some(None);
+    }
+    if bytes.len() > MAX_EXTGLOB_PATTERN
+        || !pattern.is_ascii()
+        || pattern.contains(['[', ']', '{', '}'])
+        || pattern.contains("**")
+    {
+        return None;
+    }
+    fn sequence(bytes: &[u8], pos: &mut usize, depth: usize) -> Option<String> {
+        if depth > MAX_EXTGLOB_DEPTH {
+            return None;
+        }
+        let mut out = String::new();
+        while *pos < bytes.len() {
+            let ch = bytes[*pos];
+            if depth > 0 && matches!(ch, b'|' | b')') {
+                break;
+            }
+            if matches!(ch, b'@' | b'?' | b'*' | b'+' | b'!') && bytes.get(*pos + 1) == Some(&b'(')
+            {
+                if ch == b'!' {
+                    return None;
+                }
+                *pos += 2;
+                let mut alternatives = Vec::new();
+                loop {
+                    alternatives.push(sequence(bytes, pos, depth + 1)?);
+                    match bytes.get(*pos) {
+                        Some(b'|') => *pos += 1,
+                        Some(b')') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                let quantifier = match ch {
+                    b'@' => "",
+                    b'?' => "?",
+                    b'*' => "*",
+                    b'+' => "+",
+                    _ => return None,
+                };
+                out.push_str(&format!("(?:{}){quantifier}", alternatives.join("|")));
+            } else {
+                // Bare parentheses inside an extglob are parsed differently by
+                // Node's matcher; do not infer a partial interpretation.
+                if depth > 0 && ch == b'(' {
+                    return None;
+                }
+                *pos += 1;
+                match ch {
+                    b'*' => out.push_str("[^/]*"),
+                    b'?' => out.push_str("[^/]"),
+                    b'/' if depth > 0 => return None,
+                    _ => out.push_str(&regex::escape(&(ch as char).to_string())),
+                }
+            }
+        }
+        Some(out)
+    }
+    let mut pos = 0;
+    let expression = sequence(bytes, &mut pos, 0)?;
+    if pos != bytes.len() {
+        return None;
+    }
+    let regex = regex::RegexBuilder::new(&format!("\\A{expression}\\z"))
+        .size_limit(1024 * 1024)
+        .build()
+        .ok()?;
+    Some(Some(regex))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -85,6 +168,15 @@ pub(super) fn candidates(root: &Path, kind: Kind) -> Result<Option<Vec<PathBuf>>
         .filter(|entry| entry.starts_with(['!', '+', '-']))
         .collect();
     if !overrides.is_empty() {
+        // The shared override matcher does not implement extglobs. Exact +
+        // and - overrides are literal paths, but ! is a pattern in Pi.
+        if overrides
+            .iter()
+            .filter_map(|entry| entry.strip_prefix('!'))
+            .any(has_extglob)
+        {
+            return Ok(None);
+        }
         // Pi evaluates overrides against candidates rather than eagerly
         // validating patterns when the candidate set is empty.
         let filter = ResourceFilter {
@@ -101,6 +193,13 @@ pub(super) fn candidates(root: &Path, kind: Kind) -> Result<Option<Vec<PathBuf>>
     let mut seen = HashSet::new();
     paths.retain(|path| seen.insert(path.clone()));
     Ok(Some(paths))
+}
+
+fn has_extglob(pattern: &str) -> bool {
+    pattern
+        .as_bytes()
+        .windows(2)
+        .any(|w| matches!(w[0], b'@' | b'?' | b'*' | b'+' | b'!') && w[1] == b'(')
 }
 
 struct Scanner {
@@ -130,13 +229,34 @@ impl Scanner {
             .filter(|part| !part.is_empty() && *part != ".")
             .collect::<Vec<_>>()
             .join("/");
-        let matcher = globset::GlobBuilder::new(&normalized)
-            .literal_separator(true)
-            .backslash_escape(false)
-            .build()
-            .ok()?
-            .compile_matcher();
+        let mut prefix = root.to_path_buf();
+        for component in normalized.split('/') {
+            if component.contains(['*', '?', '[', '{']) || has_extglob(component) {
+                break;
+            }
+            prefix.push(component);
+            if std::fs::symlink_metadata(&prefix)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return None;
+            }
+        }
+        let extglob = extglob_regex(&normalized)?;
+        let matcher = if extglob.is_none() {
+            Some(
+                globset::GlobBuilder::new(&normalized)
+                    .literal_separator(true)
+                    .backslash_escape(false)
+                    .build()
+                    .ok()?
+                    .compile_matcher(),
+            )
+        } else {
+            None
+        };
         let mut matches = Vec::new();
+        let mut matched_bytes = 0usize;
+        let mut symlink_checks = 0usize;
         for entry in ignore::WalkBuilder::new(root)
             .hidden(true)
             .parents(false)
@@ -155,10 +275,62 @@ impl Scanner {
             if entry.depth() == MAX_DEPTH && entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 return None;
             }
-            let relative = entry.path().strip_prefix(root).ok()?;
-            if matcher.is_match(relative)
-                && (!directory_only || entry.file_type().is_some_and(|kind| kind.is_dir()))
+            // A fixed component after a wildcard may resolve to a symlinked
+            // directory in Node's glob walker. We do not follow such trees;
+            // avoid treating an incomplete scan as an empty result.
+            if normalized.contains('/')
+                && entry.file_type().is_some_and(|kind| kind.is_symlink())
+                && entry.path().is_dir()
+                && (normalized.contains("**") || entry.depth() < normalized.split('/').count())
             {
+                symlink_checks += 1;
+                if symlink_checks > MAX_DEPTH {
+                    return None;
+                }
+                let prefix = normalized
+                    .split('/')
+                    .take(entry.depth())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let relative = entry.path().strip_prefix(root).ok()?;
+                let reachable = if normalized.contains("**") {
+                    true
+                } else if let Some(regex) = extglob_regex(&prefix)? {
+                    let input = relative.to_str()?;
+                    if !input.is_ascii() {
+                        return None;
+                    }
+                    regex.is_match(&input.replace('\\', "/"))
+                } else {
+                    globset::GlobBuilder::new(&prefix)
+                        .literal_separator(true)
+                        .backslash_escape(false)
+                        .build()
+                        .ok()?
+                        .compile_matcher()
+                        .is_match(relative)
+                };
+                if reachable {
+                    return None;
+                }
+            }
+            let relative = entry.path().strip_prefix(root).ok()?;
+            let matched = if let Some(regex) = &extglob {
+                let input = relative.to_str()?;
+                // Node matches UTF-16 code units, while Rust regex matches Unicode
+                // scalars; use the safe fallback for non-ASCII paths.
+                if !input.is_ascii() || input.len() > MAX_EXTGLOB_INPUT {
+                    return None;
+                }
+                matched_bytes = matched_bytes.checked_add(input.len())?;
+                if matched_bytes > MAX_IGNORE_BYTES {
+                    return None;
+                }
+                regex.is_match(&input.replace('\\', "/"))
+            } else {
+                matcher.as_ref()?.is_match(relative)
+            };
+            if matched && (!directory_only || entry.file_type().is_some_and(|kind| kind.is_dir())) {
                 matches.push(entry.into_path());
             }
         }
@@ -393,6 +565,218 @@ fn extension_entry(dir: &Path, count: &mut usize) -> Option<Option<Vec<PathBuf>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extglob_matches_node_when_available() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        for name in [
+            "a.md", "b.md", "ab.md", "aba.md", "c.md", "a.txt", "x.md.txt",
+        ] {
+            std::fs::write(root.path().join("p").join(name), "fixture").unwrap();
+        }
+        let patterns = [
+            "p/*.@(md|txt)",
+            "p/?(a|b)*.md",
+            "p/*(a|b)*.md",
+            "p/+(a|b)*.md",
+            "p/@(a|@(b|c))*.md",
+            "p/*.+(md|txt)",
+            "p/*.?(md|txt)",
+            "p/*.*(md|txt)",
+            "p/@(a|b)*.@(md|txt)",
+            "p/@(a*|b)*.md",
+            "p/@(a|+(b|c))*.md",
+            "p/*/@(a|b)*.md",
+            "@(p|q)/*.@(md|txt)",
+            "p/*.@(md|)",
+            "p/@(a|b)?(b|c)*.md",
+        ];
+        let output = std::process::Command::new("node")
+            .args(["-e", "const f=require('fs'); if(!f.globSync)process.exit(77); const p=JSON.parse(process.argv[1]); process.stdout.write(JSON.stringify(p.map(x=>f.globSync(x,{cwd:process.cwd()}).sort())))", &serde_json::to_string(&patterns).unwrap()])
+            .current_dir(root.path())
+            .output();
+        let Ok(output) = output else { return };
+        if output.status.code() == Some(77) {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<Vec<String>> = serde_json::from_slice(&output.stdout).unwrap();
+        for (pattern, expected) in patterns.into_iter().zip(expected) {
+            let mut scanner = Scanner {
+                count: 0,
+                ignore_bytes: 0,
+                active: HashSet::new(),
+            };
+            let actual = scanner.glob(root.path(), pattern).unwrap();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|path| root.path().join(path))
+                .collect();
+            assert_eq!(actual, expected, "{pattern}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extglob_symlink_prefix_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("real")).unwrap();
+        std::fs::write(root.path().join("real/a.md"), "prompt").unwrap();
+        std::os::unix::fs::symlink(root.path().join("real"), root.path().join("link")).unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["link/*.@(md|txt)"]}}).to_string(),
+        )
+        .unwrap();
+        assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
+        std::fs::create_dir(root.path().join("parent")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("real"), root.path().join("parent/link"))
+            .unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["*/link/*.@(md|txt)"]}}).to_string(),
+        )
+        .unwrap();
+        assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_symlink_does_not_hide_extglob_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("prompts")).unwrap();
+        std::fs::write(root.path().join("prompts/a.md"), "prompt").unwrap();
+        std::os::unix::fs::symlink(root.path().join("prompts"), root.path().join("unrelated"))
+            .unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["prompts/*.@(md|txt)"]}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates(root.path(), Kind::Prompt).unwrap().unwrap(),
+            vec![root.path().join("prompts/a.md")]
+        );
+    }
+
+    #[test]
+    fn extglob_node_fixtures_and_manifest_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        for name in [
+            "a.md",
+            "b.md",
+            "ab.md",
+            "aba.md",
+            "c.md",
+            "a.txt",
+            ".hidden.md",
+        ] {
+            std::fs::write(root.path().join("p").join(name), "fixture").unwrap();
+        }
+        // Expected sets from Node globSync, followed by Pi's hidden-path filter.
+        for (pattern, expected) in [
+            (
+                "p/*.@(md|txt)",
+                vec!["a.md", "a.txt", "ab.md", "aba.md", "b.md", "c.md"],
+            ),
+            (
+                "p/?(a|b)*.md",
+                vec!["a.md", "ab.md", "aba.md", "b.md", "c.md"],
+            ),
+            (
+                "p/*(a|b)*.md",
+                vec!["a.md", "ab.md", "aba.md", "b.md", "c.md"],
+            ),
+            ("p/+(a|b)*.md", vec!["a.md", "ab.md", "aba.md", "b.md"]),
+            (
+                "p/@(a|@(b|c))*.md",
+                vec!["a.md", "ab.md", "aba.md", "b.md", "c.md"],
+            ),
+        ] {
+            std::fs::write(
+                root.path().join("package.json"),
+                serde_json::json!({"pi":{"prompts":[pattern]}}).to_string(),
+            )
+            .unwrap();
+            let actual = candidates(root.path(), Kind::Prompt).unwrap().unwrap();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|name| root.path().join("p").join(name))
+                .collect();
+            assert_eq!(actual, expected, "{pattern}");
+        }
+        // Pi does not treat @() alone as a glob, even though Node globSync does.
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["p/@(a|b).md"]}}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            candidates(root.path(), Kind::Prompt)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unsupported_extglobs_fall_back_without_partial_results() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        std::fs::write(root.path().join("p/a.md"), "fixture").unwrap();
+        for pattern in [
+            "p/*.!(md|txt)",
+            "p/@(a|!(b))*.md",
+            "p/@(a|b/*.md)",
+            "p/@(a|b*.md",
+            "p/**/@(a|b)*",
+            "p/@(a|b)*.[mt]d",
+            "p/@(a|b)*.{md,txt}",
+        ] {
+            std::fs::write(
+                root.path().join("package.json"),
+                serde_json::json!({"pi":{"prompts":["p/a.md", pattern]}}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                candidates(root.path(), Kind::Prompt).unwrap().is_none(),
+                "{pattern}"
+            );
+        }
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["p/a.md", "!p/*.@(md|txt)"]}}).to_string(),
+        )
+        .unwrap();
+        assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
+        assert!(extglob_regex(&format!("{}*.md", "@(a|".repeat(MAX_EXTGLOB_DEPTH + 1))).is_none());
+        assert!(extglob_regex(&format!("{}@(a|b)*", "a".repeat(MAX_EXTGLOB_PATTERN))).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extglob_non_utf8_paths_fall_back() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path()
+                .join(std::ffi::OsString::from_vec(vec![b'x', 0xff])),
+            "fixture",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["*.@(md|txt)"]}}).to_string(),
+        )
+        .unwrap();
+        assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
+    }
 
     #[test]
     fn manifest_globs_resolve_relative_dot_components() {

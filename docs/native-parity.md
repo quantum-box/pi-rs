@@ -173,7 +173,12 @@ sources and other resource filter paths still treat invalid URLs as non-matches.
 Pi-only extensions, skills and prompts are scanned only for filter diagnostics;
 they are not loaded as native resources. Diagnostic scans are bounded and fall
 back to native candidates on cycles, excessive traversal, unsafe ignore files,
-or unsupported absolute/parent globs, so errors can still be missed in those
+unsupported absolute/parent globs, potentially traversed directory symlinks,
+or unsupported
+extglob forms. Diagnostic
+extglob discovery supports bounded ASCII positive groups; negated groups,
+extglob overrides, non-ASCII paths, and combinations with classes, braces, or
+globstars fall back, so errors can still be missed in those
 cases. Package resources are evaluated in settings order, with project sources
 first.
 
