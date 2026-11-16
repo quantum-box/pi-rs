@@ -18614,6 +18614,8 @@ impl Harness {
     /// Record a terminal observation for a nested pending job. An authoritative
     /// cancellation should be supplied as a failed outcome by the host after the
     /// remote cancellation is confirmed. This does not cancel the remote job.
+    /// A parked intermediate is not a remote job; resolve its listed pending
+    /// descendant instead.
     pub fn reconcile_nested_pending(
         &mut self,
         id: Uuid,
@@ -18640,6 +18642,7 @@ impl Harness {
     }
     /// Record confirmation that the remote job was cancelled. This performs no
     /// remote cancellation; the caller must obtain authoritative confirmation.
+    /// For a parked intermediate, cancel its listed pending descendant instead.
     pub fn cancel_nested_pending(
         &mut self,
         id: Uuid,

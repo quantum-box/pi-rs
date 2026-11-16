@@ -3195,6 +3195,106 @@ async fn intermediate_wakes_after_descendant_rotates_pending_reference() {
     scheduler.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn intermediate_park_rejects_public_resolution_and_leaf_wakes_after_reopen() {
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let child_calls = Arc::new(AtomicUsize::new(0));
+        let middle_calls = Arc::new(AtomicUsize::new(0));
+        let options = || Options {
+            model: Arc::new(ModelStub),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+                Arc::new(KeyedToolAdapter::new(ParkedIntermediate(
+                    middle_calls.clone(),
+                )))
+                .register(ReplayPolicy::Safe),
+                RegisteredTool {
+                    tool: Arc::new(Child(child_calls.clone())),
+                    replay: ReplayPolicy::Unsafe,
+                },
+            ],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut scheduler = Scheduler::open(&path, options()).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.conversation(id).unwrap().nested_suspended());
+        let root = scheduler.blocked(id).unwrap().unwrap().0;
+        let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let leaf = &jobs[0];
+        assert_eq!(leaf.reference, "external-job");
+
+        // The public pending-job listing exposes only the remote leaf. A caller
+        // that retained or guessed the internal marker must not resolve it.
+        let store = durable_store::Store::open(&path).unwrap();
+        let (key, marker) = store
+            .list(format!("nested/{root}/").as_bytes())
+            .unwrap()
+            .into_iter()
+            .find(|(_, entry)| {
+                let value: Value = serde_json::from_slice(&entry.value).unwrap();
+                !value["child_park"].is_null()
+            })
+            .expect("child park marker");
+        let value: Value = serde_json::from_slice(&marker.value).unwrap();
+        let intermediate = uuid::Uuid::parse_str(value["operation_id"].as_str().unwrap()).unwrap();
+        let reference = format!(
+            "nested-child-park:{}",
+            value["child_park"]["suspension"].as_str().unwrap()
+        );
+        let result = if cancel {
+            scheduler.cancel_nested_pending(id, root, intermediate, &reference, "cancelled".into())
+        } else {
+            scheduler.reconcile_nested_pending(
+                id,
+                root,
+                intermediate,
+                &reference,
+                Outcome::Succeeded("forged".into()),
+            )
+        };
+        let error = result.expect_err("internal marker must not be resolved");
+        assert!(error.to_string().contains("resolve its pending descendant"));
+        assert_eq!(store.get(&key).unwrap().unwrap().value, marker.value);
+        scheduler.shutdown().await.unwrap();
+
+        let mut scheduler = Scheduler::open(&path, options()).unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.conversation(id).unwrap().nested_suspended());
+        scheduler
+            .reconcile_nested_pending(
+                id,
+                root,
+                leaf.operation_id,
+                &leaf.reference,
+                Outcome::Succeeded("leaf-result".into()),
+            )
+            .unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none());
+        assert_eq!(child_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            scheduler.conversation(id).unwrap().messages.iter().any(
+                |m| matches!(m, Message::Tool {content, ..} if content == "middle:leaf-result")
+            )
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
 struct ChildParkDiskRoot(std::path::PathBuf);
 #[async_trait]
 impl KeyedTool for ChildParkDiskRoot {

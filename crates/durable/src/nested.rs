@@ -699,6 +699,11 @@ pub(crate) fn resolve_pending(
     }
     let (key, entry, mut record) =
         found.ok_or_else(|| Error::Invalid("nested operation not found".into()))?;
+    if record.child_park.is_some() {
+        return Err(Error::Invalid(
+            "nested child park is not a remote job; resolve its pending descendant instead".into(),
+        ));
+    }
     let resolution = Resolution {
         reference: reference.into(),
         outcome: outcome.clone(),
