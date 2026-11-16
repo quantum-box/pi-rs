@@ -8,7 +8,7 @@ use pi_rs_durable::{
     document::{Address, Documents, Error as DocumentError},
     recovery::UncertainPolicy,
     runtime::{Config, Options, Scheduler},
-    task::{Checkpoint, Task, TaskOwner},
+    task::{Checkpoint, Task, TaskOwner, TaskState},
     task_scheduler::{Handler, Registry, Step},
     task_store::TaskStore,
     task_tool::TaskTool,
@@ -77,6 +77,7 @@ async fn task_tool_parent_admission_is_atomic_owned_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (started_tx, started_rx) = mpsc::channel();
+    let (child_started_tx, child_started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
     let handler: Arc<dyn Handler> = Arc::new(move |task: &Task| {
@@ -109,7 +110,10 @@ async fn task_tool_parent_admission_is_atomic_owned_and_survives_reopen() {
     let mut scheduler = Scheduler::open(&path, options()).unwrap();
     let mut registry = Registry::default();
     registry.register_shared("parent", true, handler);
-    registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    registry.register("child", true, move |task: &Task| {
+        child_started_tx.send(task.id()).unwrap();
+        Ok(Step::Succeed(json!(null)))
+    });
     let driver = scheduler.start_tasks(registry).unwrap();
     let conversation = scheduler.create_conversation(config()).unwrap();
     let other = scheduler.create_conversation(config()).unwrap();
@@ -171,6 +175,26 @@ async fn task_tool_parent_admission_is_atomic_owned_and_survives_reopen() {
             Ok(())
         })
         .unwrap();
+    let ran = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(id) = child_started_rx.try_recv() {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child did not run while the parent was blocked");
+    assert_eq!(ran, id);
+    assert_eq!(
+        TaskStore::new(&store)
+            .load(parent)
+            .unwrap()
+            .unwrap()
+            .task
+            .state(),
+        &TaskState::Running
+    );
     let stored = TaskStore::new(&store).load(id).unwrap().unwrap();
     assert_eq!(stored.task.owner(), &TaskOwner::Task(parent));
     assert_eq!(
@@ -218,4 +242,147 @@ async fn task_tool_parent_admission_is_atomic_owned_and_survives_reopen() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn running_child_result_is_fenced_by_parent_failure_and_abort() {
+    for fail_parent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (parent_tx, parent_rx) = mpsc::channel();
+        let (parent_release_tx, parent_release_rx) = mpsc::channel();
+        let parent_release_rx = Arc::new(Mutex::new(parent_release_rx));
+        let parent_handler: Arc<dyn Handler> = Arc::new(move |task: &Task| {
+            parent_tx.send(task.id()).unwrap();
+            parent_release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|e| e.to_string())?;
+            Ok(if fail_parent {
+                Step::Fail("parent failed".into())
+            } else {
+                Step::Succeed(json!("late parent"))
+            })
+        });
+        let adapter = Arc::new(TaskTool::new(
+            ToolSpec {
+                name: "parent".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "parent",
+            true,
+            1,
+            parent_handler.clone(),
+        ));
+        let options = Options {
+            model: Arc::new(ToolModel),
+            tools: vec![adapter.register()],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let (child_tx, child_rx) = mpsc::channel();
+        let (child_release_tx, child_release_rx) = mpsc::channel();
+        let child_release_rx = Arc::new(Mutex::new(child_release_rx));
+        let mut registry = Registry::default();
+        registry.register_shared("parent", true, parent_handler);
+        registry.register("child", true, move |task: &Task| {
+            child_tx.send(task.id()).unwrap();
+            child_release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|e| e.to_string())?;
+            Ok(Step::Succeed(json!("must not commit")))
+        });
+        registry.set_abort("parent", |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.set_abort("child", |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(&path, options).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let conversation = scheduler.create_conversation(config()).unwrap();
+        scheduler.submit(conversation, None, "work".into()).unwrap();
+        let parent = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(id) = parent_rx.try_recv() {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let store = Store::open(&path).unwrap();
+        let snapshot = TaskStore::new(&store).load(parent).unwrap().unwrap();
+        let new_child = child(parent);
+        let child_id = new_child.id();
+        scheduler
+            .session_transaction(conversation, |tx| {
+                tx.create_child_task(&snapshot, new_child)
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if child_rx.try_recv().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child must run under parent");
+        if fail_parent {
+            parent_release_tx.send(()).unwrap();
+        } else {
+            scheduler.abort_task(parent).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if TaskStore::new(&store)
+                    .load(child_id)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failure or abort must mark child before it can publish");
+        child_release_tx.send(()).unwrap();
+        if !fail_parent {
+            parent_release_tx.send(()).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if TaskStore::new(&store)
+                    .load(child_id)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .is_terminal()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not drain");
+        assert!(!matches!(
+            TaskStore::new(&store)
+                .load(child_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            TaskState::Succeeded(_)
+        ));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
 }

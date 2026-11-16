@@ -1989,8 +1989,10 @@ extra identity checks are a pi-rs extension. The driver validates the exact pare
 reservation, registry and pending abort under the admission gate, and fences the
 ownership graph through commit. Multiple parents and children, including
 children of tasks staged earlier in the transaction, may be combined with
-root-task creation. Generic children of TaskTool parents are not automatically
-aborted on normal TaskTool settlement; explicit abort follows ownership. This
+root-task creation. A generic child can execute while its TaskTool parent is
+running, provided the attached driver still owns the parent invocation. An
+interrupted parent must recover before its descendants run. Successful TaskTool
+settlement waits for owned work; failure and explicit abort cascade through it. This
 slice rejects task-owned conversations and TaskTool children through these host
 methods. Ordinary nested-tool
 keys use a separate journal, so upstream shared cross-kind key semantics are not
