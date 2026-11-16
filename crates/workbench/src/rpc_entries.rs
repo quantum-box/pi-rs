@@ -28,6 +28,7 @@ struct Position {
 pub(super) struct Entries {
     values: Vec<Value>,
     leaf: Option<String>,
+    validation_error: Option<String>,
 }
 
 impl Entries {
@@ -73,7 +74,8 @@ impl Entries {
     }
 
     /// Whether Pi's compaction-aware, un-repaired projection has messages.
-    pub(super) fn has_session_context(&self) -> bool {
+    pub(super) fn has_session_context(&self) -> Result<bool> {
+        self.ensure_valid()?;
         let by_id: HashMap<_, _> = self
             .values
             .iter()
@@ -118,7 +120,7 @@ impl Entries {
                     .flatten()
             })
             .collect();
-        context.iter().any(|entry| {
+        Ok(context.iter().any(|entry| {
             let contributes = match entry["type"].as_str() {
                 Some("message" | "custom_message" | "compaction") => true,
                 Some("branch_summary") => entry["summary"]
@@ -132,11 +134,22 @@ impl Entries {
                     .and_then(|id| edits.get(id))
                     .copied()
                     .unwrap_or(false)
-        })
+        }))
     }
 
     pub(super) fn new(session: &Session) -> Self {
         let mut cursor = Cursor::default();
+        let counts = match session.validated_pi_conversion_counts() {
+            Ok(counts) => counts,
+            Err(error) => {
+                return Self {
+                    values: Vec::new(),
+                    leaf: None,
+                    validation_error: Some(error.to_string()),
+                };
+            }
+        };
+        cursor.set_verified_counts(&counts);
         let values = session
             .records()
             .iter()
@@ -145,10 +158,19 @@ impl Entries {
         Self {
             values,
             leaf: wire_id(cursor.positions[session.head() as usize].visible),
+            validation_error: None,
+        }
+    }
+
+    pub(super) fn ensure_valid(&self) -> Result<()> {
+        match &self.validation_error {
+            Some(error) => Err(Error::Session(error.clone())),
+            None => Ok(()),
         }
     }
 
     pub(super) fn after(self, since: Option<&Value>) -> Result<Value> {
+        self.ensure_valid()?;
         let start = if let Some(since) = since {
             let id = since
                 .as_str()
@@ -192,6 +214,7 @@ impl Entries {
         context: Option<&super::sessions::ShareContext>,
         limit: usize,
     ) -> Result<Vec<u8>> {
+        self.ensure_valid()?;
         let by_id: HashMap<_, _> = self
             .values
             .iter()
@@ -388,6 +411,8 @@ pub(super) struct Cursor {
     positions: Vec<Position>,
     source_ids: HashMap<String, u64>,
     messages: Projection,
+    conversion_counts: HashMap<u64, u64>,
+    invalid: bool,
 }
 
 impl Default for Cursor {
@@ -396,18 +421,43 @@ impl Default for Cursor {
             positions: vec![Position::default()],
             source_ids: HashMap::new(),
             messages: Projection::default(),
+            conversion_counts: HashMap::new(),
+            invalid: false,
         }
     }
 }
 
 impl Cursor {
+    pub(super) fn set_verified_counts(&mut self, counts: &std::collections::BTreeMap<u64, u64>) {
+        self.conversion_counts = counts.iter().map(|(id, count)| (*id, *count)).collect();
+        self.invalid = false;
+    }
+    pub(super) fn set_verified_count(&mut self, id: u64, count: u64) {
+        self.conversion_counts.insert(id, count);
+        self.invalid = false;
+    }
+    pub(super) fn invalidate(&mut self) {
+        self.invalid = true;
+    }
+    pub(super) fn is_invalid(&self) -> bool {
+        self.invalid
+    }
+    pub(super) fn processed(&self) -> usize {
+        self.positions.len() - 1
+    }
     pub(super) fn advance(&mut self, records: &[Record]) {
+        if self.invalid {
+            return;
+        }
         for record in records.iter().skip(self.positions.len() - 1) {
             self.append(records, record, None, None);
         }
     }
 
     pub(super) fn appended(&mut self, records: &[Record], metadata: Option<&Value>) -> Vec<Value> {
+        if self.invalid {
+            return Vec::new();
+        }
         let Some((record, prefix)) = records.split_last() else {
             return Vec::new();
         };
@@ -493,9 +543,14 @@ impl Cursor {
                 Some(entry)
             }
             // An imported source entry already includes the visible representation.
-            _ if parent
-                .imported
-                .is_some_and(|id| imported_conversion(records, id, record)) =>
+            _ if parent.imported.is_some_and(|id| {
+                let within_conversion = self
+                    .conversion_counts
+                    .get(&id)
+                    .copied()
+                    .is_none_or(|count| record.id > id && record.id - id <= count);
+                within_conversion && imported_conversion(records, id, record)
+            }) =>
             {
                 // A codemode source entry converts into both its original
                 // custom entry and a derived extension-state snapshot.
@@ -819,17 +874,19 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
     )
 }
 
-pub(super) fn editable_record(session: &Session, id: u64) -> u64 {
+pub(super) fn editable_record(session: &Session, id: u64) -> Result<u64> {
+    let counts = session.validated_pi_conversion_counts()?;
     let Some(source) = session.records().get(id.saturating_sub(1) as usize) else {
-        return id;
+        return Ok(id);
     };
     let Event::SourceEntry { format, .. } = &source.event else {
-        return id;
+        return Ok(id);
     };
     if format != "pi" {
-        return id;
+        return Ok(id);
     }
-    session
+    let count = counts.get(&id).copied();
+    Ok(session
         .records()
         .iter()
         .skip(id as usize)
@@ -839,25 +896,27 @@ pub(super) fn editable_record(session: &Session, id: u64) -> u64 {
                 Event::SourceEntry { .. } | Event::Checkout { .. }
             ) && record.timestamp == source.timestamp
                 && record.run_id.is_none()
+                && count.is_none_or(|count| record.id - id <= count)
         })
         .find(|record| imported_conversion(session.records(), id, record))
-        .map_or(id, |record| record.id)
+        .map_or(id, |record| record.id))
 }
 
-pub(super) fn changes(session: &Session, previous: usize) -> Vec<Value> {
+pub(super) fn changes(session: &Session, previous: usize) -> Result<Vec<Value>> {
     let records = session.records();
     let Some((prefix, appended)) = records.split_at_checked(previous) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if appended.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut cursor = Cursor::default();
+    cursor.set_verified_counts(&session.validated_pi_conversion_counts()?);
     cursor.advance(prefix);
-    appended
+    Ok(appended
         .iter()
         .flat_map(|record| cursor.append(records, record, Some(session), None))
-        .collect()
+        .collect())
 }
 
 fn with_identity(mut entry: Value, id: &str, parent: Option<String>, record: &Record) -> Value {
@@ -1183,6 +1242,7 @@ mod tests {
                 json!({"id":"3","type":"message","message":{"role":"assistant","content":[]}}),
             ],
             leaf: Some("3".into()),
+            validation_error: None,
         };
         assert!(!entries.is_user_message(1));
         assert!(entries.is_user_message(2));
@@ -1308,7 +1368,12 @@ mod tests {
                 values
                     .push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
             }
-            let tree = Entries { values, leaf: None }.tree();
+            let tree = Entries {
+                values,
+                leaf: None,
+                validation_error: None,
+            }
+            .tree();
             let actual: Vec<_> = tree["tree"][0]["children"]
                 .as_array()
                 .unwrap()
@@ -1333,7 +1398,12 @@ mod tests {
             };
             values.push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
         }
-        let tree = Entries { values, leaf: None }.tree();
+        let tree = Entries {
+            values,
+            leaf: None,
+            validation_error: None,
+        }
+        .tree();
         let ids: Vec<_> = tree["tree"][0]["children"]
             .as_array()
             .unwrap()
@@ -1388,6 +1458,7 @@ mod tests {
                 json!({"id":"child","parentId":"orphan"}),
             ],
             leaf: Some("child".into()),
+            validation_error: None,
         };
         let tree = entries.tree();
         let roots = tree["tree"].as_array().unwrap();
@@ -1428,7 +1499,7 @@ mod tests {
         assert_eq!(tree["tree"][0]["children"][0]["label"], "bookmark");
         let target = entries[2]["id"].as_str().unwrap().parse().unwrap();
         assert!(matches!(
-            &session.records()[editable_record(&session, target) as usize - 1].event,
+            &session.records()[editable_record(&session, target).unwrap() as usize - 1].event,
             Event::User { content, .. } if content == "second branch"
         ));
         let share = Entries::new(&session)

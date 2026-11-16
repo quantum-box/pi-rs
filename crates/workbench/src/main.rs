@@ -677,8 +677,9 @@ impl Cli {
     }
 
     fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
+        let has_context = rpc_entries::Entries::new(session).has_session_context()?;
         session.record_request_identity(self.provider.id(), &self.model)?;
-        if !rpc_entries::Entries::new(session).has_session_context() {
+        if !has_context {
             return self.record_model_selection(session);
         }
         if !self.model_explicit
@@ -832,10 +833,10 @@ impl Cli {
         }
     }
 
-    fn restore_session_model(&mut self, session: &Session) {
+    fn restore_session_model(&mut self, session: &Session) -> Result<()> {
         // Pi treats a journal with no projected messages as a new session,
         // even if it already contains model or thinking bookkeeping.
-        if !rpc_entries::Entries::new(session).has_session_context() {
+        if !rpc_entries::Entries::new(session).has_session_context()? {
             if !self.model_explicit
                 && let Some(initial) = &self.initial_selection
             {
@@ -854,7 +855,7 @@ impl Cli {
                     self.default_branch_thinking()
                 });
             }
-            return;
+            return Ok(());
         }
         // Extension-registered Pi virtual models are absent from this catalog.
         // Pi treats absent catalog entries as nonvirtual.
@@ -893,6 +894,7 @@ impl Cli {
                     .to_owned()
             }));
         }
+        Ok(())
     }
 
     fn remember_initial_selection(&mut self) {
@@ -2105,7 +2107,7 @@ async fn execute(
         }
         _ => {}
     }
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     if !args.model.is_empty() {
         thinking::adjust(&mut args);
         args.record_automatic_model_selection(&mut session)?;
