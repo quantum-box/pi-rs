@@ -3561,6 +3561,125 @@ impl KeyedTool for AnyRoot {
     }
 }
 struct AnyMiddle(Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>);
+
+struct ManyAnyMiddle(Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>);
+#[async_trait]
+impl KeyedTool for ManyAnyMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if let Some(wake) = host.pending_wake() {
+            self.0.lock().unwrap().push(wake.ended);
+        }
+        let mut pending = false;
+        for i in 0..6 {
+            let key = format!("job{i}");
+            let child = host
+                .call_keyed_unpolled_with_id(&key, "child", json!({"job":key}))
+                .await
+                .unwrap();
+            pending |= matches!(child.outcome, Outcome::Pending { .. });
+        }
+        if pending {
+            host.suspend_pending_any_with_checkpoint(json!("many"))
+                .unwrap();
+            Outcome::Succeeded("park".into()).into()
+        } else {
+            Outcome::Succeeded("six complete".into()).into()
+        }
+    }
+}
+
+#[tokio::test]
+async fn sequential_any_wakes_do_not_exhaust_restart_budget_across_reopen() {
+    for limit in [1, 3] {
+        check_sequential_any_wakes(limit).await;
+    }
+}
+
+async fn check_sequential_any_wakes(limit: u32) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let options = || Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(ManyAnyMiddle(wakes.clone())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkLeaf(calls.clone())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: limit,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    for i in 0..6 {
+        let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+        let job = jobs
+            .iter()
+            .find(|job| job.reference == format!("job{i}"))
+            .unwrap();
+        let expected = job.operation_id;
+        scheduler
+            .reconcile_nested_pending(
+                id,
+                root,
+                expected,
+                &job.reference,
+                Outcome::Succeeded("done".into()),
+            )
+            .unwrap();
+        wait(&mut scheduler, id).await;
+        assert_eq!(
+            wakes.lock().unwrap().last(),
+            Some(&vec![expected]),
+            "wake {i}"
+        );
+        if i < 5 {
+            assert!(
+                scheduler.conversation(id).unwrap().nested_suspended(),
+                "wake {i}"
+            );
+            scheduler.shutdown().await.unwrap();
+            scheduler = Scheduler::open(&path, options()).unwrap();
+            wait(&mut scheduler, id).await;
+        }
+    }
+    assert_eq!(wakes.lock().unwrap().len(), 6);
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "six complete"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
 #[async_trait]
 impl KeyedTool for AnyMiddle {
     fn spec(&self) -> ToolSpec {
@@ -3969,7 +4088,11 @@ fn any_disk_options(path: &std::path::Path) -> Options {
                 replay: ReplayPolicy::Unsafe,
             },
         ],
-        restart_limit: 8,
+        restart_limit: if path.join("low-restart-limit").exists() {
+            3
+        } else {
+            8
+        },
         max_turns: 8,
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     }
@@ -4008,6 +4131,71 @@ async fn any_park_crash_worker() {
 }
 
 #[tokio::test]
+async fn any_park_reopen_crash_worker() {
+    let Some(path) = std::env::var_os("PI_ANY_PARK_REOPEN_CRASH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let _scheduler = Scheduler::open(path.join("db"), any_disk_options(&path)).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn interrupted_any_wake_still_exhausts_restart_budget() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    std::fs::write(path.join("low-restart-limit"), b"yes").unwrap();
+    std::fs::write(path.join("stop-wake"), b"yes").unwrap();
+    for attempt in 0..3 {
+        let marker = path.join("at-wake");
+        let _ = std::fs::remove_file(&marker);
+        let (worker, env) = if attempt == 0 {
+            ("any_park_crash_worker", "PI_ANY_PARK_CRASH")
+        } else {
+            ("any_park_reopen_crash_worker", "PI_ANY_PARK_REOPEN_CRASH")
+        };
+        let mut process = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", worker])
+                .env(env, path)
+                .spawn()
+                .unwrap(),
+        );
+        until(|| marker.exists()).await;
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+    }
+    std::fs::remove_file(path.join("stop-wake")).unwrap();
+    let id = std::fs::read_to_string(path.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut scheduler = Scheduler::open(path.join("db"), any_disk_options(path)).unwrap();
+    wait(&mut scheduler, id).await;
+    let state = scheduler.conversation(id).unwrap();
+    assert!(state.messages.iter().any(|message| matches!(message,Message::Tool {content,..} if content.contains("restart limit"))), "{state:?}");
+    assert_eq!(
+        std::fs::read_to_string(path.join("wakes"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("dispatches")).unwrap(),
+        "a\nb\n"
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn any_wake_and_repark_recover_after_process_loss() {
     struct Kill(std::process::Child);
     impl Drop for Kill {
@@ -4040,6 +4228,17 @@ async fn any_wake_and_repark_recover_after_process_loss() {
         assert!(
             scheduler.conversation(id).unwrap().nested_suspended(),
             "{stage}"
+        );
+        let store = durable_store::Store::open(path.join("db")).unwrap();
+        let persisted = store
+            .get(format!("runtime/conversation/{id}").as_bytes())
+            .unwrap()
+            .unwrap();
+        let state: Value = serde_json::from_slice(&persisted.value).unwrap();
+        assert_eq!(
+            state["nested_resume"]["restarts"],
+            json!(0),
+            "repark should reset the crash budget: {stage}"
         );
         let root = scheduler.blocked(id).unwrap().unwrap().0;
         let jobs = scheduler.nested_pending_jobs(id, root).unwrap();

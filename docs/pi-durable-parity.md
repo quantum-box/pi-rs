@@ -376,7 +376,10 @@ wake. An all-settled park wakes after every descendant settles; an explicit
 ended IDs are frozen with checks on every job and survive crash and replay.
 The root receives the same ended IDs, and the child receives its own checkpoint.
 The child must re-park while descendants remain, and cannot admit new ones after
-wake. Results are ordered by key. Pollable descendant references can change
+wake. Normal checkpoint wakes do not consume the restart budget, and a
+successfully committed checkpoint resets the interrupted-execution count;
+repeated crashes before the next checkpoint still exhaust the configured limit.
+Results are ordered by key. Pollable descendant references can change
 without redispatch. In-flight polls are dropped before replay; a still-pending
 job may be polled again after re-parking, so external polling must tolerate
 retries. The intermediate executor is retired before replay, and

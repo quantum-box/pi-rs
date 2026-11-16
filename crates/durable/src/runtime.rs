@@ -14052,11 +14052,28 @@ impl Harness {
                     if replay == ReplayPolicy::Unsafe {
                         c.nested_resume = None;
                     }
+                    // Checkpoint wakes themselves do not consume restarts. If a
+                    // resumed invocation is interrupted, charge that execution
+                    // here before the gate/extension recovery paths retain it.
+                    let checkpoint_recovery = c.nested_resume.as_ref().is_some_and(|resume| {
+                        resume.operation_id == operation_id
+                            && resume.explicit_suspend
+                            && resume.pending_wake.is_some()
+                    });
+                    let recovered_restarts = if checkpoint_recovery && !replay_ready {
+                        restarts.saturating_add(1)
+                    } else {
+                        restarts
+                    };
                     if !c.abort_requested
                         && !panicked
                         && replay == ReplayPolicy::Safe
                         && stored_identity == Some(DispatchIdentity::Other)
-                        && restarts.saturating_add(1) < self.options.restart_limit
+                        && (if checkpoint_recovery {
+                            recovered_restarts < self.options.restart_limit
+                        } else {
+                            restarts.saturating_add(1) < self.options.restart_limit
+                        })
                         && crate::nested::recoverable_gate_intent(self.owner.store(), operation_id)?
                     {
                         // A replay may have already received a checkpoint wake
@@ -14069,7 +14086,7 @@ impl Harness {
                             .and_then(|resume| resume.pending_wake.clone());
                         c.nested_resume = Some(NestedResume {
                             operation_id,
-                            restarts,
+                            restarts: recovered_restarts,
                             dispatch_identity: DispatchIdentity::Other,
                             explicit_suspend: true,
                             pending_wake,
@@ -14095,7 +14112,11 @@ impl Harness {
                         && c.nested_resume.as_ref().is_some_and(|resume| {
                             resume.explicit_suspend && resume.operation_id == operation_id
                         })
+                        && (!checkpoint_recovery || recovered_restarts < self.options.restart_limit)
                     {
+                        if checkpoint_recovery {
+                            c.nested_resume.as_mut().unwrap().restarts = recovered_restarts;
+                        }
                         c.phase = Phase::Blocked {
                             tool_panicked: false,
                             turns,
@@ -15010,9 +15031,14 @@ impl Harness {
         else {
             return Ok(NestedResumeDecision::NotReady);
         };
+        let checkpointed = resume.explicit_suspend && resume.pending_wake.is_some();
         if operation_id != resume.operation_id
             || (resume.unsafe_park.is_none()
-                && resume.restarts.saturating_add(1) >= self.options.restart_limit)
+                && if checkpointed {
+                    resume.restarts >= self.options.restart_limit
+                } else {
+                    resume.restarts.saturating_add(1) >= self.options.restart_limit
+                })
         {
             return Ok(NestedResumeDecision::NotReady);
         }
@@ -15109,9 +15135,9 @@ impl Harness {
                 return Ok(NestedResumeDecision::NotReady);
             }
         };
-        // An unsafe parked invocation ended normally. Merely waking or
-        // recovering before its next claim is not an interrupted execution.
-        let next_restarts = if unsafe_park {
+        // A committed checkpoint park ended normally. Its wake is not an
+        // interrupted execution; actual crashes are charged during recovery.
+        let next_restarts = if unsafe_park || checkpointed {
             resume.restarts
         } else {
             resume.restarts.saturating_add(1)
@@ -17995,13 +18021,24 @@ impl Harness {
                             c.nested_resume = if nested_resume_candidate
                                 && (replay == ReplayPolicy::Safe || unsafe_park.is_some())
                                 && (unsafe_park.is_some()
+                                    || (explicitly_suspended
+                                        && parked_checkpoint.is_some()
+                                        && restarts < self.options.restart_limit)
                                     || restarts.saturating_add(1) < self.options.restart_limit)
                                 && (c.extensions.is_empty() || explicitly_suspended)
                                 && stored_identity == Some(DispatchIdentity::Other)
                             {
                                 Some(NestedResume {
                                     operation_id,
-                                    restarts: if unsafe_park.is_some() { 0 } else { restarts },
+                                    // A successfully committed checkpoint starts a
+                                    // new recovery budget; no execution is lost.
+                                    restarts: if unsafe_park.is_some()
+                                        || (explicitly_suspended && parked_checkpoint.is_some())
+                                    {
+                                        0
+                                    } else {
+                                        restarts
+                                    },
                                     dispatch_identity: DispatchIdentity::Other,
                                     explicit_suspend: explicitly_suspended,
                                     pending_wake: parked_checkpoint,
@@ -22440,15 +22477,18 @@ async fn poll_suspended_nested(
             }
         };
     }
-    match worker.prepare_nested_resume(&mut state.clone()) {
-        Ok(NestedResumeDecision::Ready) => return Ok(true),
-        Ok(NestedResumeDecision::Busy) => return Ok(true),
-        Err(Error::Storage(durable_store::Error::Conflict { .. })) => return Ok(true),
-        Err(error) => return Err(error),
-        _ => (),
-    }
-    if crate::nested::has_frozen_any(worker.owner.store(), id, *operation_id)? {
-        return Ok(false);
+    let any_park = crate::nested::has_any_park(worker.owner.store(), *operation_id)?;
+    if any_park {
+        match worker.prepare_nested_resume(&mut state.clone()) {
+            Ok(NestedResumeDecision::Ready) => return Ok(true),
+            Ok(NestedResumeDecision::Busy) => return Ok(true),
+            Err(Error::Storage(durable_store::Error::Conflict { .. })) => return Ok(true),
+            Err(error) => return Err(error),
+            _ => (),
+        }
+        if crate::nested::has_frozen_any(worker.owner.store(), id, *operation_id)? {
+            return Ok(false);
+        }
     }
     let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
     if jobs.is_empty() {
@@ -22601,12 +22641,14 @@ async fn poll_suspended_nested(
             }
             _ = cancel.cancelled() => return Ok(gates_woken),
             _ = tokio::time::sleep(Duration::from_millis(100)), if gate_scan => {
-                match worker.prepare_nested_resume(&mut state.clone()) {
-                    Ok(NestedResumeDecision::Ready) => return Ok(true),
-                    Ok(NestedResumeDecision::Busy) if crate::nested::has_frozen_any(worker.owner.store(), id, *operation_id)? => return Ok(true),
-                    Err(Error::Storage(durable_store::Error::Conflict { .. })) => return Ok(true),
-                    Err(error) => return Err(error),
-                    _ => (),
+                if any_park {
+                    match worker.prepare_nested_resume(&mut state.clone()) {
+                        Ok(NestedResumeDecision::Ready) => return Ok(true),
+                        Ok(NestedResumeDecision::Busy) if crate::nested::has_frozen_any(worker.owner.store(), id, *operation_id)? => return Ok(true),
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => return Ok(true),
+                        Err(error) => return Err(error),
+                        _ => (),
+                    }
                 }
                 match fenced_poll(async {
                     crate::nested::wake_before_gates(worker.owner.store(), *operation_id, id, Harness::key(id), version, (worker.clock)())
