@@ -1141,6 +1141,20 @@ impl Session {
         {
             return Err(Error::Session("ambiguous assistant reply".into()));
         }
+        // Another request or assistant between this request and the tool start
+        // supersedes the turn, even if the old records remain on this branch.
+        // Only inspect up to the start so later turns do not invalidate history.
+        if branch.iter().any(|record| {
+            record.id > request_record.id
+                && record.id < before
+                && (matches!(&record.event, Event::ModelRequested { .. })
+                    || (record.id != assistant.id
+                        && matches!(&record.event, Event::Assistant { .. })))
+        }) {
+            return Err(Error::Session(
+                "tool execution belongs to a superseded model turn".into(),
+            ));
+        }
         let Event::Assistant {
             content,
             invocations,
@@ -7637,5 +7651,161 @@ mod durable_tool_decision_tests {
             .recorded_tool_execution(id, "owner", &spec, "backend-v1")
             .unwrap_err();
         assert!(error.to_string().contains("summary request"));
+    }
+
+    #[test]
+    fn tool_execution_rejects_superseding_turns_at_append_and_lookup() {
+        for (kind, before_assistant) in [
+            ("request", false),
+            ("assistant", false),
+            ("request", true),
+            ("assistant", true),
+        ] {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            let (request, invocation, spec, execution) = execution_fixture(&mut original);
+            let start = original
+                .append_tool_execution_started(
+                    request,
+                    invocation.operation_id,
+                    &execution,
+                    "owner",
+                    &spec,
+                    "backend-v1",
+                )
+                .unwrap()
+                .id;
+            let start_event = original.records()[start as usize - 1].event.clone();
+            let start_metadata = original.record_metadata(start).unwrap().clone();
+            let mut records = original.records().to_vec();
+            records.pop();
+            let delayed_assistant = before_assistant.then(|| records.pop().unwrap().event);
+            let mut metadata = original.record_metadata.clone();
+            metadata.remove(&start);
+            let mut session = Session::from_records_with_metadata(records, metadata).unwrap();
+            let superseding = if kind == "request" {
+                fixture(&session).0
+            } else {
+                Event::Assistant {
+                    content: "later turn".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(Uuid::new_v4()),
+                }
+            };
+            session.append(superseding).unwrap();
+            if let Some(assistant) = delayed_assistant {
+                session.append(assistant).unwrap();
+            }
+            assert!(
+                session
+                    .append_tool_execution_started(
+                        request,
+                        invocation.operation_id,
+                        &execution,
+                        "owner",
+                        &spec,
+                        "backend-v1"
+                    )
+                    .is_err(),
+                "append accepted later {kind}"
+            );
+            let id = session
+                .append_inner_with_metadata(start_event, true, Some(start_metadata))
+                .unwrap()
+                .id;
+            assert!(
+                session
+                    .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+                    .is_err(),
+                "lookup accepted later {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_execution_allows_parallel_starts_and_intervening_lifecycle() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (request, first, spec, first_snapshot) = execution_fixture(&mut session);
+        let mut second = first.clone();
+        second.operation_id = Uuid::new_v4();
+        second.call.id = "second".into();
+        let mut records = session.records().to_vec();
+        for record in &mut records {
+            match &mut record.event {
+                Event::ModelFinished {
+                    reply: Some(reply), ..
+                } => reply.invocations.push(second.clone()),
+                Event::Assistant { invocations, .. } => invocations.push(second.clone()),
+                _ => {}
+            }
+        }
+        let mut session =
+            Session::from_records_with_metadata(records, session.record_metadata.clone()).unwrap();
+        let RecordedToolDecision::Current(decision) =
+            session.active_tool_decision(request).unwrap()
+        else {
+            panic!("missing decision")
+        };
+        let second_snapshot = crate::ToolExecutionSnapshot::capture(
+            request,
+            &second,
+            "owner",
+            &spec,
+            "backend-v1",
+            decision.binding_sha256(),
+            serde_json::json!({"path":"second"}),
+        )
+        .unwrap();
+        let first_id = session
+            .append_tool_execution_started(
+                request,
+                first.operation_id,
+                &first_snapshot,
+                "owner",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap()
+            .id;
+        session
+            .append(Event::RequestCallbackStarted {
+                id: Uuid::new_v4(),
+                purpose: "lifecycle".into(),
+            })
+            .unwrap();
+        session
+            .append(Event::InputQueueCleared { ids: vec![] })
+            .unwrap();
+        let second_id = session
+            .append_tool_execution_started(
+                request,
+                second.operation_id,
+                &second_snapshot,
+                "owner",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap()
+            .id;
+        assert!(
+            session
+                .recorded_tool_execution(first_id, "owner", &spec, "backend-v1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            session
+                .recorded_tool_execution(second_id, "owner", &spec, "backend-v1")
+                .unwrap()
+                .is_some()
+        );
+        let later_request = fixture(&session).0;
+        session.append(later_request).unwrap();
+        assert!(
+            session
+                .recorded_tool_execution(first_id, "owner", &spec, "backend-v1")
+                .unwrap()
+                .is_some()
+        );
     }
 }
