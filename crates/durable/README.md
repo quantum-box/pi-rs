@@ -1497,7 +1497,7 @@ task, and ownership records, so its cost grows with the store's graph size.
 Both schedulers expose `blocked_tasks` as a polling snapshot of nonterminal tasks,
 including their IDs, kinds, owners and current reasons; `blocked_reason` also
 inspects an individual record. The background driver's `replace_registry` waits
-for the current synchronous handler to finish, updates admission policies at the
+for current synchronous handlers to finish, updates admission policies at the
 same boundary, and wakes its worker. Lifecycle hook children are committed only
 when their selected handler identity, replay policy, and version still match the
 registry; replacement cannot interleave with that validation and commit. Calling
@@ -1950,6 +1950,11 @@ later in the transaction; its observed absence remains fenced against ABA. Dupli
 request IDs return the existing submission without replacing its notification.
 The callback runs once, and conflict, abort races, or callback errors leave its
 candidate changes unpublished. Returned IDs are provisional until commit.
+A related published task outcome can return `Error::TaskPublicationBusy`; the
+host may retry in a new transaction after settlement. A completed lifecycle hook
+or TaskTool dispatch instead retains its staged child commit in memory and
+retries it without invoking the hook or dispatch again. Abort cancels that
+retry. A process interruption retains the existing recovery and replay rules.
 
 `session_transaction_async` accepts a boxed asynchronous callback. Its
 `submit_fitted_user_blocks` fits ordered text/image blocks with the selected

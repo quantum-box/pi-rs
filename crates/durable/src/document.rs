@@ -1719,6 +1719,7 @@ enum StagedSignalStatus {
     Present,
 }
 
+#[derive(Clone)]
 struct StagedSignals {
     batch: OwnedBatch,
     keys: HashMap<(uuid::Uuid, String, String), StagedSignalStatus>,
@@ -1957,7 +1958,256 @@ pub struct TaskDocuments<'a> {
     pub(crate) keyed_child_handlers:
         HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
 }
+
+/// An invocation's staged effects, retaining its store owner without borrowing it.
+/// This is not an executor lease: the scheduler must still fence the attempt,
+/// validate children and commit the parent transition with the prepared batch.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct DetachedTaskDocuments {
+    owner: std::sync::Arc<durable_store::owner::OwnedStore>,
+    reservation: crate::task_store::StoredTask,
+    revision: u64,
+    reads: HashMap<Address, Option<Document>>,
+    writes: HashMap<Address, Option<Map<String, Value>>>,
+    acquired: HashSet<Address>,
+    entries: Option<PendingEntries>,
+    entry_initial_len: usize,
+    runtime_cut: Option<usize>,
+    runtime_config: Option<crate::runtime::Config>,
+    signals: StagedSignals,
+    child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
+    pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
+    pub(crate) keyed_child_handlers:
+        HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
+}
+
+/// Read-only inspection of a staged keyed child and its original checks.
+pub struct StagedKeyedChild<'a> {
+    pub key: &'a str,
+    pub task: &'a crate::task::Task,
+    pub tool: &'a str,
+    pub arguments: &'a Value,
+    pub parent_version: u64,
+    pub checks: &'a [Check],
+    pub mutations: &'a [Mutation],
+    pub handler_bound: bool,
+}
+
+/// Read-only inspection of staged application entries and their checks.
+pub struct StagedApplicationEntries<'a> {
+    pub conversation: uuid::Uuid,
+    pub version: Option<u64>,
+    pub entries: &'a [crate::application_entry::ApplicationEntry],
+    pub checks: &'a [Check],
+    pub dirty: bool,
+    pub initial_len: usize,
+    pub runtime_cut: Option<usize>,
+    pub runtime_config: Option<&'a crate::runtime::Config>,
+}
+
+impl DetachedTaskDocuments {
+    pub fn reservation(&self) -> &crate::task_store::StoredTask {
+        &self.reservation
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn reads(&self) -> &HashMap<Address, Option<Document>> {
+        &self.reads
+    }
+    pub fn writes(&self) -> &HashMap<Address, Option<Map<String, Value>>> {
+        &self.writes
+    }
+    pub fn acquisitions(&self) -> &HashSet<Address> {
+        &self.acquired
+    }
+    pub fn signal_batch(&self) -> &OwnedBatch {
+        &self.signals.batch
+    }
+    pub fn child_reads(&self) -> &HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>> {
+        &self.child_reads
+    }
+    pub fn keyed_children(&self) -> impl Iterator<Item = StagedKeyedChild<'_>> {
+        self.keyed_children
+            .iter()
+            .map(|(key, task, prepared)| StagedKeyedChild {
+                key,
+                task,
+                tool: prepared.tool(),
+                arguments: prepared.arguments(),
+                parent_version: prepared.parent_version,
+                checks: &prepared.checks,
+                mutations: &prepared.mutations,
+                handler_bound: self.keyed_child_handlers.contains_key(key),
+            })
+    }
+    pub fn application_entries(&self) -> Option<StagedApplicationEntries<'_>> {
+        self.entries
+            .as_ref()
+            .map(
+                |(conversation, version, entries, checks, dirty)| StagedApplicationEntries {
+                    conversation: *conversation,
+                    version: *version,
+                    entries,
+                    checks,
+                    dirty: *dirty,
+                    initial_len: self.entry_initial_len,
+                    runtime_cut: self.runtime_cut,
+                    runtime_config: self.runtime_config.as_ref(),
+                },
+            )
+    }
+}
+
+/// Prepared effects remain bound to the same owner and reservation. The caller
+/// must compose the parent and validated child graph before committing.
+#[allow(dead_code)]
+pub(crate) struct PreparedTaskDocuments {
+    pub(crate) owner: std::sync::Arc<durable_store::owner::OwnedStore>,
+    pub(crate) reservation: crate::task_store::StoredTask,
+    pub(crate) transaction: Transaction,
+    pub(crate) document_batch: OwnedBatch,
+    pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
+    pub(crate) keyed_child_handlers:
+        HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
+}
+
+#[allow(dead_code)]
+impl DetachedTaskDocuments {
+    /// Prepare only against the same unchanged running attempt. Same-value
+    /// reservation rewrites may advance its version, as in the scheduler.
+    /// The eventual atomic commit fences the supplied version; re-reading here
+    /// would discard a completed invocation before the scheduler can rebase it.
+    pub(crate) fn prepare(
+        self,
+        current: &crate::task_store::StoredTask,
+    ) -> Result<PreparedTaskDocuments, Error> {
+        if current.task != self.reservation.task
+            || current.task.state() != &crate::task::TaskState::Running
+            || current.task.abort_requested()
+        {
+            return Err(Error::Store(durable_store::Error::Conflict {
+                key: crate::task_store::key(self.reservation.task.id()),
+            }));
+        }
+        let Self {
+            owner,
+            reservation,
+            revision,
+            reads,
+            writes,
+            acquired,
+            entries,
+            entry_initial_len,
+            runtime_cut,
+            runtime_config,
+            signals,
+            child_reads,
+            mut keyed_children,
+            keyed_child_handlers,
+        } = self;
+        let mut docs = TaskDocuments {
+            store: owner.store(),
+            revision,
+            reads,
+            writes,
+            acquired,
+            task: reservation.task.clone(),
+            entries,
+            entry_initial_len,
+            runtime_cut,
+            runtime_config,
+            signals,
+            child_reads,
+            keyed_children: Vec::new(),
+            keyed_child_handlers: HashMap::new(),
+        };
+        let parent_key = crate::task_store::key(current.task.id());
+        for (_, _, prepared) in &mut keyed_children {
+            for check in &mut prepared.checks {
+                if check.key == parent_key
+                    && check.expected == Expected::Version(prepared.parent_version)
+                {
+                    check.expected = Expected::Version(current.version);
+                }
+            }
+        }
+        let mut transaction = Transaction::new();
+        docs.stage_acquisitions(&mut transaction)?;
+        docs.rebase_self_signal_check(current.version);
+        let mut document_batch = docs.into_batch()?;
+        for check in &mut document_batch.checks {
+            if check.key == parent_key {
+                match &mut check.expected {
+                    Expected::Version(version) | Expected::VersionBefore(version, _)
+                        if *version == reservation.version =>
+                    {
+                        *version = current.version
+                    }
+                    _ => (),
+                }
+            }
+        }
+        Ok(PreparedTaskDocuments {
+            owner,
+            reservation: current.clone(),
+            transaction,
+            document_batch,
+            keyed_children,
+            keyed_child_handlers,
+        })
+    }
+}
+
 impl<'a> TaskDocuments<'a> {
+    /// Detach only from the actual store owner and the handler's reservation.
+    /// No writes are committed and preparation errors remain deferred.
+    #[allow(dead_code)]
+    pub(crate) fn detach(
+        self,
+        owner: std::sync::Arc<durable_store::owner::OwnedStore>,
+        reservation: &crate::task_store::StoredTask,
+    ) -> Result<DetachedTaskDocuments, Error> {
+        if !self.belongs_to(owner.store(), &reservation.task)
+            || reservation.task.state() != &crate::task::TaskState::Running
+            || reservation.task.abort_requested()
+        {
+            return Err(Error::InvalidBatch);
+        }
+        let Self {
+            store: _,
+            revision,
+            reads,
+            writes,
+            acquired,
+            task: _,
+            entries,
+            entry_initial_len,
+            runtime_cut,
+            runtime_config,
+            signals,
+            child_reads,
+            keyed_children,
+            keyed_child_handlers,
+        } = self;
+        Ok(DetachedTaskDocuments {
+            owner,
+            reservation: reservation.clone(),
+            revision,
+            reads,
+            writes,
+            acquired,
+            entries,
+            entry_initial_len,
+            runtime_cut,
+            runtime_config,
+            signals,
+            child_reads,
+            keyed_children,
+            keyed_child_handlers,
+        })
+    }
     pub(crate) fn belongs_to(&self, store: &Store, task: &crate::task::Task) -> bool {
         std::ptr::eq(self.store, store) && &self.task == task
     }
@@ -3493,5 +3743,431 @@ mod chord_application_tests {
         let result =
             apply_operations(base.as_object().unwrap(), &[json!(["t", ["a", 0], 99])]).unwrap();
         assert_eq!(result["a"][0], "");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod detached_task_documents_tests {
+    use super::*;
+    use crate::task::{
+        Checkpoint, Task, TaskOwner, WaitFor,
+        scheduler::{Handler, Step},
+    };
+    use crate::task_store::{Save, SignalResult, SignalToken, TaskStore};
+    use serde_json::json;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn setup() -> (
+        tempfile::TempDir,
+        Arc<durable_store::owner::OwnedStore>,
+        crate::task_store::StoredTask,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner =
+            Arc::new(durable_store::owner::OwnedStore::open(dir.path().join("db")).unwrap());
+        let mut task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), true);
+        task.start_attempt(Uuid::from_u128(100)).unwrap();
+        let ts = TaskStore::new(owner.store());
+        ts.save(&[Save::Create(&task)]).unwrap();
+        let running = ts.load(task.id()).unwrap().unwrap();
+        (dir, owner, running)
+    }
+
+    #[test]
+    fn detached_effects_prepare_on_another_thread_and_commit_as_one_graph() {
+        fn assert_send<T: Send>() {}
+        assert_send::<DetachedTaskDocuments>();
+        let (_dir, owner, running) = setup();
+        let store = owner.store();
+        let ts = TaskStore::new(store);
+        let conversation = Uuid::from_u128(9);
+        let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+        let conversation_state = crate::runtime::Harness::empty_conversation(
+            conversation,
+            crate::runtime::Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 1,
+            },
+        );
+        store
+            .commit(
+                &[Check {
+                    key: conversation_key.clone(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: conversation_key,
+                    value: serde_json::to_vec(&conversation_state).unwrap(),
+                }],
+            )
+            .unwrap();
+        let mut receiver = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "signal".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        receiver.start().unwrap();
+        let token = SignalToken::new("answer", 1).unwrap();
+        receiver
+            .wait(WaitFor::TypedSleep {
+                until_millis: Some(60_000),
+                signals: vec![token.key("k").unwrap()],
+            })
+            .unwrap();
+        ts.save(&[Save::Create(&receiver)]).unwrap();
+        let address = Address {
+            scope: "test".into(),
+            name: "owned".into(),
+            key: "1".into(),
+        };
+        let mut docs = TaskDocuments::new(store, &running.task).unwrap();
+        docs.acquire_owned(&address).unwrap();
+        docs.put(&address, json!({"value":42}).as_object().unwrap().clone())
+            .unwrap();
+        assert_eq!(
+            docs.signal_at(receiver.id(), &token, "k", json!(7), 0)
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        assert_eq!(
+            docs.signal_at(running.task.id(), &token, "self", json!(8), 0)
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        let first = docs.append_entry("first", json!(1)).unwrap();
+        let second = docs.append_entry("second", json!(2)).unwrap();
+        let child = Task::new(
+            Uuid::from_u128(3),
+            TaskOwner::Task(running.task.id()),
+            Checkpoint {
+                phase: "child".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        let handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+        docs.stage_task_tool_child(
+            "child",
+            "tool",
+            &json!(null),
+            child.clone(),
+            handler.clone(),
+        )
+        .unwrap();
+        let original_deadline = docs
+            .signals
+            .batch
+            .checks
+            .iter()
+            .find_map(|check| match check.expected {
+                Expected::VersionBefore(_, deadline) => Some(deadline),
+                _ => None,
+            })
+            .unwrap();
+        // Build a reference invocation with the identical staged receipt IDs,
+        // then prepare it using the existing borrowed scheduler sequence.
+        let mut reference = TaskDocuments {
+            store,
+            revision: docs.revision,
+            reads: docs.reads.clone(),
+            writes: docs.writes.clone(),
+            acquired: docs.acquired.clone(),
+            task: docs.task.clone(),
+            entries: docs.entries.clone(),
+            entry_initial_len: docs.entry_initial_len,
+            runtime_cut: docs.runtime_cut,
+            runtime_config: docs.runtime_config.clone(),
+            signals: StagedSignals {
+                batch: OwnedBatch {
+                    checks: docs.signals.batch.checks.clone(),
+                    mutations: docs.signals.batch.mutations.clone(),
+                },
+                keys: docs.signals.keys.clone(),
+                equivalent_self_versions: docs.signals.equivalent_self_versions.clone(),
+                canonical_self_version: docs.signals.canonical_self_version,
+            },
+            child_reads: docs.child_reads.clone(),
+            keyed_children: Vec::new(),
+            keyed_child_handlers: HashMap::new(),
+        };
+        reference
+            .stage_task_tool_child(
+                "child",
+                "tool",
+                &json!(null),
+                child.clone(),
+                handler.clone(),
+            )
+            .unwrap();
+        let detached = docs.detach(owner.clone(), &running).unwrap();
+        // A same-value reservation rewrite is allowed and must rebase only its checks.
+        ts.update(&running, |_| Ok(())).unwrap();
+        let current = ts.load(running.task.id()).unwrap().unwrap();
+        let prepared = std::thread::spawn(move || detached.prepare(&current).unwrap())
+            .join()
+            .unwrap();
+        let parent_key = crate::task_store::key(running.task.id());
+        let mut reference_children = std::mem::take(&mut reference.keyed_children);
+        for (_, _, child) in &mut reference_children {
+            for check in &mut child.checks {
+                if check.key == parent_key
+                    && check.expected == Expected::Version(child.parent_version)
+                {
+                    check.expected = Expected::Version(prepared.reservation.version);
+                }
+            }
+        }
+        let mut reference_tx = Transaction::new();
+        reference.stage_acquisitions(&mut reference_tx).unwrap();
+        reference.rebase_self_signal_check(prepared.reservation.version);
+        let mut reference_batch = reference.into_batch().unwrap();
+        for check in &mut reference_batch.checks {
+            if check.key == parent_key {
+                match &mut check.expected {
+                    Expected::Version(v) | Expected::VersionBefore(v, _)
+                        if *v == running.version =>
+                    {
+                        *v = prepared.reservation.version
+                    }
+                    _ => (),
+                }
+            }
+        }
+        assert_eq!(prepared.transaction.acquisitions, reference_tx.acquisitions);
+        assert_eq!(prepared.document_batch.checks, reference_batch.checks);
+        assert_eq!(prepared.document_batch.mutations, reference_batch.mutations);
+        assert_eq!(
+            prepared.keyed_children[0].2.checks,
+            reference_children[0].2.checks
+        );
+        assert_eq!(
+            prepared.keyed_children[0].2.mutations,
+            reference_children[0].2.mutations
+        );
+        assert!(Arc::ptr_eq(
+            prepared.keyed_child_handlers.get("child").unwrap(),
+            &handler
+        ));
+        assert_eq!(prepared.keyed_children[0].2.child, child.id());
+        assert!(
+            prepared.keyed_children[0]
+                .2
+                .checks
+                .iter()
+                .any(
+                    |check| check.key == crate::task_store::key(running.task.id())
+                        && check.expected == Expected::Version(prepared.reservation.version)
+                )
+        );
+        assert!(prepared.document_batch.checks.iter().any(|check| matches!(check.expected, Expected::VersionBefore(_, deadline) if deadline == original_deadline)));
+        let PreparedTaskDocuments {
+            owner,
+            reservation,
+            mut transaction,
+            mut document_batch,
+            keyed_children,
+            ..
+        } = prepared;
+        let mut next = reservation.clone();
+        next.task
+            .advance(Checkpoint {
+                phase: "next".into(),
+                data: json!(null),
+            })
+            .unwrap();
+        next.task.yield_ready().unwrap();
+        next.task
+            .record_completed_attempt(&reservation.task)
+            .unwrap();
+        let ts = TaskStore::new(owner.store());
+        let mut graph = ts
+            .prepare_save(&[Save::Update(&next), Save::Create(&child)])
+            .unwrap();
+        let parent_key = crate::task_store::key(reservation.task.id());
+        for (_, _, prepared) in keyed_children {
+            for check in prepared.checks {
+                if !graph.checks.contains(&check) {
+                    graph.checks.push(check);
+                }
+            }
+            for mutation in prepared.mutations {
+                let key = match &mutation {
+                    Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+                };
+                if *key != parent_key && !key.starts_with(crate::task_store::PREFIX) {
+                    graph.mutations.push(mutation);
+                }
+            }
+        }
+        reconcile_task_checks(&mut document_batch, &mut graph);
+        transaction.append(document_batch).unwrap();
+        transaction.append(graph).unwrap();
+        transaction.commit(owner.store()).unwrap();
+        assert_eq!(
+            Documents::new(owner.store())
+                .get(&address)
+                .unwrap()
+                .unwrap()
+                .value["value"],
+            42
+        );
+        assert_eq!(
+            owner
+                .store()
+                .task_document_owner(&address.storage_key().unwrap())
+                .unwrap(),
+            Some(reservation.task.id())
+        );
+        assert_eq!(
+            ts.read_typed_signal(receiver.id(), &token, "k").unwrap(),
+            Some(json!(7))
+        );
+        assert_eq!(
+            ts.read_typed_signal(reservation.task.id(), &token, "self")
+                .unwrap(),
+            Some(json!(8))
+        );
+        assert_eq!(
+            crate::application_entry::list(owner.store(), conversation)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            ts.load(child.id()).unwrap().unwrap().task.owner(),
+            &TaskOwner::Task(reservation.task.id())
+        );
+        assert_eq!(
+            ts.load(reservation.task.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .checkpoint()
+                .phase,
+            "next"
+        );
+    }
+
+    #[test]
+    fn detach_rejects_wrong_owner_and_prepare_fences_changed_attempt() {
+        let (_dir, owner, running) = setup();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other =
+            Arc::new(durable_store::owner::OwnedStore::open(other_dir.path().join("db")).unwrap());
+        let docs = TaskDocuments::new(owner.store(), &running.task).unwrap();
+        assert!(matches!(
+            docs.detach(other, &running),
+            Err(Error::InvalidBatch)
+        ));
+        let docs = TaskDocuments::new(owner.store(), &running.task).unwrap();
+        let detached = docs.detach(owner.clone(), &running).unwrap();
+        let ts = TaskStore::new(owner.store());
+        ts.update(&running, |t| t.request_abort()).unwrap();
+        let changed = ts.load(running.task.id()).unwrap().unwrap();
+        assert!(matches!(
+            detached.prepare(&changed),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+    }
+
+    #[test]
+    fn detached_prepare_keeps_effects_when_reservation_version_moves() {
+        let (_dir, owner, running) = setup();
+        let docs = TaskDocuments::new(owner.store(), &running.task).unwrap();
+        let detached = docs.detach(owner.clone(), &running).unwrap();
+        let ts = TaskStore::new(owner.store());
+        ts.update(&running, |_| Ok(())).unwrap();
+        let newer = ts.load(running.task.id()).unwrap().unwrap();
+        assert_ne!(newer.version, running.version);
+        let prepared = detached.prepare(&running).unwrap();
+        let mut next = prepared.reservation;
+        next.task.succeed(json!("done")).unwrap();
+        let mut tx = prepared.transaction;
+        tx.append(prepared.document_batch).unwrap();
+        tx.append(ts.prepare_save(&[Save::Update(&next)]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            tx.commit(owner.store()),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(
+            ts.load(running.task.id()).unwrap().unwrap().task,
+            running.task
+        );
+    }
+
+    #[test]
+    fn detached_deadline_expiry_rolls_back_document_and_parent() {
+        let (_dir, owner, running) = setup();
+        let address = Address {
+            scope: "test".into(),
+            name: "atomic".into(),
+            key: "".into(),
+        };
+        let mut docs = TaskDocuments::new(owner.store(), &running.task).unwrap();
+        docs.get(&address).unwrap();
+        docs.put(&address, json!({"value":1}).as_object().unwrap().clone())
+            .unwrap();
+        let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        docs.signals.batch.checks.push(Check {
+            key: crate::task_store::key(running.task.id()),
+            expected: Expected::VersionBefore(running.version, deadline),
+        });
+        let prepared = docs
+            .detach(owner.clone(), &running)
+            .unwrap()
+            .prepare(&running)
+            .unwrap();
+        assert!(prepared.document_batch.checks.iter().any(|check| matches!(check.expected, Expected::VersionBefore(v, d) if v == running.version && d == deadline)));
+        let mut next = running.clone();
+        next.task.succeed(json!("done")).unwrap();
+        let mut graph = TaskStore::new(owner.store())
+            .prepare_save(&[Save::Update(&next)])
+            .unwrap();
+        let mut doc = prepared.document_batch;
+        reconcile_task_checks(&mut doc, &mut graph);
+        let mut tx = prepared.transaction;
+        tx.append(doc).unwrap();
+        tx.append(graph).unwrap();
+        assert!(matches!(
+            tx.commit(owner.store()),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert!(
+            Documents::new(owner.store())
+                .get(&address)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(running.task.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &crate::task::TaskState::Running
+        );
     }
 }

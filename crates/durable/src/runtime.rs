@@ -94,6 +94,9 @@ pub enum Error {
     Interrupted,
     #[error("wait cancelled")]
     WaitCancelled,
+    /// A task outcome is being published or settled; the admission can be retried.
+    #[error("task publication is temporarily busy")]
+    TaskPublicationBusy,
     #[error("invalid operation: {0}")]
     Invalid(String),
 }
@@ -268,6 +271,8 @@ pub struct WithdrawnInput {
 pub struct ConversationAbortResult {
     pub withdrawn: Vec<WithdrawnInput>,
 }
+
+type OwnedGraphAbort = (Vec<Uuid>, Vec<Uuid>, ConversationAbortResult);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Submission {
@@ -4708,12 +4713,16 @@ impl Harness {
         };
         self.save_composed_locked(state, expected, wake, children, &[], None)
     }
-    fn save_hook_children(
+    // Keep the completed hook/dispatch and its child IDs in this future while
+    // the driver publishes an outcome. Never wait holding the poll gate: abort
+    // settlement may need that gate to make the publication fence available.
+    async fn save_hook_children(
         &mut self,
         state: &Conversation,
         expected: Expected,
         children: &[crate::task::Task],
         handlers: &[Arc<dyn crate::task_scheduler::Handler>],
+        cancel: &CancellationToken,
     ) -> Result<(), Error> {
         if children.is_empty() {
             return self.save_composed(state, expected, None, children);
@@ -4725,9 +4734,36 @@ impl Harness {
             .as_ref()
             .and_then(|driver| driver.upgrade())
             .ok_or_else(|| Error::Invalid("task driver is not running".into()))?;
-        driver.with_hook_children(children, handlers, state.id, || {
-            self.save_composed_locked(state, expected, None, children, &[], None)
-        })
+        loop {
+            let gate = self.execution_gate.clone();
+            let result = fenced_poll(
+                async {
+                    driver.with_hook_children(children, handlers, state.id, || {
+                        self.save_composed_locked(
+                            state,
+                            expected.clone(),
+                            None,
+                            children,
+                            &[],
+                            None,
+                        )
+                    })
+                },
+                gate.as_ref(),
+                cancel,
+            )
+            .await
+            .ok_or(Error::Interrupted)?;
+            match result {
+                Err(Error::TaskPublicationBusy) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Interrupted),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                    }
+                }
+                other => return other,
+            }
+        }
     }
     fn save_composed_locked(
         &mut self,
@@ -10376,22 +10412,123 @@ impl Harness {
         receipt: Option<(Vec<u8>, Vec<u8>)>,
         background: bool,
         nested_parent: Option<Uuid>,
-        mut before_commit: impl FnMut(),
+        before_commit: impl FnMut(),
     ) -> Result<(Vec<Uuid>, Vec<Uuid>, ConversationAbortResult), Error> {
+        let owner = self.owner.clone();
+        let gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            conversation,
+            task,
+            receipt,
+            background,
+            nested_parent,
+            None,
+            None,
+            before_commit,
+        )
+        .map(|result| result.expect("unconditional abort always has a result"))
+    }
+
+    /// Recheck the cancellation root for a running task under the same task
+    /// gate used to commit the graph marks. `None` means the intent vanished.
+    /// The caller must fence conversation polls and cancel committed epochs,
+    /// just as for `abort_owned_graph`; this method only writes durable marks.
+    #[allow(dead_code)] // Prepared for the pending-settlement coordinator.
+    pub(crate) fn abort_pending_task_graph(
+        &mut self,
+        running: Uuid,
+    ) -> Result<Option<Vec<Uuid>>, Error> {
+        let owner = self.owner.clone();
+        let gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Some(running),
+            None,
+            || {},
+        )
+        .map(|result| result.map(|(conversations, _, _)| conversations))
+    }
+
+    /// Recheck a deferred scheduling intent under the task gate on every
+    /// graph retry. The caller has already acquired the poll and failure fences.
+    pub(crate) fn abort_maintenance_checked(
+        &mut self,
+        intent: crate::task_scheduler::MaintenanceIntent,
+    ) -> Result<Option<Vec<Uuid>>, Error> {
+        let owner = self.owner.clone();
+        let gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some(intent),
+            || {},
+        )
+        .map(|result| result.map(|(conversations, _, _)| conversations))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn abort_owned_graph_impl_roots_locked(
+        &mut self,
+        _gate: &std::sync::MutexGuard<'_, ()>,
+        conversation: Option<Uuid>,
+        fixed_task: Option<Uuid>,
+        receipt: Option<(Vec<u8>, Vec<u8>)>,
+        background: bool,
+        nested_parent: Option<Uuid>,
+        pending_running: Option<Uuid>,
+        maintenance: Option<crate::task_scheduler::MaintenanceIntent>,
+        mut before_commit: impl FnMut(),
+    ) -> Result<Option<OwnedGraphAbort>, Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
         let owner = self.owner.clone();
-        let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         loop {
             let store = owner.store();
             // Capture before discovery; creation can commit without rewriting
             // the observed owner. The checked prefixes catch such phantoms.
             let graph_version = store.put_version()?;
+            let (fixed_task, nested_parent) = if let Some(intent) = maintenance {
+                let ts = crate::task_store::TaskStore::new(store);
+                match crate::task_scheduler::resolve_maintenance(&ts, intent)
+                    .map_err(|e| Error::Invalid(format!("maintenance intent: {e}")))?
+                {
+                    Some(selected) => selected,
+                    None => return Ok(None),
+                }
+            } else {
+                (fixed_task, nested_parent)
+            };
+            let task = if let Some(running) = pending_running {
+                let ts = crate::task_store::TaskStore::new(store);
+                match crate::task_scheduler::pending_abort_root_for_running(&ts, running, false)
+                    .map_err(|e| Error::Invalid(format!("pending task abort: {e}")))?
+                {
+                    Some(root) => Some(root),
+                    None => return Ok(None),
+                }
+            } else {
+                fixed_task
+            };
             if let Some((key, _)) = &receipt
                 && store.get(key)?.is_some()
             {
-                return Ok((Vec::new(), Vec::new(), ConversationAbortResult::default()));
+                return Ok(Some((
+                    Vec::new(),
+                    Vec::new(),
+                    ConversationAbortResult::default(),
+                )));
             }
             let records = crate::task_store::TaskStore::new(store)
                 .list()
@@ -10610,11 +10747,11 @@ impl Harness {
             before_commit();
             match self.commit_conversation_save_inner(batch, Some(graph_version)) {
                 Ok(()) => {
-                    return Ok((
+                    return Ok(Some((
                         conversations.into_iter().collect(),
                         tasks.into_iter().collect(),
                         ConversationAbortResult { withdrawn },
-                    ));
+                    )));
                 }
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
@@ -12840,7 +12977,9 @@ impl Harness {
                             Expected::Version(version),
                             &children,
                             &handlers,
-                        )?;
+                            cancel,
+                        )
+                        .await?;
                         continue;
                     }
                     let continuation = continuation.and_then(|value| {
@@ -13033,7 +13172,14 @@ impl Harness {
                     // The phase transition and any hook-created children are
                     // committed together. Admission conflicts merge the queued
                     // summary without executing this completed hook again.
-                    self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
+                    self.save_hook_children(
+                        &c,
+                        Expected::Version(version),
+                        &children,
+                        &handlers,
+                        cancel,
+                    )
+                    .await?;
                 }
                 Phase::AfterRun {
                     answer,
@@ -13059,7 +13205,14 @@ impl Harness {
                             turns: None,
                         }
                     };
-                    self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
+                    self.save_hook_children(
+                        &c,
+                        Expected::Version(version),
+                        &children,
+                        &handlers,
+                        cancel,
+                    )
+                    .await?;
                 }
                 Phase::HookTasksWaiting { children, turns } => {
                     let store = crate::task_store::TaskStore::new(self.owner.store());
@@ -14230,7 +14383,9 @@ impl Harness {
                             Expected::Version(version),
                             &[task],
                             &[adapter.handler()],
-                        )?;
+                            cancel,
+                        )
+                        .await?;
                         continue;
                     }
                     match reply.outcome {

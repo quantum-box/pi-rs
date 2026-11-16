@@ -90,6 +90,41 @@ impl ConversationControls {
         }
         Ok(affected)
     }
+
+    /// Try all current poll gates. Busy performs no commit and cancels no epochs.
+    pub fn try_fence<E>(
+        &self,
+        commit: impl FnOnce() -> Result<Vec<Uuid>, E>,
+    ) -> Result<Option<Vec<Uuid>>, FenceError<E>> {
+        use std::sync::TryLockError;
+        let mut entries = match self.entries.try_lock() {
+            Ok(entries) => entries,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
+        };
+        let gates: Vec<_> = entries
+            .values()
+            .map(|control| control.gate.clone())
+            .collect();
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in &gates {
+            match gate.try_lock() {
+                Ok(guard) => guards.push(guard),
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
+            }
+        }
+        let affected = commit().map_err(FenceError::Commit)?;
+        for id in &affected {
+            if let Some(control) = entries.get_mut(id) {
+                control.cancel.cancel();
+                control.cleanup_cancel.cancel();
+                control.cancel = self.root.child_token();
+                control.cleanup_cancel = CancellationToken::new();
+            }
+        }
+        Ok(Some(affected))
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -97,6 +132,33 @@ mod tests {
     use super::*;
     use crate::owner::OwnedStore;
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn try_fence_busy_does_not_commit_or_cancel() {
+        let controls = ConversationControls::default();
+        let id = Uuid::from_u128(1);
+        let control = controls.get(id);
+        let guard = control.gate.lock().unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(controls
+            .try_fence(|| {
+                called.set(true);
+                Ok::<_, ()>(vec![id])
+            })
+            .unwrap()
+            .is_none());
+        assert!(!called.get());
+        assert!(!control.cancel.is_cancelled());
+        drop(guard);
+        assert_eq!(
+            controls.try_fence(|| Ok::<_, ()>(vec![id])).unwrap(),
+            Some(vec![id])
+        );
+        assert!(control.cancel.is_cancelled());
+        assert!(!controls.get(id).cancel.is_cancelled());
+        assert!(controls.try_fence(|| Err::<Vec<Uuid>, _>(())).is_err());
+        assert!(!controls.get(id).cancel.is_cancelled());
+    }
 
     #[test]
     fn fence_waits_for_poll_then_cancels_only_committed_epochs() {

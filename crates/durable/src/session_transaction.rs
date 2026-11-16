@@ -22,6 +22,27 @@ pub(crate) struct SessionChild {
     result_id: Uuid,
 }
 
+#[cfg(test)]
+impl SessionChild {
+    pub(crate) fn test_intent(
+        parent: crate::task_store::StoredTask,
+        child: crate::task::Task,
+    ) -> Self {
+        Self {
+            result_id: child.id(),
+            parent,
+            staged_parent: false,
+            child,
+            batch: OwnedBatch {
+                checks: vec![],
+                mutations: vec![],
+            },
+            creating: true,
+            key: None,
+        }
+    }
+}
+
 type SessionParts = (
     Conversation,
     OwnedBatch,
