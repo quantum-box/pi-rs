@@ -648,7 +648,7 @@ pub(crate) mod windows_mutex {
         }
     }
 
-    fn open_mutex() -> io::Result<Handle> {
+    fn open_mutex(test_name: Option<&str>) -> io::Result<Handle> {
         let user = user()?;
         let sd = descriptor(&user)?;
         let attrs = SECURITY_ATTRIBUTES {
@@ -656,7 +656,11 @@ pub(crate) mod windows_mutex {
             lpSecurityDescriptor: sd.0,
             bInheritHandle: 0,
         };
-        let name = wide(&format!("Global\\pi-rs-mcp-config-v1-{}", user.text));
+        let name = wide(
+            &test_name
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Global\\pi-rs-mcp-config-v1-{}", user.text)),
+        );
         let mutex = unsafe { CreateMutexExW(&attrs, name.as_ptr(), 0, RIGHTS) };
         if mutex.is_null() {
             return Err(io::Error::last_os_error());
@@ -697,22 +701,61 @@ pub(crate) mod windows_mutex {
     /// Cancellation-safe before ownership: dropping this future stops the
     /// waiting worker. After acquisition, retain Guard until all writes finish.
     pub(crate) async fn acquire() -> io::Result<Guard> {
+        acquire_inner(
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    /// Hooks are available only in tests. `wait_started` fires after an actual
+    /// timed-out OS wait, while `exited` fires only after joining the worker.
+    #[cfg(test)]
+    pub(crate) struct WorkerHooks {
+        pub(crate) wait_started: tokio::sync::oneshot::Sender<()>,
+        pub(crate) exited: tokio::sync::oneshot::Sender<bool>,
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_named_for_test(
+        name: String,
+        hooks: Option<WorkerHooks>,
+    ) -> io::Result<Guard> {
+        acquire_inner(Some(name), hooks).await
+    }
+
+    async fn acquire_inner(
+        test_name: Option<String>,
+        #[cfg(test)] hooks: Option<WorkerHooks>,
+    ) -> io::Result<Guard> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = Cancel(cancelled.clone());
         let (result_tx, result_rx) = mpsc::sync_channel::<io::Result<bool>>(1);
         let (release_tx, release_rx) = mpsc::channel::<bool>();
-        std::thread::Builder::new()
+        #[cfg(test)]
+        let (mut started, exited) = match hooks {
+            Some(hooks) => (Some(hooks.wait_started), Some(hooks.exited)),
+            None => (None, None),
+        };
+        let worker = std::thread::Builder::new()
             .name("pi-mcp-gate".into())
             .spawn(move || {
                 let result = (|| -> io::Result<()> {
-                    let mutex = open_mutex()?;
+                    let mutex = open_mutex(test_name.as_deref())?;
                     loop {
                         if cancelled.load(Ordering::Acquire) {
                             return Ok(());
                         }
                         let wait = unsafe { WaitForSingleObject(mutex.0, 50) };
                         match wait {
-                            WAIT_TIMEOUT => continue,
+                            WAIT_TIMEOUT => {
+                                #[cfg(test)]
+                                if let Some(started) = started.take() {
+                                    let _ = started.send(());
+                                }
+                                continue;
+                            }
                             WAIT_OBJECT_0 | WAIT_ABANDONED => {
                                 // result conveys whether recovery is required. The owning
                                 // thread releases even if the async receiver is dropped.
@@ -739,6 +782,16 @@ pub(crate) mod windows_mutex {
                     let _ = result_tx.send(Err(error));
                 }
             })?;
+        #[cfg(test)]
+        if let Some(exited) = exited {
+            std::thread::Builder::new()
+                .name("pi-mcp-test-join".into())
+                .spawn(move || {
+                    let _ = exited.send(worker.join().is_ok());
+                })?;
+        }
+        #[cfg(not(test))]
+        drop(worker);
         loop {
             match result_rx.try_recv() {
                 Ok(Ok(abandoned)) => {
