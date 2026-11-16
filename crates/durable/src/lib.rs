@@ -15,8 +15,8 @@ pub mod document;
 #[allow(dead_code)] // Internal identity binding, not a dispatch API.
 mod executor_handoff;
 pub mod extension;
-pub mod fork;
 pub mod foreground_subagent;
+pub mod fork;
 pub mod images;
 #[allow(dead_code)] // Storage foundation; not wired into tool execution yet.
 mod keyed_child;
