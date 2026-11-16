@@ -369,6 +369,23 @@ struct PreparedSettlement {
     attempts: usize,
 }
 
+// Failure settlement retains its original outcome and the most recently
+// prepared checked write until that write commits or is superseded.
+struct FailureSettlement {
+    running: task_store::StoredTask,
+    reason: String,
+    completed: bool,
+    check_pending: bool,
+    attempt: usize,
+    candidate: Option<FailureCandidate>,
+}
+
+struct FailureCandidate {
+    task: task_store::StoredTask,
+    batch: task_store::OwnedBatch,
+    graph_version: u64,
+}
+
 impl std::fmt::Debug for CompletedInvocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompletedInvocation")
@@ -2317,85 +2334,115 @@ impl Scheduler {
         reason: String,
         completed: bool,
         check_pending: bool,
+        before_commit: impl FnMut(),
+    ) -> Result<(), Error> {
+        let mut settlement = FailureSettlement {
+            running: parent.clone(),
+            reason,
+            completed,
+            check_pending,
+            attempt: 0,
+            candidate: None,
+        };
+        self.commit_failure_settlement(&mut settlement, before_commit)
+    }
+
+    fn commit_failure_settlement(
+        &self,
+        settlement: &mut FailureSettlement,
         mut before_commit: impl FnMut(),
     ) -> Result<(), Error> {
         let store = self.ts();
-        for attempt in 0..32 {
+        loop {
             let graph_version = store
                 .store()
                 .put_version()
                 .map_err(task_store::Error::from)?;
-            if check_pending
-                && let Some(current) = store.load(parent.task.id())?
-                && current.version != parent.version
+            if settlement.check_pending
+                && let Some(current) = store.load(settlement.running.task.id())?
+                && current.version != settlement.running.version
                 && current.task.abort_requested()
             {
-                return Err(Error::PendingAbort(parent.task.id()));
+                return Err(Error::PendingAbort(settlement.running.task.id()));
             }
-            if check_pending
+            if settlement.check_pending
                 && let Some(root) = pending_abort_root_for_running(
                     &store,
-                    parent.task.id(),
+                    settlement.running.task.id(),
                     self.validator.is_none(),
                 )?
             {
                 return Err(Error::PendingAbort(root));
             }
             let records = store.list()?;
-            let live = has_live_owned(store.store(), parent.task.id(), &records)?;
-            let mut next = parent.clone();
+            let live = has_live_owned(store.store(), settlement.running.task.id(), &records)?;
+            let mut next = settlement.running.clone();
             if live {
                 next.task
-                    .hold_failure(reason.clone())
+                    .hold_failure(settlement.reason.clone())
                     .map_err(Error::Transition)?;
             } else {
-                next.task.fail(reason.clone()).map_err(Error::Transition)?;
-            }
-            if completed {
                 next.task
-                    .record_completed_attempt(&parent.task)
+                    .fail(settlement.reason.clone())
+                    .map_err(Error::Transition)?;
+            }
+            if settlement.completed {
+                next.task
+                    .record_completed_attempt(&settlement.running.task)
                     .map_err(Error::Transition)?;
             }
             let batch = store.prepare_save(&[Save::Update(&next)])?;
+            settlement.candidate = Some(FailureCandidate {
+                task: next,
+                batch,
+                graph_version,
+            });
+            let candidate = settlement
+                .candidate
+                .as_ref()
+                .expect("candidate just prepared");
+            debug_assert_eq!(candidate.task.task.id(), settlement.running.task.id());
             #[cfg(test)]
             if let Some(hook) = &self.failure_commit_hook {
-                hook(attempt, store.store());
+                hook(settlement.attempt, store.store());
             }
             before_commit();
             match store.store().commit_with_prefix_put_fence(
-                &batch.checks,
-                &batch.mutations,
+                &candidate.batch.checks,
+                &candidate.batch.mutations,
                 &[
                     task_store::PREFIX,
                     crate::ownership_edge::PREFIX,
                     b"runtime/conversation/",
                 ],
-                graph_version,
+                candidate.graph_version,
             ) {
                 Ok(()) => return Ok(()),
                 Err(durable_store::Error::Conflict { ref key })
-                    if attempt < 31
+                    if settlement.attempt < 31
                         && (key == task_store::PREFIX
                             || key == crate::ownership_edge::PREFIX
                             || key == b"runtime/conversation/") =>
                 {
-                    let current = store.load(parent.task.id())?;
-                    if current.as_ref().map(|item| item.version) != Some(parent.version) {
-                        if check_pending && current.is_some_and(|item| item.task.abort_requested())
+                    let current = store.load(settlement.running.task.id())?;
+                    if current.as_ref().map(|item| item.version) != Some(settlement.running.version)
+                    {
+                        if settlement.check_pending
+                            && current.is_some_and(|item| item.task.abort_requested())
                         {
-                            return Err(Error::PendingAbort(parent.task.id()));
+                            return Err(Error::PendingAbort(settlement.running.task.id()));
                         }
                         return Err(task_store::Error::Store(durable_store::Error::Conflict {
-                            key: task_store::key(parent.task.id()),
+                            key: task_store::key(settlement.running.task.id()),
                         })
                         .into());
                     }
+                    settlement.attempt += 1;
                     continue;
                 }
                 Err(error) => return Err(task_store::Error::from(error).into()),
             }
         }
-        unreachable!("last graph conflict is returned")
     }
 }
 
@@ -4763,6 +4810,139 @@ mod tests {
             scheduler.get(other.id()).unwrap().unwrap().state(),
             &TaskState::Ready
         );
+    }
+
+    #[test]
+    fn owned_failure_settlement_retries_same_result_after_graph_conflict() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Failure {
+            calls: Arc<AtomicUsize>,
+            attempt: Arc<Mutex<Option<Uuid>>>,
+            address: Address,
+        }
+        impl Handler for Failure {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                *self.attempt.lock().unwrap() = task.attempt_id();
+                docs.get(&self.address).unwrap();
+                docs.put(
+                    &self.address,
+                    json!({"value": "discard"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Fail("precise failure".into()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let address = Address {
+            scope: "failure".into(),
+            name: "document".into(),
+            key: "".into(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt = Arc::new(Mutex::new(None));
+        let retries = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "parent",
+            false,
+            Failure {
+                calls: calls.clone(),
+                attempt: attempt.clone(),
+                address: address.clone(),
+            },
+        );
+        registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        scheduler.submit(&root).unwrap();
+        let observed = retries.clone();
+        scheduler.failure_commit_hook = Some(Arc::new(move |iteration, store| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            if iteration == 0 {
+                let child = task(2, TaskOwner::Task(Uuid::from_u128(1)), "child", false, 3);
+                TaskStore::new(store).save(&[Save::Create(&child)]).unwrap();
+            }
+        }));
+        scheduler.tick(0).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(retries.load(Ordering::SeqCst), 2);
+        let stored = scheduler.get(root.id()).unwrap().unwrap();
+        assert_eq!(
+            stored.state(),
+            &TaskState::CompletingFailed("precise failure".into())
+        );
+        assert_eq!(stored.retired_attempt_id(), *attempt.lock().unwrap());
+        assert!(stored.retired_attempt_id().is_some());
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        assert!(
+            Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failure_settlement_remains_owned_when_abort_supersedes_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start_attempt(Uuid::new_v4()).unwrap();
+        scheduler.ts().save(&[Save::Create(&parent)]).unwrap();
+        let running = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        let mut settlement = FailureSettlement {
+            running: running.clone(),
+            reason: "retained failure".into(),
+            completed: true,
+            check_pending: true,
+            attempt: 0,
+            candidate: None,
+        };
+        let result = scheduler.commit_failure_settlement(&mut settlement, || {
+            scheduler
+                .ts()
+                .update(&running, |task| task.request_abort())
+                .unwrap();
+        });
+        assert!(matches!(result, Err(Error::PendingAbort(id)) if id == parent.id()));
+        assert_eq!(settlement.running, running);
+        assert_eq!(settlement.reason, "retained failure");
+        let candidate = settlement.candidate.as_ref().unwrap();
+        assert_eq!(
+            candidate.task.task.state(),
+            &TaskState::Failed("retained failure".into())
+        );
+        assert_eq!(
+            candidate.task.task.retired_attempt_id(),
+            running.task.attempt_id()
+        );
+        assert!(!candidate.batch.checks.is_empty());
+        assert!(!candidate.batch.mutations.is_empty());
     }
 
     #[test]
