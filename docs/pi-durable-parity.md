@@ -468,6 +468,8 @@ For staged and immediate sealed children, admission checks that raw input is an 
 
 A reserved sealed child defers before Tool intent or before-hook execution while its parent outcome awaits settlement, including when another abort graph is uncertain. The driver checks that the Tool intent is absent before returning the child to Ready; after the parent settles it rechecks the task, registration and ownership before any dispatch. If the release transaction cannot acquire the writer lock, the driver retains the reservation and retries that checked transition; an indeterminate commit still requires reconciliation.
 
+After restart, unsafe hook and sealed raw-result after-hook recovery retain their deferred roots if the recovery transaction cannot acquire the writer lock. A later retry re-reads the task and its evidence before recovery; an error after transaction start remains a reconciliation failure.
+
 A sealed after phase that already has a raw Tool result uses its original intent and receipt evidence when identity acquisition is temporarily busy; it does not claim the Tool was undispatched or invoke it again. The release and retry retain checks for the recorded Tool identity, original dispatch attempt, raw result and any final receipt.
 
 Before a sealed Tool dispatch, an uncertain pending abort graph also defers an already-reserved child while its parent is still running. The retry checks the absent Tool intent and re-evaluates the graph and parent before dispatch.

@@ -1414,6 +1414,33 @@ fn conversation_claim_recovery_busy_hooks() -> &'static BoundaryHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn after_phase_recovery_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn before_after_phase_recovery_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    after_phase_recovery_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn after_phase_recovery_busy_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_after_phase_recovery_busy_for_test(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    after_phase_recovery_busy_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 fn conversation_claim_recovery_uncertain() -> &'static Mutex<HashSet<Uuid>> {
     static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
     TASKS.get_or_init(Default::default)
@@ -8562,11 +8589,34 @@ impl Scheduler {
                             expected: durable_store::Expected::Missing,
                         });
                         batch.checks.extend(checks);
-                        self.ts()
-                            .store()
-                            .commit(&batch.checks, &batch.mutations)
-                            .map_err(task_store::Error::from)?;
-                        continue;
+                        #[cfg(test)]
+                        if let Some(hook) = after_phase_recovery_hooks()
+                            .lock()
+                            .unwrap()
+                            .remove(&item.task.id())
+                        {
+                            hook();
+                        }
+                        match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                            Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                self.deferred_recovery.extend(deferred);
+                                continue 'scan;
+                            }
+                            Err(durable_store::Error::WriteLockBusy(_)) => {
+                                self.deferred_recovery.extend(deferred);
+                                self.deferred_recovery.insert(item.task.id());
+                                #[cfg(test)]
+                                if let Some(hook) = after_phase_recovery_busy_hooks()
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&item.task.id())
+                                {
+                                    hook();
+                                }
+                                return Ok(());
+                            }
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
                     }
                 }
                 let after_recovery = if !item.task.replay_safe() {
@@ -8601,11 +8651,34 @@ impl Scheduler {
                     next.task.recover().map_err(Error::Transition)?;
                     let mut batch = self.ts().prepare_save(&[task_store::Save::Update(&next)])?;
                     batch.checks.extend(proof.checks);
-                    self.ts()
-                        .store()
-                        .commit(&batch.checks, &batch.mutations)
-                        .map_err(task_store::Error::from)?;
-                    continue;
+                    #[cfg(test)]
+                    if let Some(hook) = after_phase_recovery_hooks()
+                        .lock()
+                        .unwrap()
+                        .remove(&item.task.id())
+                    {
+                        hook();
+                    }
+                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                            self.deferred_recovery.extend(deferred);
+                            continue 'scan;
+                        }
+                        Err(durable_store::Error::WriteLockBusy(_)) => {
+                            self.deferred_recovery.extend(deferred);
+                            self.deferred_recovery.insert(item.task.id());
+                            #[cfg(test)]
+                            if let Some(hook) = after_phase_recovery_busy_hooks()
+                                .lock()
+                                .unwrap()
+                                .remove(&item.task.id())
+                            {
+                                hook();
+                            }
+                            return Ok(());
+                        }
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
                 }
                 if !item.task.replay_safe()
                     && item.task.kind().is_some_and(|kind| {

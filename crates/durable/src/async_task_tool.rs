@@ -3228,6 +3228,223 @@ mod tests {
         );
     }
 
+    struct RecoveryBusyHook(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for RecoveryBusyHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            if !self.0.join("resume").exists() {
+                std::fs::write(self.0.join("unsafe-ready"), b"ready").unwrap();
+                std::future::pending::<()>().await;
+            }
+            Ok(crate::extension::BeforeTool::Pass)
+        }
+    }
+
+    fn recovery_busy_fixture(unsafe_hook: bool) {
+        use crate::task_scheduler::Step;
+        use std::time::{Duration, Instant};
+        const ENV: &str = "PI_TEST_RECOVERY_BUSY_1120";
+        if let Some(root) = std::env::var_os(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let mut host =
+                StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+            let tool = host
+                .register_unsafe_durable_tool_with_hook(
+                    Arc::new(HookRaceTool(Arc::new(AtomicUsize::new(0)))),
+                    "unsafe-recovery",
+                    1,
+                    vec![],
+                    "recovery-v1",
+                    Arc::new(RecoveryBusyHook(root.clone())),
+                    UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let id = host.start_unsafe_durable_root(&tool, json!({}), 5).unwrap();
+            std::fs::write(root.join("task"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = if unsafe_hook {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "async_task_tool::tests::unsafe_hook_recovery_retries_writer_timeout",
+                ])
+                .env(ENV, dir.path())
+                .spawn()
+                .unwrap()
+        } else {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "async_task_tool::tests::after_driver_kill_reopen_reuses_result_and_memo",
+                ])
+                .env("PI_RS_TASK_AFTER_KILL_1120", dir.path())
+                .spawn()
+                .unwrap()
+        };
+        let marker = dir.path().join(if unsafe_hook {
+            "unsafe-ready"
+        } else {
+            "after-ready"
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() {
+            assert!(process.try_wait().unwrap().is_none(), "kill worker exited");
+            assert!(Instant::now() < deadline, "kill boundary timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let path = dir.path().join("db");
+        let store = durable_store::Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&store);
+        let parent: Uuid =
+            std::fs::read_to_string(dir.path().join(if unsafe_hook { "task" } else { "parent" }))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let target = if unsafe_hook {
+            parent
+        } else {
+            tasks
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.task.owner() == &TaskOwner::Task(parent))
+                .unwrap()
+                .task
+                .id()
+        };
+        assert_eq!(
+            tasks.load(target).unwrap().unwrap().task.state(),
+            &crate::task::TaskState::Running
+        );
+        let other = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("independent".into(), true);
+        tasks.save(&[Save::Create(&other)]).unwrap();
+        drop(store);
+        std::fs::write(dir.path().join("resume"), b"resume").unwrap();
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        crate::task_scheduler::before_after_phase_recovery_for_test(target, move || {
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(writer_path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                locked_tx.send(()).unwrap();
+                unlock_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                conn.execute_batch("COMMIT").unwrap();
+            });
+            locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            writer_tx.send(writer).unwrap();
+        });
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        crate::task_scheduler::on_after_phase_recovery_busy_for_test(target, move || {
+            busy_tx.send(()).unwrap();
+            unlock_tx.send(()).unwrap();
+        });
+        let mut registry = Registry::default();
+        assert!(
+            registry.register("independent", true, |_: &Task| Ok(Step::Succeed(json!(
+                "ok"
+            ))))
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let driver = if unsafe_hook {
+            let mut host = StandaloneBeforeHookHost::open(&path, registry).unwrap();
+            host.register_unsafe_durable_tool_with_hook(
+                Arc::new(HookRaceTool(calls.clone())),
+                "unsafe-recovery",
+                1,
+                vec![],
+                "recovery-v1",
+                Arc::new(RecoveryBusyHook(dir.path().to_owned())),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+            host.into_driver()
+        } else {
+            let cell = Arc::new(std::sync::OnceLock::new());
+            assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
+            let mut host = StandaloneBeforeHookHost::open(&path, registry).unwrap();
+            let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let adapter = host
+                .register_tool_with_after(
+                    "leaf",
+                    tool,
+                    "backend",
+                    1,
+                    "after-v1",
+                    Arc::new(AfterFixture {
+                        root: dir.path().to_owned(),
+                        block: true,
+                    }),
+                )
+                .unwrap();
+            assert!(cell.set(adapter).is_ok());
+            host.into_driver()
+        };
+        busy_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer timeout was not observed");
+        writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            wait_terminal(&driver, parent).state(),
+            crate::task::TaskState::Succeeded(_)
+        ));
+        assert_eq!(
+            wait_terminal(&driver, other.id()).state(),
+            &crate::task::TaskState::Succeeded(json!("ok"))
+        );
+        if unsafe_hook {
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("invocations"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
+    fn unsafe_hook_recovery_retries_writer_timeout() {
+        recovery_busy_fixture(true);
+    }
+
+    #[test]
+    fn sealed_after_recovery_retries_writer_timeout() {
+        recovery_busy_fixture(false);
+    }
+
     #[test]
     fn after_reopen_identity_busy_after_reservation_retries_without_redispatch() {
         use std::time::{Duration, Instant};
