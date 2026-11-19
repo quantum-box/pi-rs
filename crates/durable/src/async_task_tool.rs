@@ -1,12 +1,13 @@
-//! Task-backed async leaf tools for standalone hosts with explicit hook policy.
-//!
-//! Conversation-attached execution and nested async calls remain unsupported.
-//! Task-owned dispatch uses its own attempt fence, cancellation and durable
-//! receipts rather than relying on a conversation attempt fence.
+//! Standalone task-backed async tools with explicit hook policy and a
+//! host-attested replay-safe checkpointable bridge. Conversation-attached
+//! execution and unsafe checkpointable tools remain unsupported.
 
 use crate::task::Task;
 use pi_rs_core::{Outcome, Tool, ToolSpec};
 use std::sync::Arc;
+
+mod replay_safe;
+pub use replay_safe::ReplaySafeAuthorization;
 
 const UNCERTAIN_PREFIX: &str = "tool outcome requires reconciliation: ";
 const UNSUPPORTED_PREFIX: &str = "unsupported tool result: ";
@@ -140,8 +141,8 @@ pub trait DurableTaskHost: Send + Sync {
 }
 
 /// Explicit opt-in for Tools that can checkpoint and resume after a park.
-/// Ordinary `Tool` implementations keep their existing behavior. This interface
-/// is not yet connected to a driver; registration is deliberately rejected.
+/// Ordinary `Tool` implementations keep their existing behavior. Standalone
+/// registration is available only with an explicit replay-safe attestation.
 #[async_trait::async_trait]
 pub trait DurableAsyncTool: Tool {
     async fn execute_durable(
@@ -212,6 +213,32 @@ impl StandaloneNoHooksHost {
         _version: u32,
     ) -> Result<Arc<AsyncTaskTool>, String> {
         Err("durable async Tool park/wake execution is not yet supported".into())
+    }
+
+    /// Register a checkpointable tool for a standalone scheduler. The host
+    /// must attest that every attempt is pure or otherwise safe to replay.
+    /// Child definitions must themselves be registered replay-safe TaskTools.
+    pub fn register_replay_safe_durable_tool(
+        &mut self,
+        tool: Arc<dyn DurableAsyncTool>,
+        implementation: &str,
+        version: u32,
+        children: Vec<Arc<crate::task_tool::TaskTool>>,
+        _authorization: ReplaySafeAuthorization,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        replay_safe::register(&mut self.scheduler, tool, implementation, version, children)
+    }
+
+    /// Create a standalone root before transferring this host to its driver.
+    /// Arguments are normalized and checked by the registered tool at dispatch.
+    pub fn start_replay_safe_root(
+        &self,
+        tool: &Arc<crate::task_tool::TaskTool>,
+        input: serde_json::Value,
+        restart_limit: u32,
+    ) -> Result<uuid::Uuid, String> {
+        self.scheduler
+            .submit_replay_safe_async_root(tool, input, restart_limit)
     }
 
     #[cfg(test)]
@@ -2105,20 +2132,47 @@ mod tests {
 
     // This adapter deliberately exists only in unit tests. It exercises the
     // real driver without granting an external Tool a replay-safe policy.
-    struct TestDurableHandler(Arc<dyn DurableAsyncTool>);
-    struct NoChildHost;
+    struct TestDurableHandler {
+        tool: Arc<dyn DurableAsyncTool>,
+        child: Option<Arc<crate::task_tool::TaskTool>>,
+    }
+    struct TestChildHost<'a, 'b> {
+        task: Task,
+        docs: std::sync::Mutex<&'a mut crate::document::TaskDocuments<'b>>,
+        child: Option<Arc<crate::task_tool::TaskTool>>,
+    }
     #[async_trait::async_trait]
-    impl DurableTaskHost for NoChildHost {
+    impl DurableTaskHost for TestChildHost<'_, '_> {
         async fn start_child(
             &self,
-            _: &str,
-            _: &str,
-            _: serde_json::Value,
+            key: &str,
+            tool: &str,
+            input: serde_json::Value,
         ) -> Result<AsyncTaskCall, String> {
-            Err("test host has no child admission".into())
+            let child = self.child.as_ref().ok_or("test host has no child")?;
+            if child.spec().name != tool {
+                return Err("test child is not registered".into());
+            }
+            let mut docs = self.docs.lock().map_err(|e| e.to_string())?;
+            child
+                .start_child(&self.task, &mut docs, key, input)
+                .map(AsyncTaskCall)
         }
-        async fn child_result(&self, _: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String> {
-            Err("test host has no child admission".into())
+        async fn child_result(
+            &self,
+            child: &AsyncTaskCall,
+        ) -> Result<Option<AsyncTaskResult>, String> {
+            let mut docs = self.docs.lock().map_err(|e| e.to_string())?;
+            use crate::task_tool::NestedTaskResult;
+            Ok(match child.0.result(&self.task, &mut docs)? {
+                Some(NestedTaskResult::Succeeded(value)) => Some(AsyncTaskResult::Outcome(
+                    serde_json::from_value(value)
+                        .map_err(|e| format!("invalid child outcome: {e}"))?,
+                )),
+                Some(NestedTaskResult::Failed(reason)) => Some(AsyncTaskResult::Failed(reason)),
+                Some(NestedTaskResult::Cancelled) => Some(AsyncTaskResult::Cancelled),
+                None => None,
+            })
         }
     }
     impl crate::task_scheduler::Handler for TestDurableHandler {
@@ -2132,31 +2186,41 @@ mod tests {
             admission: &crate::task_scheduler::AdmissionHandle<'_>,
         ) -> Result<crate::task_scheduler::Step, String> {
             use crate::task_scheduler::Step;
-            let intent = admission.test_durable_intent()?;
+            let intent = admission.replay_safe_durable_intent(true, None)?;
             let resume = match task.checkpoint().phase.as_str() {
                 "initial" => DurableToolResume {
                     checkpoint: None,
                     ended: vec![],
                 },
-                "test-park" if task.delivered_signal().is_some() => DurableToolResume {
-                    checkpoint: Some(task.checkpoint().data.clone()),
-                    ended: vec![],
-                },
+                "test-park"
+                    if task.delivered_signal().is_some() || task.ended_children().is_some() =>
+                {
+                    DurableToolResume {
+                        checkpoint: Some(task.checkpoint().data.clone()),
+                        ended: task.ended_children().unwrap_or_default().to_vec(),
+                    }
+                }
                 _ => return Err("invalid test checkpoint or wake".into()),
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .map_err(|e| e.to_string())?;
-            let result = runtime.block_on(self.0.execute_durable(
+            let host = TestChildHost {
+                task: task.clone(),
+                docs: std::sync::Mutex::new(docs),
+                child: self.child.clone(),
+            };
+            let result = runtime.block_on(self.tool.execute_durable(
                 task.input().clone(),
                 ToolContext {
                     operation_id: task.id(),
                     cancellation: pi_rs_core::CancellationToken::new(),
                 },
                 resume,
-                &NoChildHost,
+                &host,
             ))?;
-            docs.test_stage_durable_result(intent, &result)?;
+            let docs = host.docs.into_inner().map_err(|e| e.to_string())?;
+            docs.stage_replay_safe_durable_result(intent, &result)?;
             match result {
                 DurableToolStep::Complete(outcome) => Ok(Step::Succeed(
                     serde_json::to_value(outcome).map_err(|e| e.to_string())?,
@@ -2170,6 +2234,32 @@ mod tests {
                         data: checkpoint,
                     },
                     condition: crate::task::WaitFor::Signal(signal),
+                    children: vec![],
+                }),
+                DurableToolStep::Park {
+                    checkpoint,
+                    wait: DurableWait::All(calls),
+                } if !calls.is_empty() => Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "test-park".into(),
+                        data: checkpoint,
+                    },
+                    condition: crate::task::WaitFor::Tasks(
+                        calls.iter().map(AsyncTaskCall::task_id).collect(),
+                    ),
+                    children: vec![],
+                }),
+                DurableToolStep::Park {
+                    checkpoint,
+                    wait: DurableWait::Any(calls),
+                } if !calls.is_empty() => Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "test-park".into(),
+                        data: checkpoint,
+                    },
+                    condition: crate::task::WaitFor::TasksAny(
+                        calls.iter().map(AsyncTaskCall::task_id).collect(),
+                    ),
                     children: vec![],
                 }),
                 DurableToolStep::Park { .. } => Err("test host supports only signal waits".into()),
@@ -2230,11 +2320,971 @@ mod tests {
     }
     fn pure_registry(tool: Arc<dyn DurableAsyncTool>) -> Registry {
         let mut registry = Registry::default();
-        assert!(registry.register("test-durable", true, TestDurableHandler(tool)));
+        assert!(registry.register(
+            "test-durable",
+            true,
+            TestDurableHandler { tool, child: None }
+        ));
         assert!(registry.set_abort("test-durable", |_: &Task| Ok(
             crate::task_scheduler::Step::Succeed(json!(null))
         )));
         registry
+    }
+
+    struct ChainTool {
+        name: &'static str,
+        child: &'static str,
+        calls: Arc<AtomicUsize>,
+        any: bool,
+    }
+    #[async_trait::async_trait]
+    impl Tool for ChainTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for ChainTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            resume: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match resume.checkpoint {
+                None => {
+                    let call = host.start_child("child", self.child, json!({})).await?;
+                    let wait = if self.any {
+                        DurableWait::Any(vec![call.clone()])
+                    } else {
+                        DurableWait::All(vec![call.clone()])
+                    };
+                    Ok(DurableToolStep::Park {
+                        checkpoint: json!({"call":call}),
+                        wait,
+                    })
+                }
+                Some(data) => {
+                    let call: AsyncTaskCall =
+                        serde_json::from_value(data["call"].clone()).map_err(|e| e.to_string())?;
+                    if resume.ended != vec![call.task_id()] {
+                        return Err("wrong child wake".into());
+                    }
+                    match host.child_result(&call).await? {
+                        Some(AsyncTaskResult::Outcome(Outcome::Succeeded(value)))
+                            if value == self.child =>
+                        {
+                            ()
+                        }
+                        other => return Err(format!("wrong child result: {other:?}")),
+                    }
+                    Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                        self.name.into(),
+                    )))
+                }
+            }
+        }
+    }
+    struct ChainLeaf;
+    impl crate::task_scheduler::Handler for ChainLeaf {
+        fn run(&self, task: &Task) -> Result<crate::task_scheduler::Step, String> {
+            use crate::task_scheduler::Step;
+            match task.checkpoint().phase.as_str() {
+                "initial" => Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "leaf-wait".into(),
+                        data: json!({}),
+                    },
+                    condition: crate::task::WaitFor::Signal("release".into()),
+                    children: vec![],
+                }),
+                "leaf-wait" if task.delivered_signal().is_some() => Ok(Step::Succeed(
+                    serde_json::to_value(Outcome::Succeeded("leaf".into())).unwrap(),
+                )),
+                _ => Err("invalid leaf wake".into()),
+            }
+        }
+    }
+    fn chain_registry(root_calls: Arc<AtomicUsize>, middle_calls: Arc<AtomicUsize>) -> Registry {
+        use crate::task_scheduler::Handler;
+        let leaf: Arc<dyn Handler> = Arc::new(ChainLeaf);
+        let spec = |name: &str| ToolSpec {
+            name: name.into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let leaf_tool = Arc::new(crate::task_tool::TaskTool::new(
+            spec("leaf"),
+            "chain-leaf",
+            true,
+            1,
+            leaf.clone(),
+        ));
+        let middle: Arc<dyn Handler> = Arc::new(TestDurableHandler {
+            tool: Arc::new(ChainTool {
+                name: "middle",
+                child: "leaf",
+                calls: middle_calls,
+                any: false,
+            }),
+            child: Some(leaf_tool),
+        });
+        let middle_tool = Arc::new(crate::task_tool::TaskTool::new(
+            spec("middle"),
+            "chain-middle",
+            true,
+            1,
+            middle.clone(),
+        ));
+        let root: Arc<dyn Handler> = Arc::new(TestDurableHandler {
+            tool: Arc::new(ChainTool {
+                name: "root",
+                child: "middle",
+                calls: root_calls,
+                any: false,
+            }),
+            child: Some(middle_tool),
+        });
+        let mut registry = Registry::default();
+        for (kind, handler) in [
+            ("test-durable", root),
+            ("chain-middle", middle),
+            ("chain-leaf", leaf),
+        ] {
+            assert!(registry.register_shared(kind, true, handler));
+            assert!(
+                registry.set_abort(kind, |_: &Task| Ok(crate::task_scheduler::Step::Succeed(
+                    json!(null)
+                )))
+            );
+        }
+        registry
+    }
+    fn chain_parked(driver: &crate::task_driver::Driver, root: Uuid) -> (Uuid, Uuid) {
+        let parent = wait_state(driver, root, |s| {
+            matches!(
+                s,
+                crate::task::TaskState::Waiting(crate::task::WaitFor::Tasks(_))
+            )
+        });
+        let middle: AsyncTaskCall =
+            serde_json::from_value(parent.checkpoint().data["call"].clone()).unwrap();
+        let middle_task = wait_state(driver, middle.task_id(), |s| {
+            matches!(
+                s,
+                crate::task::TaskState::Waiting(crate::task::WaitFor::Tasks(_))
+            )
+        });
+        let leaf: AsyncTaskCall =
+            serde_json::from_value(middle_task.checkpoint().data["call"].clone()).unwrap();
+        wait_state(
+            driver,
+            leaf.task_id(),
+            |s| matches!(s, crate::task::TaskState::Waiting(crate::task::WaitFor::Signal(name)) if name == "release"),
+        );
+        (middle.task_id(), leaf.task_id())
+    }
+
+    struct ProductionOuter(Arc<std::sync::OnceLock<Arc<crate::task_tool::TaskTool>>>);
+    impl crate::task_scheduler::Handler for ProductionOuter {
+        fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
+            Err("documents required".into())
+        }
+        fn run_with_documents(
+            &self,
+            task: &Task,
+            docs: &mut crate::document::TaskDocuments<'_>,
+        ) -> Result<crate::task_scheduler::Step, String> {
+            use crate::task_scheduler::Step;
+            use crate::task_tool::{NestedTaskCall, NestedTaskResult};
+            match task.checkpoint().phase.as_str() {
+                "initial" => {
+                    let call = self.0.get().ok_or("missing root tool")?.start_child(
+                        task,
+                        docs,
+                        "root",
+                        json!({}),
+                    )?;
+                    Ok(Step::Wait {
+                        condition: crate::task::WaitFor::Tasks(vec![call.task_id()]),
+                        checkpoint: Checkpoint {
+                            phase: "root".into(),
+                            data: json!({"call":call}),
+                        },
+                        children: vec![],
+                    })
+                }
+                "root" => {
+                    let call: NestedTaskCall =
+                        serde_json::from_value(task.checkpoint().data["call"].clone())
+                            .map_err(|e| e.to_string())?;
+                    match call.result(task, docs)? {
+                        Some(NestedTaskResult::Succeeded(value)) => Ok(Step::Succeed(value)),
+                        other => Err(format!("root failed: {other:?}")),
+                    }
+                }
+                _ => Err("invalid outer checkpoint".into()),
+            }
+        }
+    }
+    fn production_chain_scheduler(
+        path: &std::path::Path,
+        any: bool,
+        root_calls: Arc<AtomicUsize>,
+        middle_calls: Arc<AtomicUsize>,
+    ) -> crate::task_scheduler::Scheduler {
+        use crate::task_scheduler::Handler;
+        let root_slot = Arc::new(std::sync::OnceLock::new());
+        let outer: Arc<dyn Handler> = Arc::new(ProductionOuter(root_slot.clone()));
+        let leaf: Arc<dyn Handler> = Arc::new(ChainLeaf);
+        let mut registry = Registry::default();
+        for (kind, handler) in [
+            ("production-outer", outer),
+            ("production-leaf", leaf.clone()),
+        ] {
+            assert!(registry.register_shared(kind, true, handler));
+            assert!(
+                registry.set_abort(kind, |_: &Task| Ok(crate::task_scheduler::Step::Succeed(
+                    json!(null)
+                )))
+            );
+        }
+        let mut host =
+            StandaloneNoHooksHost::open(path, registry, UnhookedAuthorization::standalone_only())
+                .unwrap();
+        let leaf_tool = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "leaf".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "production-leaf",
+            true,
+            1,
+            leaf,
+        ));
+        let middle: Arc<dyn DurableAsyncTool> = Arc::new(ChainTool {
+            name: "middle",
+            child: "leaf",
+            calls: middle_calls,
+            any,
+        });
+        let middle_tool = host
+            .register_replay_safe_durable_tool(
+                middle,
+                "pure-middle-v1",
+                1,
+                vec![leaf_tool],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let root: Arc<dyn DurableAsyncTool> = Arc::new(ChainTool {
+            name: "root",
+            child: "middle",
+            calls: root_calls,
+            any,
+        });
+        let root_tool = host
+            .register_replay_safe_durable_tool(
+                root,
+                "pure-root-v1",
+                1,
+                vec![middle_tool],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        assert!(root_slot.set(root_tool).is_ok());
+        host.into_scheduler_for_test()
+    }
+    fn production_outer_task() -> Task {
+        Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("production-outer".into(), true)
+        .into_task_tool()
+    }
+    fn production_chain_parked(
+        driver: &crate::task_driver::Driver,
+        outer: Uuid,
+    ) -> (Uuid, Uuid, Uuid) {
+        let task = wait_state(driver, outer, |s| {
+            matches!(s, crate::task::TaskState::Waiting(_))
+        });
+        let root: crate::task_tool::NestedTaskCall =
+            serde_json::from_value(task.checkpoint().data["call"].clone()).unwrap();
+        let root_task = wait_state(driver, root.task_id(), |s| {
+            matches!(
+                s,
+                crate::task::TaskState::Waiting(
+                    crate::task::WaitFor::Tasks(_) | crate::task::WaitFor::TasksAny(_)
+                )
+            )
+        });
+        let middle: AsyncTaskCall =
+            serde_json::from_value(root_task.checkpoint().data["checkpoint"]["call"].clone())
+                .unwrap();
+        let mid_task = wait_state(driver, middle.task_id(), |s| {
+            matches!(
+                s,
+                crate::task::TaskState::Waiting(
+                    crate::task::WaitFor::Tasks(_) | crate::task::WaitFor::TasksAny(_)
+                )
+            )
+        });
+        let leaf: AsyncTaskCall =
+            serde_json::from_value(mid_task.checkpoint().data["checkpoint"]["call"].clone())
+                .unwrap();
+        wait_state(driver, leaf.task_id(), |s| {
+            matches!(
+                s,
+                crate::task::TaskState::Waiting(crate::task::WaitFor::Signal(_))
+            )
+        });
+        (root.task_id(), middle.task_id(), leaf.task_id())
+    }
+    #[test]
+    fn production_replay_safe_async_children_all_and_any_wake() {
+        for any in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root_calls = Arc::new(AtomicUsize::new(0));
+            let middle_calls = Arc::new(AtomicUsize::new(0));
+            let scheduler = production_chain_scheduler(
+                &dir.path().join("db"),
+                any,
+                root_calls.clone(),
+                middle_calls.clone(),
+            );
+            let task = production_outer_task();
+            scheduler.submit(&task).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let (_, _, leaf) = production_chain_parked(&driver, task.id());
+            release_chain(&driver, task.id(), leaf);
+            assert_eq!(root_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+            driver.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn production_replay_safe_registration_rejects_unsafe_and_ambiguous_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            Registry::default(),
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let handler: Arc<dyn crate::task_scheduler::Handler> = Arc::new(ChainLeaf);
+        let spec = ToolSpec {
+            name: "leaf".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let unsafe_child = Arc::new(crate::task_tool::TaskTool::new(
+            spec.clone(),
+            "unsafe",
+            false,
+            1,
+            handler.clone(),
+        ));
+        let safe_child = Arc::new(crate::task_tool::TaskTool::new(
+            spec, "safe", true, 1, handler,
+        ));
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(PureParkTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+            barrier: None,
+            fail: false,
+        });
+        assert!(
+            host.register_replay_safe_durable_tool(
+                tool.clone(),
+                "impl",
+                1,
+                vec![unsafe_child],
+                ReplaySafeAuthorization::host_attests_replay_safe()
+            )
+            .is_err()
+        );
+        assert!(
+            host.register_replay_safe_durable_tool(
+                tool.clone(),
+                "impl",
+                1,
+                vec![safe_child.clone(), safe_child],
+                ReplaySafeAuthorization::host_attests_replay_safe()
+            )
+            .is_err()
+        );
+        assert!(
+            host.register_replay_safe_durable_tool(
+                tool,
+                "",
+                1,
+                vec![],
+                ReplaySafeAuthorization::host_attests_replay_safe()
+            )
+            .is_err()
+        );
+        host.into_driver().shutdown().unwrap();
+    }
+
+    struct TwoChildTool {
+        any: bool,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for TwoChildTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "two-children".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for TwoChildTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            resume: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match resume.checkpoint {
+                None => {
+                    let a = host.start_child("a", "leaf", json!({"id":"a"})).await?;
+                    let b = host.start_child("b", "leaf", json!({"id":"b"})).await?;
+                    let calls = vec![a, b];
+                    let wait = if self.any {
+                        DurableWait::Any(calls.clone())
+                    } else {
+                        DurableWait::All(calls.clone())
+                    };
+                    Ok(DurableToolStep::Park {
+                        checkpoint: json!({"calls":calls}),
+                        wait,
+                    })
+                }
+                Some(value) => {
+                    let calls: Vec<AsyncTaskCall> = serde_json::from_value(value["calls"].clone())
+                        .map_err(|e| e.to_string())?;
+                    if resume.ended.len() != if self.any { 1 } else { 2 } {
+                        return Err("unexpected ended children".into());
+                    }
+                    for id in resume.ended {
+                        let call = calls
+                            .iter()
+                            .find(|call| call.task_id() == id)
+                            .ok_or("unknown ended child")?;
+                        if !matches!(host.child_result(call).await?, Some(AsyncTaskResult::Outcome(Outcome::Succeeded(value))) if value == "leaf")
+                        {
+                            return Err("bad child result".into());
+                        }
+                    }
+                    Ok(DurableToolStep::Complete(Outcome::Succeeded("root".into())))
+                }
+            }
+        }
+    }
+    #[test]
+    fn production_all_and_any_freeze_ended_children_with_two_children() {
+        for any in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let slot = Arc::new(std::sync::OnceLock::new());
+            let leaf: Arc<dyn crate::task_scheduler::Handler> = Arc::new(ChainLeaf);
+            let mut registry = Registry::default();
+            assert!(registry.register("production-outer", true, ProductionOuter(slot.clone())));
+            assert!(registry.register_shared("production-leaf", true, leaf.clone()));
+            for kind in ["production-outer", "production-leaf"] {
+                assert!(registry.set_abort(kind, |_: &Task| Ok(
+                    crate::task_scheduler::Step::Succeed(json!(null))
+                )));
+            }
+            let mut host = StandaloneNoHooksHost::open(
+                dir.path().join("db"),
+                registry,
+                UnhookedAuthorization::standalone_only(),
+            )
+            .unwrap();
+            let leaf_tool = Arc::new(crate::task_tool::TaskTool::new(
+                ToolSpec {
+                    name: "leaf".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                },
+                "production-leaf",
+                true,
+                1,
+                leaf,
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let root_tool = host
+                .register_replay_safe_durable_tool(
+                    Arc::new(TwoChildTool {
+                        any,
+                        calls: calls.clone(),
+                    }),
+                    "two-v1",
+                    1,
+                    vec![leaf_tool],
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            assert!(slot.set(root_tool).is_ok());
+            let scheduler = host.into_scheduler_for_test();
+            let outer = production_outer_task();
+            scheduler.submit(&outer).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let outer_wait = wait_state(&driver, outer.id(), |s| {
+                matches!(s, crate::task::TaskState::Waiting(_))
+            });
+            let root: crate::task_tool::NestedTaskCall =
+                serde_json::from_value(outer_wait.checkpoint().data["call"].clone()).unwrap();
+            let root_wait = wait_state(&driver, root.task_id(), |s| {
+                matches!(s, crate::task::TaskState::Waiting(_))
+            });
+            let children: Vec<AsyncTaskCall> =
+                serde_json::from_value(root_wait.checkpoint().data["checkpoint"]["calls"].clone())
+                    .unwrap();
+            for child in &children {
+                wait_state(&driver, child.task_id(), |s| {
+                    matches!(s, crate::task::TaskState::Waiting(_))
+                });
+            }
+            driver
+                .signal(&crate::task_store::Signal::new(
+                    Uuid::new_v4(),
+                    children[0].task_id(),
+                    "release".into(),
+                    json!(null),
+                ))
+                .unwrap();
+            wait_state(&driver, children[0].task_id(), |s| {
+                matches!(s, crate::task::TaskState::Succeeded(_))
+            });
+            if any {
+                wait_state(&driver, root.task_id(), |s| {
+                    matches!(s, crate::task::TaskState::Succeeded(_))
+                });
+                wait_state(&driver, children[1].task_id(), |s| {
+                    matches!(s, crate::task::TaskState::Cancelled)
+                });
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            } else {
+                assert!(matches!(
+                    driver.get(root.task_id()).unwrap().unwrap().state(),
+                    crate::task::TaskState::Waiting(_)
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                driver
+                    .signal(&crate::task_store::Signal::new(
+                        Uuid::new_v4(),
+                        children[1].task_id(),
+                        "release".into(),
+                        json!(null),
+                    ))
+                    .unwrap();
+            }
+            let completed = wait_state(&driver, outer.id(), |s| {
+                matches!(s, crate::task::TaskState::Succeeded(_))
+            });
+            assert_eq!(
+                completed.state(),
+                &crate::task::TaskState::Succeeded(
+                    serde_json::to_value(Outcome::Succeeded("root".into())).unwrap()
+                )
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            driver.shutdown().unwrap();
+        }
+    }
+
+    struct CancellationTool(std::sync::mpsc::Sender<()>);
+    #[async_trait::async_trait]
+    impl Tool for CancellationTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "cancel-test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for CancellationTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            context: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.send(()).map_err(|e| e.to_string())?;
+            context.cancellation.cancelled().await;
+            Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "cancel observed".into(),
+            )))
+        }
+    }
+    #[test]
+    fn production_replay_safe_async_abort_cancels_live_tool_and_discards_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let mut registry = Registry::default();
+        assert!(registry.register("production-outer", true, ProductionOuter(slot.clone())));
+        assert!(registry.set_abort("production-outer", |_: &Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!(null))
+        )));
+        let mut host = StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            registry,
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tool = host
+            .register_replay_safe_durable_tool(
+                Arc::new(CancellationTool(tx)),
+                "cancel-v1",
+                1,
+                vec![],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        assert!(slot.set(tool).is_ok());
+        let scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let outer = production_outer_task();
+        scheduler.submit(&outer).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let parked = wait_state(&driver, outer.id(), |s| {
+            matches!(s, crate::task::TaskState::Waiting(_))
+        });
+        let call: crate::task_tool::NestedTaskCall =
+            serde_json::from_value(parked.checkpoint().data["call"].clone()).unwrap();
+        driver.request_abort(outer.id()).unwrap();
+        wait_state(&driver, outer.id(), |s| {
+            matches!(s, crate::task::TaskState::Cancelled)
+        });
+        wait_state(&driver, call.task_id(), |s| {
+            matches!(s, crate::task::TaskState::Cancelled)
+        });
+        let records = owner
+            .store()
+            .list(format!("durable/replay-safe-async/{}/", call.task_id()).as_bytes())
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "aborted execution must not publish a result"
+        );
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn production_replay_safe_process_fixture() {
+        let Some(dir) = std::env::var_os("PI_TEST_REPLAY_SAFE_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let scheduler = production_chain_scheduler(
+            &dir.join("db"),
+            false,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let task = production_outer_task();
+        scheduler.submit(&task).unwrap();
+        std::fs::write(dir.join("outer"), task.id().to_string()).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        if std::env::var_os("PI_TEST_REPLAY_SAFE_CUT").is_none() {
+            let ids = production_chain_parked(&driver, task.id());
+            std::fs::write(dir.join("cut.tmp"), serde_json::to_vec(&ids).unwrap()).unwrap();
+            std::fs::rename(dir.join("cut.tmp"), dir.join("cut")).unwrap();
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+    fn kill_production_fixture(dir: &std::path::Path, cut: Option<&str>) -> (Uuid, Vec<u8>) {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact")
+            .arg("async_task_tool::tests::production_replay_safe_process_fixture")
+            .env("PI_TEST_REPLAY_SAFE_DIR", dir);
+        if let Some(cut) = cut {
+            cmd.env("PI_TEST_REPLAY_SAFE_CUT", cut);
+        }
+        let mut process = cmd.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.join("cut").exists() {
+            if std::time::Instant::now() >= deadline || process.try_wait().unwrap().is_some() {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("production fixture did not reach boundary");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        (
+            std::fs::read_to_string(dir.join("outer"))
+                .unwrap()
+                .parse()
+                .unwrap(),
+            std::fs::read(dir.join("cut")).unwrap(),
+        )
+    }
+    #[test]
+    fn production_replay_safe_kill_before_park_commit_replays_without_orphan_child() {
+        for cut in ["intent", "result"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (outer, root_data) = kill_production_fixture(dir.path(), Some(cut));
+            let root: Uuid = std::str::from_utf8(&root_data).unwrap().parse().unwrap();
+            let root_calls = Arc::new(AtomicUsize::new(0));
+            let middle_calls = Arc::new(AtomicUsize::new(0));
+            let scheduler = production_chain_scheduler(
+                &dir.path().join("db"),
+                false,
+                root_calls.clone(),
+                middle_calls.clone(),
+            );
+            let owner = scheduler.owner();
+            let records = owner
+                .store()
+                .list(format!("durable/replay-safe-async/{root}/").as_bytes())
+                .unwrap();
+            assert_eq!(records.len(), 1, "uncommitted result must not persist");
+            assert!(
+                !TaskStore::new(owner.store())
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.task.owner() == &TaskOwner::Task(root)),
+                "staged child must not persist before park"
+            );
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let (resumed_root, _, leaf) = production_chain_parked(&driver, outer);
+            assert_eq!(resumed_root, root);
+            release_chain(&driver, outer, leaf);
+            assert_eq!(root_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+            let records = owner
+                .store()
+                .list(format!("durable/replay-safe-async/{root}/").as_bytes())
+                .unwrap();
+            assert_eq!(
+                records.len(),
+                5,
+                "old intent plus two new attempt/result pairs"
+            );
+            driver.shutdown().unwrap();
+        }
+    }
+    #[test]
+    fn production_replay_safe_parked_kill_reopen_and_abort() {
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (outer, data) = kill_production_fixture(dir.path(), None);
+            let (root, middle, leaf): (Uuid, Uuid, Uuid) = serde_json::from_slice(&data).unwrap();
+            let root_calls = Arc::new(AtomicUsize::new(0));
+            let middle_calls = Arc::new(AtomicUsize::new(0));
+            let scheduler = production_chain_scheduler(
+                &dir.path().join("db"),
+                false,
+                root_calls.clone(),
+                middle_calls.clone(),
+            );
+            let driver = crate::task_driver::Driver::start(scheduler);
+            if abort {
+                driver.request_abort(outer).unwrap();
+                for id in [outer, root, middle, leaf] {
+                    wait_state(&driver, id, |s| {
+                        matches!(s, crate::task::TaskState::Cancelled)
+                    });
+                }
+                assert_eq!(root_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(middle_calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(
+                    production_chain_parked(&driver, outer),
+                    (root, middle, leaf)
+                );
+                release_chain(&driver, outer, leaf);
+                assert_eq!(root_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(middle_calls.load(Ordering::SeqCst), 1);
+            }
+            driver.shutdown().unwrap();
+        }
+    }
+    fn release_chain(driver: &crate::task_driver::Driver, root: Uuid, leaf: Uuid) {
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                leaf,
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+        let task = wait_state(driver, root, |s| {
+            matches!(s, crate::task::TaskState::Succeeded(_))
+        });
+        assert_eq!(
+            task.state(),
+            &crate::task::TaskState::Succeeded(
+                serde_json::to_value(Outcome::Succeeded("root".into())).unwrap()
+            )
+        );
+    }
+    #[test]
+    fn multilevel_async_tools_admit_park_and_wake_in_real_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_calls = Arc::new(AtomicUsize::new(0));
+        let middle_calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = crate::task_scheduler::Scheduler::open(
+            dir.path().join("db"),
+            chain_registry(root_calls.clone(), middle_calls.clone()),
+        )
+        .unwrap();
+        let task = test_task();
+        scheduler.submit(&task).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let (_, leaf) = chain_parked(&driver, task.id());
+        release_chain(&driver, task.id(), leaf);
+        assert_eq!(root_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn multilevel_async_tools_kill_fixture() {
+        let Some(dir) = std::env::var_os("PI_TEST_ASYNC_CHAIN_KILL_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let scheduler = crate::task_scheduler::Scheduler::open(
+            dir.join("db"),
+            chain_registry(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+        )
+        .unwrap();
+        let task = test_task();
+        scheduler.submit(&task).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let (middle, leaf) = chain_parked(&driver, task.id());
+        std::fs::write(
+            dir.join("ready.tmp"),
+            serde_json::to_vec(&(task.id(), middle, leaf)).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(dir.join("ready.tmp"), dir.join("ready")).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    fn kill_parked_chain(dir: &std::path::Path) -> (Uuid, Uuid, Uuid) {
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::multilevel_async_tools_kill_fixture")
+            .env("PI_TEST_ASYNC_CHAIN_KILL_DIR", dir)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.join("ready").exists() {
+            if std::time::Instant::now() >= deadline || process.try_wait().unwrap().is_some() {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("multilevel fixture did not park");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        serde_json::from_slice(&std::fs::read(dir.join("ready")).unwrap()).unwrap()
+    }
+    #[test]
+    fn multilevel_async_tools_kill_reopen_resumes_once_per_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, middle, leaf) = kill_parked_chain(dir.path());
+        let root_calls = Arc::new(AtomicUsize::new(0));
+        let middle_calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = crate::task_scheduler::Scheduler::open(
+            dir.path().join("db"),
+            chain_registry(root_calls.clone(), middle_calls.clone()),
+        )
+        .unwrap();
+        let owner = scheduler.owner();
+        for id in [root, middle] {
+            assert_eq!(
+                owner
+                    .store()
+                    .list(format!("test/durable-async/{id}/").as_bytes())
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert_eq!(chain_parked(&driver, root), (middle, leaf));
+        release_chain(&driver, root, leaf);
+        assert_eq!(root_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(middle_calls.load(Ordering::SeqCst), 1);
+        for id in [root, middle] {
+            assert_eq!(
+                owner
+                    .store()
+                    .list(format!("test/durable-async/{id}/").as_bytes())
+                    .unwrap()
+                    .len(),
+                4
+            );
+        }
+        driver.shutdown().unwrap();
+    }
+    #[test]
+    fn multilevel_async_tools_abort_after_reopen_drains_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, middle, leaf) = kill_parked_chain(dir.path());
+        let root_calls = Arc::new(AtomicUsize::new(0));
+        let middle_calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = crate::task_scheduler::Scheduler::open(
+            dir.path().join("db"),
+            chain_registry(root_calls.clone(), middle_calls.clone()),
+        )
+        .unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        driver.request_abort(root).unwrap();
+        for id in [root, middle, leaf] {
+            wait_state(&driver, id, |s| {
+                matches!(s, crate::task::TaskState::Cancelled)
+            });
+        }
+        assert_eq!(root_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middle_calls.load(Ordering::SeqCst), 0);
+        driver.shutdown().unwrap();
     }
     fn test_task() -> Task {
         Task::new(

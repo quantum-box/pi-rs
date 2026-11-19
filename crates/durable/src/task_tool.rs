@@ -14,6 +14,7 @@ pub struct TaskTool {
     definition_version: u32,
     handler: Arc<dyn crate::task_scheduler::Handler>,
     direct_binding: Option<Value>,
+    deferred_arguments: bool,
 }
 /// Handle for a keyed task-backed nested tool. It can be stored in a checkpoint
 /// and resolved after a child wake. The child is admitted only when the parent
@@ -33,6 +34,9 @@ pub enum NestedTaskResult {
 }
 
 impl NestedTaskCall {
+    pub(crate) fn belongs_to(&self, parent: uuid::Uuid) -> bool {
+        self.parent == parent
+    }
     pub(crate) fn new(parent: uuid::Uuid, task_id: uuid::Uuid) -> Self {
         Self { parent, task_id }
     }
@@ -80,10 +84,15 @@ impl TaskTool {
             definition_version,
             handler,
             direct_binding: None,
+            deferred_arguments: false,
         }
     }
     pub(crate) fn with_direct_binding(mut self, binding: Value) -> Self {
         self.direct_binding = Some(binding);
+        self
+    }
+    pub(crate) fn with_deferred_arguments(mut self) -> Self {
+        self.deferred_arguments = true;
         self
     }
     pub(crate) fn is_direct(&self) -> bool {
@@ -179,7 +188,7 @@ impl TaskTool {
         if identity.len() > 65_536
             || self.spec.name.is_empty()
             || serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024
-            || if validate_input {
+            || if validate_input && !self.deferred_arguments {
                 !validator.is_valid(&input)
             } else {
                 !input.is_object()
@@ -249,6 +258,7 @@ impl TaskTool {
             definition_version: self.definition_version,
             replay_safe: self.replay_safe,
             direct_binding: self.direct_binding.clone(),
+            deferred_arguments: self.deferred_arguments,
         })
     }
     pub(crate) fn task(
@@ -293,6 +303,8 @@ pub(crate) struct Identity {
     pub(crate) replay_safe: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     direct_binding: Option<Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deferred_arguments: bool,
 }
 #[async_trait::async_trait]
 impl Tool for TaskTool {

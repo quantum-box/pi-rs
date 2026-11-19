@@ -67,6 +67,15 @@ pub trait Handler: Send + Sync {
     ) -> Result<Step, String> {
         self.run_with_documents(task, documents)
     }
+    fn run_with_admission_and_cancellation(
+        &self,
+        task: &Task,
+        documents: &mut crate::document::TaskDocuments<'_>,
+        admission: &AdmissionHandle<'_>,
+        _cancellation: &pi_rs_core::CancellationToken,
+    ) -> Result<Step, String> {
+        self.run_with_admission(task, documents, admission)
+    }
 }
 impl<F> Handler for F
 where
@@ -152,6 +161,7 @@ struct Registration {
     handler: Arc<dyn Handler>,
     abort: Option<Arc<dyn Handler>>,
     receipt_capture: Option<Arc<ReceiptCapture>>,
+    cancellable_replay_safe: bool,
 }
 /// Clones preserve definition identity for migration retry decisions.
 #[derive(Clone, Default)]
@@ -200,6 +210,7 @@ impl Registry {
                     handler,
                     abort: None,
                     receipt_capture: None,
+                    cancellable_replay_safe: false,
                 });
                 true
             }
@@ -223,6 +234,7 @@ impl Registry {
                     handler: Arc::new(handler),
                     abort: None,
                     receipt_capture: None,
+                    cancellable_replay_safe: false,
                 });
                 true
             }
@@ -1342,16 +1354,19 @@ impl DetachedInvocation {
 }
 
 impl AdmissionHandle<'_> {
-    #[cfg(test)]
-    pub(crate) fn test_durable_intent(&self) -> Result<Vec<u8>, String> {
+    pub(crate) fn replay_safe_durable_intent(
+        &self,
+        test_namespace: bool,
+        cancellation: Option<&pi_rs_core::CancellationToken>,
+    ) -> Result<Vec<u8>, String> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         if !self.standalone
             || self.abort
             || self.lease.retired
             || !self.running.task.replay_safe()
-            || !matches!(self.running.task.owner(), TaskOwner::Conversation(_))
+            || !self.running.task.is_task_tool()
         {
-            return Err("unsupported test executor".into());
+            return Err("unsupported replay-safe executor".into());
         }
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
@@ -1362,6 +1377,7 @@ impl AdmissionHandle<'_> {
             .ok_or("missing task")?;
         if state.poisoned
             || state.handler_failed
+            || cancellation.is_some_and(pi_rs_core::CancellationToken::is_cancelled)
             || self
                 .lease
                 .scheduler_poison
@@ -1383,20 +1399,67 @@ impl AdmissionHandle<'_> {
         {
             return Err("stale or aborted test attempt".into());
         }
-        let key = format!("test/durable-async/{}/{attempt}/intent", current.task.id()).into_bytes();
+        let prefix = if test_namespace {
+            "test/durable-async"
+        } else {
+            "durable/replay-safe-async"
+        };
+        let key = format!("{prefix}/{}/{attempt}/intent", current.task.id()).into_bytes();
+        let mut checks = crate::ownership_edge::owner_chain_admission_checks(
+            owner.store(),
+            current.task.id(),
+            Uuid::nil(),
+        )
+        .map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let mut ancestor = current.task.clone();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(ancestor.id())
+                || ancestor.abort_requested()
+                || ancestor.is_terminal()
+                || ancestor.is_completing()
+                || ancestor.is_background()
+                || (ancestor.id() != current.task.id()
+                    && !ancestor.replay_safe()
+                    && !matches!(ancestor.state(), TaskState::Waiting(_)))
+            {
+                return Err("unsafe or unavailable owner".into());
+            }
+            match ancestor.owner() {
+                TaskOwner::Task(id) => {
+                    ancestor = tasks
+                        .load(*id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("missing owner")?
+                        .task
+                }
+                TaskOwner::Conversation(id) => {
+                    let conversation = format!("runtime/conversation/{id}").into_bytes();
+                    if owner
+                        .store()
+                        .get(&conversation)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                    {
+                        return Err("standalone execution cannot attach to a conversation".into());
+                    }
+                    checks.push(durable_store::Check {
+                        key: conversation,
+                        expected: durable_store::Expected::Missing,
+                    });
+                    break;
+                }
+            }
+        }
+        checks.push(durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
         owner
             .store()
             .commit(
-                &[
-                    durable_store::Check {
-                        key: task_store::key(current.task.id()),
-                        expected: durable_store::Expected::Version(current.version),
-                    },
-                    durable_store::Check {
-                        key: key.clone(),
-                        expected: durable_store::Expected::Missing,
-                    },
-                ],
+                &checks,
                 &[durable_store::Mutation::Put {
                     key: key.clone(),
                     value: serde_json::to_vec(&current.task).map_err(|e| e.to_string())?,
@@ -2185,7 +2248,7 @@ impl DetachedInvocation {
                         (Some(_), None, Some(_)) => {
                             Ok(Step::Fail("aborted before dispatch".into()))
                         }
-                        (None, None, None) => {
+                        (None, None, cancellation) => {
                             let admission = AdmissionHandle {
                                 running: &running,
                                 lease: &lease,
@@ -2194,7 +2257,13 @@ impl DetachedInvocation {
                                 activity: &activity,
                                 standalone: validator.is_none(),
                             };
-                            handler.run_with_admission(&running.task, &mut documents, &admission)
+                            if let Some(cancellation) = cancellation {
+                                handler.run_with_admission_and_cancellation(
+                                    &running.task, &mut documents, &admission, cancellation,
+                                )
+                            } else {
+                                handler.run_with_admission(&running.task, &mut documents, &admission)
+                            }
                         }
                         _ => Err("invalid unhooked executor state".into()),
                     }
@@ -2592,7 +2661,9 @@ impl Scheduler {
         abort: bool,
     ) -> Result<DetachedInvocation, Error> {
         let id = running.task.id();
-        let registered_capture = self.registered(&running.task)?.receipt_capture.clone();
+        let registration = self.registered(&running.task)?;
+        let cancellable_replay_safe = registration.cancellable_replay_safe;
+        let registered_capture = registration.receipt_capture.clone();
         let sealed_registration = registered_capture.is_some();
         let receipt_capture = if abort { None } else { registered_capture };
         let mut state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
@@ -2602,9 +2673,9 @@ impl Scheduler {
         let token = Uuid::new_v4();
         state.leases.insert(id, (token, running.task.attempt_id()));
         drop(state);
-        let unhooked_cancellation = receipt_capture
-            .as_ref()
-            .map(|_| pi_rs_core::CancellationToken::new());
+        let unhooked_cancellation = (!abort
+            && (receipt_capture.is_some() || cancellable_replay_safe))
+            .then(pi_rs_core::CancellationToken::new);
         Ok(DetachedInvocation {
             running,
             handler,
@@ -4070,6 +4141,60 @@ impl Scheduler {
         }));
         self.replace_registry(registry).map_err(|e| e.to_string())?;
         Ok((executor, identity))
+    }
+
+    pub(crate) fn install_replay_safe_async_handler(
+        &mut self,
+        kind: String,
+        version: u32,
+        handler: Arc<dyn Handler>,
+    ) -> Result<(), String> {
+        if self.validator.is_some() {
+            return Err("standalone scheduler required".into());
+        }
+        let mut registry = self.registry.clone();
+        if !registry.register_shared_versioned(kind.clone(), version, true, handler) {
+            return Err("task kind already registered or invalid".into());
+        }
+        registry
+            .entries
+            .get_mut(&kind)
+            .expect("registered")
+            .cancellable_replay_safe = true;
+        if !registry.set_abort(&kind, |_: &Task| Ok(Step::Succeed(Value::Null))) {
+            return Err("failed to install abort handler".into());
+        }
+        self.replace_registry(registry).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn submit_replay_safe_async_root(
+        &self,
+        tool: &Arc<crate::task_tool::TaskTool>,
+        input: Value,
+        restart_limit: u32,
+    ) -> Result<Uuid, String> {
+        if self.validator.is_some()
+            || !input.is_object()
+            || serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024
+            || restart_limit == 0
+        {
+            return Err("invalid standalone root input or restart limit".into());
+        }
+        let identity = tool.identity().ok_or("invalid root tool identity")?;
+        let registered = self
+            .registry
+            .entries
+            .get(&identity.kind)
+            .ok_or("root tool not registered")?;
+        if !registered.cancellable_replay_safe
+            || !self.registry.matches_task_tool(&identity, &tool.handler())
+        {
+            return Err("root is not this host's replay-safe durable tool".into());
+        }
+        let id = Uuid::new_v4();
+        let task = tool.task(Uuid::new_v4(), id, input, restart_limit)?;
+        self.submit(&task).map_err(|e| e.to_string())?;
+        Ok(id)
     }
 
     pub(crate) fn conversation_harness(&self) -> Option<crate::runtime::Harness> {

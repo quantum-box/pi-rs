@@ -2362,8 +2362,7 @@ impl DetachedTaskDocuments {
 }
 
 impl<'a> TaskDocuments<'a> {
-    #[cfg(test)]
-    pub(crate) fn test_stage_durable_result(
+    pub(crate) fn stage_replay_safe_durable_result(
         &mut self,
         intent_key: Vec<u8>,
         result: &impl serde::Serialize,

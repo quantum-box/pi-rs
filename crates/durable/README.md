@@ -635,6 +635,44 @@ the failure is included in the blocked reason; the still-pending child must be
 reconciled before parent settlement. A replay-safe parent retains its earlier
 behavior and may suspend after such a reply.
 
+The standalone no-hook task host also has an opt-in
+`register_replay_safe_durable_tool` path for `DurableAsyncTool`. The host must
+explicitly attest that argument preparation and every attempt are safe to
+replay; this is a trusted assertion, not something the runtime can verify.
+Provide a stable implementation identity and increase the version when the
+implementation or checkpoint interpretation changes. A digest of the identity,
+tool specification and allowed child definitions determines the task kind, so
+a missing or changed registration blocks older tasks. Register the same child
+definitions after reopening. Only replay-safe task-backed child adapters are
+accepted; their successful JSON result must encode a `pi_rs_core::Outcome`.
+Use `start_replay_safe_root` on the host before transferring it to the driver;
+the root adapter must belong to that host. Raw arguments must be JSON objects.
+Normalization runs before schema validation, and normalized arguments are
+committed with the park checkpoint and reused after wake or reopening. A crash
+before the first park commit can cause normalization to run again, so it too
+must satisfy the replay-safe attestation.
+
+An attempt may stage keyed direct children and return `Park` with an `All` or
+`Any` wait. Child admissions, checkpoint, wait and the attempt result commit
+together; the worker is released and the wake runs a new attempt with the
+checkpoint and frozen ended-child IDs. Attempt intents are recorded separately
+per task and attempt. A process loss before the park commit can rerun the pure
+attempt; staged children from that attempt were not committed. An abort fences
+settlement and requests cancellation through the Tool context. A tool that
+ignores cancellation or spawns detached work can delay shutdown or continue work;
+the host is responsible for ensuring replay safety and joining its own work.
+Tool results and the combined normalized-arguments/checkpoint record are each
+limited to 64 KiB, and waits to 256
+distinct direct children. A durable tool cannot itself complete with `Pending`
+or `Unknown`; those values returned by an allowed generic child are exposed as
+uncertain child results. Signal waits, UI, progress, extension state, unsafe
+Tool attempts and conversation hooks are not
+supported by this path. Completing a task-backed tool after an `Any` wake
+cancels its still-running task-backed children under pi-rs cleanup semantics;
+this differs from upstream's general task finishing behavior. A tool that wants
+all children to finish can park again before completing. The generic
+`register_durable_tool` entry remains disabled.
+
 Pending nested jobs are resolved by tool name and replay policy; their stored
 references are not bound to an implementation or tenant identity. On reopen,
 the host must restore the same nested tool configuration and tenant before
