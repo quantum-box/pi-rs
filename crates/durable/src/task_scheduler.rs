@@ -7593,6 +7593,40 @@ impl Scheduler {
                 }),
             });
         }
+        // An abort settlement is bound to the exact running task version.
+        // A conflict on that record cannot be fixed by retrying the same
+        // immutable snapshot, even if its graph is otherwise independent.
+        // Return the original outcome and lease for reconciliation instead.
+        if independent_abort
+            && !woken_abort
+            && let Some((running, InvocationResult::Abort(_))) = &backup
+            && !running.task.holds_interrupted_cleanup()
+            && matches!(&result,
+                Err(Error::Store(task_store::Error::Store(
+                    durable_store::Error::Conflict { key }
+                ))) if *key == task_store::key(running.task.id()))
+        {
+            let current = self.ts().load(running.task.id());
+            if !matches!(&current, Ok(Some(current)) if current.version == running.version) {
+                let error = match current {
+                    Err(error) => error.into(),
+                    _ => Error::Ownership,
+                };
+                let (running, result) = backup.take().expect("checked above");
+                drop(guard);
+                return Err(SettlementError::Rejected {
+                    error,
+                    completed: Box::new(CompletedInvocation {
+                        running,
+                        result,
+                        lease,
+                        receipt_capture,
+                        abort_definition,
+                        _identity_lease: None,
+                    }),
+                });
+            }
+        }
         // A checked store conflict is known not to have committed. Keep the
         // same invocation and lease, then re-read task, graph and evidence.
         if matches!(
