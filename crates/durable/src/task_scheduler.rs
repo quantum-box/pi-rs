@@ -138,6 +138,8 @@ struct ReceiptCapture {
     #[cfg(test)]
     before_intent: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
+    busy_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
     after_intent: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -1471,6 +1473,41 @@ impl DetachedInvocation {
         Ok(intent)
     }
 
+    fn release_undispatched(mut self) -> Result<CompletedInvocation, Error> {
+        let owner = &self.lease.attachment.owner;
+        {
+            let _failure = self
+                .lease
+                .failure_fence
+                .lock()
+                .map_err(|_| Error::Poisoned)?;
+            let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+            let tasks = task_store::TaskStore::new(owner.store());
+            let mut current = tasks
+                .load(self.running.task.id())?
+                .ok_or(Error::Ownership)?;
+            if current.task.state() != &TaskState::Running
+                || current.task.attempt_id() != self.running.task.attempt_id()
+                || current.task.attempt_id().is_none()
+            {
+                return Err(Error::Ownership);
+            }
+            current.task.yield_ready().map_err(Error::Transition)?;
+            let mut batch = tasks.prepare_save(&[task_store::Save::Update(&current)])?;
+            batch
+                .checks
+                .push(crate::async_task_protocol::undispatched_intent_check(
+                    current.task.id(),
+                ));
+            owner
+                .store()
+                .commit(&batch.checks, &batch.mutations)
+                .map_err(task_store::Error::from)?;
+            self.lease.retired = true;
+        }
+        Err(Error::Stopped)
+    }
+
     fn abort_precedes_unhooked_dispatch(&self) -> Result<bool, Error> {
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
@@ -1497,15 +1534,33 @@ impl DetachedInvocation {
             ));
         }
         let identity_lease = if let Some(capture) = &self.receipt_capture {
-            Some(
-                crate::nested_identity::checked_lease(
+            loop {
+                match crate::nested_identity::checked_lease(
                     capture.executor.tool(),
                     &capture.implementation,
-                )
-                .map_err(|_| {
-                    Error::Handler("unhooked tool identity unavailable or changed".into())
-                })?,
-            )
+                ) {
+                    Ok(lease) => break Some(lease),
+                    Err(crate::nested_identity::LeaseFailure::Mismatch) => {
+                        return Err(Error::Handler(
+                            "unhooked tool identity unavailable or changed".into(),
+                        ));
+                    }
+                    Err(crate::nested_identity::LeaseFailure::Busy) => {
+                        #[cfg(test)]
+                        if let Some(hook) = &capture.busy_hook {
+                            hook();
+                        }
+                        if self
+                            .unhooked_cancellation
+                            .as_ref()
+                            .is_some_and(|token| token.is_cancelled())
+                        {
+                            return self.release_undispatched();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
         } else {
             None
         };
@@ -1521,6 +1576,14 @@ impl DetachedInvocation {
                 capture.version,
             ) {
                 Ok(intent) => Some(intent),
+                Err(crate::async_task_protocol::Error::Invalid)
+                    if self
+                        .unhooked_cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled()) =>
+                {
+                    return self.release_undispatched();
+                }
                 Err(crate::async_task_protocol::Error::Invalid)
                     if self.abort_precedes_unhooked_dispatch()? =>
                 {
@@ -3341,6 +3404,24 @@ impl Scheduler {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_sealed_busy_test_hook(
+        &mut self,
+        kind: &str,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        let Some(capture) = self
+            .registry
+            .entries
+            .get_mut(kind)
+            .and_then(|entry| entry.receipt_capture.as_mut())
+        else {
+            return false;
+        };
+        Arc::make_mut(capture).busy_hook = Some(hook);
+        true
+    }
+
     /// Install only a sealed Tool executor on a standalone scheduler. No
     /// arbitrary Handler can be supplied on this path. Child admission remains
     /// unavailable until its identity can be staged with the parent transition.
@@ -3393,6 +3474,8 @@ impl Scheduler {
             version,
             #[cfg(test)]
             before_intent: None,
+            #[cfg(test)]
+            busy_hook: None,
             #[cfg(test)]
             after_intent: None,
         }));

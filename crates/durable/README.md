@@ -499,6 +499,12 @@ dispatch. The identity is a host assertion, not a cryptographic measurement.
 The driver invokes the registered Tool itself; arbitrary handlers cannot stand in
 for it. The standalone leaf host rejects nested calls, progress and UI requests.
 
+While an identity update holds the identity lease, a reserved worker waits and
+rechecks it; a changed identity is rejected. A busy identity occupies a worker
+slot, so enough simultaneous updates can delay unrelated work. Cancellation
+before an intent is committed releases the attempt back to Ready using an
+atomic missing-intent check; after restart it can be reserved again.
+
 A durable intent committed under the task gate is logical dispatch start. A prior
 abort rejects dispatch; a later abort requests cancellation and the driver joins
 the Tool future. A Tool can ignore cancellation and block shutdown indefinitely.

@@ -644,6 +644,11 @@ impl Driver {
         self.shared.cleanup_stop.cancel();
         self.stop_worker();
     }
+    #[cfg(test)]
+    pub(crate) fn stop_worker_for_test(&self) {
+        self.stop_worker();
+    }
+
     fn stop_worker(&self) {
         self.shared
             .reservation_stop
@@ -861,6 +866,7 @@ fn fail_cleanup(shared: &Shared, error: String) {
 }
 
 enum WorkerEvent {
+    Released,
     Completed(Box<task_scheduler::CompletedInvocation>),
     Failed(String),
 }
@@ -899,6 +905,7 @@ impl Drop for WorkerPool {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(task_scheduler::PendingSettlement::Unprepared(*completed)),
+                WorkerEvent::Released => (),
                 WorkerEvent::Failed(_) => failed = true,
             }
         }
@@ -1045,6 +1052,7 @@ impl Shared {
                                 WorkerEvent::Failed(message)
                             }
                         },
+                        Ok(Err(task_scheduler::Error::Stopped)) => WorkerEvent::Released,
                         Ok(Err(error)) => WorkerEvent::Failed(error.to_string()),
                         Err(payload) => {
                             crate::extension::discard_panic_payload(payload);
@@ -1103,6 +1111,7 @@ impl Shared {
                             self.stop_for_failure(error);
                         }
                     }
+                    WorkerEvent::Released => (),
                     WorkerEvent::Failed(error) => self.stop_for_failure(error),
                 }
                 self.notify_work();
