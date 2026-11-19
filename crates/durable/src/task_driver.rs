@@ -1857,6 +1857,163 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn panic_after_admission_stops_driver_and_recovers_owned_child() {
+        use crate::task_scheduler::{AdmissionHandle, Handler, Step};
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+        struct Parent {
+            child: Arc<crate::task_tool::TaskTool>,
+            admitted: mpsc::Sender<Uuid>,
+            panic_now: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_admission(
+                &self,
+                _: &Task,
+                _: &mut crate::document::TaskDocuments<'_>,
+                admission: &AdmissionHandle<'_>,
+            ) -> Result<Step, String> {
+                let id = admission
+                    .admit_task_tool_child(&self.child, "child", json!({}))
+                    .unwrap();
+                self.admitted.send(id).unwrap();
+                self.panic_now.lock().unwrap().recv().unwrap();
+                panic!("parent failed after admission")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let effects = Arc::new(AtomicUsize::new(0));
+        let (child_entered_tx, child_entered_rx) = mpsc::channel();
+        let (child_release_tx, child_release_rx) = mpsc::channel();
+        let child_release_rx = Mutex::new(child_release_rx);
+        let recorded = effects.clone();
+        let child_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            child_entered_tx.send(()).unwrap();
+            child_release_rx.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(json!("external work returned")))
+        });
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            pi_rs_core::ToolSpec {
+                name: "child".into(),
+                description: "".into(),
+                parameters: json!({"type":"object"}),
+            },
+            "child",
+            false,
+            1,
+            child_handler.clone(),
+        ));
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (panic_tx, panic_rx) = mpsc::channel();
+        let parent_handler: Arc<dyn Handler> = Arc::new(Parent {
+            child,
+            admitted: admitted_tx,
+            panic_now: Mutex::new(panic_rx),
+        });
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_shared("parent", false, parent_handler);
+        registry.register_shared("child", false, child_handler);
+        let scheduler = task_scheduler::Scheduler::open(&path, registry).unwrap();
+        // Recovery scans task keys in order. Keep the unsafe child before its
+        // parent to exercise interruption before the parent's cleanup cascade.
+        let parent_id = Uuid::from_u128(u128::MAX);
+        let conversation = Uuid::new_v4();
+        let parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false)
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let owner = scheduler.owner();
+        let driver = Driver::start(scheduler);
+        let child_id = admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        child_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        panic_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.shared.state.lock().unwrap().stop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "driver did not stop after panic"
+            );
+            thread::yield_now();
+        }
+        let tasks = TaskStore::new(owner.store());
+        let parent = tasks.load(parent_id).unwrap().unwrap().task;
+        let child = tasks.load(child_id).unwrap().unwrap().task;
+        assert_eq!(parent.state(), &crate::task::TaskState::Running);
+        assert_eq!(child.state(), &crate::task::TaskState::Running);
+        assert!(!child.abort_requested());
+        let publication = driver.shared.failure_publication.admission().unwrap();
+        assert!(!publication.permits_admission(&owner, conversation, Some(&child)));
+        drop(publication);
+        child_release_tx.send(()).unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_some());
+        assert_eq!(report.pending().len(), 1);
+        assert_eq!(report.pending()[0].task_id(), child_id);
+        assert!(report.pending()[0].completed().is_some());
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(child_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &crate::task::TaskState::Running
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        drop(report);
+        drop(owner);
+        let child_replays = effects.clone();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("parent", false, |_: &Task| -> Result<Step, String> {
+            panic!("unsafe parent replayed")
+        });
+        registry.register("child", false, move |_: &Task| {
+            child_replays.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(json!("unexpected replay")))
+        });
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let abort_count = aborts.clone();
+        assert!(registry.set_abort("child", move |_: &Task| {
+            abort_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(json!(null)))
+        }));
+        let mut recovered = task_scheduler::Scheduler::open(&path, registry).unwrap();
+        for _ in 0..20 {
+            if recovered.get(parent_id).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            recovered.tick(0).unwrap();
+        }
+        assert!(
+            matches!(recovered.get(parent_id).unwrap().unwrap().state(), crate::task::TaskState::Failed(reason) if reason.contains("requires reconciliation"))
+        );
+        assert!(
+            matches!(recovered.get(child_id).unwrap().unwrap().state(), crate::task::TaskState::Failed(reason) if reason.contains("requires reconciliation"))
+        );
+        assert_eq!(aborts.load(Ordering::SeqCst), 0);
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn driver_passes_live_admission_to_handler_and_fences_abort() {
         use crate::task_scheduler::{AdmissionHandle, Handler, Step};
         use std::time::Duration;

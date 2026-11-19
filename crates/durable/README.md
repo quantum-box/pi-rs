@@ -1902,9 +1902,9 @@ Four simultaneously blocked TaskTool parents can occupy all ordinary workers
 and leave a TaskTool child waiting. Arbitrary-depth or multi-child progress
 requires a future park connection that releases the waiting parent's worker.
 
-New TaskTool tasks persist their adapter type. When a TaskTool succeeds, fails,
-returns a handler error, or is interrupted, it holds its outcome and atomically
-marks all live direct nested TaskTool children and their foreground descendants
+New TaskTool tasks persist their adapter type. When a TaskTool settles with a
+success, failure or handler error, it holds its outcome and atomically marks
+live direct nested TaskTool children and their foreground descendants
 for abort. The parent waits for owned foreground work to finish before its
 outcome becomes terminal. Abort handlers must be registered and perform their
 own external cleanup; an abort handler's `Step::Fail`, `Err`, unwinding panic,
@@ -1916,6 +1916,13 @@ children are not marked by normal TaskTool settlement, even if they share a
 handler kind, and generic task success still waits for its children naturally.
 An explicit parent abort retains its broader ownership semantics. Handler errors
 and `Step::Fail` discard children staged in that same uncommitted invocation.
+An unwinding handler panic after immediate admission stops the driver; it does
+not itself durably abort a child that is already running. A completed child
+outcome can remain in `shutdown_with_pending` for reconciliation. Dropping that
+pending outcome and reopening can instead classify an interrupted unsafe child
+as failed before the parent cleanup reaches it, without running its abort handler.
+External effects already started are not rolled back or confirmed cancelled;
+the host must retain or reconcile uncertain outcomes and external work.
 Records written before the adapter type was added lack it and retain generic
 semantics; existing keyed children cannot be silently upgraded. Drain or
 reconcile such work before upgrading. A commit recorded by the new runtime must
