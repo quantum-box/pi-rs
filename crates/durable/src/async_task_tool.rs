@@ -11023,6 +11023,70 @@ mod tests {
         }
     }
     #[test]
+    fn interrupted_after_late_receipt_between_evidence_reads_retries() {
+        for final_receipt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (_, child) = interrupted_kill_tool(root);
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let mut scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+            let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let marker = injected.clone();
+            scheduler.set_interrupted_receipt_read_hook(Arc::new(move |_, store| {
+                if marker.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let intent = crate::async_task_protocol::load_intent(store, child).unwrap();
+                let outcome = Outcome::Succeeded("between reads".into());
+                let batch = if final_receipt {
+                    crate::async_task_protocol::prepare_receipt(store, &intent, &outcome)
+                } else {
+                    crate::async_task_protocol::prepare_raw_result(store, &intent, &outcome)
+                }
+                .unwrap();
+                store.commit(&batch.checks, &batch.mutations).unwrap();
+            }));
+            let driver = crate::task_driver::Driver::start(scheduler);
+            assert!(matches!(
+                wait_terminal(&driver, child).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            let _ = driver.shutdown_with_pending().unwrap();
+            assert!(injected.load(std::sync::atomic::Ordering::SeqCst));
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            let evidence = read_sealed_outcome_evidence(&store, child).unwrap();
+            if final_receipt {
+                assert!(
+                    matches!(evidence, Some(SealedOutcomeEvidence::Final(Outcome::Succeeded(ref s))) if s == "between reads")
+                );
+            } else {
+                assert!(
+                    matches!(evidence, Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Succeeded(ref s))) if s == "between reads")
+                );
+            }
+            assert!(
+                read_interrupted_after_result(&store, child)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("unsafe-invocations"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
     fn interrupted_after_blocking_settlement_retains_conflicted_invocation() {
         for receipt_race in [false, true] {
             let dir = tempfile::tempdir().unwrap();

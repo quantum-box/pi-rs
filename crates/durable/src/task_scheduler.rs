@@ -558,6 +558,8 @@ pub enum Error {
     Handler(String),
     #[error("a task scheduler is already attached to this owner")]
     AlreadyAttached,
+    #[error("interrupted cleanup evidence changed before settlement")]
+    InterruptedEvidenceChanged,
     #[error("scheduler has active detached invocations")]
     Busy,
     #[error("scheduler is no longer accepting reservations")]
@@ -3721,6 +3723,8 @@ pub struct Scheduler {
     #[cfg(test)]
     reservation_commit_hook: Option<CommitHook>,
     #[cfg(test)]
+    interrupted_receipt_read_hook: Option<CommitHook>,
+    #[cfg(test)]
     after_result_load_hook: Option<CommitHook>,
     #[cfg(test)]
     preparation_conflict_hook: Option<CommitHook>,
@@ -4069,13 +4073,26 @@ impl Scheduler {
                                     .map_err(task_store::Error::from)?;
                                 match (outcome, entry) {
                                     (None, Some(entry)) => {
-                                        let (_, checks) = interrupted_receipt_evidence(
+                                        #[cfg(test)]
+                                        if let Some(hook) = &self.interrupted_receipt_read_hook {
+                                            hook(0, self.ts().store());
+                                        }
+                                        let (_, checks) = match interrupted_receipt_evidence(
                                             self.ts().store(),
                                             &current.task,
                                             identity,
                                             &entry,
-                                        )
-                                        .map_err(Error::Handler)?;
+                                        ) {
+                                            Ok(evidence) => evidence,
+                                            Err(error) => {
+                                                if crate::async_task_protocol::known_interrupted_evidence(
+                                                    self.ts().store(), &current.task, identity,
+                                                ).map_err(|e| Error::Handler(e.to_string()))?.is_some() {
+                                                    return Err(Error::InterruptedEvidenceChanged);
+                                                }
+                                                return Err(Error::Handler(error));
+                                            }
+                                        };
                                         batch.checks.extend(checks);
                                     }
                                     (None, None) => return Err(Error::Ownership),
@@ -4339,9 +4356,10 @@ impl Scheduler {
         // same invocation and lease, then re-read task, graph and evidence.
         if matches!(
             &result,
-            Err(Error::Store(task_store::Error::Store(
-                durable_store::Error::Conflict { .. }
-            )))
+            Err(Error::InterruptedEvidenceChanged
+                | Error::Store(task_store::Error::Store(
+                    durable_store::Error::Conflict { .. }
+                )))
         ) && backup
             .as_ref()
             .is_some_and(|(running, _)| running.task.holds_interrupted_cleanup())
@@ -5267,6 +5285,11 @@ impl Scheduler {
         self.reservation_commit_hook = Some(hook);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_interrupted_receipt_read_hook(&mut self, hook: CommitHook) {
+        self.interrupted_receipt_read_hook = Some(hook);
+    }
+
     pub(crate) fn reservation_stop_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.reservation_stop.clone()
     }
@@ -5678,6 +5701,8 @@ impl Scheduler {
             after_order_hook: None,
             #[cfg(test)]
             reservation_commit_hook: None,
+            #[cfg(test)]
+            interrupted_receipt_read_hook: None,
             #[cfg(test)]
             after_result_load_hook: None,
             #[cfg(test)]
