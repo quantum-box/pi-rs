@@ -971,6 +971,94 @@ mod tests {
         let _ = driver.shutdown_with_pending().unwrap();
     }
 
+    struct KillBeforeHook(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for KillBeforeHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            ctx.memo
+                .get_or_insert("kill-marker", json!("saved"))
+                .await?;
+            std::fs::write(self.0.join("hook-ready"), b"ready").map_err(|e| e.to_string())?;
+            std::future::pending().await
+        }
+    }
+    #[test]
+    fn driver_kill_during_before_reopens_without_dispatch() {
+        const ENV: &str = "PI_RS_TASK_BEFORE_KILL_1119";
+        if let Ok(path) = std::env::var(ENV) {
+            let path = std::path::PathBuf::from(path);
+            let (sent, _received) = std::sync::mpsc::channel();
+            let tool: Arc<dyn Tool> = Arc::new(BeforeToolFixture(sent));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = before_fixture_host(
+                &path.join("db"),
+                tool,
+                Arc::new(KillBeforeHook(path.clone())),
+                "kill-v1",
+            )
+            .into_scheduler_for_test();
+            let parent = before_parent();
+            scheduler.submit(&parent).unwrap();
+            std::fs::write(path.join("parent"), parent.id().to_string()).unwrap();
+            let _driver = crate::task_driver::Driver::start(scheduler);
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::driver_kill_during_before_reopens_without_dispatch")
+            .env(ENV, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("hook-ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("before hook did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let parent: Uuid = std::fs::read_to_string(dir.path().join("parent"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(BeforeToolFixture(sent));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = before_fixture_host(
+            &dir.path().join("db"),
+            tool,
+            Arc::new(KillBeforeHook(dir.path().to_owned())),
+            "kill-v1",
+        )
+        .into_driver();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match driver.get(parent) {
+                Ok(Some(task)) if task.is_terminal() => break,
+                Err(_) => break,
+                _ => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "reopened task did not fail closed"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(received.try_recv().is_err());
+        let _ = driver.shutdown_with_pending();
+    }
+
     #[test]
     fn selected_extensions_execute_in_driver_and_bind_order_to_identity() {
         let dir = tempfile::tempdir().unwrap();
