@@ -510,7 +510,14 @@ impl StandaloneNoHooksHost {
         children: Vec<Arc<crate::task_tool::TaskTool>>,
         _authorization: UnsafeDurableAuthorization,
     ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
-        replay_safe::register_unsafe(&mut self.scheduler, tool, implementation, version, children)
+        replay_safe::register_unsafe(
+            &mut self.scheduler,
+            tool,
+            implementation,
+            version,
+            children,
+            None,
+        )
     }
 
     /// Admit an unsafe root belonging to this standalone host.
@@ -871,6 +878,30 @@ impl StandaloneBeforeHookHost {
             true,
         )
     }
+    /// Register an unsafe checkpointable tool with replay-safe hooks and argument preparation.
+    /// A committed park may resume; interruption during tool execution requires reconciliation.
+    /// Parked external-job cancellation is not yet supported by `DurableAsyncTool`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_unsafe_durable_tool_with_hook(
+        &mut self,
+        tool: Arc<dyn DurableAsyncTool>,
+        implementation: &str,
+        version: u32,
+        children: Vec<Arc<crate::task_tool::TaskTool>>,
+        hook_identity: &str,
+        hook: Arc<dyn crate::extension::Hook>,
+        _unsafe_authorization: UnsafeDurableAuthorization,
+        _hook_authorization: ReplaySafeAuthorization,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        replay_safe::register_unsafe(
+            &mut self.scheduler,
+            tool,
+            implementation,
+            version,
+            children,
+            Some((hook_identity.into(), hook)),
+        )
+    }
     pub fn start_replay_safe_root(
         &self,
         tool: &Arc<crate::task_tool::TaskTool>,
@@ -879,6 +910,15 @@ impl StandaloneBeforeHookHost {
     ) -> Result<uuid::Uuid, String> {
         self.scheduler
             .submit_checkpointable_async_root(tool, input, restart_limit, true)
+    }
+    pub fn start_unsafe_durable_root(
+        &self,
+        tool: &Arc<crate::task_tool::TaskTool>,
+        input: serde_json::Value,
+        restart_limit: u32,
+    ) -> Result<uuid::Uuid, String> {
+        self.scheduler
+            .submit_checkpointable_async_root(tool, input, restart_limit, false)
     }
     pub fn into_driver(self) -> crate::task_driver::Driver {
         crate::task_driver::Driver::start(self.scheduler)
@@ -3240,7 +3280,86 @@ mod tests {
         let (entered, receiver) = std::sync::mpsc::channel();
         let barrier = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let worker_barrier = barrier.clone();
-        replay_safe::after_unsafe_park_evidence(id, move || {
+        replay_safe::after_unsafe_evidence(id, move || {
+            entered.send(()).unwrap();
+            let (lock, wake) = &*worker_barrier;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        });
+        let driver = host.into_driver();
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        driver.request_abort(id).unwrap();
+        let (lock, wake) = &*barrier;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        wait_state(&driver, id, |s| {
+            matches!(s, crate::task::TaskState::Cancelled)
+        });
+        driver.shutdown().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let evidence = read_unsafe_durable_park_evidence(&store, id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].checkpoint["remote_job"], "external-park-42");
+        assert!(matches!(&evidence[0].wait, DurableWait::All(children) if children.len() == 1));
+        assert!(
+            store
+                .get(format!("durable/unsafe-park-async/{id}/park").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !crate::task_store::TaskStore::new(&store)
+                .list()
+                .unwrap()
+                .iter()
+                .any(|task| task.task.owner() == &TaskOwner::Task(id))
+        );
+        assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
+    }
+    #[test]
+    fn unsafe_hook_park_proposal_survives_abort_before_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let child_handler: Arc<dyn crate::task_scheduler::Handler> = Arc::new(ChainLeaf);
+        let mut registry = Registry::default();
+        assert!(registry.register_shared("proposal-child", true, child_handler.clone()));
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "proposal-child".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "proposal-child",
+            true,
+            1,
+            child_handler,
+        ));
+        let mut host = StandaloneBeforeHookHost::open(&path, registry).unwrap();
+        let tool = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(ParkEvidenceTool),
+                "park-evidence-v1",
+                1,
+                vec![child],
+                "hook-v1",
+                Arc::new(HookRace {
+                    phase: "unused",
+                    fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    change_parent: Arc::new(std::sync::OnceLock::new()),
+                }),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_unsafe_durable_root(&tool, json!({}), 3).unwrap();
+        let (entered, receiver) = std::sync::mpsc::channel();
+        let barrier = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_barrier = barrier.clone();
+        replay_safe::after_unsafe_evidence(id, move || {
             entered.send(()).unwrap();
             let (lock, wake) = &*worker_barrier;
             let mut released = lock.lock().unwrap();
@@ -3618,7 +3737,12 @@ mod tests {
     fn hooked_child_defers_memo_races_with_running_unsafe_parent() {
         use crate::task_scheduler::{Step, TickReservation};
         use crate::task_store::{Save, TaskStore};
-        for phase in ["before", "after"] {
+        for (phase, safe) in [
+            ("before", true),
+            ("after", true),
+            ("before", false),
+            ("after", false),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let mut registry = Registry::default();
             assert!(
@@ -3631,21 +3755,36 @@ mod tests {
             let change_parent: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>> =
                 Arc::new(std::sync::OnceLock::new());
             let calls = Arc::new(AtomicUsize::new(0));
-            let child_tool = host
-                .register_replay_safe_durable_tool_with_hook(
-                    Arc::new(HookRaceTool(calls.clone())),
+            let tool: Arc<dyn DurableAsyncTool> = Arc::new(HookRaceTool(calls.clone()));
+            let hook: Arc<dyn crate::extension::Hook> = Arc::new(HookRace {
+                phase,
+                fired: fired.clone(),
+                change_parent: change_parent.clone(),
+            });
+            let child_tool = if safe {
+                host.register_replay_safe_durable_tool_with_hook(
+                    tool,
                     "hook-race-v1",
                     1,
                     vec![],
                     "hook-v1",
-                    Arc::new(HookRace {
-                        phase,
-                        fired: fired.clone(),
-                        change_parent: change_parent.clone(),
-                    }),
+                    hook,
                     ReplaySafeAuthorization::host_attests_replay_safe(),
                 )
-                .unwrap();
+                .unwrap()
+            } else {
+                host.register_unsafe_durable_tool_with_hook(
+                    tool,
+                    "hook-race-v1",
+                    1,
+                    vec![],
+                    "hook-v1",
+                    hook,
+                    UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap()
+            };
             let mut scheduler = host.into_scheduler_for_test();
             let owner = scheduler.owner();
             let parent = Task::new(
@@ -3894,6 +4033,255 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn unsafe_hook_raw_receipt_survives_abort_before_after_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tool = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(HookRaceTool(calls.clone())),
+                "unsafe-raw-before-after",
+                1,
+                vec![],
+                "hook-v1",
+                Arc::new(HookRace {
+                    phase: "unused",
+                    fired,
+                    change_parent: Arc::new(std::sync::OnceLock::new()),
+                }),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_unsafe_durable_root(&tool, json!({}), 5).unwrap();
+        let (entered, receiver) = std::sync::mpsc::channel();
+        let barrier = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_barrier = barrier.clone();
+        replay_safe::after_unsafe_evidence(id, move || {
+            entered.send(()).unwrap();
+            let (lock, wake) = &*worker_barrier;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        });
+        let driver = host.into_driver();
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        driver.request_abort(id).unwrap();
+        let (lock, wake) = &*barrier;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        wait_state(&driver, id, |s| {
+            matches!(s, crate::task::TaskState::Cancelled)
+        });
+        driver.shutdown().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let receipts = read_unsafe_durable_receipts(&store, id).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let prefix = format!("durable/unsafe-park-async/{id}/");
+        let evidence = store.list(prefix.as_bytes()).unwrap();
+        assert!(
+            !evidence
+                .iter()
+                .any(|(key, _)| key.ends_with(b"/result") || key.ends_with(b"/hook-final"))
+        );
+    }
+    #[test]
+    fn unsafe_hook_kill_after_receipt_before_checkpoint_requires_reconciliation() {
+        fn open(
+            path: &std::path::Path,
+            calls: Arc<AtomicUsize>,
+        ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+            let mut host = StandaloneBeforeHookHost::open(path, Registry::default()).unwrap();
+            let tool = host
+                .register_unsafe_durable_tool_with_hook(
+                    Arc::new(HookRaceTool(calls)),
+                    "unsafe-raw-kill",
+                    1,
+                    vec![],
+                    "hook-v1",
+                    Arc::new(HookRace {
+                        phase: "unused",
+                        fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        change_parent: Arc::new(std::sync::OnceLock::new()),
+                    }),
+                    UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            (host, tool)
+        }
+        if let Some(dir) = std::env::var_os("PI_UNSAFE_HOOK_RAW_KILL") {
+            let dir = std::path::PathBuf::from(dir);
+            let (host, tool) = open(&dir.join("db"), Arc::new(AtomicUsize::new(0)));
+            let id = host.start_unsafe_durable_root(&tool, json!({}), 5).unwrap();
+            replay_safe::after_unsafe_evidence(id, move || {
+                std::fs::write(dir.join("raw.tmp"), id.to_string()).unwrap();
+                std::fs::rename(dir.join("raw.tmp"), dir.join("raw-ready")).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            });
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "async_task_tool::tests::unsafe_hook_kill_after_receipt_before_checkpoint_requires_reconciliation"])
+            .env("PI_UNSAFE_HOOK_RAW_KILL",dir.path()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !dir.path().join("raw-ready").exists() {
+            if std::time::Instant::now() >= deadline || process.try_wait().unwrap().is_some() {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("raw receipt boundary not reached");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let id: Uuid = std::fs::read_to_string(dir.path().join("raw-ready"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (host, _) = open(&dir.path().join("db"), calls.clone());
+        let driver = host.into_driver();
+        let failed = wait_state(&driver, id, |s| {
+            matches!(s, crate::task::TaskState::Failed(_))
+        });
+        assert!(
+            matches!(failed.state(), crate::task::TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        driver.shutdown().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let receipts = read_unsafe_durable_receipts(&store, id).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].outcome, Outcome::Succeeded("done".into()));
+        let evidence = store
+            .list(format!("durable/unsafe-park-async/{id}/").as_bytes())
+            .unwrap();
+        assert!(
+            !evidence
+                .iter()
+                .any(|(key, _)| key.ends_with(b"/result") || key.ends_with(b"/hook-final"))
+        );
+    }
+    #[test]
+    fn unsafe_after_hook_settlement_conflict_retries_without_tool_dispatch() {
+        use crate::task_scheduler::TickReservation;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(HookRaceTool(calls.clone())),
+                "unsafe-after-conflict",
+                1,
+                vec![],
+                "hook-v1",
+                Arc::new(HookRace {
+                    phase: "unused",
+                    fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    change_parent: Arc::new(std::sync::OnceLock::new()),
+                }),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_unsafe_durable_root(&tool, json!({}), 5).unwrap();
+        let mut scheduler = host.into_scheduler_for_test();
+        while scheduler.get(id).unwrap().unwrap().checkpoint().phase != "replay-safe-async-after" {
+            assert!(scheduler.tick(0).unwrap());
+        }
+        let TickReservation::Invocation(job) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("after hook not reserved")
+        };
+        let completed = job.execute().unwrap();
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let once = changed.clone();
+        scheduler.set_result_commit_hook(Arc::new(move |_, store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                store
+                    .commit(
+                        &[],
+                        &[durable_store::Mutation::Put {
+                            key: format!("durable/unsafe-park-async/{id}/unrelated").into_bytes(),
+                            value: b"race".to_vec(),
+                        }],
+                    )
+                    .unwrap();
+            }
+        }));
+        scheduler.settle_invocation(completed).unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        assert!(matches!(
+            scheduler.get(id).unwrap().unwrap().state(),
+            crate::task::TaskState::Ready
+        ));
+        assert!(scheduler.tick(0).unwrap());
+        assert!(matches!(
+            scheduler.get(id).unwrap().unwrap().state(),
+            crate::task::TaskState::Succeeded(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn unsafe_hook_block_fails_closed_before_dispatch() {
+        struct Block;
+        #[async_trait::async_trait]
+        impl crate::extension::Hook for Block {
+            async fn before_tool(
+                &self,
+                _: &crate::extension::ToolCall,
+                _: &crate::extension::Context<'_>,
+            ) -> Result<crate::extension::BeforeTool, String> {
+                Ok(crate::extension::BeforeTool::Block("denied".into()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(HookRaceTool(calls.clone())),
+                "unsafe-block",
+                1,
+                vec![],
+                "hook-v1",
+                Arc::new(Block),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_unsafe_durable_root(&tool, json!({}), 5).unwrap();
+        let driver = host.into_driver();
+        wait_state(&driver, id, |s| {
+            matches!(s, crate::task::TaskState::Failed(_))
+        });
+        driver.shutdown().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
+        assert!(
+            store
+                .list(format!("durable/unsafe-park-async/{id}/").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+    }
     struct DurableHooks {
         before: Arc<AtomicUsize>,
         after: Arc<AtomicUsize>,
@@ -8674,6 +9062,7 @@ mod tests {
             "interrupted-unsafe-child-v1",
             1,
             vec![],
+            None,
         )
         .unwrap();
         let fast = host

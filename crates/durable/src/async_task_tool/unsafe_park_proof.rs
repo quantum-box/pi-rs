@@ -257,7 +257,10 @@ pub(crate) fn prepare_park(
 pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, String> {
     let park_key = key(task.id());
     let park_entry = store.get(&park_key).map_err(|e| e.to_string())?;
-    if task.checkpoint().phase == "initial" {
+    if matches!(
+        task.checkpoint().phase.as_str(),
+        "initial" | "replay-safe-async-prepared"
+    ) {
         if park_entry.is_some() {
             return Err("unexpected unsafe park proof".into());
         }
@@ -344,4 +347,187 @@ pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, 
             expected: Expected::Version(result.version),
         },
     ])
+}
+
+/// Bind a replayable after phase to the exact committed unsafe Complete and its joined receipt.
+pub(crate) fn after_checks(store: &Store, task: &Task) -> Result<Vec<Check>, String> {
+    if task.replay_safe() || task.checkpoint().phase != "replay-safe-async-after" {
+        return Err("invalid unsafe after phase".into());
+    }
+    let checkpoint = &task.checkpoint().data;
+    if checkpoint
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || !checkpoint
+            .get("arguments")
+            .is_some_and(serde_json::Value::is_object)
+        || !checkpoint
+            .get("host_error")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err("invalid unsafe after checkpoint".into());
+    }
+    let outcome: pi_rs_core::Outcome = serde_json::from_value(
+        checkpoint
+            .get("outcome")
+            .cloned()
+            .ok_or("missing unsafe after outcome")?,
+    )
+    .map_err(|_| "invalid unsafe after outcome")?;
+    if matches!(
+        outcome,
+        pi_rs_core::Outcome::Pending { .. } | pi_rs_core::Outcome::Unknown(_)
+    ) {
+        return Err("uncertain outcome cannot run after hook".into());
+    }
+    let boundary = store.put_version().map_err(|e| e.to_string())?;
+    if !task.is_terminal()
+        && store
+            .get(&hook_final_key(task.id()))
+            .map_err(|e| e.to_string())?
+            .is_some()
+    {
+        return Err("unsafe hook final exists before terminal settlement".into());
+    }
+    let receipts = read_receipts(store, task.id())?;
+    if receipts.len() != 1 || receipts[0].outcome != outcome {
+        return Err("unsafe after receipt mismatch".into());
+    }
+    let intent_key = intent_key(task.id(), receipts[0].attempt_id);
+    let intent = store
+        .get(&intent_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing unsafe after intent")?;
+    let original: Task =
+        serde_json::from_slice(&intent.value).map_err(|_| "invalid unsafe after intent")?;
+    if original.owner() != task.owner()
+        || original.kind() != task.kind()
+        || original.input() != task.input()
+        || original.definition_version() != task.definition_version()
+        || !matches!(
+            original.checkpoint().phase.as_str(),
+            "replay-safe-async-prepared" | "replay-safe-async-wait"
+        )
+        || original.checkpoint().data.get("arguments") != checkpoint.get("arguments")
+    {
+        return Err("unsafe after identity changed".into());
+    }
+    let mut receipt_key = intent_key.clone();
+    receipt_key.extend_from_slice(b"/receipt");
+    let receipt = store
+        .get(&receipt_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing unsafe after receipt")?;
+    let mut result_key = intent_key.clone();
+    result_key.extend_from_slice(b"/result");
+    let result = store
+        .get(&result_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("unsafe after result not committed")?;
+    let step: DurableToolStep =
+        serde_json::from_slice(&result.value).map_err(|_| "invalid unsafe after result")?;
+    if !matches!(step, DurableToolStep::Complete(ref value) if *value == outcome) {
+        return Err("unsafe after result mismatch".into());
+    }
+    Ok(vec![
+        Check {
+            key: format!("durable/unsafe-park-async/{}/", task.id()).into_bytes(),
+            expected: Expected::PrefixUnchangedSince(boundary),
+        },
+        Check {
+            key: intent_key,
+            expected: Expected::Version(intent.version),
+        },
+        Check {
+            key: receipt_key,
+            expected: Expected::Version(receipt.version),
+        },
+        Check {
+            key: result_key,
+            expected: Expected::Version(result.version),
+        },
+    ])
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookFinal {
+    version: u32,
+    task: Uuid,
+    raw_attempt: Uuid,
+    raw: pi_rs_core::Outcome,
+    final_outcome: pi_rs_core::Outcome,
+}
+fn hook_final_key(task: Uuid) -> Vec<u8> {
+    format!("durable/unsafe-park-async/{task}/hook-final").into_bytes()
+}
+
+pub(crate) fn prepare_hook_phase(
+    store: &Store,
+    task: &Task,
+    step: &crate::task_scheduler::Step,
+) -> Result<(Vec<Check>, Vec<Mutation>), String> {
+    let attempt = task.attempt_id().ok_or("missing hook attempt")?;
+    let mut checks = vec![Check {
+        key: intent_key(task.id(), attempt),
+        expected: Expected::Missing,
+    }];
+    let mut mutations = Vec::new();
+    match (task.checkpoint().phase.as_str(), step) {
+        ("initial", crate::task_scheduler::Step::Continue(next))
+            if next.phase == "replay-safe-async-prepared" => {}
+        ("replay-safe-async-after", crate::task_scheduler::Step::Succeed(value)) => {
+            checks.extend(after_checks(store, task)?);
+            let receipt = read_receipts(store, task.id())?
+                .into_iter()
+                .next()
+                .ok_or("missing unsafe receipt")?;
+            let final_outcome: pi_rs_core::Outcome =
+                serde_json::from_value(value.clone()).map_err(|_| "invalid hook final outcome")?;
+            let record = HookFinal {
+                version: 1,
+                task: task.id(),
+                raw_attempt: receipt.attempt_id,
+                raw: receipt.outcome,
+                final_outcome,
+            };
+            let key = hook_final_key(task.id());
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            });
+            mutations.push(Mutation::Put {
+                key,
+                value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+            });
+        }
+        _ => return Err("unsupported unsafe hook settlement".into()),
+    }
+    Ok((checks, mutations))
+}
+
+pub(crate) fn read_hook_final(
+    store: &Store,
+    task: &Task,
+    raw: &pi_rs_core::Outcome,
+) -> Result<pi_rs_core::Outcome, String> {
+    let entry = store
+        .get(&hook_final_key(task.id()))
+        .map_err(|e| e.to_string())?
+        .ok_or("missing unsafe hook final")?;
+    let record: HookFinal =
+        serde_json::from_slice(&entry.value).map_err(|_| "invalid unsafe hook final")?;
+    let receipts = read_receipts(store, task.id())?;
+    if record.version != 1
+        || record.task != task.id()
+        || &record.raw != raw
+        || receipts.len() != 1
+        || receipts[0].attempt_id != record.raw_attempt
+        || receipts[0].outcome != record.raw
+    {
+        return Err("unsafe hook final mismatch".into());
+    }
+    after_checks(store, task)?;
+    Ok(record.final_outcome)
 }

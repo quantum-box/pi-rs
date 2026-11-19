@@ -297,6 +297,7 @@ struct Registration {
     receipt_capture: Option<Arc<ReceiptCapture>>,
     cancellable_durable_async: bool,
     restart_after: bool,
+    checkpointable_hooks: bool,
 }
 /// Clones preserve definition identity for migration retry decisions.
 #[derive(Clone, Default)]
@@ -347,6 +348,7 @@ impl Registry {
                     receipt_capture: None,
                     cancellable_durable_async: false,
                     restart_after: false,
+                    checkpointable_hooks: false,
                 });
                 true
             }
@@ -372,6 +374,7 @@ impl Registry {
                     receipt_capture: None,
                     cancellable_durable_async: false,
                     restart_after: false,
+                    checkpointable_hooks: false,
                 });
                 true
             }
@@ -1942,6 +1945,7 @@ impl AdmissionHandle<'_> {
             expected_replay_safe,
             cancellation,
             true,
+            false,
             (&[], &[]),
         ) {
             Err(error) if error == HOOK_FENCE_CONFLICT => {
@@ -1952,6 +1956,7 @@ impl AdmissionHandle<'_> {
                         test_namespace,
                         expected_replay_safe,
                         cancellation,
+                        false,
                         false,
                         (&[], &[]),
                     ) {
@@ -2004,15 +2009,22 @@ impl AdmissionHandle<'_> {
         &self,
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Result<(), String> {
-        self.replay_safe_durable_fence(false, true, Some(cancellation), false, (&[], &[]))
-            .map(|_| ())
-            .map_err(|error| {
-                if error == HOOK_FENCE_CONFLICT {
-                    UNSAFE_ANCESTOR_BUSY.into()
-                } else {
-                    error
-                }
-            })
+        self.replay_safe_durable_fence(
+            false,
+            self.running.task.replay_safe(),
+            Some(cancellation),
+            false,
+            true,
+            (&[], &[]),
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            if error == HOOK_FENCE_CONFLICT {
+                UNSAFE_ANCESTOR_BUSY.into()
+            } else {
+                error
+            }
+        })
     }
     fn replay_safe_durable_fence(
         &self,
@@ -2020,6 +2032,7 @@ impl AdmissionHandle<'_> {
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
         write_intent: bool,
+        hook_phase: bool,
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<Vec<u8>, String> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
@@ -2070,7 +2083,9 @@ impl AdmissionHandle<'_> {
                 .and_then(|kind| definitions.registry.entries.get(kind))
                 .ok_or("missing durable registration")?;
             if !registration.cancellable_durable_async
+                || registration.version != current.task.definition_version()
                 || registration.replay_safe != expected_replay_safe
+                || (hook_phase && !expected_replay_safe && !registration.checkpointable_hooks)
             {
                 return Err("durable registration or replay policy changed".into());
             }
@@ -2090,10 +2105,19 @@ impl AdmissionHandle<'_> {
         )
         .map_err(|e| e.to_string())?;
         if !expected_replay_safe && !test_namespace {
-            checks.extend(crate::async_task_tool::unsafe_park_proof::dispatch_checks(
-                owner.store(),
-                &current.task,
-            )?);
+            if !hook_phase {
+                checks.extend(crate::async_task_tool::unsafe_park_proof::dispatch_checks(
+                    owner.store(),
+                    &current.task,
+                )?);
+            } else if current.task.checkpoint().phase == "replay-safe-async-after" {
+                checks.extend(crate::async_task_tool::unsafe_park_proof::after_checks(
+                    owner.store(),
+                    &current.task,
+                )?);
+            } else if current.task.checkpoint().phase != "initial" {
+                return Err("unsafe hook is not in an authorized phase".into());
+            }
         }
         let tasks = TaskStore::new(owner.store());
         let mut ancestor = current.task.clone();
@@ -2232,7 +2256,14 @@ impl AdmissionHandle<'_> {
             }
             (None, None) => (None, vec![]),
         };
-        self.replay_safe_durable_fence(false, true, Some(cancel), false, (&[check], &mutations))?;
+        self.replay_safe_durable_fence(
+            false,
+            self.running.task.replay_safe(),
+            Some(cancel),
+            false,
+            true,
+            (&[check], &mutations),
+        )?;
         Ok(result)
     }
     /// Atomically admit or reconnect a keyed TaskTool child. The parent must be
@@ -4430,7 +4461,9 @@ impl Scheduler {
                     )? {
                         return Err(Error::PendingAbort(root));
                     }
-                    if current.task.replay_safe() && self.registered(&current.task)?.replay_safe {
+                    if (current.task.replay_safe() && self.registered(&current.task)?.replay_safe)
+                        || self.replayable_unsafe_hook_phase(&current.task)
+                    {
                         self.ts().update(&current, |task| task.yield_ready())?;
                         return Ok(true);
                     }
@@ -5053,6 +5086,7 @@ impl Scheduler {
         handler: Arc<dyn Handler>,
         abort_hook: bool,
         restart_after: bool,
+        checkpointable_hooks: bool,
     ) -> Result<(), String> {
         if self.validator.is_some() {
             return Err("standalone scheduler required".into());
@@ -5072,6 +5106,7 @@ impl Scheduler {
             .get_mut(&kind)
             .expect("registered")
             .restart_after = restart_after;
+        registry.entries.get_mut(&kind).expect("registered").checkpointable_hooks = checkpointable_hooks;
         if abort_hook {
             registry.entries.get_mut(&kind).expect("registered").abort = Some(handler);
         } else if !registry.set_abort(&kind, |_: &Task| Ok(Step::Succeed(Value::Null))) {
@@ -5295,6 +5330,43 @@ impl Scheduler {
             .get(task.kind().ok_or(Error::Registration)?)
             .ok_or(Error::Registration)?;
         Ok(entry)
+    }
+    /// Only an attested hook phase with no tool dispatch in this attempt may
+    /// use replay-safe settlement policy for an otherwise unsafe task.
+    fn replayable_unsafe_hook_phase(&self, task: &Task) -> bool {
+        if task.replay_safe()
+            || task.abort_requested()
+            || !task.is_task_tool()
+            || !task
+                .kind()
+                .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook."))
+            || !matches!(
+                task.checkpoint().phase.as_str(),
+                "initial" | "replay-safe-async-after"
+            )
+        {
+            return false;
+        }
+        let Ok(registration) = self.registered(task) else {
+            return false;
+        };
+        if !registration.checkpointable_hooks
+            || !registration.cancellable_durable_async
+            || registration.replay_safe
+            || registration.version != task.definition_version()
+        {
+            return false;
+        }
+        let Some(attempt) = task.attempt_id() else {
+            return false;
+        };
+        let key = format!("durable/unsafe-park-async/{}/{attempt}/intent", task.id());
+        if !matches!(self.ts().store().get(key.as_bytes()), Ok(None)) {
+            return false;
+        }
+        task.checkpoint().phase == "initial"
+            || crate::async_task_tool::unsafe_park_proof::after_checks(self.ts().store(), task)
+                .is_ok()
     }
     /// Replace registrations after a clean scheduling boundary. Failed migrations
     /// are retried only when their task definition changes. Returns `Busy`
@@ -5608,6 +5680,88 @@ impl Scheduler {
                     // Defer even restart-limit failure until owned cleanup settles.
                     self.ts().update(&item, |task| task.recover())?;
                     continue;
+                }
+                // Standalone hosts install tools after opening the scheduler.
+                // Keep these phases blocked until the exact hook definition is
+                // registered; an unknown definition must not authorize replay.
+                if !item.task.replay_safe()
+                    && item
+                        .task
+                        .kind()
+                        .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook."))
+                    && matches!(
+                        item.task.checkpoint().phase.as_str(),
+                        "initial" | "replay-safe-async-after"
+                    )
+                    && self.registered(&item.task).is_err()
+                {
+                    continue;
+                }
+                // A replay-safe hook phase never dispatches the unsafe tool. Prove
+                // this exact attempt has no tool intent and, for after, bind the
+                // committed checkpoint to the original unsafe result and receipt.
+                if !item.task.replay_safe()
+                    && self.registered(&item.task).is_ok_and(|reg| {
+                        reg.cancellable_durable_async
+                            && reg.checkpointable_hooks
+                            && !reg.replay_safe
+                            && reg.version == item.task.definition_version()
+                    })
+                    && item.task.is_task_tool()
+                    && item
+                        .task
+                        .kind()
+                        .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook."))
+                    && matches!(
+                        item.task.checkpoint().phase.as_str(),
+                        "initial" | "replay-safe-async-after"
+                    )
+                {
+                    let attempt = item.task.attempt_id().ok_or(Error::Ownership)?;
+                    let key = format!(
+                        "durable/unsafe-park-async/{}/{attempt}/intent",
+                        item.task.id()
+                    )
+                    .into_bytes();
+                    if self
+                        .ts()
+                        .store()
+                        .get(&key)
+                        .map_err(task_store::Error::from)?
+                        .is_none()
+                    {
+                        let mut checks =
+                            if item.task.checkpoint().phase == "replay-safe-async-after" {
+                                crate::async_task_tool::unsafe_park_proof::after_checks(
+                                    self.ts().store(),
+                                    &item.task,
+                                )
+                                .map_err(|e| {
+                                    Error::Handler(format!("unsafe hook recovery rejected: {e}"))
+                                })?
+                            } else {
+                                vec![]
+                            };
+                        if item.task.restarts().saturating_add(1) >= item.task.restart_limit() {
+                            self.finish_failed(&item, "hook restart limit".into())?;
+                            self.deferred_recovery.extend(deferred);
+                            continue 'scan;
+                        }
+                        let mut next = item.clone();
+                        next.task.recover().map_err(Error::Transition)?;
+                        let mut batch =
+                            self.ts().prepare_save(&[task_store::Save::Update(&next)])?;
+                        checks.push(durable_store::Check {
+                            key,
+                            expected: durable_store::Expected::Missing,
+                        });
+                        batch.checks.extend(checks);
+                        self.ts()
+                            .store()
+                            .commit(&batch.checks, &batch.mutations)
+                            .map_err(task_store::Error::from)?;
+                        continue;
+                    }
                 }
                 let after_recovery = if !item.task.replay_safe() {
                     match crate::async_task_protocol::read_raw_result(
@@ -6692,7 +6846,9 @@ impl Scheduler {
             return Ok(true);
         }
         if documents.task_input_conflict.is_some() {
-            if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+            if (running.task.replay_safe() && self.registered(&running.task)?.replay_safe)
+                || self.replayable_unsafe_hook_phase(&running.task)
+            {
                 self.ts().update(&current, |task| task.yield_ready())?;
             } else {
                 return self.finish_running_conflict(
@@ -7062,7 +7218,9 @@ impl Scheduler {
                 }
                 // A staged runtime checkpoint observed a newer root while
                 // preparing; no effects committed. Follow normal replay policy.
-                if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+                if (running.task.replay_safe() && self.registered(&running.task)?.replay_safe)
+                    || self.replayable_unsafe_hook_phase(&running.task)
+                {
                     self.ts().update(&current, |task| task.yield_ready())?;
                 } else {
                     return self.finish_running_conflict(
@@ -7426,8 +7584,9 @@ impl Scheduler {
                 {
                     // The checked batch definitely did not commit. Only registered
                     // replay-safe invocations may be run again after external effects.
-                    if prepared.running.task.replay_safe()
-                        && self.registered(&prepared.running.task)?.replay_safe
+                    if (prepared.running.task.replay_safe()
+                        && self.registered(&prepared.running.task)?.replay_safe)
+                        || self.replayable_unsafe_hook_phase(&prepared.running.task)
                     {
                         self.ts().update(&current, |task| task.yield_ready())?;
                     } else {

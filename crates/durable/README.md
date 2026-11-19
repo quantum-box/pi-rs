@@ -801,6 +801,21 @@ honor the new marker and may cancel retained children; do not downgrade a store
 containing these tasks to an older executor.
 The generic `register_durable_tool` entry remains disabled.
 
+`StandaloneBeforeHookHost::register_unsafe_durable_tool_with_hook` opts an
+unsafe checkpointable Tool into replay-safe before and after hooks. The host
+must attest that argument preparation and both hooks may replay, and must
+restore the same Tool and hook identity. The Tool itself remains unsafe:
+interruption after its dispatch intent requires reconciliation. A committed
+park retains the prepared arguments and resumes under a new attempt; the after
+hook is recoverable only after its raw outcome receipt and completion checkpoint
+commit. The final hook-rewritten outcome is separately fenced to that receipt.
+`Pending` and `Unknown` remain reconciliation evidence and do not run after
+hooks. Only the existing bounded legacy text after-hook replacement is supported;
+structured metadata rewriting is not supported. Hook sleep, before-hook
+block/invalid-argument result handling, and arbitrary hook side effects are not
+supported in this unsafe path and fail closed. `DurableAsyncTool` has no parked external-job cancel API: abort drains
+owned tasks but the host must reconcile or cancel external jobs separately.
+
 `StandaloneNoHooksHost::register_unsafe_durable_tool` separately opts an
 unsafe checkpointable Tool in with
 `UnsafeDurableAuthorization::interruption_requires_reconciliation()`;

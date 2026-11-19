@@ -2403,6 +2403,24 @@ impl<'a> TaskDocuments<'a> {
         }
         Ok((receipts, has_intent))
     }
+    pub(crate) fn stage_unsafe_hook_phase(
+        &mut self,
+        step: &crate::task_scheduler::Step,
+    ) -> Result<(), String> {
+        let (checks, mutations) = crate::async_task_tool::unsafe_park_proof::prepare_hook_phase(
+            self.store, &self.task, step,
+        )?;
+        self.signals.batch.checks.extend(checks);
+        self.signals.batch.mutations.extend(mutations);
+        Ok(())
+    }
+    pub(crate) fn read_unsafe_hook_final(
+        &self,
+        task: &crate::task::Task,
+        raw: &pi_rs_core::Outcome,
+    ) -> Result<pi_rs_core::Outcome, String> {
+        crate::async_task_tool::unsafe_park_proof::read_hook_final(self.store, task, raw)
+    }
     pub(crate) fn stage_unsafe_park_proof(
         &mut self,
         checkpoint: &crate::task::Checkpoint,

@@ -19,7 +19,7 @@ fn park_hooks() -> &'static ParkHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
-pub(super) fn after_unsafe_park_evidence(id: uuid::Uuid, hook: impl FnOnce() + Send + 'static) {
+pub(super) fn after_unsafe_evidence(id: uuid::Uuid, hook: impl FnOnce() + Send + 'static) {
     park_hooks().lock().unwrap().insert(id, Box::new(hook));
 }
 
@@ -122,6 +122,7 @@ pub(super) fn register_unsafe(
     implementation: &str,
     version: u32,
     children: Vec<Arc<TaskTool>>,
+    hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -130,7 +131,7 @@ pub(super) fn register_unsafe(
         version,
         children,
         false,
-        None,
+        hook,
         false,
         false,
         false,
@@ -206,10 +207,13 @@ fn register_with_policy(
     let hash = Sha256::digest(encoded);
     let kind = if replay_safe {
         format!("pi-rs.replay-safe-async.v1.{hash:x}")
+    } else if hook.is_some() {
+        format!("pi-rs.unsafe-park-async.v1.hook.{hash:x}")
     } else {
         format!("pi-rs.unsafe-park-async.v1.{hash:x}")
     };
     let spec = tool.spec();
+    let has_hook = hook.is_some();
     let handler: Arc<dyn Handler> = Arc::new(Executor {
         tool,
         identity,
@@ -228,6 +232,7 @@ fn register_with_policy(
         handler.clone(),
         abort_after,
         restart_after,
+        has_hook,
     )?;
     Ok(Arc::new(
         TaskTool::new(spec, kind, replay_safe, version, handler).with_deferred_arguments(),
@@ -514,7 +519,9 @@ impl DurableTaskHost for Host<'_, '_> {
             return Ok(Some(match task.state() {
                 TaskState::Succeeded(value) => {
                     let result: Outcome = serde_json::from_value(value.clone()).map_err(|_| "invalid unsafe child result")?;
-                    if outcome.as_ref() != Some(&result) { return Err("unsafe child result lacks matching receipt".into()); }
+                    let raw = outcome.as_ref().ok_or("unsafe child result lacks receipt")?;
+                    let expected = if task.checkpoint().phase == "replay-safe-async-after" { docs.read_unsafe_hook_final(&task, raw)? } else { raw.clone() };
+                    if expected != result { return Err("unsafe child result lacks matching final evidence".into()); }
                     AsyncTaskResult::Outcome(result)
                 }
                 TaskState::Failed(reason) => AsyncTaskResult::Uncertain(outcome.unwrap_or_else(|| Outcome::Unknown(format!("unsafe child requires reconciliation: {reason}")))),
@@ -1203,18 +1210,30 @@ impl Handler for Executor {
         {
             return Err("tool identity changed".into());
         }
-        if self.hook.is_some() && task.checkpoint().phase == "initial" {
-            return match self.before(task, admission, cancellation) {
+        if self.hook.is_some()
+            && matches!(
+                task.checkpoint().phase.as_str(),
+                "initial" | "replay-safe-async-after"
+            )
+        {
+            let result = if task.checkpoint().phase == "initial" {
+                self.before(task, admission, cancellation)
+            } else {
+                self.after(task, admission, cancellation)
+            };
+            if !self
+                .identity
+                .matches(self.tool.as_ref(), &self.implementation, self.version)
+            {
+                return Err("tool identity changed during hook".into());
+            }
+            return match result {
                 Err(error) if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY => {
                     Ok(Step::DeferUndispatched)
                 }
-                result => result,
-            };
-        }
-        if self.hook.is_some() && task.checkpoint().phase == "replay-safe-async-after" {
-            return match self.after(task, admission, cancellation) {
-                Err(error) if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY => {
-                    Ok(Step::DeferUndispatched)
+                Ok(step) if !self.replay_safe => {
+                    docs.stage_unsafe_hook_phase(&step)?;
+                    Ok(step)
                 }
                 result => result,
             };
@@ -1314,7 +1333,7 @@ impl Handler for Executor {
         if !self.replay_safe {
             admission.capture_unsafe_durable_outcome(&intent, &result)?;
             #[cfg(test)]
-            if matches!(result, DurableToolStep::Park { .. }) {
+            {
                 let hook = park_hooks().lock().unwrap().remove(&task.id());
                 if let Some(hook) = hook {
                     hook();
