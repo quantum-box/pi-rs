@@ -719,7 +719,18 @@ the limit. Hook failures fail the cleanup; a non-cooperative hook can still
 block shutdown, so the host's completion attestation is required. The normal
 content registration keeps its existing abort behavior. Dynamic conversation
 selection, hook parking, and after hooks for host interrupted, unavailable and
-restart-limit results remain unsupported.
+restart-limit results remain unsupported. The abort cleanup lease cannot be
+reused for these failures: it requires an abort-marked task and leads to
+`Cancelled`, while interrupted work can have uncertain external effects and a
+restart-limit task must remain failed. A safe salvage path needs a distinct
+failed-result lease, child-drain ordering and its own bounded attempt budget;
+it must not replace a committed Tool outcome or final after result.
+`read_replay_safe_after_evidence` exposes a committed raw Tool outcome, or a
+distinct host error, from the after checkpoint of a failed or cancelled
+replay-safe task. It is reconciliation evidence only: it is not a final hook
+result and does not authorize replay. An interrupted execution without an
+after checkpoint returns no evidence; absence does not imply that the Tool had
+no external effects.
 
 An attempt may stage keyed direct children and return `Park` with an `All` or
 `Any` wait. Child admissions, checkpoint, wait and the attempt result commit

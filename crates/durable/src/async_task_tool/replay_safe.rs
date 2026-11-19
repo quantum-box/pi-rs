@@ -213,6 +213,39 @@ struct HookCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_error: Option<String>,
 }
+pub(super) fn after_checkpoint_evidence(
+    data: &serde_json::Value,
+) -> Result<super::ReplaySafeAfterEvidence, String> {
+    if serde_json::to_vec(data).map_err(|e| e.to_string())?.len() > 65536 {
+        return Err("after checkpoint exceeds limit".into());
+    }
+    let checkpoint: HookCheckpoint =
+        serde_json::from_value(data.clone()).map_err(|_| "invalid after checkpoint")?;
+    if checkpoint.version != 1
+        || !checkpoint.arguments.is_object()
+        || serde_json::to_vec(&checkpoint.arguments)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 60 * 1024
+    {
+        return Err("invalid after checkpoint".into());
+    }
+    let outcome = checkpoint.outcome.ok_or("missing after outcome")?;
+    if matches!(outcome, Outcome::Unknown(_) | Outcome::Pending { .. }) {
+        return Err("uncertain after outcome".into());
+    }
+    match checkpoint.host_error {
+        Some(code)
+            if matches!(code.as_str(), "blocked" | "invalid_arguments")
+                && matches!(outcome, Outcome::Failed(_)) =>
+        {
+            Ok(super::ReplaySafeAfterEvidence::HostError { code, outcome })
+        }
+        None => Ok(super::ReplaySafeAfterEvidence::ToolOutcome(outcome)),
+        _ => Err("invalid host error checkpoint".into()),
+    }
+}
+
 struct HookMemo<'a, 'b> {
     admission: &'a AdmissionHandle<'b>,
     cancellation: &'a pi_rs_core::CancellationToken,
@@ -1191,5 +1224,43 @@ impl Handler for Executor {
         #[cfg(test)]
         crash_test_boundary(&self.tool.spec().name, task.id(), "result");
         Ok(step)
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    #[test]
+    fn rejects_ambiguous_or_malformed_after_evidence() {
+        let checkpoint = |outcome: Outcome, host_error: Option<&str>| {
+            serde_json::to_value(HookCheckpoint {
+                version: 1,
+                arguments: serde_json::json!({}),
+                outcome: Some(outcome),
+                host_error: host_error.map(str::to_owned),
+            })
+            .unwrap()
+        };
+        assert!(
+            after_checkpoint_evidence(&checkpoint(Outcome::Unknown("uncertain".into()), None))
+                .is_err()
+        );
+        assert!(
+            after_checkpoint_evidence(&checkpoint(
+                Outcome::Succeeded("done".into()),
+                Some("blocked")
+            ))
+            .is_err()
+        );
+        assert!(
+            after_checkpoint_evidence(&checkpoint(Outcome::Failed("bad".into()), Some("unknown")))
+                .is_err()
+        );
+        assert!(
+            after_checkpoint_evidence(
+                &serde_json::json!({"version":1,"arguments":{},"outcome":null})
+            )
+            .is_err()
+        );
     }
 }

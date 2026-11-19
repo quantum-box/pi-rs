@@ -166,6 +166,42 @@ pub(crate) fn validate_aborted_after_result(value: &serde_json::Value) -> Result
     replay_safe::validate_content_hook_result(&result, Some(&required), false)
 }
 
+/// A committed replay-safe after checkpoint, retained only as reconciliation evidence.
+/// This does not mean that the after hook completed or authorize a Tool retry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReplaySafeAfterEvidence {
+    ToolOutcome(Outcome),
+    HostError { code: String, outcome: Outcome },
+}
+
+/// Read a known raw outcome retained by a failed or cancelled replay-safe task.
+/// Interrupted attempts without a committed after checkpoint remain unknown.
+pub fn read_replay_safe_after_evidence(
+    store: &durable_store::Store,
+    task_id: uuid::Uuid,
+) -> Result<Option<ReplaySafeAfterEvidence>, String> {
+    let Some(record) = crate::task_store::TaskStore::new(store)
+        .load(task_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let task = &record.task;
+    if !matches!(
+        task.state(),
+        crate::task::TaskState::Failed(_) | crate::task::TaskState::Cancelled
+    ) || !task.replay_safe()
+        || !task.is_task_tool()
+        || !task
+            .kind()
+            .is_some_and(|kind| kind.starts_with("pi-rs.replay-safe-async.v1."))
+        || task.checkpoint().phase != "replay-safe-async-after"
+    {
+        return Ok(None);
+    }
+    replay_safe::after_checkpoint_evidence(&task.checkpoint().data).map(Some)
+}
+
 /// Read the durable pre-after Tool outcome for reconciliation after shutdown.
 /// This is evidence only: it does not authorize dispatch or imply that the
 /// after hook completed, and must not be used as a finalized tool result.
@@ -6606,6 +6642,11 @@ mod tests {
         assert!(!root.join("abort-hook-count").exists());
         let store = durable_store::Store::open(root.join("db")).unwrap();
         assert!(read_aborted_after_result(&store, id).unwrap().is_none());
+        assert!(
+            read_replay_safe_after_evidence(&store, id)
+                .unwrap()
+                .is_none()
+        );
         drop(store);
         let (host, _) = ordinary_rich_abort_host(root);
         let driver = host.into_driver();
@@ -7331,6 +7372,127 @@ mod tests {
                 .is_some()
         );
     }
+    #[test]
+    fn replay_safe_restart_limit_keeps_structured_raw_outcome_for_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("structured"), b"yes").unwrap();
+        let mut process=std::process::Command::new(std::env::current_exe().unwrap()).arg("--exact").arg("async_task_tool::tests::durable_host_restart_limit_does_not_invoke_unfenced_recovery_hook").env("PI_RS_HOST_RESTART_LIMIT_1120",root).spawn().unwrap();
+        wait_file(&root.join("content-ready"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = content_pause_host(root);
+        let driver = host.into_driver();
+        assert!(
+            matches!(wait_terminal(&driver,id).state(),crate::task::TaskState::Failed(reason) if reason=="restart limit")
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let Some(ReplaySafeAfterEvidence::ToolOutcome(Outcome::Structured { data, attachments })) =
+            read_replay_safe_after_evidence(&store, id).unwrap()
+        else {
+            panic!("missing structured raw outcome")
+        };
+        assert_eq!(data["payload"].as_str().unwrap().len(), 60_000);
+        assert!(attachments.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("tool-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    struct CrashUncertainTool(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for CrashUncertainTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "crash-uncertain".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for CrashUncertainTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(self.0.join("uncertain-invocations"))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "invoked").map_err(|e| e.to_string())?;
+            f.sync_all().map_err(|e| e.to_string())?;
+            std::future::pending().await
+        }
+    }
+    fn uncertain_recovery_host(
+        root: &std::path::Path,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        single_content_host(
+            &root.join("db"),
+            Arc::new(CrashUncertainTool(root.to_owned())),
+            Arc::new(NoopDurableHook),
+        )
+    }
+    #[test]
+    fn replay_safe_interrupted_execution_never_invents_known_outcome() {
+        const ENV: &str = "PI_RS_UNCERTAIN_PRECHECKPOINT_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tool) = uncertain_recovery_host(&root);
+            let id = host.start_replay_safe_root(&tool, json!({}), 1).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process=std::process::Command::new(std::env::current_exe().unwrap()).arg("--exact").arg("async_task_tool::tests::replay_safe_interrupted_execution_never_invents_known_outcome").env(ENV,root).spawn().unwrap();
+        wait_file(&root.join("uncertain-invocations"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = uncertain_recovery_host(root);
+        let driver = host.into_driver();
+        assert!(
+            matches!(wait_terminal(&driver,id).state(),crate::task::TaskState::Failed(reason) if reason=="restart limit")
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(
+            read_replay_safe_after_evidence(&store, id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("uncertain-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
     struct SuppressGate;
     #[async_trait::async_trait]
     impl crate::extension::Hook for SuppressGate {
@@ -7401,6 +7563,10 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        assert!(
+            matches!(read_replay_safe_after_evidence(&store,id).unwrap(),Some(ReplaySafeAfterEvidence::HostError {code,outcome:Outcome::Failed(reason)}) if code=="blocked" && reason.contains("denied"))
+        );
     }
     #[test]
     fn durable_content_abort_fences_late_memo() {
@@ -7437,6 +7603,13 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        assert_eq!(
+            read_replay_safe_after_evidence(&store, id).unwrap(),
+            Some(ReplaySafeAfterEvidence::ToolOutcome(Outcome::Succeeded(
+                "done".into()
+            )))
+        );
     }
 
     struct CountAbortHook {
