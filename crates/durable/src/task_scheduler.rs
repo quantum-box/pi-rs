@@ -121,6 +121,9 @@ pub enum Step {
     /// Internal pre-dispatch yield for checkpointable Tools.
     #[doc(hidden)]
     DeferUndispatched,
+    /// Internal yield of a sealed after phase with retained dispatch evidence.
+    #[doc(hidden)]
+    DeferSealedAfter,
     Wait {
         checkpoint: Checkpoint,
         condition: WaitFor,
@@ -4679,13 +4682,38 @@ impl DetachedInvocation {
             {
                 return Err(Error::Ownership);
             }
+            let after_identity = self.receipt_capture.as_ref().filter(|capture| {
+                capture.identity.has_after_hook()
+                    && current.task.checkpoint().phase == "sealed.execute.v1"
+            });
+            let after_checks = if let Some(capture) = after_identity {
+                match crate::async_task_protocol::read_raw_result(owner.store(), current.task.id())
+                    .map_err(|e| Error::Handler(format!("sealed after evidence: {e}")))?
+                {
+                    Some(_) => Some(
+                        crate::async_task_protocol::sealed_after_release_checks(
+                            owner.store(),
+                            &current.task,
+                            &capture.identity,
+                        )
+                        .map_err(|e| Error::Handler(format!("sealed after release: {e}")))?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
             current.task.yield_ready().map_err(Error::Transition)?;
             let mut batch = tasks.prepare_save(&[task_store::Save::Update(&current)])?;
-            batch
-                .checks
-                .push(crate::async_task_protocol::undispatched_intent_check(
-                    current.task.id(),
-                ));
+            if let Some(checks) = &after_checks {
+                batch.checks.extend(checks.iter().cloned());
+            } else {
+                batch
+                    .checks
+                    .push(crate::async_task_protocol::undispatched_intent_check(
+                        current.task.id(),
+                    ));
+            }
             let mut live = self.lease.state.lock().map_err(|_| Error::Poisoned)?;
             if !live
                 .leases
@@ -4713,7 +4741,7 @@ impl DetachedInvocation {
                     drop(live);
                     drop(_gate);
                     drop(_failure);
-                    return self.publish_undispatched_release();
+                    return self.publish_undispatched_release(after_checks.is_some());
                 }
                 Err(error) => return Err(task_store::Error::from(error).into()),
             }
@@ -4732,7 +4760,7 @@ impl DetachedInvocation {
         Err(Error::Stopped)
     }
 
-    fn publish_undispatched_release(self) -> Result<CompletedInvocation, Error> {
+    fn publish_undispatched_release(self, after: bool) -> Result<CompletedInvocation, Error> {
         let owner = self.lease.attachment.owner.clone();
         let documents = crate::document::TaskDocuments::new(owner.store(), &self.running.task)?
             .detach(owner.clone(), &self.running)?;
@@ -4758,7 +4786,14 @@ impl DetachedInvocation {
         }
         Ok(CompletedInvocation {
             running: self.running,
-            result: InvocationResult::Handler(Ok(Step::DeferUndispatched), Box::new(documents)),
+            result: InvocationResult::Handler(
+                Ok(if after {
+                    Step::DeferSealedAfter
+                } else {
+                    Step::DeferUndispatched
+                }),
+                Box::new(documents),
+            ),
             lease: self.lease,
             receipt_capture: false,
             abort_definition: self.abort_definition,
@@ -10398,6 +10433,25 @@ impl Scheduler {
                         expected: durable_store::Expected::Missing,
                     }
                 });
+                next.task.yield_ready().map_err(Error::Transition)?;
+            }
+            Step::DeferSealedAfter => {
+                let registration = self.registered(&running.task)?;
+                let capture = registration
+                    .receipt_capture
+                    .as_ref()
+                    .ok_or(Error::Registration)?;
+                if self.validator.is_some() || !staged.is_empty() {
+                    return Err(Error::Registration);
+                }
+                unsafe_evidence_checks.extend(
+                    crate::async_task_protocol::sealed_after_release_checks(
+                        owner.store(),
+                        &running.task,
+                        &capture.identity,
+                    )
+                    .map_err(|e| Error::Handler(format!("sealed after release: {e}")))?,
+                );
                 next.task.yield_ready().map_err(Error::Transition)?;
             }
             Step::Wait {

@@ -3229,6 +3229,128 @@ mod tests {
     }
 
     #[test]
+    fn after_reopen_identity_busy_after_reservation_retries_without_redispatch() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "async_task_tool::tests::after_driver_kill_reopen_reuses_result_and_memo",
+            ])
+            .env("PI_RS_TASK_AFTER_KILL_1120", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !dir.path().join("after-ready").exists() {
+            assert!(process.try_wait().unwrap().is_none(), "kill worker exited");
+            assert!(Instant::now() < deadline, "after hook did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let parent: Uuid = std::fs::read_to_string(dir.path().join("parent"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let path = dir.path().join("db");
+        let store = durable_store::Store::open(&path).unwrap();
+        let child = crate::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.task.owner() == &TaskOwner::Task(parent))
+            .unwrap()
+            .task
+            .id();
+        assert!(
+            crate::async_task_protocol::read_raw_result(&store, child)
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+        let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+        let binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let mut scheduler = after_fixture_host(
+            &path,
+            tool,
+            Arc::new(AfterFixture {
+                root: dir.path().to_owned(),
+                block: true,
+            }),
+        )
+        .into_scheduler_for_test();
+        let mut registry = scheduler.registry_for_test();
+        assert!(registry.register("independent", true, |_: &Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!("ok"))
+        )));
+        scheduler.replace_registry(registry).unwrap();
+        let other = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("independent".into(), true);
+        scheduler.submit(&other).unwrap();
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::task_driver::before_execute_for_test(child, move |_| {
+            reserved_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let driver = crate::task_driver::Driver::start(scheduler);
+        reserved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (updating_tx, updating_rx) = std::sync::mpsc::channel();
+        let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(binding.update(Some("backend".into()), move || {
+                    updating_tx.send(()).unwrap();
+                    unlock_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }))
+                .unwrap()
+        });
+        updating_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let task = driver
+                .get(child)
+                .expect("identity busy must not stop driver")
+                .unwrap();
+            let independent = driver.get(other.id()).unwrap().unwrap();
+            if task.state() == &crate::task::TaskState::Ready && independent.is_terminal() {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "busy after phase or independent graph did not progress"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unlock_tx.send(()).unwrap();
+        updater.join().unwrap();
+        assert_eq!(
+            wait_terminal(&driver, parent).state(),
+            &crate::task::TaskState::Succeeded(json!({"done":true}))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
     fn after_driver_kill_reopen_reuses_result_and_memo() {
         const ENV: &str = "PI_RS_TASK_AFTER_KILL_1120";
         if let Ok(root) = std::env::var(ENV) {

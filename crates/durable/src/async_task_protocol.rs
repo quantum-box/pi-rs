@@ -632,6 +632,31 @@ pub(crate) fn prepare_after_recovery(
     Ok(batch)
 }
 
+/// Fence a sealed after-phase yield without asserting that dispatch never
+/// happened. The raw result and original dispatch evidence remain authoritative.
+pub(crate) fn sealed_after_release_checks(
+    store: &Store,
+    task: &Task,
+    identity: &ToolIdentity,
+) -> Result<Vec<Check>, Error> {
+    if task.replay_safe()
+        || task.checkpoint().phase != "sealed.execute.v1"
+        || task.checkpoint().data.get("identity") != Some(&serde_json::to_value(identity)?)
+        || task.attempt_id().is_none()
+    {
+        return Err(Error::Invalid);
+    }
+    let (intent, _) = read_raw_result(store, task.id())?.ok_or(Error::Invalid)?;
+    if intent.identity != *identity {
+        return Err(Error::Invalid);
+    }
+    let (result, checks) = prepare_receipt_read(store, task.id())?;
+    if result.is_none() {
+        return Err(Error::Invalid);
+    }
+    Ok(checks)
+}
+
 pub(crate) fn read_raw_result(
     store: &Store,
     task: Uuid,
