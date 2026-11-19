@@ -5078,6 +5078,7 @@ impl Scheduler {
         Ok((executor, identity))
     }
 
+    #[allow(clippy::too_many_arguments)] // Definition and independent task policies are bound at registration.
     pub(crate) fn install_checkpointable_async_handler(
         &mut self,
         kind: String,
