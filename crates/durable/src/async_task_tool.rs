@@ -3141,6 +3141,92 @@ mod tests {
         }
     }
 
+    struct PoisonedMemoHook {
+        before_phase: bool,
+        observed: std::sync::mpsc::Sender<(bool, bool, bool)>,
+    }
+    impl PoisonedMemoHook {
+        async fn check(&self, ctx: &crate::extension::Context<'_>) {
+            assert_eq!(
+                ctx.memo.get_or_insert("existing", json!(42)).await.unwrap(),
+                json!(42)
+            );
+            let first = ctx.memo.get("").await.is_err();
+            let read = ctx.memo.get("existing").await.is_err();
+            let write = ctx
+                .memo
+                .get_or_insert("valid", json!("must-not-persist"))
+                .await
+                .is_err();
+            self.observed.send((first, read, write)).unwrap();
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for PoisonedMemoHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            if self.before_phase {
+                self.check(ctx).await;
+            }
+            Ok(crate::extension::BeforeTool::Pass)
+        }
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if !self.before_phase {
+                self.check(ctx).await;
+            }
+            Ok(None)
+        }
+    }
+    #[test]
+    fn hooked_durable_memo_failure_rejects_later_access_in_both_phases() {
+        for before_phase in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (observed, received) = std::sync::mpsc::channel();
+            let mut host = StandaloneBeforeHookHost::open(&path, Registry::default()).unwrap();
+            let tool = host
+                .register_replay_safe_durable_tool_with_hook(
+                    Arc::new(ImmediateDurable(calls.clone())),
+                    "immediate-v1",
+                    1,
+                    vec![],
+                    "hook-v1",
+                    Arc::new(PoisonedMemoHook {
+                        before_phase,
+                        observed,
+                    }),
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            assert_eq!(
+                received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                (true, true, true)
+            );
+            assert!(matches!(
+                wait_terminal(&driver, id).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!before_phase));
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            let key = format!("runtime/extension-memo/{id}/valid");
+            assert!(store.get(key.as_bytes()).unwrap().is_none());
+        }
+    }
+
     #[test]
     fn hooked_durable_after_ignored_memo_error_fails_closed() {
         let dir = tempfile::tempdir().unwrap();

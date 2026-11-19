@@ -103,34 +103,52 @@ struct HookCheckpoint {
 struct HookMemo<'a, 'b> {
     admission: &'a AdmissionHandle<'b>,
     cancellation: &'a pi_rs_core::CancellationToken,
-    failed: std::sync::atomic::AtomicBool,
+    failed: Mutex<bool>,
+}
+impl HookMemo<'_, '_> {
+    fn access(
+        &self,
+        key: &str,
+        value: Option<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        // Serialize access with failure publication: a concurrent operation
+        // cannot commit after another operation has failed.
+        let mut failed = self.failed.lock().map_err(|_| "hook memo unavailable")?;
+        if *failed {
+            return Err("hook memo unavailable after failure".into());
+        }
+        let inserting = value.is_some();
+        let result = self
+            .admission
+            .replay_safe_hook_memo(key, value, self.cancellation)
+            .and_then(|value| {
+                if inserting && value.is_none() {
+                    Err("memo insertion failed".into())
+                } else {
+                    Ok(value)
+                }
+            });
+        if result.is_err() {
+            *failed = true;
+        }
+        result
+    }
+    fn failed(&self) -> bool {
+        self.failed.lock().map_or(true, |failed| *failed)
+    }
 }
 #[async_trait::async_trait]
 impl crate::extension::Memo for HookMemo<'_, '_> {
     async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
-        let result = self
-            .admission
-            .replay_safe_hook_memo(key, None, self.cancellation);
-        if result.is_err() {
-            self.failed
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        result
+        self.access(key, None)
     }
     async fn get_or_insert(
         &self,
         key: &str,
         value: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let result = self
-            .admission
-            .replay_safe_hook_memo(key, Some(value), self.cancellation)
-            .and_then(|v| v.ok_or("memo insertion failed".into()));
-        if result.is_err() {
-            self.failed
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        result
+        self.access(key, Some(value))?
+            .ok_or_else(|| "memo insertion failed".into())
     }
 }
 
@@ -242,7 +260,7 @@ impl Executor {
         let memo = HookMemo {
             admission,
             cancellation: cancel,
-            failed: std::sync::atomic::AtomicBool::new(false),
+            failed: Mutex::new(false),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -259,7 +277,7 @@ impl Executor {
             };
             tokio::select! { biased; _ = cancel.cancelled() => Err("before hook cancelled".into()), result = operation => result }
         })?;
-        if memo.failed.load(std::sync::atomic::Ordering::Acquire) {
+        if memo.failed() {
             return Err("task-fenced hook memo failed".into());
         }
         admission.replay_safe_durable_check(cancel)?;
@@ -303,7 +321,7 @@ impl Executor {
         let memo = HookMemo {
             admission,
             cancellation: cancel,
-            failed: std::sync::atomic::AtomicBool::new(false),
+            failed: Mutex::new(false),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -315,7 +333,7 @@ impl Executor {
             let selected = self.hook_registry()?;
             tokio::select! { biased; _ = cancel.cancelled() => Err("after hook cancelled".to_string()), value = selected.after_tool(&call, serde_json::Value::String(text.clone()), &ctx) => Ok(value.0) }
         })?;
-        if memo.failed.load(std::sync::atomic::Ordering::Acquire) {
+        if memo.failed() {
             return Err("task-fenced hook memo failed".into());
         }
         admission.replay_safe_durable_check(cancel)?;

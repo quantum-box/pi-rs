@@ -661,7 +661,7 @@ rewritten arguments are validated again and reused after wake. After runs only
 after a terminal Tool result, not on a park. The completed result is committed
 before after, allowing after to restart without repeating the Tool. Task-scoped
 memo reads and writes are fenced by the current reservation and ancestor abort;
-failures stop the phase. Hook sleep, selection chains, rich result replacement,
+a failed access rejects later accesses and stops the phase. Hook sleep, selection chains, rich result replacement,
 and after on host-generated block/error/abort are not supported on this path.
 The hook snapshot is null; external effects and detached work remain the host's
 responsibility.
