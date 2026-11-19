@@ -274,9 +274,15 @@ async fn multilevel_process_child() {
         let middle = ids[0].1;
         let leaf = ids[1].1;
         assert_eq!(ids[1].0, middle);
-        let root_task = driver.get(root).unwrap().unwrap();
-        let middle_task = driver.get(middle).unwrap().unwrap();
-        let leaf_task = driver.get(leaf).unwrap().unwrap();
+        // IDs are shared by handlers before their staged children commit.
+        // Wait for each record; a storage error must still fail the test.
+        let (Some(root_task), Some(middle_task), Some(leaf_task)) = (
+            driver.get(root).unwrap(),
+            driver.get(middle).unwrap(),
+            driver.get(leaf).unwrap(),
+        ) else {
+            return false;
+        };
         let ready = matches!(root_task.state(), TaskState::Waiting(_))
             && root_task.checkpoint().phase == "child"
             && if park {
