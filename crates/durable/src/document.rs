@@ -2362,6 +2362,32 @@ impl DetachedTaskDocuments {
 }
 
 impl<'a> TaskDocuments<'a> {
+    /// Discard a handler's staged work without performing further storage I/O.
+    /// A panicked invocation must still be able to publish its failure even
+    /// when the handler left a conflict or staged input in this context.
+    pub(crate) fn discard_staged(self) -> Self {
+        Self {
+            store: self.store,
+            input_validator: self.input_validator,
+            task: self.task,
+            revision: self.revision,
+            acquired: HashSet::new(),
+            entries: None,
+            entry_initial_len: 0,
+            runtime_cut: None,
+            runtime_config: None,
+            task_input: None,
+            task_input_conflict: None,
+            task_input_storage: None,
+            signals: StagedSignals::new(),
+            child_reads: HashMap::new(),
+            keyed_children: Vec::new(),
+            keyed_child_handlers: HashMap::new(),
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+        }
+    }
+
     /// Detach only from the actual store owner and the handler's reservation.
     /// No writes are committed and preparation errors remain deferred.
     #[allow(dead_code)]

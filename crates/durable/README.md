@@ -1916,13 +1916,15 @@ children are not marked by normal TaskTool settlement, even if they share a
 handler kind, and generic task success still waits for its children naturally.
 An explicit parent abort retains its broader ownership semantics. Handler errors
 and `Step::Fail` discard children staged in that same uncommitted invocation.
-An unwinding handler panic after immediate admission stops the driver; it does
-not itself durably abort a child that is already running. A completed child
-outcome can remain in `shutdown_with_pending` for reconciliation. Dropping that
-pending outcome and reopening can instead classify an interrupted unsafe child
-as failed before the parent cleanup reaches it, without running its abort handler.
-External effects already started are not rolled back or confirmed cancelled;
-the host must retain or reconcile uncertain outcomes and external work.
+An unwinding TaskTool handler panic is published as a redacted failure; staged
+documents and the failed handler's other staged work are discarded. Already
+admitted children remain owned. Cleanup marks running descendants for abort and
+waits for their executors to return before running abort handlers or settling
+the parent. If cleanup or result settlement cannot complete, the driver retains
+the corresponding pending outcome for reconciliation. External effects already
+started are not rolled back or confirmed cancelled; hosts must reconcile them.
+A process crash before the panic failure is durably recorded still follows
+interrupted-attempt recovery and does not prove external cancellation.
 Records written before the adapter type was added lack it and retain generic
 semantics; existing keyed children cannot be silently upgraded. Drain or
 reconcile such work before upgrading. A commit recorded by the new runtime must

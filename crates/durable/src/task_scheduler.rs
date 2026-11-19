@@ -1262,9 +1262,9 @@ impl AdmissionHandle<'_> {
 }
 
 impl DetachedInvocation {
-    /// Run without holding the scheduler mutex. A handler panic publishes a
-    /// known failed attempt; other unretired exits poison the scheduler. Abort
-    /// handler panics retain existing semantics.
+    /// Run without holding the scheduler mutex. An unwinding TaskTool handler
+    /// panic becomes a published failure so its owned graph can be cleaned up.
+    /// Generic handler panics and abort handler panics retain their semantics.
     pub fn execute(self) -> Result<CompletedInvocation, Error> {
         let Self {
             running,
@@ -1306,6 +1306,14 @@ impl DetachedInvocation {
             }));
             let result = match result {
                 Ok(result) => result,
+                Err(payload) if running.task.is_task_tool() => {
+                    crate::extension::discard_panic_payload(payload);
+                    // Nothing staged by a panicking handler is a valid result.
+                    // In particular, a staged input conflict must not turn the
+                    // panic into a replayable Continue or hide its cleanup.
+                    documents = documents.discard_staged();
+                    Err("task handler panicked; execution outcome requires reconciliation".into())
+                }
                 Err(payload) => {
                     let mut lease = lease;
                     {
@@ -2856,6 +2864,11 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn set_result_commit_hook(&mut self, hook: CommitHook) {
         self.result_commit_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_failure_commit_error_for_test(&mut self, boundary: u8) {
+        self.inject_failure_commit_error = boundary;
     }
 
     #[cfg(test)]

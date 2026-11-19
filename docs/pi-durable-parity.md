@@ -491,14 +491,16 @@ parent abort, and the borrowed handle's lifetime. They also exercise both orders
 and a race with conversation-root abort, and descendant admission racing its
 ancestor's failure publication. The handle cannot survive its own handler's
 return to race that handler's result publication.
-An unwinding parent-handler panic after immediate admission publishes an
-in-process failure fence and stops the driver, but does not itself persist an
-abort mark for an already-running child. A real-driver test starts an unsafe
-child effect, panics its parent, and confirms the child outcome is retained as
-pending at shutdown. If the host discards that outcome, recovery can mark the
-unsafe child failed for reconciliation before parent cleanup, without invoking
-the child's abort handler. Neither the external effect nor its cancellation is
-proved by those task states; process-aborting panics are not caught.
+An unwinding TaskTool handler panic after immediate admission publishes a
+redacted failure and follows the owned-graph cleanup path. Running descendants
+receive durable abort marks; their executors must return before their abort
+handlers run and the parent can settle. Staged handler documents and input
+conflicts are discarded, while already admitted children remain owned. A real
+driver test exercises standalone and conversation-attached schedulers, safe and
+unsafe parents, and an unsafe child with an already-started external effect.
+Neither that effect nor its cancellation is proved by the task states. A crash
+before the failure is durably recorded still uses interrupted-attempt recovery;
+process-aborting panics are not caught.
 The driver has four ordinary workers. A test occupies all four with TaskTool
 parents and verifies that an admitted TaskTool child stays ready until an
 ordinary worker becomes free; the overflow reservation cannot run that child.

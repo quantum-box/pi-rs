@@ -1857,7 +1857,7 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn panic_after_admission_stops_driver_and_recovers_owned_child() {
+    fn panic_cleanup_commit_error_retains_parent_and_child_outcomes() {
         use crate::task_scheduler::{AdmissionHandle, Handler, Step};
         use std::{
             sync::atomic::{AtomicUsize, Ordering},
@@ -1866,7 +1866,7 @@ mod tests {
         struct Parent {
             child: Arc<crate::task_tool::TaskTool>,
             admitted: mpsc::Sender<Uuid>,
-            panic_now: Mutex<mpsc::Receiver<()>>,
+            proceed: Mutex<mpsc::Receiver<()>>,
         }
         impl Handler for Parent {
             fn run(&self, _: &Task) -> Result<Step, String> {
@@ -1882,135 +1882,358 @@ mod tests {
                     .admit_task_tool_child(&self.child, "child", json!({}))
                     .unwrap();
                 self.admitted.send(id).unwrap();
+                self.proceed.lock().unwrap().recv().unwrap();
+                panic!("failure before cleanup commit")
+            }
+        }
+        for boundary in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let effects = Arc::new(AtomicUsize::new(0));
+            let effect_counter = effects.clone();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            let child_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+                effect_counter.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok(Step::Succeed(json!("child")))
+            });
+            let child = Arc::new(crate::task_tool::TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "child".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                "child",
+                false,
+                1,
+                child_handler.clone(),
+            ));
+            let (admitted_tx, admitted_rx) = mpsc::channel();
+            let (proceed_tx, proceed_rx) = mpsc::channel();
+            let parent_handler: Arc<dyn Handler> = Arc::new(Parent {
+                child,
+                admitted: admitted_tx,
+                proceed: Mutex::new(proceed_rx),
+            });
+            let mut registry = task_scheduler::Registry::default();
+            registry.register_shared("parent", false, parent_handler);
+            registry.register_shared("child", false, child_handler);
+            let mut scheduler =
+                task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let parent_id = Uuid::new_v4();
+            let parent = Task::new(
+                parent_id,
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("parent".into(), false)
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            scheduler.inject_failure_commit_error_for_test(boundary);
+            let driver = Driver::start(scheduler);
+            let child_id = admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            proceed_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !driver.shared.state.lock().unwrap().stop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "injected failure did not stop driver"
+                );
+                thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+            let report = driver.shutdown_with_pending().unwrap();
+            assert!(report.failure().is_some());
+            assert!(
+                report
+                    .pending()
+                    .iter()
+                    .any(|p| p.task_id() == parent_id && p.failure_reason().is_some())
+            );
+            assert!(
+                report
+                    .pending()
+                    .iter()
+                    .any(|p| p.task_id() == child_id && p.completed().is_some())
+            );
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn panic_after_admission_aborts_and_joins_running_child() {
+        use crate::document::{Address, Documents};
+        use crate::task_scheduler::{AdmissionHandle, Handler, Step};
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+        struct Parent {
+            child: Arc<crate::task_tool::TaskTool>,
+            admitted: mpsc::Sender<Uuid>,
+            panic_now: Mutex<mpsc::Receiver<()>>,
+            address: Address,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_admission(
+                &self,
+                _: &Task,
+                documents: &mut crate::document::TaskDocuments<'_>,
+                admission: &AdmissionHandle<'_>,
+            ) -> Result<Step, String> {
+                documents.get(&self.address).unwrap();
+                documents
+                    .put(
+                        &self.address,
+                        json!({"staged": true}).as_object().unwrap().clone(),
+                    )
+                    .unwrap();
+                // Panic must take priority over a replayable input conflict.
+                documents.task_input_conflict = Some(b"test/conflict".to_vec());
+                let id = admission
+                    .admit_task_tool_child(&self.child, "child", json!({}))
+                    .unwrap();
+                self.admitted.send(id).unwrap();
                 self.panic_now.lock().unwrap().recv().unwrap();
                 panic!("parent failed after admission")
             }
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        let effects = Arc::new(AtomicUsize::new(0));
-        let (child_entered_tx, child_entered_rx) = mpsc::channel();
-        let (child_release_tx, child_release_rx) = mpsc::channel();
-        let child_release_rx = Mutex::new(child_release_rx);
-        let recorded = effects.clone();
-        let child_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
-            recorded.fetch_add(1, Ordering::SeqCst);
-            child_entered_tx.send(()).unwrap();
-            child_release_rx.lock().unwrap().recv().unwrap();
-            Ok(Step::Succeed(json!("external work returned")))
-        });
-        let child = Arc::new(crate::task_tool::TaskTool::new(
-            pi_rs_core::ToolSpec {
-                name: "child".into(),
-                description: "".into(),
-                parameters: json!({"type":"object"}),
-            },
-            "child",
-            false,
-            1,
-            child_handler.clone(),
-        ));
-        let (admitted_tx, admitted_rx) = mpsc::channel();
-        let (panic_tx, panic_rx) = mpsc::channel();
-        let parent_handler: Arc<dyn Handler> = Arc::new(Parent {
-            child,
-            admitted: admitted_tx,
-            panic_now: Mutex::new(panic_rx),
-        });
-        let mut registry = task_scheduler::Registry::default();
-        registry.register_shared("parent", false, parent_handler);
-        registry.register_shared("child", false, child_handler);
-        let scheduler = task_scheduler::Scheduler::open(&path, registry).unwrap();
-        // Recovery scans task keys in order. Keep the unsafe child before its
-        // parent to exercise interruption before the parent's cleanup cascade.
-        let parent_id = Uuid::from_u128(u128::MAX);
-        let conversation = Uuid::new_v4();
-        let parent = Task::new(
-            parent_id,
-            TaskOwner::Conversation(conversation),
-            Checkpoint {
-                phase: "start".into(),
-                data: json!(null),
-            },
-            3,
-        )
-        .unwrap()
-        .registered("parent".into(), false)
-        .into_task_tool();
-        scheduler.submit(&parent).unwrap();
-        let owner = scheduler.owner();
-        let driver = Driver::start(scheduler);
-        let child_id = admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        child_entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
-        assert_eq!(effects.load(Ordering::SeqCst), 1);
-        panic_tx.send(()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !driver.shared.state.lock().unwrap().stop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "driver did not stop after panic"
-            );
-            thread::yield_now();
-        }
-        let tasks = TaskStore::new(owner.store());
-        let parent = tasks.load(parent_id).unwrap().unwrap().task;
-        let child = tasks.load(child_id).unwrap().unwrap().task;
-        assert_eq!(parent.state(), &crate::task::TaskState::Running);
-        assert_eq!(child.state(), &crate::task::TaskState::Running);
-        assert!(!child.abort_requested());
-        let publication = driver.shared.failure_publication.admission().unwrap();
-        assert!(!publication.permits_admission(&owner, conversation, Some(&child)));
-        drop(publication);
-        child_release_tx.send(()).unwrap();
-        let report = driver.shutdown_with_pending().unwrap();
-        assert!(report.failure().is_some());
-        assert_eq!(report.pending().len(), 1);
-        assert_eq!(report.pending()[0].task_id(), child_id);
-        assert!(report.pending()[0].completed().is_some());
-        assert_eq!(
-            TaskStore::new(owner.store())
-                .load(child_id)
-                .unwrap()
-                .unwrap()
-                .task
-                .state(),
-            &crate::task::TaskState::Running
-        );
-        assert_eq!(effects.load(Ordering::SeqCst), 1);
-        drop(report);
-        drop(owner);
-        let child_replays = effects.clone();
-        let mut registry = task_scheduler::Registry::default();
-        registry.register("parent", false, |_: &Task| -> Result<Step, String> {
-            panic!("unsafe parent replayed")
-        });
-        registry.register("child", false, move |_: &Task| {
-            child_replays.fetch_add(1, Ordering::SeqCst);
-            Ok(Step::Succeed(json!("unexpected replay")))
-        });
-        let aborts = Arc::new(AtomicUsize::new(0));
-        let abort_count = aborts.clone();
-        assert!(registry.set_abort("child", move |_: &Task| {
-            abort_count.fetch_add(1, Ordering::SeqCst);
-            Ok(Step::Succeed(json!(null)))
-        }));
-        let mut recovered = task_scheduler::Scheduler::open(&path, registry).unwrap();
-        for _ in 0..20 {
-            if recovered.get(parent_id).unwrap().unwrap().is_terminal() {
-                break;
+        struct Stub;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for Stub {
+            async fn stream(
+                &self,
+                _: pi_rs_core::ModelRequest,
+            ) -> Result<pi_rs_core::ModelStream, pi_rs_core::Error> {
+                unreachable!()
             }
-            recovered.tick(0).unwrap();
         }
-        assert!(
-            matches!(recovered.get(parent_id).unwrap().unwrap().state(), crate::task::TaskState::Failed(reason) if reason.contains("requires reconciliation"))
-        );
-        assert!(
-            matches!(recovered.get(child_id).unwrap().unwrap().state(), crate::task::TaskState::Failed(reason) if reason.contains("requires reconciliation"))
-        );
-        assert_eq!(aborts.load(Ordering::SeqCst), 0);
-        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        for attached in [false, true] {
+            for parent_replay_safe in [false, true] {
+                for shutdown_early in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("db");
+                    let effects = Arc::new(AtomicUsize::new(0));
+                    let (child_entered_tx, child_entered_rx) = mpsc::channel();
+                    let (child_release_tx, child_release_rx) = mpsc::channel();
+                    let child_release_rx = Mutex::new(child_release_rx);
+                    let recorded = effects.clone();
+                    let child_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+                        recorded.fetch_add(1, Ordering::SeqCst);
+                        child_entered_tx.send(()).unwrap();
+                        child_release_rx.lock().unwrap().recv().unwrap();
+                        Ok(Step::Succeed(json!("external work returned")))
+                    });
+                    let child = Arc::new(crate::task_tool::TaskTool::new(
+                        pi_rs_core::ToolSpec {
+                            name: "child".into(),
+                            description: "".into(),
+                            parameters: json!({"type":"object"}),
+                        },
+                        "child",
+                        false,
+                        1,
+                        child_handler.clone(),
+                    ));
+                    let (admitted_tx, admitted_rx) = mpsc::channel();
+                    let (panic_tx, panic_rx) = mpsc::channel();
+                    let address = Address {
+                        scope: "test".into(),
+                        name: "panic-staged".into(),
+                        key: "".into(),
+                    };
+                    let parent_handler: Arc<dyn Handler> = Arc::new(Parent {
+                        child,
+                        admitted: admitted_tx,
+                        panic_now: Mutex::new(panic_rx),
+                        address: address.clone(),
+                    });
+                    let mut registry = task_scheduler::Registry::default();
+                    registry.register_shared("parent", parent_replay_safe, parent_handler);
+                    registry.register_shared("child", false, child_handler);
+                    let aborts = Arc::new(AtomicUsize::new(0));
+                    let abort_count = aborts.clone();
+                    assert!(registry.set_abort("child", move |_: &Task| {
+                        abort_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(Step::Succeed(json!(null)))
+                    }));
+                    let (scheduler, conversation, harness) = if attached {
+                        let mut harness = crate::runtime::Harness::open_paused(
+                            &path,
+                            crate::runtime::Options {
+                                model: Arc::new(Stub),
+                                tools: vec![],
+                                restart_limit: 3,
+                                max_turns: 3,
+                                uncertain_policy:
+                                    crate::recovery::UncertainPolicy::RequireReconciliation,
+                            },
+                        )
+                        .unwrap();
+                        let conversation = harness
+                            .create_conversation(crate::runtime::Config {
+                                model: "test".into(),
+                                system_prompt: "".into(),
+                                max_output_tokens: 10,
+                            })
+                            .unwrap();
+                        let scheduler = harness.attach_tasks(registry).unwrap();
+                        (scheduler, conversation, Some(harness))
+                    } else {
+                        (
+                            task_scheduler::Scheduler::open(&path, registry).unwrap(),
+                            Uuid::new_v4(),
+                            None,
+                        )
+                    };
+                    // Recovery scans task keys in order. Keep the unsafe child before its
+                    // parent to exercise interruption before the parent's cleanup cascade.
+                    let parent_id = Uuid::from_u128(u128::MAX);
+                    let parent = Task::new(
+                        parent_id,
+                        TaskOwner::Conversation(conversation),
+                        Checkpoint {
+                            phase: "start".into(),
+                            data: json!(null),
+                        },
+                        3,
+                    )
+                    .unwrap()
+                    .registered("parent".into(), parent_replay_safe)
+                    .into_task_tool();
+                    scheduler.submit(&parent).unwrap();
+                    let owner = scheduler.owner();
+                    let driver = Driver::start(scheduler);
+                    let child_id = admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    child_entered_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    assert_eq!(effects.load(Ordering::SeqCst), 1);
+                    panic_tx.send(()).unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let tasks = TaskStore::new(owner.store());
+                    while !tasks
+                        .load(child_id)
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .abort_requested()
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "panic did not mark the running child for abort"
+                        );
+                        thread::yield_now();
+                    }
+                    let parent = tasks.load(parent_id).unwrap().unwrap().task;
+                    let child = tasks.load(child_id).unwrap().unwrap().task;
+                    assert!(matches!(
+                        parent.state(),
+                        crate::task::TaskState::CompletingFailed(_)
+                    ));
+                    assert_eq!(child.state(), &crate::task::TaskState::Running);
+                    assert!(child.abort_requested());
+                    assert_eq!(aborts.load(Ordering::SeqCst), 0);
+                    assert_eq!(effects.load(Ordering::SeqCst), 1);
+                    assert!(
+                        Documents::new(owner.store())
+                            .get(&address)
+                            .unwrap()
+                            .is_none()
+                    );
+                    let report = if shutdown_early {
+                        let (started_tx, started_rx) = mpsc::channel();
+                        let (report_tx, report_rx) = mpsc::channel();
+                        let stop = thread::spawn(move || {
+                            started_tx.send(()).unwrap();
+                            report_tx.send(driver.shutdown_with_pending()).unwrap();
+                        });
+                        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        assert!(
+                            matches!(
+                                report_rx.recv_timeout(Duration::from_millis(100)),
+                                Err(mpsc::RecvTimeoutError::Timeout)
+                            ),
+                            "shutdown returned while child executor was running"
+                        );
+                        child_release_tx.send(()).unwrap();
+                        let report = report_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap();
+                        stop.join().unwrap();
+                        report
+                    } else {
+                        child_release_tx.send(()).unwrap();
+                        while !tasks.load(parent_id).unwrap().unwrap().task.is_terminal() {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "cleanup did not settle"
+                            );
+                            thread::yield_now();
+                        }
+                        let parent = tasks.load(parent_id).unwrap().unwrap().task;
+                        let child = tasks.load(child_id).unwrap().unwrap().task;
+                        assert!(
+                            matches!(parent.state(), crate::task::TaskState::Failed(reason)
+                        if reason.contains("panicked") && !reason.contains("parent failed after admission"))
+                        );
+                        assert_eq!(child.state(), &crate::task::TaskState::Cancelled);
+                        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+                        driver.shutdown_with_pending().unwrap()
+                    };
+                    assert!(report.failure().is_none());
+                    assert!(report.pending().is_empty());
+                    assert_eq!(effects.load(Ordering::SeqCst), 1);
+                    drop(report);
+                    drop(owner);
+                    drop(harness);
+                    let child_replays = effects.clone();
+                    let mut registry = task_scheduler::Registry::default();
+                    registry.register(
+                        "parent",
+                        parent_replay_safe,
+                        |_: &Task| -> Result<Step, String> { panic!("completed parent replayed") },
+                    );
+                    registry.register("child", false, move |_: &Task| {
+                        child_replays.fetch_add(1, Ordering::SeqCst);
+                        Ok(Step::Succeed(json!("unexpected replay")))
+                    });
+                    let abort_count = aborts.clone();
+                    registry.set_abort("child", move |_: &Task| {
+                        abort_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(Step::Succeed(json!(null)))
+                    });
+                    let mut recovered = task_scheduler::Scheduler::open(&path, registry).unwrap();
+                    for _ in 0..20 {
+                        if recovered.get(parent_id).unwrap().unwrap().is_terminal() {
+                            break;
+                        }
+                        recovered.tick(0).unwrap();
+                    }
+                    assert!(
+                        matches!(recovered.get(parent_id).unwrap().unwrap().state(), crate::task::TaskState::Failed(reason) if reason.contains("panicked"))
+                    );
+                    assert_eq!(
+                        recovered.get(child_id).unwrap().unwrap().state(),
+                        &crate::task::TaskState::Cancelled
+                    );
+                    assert_eq!(aborts.load(Ordering::SeqCst), 1);
+                    assert_eq!(effects.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
     }
 
     #[test]
