@@ -1521,6 +1521,122 @@ mod tests {
         let _ = driver.shutdown_with_pending().unwrap();
     }
 
+    struct ReceiptKillHook(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for ReceiptKillHook {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("after-invocations"))
+                .map_err(|e| e.to_string())?;
+            writeln!(file, "after").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn after_driver_real_kill_after_receipt_before_settlement() {
+        const ENV: &str = "PI_RS_AFTER_RECEIPT_KILL_DIR";
+        if let Some(root) = std::env::var_os(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(root.clone()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = after_fixture_host(
+                &root.join("db"),
+                tool,
+                Arc::new(ReceiptKillHook(root.clone())),
+            )
+            .into_scheduler_for_test();
+            let parent = before_parent();
+            scheduler.submit(&parent).unwrap();
+            std::fs::write(root.join("parent"), parent.id().to_string()).unwrap();
+            let _driver = crate::task_driver::Driver::start(scheduler);
+            loop {
+                std::thread::park();
+            }
+        }
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "async_task_tool::tests::after_driver_real_kill_after_receipt_before_settlement"])
+            .env(ENV, dir.path()).spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("receipt-ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "fixture exited before receipt"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receipt boundary timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let parent: Uuid = std::fs::read_to_string(dir.path().join("parent"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let leaf: Uuid = std::fs::read_to_string(dir.path().join("receipt-ready"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        {
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let saved = crate::task_store::TaskStore::new(&store)
+                .load(leaf)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.task.state(), &crate::task::TaskState::Running);
+            assert!(
+                matches!(crate::async_task_protocol::prepare_receipt_read(&store, leaf).unwrap().0,
+                Some(crate::async_task_protocol::ReceiptRead::Final(Outcome::Structured { data, .. })) if data == json!({"done":true}))
+            );
+        }
+        let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = after_fixture_host(
+            &dir.path().join("db"),
+            tool,
+            Arc::new(ReceiptKillHook(dir.path().to_owned())),
+        )
+        .into_driver();
+        assert_eq!(
+            wait_terminal(&driver, parent).state(),
+            &crate::task::TaskState::Succeeded(json!({"done":true}))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("after-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        driver.shutdown().unwrap();
+    }
+
     #[test]
     fn after_driver_reopen_rejects_changed_hook_identity() {
         let dir = tempfile::tempdir().unwrap();

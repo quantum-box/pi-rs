@@ -661,6 +661,23 @@ impl CompletedInvocation {
         };
         let outcome: pi_rs_core::Outcome = serde_json::from_value(value.clone())?;
         self.persist_unhooked_receipt(&intent)?;
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os("PI_RS_AFTER_RECEIPT_KILL_DIR")
+            && crate::async_task_protocol::read_raw_result(
+                self.lease.attachment.owner.store(),
+                self.running.task.id(),
+            )?
+            .is_some()
+        {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::write(dir.join("receipt.tmp"), self.running.task.id().to_string())
+                .expect("write receipt boundary marker");
+            std::fs::rename(dir.join("receipt.tmp"), dir.join("receipt-ready"))
+                .expect("publish receipt boundary marker");
+            loop {
+                std::thread::park();
+            }
+        }
         self.receipt_capture = false;
         if matches!(
             outcome,
