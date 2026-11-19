@@ -14409,13 +14409,13 @@ impl Harness {
         use std::collections::{HashMap, HashSet, VecDeque};
         let owner = self.owner.clone();
         loop {
-            if let Some(verify) = verify {
-                verify().map_err(Error::TaskScheduler)?;
-            }
             let store = owner.store();
             // Capture before discovery; creation can commit without rewriting
             // the observed owner. The checked prefixes catch such phantoms.
             let graph_version = store.put_version()?;
+            if let Some(verify) = verify {
+                verify().map_err(Error::TaskScheduler)?;
+            }
             let (fixed_task, nested_parent) = if let Some(intent) = maintenance {
                 let ts = crate::task_store::TaskStore::new(store);
                 match crate::task_scheduler::resolve_maintenance(&ts, intent)

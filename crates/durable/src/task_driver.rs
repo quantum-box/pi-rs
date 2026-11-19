@@ -1256,7 +1256,8 @@ impl Shared {
             shared: self.clone(),
         };
         let mut active = 0usize;
-        let mut maintenance: Option<task_scheduler::PendingMaintenance> = None;
+        let mut maintenance: Vec<task_scheduler::PendingMaintenance> = Vec::new();
+        let mut maintenance_cursor = 0usize;
         loop {
             if let Err(error) = self.cancel_marked_unhooked() {
                 self.stop_for_failure(format!("abort cancellation scan failed: {error}"));
@@ -1318,41 +1319,53 @@ impl Shared {
                     }
                 }
             }
-            if let Some(intent) = &maintenance {
-                if let Some(harness) = &self.harness {
+            if !maintenance.is_empty() {
+                let index = maintenance_cursor % maintenance.len();
+                let earlier: Vec<_> = maintenance[..index]
+                    .iter()
+                    .map(|item| item.intent())
+                    .collect();
+                let result = if let Some(harness) = &self.harness {
                     match harness.try_lock() {
                         Ok(harness) => {
                             let mut worker = harness.worker();
                             drop(harness);
-                            match intent.try_cleanup(&mut worker) {
-                                Ok(true) => {
-                                    maintenance = None;
-                                    progressed = true;
-                                    self.notify_work();
-                                }
-                                Ok(false) => (),
-                                Err(error) => {
-                                    fail_cleanup(self, error.to_string());
-                                    maintenance = None;
-                                }
-                            }
+                            maintenance[index].try_cleanup_after(&mut worker, &earlier)
                         }
-                        Err(std::sync::TryLockError::WouldBlock) => (),
+                        Err(std::sync::TryLockError::WouldBlock) => Ok(false),
                         Err(std::sync::TryLockError::Poisoned(_)) => {
-                            fail_cleanup(self, "harness lock poisoned".into());
-                            maintenance = None;
+                            Err(task_scheduler::Error::Poisoned)
                         }
                     }
                 } else {
-                    fail_cleanup(self, "missing maintenance harness".into());
-                    maintenance = None;
+                    Err(task_scheduler::Error::Handler(
+                        "missing maintenance harness".into(),
+                    ))
+                };
+                match result {
+                    Ok(true) => {
+                        maintenance.remove(index);
+                        maintenance_cursor = if maintenance.is_empty() {
+                            0
+                        } else {
+                            index % maintenance.len()
+                        };
+                        progressed = true;
+                        self.notify_work();
+                    }
+                    Ok(false) => maintenance_cursor = (index + 1) % maintenance.len(),
+                    Err(error) => {
+                        fail_cleanup(self, error.to_string());
+                        maintenance.clear();
+                        maintenance_cursor = 0;
+                    }
                 }
             }
             let stopped_now = stopped
                 || self
                     .reservation_stop
                     .load(std::sync::atomic::Ordering::Acquire);
-            let graph_pending = maintenance.is_some()
+            let graph_pending = !maintenance.is_empty()
                 || !self
                     .pending
                     .lock()
@@ -1375,26 +1388,22 @@ impl Shared {
                         if self
                             .registry_replacing
                             .load(std::sync::atomic::Ordering::Acquire)
-                            && maintenance.is_none()
+                            && maintenance.is_empty()
                             && !pending
                         {
                             Err(task_scheduler::Error::Busy)
-                        } else if maintenance.is_some()
+                        } else if !maintenance.is_empty()
                             || pending
                             || scheduler.has_published_outcomes().unwrap_or(true)
                         {
-                            match scheduler.try_reserve_independent_maintenance(
-                                maintenance.is_none(),
-                                maintenance.as_ref().map(|intent| intent.intent()),
-                            ) {
+                            let excluded: Vec<_> =
+                                maintenance.iter().map(|item| item.intent()).collect();
+                            match scheduler.try_reserve_independent_maintenance(true, &excluded) {
                                 Ok(task_scheduler::TickReservation::Progress(false))
                                     if active < WORKERS =>
                                 {
-                                    scheduler
-                                        .reserve_independent_root_excluding(
-                                            maintenance.as_ref().map(|intent| intent.intent()),
-                                        )
-                                        .map(|value| {
+                                    scheduler.reserve_independent_root_excluding(&excluded).map(
+                                        |value| {
                                             value
                                                 .map(task_scheduler::TickReservation::Invocation)
                                                 .unwrap_or(
@@ -1402,7 +1411,8 @@ impl Shared {
                                                         false,
                                                     ),
                                                 )
-                                        })
+                                        },
+                                    )
                                 }
                                 result => result,
                             }
@@ -1458,8 +1468,13 @@ impl Shared {
                                 hook();
                             }
                         }
-                        maintenance = Some(intent);
-                        progressed = true;
+                        if !maintenance
+                            .iter()
+                            .any(|item| item.intent() == intent.intent())
+                        {
+                            maintenance.push(intent);
+                            progressed = true;
+                        }
                     }
                     Ok(task_scheduler::TickReservation::Progress(value)) => progressed |= value,
                     Err(task_scheduler::Error::Busy) => (),
@@ -1496,7 +1511,7 @@ impl Shared {
             if stopping
                 && active == 0
                 && (failed_now
-                    || (!remaining && maintenance.is_none())
+                    || (!remaining && maintenance.is_empty())
                     || self.cleanup_stop.is_cancelled())
             {
                 break;
@@ -2233,7 +2248,15 @@ mod tests {
     use serde_json::json;
     use std::sync::mpsc;
 
-    fn maintenance_wait_fixture(root: &std::path::Path, reopen: bool, mutation: bool, park: bool) {
+    fn maintenance_wait_fixture(
+        root: &std::path::Path,
+        reopen: bool,
+        mutation: bool,
+        park: bool,
+        hold_first: bool,
+        merge_graphs: bool,
+        writer_busy: bool,
+    ) {
         use crate::runtime::{Harness, Options};
         use crate::task_store::{Save, Signal};
         use async_trait::async_trait;
@@ -2246,7 +2269,7 @@ mod tests {
                 unreachable!()
             }
         }
-        let harness = Harness::open_paused(
+        let mut harness = Harness::open_paused(
             root.join("db"),
             Options {
                 model: Arc::new(Stub),
@@ -2257,10 +2280,38 @@ mod tests {
             },
         )
         .unwrap();
+        let second_owner = if merge_graphs {
+            harness
+                .create_conversation(crate::runtime::Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 128,
+                })
+                .unwrap()
+        } else {
+            Uuid::from_u128(200)
+        };
         let mut registry = task_scheduler::Registry::default();
-        registry.register("work", true, |_: &Task| {
-            Ok(task_scheduler::Step::Succeed(json!("ok")))
-        });
+        let abort_log = root.join("multi-abort-log");
+        registry.register_with_abort(
+            "work",
+            true,
+            |_: &Task| Ok(task_scheduler::Step::Succeed(json!("ok"))),
+            move |task: &Task| {
+                use std::io::Write;
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&abort_log)
+                        .map_err(|e| e.to_string())?,
+                    "{}",
+                    task.id()
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(task_scheduler::Step::Succeed(json!("cancelled")))
+            },
+        );
         let scheduler = harness.attach_tasks(registry).unwrap();
         let owner = scheduler.owner();
         let tasks = TaskStore::new(owner.store());
@@ -2310,6 +2361,31 @@ mod tests {
             tasks
                 .update(&tasks.load(parent_id).unwrap().unwrap(), |task| {
                     task.hold_failure("held failure".into())
+                })
+                .unwrap();
+            let mut second = Task::new(
+                Uuid::from_u128(5),
+                TaskOwner::Conversation(second_owner),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), true);
+            second.start().unwrap();
+            let second_child = Task::new(
+                Uuid::from_u128(6),
+                TaskOwner::Task(second.id()),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), true);
+            tasks
+                .save(&[Save::Create(&second), Save::Create(&second_child)])
+                .unwrap();
+            tasks
+                .update(&tasks.load(second.id()).unwrap().unwrap(), |task| {
+                    task.hold_failure("second held failure".into())
                 })
                 .unwrap();
             tasks
@@ -2431,6 +2507,8 @@ mod tests {
         let poll = control.gate.lock().unwrap();
         let (reserved_tx, reserved_rx) = mpsc::channel();
         on_maintenance_reserved_for_test(parent_id, move || reserved_tx.send(()).unwrap());
+        let (second_tx, second_rx) = mpsc::channel();
+        on_maintenance_reserved_for_test(Uuid::from_u128(5), move || second_tx.send(()).unwrap());
         let (mutation_tx, mutation_rx) = mpsc::channel();
         let edge_key = crate::ownership_edge::edge_key(Uuid::from_u128(offset + 100));
         if mutation {
@@ -2462,10 +2540,16 @@ mod tests {
                 move || mutation_tx.send(()).unwrap(),
             );
         }
+        if hold_first {
+            crate::task_scheduler::set_maintenance_busy_for_test(parent_id, true);
+        }
         let driver = Driver::start_with_harness(scheduler, harness.worker());
         reserved_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("maintenance not reserved");
+        second_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second independent maintenance not retained");
         let abort_signal_id = Uuid::new_v4();
         {
             let _gate = owner.task_gate().lock().unwrap();
@@ -2556,6 +2640,15 @@ mod tests {
         ));
         assert!(matches!(
             tasks
+                .load(Uuid::from_u128(5))
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            TaskState::CompletingFailed(_)
+        ));
+        assert!(matches!(
+            tasks
                 .load(Uuid::from_u128(4))
                 .unwrap()
                 .unwrap()
@@ -2580,6 +2673,62 @@ mod tests {
                 .state(),
             TaskState::Waiting(_)
         ));
+        let (writer_busy_tx, writer_busy_rx) = mpsc::channel();
+        let (writer_handle_tx, writer_handle_rx) = mpsc::channel();
+        if writer_busy {
+            let (unlock_tx, unlock_rx) = mpsc::channel();
+            let path = root.join("db");
+            crate::task_scheduler::on_maintenance_checked_for_test(Uuid::from_u128(5), move || {
+                let (locked_tx, locked_rx) = mpsc::channel();
+                let writer = thread::spawn(move || {
+                    let db = rusqlite::Connection::open(path).unwrap();
+                    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    locked_tx.send(()).unwrap();
+                    unlock_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                    db.execute_batch("COMMIT").unwrap();
+                });
+                locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                writer_handle_tx.send(writer).unwrap();
+            });
+            crate::task_scheduler::on_maintenance_write_busy_for_test(
+                Uuid::from_u128(5),
+                move || {
+                    writer_busy_tx.send(()).unwrap();
+                    unlock_tx.send(()).unwrap();
+                },
+            );
+        }
+        let (overlap_tx, overlap_rx) = mpsc::channel();
+        if merge_graphs {
+            let edge = crate::ownership_edge::Edge {
+                task: parent_id,
+                task_owner: TaskOwner::Conversation(owner_id),
+                child: second_owner,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let key = crate::ownership_edge::edge_key(second_owner);
+            crate::task_scheduler::on_maintenance_overlap_for_test(Uuid::from_u128(5), move || {
+                overlap_tx.send(()).unwrap()
+            });
+            let writer = owner.clone();
+            crate::task_scheduler::on_maintenance_checked_for_test(Uuid::from_u128(5), move || {
+                // Insert after independence was checked but before the abort
+                // transaction commits; the graph fence must force a retry.
+                writer
+                    .store()
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&edge).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+            });
+        }
         if park {
             std::fs::write(root.join("maintenance-ready"), b"ready").unwrap();
             loop {
@@ -2587,14 +2736,73 @@ mod tests {
             }
         }
         drop(poll);
+        if writer_busy {
+            writer_busy_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("maintenance writer busy was not observed");
+            writer_handle_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+        if hold_first && merge_graphs {
+            overlap_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("merged graph was not serialized");
+            assert!(matches!(
+                driver.get(Uuid::from_u128(5)).unwrap().unwrap().state(),
+                TaskState::CompletingFailed(_)
+            ));
+            assert!(
+                !driver
+                    .get(Uuid::from_u128(6))
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
+            crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
+        } else if hold_first {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !driver
+                .get(Uuid::from_u128(5))
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+            {
+                assert!(
+                    Instant::now() < until,
+                    "later independent maintenance was starved"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(
+                driver.get(parent_id).unwrap().unwrap().state(),
+                TaskState::CompletingFailed(_)
+            ));
+            crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
+        }
         let until = Instant::now() + Duration::from_secs(10);
-        while !driver.get(parent_id).unwrap().unwrap().is_terminal() {
+        while !driver.get(parent_id).unwrap().unwrap().is_terminal()
+            || !driver
+                .get(Uuid::from_u128(5))
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+        {
             assert!(Instant::now() < until, "maintenance did not settle");
             thread::sleep(Duration::from_millis(5));
         }
         let related = driver.get(Uuid::from_u128(3)).unwrap().unwrap();
         assert!(related.abort_requested());
         assert!(!matches!(related.state(), TaskState::Succeeded(_)));
+        let log = std::fs::read_to_string(root.join("multi-abort-log")).unwrap();
+        for id in [child_id, Uuid::from_u128(6)] {
+            assert_eq!(
+                log.lines().filter(|line| *line == id.to_string()).count(),
+                1
+            );
+        }
         assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
     }
 
@@ -2602,15 +2810,41 @@ mod tests {
     fn maintenance_blocks_only_related_wait_graphs() {
         for mutation in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            maintenance_wait_fixture(dir.path(), false, mutation, false);
+            maintenance_wait_fixture(dir.path(), false, mutation, false, false, false, false);
         }
+    }
+
+    #[test]
+    fn maintenance_busy_on_first_graph_does_not_starve_second() {
+        let dir = tempfile::tempdir().unwrap();
+        maintenance_wait_fixture(dir.path(), false, false, false, true, false, false);
+    }
+
+    #[test]
+    fn maintenance_graph_merge_serializes_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        maintenance_wait_fixture(dir.path(), false, false, false, true, true, false);
+    }
+
+    #[test]
+    fn maintenance_writer_busy_retries_without_duplicate_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        maintenance_wait_fixture(dir.path(), false, false, false, false, false, true);
     }
 
     #[test]
     fn maintenance_waits_survive_kill_reopen() {
         const ENV: &str = "PI_TEST_MAINTENANCE_WAKE_KILL_1120";
         if let Some(root) = std::env::var_os(ENV) {
-            maintenance_wait_fixture(std::path::Path::new(&root), false, false, true);
+            maintenance_wait_fixture(
+                std::path::Path::new(&root),
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+            );
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2630,7 +2864,7 @@ mod tests {
         }
         worker.kill().unwrap();
         worker.wait().unwrap();
-        maintenance_wait_fixture(dir.path(), true, false, false);
+        maintenance_wait_fixture(dir.path(), true, false, false, false, false, false);
     }
 
     #[test]

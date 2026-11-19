@@ -474,7 +474,7 @@ When a running invocation's cancellation scan encounters an uncertain ownership 
 
 While a settlement retains its lease, the driver can poll waits, complete recovery and drain aborted descendants child-first in independent foreground ownership graphs. Signal, deadline, recovery and independent abort commits include a graph put fence; deferred abort maintenance rechecks the selected graph against published outcomes on each transaction retry. While maintenance is pending, wait polling, completion and recovery require proof that the affected task is outside the selected maintenance graph. A damaged ownership chain or a background boundary that prevents proving independence stays blocked until it can be reconciled.
 
-The driver still retains only one deferred maintenance intent at a time. A second graph whose completion itself needs a new deferred maintenance intent waits until that slot is released; independent completion without another intent, evidenced recovery, wait polling and abort-handler work can proceed.
+The driver retains separate deferred maintenance intents for independent graphs and retries them in rotation. It rechecks ownership before each cleanup transaction; if graphs become related, later intents wait behind the earlier one. Ambiguous ownership remains blocked, and a crash reconstructs pending work from the durable task graph.
 
 A sealed after phase that already has a raw Tool result uses its original intent and receipt evidence when identity acquisition is temporarily busy; it does not claim the Tool was undispatched or invoke it again. The release and retry retain checks for the recorded Tool identity, original dispatch attempt, raw result and any final receipt.
 
