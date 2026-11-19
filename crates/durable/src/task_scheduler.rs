@@ -2468,6 +2468,121 @@ impl AdmissionHandle<'_> {
         Ok(())
     }
 
+    /// Read receipt evidence while the original cleanup attempt remains live.
+    /// The checked read does not authorize callback execution.
+    #[allow(dead_code)]
+    pub(crate) fn read_live_conversation_cancel_receipt(
+        &self,
+        handler: &dyn Handler,
+        claim_id: Uuid,
+    ) -> Result<Option<ConversationCancelReceipt>, String> {
+        if !self.abort || self.standalone || self.lease.retired {
+            return Err("invalid conversation cleanup lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cleanup attempt or live child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation cancel registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
+            owner.store(),
+            &current.task,
+            boundary,
+        )?);
+        let (claim, claim_check) =
+            read_conversation_cancel_claim(owner.store(), current.task.id(), attempt, claim_id)?
+                .ok_or("missing claim")?;
+        if claim.lease != self.lease.token {
+            return Err("receipt lease mismatch".into());
+        }
+        checks.push(claim_check);
+        let key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+            current.task.id()
+        )
+        .into_bytes();
+        let entry = owner.store().get(&key).map_err(|e| e.to_string())?;
+        let receipt = if let Some(ref entry) = entry {
+            let receipt: ConversationCancelReceipt =
+                serde_json::from_slice(&entry.value).map_err(|_| "invalid receipt")?;
+            validate_conversation_cancel_receipt(&receipt, &claim)?;
+            checks.push(durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(entry.version),
+            });
+            Some(receipt)
+        } else {
+            checks.push(durable_store::Check {
+                key,
+                expected: durable_store::Expected::Missing,
+            });
+            None
+        };
+        owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &[],
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(receipt)
+    }
+
     /// Preserve a joined unsafe result while the exact invocation lease is
     /// held. Abort may have marked the task; it must not erase this evidence.
     pub(crate) fn capture_unsafe_durable_outcome(

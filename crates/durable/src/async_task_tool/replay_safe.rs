@@ -1689,8 +1689,25 @@ impl Handler for Executor {
                     claim: _claim.clone(),
                     result: "test evidence only".into(),
                 };
+                if admission
+                    .read_live_conversation_cancel_receipt(self, _claim.claim_id)?
+                    .is_some()
+                {
+                    return Err("unexpected pre-existing receipt".into());
+                }
                 admission.store_conversation_cancel_receipt(self, &receipt)?;
                 admission.store_conversation_cancel_receipt(self, &receipt)?;
+                if admission.read_live_conversation_cancel_receipt(self, _claim.claim_id)?
+                    != Some(receipt.clone())
+                {
+                    return Err("receipt read mismatch".into());
+                }
+                if admission
+                    .read_live_conversation_cancel_receipt(self, uuid::Uuid::new_v4())
+                    .is_ok()
+                {
+                    return Err("foreign claim accepted".into());
+                }
                 let mut foreign = receipt.clone();
                 foreign.claim.attempt = uuid::Uuid::new_v4();
                 if admission
