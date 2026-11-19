@@ -184,12 +184,62 @@ impl StandaloneBeforeHookHost {
         ));
         Ok(Arc::new(AsyncTaskTool { adapter, identity }))
     }
+    /// Bind an exact, host-identified extension selection to this standalone
+    /// task tool. The selection and its order are part of the durable identity.
+    /// The selected hooks have the same replay and capability restrictions as
+    /// `register_tool`; in particular this phase only invokes before hooks.
+    pub fn register_selected_tool(
+        &mut self,
+        kind: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        implementation: &str,
+        version: u32,
+        snapshot: &crate::extension::Snapshot,
+        names: &[String],
+    ) -> Result<Arc<AsyncTaskTool>, String> {
+        let selection = snapshot
+            .stable_selection(names)
+            .ok_or("extension selection is missing, duplicated, or unidentified")?;
+        let resolved = snapshot
+            .resolve_stable(names, &selection)
+            .ok_or("extension selection changed")?;
+        let identity = format!(
+            "selection-v1:{}",
+            serde_json::to_string(&selection).map_err(|e| e.to_string())?
+        );
+        self.register_tool(
+            kind,
+            tool,
+            implementation,
+            version,
+            &identity,
+            Arc::new(SelectedBeforeHooks(resolved)),
+        )
+    }
     pub fn into_driver(self) -> crate::task_driver::Driver {
         crate::task_driver::Driver::start(self.scheduler)
     }
     #[cfg(test)]
     pub(crate) fn into_scheduler_for_test(self) -> crate::task_scheduler::Scheduler {
         self.scheduler
+    }
+}
+
+struct SelectedBeforeHooks(crate::extension::Resolved);
+#[async_trait::async_trait]
+impl crate::extension::Hook for SelectedBeforeHooks {
+    async fn before_tool(
+        &self,
+        call: &crate::extension::ToolCall,
+        context: &crate::extension::Context<'_>,
+    ) -> Result<crate::extension::BeforeTool, String> {
+        let (next, decision, _reports) = self.0.before_tool(call.clone(), context).await;
+        Ok(match decision {
+            crate::extension::BeforeTool::Pass if next.arguments != call.arguments => {
+                crate::extension::BeforeTool::Rewrite(next.arguments)
+            }
+            other => other,
+        })
     }
 }
 
@@ -830,6 +880,65 @@ mod tests {
         assert!(received.try_recv().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = driver.shutdown_with_pending();
+    }
+
+    #[test]
+    fn selected_extensions_execute_in_driver_and_bind_order_to_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(BeforeToolFixture(sent));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut extensions = crate::extension::Registry::default();
+        for (name, mode) in [("first", 1), ("second", 0)] {
+            extensions
+                .install_identified(
+                    crate::extension::Extension {
+                        name: name.into(),
+                        hooks: vec![Arc::new(BeforeFixture {
+                            decision: mode,
+                            entered: None,
+                            calls: calls.clone(),
+                        })],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(1, name.into(), vec!["hook".into()])
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let snapshot = extensions.snapshot();
+        let names = vec!["first".into(), "second".into()];
+        let mut registry = Registry::default();
+        let cell = Arc::new(std::sync::OnceLock::new());
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+        let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
+        assert!(
+            host.register_selected_tool(
+                "invalid",
+                tool.clone(),
+                "backend",
+                1,
+                &snapshot,
+                &["missing".into()]
+            )
+            .is_err()
+        );
+        let adapter = host
+            .register_selected_tool("leaf", tool, "backend", 1, &snapshot, &names)
+            .unwrap();
+        assert!(cell.set(adapter).is_ok());
+        let scheduler = host.into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert!(matches!(
+            wait_terminal(&driver, parent.id()).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(received.try_recv().is_err());
+        let _ = driver.shutdown_with_pending().unwrap();
     }
 
     #[test]
