@@ -215,6 +215,24 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
+    if case == "kill_after_claim" {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
+        );
+        let claim_path = path.clone();
+        crate::task_scheduler::on_conversation_claim_after_commit(root_id, move || {
+            let store = durable_store::Store::open(claim_path).unwrap();
+            let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
+            let claim = store.get(key.as_bytes()).unwrap().expect("claim committed");
+            std::fs::write(directory.join("ready"), claim.value).unwrap();
+            loop {
+                std::thread::park();
+            }
+        });
+        scheduler.abort_task(root_id).unwrap();
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
     if case == "late_after_claim" {
         crate::task_scheduler::enable_test_conversation_receipt(root_id);
         let mutation_path = path.clone();
@@ -777,4 +795,262 @@ async fn conversation_receipt_terminal_marker_survives_process_kill() {
         .is_err()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn conversation_cancel_claim_kill_worker() {
+    if std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").is_some() {
+        exercise_conversation_park_claim("kill_after_claim").await;
+    }
+}
+
+#[tokio::test]
+async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph_runs() {
+    use pi_rs_durable::async_task_tool::{
+        DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
+    };
+    use pi_rs_durable::task::{Checkpoint, Task, TaskOwner};
+    use pi_rs_durable::task_scheduler::Step;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Cancel(Arc<AtomicUsize>);
+    #[async_trait]
+    impl DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for late in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::conversation_cancel_claim_kill_worker",
+                "--nocapture",
+            ])
+            .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = dir.path().join("ready");
+        let wait = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if ready.exists() {
+                    break;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("claim worker exited: {status}");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if wait.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("claim barrier timed out");
+        }
+        let claim_bytes = std::fs::read(ready).unwrap();
+        let claim: crate::task_scheduler::ConversationCancelClaim =
+            serde_json::from_slice(&claim_bytes).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let path = dir.path().join("db");
+        let store = durable_store::Store::open(&path).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
+        let running = tasks.load(claim.task).unwrap().unwrap();
+        assert_eq!(running.task.state(), &TaskState::Running);
+        assert_eq!(running.task.attempt_id(), Some(claim.attempt));
+        assert!(
+            store
+                .get(&crate::task_scheduler::conversation_cancel_terminal_key(
+                    claim.task
+                ))
+                .unwrap()
+                .is_none()
+        );
+        if late {
+            let prefix = format!("durable/unsafe-park-async/{}/", claim.task);
+            let (mut key, entry) = store
+                .list(prefix.as_bytes())
+                .unwrap()
+                .into_iter()
+                .find(|(key, _)| key.ends_with(b"/intent"))
+                .expect("park intent");
+            let intent: Task = serde_json::from_slice(&entry.value).unwrap();
+            let receipt = pi_rs_durable::async_task_tool::UnsafeDurableReceipt {
+                task_id: claim.task,
+                attempt_id: intent.attempt_id().unwrap(),
+                outcome: Outcome::Pending {
+                    reference: "late-remote-job".into(),
+                },
+            };
+            key.extend_from_slice(b"/receipt");
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&receipt).unwrap(),
+                    }],
+                )
+                .unwrap();
+        }
+        let unsafe_prefix = format!("durable/unsafe-park-async/{}/", claim.task);
+        let intents_before: Vec<_> = store
+            .list(unsafe_prefix.as_bytes())
+            .unwrap()
+            .into_iter()
+            .filter_map(|(key, _)| key.ends_with(b"/intent").then_some(key))
+            .collect();
+        assert!(!intents_before.is_empty());
+        drop(store);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register("independent", true, |_: &Task| {
+            Ok(Step::Succeed(json!("ok")))
+        });
+        let leaf = register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            Arc::new(AsyncTool {
+                name: "leaf",
+                child: None,
+                gate: None,
+                early: false,
+            }),
+            "leaf",
+            1,
+            vec![],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap();
+        let tool = Arc::new(AsyncTool {
+            name: "root",
+            child: Some("leaf"),
+            gate: None,
+            early: false,
+        });
+        let identity_tool: Arc<dyn Tool> = tool.clone();
+        let _identity =
+            pi_rs_durable::nested_identity::register(&identity_tool, Some("backend-v1".into()))
+                .unwrap();
+        let root = register_conversation_unsafe_durable_tool_with_park_cancel(
+            &mut registry,
+            tool,
+            "root",
+            1,
+            vec![leaf.clone()],
+            "cancel-v1",
+            Arc::new(Cancel(calls.clone())),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        )
+        .unwrap();
+        let options = Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: vec![root.register(), leaf.register()],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut scheduler = Scheduler::open(&path, options).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let other = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let other_id = uuid::Uuid::new_v4();
+        let other_task = Task::new(
+            other_id,
+            TaskOwner::Conversation(other),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("independent".into(), true);
+        driver.submit(&other_task).unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let root = tasks.load(claim.task).unwrap().unwrap();
+                let other = tasks.load(other_id).unwrap().unwrap();
+                if root.task.is_terminal() && other.task.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery and unrelated graph must progress");
+        let terminal = tasks.load(claim.task).unwrap().unwrap();
+        assert!(
+            matches!(terminal.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation required"))
+        );
+        assert!(matches!(
+            tasks.load(other_id).unwrap().unwrap().task.state(),
+            TaskState::Succeeded(_)
+        ));
+        let marker_key = crate::task_scheduler::conversation_cancel_terminal_key(claim.task);
+        let marker_entry = store.get(&marker_key).unwrap().unwrap();
+        let marker: crate::task_scheduler::ConversationCancelTerminalMarker =
+            serde_json::from_slice(&marker_entry.value).unwrap();
+        assert_eq!(marker.claim_id, claim.claim_id);
+        assert_eq!(marker.attempt, claim.attempt);
+        assert_eq!(marker.running_task_version, running.version);
+        assert_eq!(marker.terminal_task, terminal.task);
+        let task_commit = store
+            .commit_for_version(&crate::task_store::key(claim.task), terminal.version)
+            .unwrap();
+        assert!(task_commit.is_some());
+        assert_eq!(
+            task_commit,
+            store
+                .commit_for_version(&marker_key, marker_entry.version)
+                .unwrap()
+        );
+        let claim_key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-claim",
+            claim.task
+        );
+        assert_eq!(
+            store.get(claim_key.as_bytes()).unwrap().unwrap().value,
+            claim_bytes
+        );
+        let intents_after: Vec<_> = store
+            .list(unsafe_prefix.as_bytes())
+            .unwrap()
+            .into_iter()
+            .filter_map(|(key, _)| key.ends_with(b"/intent").then_some(key))
+            .collect();
+        assert_eq!(
+            intents_after, intents_before,
+            "recovery must not redispatch the Tool"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        if late {
+            let receipts =
+                pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, claim.task)
+                    .unwrap();
+            assert!(receipts.iter().any(|r| matches!(&r.outcome, Outcome::Pending { reference } if reference == "late-remote-job")));
+        }
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
+        let _ = scheduler.shutdown().await;
+    }
 }

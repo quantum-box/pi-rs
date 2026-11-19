@@ -8220,6 +8220,74 @@ impl Scheduler {
                     continue;
                 }
                 if item.task.abort_requested() {
+                    // A committed conversation cancel claim belongs to this
+                    // interrupted attempt. Never reserve a new attempt for it:
+                    // neither the claim nor a possible callback outcome can be
+                    // attributed to that new attempt. Settle the original
+                    // running record and its marker in one transaction instead.
+                    let owner = self.owner();
+                    let store = owner.store();
+                    let claim_key = conversation_cancel_claim_key(item.task.id());
+                    if let Some(entry) = store.get(&claim_key).map_err(task_store::Error::from)? {
+                        let claim: ConversationCancelClaim =
+                            serde_json::from_slice(&entry.value)
+                                .map_err(|e| Error::Handler(e.to_string()))?;
+                        if claim.version != 2
+                            || claim.task != item.task.id()
+                            || Some(claim.attempt) != item.task.attempt_id()
+                            || claim.claim_id.is_nil()
+                            || claim.attempt.is_nil()
+                            || claim.lease.is_nil()
+                            || claim.kind.is_empty()
+                            || Some(claim.kind.as_str()) != item.task.kind()
+                            || claim.definition_version == 0
+                            || claim.definition_version != item.task.definition_version()
+                            || claim.checkpoint.phase != "replay-safe-async-wait"
+                            || claim.checkpoint != *item.task.checkpoint()
+                        {
+                            return Err(Error::Handler(
+                                "conversation terminal claim mismatch".into(),
+                            ));
+                        }
+                        let mut next = item.clone();
+                        next.task
+                            .fail(
+                                "interrupted conversation cancel claim; reconciliation required"
+                                    .into(),
+                            )
+                            .map_err(Error::Transition)?;
+                        let marker = ConversationCancelTerminalMarker {
+                            version: 1,
+                            claim_id: claim.claim_id,
+                            attempt: claim.attempt,
+                            running_task_version: item.version,
+                            terminal_task: next.task.clone(),
+                        };
+                        let marker_key = conversation_cancel_terminal_key(item.task.id());
+                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        batch.checks.extend([
+                            durable_store::Check {
+                                key: claim_key,
+                                expected: durable_store::Expected::Version(entry.version),
+                            },
+                            durable_store::Check {
+                                key: marker_key.clone(),
+                                expected: durable_store::Expected::Missing,
+                            },
+                        ]);
+                        batch.mutations.push(durable_store::Mutation::Put {
+                            key: marker_key,
+                            value: serde_json::to_vec(&marker)
+                                .map_err(|e| Error::Handler(e.to_string()))?,
+                        });
+                        match store.commit(&batch.checks, &batch.mutations) {
+                            Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                self.deferred_recovery.extend(deferred);
+                                continue 'scan;
+                            }
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    }
                     // Defer even restart-limit failure until owned cleanup settles.
                     self.ts().update(&item, |task| task.recover())?;
                     continue;
