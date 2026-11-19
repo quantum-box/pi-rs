@@ -524,6 +524,14 @@ impl DurableTaskHost for Host<'_, '_> {
                     if expected != result { return Err("unsafe child result lacks matching final evidence".into()); }
                     AsyncTaskResult::Outcome(result)
                 }
+                TaskState::Failed(_) if task.checkpoint().phase == "replay-safe-async-after" && outcome.is_some() => {
+                    let raw = outcome.expect("checked outcome");
+                    if docs.unsafe_after_is_incomplete(&task, &raw)? {
+                        AsyncTaskResult::AfterIncomplete(raw)
+                    } else {
+                        AsyncTaskResult::Uncertain(raw)
+                    }
+                }
                 TaskState::Failed(reason) => AsyncTaskResult::Uncertain(outcome.unwrap_or_else(|| Outcome::Unknown(format!("unsafe child requires reconciliation: {reason}")))),
                 TaskState::Cancelled if has_intent => AsyncTaskResult::Uncertain(outcome.unwrap_or_else(|| Outcome::Unknown("unsafe child was cancelled after dispatch; reconciliation may be required".into()))),
                 TaskState::Cancelled => AsyncTaskResult::Cancelled,
@@ -1331,7 +1339,7 @@ impl Handler for Executor {
             Ok::<_, String>((result, args))
         })?;
         if !self.replay_safe {
-            admission.capture_unsafe_durable_outcome(&intent, &result)?;
+            admission.capture_unsafe_durable_outcome(&intent, &result, &args)?;
             #[cfg(test)]
             {
                 let hook = park_hooks().lock().unwrap().remove(&task.id());

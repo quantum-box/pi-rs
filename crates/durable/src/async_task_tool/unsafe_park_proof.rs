@@ -2,6 +2,7 @@
 use super::{DurableToolStep, DurableWait};
 use crate::task::{Checkpoint, Task, TaskState, WaitFor};
 use durable_store::{Check, Expected, Mutation, Store};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// An executor-joined unsafe Tool outcome retained independently of settlement.
@@ -49,6 +50,7 @@ pub(crate) fn prepare_park_evidence(
     intent_key: &[u8],
     checkpoint: &serde_json::Value,
     wait: &DurableWait,
+    arguments: &serde_json::Value,
 ) -> Result<(Vec<Check>, Vec<Mutation>), String> {
     let attempt = task
         .attempt_id()
@@ -59,13 +61,46 @@ pub(crate) fn prepare_park_evidence(
         checkpoint: checkpoint.clone(),
         wait: wait.clone(),
     };
-    prepare_evidence(
+    let (mut checks, mut mutations) = prepare_evidence(
         store,
         task,
         intent_key,
         b"/park-evidence",
         serde_json::to_vec(&evidence).map_err(|e| e.to_string())?,
-    )
+    )?;
+    // The first unhooked attempt prepares arguments after intent. Bind them
+    // in separate joined evidence without treating the proposal as a park.
+    if task.checkpoint().phase == "initial"
+        && !task
+            .kind()
+            .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook."))
+    {
+        let (extra_checks, extra_mutations) = prepare_evidence(
+            store,
+            task,
+            intent_key,
+            b"/prepared-arguments",
+            argument_digest(arguments)?,
+        )?;
+        for check in extra_checks {
+            if !checks.contains(&check) {
+                checks.push(check);
+            }
+        }
+        mutations.extend(extra_mutations);
+    }
+    Ok((checks, mutations))
+}
+
+fn argument_digest(arguments: &serde_json::Value) -> Result<Vec<u8>, String> {
+    if !arguments.is_object() {
+        return Err("invalid prepared arguments evidence".into());
+    }
+    let mut evidence = b"pi-rs.unsafe-park.arguments.sha256.v1\0".to_vec();
+    evidence.extend_from_slice(&Sha256::digest(
+        serde_json::to_vec(arguments).map_err(|e| e.to_string())?,
+    ));
+    Ok(evidence)
 }
 
 fn prepare_evidence(
@@ -311,6 +346,51 @@ pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, 
     {
         return Err("parked attempt identity changed".into());
     }
+    // Hooked attempts, and every resumed attempt, already durably stored the
+    // prepared arguments before dispatch. The new park must preserve them;
+    // comparing only the task and park proof would allow both to be replaced.
+    match previous_task.checkpoint().phase.as_str() {
+        "replay-safe-async-prepared" | "replay-safe-async-wait" => {
+            let arguments = previous_task
+                .checkpoint()
+                .data
+                .get("arguments")
+                .ok_or("parked attempt lacks prepared arguments")?;
+            if !arguments.is_object() || proof.checkpoint.data.get("arguments") != Some(arguments) {
+                return Err(
+                    "parked attempt prepared arguments changed; reconciliation required".into(),
+                );
+            }
+        }
+        "initial"
+            if !previous_task
+                .kind()
+                .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook.")) => {}
+        _ => return Err("invalid parked attempt checkpoint".into()),
+    }
+    let argument_check = if previous_task.checkpoint().phase == "initial" {
+        let mut argument_key = previous_key.clone();
+        argument_key.extend_from_slice(b"/prepared-arguments");
+        let argument_entry = store.get(&argument_key).map_err(|e| e.to_string())?.ok_or(
+            "unsafe first park lacks prepared arguments evidence; reconciliation required",
+        )?;
+        let arguments = proof
+            .checkpoint
+            .data
+            .get("arguments")
+            .ok_or("unsafe park lacks prepared arguments")?;
+        if argument_entry.value != argument_digest(arguments)? {
+            return Err(
+                "parked attempt prepared arguments changed; reconciliation required".into(),
+            );
+        }
+        Some(Check {
+            key: argument_key,
+            expected: Expected::Version(argument_entry.version),
+        })
+    } else {
+        None
+    };
     let mut result_key = previous_key.clone();
     result_key.extend_from_slice(b"/result");
     let result = store
@@ -333,7 +413,7 @@ pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, 
     if !same_wait || proof.checkpoint.data.get("checkpoint") != Some(&checkpoint) {
         return Err("committed park result mismatch".into());
     }
-    Ok(vec![
+    let mut checks = vec![
         Check {
             key: park_key,
             expected: Expected::Version(entry.version),
@@ -346,7 +426,9 @@ pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, 
             key: result_key,
             expected: Expected::Version(result.version),
         },
-    ])
+    ];
+    checks.extend(argument_check);
+    Ok(checks)
 }
 
 /// Bind a replayable after phase to the exact committed unsafe Complete and its joined receipt.
@@ -505,6 +587,47 @@ pub(crate) fn prepare_hook_phase(
         _ => return Err("unsupported unsafe hook settlement".into()),
     }
     Ok((checks, mutations))
+}
+
+/// Validate a terminal failed after phase before exposing its known raw
+/// result as after-incomplete. A validated final marker instead indicates
+/// that later owned-work failure made the overall result uncertain.
+pub(crate) fn after_is_incomplete(
+    store: &Store,
+    task: &Task,
+    raw: &pi_rs_core::Outcome,
+) -> Result<bool, String> {
+    if !matches!(task.state(), TaskState::Failed(_))
+        || !task
+            .kind()
+            .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook."))
+    {
+        return Err("invalid unsafe after-incomplete state".into());
+    }
+    after_checks(store, task)?;
+    let stored: pi_rs_core::Outcome = serde_json::from_value(
+        task.checkpoint()
+            .data
+            .get("outcome")
+            .cloned()
+            .ok_or("missing after outcome")?,
+    )
+    .map_err(|_| "invalid after outcome")?;
+    if &stored != raw {
+        return Err("unsafe after-incomplete evidence mismatch".into());
+    }
+    if store
+        .get(&hook_final_key(task.id()))
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        // The hook finalized before a later owned-child failure. The raw
+        // outcome remains uncertain, but the hook is not incomplete.
+        read_hook_final(store, task, raw)?;
+        Ok(false)
+    } else {
+        Ok(true)
+    }
 }
 
 pub(crate) fn read_hook_final(

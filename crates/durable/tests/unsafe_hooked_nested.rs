@@ -151,6 +151,13 @@ impl DurableAsyncTool for UnsafeChild {
                     "abort-job".into(),
                 )));
             }
+            if self.mode == "two-parks" && data["job"] == "external-17" {
+                let next = host.start_child("gate2", "gate", json!({})).await?;
+                return Ok(DurableToolStep::Park {
+                    checkpoint: json!({"gate":next,"job":"external-18"}),
+                    wait: DurableWait::All(vec![next]),
+                });
+            }
             let outcome = match self.mode.as_str() {
                 "pending" => Outcome::Pending {
                     reference: "remote-job".into(),
@@ -161,15 +168,58 @@ impl DurableAsyncTool for UnsafeChild {
             Ok(DurableToolStep::Complete(outcome))
         } else {
             let gate = host.start_child("gate", "gate", json!({})).await?;
-            Ok(DurableToolStep::Park {
-                checkpoint: json!({"gate":gate,"job":"external-17"}),
-                wait: DurableWait::All(vec![gate]),
-            })
+            if self.mode == "finalized-uncertain" {
+                let bad = host.start_child("bad", "bad", json!({})).await?;
+                Ok(DurableToolStep::Park {
+                    checkpoint: json!({"gate":gate,"job":"external-17"}),
+                    wait: DurableWait::Any(vec![gate, bad]),
+                })
+            } else {
+                Ok(DurableToolStep::Park {
+                    checkpoint: json!({"gate":gate,"job":"external-17"}),
+                    wait: DurableWait::All(vec![gate]),
+                })
+            }
         }
+    }
+}
+struct BadLeaf {
+    dir: PathBuf,
+}
+#[async_trait]
+impl Tool for BadLeaf {
+    fn spec(&self) -> ToolSpec {
+        spec("bad")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for BadLeaf {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        std::fs::write(self.dir.join("bad-running"), b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !self.dir.join("release-bad").exists() {
+            if Instant::now() >= deadline {
+                return Err("bad child release timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(DurableToolStep::Complete(Outcome::Pending {
+            reference: "bad-job".into(),
+        }))
     }
 }
 struct Parent {
     mode: String,
+    dir: PathBuf,
 }
 #[async_trait]
 impl Tool for Parent {
@@ -200,6 +250,27 @@ impl DurableAsyncTool for Parent {
                 ("unknown", Some(AsyncTaskResult::Uncertain(Outcome::Unknown(reason)))) => {
                     reason == "unknown-job"
                 }
+                (
+                    "after-incomplete",
+                    Some(AsyncTaskResult::AfterIncomplete(Outcome::Succeeded(value))),
+                ) if value == "raw" => {
+                    std::fs::write(self.dir.join("after-incomplete-observed"), b"yes").unwrap();
+                    true
+                }
+                (
+                    "finalized-uncertain",
+                    Some(AsyncTaskResult::Uncertain(Outcome::Succeeded(value))),
+                ) if value == "raw" => {
+                    std::fs::write(self.dir.join("finalized-uncertain-observed"), b"yes").unwrap();
+                    true
+                }
+                (
+                    "after-incomplete-missing",
+                    Some(AsyncTaskResult::Uncertain(Outcome::Unknown(_))),
+                ) => {
+                    std::fs::write(self.dir.join("unknown-observed"), b"yes").unwrap();
+                    true
+                }
                 (_, Some(AsyncTaskResult::Outcome(Outcome::Succeeded(value)))) => {
                     value == "rewritten"
                 }
@@ -213,10 +284,21 @@ impl DurableAsyncTool for Parent {
             )))
         } else {
             let child = host.start_child("child", "unsafe", json!({})).await?;
-            Ok(DurableToolStep::Park {
-                checkpoint: json!({"child":child}),
-                wait: DurableWait::All(vec![child]),
-            })
+            if matches!(
+                self.mode.as_str(),
+                "after-incomplete-missing" | "after-incomplete-corrupt"
+            ) {
+                let sibling = host.start_child("sibling", "gate", json!({})).await?;
+                Ok(DurableToolStep::Park {
+                    checkpoint: json!({"child":child, "sibling":sibling}),
+                    wait: DurableWait::All(vec![child, sibling]),
+                })
+            } else {
+                Ok(DurableToolStep::Park {
+                    checkpoint: json!({"child":child}),
+                    wait: DurableWait::All(vec![child]),
+                })
+            }
         }
     }
 }
@@ -241,6 +323,22 @@ fn build_with_parent(
     assert!(registry.set_abort("gate", |_: &Task| Ok(Step::Succeed(json!(null)))));
     let gate = Arc::new(TaskTool::new(spec("gate"), "gate", true, 1, handler));
     let mut host = StandaloneBeforeHookHost::open(dir.join("db"), registry).unwrap();
+    let mut child_tools = vec![gate.clone()];
+    if mode == "finalized-uncertain" {
+        let bad = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(BadLeaf { dir: dir.into() }),
+                "bad-v1",
+                1,
+                vec![],
+                "bad-hook",
+                Arc::new(Pass),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        child_tools.push(bad);
+    }
     let child = host
         .register_unsafe_durable_tool_with_hook(
             Arc::new(UnsafeChild {
@@ -250,7 +348,7 @@ fn build_with_parent(
             }),
             "unsafe-hooked",
             1,
-            vec![gate],
+            child_tools,
             identity,
             Arc::new(Hooks {
                 dir: dir.into(),
@@ -260,13 +358,16 @@ fn build_with_parent(
             ReplaySafeAuthorization::host_attests_replay_safe(),
         )
         .unwrap();
-    let parent: Arc<dyn DurableAsyncTool> = Arc::new(Parent { mode: mode.into() });
+    let parent: Arc<dyn DurableAsyncTool> = Arc::new(Parent {
+        mode: mode.into(),
+        dir: dir.into(),
+    });
     let parent = if parent_safe {
         host.register_replay_safe_durable_tool_with_hook(
             parent,
             "parent",
             1,
-            vec![child],
+            vec![child, gate],
             "parent-hook",
             Arc::new(Pass),
             ReplaySafeAuthorization::host_attests_replay_safe(),
@@ -277,7 +378,7 @@ fn build_with_parent(
             parent,
             "parent",
             1,
-            vec![child],
+            vec![child, gate],
             "parent-hook",
             Arc::new(Pass),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
@@ -372,8 +473,15 @@ fn kill_fixture() {
     };
     let dir = PathBuf::from(dir);
     let cut = std::env::var("PI_UNSAFE_HOOK_CUT").unwrap();
-    let (host, parent) = build(&dir, "success", Some(&cut), "hook-v1");
-    let root = host.start_replay_safe_root(&parent, json!({}), 5).unwrap();
+    let mode = std::env::var("PI_UNSAFE_HOOK_MODE").unwrap_or_else(|_| "success".into());
+    let limit = std::env::var("PI_UNSAFE_HOOK_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let (host, parent) = build(&dir, &mode, Some(&cut), "hook-v1");
+    let root = host
+        .start_replay_safe_root(&parent, json!({}), limit)
+        .unwrap();
     let driver = host.into_driver();
     let child_id = child(&driver, root);
     if cut == "before" || cut == "execute" {
@@ -383,6 +491,23 @@ fn kill_fixture() {
         if matches!(cut.as_str(), "after" | "resume-execute") {
             signal(&driver, gate_id);
             wait_file(&dir.join("cut"));
+        } else if cut == "second-park" {
+            signal(&driver, gate_id);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let task = driver.get(child_id).unwrap().unwrap();
+                if matches!(task.state(), TaskState::Waiting(_))
+                    && task.checkpoint().data["checkpoint"]["job"] == "external-18"
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "second park not committed: {:?}",
+                    task.state()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
     std::fs::write(
@@ -396,10 +521,15 @@ fn kill_fixture() {
     }
 }
 fn killed(dir: &Path, cut: &str) -> (Uuid, Uuid) {
+    killed_mode(dir, cut, "success", 5)
+}
+fn killed_mode(dir: &Path, cut: &str, mode: &str, limit: u32) -> (Uuid, Uuid) {
     let mut process = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "kill_fixture"])
         .env("PI_UNSAFE_HOOK_DIR", dir)
         .env("PI_UNSAFE_HOOK_CUT", cut)
+        .env("PI_UNSAFE_HOOK_MODE", mode)
+        .env("PI_UNSAFE_HOOK_LIMIT", limit.to_string())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -705,7 +835,8 @@ fn foreign_hooked_unsafe_child_is_rejected() {
         host_b
             .register_replay_safe_durable_tool_with_hook(
                 Arc::new(Parent {
-                    mode: "success".into()
+                    mode: "success".into(),
+                    dir: second.path().into(),
                 }),
                 "parent",
                 1,
@@ -716,4 +847,192 @@ fn foreign_hooked_unsafe_child_is_rejected() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn unsafe_wake_rejects_replaced_task_and_park_arguments() {
+    for (cut, mode, expected_effects) in [
+        ("park", "success", "initial\n"),
+        ("second-park", "two-parks", "initial\nresume\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, child_id) = killed_mode(dir.path(), cut, mode, 5);
+        {
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let mut task_key = b"durable/task/".to_vec();
+            task_key.extend_from_slice(child_id.as_bytes());
+            let park_key = format!("durable/unsafe-park-async/{child_id}/park").into_bytes();
+            let task_entry = store.get(&task_key).unwrap().unwrap();
+            let park_entry = store.get(&park_key).unwrap().unwrap();
+            let mut task: Value = serde_json::from_slice(&task_entry.value).unwrap();
+            let mut proof: Value = serde_json::from_slice(&park_entry.value).unwrap();
+            assert_eq!(
+                task["checkpoint"]["data"]["arguments"],
+                json!({"bound":true})
+            );
+            assert_eq!(
+                proof["checkpoint"]["data"]["arguments"],
+                json!({"bound":true})
+            );
+            task["checkpoint"]["data"]["arguments"] = json!({"bound":false});
+            proof["checkpoint"]["data"]["arguments"] = json!({"bound":false});
+            store
+                .commit(
+                    &[
+                        durable_store::Check {
+                            key: task_key.clone(),
+                            expected: durable_store::Expected::Version(task_entry.version),
+                        },
+                        durable_store::Check {
+                            key: park_key.clone(),
+                            expected: durable_store::Expected::Version(park_entry.version),
+                        },
+                    ],
+                    &[
+                        durable_store::Mutation::Put {
+                            key: task_key,
+                            value: serde_json::to_vec(&task).unwrap(),
+                        },
+                        durable_store::Mutation::Put {
+                            key: park_key,
+                            value: serde_json::to_vec(&proof).unwrap(),
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+        let (host, _) = build(dir.path(), mode, None, "hook-v1");
+        let driver = host.into_driver();
+        let gate_id = gate(&driver, child_id);
+        signal(&driver, gate_id);
+        let failed = until(&driver, child_id, |s| matches!(s, TaskState::Failed(_)));
+        assert!(
+            matches!(failed.state(),TaskState::Failed(reason) if reason.contains("prepared arguments changed")),
+            "{cut}: {:?}",
+            failed.state()
+        );
+        until(&driver, root, |s| matches!(s, TaskState::Failed(_)));
+        driver.shutdown().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("effects")).unwrap(),
+            expected_effects
+        );
+    }
+}
+
+#[test]
+fn unsafe_after_restart_limit_exposes_after_incomplete_to_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, child_id) = killed_mode(dir.path(), "after", "after-incomplete", 1);
+    let (host, _) = build(dir.path(), "after-incomplete", None, "hook-v1");
+    let driver = host.into_driver();
+    let child_task = until(&driver, child_id, |s| matches!(s, TaskState::Failed(_)));
+    assert!(
+        matches!(child_task.state(),TaskState::Failed(reason) if reason.contains("hook restart limit"))
+    );
+    let root_task = until(&driver, root, |s| matches!(s, TaskState::Failed(_)));
+    assert!(
+        matches!(root_task.state(),TaskState::Failed(reason) if reason.contains("reconciliation"))
+    );
+    assert!(
+        dir.path().join("after-incomplete-observed").exists(),
+        "parent did not observe AfterIncomplete(raw)"
+    );
+    driver.shutdown().unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let receipts =
+        pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, child_id).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].outcome, Outcome::Succeeded("raw".into()));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("effects")).unwrap(),
+        "initial\nresume\n"
+    );
+}
+
+#[test]
+fn unsafe_after_incomplete_requires_intact_receipt_and_missing_is_uncertain() {
+    for mode in ["after-incomplete-missing", "after-incomplete-corrupt"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, child_id) = killed_mode(dir.path(), "after", mode, 1);
+        let (host, _) = build(dir.path(), mode, None, "hook-v1");
+        let driver = host.into_driver();
+        until(&driver, child_id, |s| matches!(s, TaskState::Failed(_)));
+        let root_task = until(&driver, root, |s| matches!(s, TaskState::Waiting(_)));
+        let sibling: AsyncTaskCall =
+            serde_json::from_value(root_task.checkpoint().data["checkpoint"]["sibling"].clone())
+                .unwrap();
+        until(&driver, sibling.task_id(), |s| {
+            matches!(s, TaskState::Waiting(_))
+        });
+        {
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let prefix = format!("durable/unsafe-park-async/{child_id}/");
+            let (key, entry) = store
+                .list(prefix.as_bytes())
+                .unwrap()
+                .into_iter()
+                .find(|(key, _)| key.ends_with(b"/intent/receipt"))
+                .unwrap();
+            let mutation = if mode == "after-incomplete-missing" {
+                durable_store::Mutation::Delete { key: key.clone() }
+            } else {
+                let mut receipt: Value = serde_json::from_slice(&entry.value).unwrap();
+                receipt["outcome"] =
+                    serde_json::to_value(Outcome::Succeeded("forged".into())).unwrap();
+                durable_store::Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&receipt).unwrap(),
+                }
+            };
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key,
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[mutation],
+                )
+                .unwrap();
+        }
+        signal(&driver, sibling.task_id());
+        let parent = until(&driver, root, |s| matches!(s, TaskState::Failed(_)));
+        if mode == "after-incomplete-missing" {
+            assert!(dir.path().join("unknown-observed").exists());
+            assert!(
+                matches!(parent.state(),TaskState::Failed(reason) if reason.contains("reconciliation"))
+            );
+        } else {
+            assert!(!dir.path().join("unknown-observed").exists());
+            assert!(!dir.path().join("after-incomplete-observed").exists());
+            assert!(
+                matches!(parent.state(),TaskState::Failed(reason) if reason.contains("receipt mismatch")),
+                "{:?}",
+                parent.state()
+            );
+        }
+        driver.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn finalized_after_then_uncertain_descendant_is_not_after_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, parent) = build(dir.path(), "finalized-uncertain", None, "hook-v1");
+    let root = host.start_replay_safe_root(&parent, json!({}), 5).unwrap();
+    let driver = host.into_driver();
+    let child_id = child(&driver, root);
+    let gate_id = gate(&driver, child_id);
+    wait_file(&dir.path().join("bad-running"));
+    signal(&driver, gate_id);
+    until(&driver, child_id, |s| matches!(s, TaskState::Completing(_)));
+    std::fs::write(dir.path().join("release-bad"), b"go").unwrap();
+    let failed = until(&driver, child_id, |s| matches!(s, TaskState::Failed(_)));
+    assert!(
+        matches!(failed.state(),TaskState::Failed(reason) if reason.contains("reconciliation"))
+    );
+    until(&driver, root, |s| matches!(s, TaskState::Failed(_)));
+    assert!(dir.path().join("finalized-uncertain-observed").exists());
+    assert!(!dir.path().join("after-incomplete-observed").exists());
+    driver.shutdown().unwrap();
 }

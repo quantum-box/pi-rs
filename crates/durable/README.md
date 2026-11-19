@@ -836,7 +836,19 @@ checkpoint and prepared arguments, the owned child admission and wait, and a
 park proof commit together. A wake can dispatch a fresh unsafe attempt only
 after checking the committed park proof, its original attempt intent and Park
 result against the checkpoint and ended children. Missing or inconsistent
-proof fails closed. Killing an execution before its park commits, or killing a
+proof fails closed. Prepared arguments are bound to the previous prepared or
+parked checkpoint. For an unhooked first attempt, which prepares after its
+intent, joined park evidence also records a digest of the actual prepared
+arguments, using the versioned `pi-rs.unsafe-park.arguments.sha256.v1`
+evidence format. First parks from `216a7eb` and earlier writers without that
+evidence cannot be safely resumed and require reconciliation. The runtime
+never backfills a missing digest from raw input or the current park checkpoint:
+argument preparation may have changed it. An absent, unknown-version or
+mismatched record fails closed while retaining the existing park evidence. This
+policy permits old and new records to coexist; operators must reconcile the
+external job independently before deciding how to proceed. A legacy later park
+can still resume if its preceding attempt contains a matching parked checkpoint
+and all existing proof checks pass. Killing an execution before its park commits, or killing a
 resumed execution before its next park or completion commits, leaves an
 interrupted unsafe attempt requiring reconciliation; it is not replayed.
 
@@ -845,7 +857,12 @@ including if abort was requested during execution. After stopping the driver,
 `read_unsafe_durable_receipts` reads these per-attempt outcomes from the store
 as reconciliation evidence. `Pending` and `Unknown` results are retained
 there and leave the task failed for reconciliation, rather than being replayed
-or treated as completed. A returned Park proposal is also retained independently
+or treated as completed. If a hooked child's after phase fails before final
+hook settlement, its parent receives `AfterIncomplete` only after validating
+the after checkpoint, outcome receipt and committed result. If the hook already
+settled and owned work later fails, its result remains `Uncertain` instead. A
+missing outcome remains `Uncertain`; inconsistent evidence fails closed. The
+parent's unsafe-descendant reconciliation fence still applies. A returned Park proposal is also retained independently
 and can be read using `read_unsafe_durable_park_evidence`, including when abort
 prevents settlement. It may contain external job identifiers, but is evidence
 only: it does not mean the child or park committed and cannot authorize wake.

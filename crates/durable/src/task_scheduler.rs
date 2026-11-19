@@ -1545,6 +1545,7 @@ impl AdmissionHandle<'_> {
         &self,
         intent: &[u8],
         result: &crate::async_task_tool::DurableToolStep,
+        arguments: &serde_json::Value,
     ) -> Result<(), String> {
         if !self.standalone || self.abort || self.lease.retired || self.running.task.replay_safe() {
             return Err("invalid unsafe result executor".into());
@@ -1587,6 +1588,7 @@ impl AdmissionHandle<'_> {
                     intent,
                     checkpoint,
                     wait,
+                    arguments,
                 )?
             }
         };

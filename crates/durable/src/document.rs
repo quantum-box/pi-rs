@@ -2414,6 +2414,15 @@ impl<'a> TaskDocuments<'a> {
         self.signals.batch.mutations.extend(mutations);
         Ok(())
     }
+    /// Caller must first read unsafe child evidence, which adds the prefix
+    /// fence covering these checks to the parent's checked settlement.
+    pub(crate) fn unsafe_after_is_incomplete(
+        &self,
+        task: &crate::task::Task,
+        raw: &pi_rs_core::Outcome,
+    ) -> Result<bool, String> {
+        crate::async_task_tool::unsafe_park_proof::after_is_incomplete(self.store, task, raw)
+    }
     pub(crate) fn read_unsafe_hook_final(
         &self,
         task: &crate::task::Task,
