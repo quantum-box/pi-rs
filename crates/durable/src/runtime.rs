@@ -12770,6 +12770,8 @@ impl Harness {
     /// A callback-start fence returns `TaskPublicationBusy` before any write;
     /// callers may retry the same operation after the fence is released.
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
+        // Do not allocate a process-local control for a nonexistent ID.
+        self.load(id)?;
         let gate = self.owner.conversation_controls().get(id).callback_start;
         let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
@@ -14227,6 +14229,8 @@ impl Harness {
         id: Uuid,
         submission: Uuid,
     ) -> Result<WithdrawResult, Error> {
+        // Do not allocate a process-local control for a nonexistent ID.
+        self.load(id)?;
         let gate = self.owner.conversation_controls().get(id).callback_start;
         let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
         loop {
@@ -25139,6 +25143,30 @@ mod scheduler_tests {
         writer.join().unwrap();
         let id = harness.create_conversation(config()).unwrap();
         assert_eq!(harness.conversation(id).unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn missing_reset_and_withdraw_do_not_create_callback_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        for _ in 0..128 {
+            let id = Uuid::new_v4();
+            assert!(matches!(scheduler.reset(id, None), Err(Error::NotFound)));
+            assert!(matches!(
+                scheduler.withdraw_submission(id, Uuid::new_v4()),
+                Err(Error::NotFound)
+            ));
+            assert!(matches!(
+                scheduler
+                    .harness
+                    .owner
+                    .conversation_controls()
+                    .try_callback_start(id),
+                Err(durable_store::controls::CallbackStartGateError::Missing)
+            ));
+        }
+        scheduler.shutdown().await.unwrap();
     }
 
     #[tokio::test]

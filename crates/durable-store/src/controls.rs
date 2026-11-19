@@ -26,6 +26,7 @@ pub struct CallbackStartLease(Arc<std::sync::atomic::AtomicBool>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallbackStartGateError {
     Poisoned,
+    Missing,
 }
 
 impl CallbackStartGate {
@@ -132,24 +133,14 @@ impl ConversationControls {
     ) -> Result<Option<CallbackStartLease>, CallbackStartGateError> {
         use std::sync::TryLockError;
         let gate = {
-            let mut entries = match self.entries.try_lock() {
+            let entries = match self.entries.try_lock() {
                 Ok(entries) => entries,
                 Err(TryLockError::WouldBlock) => return Ok(None),
                 Err(TryLockError::Poisoned(_)) => return Err(CallbackStartGateError::Poisoned),
             };
             entries
-                .entry(id)
-                .or_insert_with(|| Control {
-                    callback_start: CallbackStartGate::default(),
-                    gate: Arc::new(Mutex::new(())),
-                    worker: Arc::new(tokio::sync::Mutex::new(())),
-                    abort_execution: Arc::new(tokio::sync::Mutex::new(())),
-                    summary_execution: Arc::new(tokio::sync::RwLock::new(())),
-                    nested_poll: Arc::new(tokio::sync::Mutex::new(())),
-                    next_poll: Arc::new(Mutex::new(None)),
-                    cancel: self.root.child_token(),
-                    cleanup_cancel: CancellationToken::new(),
-                })
+                .get(&id)
+                .ok_or(CallbackStartGateError::Missing)?
                 .callback_start
                 .clone()
         };
@@ -256,6 +247,8 @@ mod tests {
         let controls = ConversationControls::default();
         let id = Uuid::from_u128(1);
         let other = Uuid::from_u128(2);
+        controls.get(id);
+        controls.get(other);
         let lease = controls.try_callback_start(id).unwrap().unwrap();
         assert!(controls.try_callback_start(id).unwrap().is_none());
         assert!(controls.try_callback_start(other).unwrap().is_some());
@@ -269,6 +262,18 @@ mod tests {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(lease.poll_first(future.as_mut(), &mut context).is_pending());
         assert!(controls.try_callback_start(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn callback_start_for_unknown_conversations_does_not_allocate_controls() {
+        let controls = ConversationControls::default();
+        for id in 1..=1024 {
+            assert!(matches!(
+                controls.try_callback_start(Uuid::from_u128(id)),
+                Err(CallbackStartGateError::Missing)
+            ));
+        }
+        assert!(controls.entries.lock().unwrap().is_empty());
     }
 
     #[test]
