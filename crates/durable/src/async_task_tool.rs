@@ -102,7 +102,35 @@ pub fn register_conversation_unsafe_durable_tool_with_park_cancel(
         children,
         None,
         false,
-        Some((cancel_identity.to_owned(), cancel)),
+        Some((cancel_identity.to_owned(), cancel, false)),
+    )
+}
+
+/// Explicitly enable at-most-once cancellation for a conversation-owned,
+/// unhooked unsafe root. An interrupted callback requires reconciliation.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _authorization: UnsafeDurableAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+        return Err("invalid cancel identity".into());
+    }
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        None,
+        false,
+        Some((cancel_identity.to_owned(), cancel, true)),
     )
 }
 

@@ -128,11 +128,97 @@ async fn exercise_conversation_park_claim(case: &str) {
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    struct Cancel(Arc<AtomicUsize>);
+    struct Cancel(
+        Arc<AtomicUsize>,
+        String,
+        std::path::PathBuf,
+        pi_rs_durable::nested_identity::IdentityHandle,
+    );
     #[async_trait]
     impl DurableParkCancel for Cancel {
-        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+        async fn cancel(&self, _: Value, _: Value, context: ToolContext) -> Result<(), String> {
             self.0.fetch_add(1, Ordering::SeqCst);
+            if self.1 == "dispatch_late" {
+                let store = durable_store::Store::open(&self.2).unwrap();
+                let prefix = format!("durable/unsafe-park-async/{}/", context.operation_id);
+                let (mut key, entry) = store
+                    .list(prefix.as_bytes())
+                    .unwrap()
+                    .into_iter()
+                    .find(|(key, _)| key.ends_with(b"/intent"))
+                    .unwrap();
+                let intent: pi_rs_durable::task::Task =
+                    serde_json::from_slice(&entry.value).unwrap();
+                let receipt = pi_rs_durable::async_task_tool::UnsafeDurableReceipt {
+                    task_id: context.operation_id,
+                    attempt_id: intent.attempt_id().unwrap(),
+                    outcome: Outcome::Pending {
+                        reference: "late-job".into(),
+                    },
+                };
+                key.extend_from_slice(b"/receipt");
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&receipt).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+            }
+            if self.1 == "dispatch_hold" {
+                while !self.2.with_extension("release").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            if self.1 == "dispatch_panic" {
+                panic!("cancel panic");
+            }
+            if self.1 == "dispatch_guard" {
+                use futures_util::FutureExt;
+                let update = self
+                    .3
+                    .update(Some("different".into()), || {})
+                    .now_or_never()
+                    .unwrap();
+                assert!(update.is_err(), "identity lease must cover first poll");
+                let store = durable_store::Store::open(&self.2).unwrap();
+                let task = pi_rs_durable::task_store::TaskStore::new(&store)
+                    .load(context.operation_id)
+                    .unwrap()
+                    .unwrap();
+                let pi_rs_durable::task::TaskOwner::Conversation(conversation) = task.task.owner()
+                else {
+                    panic!("not a conversation root")
+                };
+                let signal = crate::conversation_signal::Signal::new(
+                    uuid::Uuid::new_v4(),
+                    *conversation,
+                    "during-first-poll".into(),
+                    json!(1),
+                );
+                assert!(matches!(
+                    crate::conversation_signal::Inbox::new(&store).send(&signal),
+                    Err(crate::conversation_signal::Error::CallbackStartBusy)
+                ));
+            }
+            if std::env::var("PI_TEST_CONV_CALLBACK_KILL").ok().as_deref() == Some("1") {
+                let dir = std::path::PathBuf::from(
+                    std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
+                );
+                let store = durable_store::Store::open(dir.join("db")).unwrap();
+                let key = format!(
+                    "durable/replay-safe-async/{}/conversation-park-cancel-claim",
+                    context.operation_id
+                );
+                let claim = store.get(key.as_bytes()).unwrap().unwrap();
+                std::fs::write(dir.join("ready"), claim.value).unwrap();
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
     }
@@ -168,17 +254,19 @@ async fn exercise_conversation_park_claim(case: &str) {
     let identity_handle =
         pi_rs_durable::nested_identity::register(&identity_tool, Some("backend-v1".into()))
             .unwrap();
-    let root = register_conversation_unsafe_durable_tool_with_park_cancel(
-        &mut registry,
-        root_tool,
-        "root",
-        1,
-        vec![leaf.clone()],
-        "cancel-v1",
-        Arc::new(Cancel(calls.clone())),
-        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
-    )
-    .unwrap();
+    let root = if case.starts_with("dispatch_") {
+        pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
+            &mut registry, root_tool, "root", 1, vec![leaf.clone()], "cancel-v1",
+            Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone())),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        )
+    } else {
+        register_conversation_unsafe_durable_tool_with_park_cancel(
+            &mut registry, root_tool, "root", 1, vec![leaf.clone()], "cancel-v1",
+            Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone())),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        )
+    }.unwrap();
     let options = Options {
         model: Arc::new(ModelStub {
             arguments: "{}".into(),
@@ -215,6 +303,259 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
+    if case == "dispatch_signal_before" || case == "dispatch_abort_before" {
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_hook = finished.clone();
+        crate::task_scheduler::on_conversation_start_result(root_id, move || {
+            finished_hook.store(true, Ordering::SeqCst)
+        });
+        let after_path = path.clone();
+        let abort_first = case == "dispatch_abort_before";
+        crate::task_scheduler::on_conversation_claim_after_commit(root_id, move || {
+            let writer = durable_store::Store::open(after_path).unwrap();
+            if abort_first {
+                let key = format!("runtime/conversation/{conversation}").into_bytes();
+                let entry = writer.get(&key).unwrap().unwrap();
+                let mut value: Value = serde_json::from_slice(&entry.value).unwrap();
+                value["abort_requested"] = json!(true);
+                writer
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&value).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+            } else {
+                let signal = crate::task_store::Signal::new(
+                    uuid::Uuid::new_v4(),
+                    root_id,
+                    "before-first-poll".into(),
+                    json!(1),
+                );
+                crate::task_store::TaskStore::new(&writer)
+                    .send_signal(&signal)
+                    .unwrap();
+            }
+        });
+        scheduler.abort_task(root_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !finished.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        assert!(store.get(key.as_bytes()).unwrap().is_none());
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
+        return;
+    }
+    if case == "dispatch_kill" {
+        scheduler.abort_task(root_id).unwrap();
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
+    if case == "dispatch_late_after_receipt" || case == "dispatch_late_during_settlement" {
+        let writer_path = path.clone();
+        let inject = move || {
+            let writer = durable_store::Store::open(writer_path).unwrap();
+            let prefix = format!("durable/unsafe-park-async/{root_id}/");
+            let (mut key, entry) = writer
+                .list(prefix.as_bytes())
+                .unwrap()
+                .into_iter()
+                .find(|(key, _)| key.ends_with(b"/intent"))
+                .unwrap();
+            let intent: pi_rs_durable::task::Task = serde_json::from_slice(&entry.value).unwrap();
+            let receipt = pi_rs_durable::async_task_tool::UnsafeDurableReceipt {
+                task_id: root_id,
+                attempt_id: intent.attempt_id().unwrap(),
+                outcome: Outcome::Pending {
+                    reference: "late-after-receipt".into(),
+                },
+            };
+            key.extend_from_slice(b"/receipt");
+            writer
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&receipt).unwrap(),
+                    }],
+                )
+                .unwrap();
+        };
+        if case == "dispatch_late_during_settlement" {
+            crate::task_scheduler::on_conversation_cancel_settlement(root_id, inject);
+        } else {
+            crate::task_scheduler::on_conversation_receipt_saved(root_id, inject);
+        }
+        scheduler.abort_task(root_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let task = tasks.load(root_id).unwrap().unwrap();
+        assert!(
+            matches!(task.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
+        return;
+    }
+    if case == "dispatch_late" || case == "dispatch_panic" {
+        scheduler.abort_task(root_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
+        let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        assert!(store.get(key.as_bytes()).unwrap().is_none());
+        assert!(
+            store
+                .get(format!("runtime/conversation-callback-start/{conversation}").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        let unknown =
+            format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-unknown");
+        assert!(store.get(unknown.as_bytes()).unwrap().is_some());
+        let evidence =
+            pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, root_id).unwrap();
+        if case == "dispatch_late" {
+            assert!(evidence.iter().any(
+                |r| matches!(&r.outcome, Outcome::Pending { reference } if reference == "late-job")
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        return;
+    }
+    if case == "dispatch_hold" {
+        let other = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.abort_task(root_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let signal = crate::conversation_signal::Signal::new(
+            uuid::Uuid::new_v4(),
+            other,
+            "other-graph".into(),
+            json!(1),
+        );
+        scheduler.send_signal(&signal).unwrap();
+        std::fs::write(path.with_extension("release"), b"release").unwrap();
+        let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.get(key.as_bytes()).unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
+        return;
+    }
+    if case == "dispatch_ok" || case == "dispatch_guard" {
+        scheduler.abort_task(root_id).unwrap();
+        let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if store.get(key.as_bytes()).unwrap().is_some() {
+                    break;
+                }
+                if tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                    panic!(
+                        "callback terminated without receipt: {:?}",
+                        tasks.load(root_id).unwrap().unwrap().task
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            store
+                .get(format!("runtime/conversation-callback-start/{conversation}").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(format!("durable/task-callback-start/{root_id}").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
+        return;
+    }
     if case.starts_with("start_") {
         use std::sync::atomic::{AtomicBool, Ordering};
         let case_name = case.to_owned();
@@ -1046,6 +1387,51 @@ async fn conversation_start_markers_survive_process_kill() {
 }
 
 #[tokio::test]
+async fn conversation_cancel_panic_preserves_unknown_and_releases_marker() {
+    exercise_conversation_park_claim("dispatch_panic").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_late_outcome_at_settlement_retries_and_reconciles() {
+    exercise_conversation_park_claim("dispatch_late_during_settlement").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_late_outcome_after_receipt_requires_reconciliation() {
+    exercise_conversation_park_claim("dispatch_late_after_receipt").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_late_outcome_prevents_success_receipt() {
+    exercise_conversation_park_claim("dispatch_late").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_abort_before_first_poll_prevents_dispatch() {
+    exercise_conversation_park_claim("dispatch_abort_before").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_signal_before_first_poll_prevents_dispatch() {
+    exercise_conversation_park_claim("dispatch_signal_before").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_first_poll_fences_signal_and_identity_update() {
+    exercise_conversation_park_claim("dispatch_guard").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_pending_callback_does_not_block_other_graph() {
+    exercise_conversation_park_claim("dispatch_hold").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_dispatches_once_and_stores_receipt() {
+    exercise_conversation_park_claim("dispatch_ok").await;
+}
+
+#[tokio::test]
 async fn conversation_start_marker_transaction_fences_real_driver_races() {
     for case in [
         "start_ok",
@@ -1215,7 +1601,12 @@ async fn conversation_receipt_terminal_marker_survives_process_kill() {
 #[tokio::test]
 async fn conversation_cancel_claim_kill_worker() {
     if std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").is_some() {
-        exercise_conversation_park_claim("kill_after_claim").await;
+        let case = if std::env::var("PI_TEST_CONV_CALLBACK_KILL").ok().as_deref() == Some("1") {
+            "dispatch_kill"
+        } else {
+            "kill_after_claim"
+        };
+        exercise_conversation_park_claim(case).await;
     }
 }
 
@@ -1235,11 +1626,12 @@ async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph
             Ok(())
         }
     }
-    for (late, busy, uncertain) in [
-        (false, false, false),
-        (true, false, false),
-        (true, true, false),
-        (false, false, true),
+    for (late, busy, uncertain, dispatch) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (true, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1249,6 +1641,10 @@ async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph
                 "--nocapture",
             ])
             .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+            .env(
+                "PI_TEST_CONV_CALLBACK_KILL",
+                if dispatch { "1" } else { "0" },
+            )
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -1358,17 +1754,19 @@ async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph
         let _identity =
             pi_rs_durable::nested_identity::register(&identity_tool, Some("backend-v1".into()))
                 .unwrap();
-        let root = register_conversation_unsafe_durable_tool_with_park_cancel(
-            &mut registry,
-            tool,
-            "root",
-            1,
-            vec![leaf.clone()],
-            "cancel-v1",
-            Arc::new(Cancel(calls.clone())),
-            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
-        )
-        .unwrap();
+        let root = if dispatch {
+            pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
+                &mut registry, tool, "root", 1, vec![leaf.clone()], "cancel-v1",
+                Arc::new(Cancel(calls.clone())),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+        } else {
+            register_conversation_unsafe_durable_tool_with_park_cancel(
+                &mut registry, tool, "root", 1, vec![leaf.clone()], "cancel-v1",
+                Arc::new(Cancel(calls.clone())),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+        }.unwrap();
         let options = Options {
             model: Arc::new(ModelStub {
                 arguments: "{}".into(),

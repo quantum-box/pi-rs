@@ -356,7 +356,7 @@ pub(super) fn register_conversation_candidate(
         Arc<dyn crate::extension::Hook>,
     )>,
     replay_safe: bool,
-    conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
+    conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
 ) -> Result<Arc<TaskTool>, String> {
     let identity_tool: Arc<dyn Tool> = tool.clone();
     let identity_guard = if conversation_cancel.is_some() {
@@ -417,9 +417,13 @@ pub(super) fn register_conversation_candidate(
         &child_identities,
     ))
     .map_err(|e| e.to_string())?;
-    let encoded = if let Some((cancel_identity, _)) = &conversation_cancel {
+    let encoded = if let Some((cancel_identity, _, enabled)) = &conversation_cancel {
         serde_json::to_vec(&(
-            "conversation-cancel-v2",
+            if *enabled {
+                "conversation-cancel-dispatch-v1"
+            } else {
+                "conversation-cancel-v2"
+            },
             encoded,
             cancel_identity,
             &conversation_identity,
@@ -876,7 +880,7 @@ struct Executor {
     unavailable: bool,
     park_cancel: Option<(Arc<dyn DurableParkCancel>, bool)>,
     // Registered and identity-bound, but deliberately not dispatchable yet.
-    _conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
+    _conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
     conversation_identity: Option<String>,
     woken_identity: Option<String>,
 }
@@ -1625,6 +1629,11 @@ impl Executor {
 }
 
 impl Handler for Executor {
+    fn conversation_cancel_dispatch_enabled(&self) -> bool {
+        self._conversation_cancel
+            .as_ref()
+            .is_some_and(|(_, _, enabled)| *enabled)
+    }
     fn conversation_cleanup_identity_lease(
         &self,
     ) -> Result<crate::nested_identity::IdentityLease, crate::nested_identity::LeaseFailure> {
@@ -1696,7 +1705,7 @@ impl Handler for Executor {
             {
                 return Err("conversation cancel tool identity changed".into());
             }
-            let (_, cancel) = self
+            let (_, cancel, enabled) = self
                 ._conversation_cancel
                 .as_ref()
                 .ok_or("missing cancel registration")?;
@@ -1825,9 +1834,94 @@ impl Handler for Executor {
                     return Err("foreign attempt accepted".into());
                 }
             }
-            return Err(
-                "conversation cancel callback is not enabled; reconciliation required".into(),
+            if !enabled {
+                return Err(
+                    "conversation cancel callback is not enabled; reconciliation required".into(),
+                );
+            }
+            let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
+                .map_err(|_| "invalid parked cancel checkpoint")?;
+            if stored.version != 2
+                || stored.park_attempt.is_none()
+                || !stored.arguments.is_object()
+                || !jsonschema::validator_for(&self.identity.spec.parameters)
+                    .is_ok_and(|schema| schema.is_valid(&stored.arguments))
+            {
+                return Err("unsupported parked cancel checkpoint".into());
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let start = admission.conversation_callback_start_lease()?;
+            let marker_result = admission.record_conversation_start_markers(
+                self,
+                _claim.claim_id,
+                &_identity_lease,
+                expected,
+                cancel.conversation_cancel_policy(),
             );
+            #[cfg(test)]
+            crate::task_scheduler::report_conversation_start_result(task.id());
+            let marker = marker_result?;
+            let cancellation = pi_rs_core::CancellationToken::new();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(async {
+                    let future = cancel.cancel(
+                        stored.arguments,
+                        stored.checkpoint,
+                        ToolContext {
+                            operation_id: task.id(),
+                            cancellation: cancellation.clone(),
+                        },
+                    );
+                    let mut future = std::pin::pin!(future);
+                    let mut start = Some(start);
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        std::future::poll_fn(|cx| match start.take() {
+                            Some(lease) => lease.poll_first(future.as_mut(), cx),
+                            None => future.as_mut().poll(cx),
+                        }),
+                    )
+                    .await
+                })
+            }));
+            cancellation.cancel();
+            if !matches!(result, Ok(Ok(Ok(())))) {
+                admission.retire_conversation_cancel_unknown(
+                    &_claim,
+                    &_identity_lease,
+                    expected,
+                    &marker,
+                )?;
+                return Err("conversation cancel outcome unknown; reconciliation required".into());
+            }
+            let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                version: 1,
+                claim: _claim,
+                result: "callback returned".into(),
+            };
+            if let Err(error) = admission.store_conversation_cancel_receipt_and_retire(
+                self,
+                &receipt,
+                &_identity_lease,
+                expected,
+                &marker,
+            ) {
+                admission.retire_conversation_cancel_unknown(
+                    &receipt.claim,
+                    &_identity_lease,
+                    expected,
+                    &marker,
+                )?;
+                return Err(format!(
+                    "conversation cancel result requires reconciliation: {error}"
+                ));
+            }
+            #[cfg(test)]
+            crate::task_scheduler::report_conversation_receipt_saved(task.id());
+            return Ok(Step::Succeed(serde_json::Value::Null));
         }
         if !self.replay_safe
             && self.park_cancel.is_some()

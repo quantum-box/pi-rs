@@ -1,5 +1,33 @@
 # Conversation-owned external cancellation: integration notes
 
+## Opt-in first-poll dispatch
+
+`register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel`
+explicitly enables cancellation only for an unhooked, conversation-owned root
+with a confirmed park and no live owned children. The host identity must cover
+the Tool and cancel handler, and host updates must use its `IdentityHandle`.
+The original registration still does not dispatch callbacks and keeps its
+existing definition identity. Opting in changes the registered definition identity;
+previously parked tasks must retain their original registration and cannot be
+silently upgraded. Older claims lacking the claim-time conversation version fail
+closed and require reconciliation.
+
+The driver obtains a nonblocking target start lease before committing the
+identity-bound claim's conversation and task markers. It holds that lease
+through the callback's first poll, and releases it before subsequent polls.
+A successful callback receipt and exact marker retirement share one checked
+transaction. A callback error, panic, timeout or competing late Tool outcome
+is recorded as unknown and requires reconciliation; no subsequent attempt may
+redispatch the same claim. A process interruption recovers the original claim
+and matching markers into a reconciliation-required terminal task. The callback
+is bounded to 30 seconds and must cooperate with cancellation and avoid detached
+work. Direct Store writes outside the public mutation APIs are a trusted-host
+boundary. Nested cancel callbacks, selected hooks and woken cancellation remain
+unsupported by this opt-in.
+
+The sections below describe the earlier stages; references to dispatch being
+disabled apply to those stages and to the original registration.
+
 Status: cancellation is not enabled. The scheduler defers conversation-owned
 interrupted wake or parked-abort recovery and its owned task graph until a
 Harness is bound; unrelated tasks continue. Binding triggers re-evaluation,
