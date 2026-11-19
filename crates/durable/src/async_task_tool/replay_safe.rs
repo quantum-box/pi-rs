@@ -237,7 +237,10 @@ impl crate::extension::Memo for HookMemo<'_, '_> {
     }
 }
 
-fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result<(), String> {
+fn validate_content_result_with_limit(
+    result: &crate::extension::ToolBlockResult,
+    limit: usize,
+) -> Result<(), String> {
     if crate::content::UserContent::from_yield(
         serde_json::Value::Array(result.output.clone()),
         false,
@@ -283,10 +286,14 @@ fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result
     {
         return Err("invalid rich result metadata".into());
     }
-    if serde_json::to_vec(result).map_err(|e| e.to_string())?.len() > 60 * 1024 {
+    if serde_json::to_vec(result).map_err(|e| e.to_string())?.len() > limit {
         return Err("rich result exceeds size limit".into());
     }
     Ok(())
+}
+
+fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result<(), String> {
+    validate_content_result_with_limit(result, 60 * 1024)
 }
 
 fn bounded_diagnostic(message: &str) -> String {
@@ -300,8 +307,12 @@ fn bounded_diagnostic(message: &str) -> String {
 pub(super) fn validate_content_hook_result(
     result: &crate::extension::ToolBlockResult,
     required: Option<&crate::runtime::ToolDiagnostic>,
+    initial: bool,
 ) -> Result<(), String> {
-    validate_content_result(result)?;
+    // The trusted initial projection may duplicate and JSON-escape a bounded raw
+    // checkpoint. Allow it to reach the first hook; replacements remain subject
+    // to the final result bound before any later hook can observe them.
+    validate_content_result_with_limit(result, if initial { 4 * 65536 } else { 60 * 1024 })?;
     if let Some(gate) = required
         && (result.extra.get("isError") != Some(&serde_json::Value::Bool(true))
             || !result.diagnostics.contains(gate))
@@ -639,7 +650,7 @@ impl Executor {
             return Err("task-fenced hook memo failed".into());
         }
         admission.replay_safe_durable_check(cancel)?;
-        validate_content_hook_result(&result, required.as_ref())?;
+        validate_content_hook_result(&result, required.as_ref(), false)?;
         let value = serde_json::to_value(DurableTaskResult::Rich {
             task_content_v1: result,
         })

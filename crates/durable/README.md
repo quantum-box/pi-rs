@@ -681,7 +681,10 @@ Every replacement is validated before the next hook runs; invalid content or
 suppressed host diagnostics stop the chain. Diagnostic messages derived from
 host or Tool failures are truncated at a UTF-8 boundary to 4096 bytes; the
 original outcome remains available in the text block. Results and hook memo
-remain bounded and fenced. The Tool itself still returns
+remain bounded and fenced. A bounded raw outcome may expand past the final
+60 KiB limit when projected into both text and structured channels; hooks can
+inspect and shrink that initial value. A no-op that leaves an oversized result
+still fails the final size check. The Tool itself still returns
 an `Outcome`, which is projected to an initial text block; native multi-block
 Tool results and structured-output schema validation are not supported. This
 mode runs block hooks, including their existing single-text legacy bridge, but

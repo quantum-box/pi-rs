@@ -595,9 +595,14 @@ impl crate::extension::Hook for SelectedBeforeHooks {
         });
         let value = self
             .0
-            .after_tool_blocks_checked(call, result.clone(), nested, context, |candidate| {
-                replay_safe::validate_content_hook_result(candidate, required)
-            })
+            .after_tool_blocks_checked(
+                call,
+                result.clone(),
+                nested,
+                context,
+                |candidate| replay_safe::validate_content_hook_result(candidate, required, true),
+                |candidate| replay_safe::validate_content_hook_result(candidate, required, false),
+            )
             .await?;
         Ok((value != *result).then_some(value))
     }
@@ -4706,6 +4711,17 @@ mod tests {
             ctx: &crate::extension::Context<'_>,
         ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
             let exists = self.0.join("content-ready").exists();
+            if self.0.join("structured").exists()
+                && input
+                    .extra
+                    .get("structuredOutput")
+                    .and_then(|v| v.get("payload"))
+                    .and_then(|v| v.as_str())
+                    .map(str::len)
+                    != Some(60_000)
+            {
+                return Err("large structured result missing".into());
+            }
             if ctx
                 .memo
                 .get_or_insert("resume", json!(if exists { "second" } else { "first" }))
@@ -4760,7 +4776,16 @@ mod tests {
                 .map_err(|e| e.to_string())?;
             writeln!(file, "run").map_err(|e| e.to_string())?;
             file.sync_all().map_err(|e| e.to_string())?;
-            Ok(DurableToolStep::Complete(Outcome::Succeeded("raw".into())))
+            Ok(DurableToolStep::Complete(
+                if self.0.join("structured").exists() {
+                    Outcome::Structured {
+                        data: json!({"payload": "x".repeat(60_000)}),
+                        attachments: vec![],
+                    }
+                } else {
+                    Outcome::Succeeded("raw".into())
+                },
+            ))
         }
     }
     fn content_pause_host(
@@ -4832,6 +4857,113 @@ mod tests {
         assert!(
             matches!(serde_json::from_value::<DurableTaskResult>(value.clone()), Ok(DurableTaskResult::Rich { task_content_v1: result }) if result.output.len() == 2 && result.extra.get("details") == Some(&json!({"resumed":true})))
         );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tool-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    #[test]
+    fn durable_large_structured_after_kill_reopens_without_tool_reexecution() {
+        const ENV: &str = "PI_RS_LARGE_CONTENT_AFTER_KILL_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tool) = content_pause_host(&root);
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("structured"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap()).arg("--exact").arg("async_task_tool::tests::durable_large_structured_after_kill_reopens_without_tool_reexecution").env(ENV, dir.path()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("content-ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("large structured hook did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(dir.path().join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = content_pause_host(dir.path());
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected task state {:?}", task.state())
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: result,
+        } = serde_json::from_value(value.clone()).unwrap()
+        else {
+            panic!("expected rich result")
+        };
+        assert_eq!(
+            result.extra["structuredOutput"]["payload"]
+                .as_str()
+                .unwrap()
+                .len(),
+            60_000
+        );
+        assert_eq!(result.extra.get("details"), Some(&json!({"resumed":true})));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tool-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    struct CountLargeNoop(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for CountLargeNoop {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            result: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            assert_eq!(
+                result.extra["structuredOutput"]["payload"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                60_000
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+    #[test]
+    fn durable_large_structured_noop_runs_before_final_size_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("structured"), b"yes").unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (host, tool) = single_content_host(
+            &dir.path().join("db"),
+            Arc::new(CountFileTool(dir.path().to_owned())),
+            Arc::new(CountLargeNoop(seen.clone())),
+        );
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("tool-count"))
                 .unwrap()
