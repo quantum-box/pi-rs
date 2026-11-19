@@ -22361,6 +22361,34 @@ impl Scheduler {
         }
         Ok(result)
     }
+    /// Abort and wait with an explicit cancellation token. Cancellation before
+    /// the abort transaction leaves the conversation unchanged; cancellation
+    /// after commit does not undo the durable abort.
+    pub async fn abort_and_wait_with_cancel(
+        &mut self,
+        id: Uuid,
+        cancel: &CancellationToken,
+    ) -> Result<(), Error> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::Interrupted),
+            result = self.abort_and_wait(id) => result,
+        }
+    }
+
+    /// Background-inclusive abort with the same cancellation semantics.
+    pub async fn abort_and_wait_with_background_and_cancel(
+        &mut self,
+        id: Uuid,
+        cancel: &CancellationToken,
+    ) -> Result<(), Error> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::Interrupted),
+            result = self.abort_and_wait_with_background(id) => result,
+        }
+    }
+
     /// Abort across background boundaries and wait for the reached work to settle.
     /// A task driver must be running for any nonterminal generic tasks.
     pub async fn abort_and_wait_with_background(&mut self, id: Uuid) -> Result<(), Error> {
@@ -25651,6 +25679,57 @@ mod scheduler_tests {
         drop(unrelated_poll);
         drop(unrelated_callback);
         scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_abort_cancellation_before_commit_survives_reopen() {
+        for background in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+            let target = scheduler.create_conversation(config()).unwrap();
+            let worker = scheduler.harness.worker();
+            let store = durable_store::Store::open(&path).unwrap();
+            let start = crate::conversation_signal::prepare_callback_start_signal_fence(
+                &store, target, b"claim",
+            )
+            .unwrap();
+            store.commit(&start.checks, &start.mutations).unwrap();
+            let busy = Arc::new(tokio::sync::Semaphore::new(0));
+            scoped_abort_busy_hooks()
+                .lock()
+                .unwrap()
+                .insert(target, busy.clone());
+            let cancel = CancellationToken::new();
+            let mut abort = Box::pin(async {
+                if background {
+                    scheduler
+                        .abort_and_wait_with_background_and_cancel(target, &cancel)
+                        .await
+                } else {
+                    scheduler.abort_and_wait_with_cancel(target, &cancel).await
+                }
+            });
+            tokio::select! {
+                result = &mut abort => panic!("abort completed before cancellation: {result:?}"),
+                permit = busy.acquire() => permit.unwrap().forget(),
+            }
+            assert!(!worker.conversation(target).unwrap().abort_requested);
+            cancel.cancel();
+            assert!(matches!(abort.await, Err(Error::Interrupted)));
+            assert!(!worker.conversation(target).unwrap().abort_requested);
+            let finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+                &store, target, b"claim",
+            )
+            .unwrap();
+            store.commit(&finish.checks, &finish.mutations).unwrap();
+            drop(worker);
+            drop(store);
+            scheduler.shutdown().await.unwrap();
+            let reopened = Scheduler::open(&path, options(placement_model())).unwrap();
+            assert!(!reopened.conversation(target).unwrap().abort_requested);
+            reopened.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

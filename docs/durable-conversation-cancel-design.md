@@ -119,7 +119,8 @@ Generic public task save and update batches now also check marker absence;
 known pre-transaction conflicts defer reservation instead of poisoning the
 driver. The async `abort_and_wait` paths discover and fence only the reached
 conversation graph, repeat discovery under the task gate at commit, and yield
-and retry on busy. The synchronous direct abort API still takes the legacy
+and retry on busy. Explicit cancellation-token variants stop the wait; if
+cancellation occurs after the abort commit, it does not roll back that commit. The synchronous direct abort API still takes the legacy
 global poll fence; full graph marker coverage and the composed callback start
 transaction remain unconnected. Callback dispatch remains disabled until
 every boundary and retry path is complete.
