@@ -671,6 +671,24 @@ aborted results are unsupported. Abort cleanup does not call the hook.
 The hook snapshot is null; external effects and detached work remain the host's
 responsibility.
 
+`register_replay_safe_durable_tool_with_content_hooks` explicitly selects an
+ordered, host-identified extension snapshot for the existing block-aware after
+API. Its final `DurableTaskResult::Rich` preserves ordered text/image blocks,
+`isError`, details, structured output, attachments and diagnostics; a durable
+parent reads the same data as `AsyncTaskResult::Rich`. Host blocked and invalid
+results retain their mandatory diagnostics and cannot be rewritten into success.
+Every replacement is validated before the next hook runs; invalid content or
+suppressed host diagnostics stop the chain. Diagnostic messages derived from
+host or Tool failures are truncated at a UTF-8 boundary to 4096 bytes; the
+original outcome remains available in the text block. Results and hook memo
+remain bounded and fenced. The Tool itself still returns
+an `Outcome`, which is projected to an initial text block; native multi-block
+Tool results and structured-output schema validation are not supported. This
+mode runs block hooks, including their existing single-text legacy bridge, but
+does not run the separate `after_tool_result` API. Dynamic conversation
+selection, hook parking, and after hooks for host interrupted, unavailable,
+restart-limit and aborted results remain unsupported.
+
 An attempt may stage keyed direct children and return `Park` with an `All` or
 `Any` wait. Child admissions, checkpoint, wait and the attempt result commit
 together; the worker is released and the wake runs a new attempt with the

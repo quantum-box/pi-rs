@@ -1,7 +1,7 @@
 //! Standalone checkpointable tools with an explicitly registered replay policy.
 use super::{
-    AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
-    DurableToolStep, DurableWait, ToolIdentity,
+    AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableTaskResult,
+    DurableToolResume, DurableToolStep, DurableWait, ToolIdentity,
 };
 use crate::task::{Checkpoint, Task, WaitFor};
 use crate::task_scheduler::{AdmissionHandle, Handler, Scheduler, Step};
@@ -65,6 +65,7 @@ pub(super) fn register(
     version: u32,
     children: Vec<Arc<TaskTool>>,
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
+    block_results: bool,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -74,6 +75,7 @@ pub(super) fn register(
         children,
         true,
         hook,
+        block_results,
     )
 }
 
@@ -92,6 +94,7 @@ pub(super) fn register_unsafe(
         children,
         false,
         None,
+        false,
     )
 }
 
@@ -104,7 +107,11 @@ fn register_with_policy(
     children: Vec<Arc<TaskTool>>,
     replay_safe: bool,
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
+    block_results: bool,
 ) -> Result<Arc<TaskTool>, String> {
+    if block_results && hook.is_none() {
+        return Err("content hooks require a registration".into());
+    }
     let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
     if let Some((id, _)) = &hook {
         identity = identity.with_before_hook(id.clone())?.with_after_hook();
@@ -124,8 +131,12 @@ fn register_with_policy(
         child_identities.push((name, id));
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
-    let encoded =
-        serde_json::to_vec(&(1u32, &identity, &child_identities)).map_err(|e| e.to_string())?;
+    let encoded = serde_json::to_vec(&(
+        if block_results { 2u32 } else { 1u32 },
+        &identity,
+        &child_identities,
+    ))
+    .map_err(|e| e.to_string())?;
     if encoded.len() > 65536 {
         return Err("definition identity too large".into());
     }
@@ -144,6 +155,7 @@ fn register_with_policy(
         children: names,
         hook: hook.map(|(_, hook)| hook),
         replay_safe,
+        block_results,
     });
     scheduler.install_checkpointable_async_handler(
         kind.clone(),
@@ -225,6 +237,80 @@ impl crate::extension::Memo for HookMemo<'_, '_> {
     }
 }
 
+fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result<(), String> {
+    if crate::content::UserContent::from_yield(
+        serde_json::Value::Array(result.output.clone()),
+        false,
+    )
+    .is_none()
+    {
+        return Err("invalid content blocks".into());
+    }
+    for block in &result.output {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("image") {
+            let image = pi_rs_core::ImageContent {
+                data: block
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("invalid image data")?
+                    .to_owned(),
+                mime_type: block
+                    .get("mimeType")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("invalid image type")?
+                    .to_owned(),
+            };
+            image.validate().map_err(|e| e.to_string())?;
+        }
+    }
+    if result.extra.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "isError" | "details" | "structuredOutput" | "attachments"
+        )
+    }) || !result
+        .extra
+        .get("isError")
+        .is_some_and(serde_json::Value::is_boolean)
+        || result.extra.get("attachments").is_some_and(|v| {
+            serde_json::from_value::<Vec<pi_rs_core::AttachmentRef>>(v.clone()).is_err()
+        })
+        || result.diagnostics.len() > 32
+        || result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.len() > 4096 || d.code.as_ref().is_some_and(|v| v.len() > 256))
+    {
+        return Err("invalid rich result metadata".into());
+    }
+    if serde_json::to_vec(result).map_err(|e| e.to_string())?.len() > 60 * 1024 {
+        return Err("rich result exceeds size limit".into());
+    }
+    Ok(())
+}
+
+fn bounded_diagnostic(message: &str) -> String {
+    let mut end = message.len().min(4096);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_owned()
+}
+
+pub(super) fn validate_content_hook_result(
+    result: &crate::extension::ToolBlockResult,
+    required: Option<&crate::runtime::ToolDiagnostic>,
+) -> Result<(), String> {
+    validate_content_result(result)?;
+    if let Some(gate) = required
+        && (result.extra.get("isError") != Some(&serde_json::Value::Bool(true))
+            || !result.diagnostics.contains(gate))
+    {
+        return Err("host error metadata cannot be suppressed".into());
+    }
+    Ok(())
+}
+
 struct Executor {
     tool: Arc<dyn DurableAsyncTool>,
     identity: ToolIdentity,
@@ -233,6 +319,7 @@ struct Executor {
     children: HashMap<String, Arc<TaskTool>>,
     hook: Option<Arc<dyn crate::extension::Hook>>,
     replay_safe: bool,
+    block_results: bool,
 }
 
 struct Host<'a, 'b> {
@@ -264,15 +351,18 @@ impl DurableTaskHost for Host<'_, '_> {
         Ok(match child.0.result(&self.task, &mut docs)? {
             None => None,
             Some(NestedTaskResult::Succeeded(value)) => {
-                let outcome: Outcome = serde_json::from_value(value)
+                let result: DurableTaskResult = serde_json::from_value(value)
                     .map_err(|_| "child result is not a Tool outcome")?;
-                Some(
-                    if matches!(outcome, Outcome::Pending { .. } | Outcome::Unknown(_)) {
-                        AsyncTaskResult::Uncertain(outcome)
-                    } else {
-                        AsyncTaskResult::Outcome(outcome)
-                    },
-                )
+                Some(match result {
+                    DurableTaskResult::Rich { task_content_v1 } => {
+                        validate_content_result(&task_content_v1)?;
+                        AsyncTaskResult::Rich(task_content_v1)
+                    }
+                    DurableTaskResult::Outcome(
+                        outcome @ (Outcome::Pending { .. } | Outcome::Unknown(_)),
+                    ) => AsyncTaskResult::Uncertain(outcome),
+                    DurableTaskResult::Outcome(outcome) => AsyncTaskResult::Outcome(outcome),
+                })
             }
             Some(NestedTaskResult::Failed(reason)) => Some(AsyncTaskResult::Failed(reason)),
             Some(NestedTaskResult::Cancelled) => Some(AsyncTaskResult::Cancelled),
@@ -443,6 +533,123 @@ impl Executor {
             data,
         }))
     }
+    fn after_blocks(
+        &self,
+        task: &Task,
+        admission: &AdmissionHandle<'_>,
+        cancel: &pi_rs_core::CancellationToken,
+        args: serde_json::Value,
+        outcome: Outcome,
+        host_error: Option<String>,
+    ) -> Result<Step, String> {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "isError".into(),
+            serde_json::json!(matches!(outcome, Outcome::Failed(_) | Outcome::Skipped(_))),
+        );
+        match &outcome {
+            Outcome::SucceededWithDetails { details, .. } => {
+                extra.insert("details".into(), details.clone());
+            }
+            Outcome::Structured { data, attachments } => {
+                extra.insert("structuredOutput".into(), data.clone());
+                extra.insert(
+                    "attachments".into(),
+                    serde_json::to_value(attachments).map_err(|e| e.to_string())?,
+                );
+            }
+            _ => (),
+        }
+        let required = if let Some(code) = &host_error {
+            let Outcome::Failed(message) = &outcome else {
+                return Err("invalid host error outcome".into());
+            };
+            Some(crate::runtime::ToolDiagnostic {
+                severity: crate::runtime::DiagnosticSeverity::Error,
+                code: Some(code.clone()),
+                message: bounded_diagnostic(message),
+            })
+        } else {
+            None
+        };
+        let mut diagnostics: Vec<crate::runtime::ToolDiagnostic> =
+            required.clone().into_iter().collect();
+        if required.is_none() {
+            match &outcome {
+                Outcome::Failed(reason) | Outcome::Skipped(reason) => {
+                    diagnostics.push(crate::runtime::ToolDiagnostic {
+                        severity: crate::runtime::DiagnosticSeverity::Error,
+                        message: bounded_diagnostic(reason),
+                        code: Some(
+                            if matches!(outcome, Outcome::Failed(_)) {
+                                "tool_failed"
+                            } else {
+                                "tool_skipped"
+                            }
+                            .into(),
+                        ),
+                    })
+                }
+                Outcome::Truncated { original_bytes } => {
+                    diagnostics.push(crate::runtime::ToolDiagnostic {
+                        severity: crate::runtime::DiagnosticSeverity::Warn,
+                        message: format!("tool output omitted ({original_bytes} bytes)"),
+                        code: Some("output_truncated".into()),
+                    })
+                }
+                _ => (),
+            }
+        }
+        let initial = crate::extension::ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text", "text":outcome.tool_content()})],
+            diagnostics,
+            extra,
+        };
+        let memo = HookMemo {
+            admission,
+            cancellation: cancel,
+            failed: Mutex::new(false),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let result = runtime.block_on(async {
+            let call = crate::extension::ToolCall {
+                name: self.identity.spec.name.clone(),
+                arguments: args,
+            };
+            let snapshot = serde_json::Value::Null;
+            let ctx = crate::extension::Context {
+                snapshot: &snapshot,
+                memo: &memo,
+            };
+            let selected = self.hook_registry()?;
+            let nested = matches!(task.owner(), crate::task::TaskOwner::Task(_));
+            tokio::select! { biased;
+                _ = cancel.cancelled() => Err("after hook cancelled".to_string()),
+                result = selected.after_tool_blocks(&call, initial, nested, &ctx) => {
+                    let (value, reports) = result?;
+                    if !reports.is_empty() { return Err("block hook failed".into()); }
+                    Ok(value)
+                }
+            }
+        })?;
+        if memo.failed() {
+            return Err("task-fenced hook memo failed".into());
+        }
+        admission.replay_safe_durable_check(cancel)?;
+        validate_content_hook_result(&result, required.as_ref())?;
+        let value = serde_json::to_value(DurableTaskResult::Rich {
+            task_content_v1: result,
+        })
+        .map_err(|e| e.to_string())?;
+        if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > 60 * 1024 {
+            return Err("rich result exceeds size limit".into());
+        }
+        Ok(Step::Succeed(value))
+    }
+
     fn after(
         &self,
         task: &Task,
@@ -469,6 +676,16 @@ impl Executor {
         let outcome = stored.outcome.ok_or("missing completed outcome")?;
         if stored.host_error.is_some() && !matches!(outcome, Outcome::Failed(_)) {
             return Err("invalid host result outcome".into());
+        }
+        if self.block_results {
+            return self.after_blocks(
+                task,
+                admission,
+                cancel,
+                stored.arguments,
+                outcome,
+                stored.host_error,
+            );
         }
         let diagnostic_message = match &outcome {
             Outcome::Failed(reason) => reason.clone(),

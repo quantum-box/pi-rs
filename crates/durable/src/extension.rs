@@ -1470,6 +1470,35 @@ impl Resolved {
         }
         Ok((result, reports))
     }
+    /// Run a durable hook chain, rejecting each invalid replacement before invoking the next hook.
+    pub(crate) async fn after_tool_blocks_checked<F>(
+        &self,
+        call: &ToolCall,
+        mut result: ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+        validate: F,
+    ) -> Result<ToolBlockResult, String>
+    where
+        F: Fn(&ToolBlockResult) -> Result<(), String> + Sync,
+    {
+        validate(&result)?;
+        for extension in &self.extensions {
+            for hook in &extension.hooks {
+                match protect(async { hook.after_tool_blocks(call, &result, nested, ctx).await })
+                    .await
+                {
+                    Ok(Some(value)) => {
+                        validate(&value)?;
+                        result = value;
+                    }
+                    Ok(None) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(result)
+    }
     pub(crate) async fn runtime_after_tool_blocks_with_derived(
         &self,
         call: &ToolCall,

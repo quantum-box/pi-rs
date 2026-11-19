@@ -40,6 +40,8 @@ pub struct AsyncTaskCall(crate::task_tool::NestedTaskCall);
 #[derive(Debug, PartialEq)]
 pub enum AsyncTaskResult {
     Outcome(Outcome),
+    /// Ordered content and result metadata produced by block-aware after hooks.
+    Rich(crate::extension::ToolBlockResult),
     /// The external outcome is unresolved and must not be replayed automatically.
     Uncertain(Outcome),
     /// The Tool outcome is known, but its after hook did not finish. It is
@@ -105,6 +107,17 @@ impl AsyncTaskCall {
         };
         Ok(Some(result))
     }
+}
+
+/// Durable result envelope for replay-safe block-hook task registrations.
+/// Legacy task results remain directly encoded as `Outcome`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum DurableTaskResult {
+    Rich {
+        task_content_v1: crate::extension::ToolBlockResult,
+    },
+    Outcome(Outcome),
 }
 
 /// Read the durable pre-after Tool outcome for reconciliation after shutdown.
@@ -253,6 +266,7 @@ impl StandaloneNoHooksHost {
             version,
             children,
             None,
+            false,
         )
     }
 
@@ -487,6 +501,40 @@ impl StandaloneBeforeHookHost {
             version,
             children,
             Some((hook_identity.into(), hook)),
+            false,
+        )
+    }
+    /// Register a stable ordered selection of replay-safe block-aware hooks.
+    /// Hook identity declarations must cover implementation and configuration.
+    #[allow(clippy::too_many_arguments)] // Definition, selection and replay policy are explicit.
+    pub fn register_replay_safe_durable_tool_with_content_hooks(
+        &mut self,
+        tool: Arc<dyn DurableAsyncTool>,
+        implementation: &str,
+        version: u32,
+        children: Vec<Arc<crate::task_tool::TaskTool>>,
+        snapshot: &crate::extension::Snapshot,
+        names: &[String],
+        _authorization: ReplaySafeAuthorization,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        let selection = snapshot
+            .stable_selection(names)
+            .ok_or("extension selection is missing, duplicated, or unidentified")?;
+        let resolved = snapshot
+            .resolve_stable(names, &selection)
+            .ok_or("extension selection changed")?;
+        let identity = format!(
+            "selection-v1:{}",
+            serde_json::to_string(&selection).map_err(|e| e.to_string())?
+        );
+        replay_safe::register(
+            &mut self.scheduler,
+            tool,
+            implementation,
+            version,
+            children,
+            Some((identity, Arc::new(SelectedBeforeHooks(resolved)))),
+            true,
         )
     }
     pub fn start_replay_safe_root(
@@ -530,6 +578,27 @@ impl crate::extension::Hook for SelectedBeforeHooks {
         context: &crate::extension::Context<'_>,
     ) -> Result<Option<serde_json::Value>, String> {
         let (value, _reports) = self.0.after_tool(call, result.clone(), context).await;
+        Ok((value != *result).then_some(value))
+    }
+    async fn after_tool_blocks(
+        &self,
+        call: &crate::extension::ToolCall,
+        result: &crate::extension::ToolBlockResult,
+        nested: bool,
+        context: &crate::extension::Context<'_>,
+    ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+        let required = result.diagnostics.iter().find(|diagnostic| {
+            matches!(
+                diagnostic.code.as_deref(),
+                Some("blocked" | "invalid_arguments")
+            )
+        });
+        let value = self
+            .0
+            .after_tool_blocks_checked(call, result.clone(), nested, context, |candidate| {
+                replay_safe::validate_content_hook_result(candidate, required)
+            })
+            .await?;
         Ok((value != *result).then_some(value))
     }
 }
@@ -3992,6 +4061,891 @@ mod tests {
             crate::task::TaskState::Failed(_)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    struct OrderedContentHook {
+        stage: u8,
+        block: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for OrderedContentHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            if self.block && self.stage == 1 {
+                Ok(crate::extension::BeforeTool::Block("policy".into()))
+            } else {
+                Ok(crate::extension::BeforeTool::Pass)
+            }
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let mut out = input.clone();
+            if self.stage == 1 {
+                if self.block
+                    && (!out
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code.as_deref() == Some("blocked"))
+                        || out.extra.get("isError") != Some(&json!(true)))
+                {
+                    return Err("missing gate diagnosis".into());
+                }
+                ctx.memo
+                    .get_or_insert("content-hook", json!("first"))
+                    .await?;
+                out.output = vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                ];
+                out.extra.insert("details".into(), json!({"private":42}));
+                out.extra
+                    .insert("structuredOutput".into(), json!({"stage":1}));
+                out.diagnostics.push(crate::runtime::ToolDiagnostic {
+                    severity: crate::runtime::DiagnosticSeverity::Info,
+                    message: "stage one".into(),
+                    code: Some("stage_one".into()),
+                });
+            } else {
+                if out.output.len() != 2
+                    || out.extra.get("details") != Some(&json!({"private":42}))
+                    || out.extra.get("structuredOutput") != Some(&json!({"stage":1}))
+                    || !out
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code.as_deref() == Some("stage_one"))
+                    || ctx.memo.get("content-hook").await? != Some(json!("first"))
+                {
+                    return Err("prior hook result not preserved".into());
+                }
+                out.output.push(json!({"type":"text","text":"second"}));
+                out.extra
+                    .insert("structuredOutput".into(), json!({"stage":2}));
+            }
+            Ok(Some(out))
+        }
+    }
+    fn content_host(
+        path: &std::path::Path,
+        tool: Arc<dyn DurableAsyncTool>,
+        block: bool,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        let mut extensions = crate::extension::Registry::default();
+        for (name, stage) in [("first", 1), ("second", 2)] {
+            extensions
+                .install_identified(
+                    crate::extension::Extension {
+                        name: name.into(),
+                        hooks: vec![Arc::new(OrderedContentHook { stage, block })],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(
+                        1,
+                        format!("{name}-v1"),
+                        vec!["hook".into()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut host = StandaloneBeforeHookHost::open(path, Registry::default()).unwrap();
+        let adapter = host
+            .register_replay_safe_durable_tool_with_content_hooks(
+                tool,
+                "immediate-v1",
+                1,
+                vec![],
+                &extensions.snapshot(),
+                &["first".into(), "second".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        (host, adapter)
+    }
+    #[test]
+    fn durable_content_hooks_chain_and_persist_all_channels_after_reopen() {
+        for block in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (host, tool) =
+                content_host(&path, Arc::new(ImmediateDurable(calls.clone())), block);
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, id);
+            let crate::task::TaskState::Succeeded(value) = task.state() else {
+                panic!("unexpected task state {:?}", task.state())
+            };
+            let result: DurableTaskResult = serde_json::from_value(value.clone()).unwrap();
+            let DurableTaskResult::Rich {
+                task_content_v1: result,
+            } = result
+            else {
+                panic!("missing rich result")
+            };
+            assert_eq!(
+                result.output,
+                vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                    json!({"type":"text","text":"second"})
+                ]
+            );
+            assert_eq!(result.extra.get("details"), Some(&json!({"private":42})));
+            assert_eq!(
+                result.extra.get("structuredOutput"),
+                Some(&json!({"stage":2}))
+            );
+            assert_eq!(result.extra.get("isError"), Some(&json!(block)));
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_deref() == Some("stage_one"))
+            );
+            if block {
+                assert!(
+                    result
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code.as_deref() == Some("blocked"))
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!block));
+            let _ = driver.shutdown_with_pending().unwrap();
+            let (host, _) = content_host(&path, Arc::new(ImmediateDurable(calls.clone())), block);
+            let driver = host.into_driver();
+            let restored = driver.get(id).unwrap().unwrap();
+            assert_eq!(restored.state(), task.state());
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!block));
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+
+    struct NoopDurableHook;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for NoopDurableHook {}
+    struct RichParentTool;
+    #[async_trait::async_trait]
+    impl Tool for RichParentTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "rich-parent".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for RichParentTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            resume: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            match resume.checkpoint {
+                None => {
+                    let child = host.start_child("child", "immediate", json!({})).await?;
+                    Ok(DurableToolStep::Park {
+                        checkpoint: json!({"child":child}),
+                        wait: DurableWait::All(vec![child]),
+                    })
+                }
+                Some(checkpoint) => {
+                    let child: AsyncTaskCall = serde_json::from_value(checkpoint["child"].clone())
+                        .map_err(|e| e.to_string())?;
+                    match host.child_result(&child).await? {
+                        Some(AsyncTaskResult::Rich(result))
+                            if result.output.len() == 3
+                                && result.extra.get("structuredOutput")
+                                    == Some(&json!({"stage":2}))
+                                && result
+                                    .diagnostics
+                                    .iter()
+                                    .any(|d| d.code.as_deref() == Some("stage_one")) =>
+                        {
+                            Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                                "rich child received".into(),
+                            )))
+                        }
+                        other => Err(format!("unexpected child result: {other:?}")),
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn durable_content_nested_result_delivers_rich_channels_after_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut host, child) = content_host(
+            &dir.path().join("db"),
+            Arc::new(ImmediateDurable(calls.clone())),
+            false,
+        );
+        let parent = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(RichParentTool),
+                "rich-parent-v1",
+                1,
+                vec![child],
+                "parent-hook-v1",
+                Arc::new(NoopDurableHook),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&parent, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(
+            matches!(wait_terminal(&driver, id).state(), crate::task::TaskState::Succeeded(value) if serde_json::from_value::<Outcome>(value.clone()).ok() == Some(Outcome::Succeeded("rich child received".into())))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    #[test]
+    fn durable_content_invalid_arguments_preserve_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (host, tool) = content_host(
+            &dir.path().join("db"),
+            Arc::new(StrictDurable(calls.clone())),
+            false,
+        );
+        let id = host
+            .start_replay_safe_root(&tool, json!({"bad":true}), 4)
+            .unwrap();
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected state {:?}", task.state())
+        };
+        assert!(
+            matches!(serde_json::from_value::<DurableTaskResult>(value.clone()), Ok(DurableTaskResult::Rich { task_content_v1: result }) if result.extra.get("isError") == Some(&json!(true)) && result.diagnostics.iter().any(|d| d.code.as_deref() == Some("invalid_arguments")) && result.output.len() == 3)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    struct InvalidContentHook;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for InvalidContentHook {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let mut result = input.clone();
+            result.output = vec![json!({"type":"image","data":"invalid","mimeType":"image/png"})];
+            Ok(Some(result))
+        }
+    }
+    #[test]
+    fn durable_content_rejects_invalid_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, tool) = single_content_host(
+            &dir.path().join("db"),
+            Arc::new(ImmediateDurable(Arc::new(AtomicUsize::new(0)))),
+            Arc::new(InvalidContentHook),
+        );
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    struct OriginalChannelsTool {
+        structured: bool,
+    }
+    #[async_trait::async_trait]
+    impl Tool for OriginalChannelsTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "original-channels".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for OriginalChannelsTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            Ok(DurableToolStep::Complete(if self.structured {
+                Outcome::Structured {
+                    data: json!({"source":42}),
+                    attachments: vec![pi_rs_core::AttachmentRef {
+                        id: "source-file".into(),
+                        media_type: "text/plain".into(),
+                    }],
+                }
+            } else {
+                Outcome::SucceededWithDetails {
+                    output: "original".into(),
+                    details: serde_json::Value::Null,
+                }
+            }))
+        }
+    }
+    struct PreserveOriginalHook(bool);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for PreserveOriginalHook {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            if self.0 {
+                if input.extra.get("structuredOutput") != Some(&json!({"source":42}))
+                    || input
+                        .extra
+                        .get("attachments")
+                        .and_then(|v| v.as_array())
+                        .is_none_or(|v| v.len() != 1)
+                {
+                    return Err("original structured channels missing".into());
+                }
+            } else if input.extra.get("details") != Some(&serde_json::Value::Null) {
+                return Err("explicit null details missing".into());
+            }
+            let mut out = input.clone();
+            out.output = vec![
+                json!({"type":"text","text":"a"}),
+                json!({"type":"text","text":"b"}),
+            ];
+            Ok(Some(out))
+        }
+    }
+    #[test]
+    fn durable_content_preserves_original_details_and_structured_attachments() {
+        for structured in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, tool) = single_content_host(
+                &dir.path().join("db"),
+                Arc::new(OriginalChannelsTool { structured }),
+                Arc::new(PreserveOriginalHook(structured)),
+            );
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, id);
+            let crate::task::TaskState::Succeeded(value) = task.state() else {
+                panic!("unexpected {:?}", task.state())
+            };
+            let DurableTaskResult::Rich {
+                task_content_v1: result,
+            } = serde_json::from_value(value.clone()).unwrap()
+            else {
+                panic!("expected rich result")
+            };
+            assert_eq!(result.output.len(), 2);
+            if structured {
+                assert_eq!(
+                    result.extra.get("structuredOutput"),
+                    Some(&json!({"source":42}))
+                );
+                assert_eq!(result.extra["attachments"][0]["id"], "source-file");
+            } else {
+                assert_eq!(result.extra.get("details"), Some(&serde_json::Value::Null));
+            }
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+
+    struct FailedResultTool;
+    #[async_trait::async_trait]
+    impl Tool for FailedResultTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "failed-result".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for FailedResultTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            Ok(DurableToolStep::Complete(Outcome::Failed(
+                "tool failure".into(),
+            )))
+        }
+    }
+    #[test]
+    fn durable_content_tool_failure_produces_durable_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (host, tool) =
+            single_content_host(&path, Arc::new(FailedResultTool), Arc::new(NoopDurableHook));
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected {:?}", task.state())
+        };
+        assert!(
+            matches!(serde_json::from_value::<DurableTaskResult>(value.clone()), Ok(DurableTaskResult::Rich { task_content_v1: result }) if result.extra.get("isError") == Some(&json!(true)) && result.diagnostics.iter().any(|d| d.code.as_deref() == Some("tool_failed") && d.message == "tool failure"))
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        let (host, _) =
+            single_content_host(&path, Arc::new(FailedResultTool), Arc::new(NoopDurableHook));
+        let driver = host.into_driver();
+        assert_eq!(driver.get(id).unwrap().unwrap().state(), task.state());
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    struct LongBlock;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for LongBlock {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            Ok(crate::extension::BeforeTool::Block("あ".repeat(2000)))
+        }
+    }
+    struct LongFailure(bool);
+    #[async_trait::async_trait]
+    impl Tool for LongFailure {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "long-failure".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for LongFailure {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            Ok(DurableToolStep::Complete(if self.0 {
+                Outcome::Skipped("あ".repeat(2000))
+            } else {
+                Outcome::Failed("あ".repeat(2000))
+            }))
+        }
+    }
+    #[test]
+    fn durable_content_long_utf8_host_and_tool_diagnostics_survive() {
+        for mode in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (tool, hook): (Arc<dyn DurableAsyncTool>, Arc<dyn crate::extension::Hook>) =
+                if mode == 0 {
+                    (
+                        Arc::new(ImmediateDurable(calls.clone())),
+                        Arc::new(LongBlock),
+                    )
+                } else {
+                    (Arc::new(LongFailure(mode == 2)), Arc::new(NoopDurableHook))
+                };
+            let (host, adapter) = single_content_host(&dir.path().join("db"), tool, hook);
+            let id = host.start_replay_safe_root(&adapter, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, id);
+            let crate::task::TaskState::Succeeded(value) = task.state() else {
+                panic!("unexpected {:?}", task.state())
+            };
+            let DurableTaskResult::Rich {
+                task_content_v1: result,
+            } = serde_json::from_value(value.clone()).unwrap()
+            else {
+                panic!("expected rich result")
+            };
+            let diagnostic = &result.diagnostics[0];
+            assert_eq!(
+                diagnostic.code.as_deref(),
+                Some(match mode {
+                    0 => "blocked",
+                    1 => "tool_failed",
+                    _ => "tool_skipped",
+                })
+            );
+            assert!(diagnostic.message.len() <= 4096 && diagnostic.message.len() >= 4093);
+            assert!(result.output[0]["text"].as_str().unwrap().len() > diagnostic.message.len());
+            assert_eq!(result.extra.get("isError"), Some(&json!(true)));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+
+    struct LateContentMemo(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for LateContentMemo {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::ToolBlockResult,
+            _: bool,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ctx.memo.get_or_insert("must-not-run", json!(true)).await?;
+            Ok(None)
+        }
+    }
+    #[test]
+    fn durable_content_invalid_first_replacement_stops_later_hook_and_memo() {
+        for blocked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let later = Arc::new(AtomicUsize::new(0));
+            let first: Arc<dyn crate::extension::Hook> = if blocked {
+                Arc::new(SuppressGate)
+            } else {
+                Arc::new(InvalidContentHook)
+            };
+            let mut extensions = crate::extension::Registry::default();
+            for (name, hook) in [
+                ("first", first),
+                (
+                    "second",
+                    Arc::new(LateContentMemo(later.clone())) as Arc<dyn crate::extension::Hook>,
+                ),
+            ] {
+                extensions
+                    .install_identified(
+                        crate::extension::Extension {
+                            name: name.into(),
+                            hooks: vec![hook],
+                            ..Default::default()
+                        },
+                        crate::extension::ExtensionIdentity::new(
+                            1,
+                            format!("{name}-v1"),
+                            vec!["hook".into()],
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let mut host = StandaloneBeforeHookHost::open(&path, Registry::default()).unwrap();
+            let tool = host
+                .register_replay_safe_durable_tool_with_content_hooks(
+                    Arc::new(ImmediateDurable(calls.clone())),
+                    "immediate-v1",
+                    1,
+                    vec![],
+                    &extensions.snapshot(),
+                    &["first".into(), "second".into()],
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            assert!(matches!(
+                wait_terminal(&driver, id).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!blocked));
+            assert_eq!(later.load(Ordering::SeqCst), 0);
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            assert!(
+                store
+                    .get(format!("runtime/extension-memo/{id}/must-not-run").as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    struct ContentPause(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for ContentPause {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let exists = self.0.join("content-ready").exists();
+            if ctx
+                .memo
+                .get_or_insert("resume", json!(if exists { "second" } else { "first" }))
+                .await?
+                != json!("first")
+            {
+                return Err("memo changed".into());
+            }
+            if !exists {
+                std::fs::write(self.0.join("content-ready"), b"ready")
+                    .map_err(|e| e.to_string())?;
+                std::future::pending().await
+            } else {
+                let mut out = input.clone();
+                out.output = vec![
+                    json!({"type":"text","text":"restored"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                ];
+                out.extra.insert("details".into(), json!({"resumed":true}));
+                Ok(Some(out))
+            }
+        }
+    }
+    struct CountFileTool(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for CountFileTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "content-file".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for CountFileTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(self.0.join("tool-count"))
+                .map_err(|e| e.to_string())?;
+            writeln!(file, "run").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            Ok(DurableToolStep::Complete(Outcome::Succeeded("raw".into())))
+        }
+    }
+    fn content_pause_host(
+        root: &std::path::Path,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        let mut extensions = crate::extension::Registry::default();
+        extensions
+            .install_identified(
+                crate::extension::Extension {
+                    name: "pause".into(),
+                    hooks: vec![Arc::new(ContentPause(root.to_owned()))],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(1, "pause-v1".into(), vec!["hook".into()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+        let adapter = host
+            .register_replay_safe_durable_tool_with_content_hooks(
+                Arc::new(CountFileTool(root.to_owned())),
+                "file-v1",
+                1,
+                vec![],
+                &extensions.snapshot(),
+                &["pause".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        (host, adapter)
+    }
+    #[test]
+    fn durable_content_after_kill_reopens_without_tool_reexecution() {
+        const ENV: &str = "PI_RS_CONTENT_AFTER_KILL_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tool) = content_pause_host(&root);
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap()).arg("--exact").arg("async_task_tool::tests::durable_content_after_kill_reopens_without_tool_reexecution").env(ENV, dir.path()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("content-ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("content hook did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(dir.path().join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = content_pause_host(dir.path());
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected task state {:?}", task.state())
+        };
+        assert!(
+            matches!(serde_json::from_value::<DurableTaskResult>(value.clone()), Ok(DurableTaskResult::Rich { task_content_v1: result }) if result.output.len() == 2 && result.extra.get("details") == Some(&json!({"resumed":true})))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tool-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    struct SuppressGate;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for SuppressGate {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            Ok(crate::extension::BeforeTool::Block("denied".into()))
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let mut out = input.clone();
+            out.diagnostics.clear();
+            Ok(Some(out))
+        }
+    }
+    fn single_content_host(
+        path: &std::path::Path,
+        tool: Arc<dyn DurableAsyncTool>,
+        hook: Arc<dyn crate::extension::Hook>,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        let mut extensions = crate::extension::Registry::default();
+        extensions
+            .install_identified(
+                crate::extension::Extension {
+                    name: "hook".into(),
+                    hooks: vec![hook],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(1, "hook-v1".into(), vec!["hook".into()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut host = StandaloneBeforeHookHost::open(path, Registry::default()).unwrap();
+        let adapter = host
+            .register_replay_safe_durable_tool_with_content_hooks(
+                tool,
+                "single-v1",
+                1,
+                vec![],
+                &extensions.snapshot(),
+                &["hook".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        (host, adapter)
+    }
+    #[test]
+    fn durable_content_host_block_cannot_suppress_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (host, tool) = single_content_host(
+            &dir.path().join("db"),
+            Arc::new(ImmediateDurable(calls.clone())),
+            Arc::new(SuppressGate),
+        );
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    #[test]
+    fn durable_content_abort_fences_late_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (result, result_rx) = std::sync::mpsc::channel();
+        let hook = Arc::new(AbortAfterHook {
+            entered,
+            release: std::sync::Mutex::new(release_rx),
+            result,
+        });
+        let (host, tool) = single_content_host(
+            &dir.path().join("db"),
+            Arc::new(ImmediateDurable(calls.clone())),
+            hook,
+        );
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        driver.request_abort(id).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = driver.shutdown_with_pending().unwrap();
     }
 
