@@ -376,6 +376,18 @@ async fn invalid_raw_runs_only_after_hook_and_survives_reopen() {
         assert!(store.get(memo_key.as_bytes()).unwrap().is_some());
         assert_eq!(after.load(Ordering::SeqCst), 1);
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let c = scheduler.conversation(id).unwrap();
+                if let Some(pos) = c.messages.iter().position(|m| matches!(m, Message::Tool { content, .. } if content.contains("invalid checkpointable arguments") && content.contains("-after")))
+                    && c.messages[pos + 1..].iter().any(|m| matches!(m, Message::Assistant { .. })) {
+                    assert_eq!(c.messages.iter().filter(|m| matches!(m, Message::Tool { .. })).count(), 1);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(after.load(Ordering::SeqCst), 1);
         let _ = driver.shutdown_with_pending();
         let _ = scheduler.shutdown().await;
     }
@@ -571,6 +583,10 @@ async fn invalid_raw_after_recovers_after_process_kill() {
     .unwrap();
     process.0.kill().unwrap();
     process.0.wait().unwrap();
+    let conversation: uuid::Uuid = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
     let path = dir.path().join("db");
     let store = durable_store::Store::open(&path).unwrap();
     let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
@@ -611,6 +627,18 @@ async fn invalid_raw_after_recovers_after_process_kill() {
     assert_eq!(before.load(Ordering::SeqCst), 0);
     assert_eq!(after.load(Ordering::SeqCst), 1);
     assert_eq!(executions.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let c = scheduler.conversation(conversation).unwrap();
+            if let Some(pos) = c.messages.iter().position(|m| matches!(m, Message::Tool { content, .. } if content.contains("invalid checkpointable arguments") && content.contains("-after")))
+                && c.messages[pos+1..].iter().any(|m| matches!(m, Message::Assistant { .. })) {
+                assert_eq!(c.messages.iter().filter(|m| matches!(m, Message::Tool { .. })).count(), 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(after.load(Ordering::SeqCst), 1);
     let _ = driver.shutdown_with_pending();
     let _ = scheduler.shutdown().await;
 }
