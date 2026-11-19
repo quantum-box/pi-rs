@@ -1451,6 +1451,104 @@ impl AdmissionHandle<'_> {
     }
 }
 
+/// Memo writes are committed under the same attempt, lease, ancestor and
+/// registration checks as dispatch. A failed operation poisons the handle,
+/// including when a hook ignores its error.
+struct TaskHookMemo<'a> {
+    invocation: &'a DetachedInvocation,
+    failed: std::sync::atomic::AtomicBool,
+}
+impl TaskHookMemo<'_> {
+    fn access(
+        &self,
+        key: &str,
+        value: Option<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        use std::sync::atomic::Ordering;
+        if self.failed.load(Ordering::Acquire) {
+            return Err("memo is unavailable".into());
+        }
+        let operation = || -> Result<Option<serde_json::Value>, String> {
+            if key.is_empty() || key.len() > 4096 {
+                return Err("invalid memo key".into());
+            }
+            let invocation = self.invocation;
+            let capture = invocation
+                .receipt_capture
+                .as_ref()
+                .ok_or("missing capture")?;
+            let store = invocation.lease.attachment.owner.store();
+            let storage_key = format!(
+                "runtime/extension-memo/{}/{}",
+                invocation.running.task.id(),
+                key
+            )
+            .into_bytes();
+            let entry = store.get(&storage_key).map_err(|e| e.to_string())?;
+            let expected = entry
+                .as_ref()
+                .map_or(durable_store::Expected::Missing, |e| {
+                    durable_store::Expected::Version(e.version)
+                });
+            let check = durable_store::Check {
+                key: storage_key.clone(),
+                expected,
+            };
+            let (result, mutations) = match (entry, value) {
+                (Some(entry), _) => (
+                    Some(serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?),
+                    vec![],
+                ),
+                (None, Some(value)) => {
+                    let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+                    if bytes.len() > 65536 {
+                        return Err("memo value exceeds 64 KiB".into());
+                    }
+                    (
+                        Some(value),
+                        vec![durable_store::Mutation::Put {
+                            key: storage_key,
+                            value: bytes,
+                        }],
+                    )
+                }
+                (None, None) => (None, vec![]),
+            };
+            invocation
+                .checked_tool_transaction(
+                    &capture.identity,
+                    capture.executor.tool().as_ref(),
+                    &capture.implementation,
+                    capture.version,
+                    false,
+                    &[check],
+                    &mutations,
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(result)
+        };
+        let result = operation();
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+#[async_trait::async_trait]
+impl crate::extension::Memo for TaskHookMemo<'_> {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        self.access(key, None)
+    }
+    async fn get_or_insert(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.access(key, Some(value))?
+            .ok_or_else(|| "memo insertion failed".into())
+    }
+}
+
 impl DetachedInvocation {
     /// Record a standalone intent while both task reservations and the graph
     /// gate are held. The commit can be a logical dispatch start only when the
@@ -1473,6 +1571,19 @@ impl DetachedInvocation {
         implementation: &str,
         version: u32,
         commit: bool,
+    ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
+        self.checked_tool_transaction(identity, tool, implementation, version, commit, &[], &[])
+    }
+
+    fn checked_tool_transaction(
+        &self,
+        identity: &crate::async_task_tool::ToolIdentity,
+        tool: &dyn pi_rs_core::Tool,
+        implementation: &str,
+        version: u32,
+        commit: bool,
+        extra_checks: &[durable_store::Check],
+        extra_mutations: &[durable_store::Mutation],
     ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
         use crate::async_task_protocol::Error as ProtocolError;
         if self.abort
@@ -1568,9 +1679,11 @@ impl DetachedInvocation {
         {
             return Err(ProtocolError::Invalid);
         }
-        owner
-            .store()
-            .commit(&batch.checks, if commit { &batch.mutations } else { &[] })?;
+        let mut checks = batch.checks;
+        checks.extend_from_slice(extra_checks);
+        let mut mutations = if commit { batch.mutations } else { Vec::new() };
+        mutations.extend_from_slice(extra_mutations);
+        owner.store().commit(&checks, &mutations)?;
         Ok(intent)
     }
 
@@ -1760,6 +1873,31 @@ impl DetachedInvocation {
         } else {
             None
         };
+        let preflight_result = if preflight {
+            let capture = self.receipt_capture.as_ref().expect("preflight capture");
+            let cancel = self
+                .unhooked_cancellation
+                .as_ref()
+                .expect("preflight cancellation");
+            let memo = TaskHookMemo {
+                invocation: &self,
+                failed: std::sync::atomic::AtomicBool::new(false),
+            };
+            Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || {
+                    let result = capture
+                        .executor
+                        .preflight(&self.running.task, cancel, &memo);
+                    if memo.failed.load(std::sync::atomic::Ordering::Acquire) {
+                        Err("task-fenced memo failed".into())
+                    } else {
+                        result
+                    }
+                },
+            )))
+        } else {
+            None
+        };
         let Self {
             running,
             handler,
@@ -1792,31 +1930,34 @@ impl DetachedInvocation {
             let owner = &lease.attachment.owner;
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
             documents.set_input_validator(validator.as_ref());
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match (&receipt_capture, &intent, &unhooked_cancellation) {
-                    (Some(capture), None, Some(cancel)) if preflight => {
-                        capture.executor.preflight(&running.task, cancel)
+            let result = preflight_result.unwrap_or_else(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match (&receipt_capture, &intent, &unhooked_cancellation) {
+                        (Some(capture), Some(intent), Some(cancel)) => capture.executor.run(
+                            &running.task,
+                            intent,
+                            owner.store(),
+                            cancel,
+                            prepared,
+                        ),
+                        (Some(_), None, Some(_)) => {
+                            Ok(Step::Fail("aborted before dispatch".into()))
+                        }
+                        (None, None, None) => {
+                            let admission = AdmissionHandle {
+                                running: &running,
+                                lease: &lease,
+                                abort,
+                                definitions: &definitions,
+                                activity: &activity,
+                                standalone: validator.is_none(),
+                            };
+                            handler.run_with_admission(&running.task, &mut documents, &admission)
+                        }
+                        _ => Err("invalid unhooked executor state".into()),
                     }
-                    (Some(capture), Some(intent), Some(cancel)) => {
-                        capture
-                            .executor
-                            .run(&running.task, intent, owner.store(), cancel, prepared)
-                    }
-                    (Some(_), None, Some(_)) => Ok(Step::Fail("aborted before dispatch".into())),
-                    (None, None, None) => {
-                        let admission = AdmissionHandle {
-                            running: &running,
-                            lease: &lease,
-                            abort,
-                            definitions: &definitions,
-                            activity: &activity,
-                            standalone: validator.is_none(),
-                        };
-                        handler.run_with_admission(&running.task, &mut documents, &admission)
-                    }
-                    _ => Err("invalid unhooked executor state".into()),
-                }
-            }));
+                }))
+            });
             let result = match result {
                 Ok(result) => result,
                 Err(payload) if running.task.is_task_tool() => {

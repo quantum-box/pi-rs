@@ -370,6 +370,7 @@ impl SealedExecutor {
         &self,
         task: &Task,
         cancel: &pi_rs_core::CancellationToken,
+        memo: &dyn crate::extension::Memo,
     ) -> Result<crate::task_scheduler::Step, String> {
         let hook = self
             .before_hook
@@ -388,11 +389,9 @@ impl SealedExecutor {
                 let mut registry = crate::extension::Registry::default();
                 registry.install(crate::extension::Extension { name: "task-before".into(), hooks: vec![hook], ..Default::default() }).map_err(|e| e.to_string())?;
                 let selected = registry.snapshot().resolve(None);
-                let unsupported = UnsupportedMemo(std::sync::atomic::AtomicBool::new(false));
                 let snapshot = serde_json::Value::Null;
-                let context = crate::extension::Context { snapshot: &snapshot, memo: &unsupported };
+                let context = crate::extension::Context { snapshot: &snapshot, memo };
                 let (call, decision, _) = selected.before_tool(crate::extension::ToolCall { name: self.identity.spec.name.clone(), arguments: args }, &context).await;
-                if unsupported.0.load(std::sync::atomic::Ordering::Acquire) { return Err("before-hook memo is unsupported".into()); }
                 match decision {
                     crate::extension::BeforeTool::Pass => (),
                     crate::extension::BeforeTool::Block(reason) => return Ok(crate::task_scheduler::Step::Fail(format!("tool call blocked: {reason}"))),
@@ -498,23 +497,6 @@ impl SealedExecutor {
 impl crate::task_scheduler::Handler for SealedExecutor {
     fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
         Err("sealed executor requires its driver-owned task reservation".into())
-    }
-}
-
-struct UnsupportedMemo(std::sync::atomic::AtomicBool);
-#[async_trait::async_trait]
-impl crate::extension::Memo for UnsupportedMemo {
-    async fn get(&self, _: &str) -> Result<Option<serde_json::Value>, String> {
-        self.0.store(true, std::sync::atomic::Ordering::Release);
-        Err("memo unsupported".into())
-    }
-    async fn get_or_insert(
-        &self,
-        _: &str,
-        _: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        self.0.store(true, std::sync::atomic::Ordering::Release);
-        Err("memo unsupported".into())
     }
 }
 
@@ -880,6 +862,113 @@ mod tests {
         assert!(received.try_recv().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = driver.shutdown_with_pending();
+    }
+
+    struct MemoHook {
+        invalid: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for MemoHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            if self.invalid {
+                let _ = ctx.memo.get_or_insert("", json!(1)).await;
+                return Ok(crate::extension::BeforeTool::Pass);
+            }
+            let first = ctx.memo.get_or_insert("key", json!("first")).await?;
+            let second = ctx.memo.get_or_insert("key", json!("second")).await?;
+            let read = ctx.memo.get("key").await?;
+            if first != json!("first") || second != first || read != Some(first) {
+                return Err("memo did not retain first value".into());
+            }
+            Ok(crate::extension::BeforeTool::Rewrite(json!({"memo":true})))
+        }
+    }
+
+    #[test]
+    fn driver_fences_memo_and_rejects_ignored_memo_errors() {
+        for invalid in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (sent, received) = std::sync::mpsc::channel();
+            let tool: Arc<dyn Tool> = Arc::new(BeforeToolFixture(sent));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = before_fixture_host(
+                &dir.path().join("db"),
+                tool,
+                Arc::new(MemoHook { invalid }),
+                "memo-v1",
+            )
+            .into_scheduler_for_test();
+            let parent = before_parent();
+            scheduler.submit(&parent).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let task = wait_terminal(&driver, parent.id());
+            if invalid {
+                assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+                assert!(received.try_recv().is_err());
+            } else {
+                assert_eq!(received.try_recv().unwrap(), json!({"memo":true}));
+                assert!(matches!(task.state(), crate::task::TaskState::Succeeded(_)));
+            }
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+
+    struct StaleMemoHook {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        result: std::sync::mpsc::Sender<bool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for StaleMemoHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            let rejected = ctx.memo.get_or_insert("late", json!(1)).await.is_err();
+            self.result.send(rejected).unwrap();
+            Ok(crate::extension::BeforeTool::Pass)
+        }
+    }
+    #[test]
+    fn driver_rejects_memo_after_ancestor_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(BeforeToolFixture(sent));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (result, result_rx) = std::sync::mpsc::channel();
+        let hook = StaleMemoHook {
+            entered,
+            release: std::sync::Mutex::new(release_rx),
+            result,
+        };
+        let scheduler =
+            before_fixture_host(&dir.path().join("db"), tool, Arc::new(hook), "memo-v1")
+                .into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        driver.request_abort(parent.id()).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        let _ = wait_terminal(&driver, parent.id());
+        assert!(received.try_recv().is_err());
+        let _ = driver.shutdown_with_pending().unwrap();
     }
 
     #[test]
