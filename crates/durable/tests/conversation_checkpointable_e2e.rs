@@ -1795,3 +1795,162 @@ async fn abort_during_unsafe_preparation_does_not_publish_no_dispatch() {
     let _ = driver.shutdown_with_pending();
     let _ = scheduler.shutdown().await;
 }
+
+#[tokio::test]
+async fn conversation_park_cancel_claim_does_not_dispatch_callback() {
+    exercise_conversation_park_claim(false).await;
+}
+
+#[tokio::test]
+async fn conversation_park_cancel_claim_rejects_changed_conversation_attempt() {
+    exercise_conversation_park_claim(true).await;
+}
+
+async fn exercise_conversation_park_claim(replace_attempt: bool) {
+    use pi_rs_durable::async_task_tool::{
+        DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Cancel(Arc<AtomicUsize>);
+    #[async_trait]
+    impl DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let gate = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    let leaf = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(AsyncTool {
+            name: "leaf",
+            child: None,
+            gate: Some(gate),
+            early: false,
+        }),
+        "leaf",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let root_tool = Arc::new(AsyncTool {
+        name: "root",
+        child: Some("leaf"),
+        gate: None,
+        early: false,
+    });
+    let identity_tool: Arc<dyn Tool> = root_tool.clone();
+    let _identity_handle =
+        pi_rs_durable::nested_identity::register(&identity_tool, Some("backend-v1".into()))
+            .unwrap();
+    let root = register_conversation_unsafe_durable_tool_with_park_cancel(
+        &mut registry,
+        root_tool,
+        "root",
+        1,
+        vec![leaf.clone()],
+        "cancel-v1",
+        Arc::new(Cancel(calls.clone())),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![root.register(), leaf.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
+    let root_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(record) = tasks.list().unwrap().into_iter().find(|r| {
+                r.task.owner() == &pi_rs_durable::task::TaskOwner::Conversation(conversation)
+                    && matches!(r.task.state(), TaskState::Waiting(_))
+            }) {
+                break record.task.id();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if replace_attempt {
+        let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+        let entry = store.get(&conversation_key).unwrap().unwrap();
+        let mut record: Value = serde_json::from_slice(&entry.value).unwrap();
+        record["tool_attempt"]["attempt_id"] = json!(uuid::Uuid::new_v4());
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: conversation_key.clone(),
+                    expected: durable_store::Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: conversation_key,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+    }
+    scheduler.abort_task(root_id).unwrap();
+    let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if store.get(key.as_bytes()).unwrap().is_some()
+                || (replace_attempt && tasks.load(root_id).unwrap().unwrap().task.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        store.get(key.as_bytes()).unwrap().is_none(),
+        replace_attempt
+    );
+    if !replace_attempt {
+        let entry = store.get(key.as_bytes()).unwrap().unwrap();
+        let claim: Value = serde_json::from_slice(&entry.value).unwrap();
+        assert_eq!(claim["task"], json!(root_id));
+        assert_eq!(claim["definition_version"], 1);
+        assert!(claim["attempt"].as_str().is_some());
+        assert!(claim["lease"].as_str().is_some());
+        let final_state = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let state = tasks.load(root_id).unwrap().unwrap().task.state().clone();
+                if matches!(state, TaskState::Failed(_)) {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(final_state, TaskState::Failed(reason) if reason.contains("reconciliation required"))
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let _ = driver.shutdown_with_pending().unwrap();
+}

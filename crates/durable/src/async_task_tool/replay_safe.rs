@@ -324,6 +324,7 @@ fn register_with_policy(
         unavailable,
         park_cancel: park_cancel.map(|(_, callback, retry, _)| (callback, retry)),
         _conversation_cancel: None,
+        conversation_identity: None,
         woken_identity,
     });
     scheduler.install_checkpointable_async_handler(
@@ -356,6 +357,25 @@ pub(super) fn register_conversation_candidate(
     replay_safe: bool,
     conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
 ) -> Result<Arc<TaskTool>, String> {
+    let identity_tool: Arc<dyn Tool> = tool.clone();
+    let identity_guard = if conversation_cancel.is_some() {
+        Some(
+            crate::nested_identity::execution_lease(&identity_tool)
+                .map_err(|_| "conversation cancel identity busy")?
+                .ok_or("conversation cancel requires a registered identity lease")?,
+        )
+    } else {
+        None
+    };
+    let conversation_identity = match identity_guard.as_ref() {
+        Some(guard) => Some(
+            guard
+                .as_deref()
+                .ok_or("conversation cancel identity missing")?
+                .to_owned(),
+        ),
+        None => None,
+    };
     let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
     if let Some((selection, _, _)) = &selected {
         let hook_id = format!(
@@ -397,8 +417,13 @@ pub(super) fn register_conversation_candidate(
     ))
     .map_err(|e| e.to_string())?;
     let encoded = if let Some((cancel_identity, _)) = &conversation_cancel {
-        serde_json::to_vec(&("conversation-cancel-v1", encoded, cancel_identity))
-            .map_err(|e| e.to_string())?
+        serde_json::to_vec(&(
+            "conversation-cancel-v2",
+            encoded,
+            cancel_identity,
+            &conversation_identity,
+        ))
+        .map_err(|e| e.to_string())?
     } else {
         encoded
     };
@@ -428,6 +453,7 @@ pub(super) fn register_conversation_candidate(
         None => (None, None, None),
     };
     let has_hook = hook.is_some();
+    let has_conversation_cancel = conversation_cancel.is_some();
     let handler: Arc<dyn Handler> = Arc::new(Executor {
         tool,
         identity,
@@ -440,6 +466,7 @@ pub(super) fn register_conversation_candidate(
         unavailable: false,
         park_cancel: None,
         _conversation_cancel: conversation_cancel,
+        conversation_identity,
         woken_identity: None,
     });
     let mut adapter =
@@ -452,6 +479,9 @@ pub(super) fn register_conversation_candidate(
     }
     let adapter = Arc::new(adapter);
     registry.register_conversation_checkpointable(&adapter, validate, selection)?;
+    if has_conversation_cancel {
+        registry.enable_conversation_claim_handler(&adapter)?;
+    }
     Ok(adapter)
 }
 
@@ -843,6 +873,7 @@ struct Executor {
     park_cancel: Option<(Arc<dyn DurableParkCancel>, bool)>,
     // Registered and identity-bound, but deliberately not dispatchable yet.
     _conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
+    conversation_identity: Option<String>,
     woken_identity: Option<String>,
 }
 
@@ -1613,6 +1644,27 @@ impl Handler for Executor {
         if task.holds_restart_cleanup() {
             return self.run_with_restart_cleanup(task, admission);
         }
+        if admission.is_conversation_checkpointable() && self._conversation_cancel.is_some() {
+            let identity_tool: Arc<dyn Tool> = self.tool.clone();
+            let expected = self
+                .conversation_identity
+                .as_deref()
+                .ok_or("missing conversation cancel identity")?;
+            let _identity_lease = crate::nested_identity::checked_lease(&identity_tool, expected)
+                .map_err(
+                |_| "conversation cancel identity unavailable; reconciliation required",
+            )?;
+            if !self
+                .identity
+                .matches(self.tool.as_ref(), &self.implementation, self.version)
+            {
+                return Err("conversation cancel tool identity changed".into());
+            }
+            admission.record_conversation_park_claim(self)?;
+            return Err(
+                "conversation cancel callback is not enabled; reconciliation required".into(),
+            );
+        }
         if !self.replay_safe
             && self.park_cancel.is_some()
             && task.checkpoint().phase != "replay-safe-async-wait"
@@ -2052,7 +2104,9 @@ impl Handler for Executor {
                 let legacy_fixture = std::env::var_os("PI_TEST_LEGACY_PARK_CANCEL").is_some();
                 #[cfg(not(test))]
                 let legacy_fixture = false;
-                let proven_park = self.park_cancel.is_some() && !legacy_fixture;
+                let proven_park = (self.park_cancel.is_some()
+                    || self._conversation_cancel.is_some())
+                    && !legacy_fixture;
                 let data = serde_json::to_value(ParkCheckpoint {
                     version: if proven_park { 2 } else { 1 },
                     arguments: args.clone(),

@@ -65,3 +65,8 @@ pub mod tool_search;
 pub mod transcript;
 pub mod wake_delivery;
 pub mod worker_activity;
+
+#[cfg(test)]
+extern crate self as pi_rs_durable;
+#[cfg(test)]
+mod conversation_claim_boundary_tests;

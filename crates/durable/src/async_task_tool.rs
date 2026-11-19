@@ -74,6 +74,10 @@ pub fn register_conversation_unsafe_durable_tool(
 /// Register an unsafe, unhooked conversation Tool and its external park-cancel
 /// handler. `cancel_identity` must change whenever the handler implementation
 /// or configuration changes and must be restored after reopening the store.
+/// The exact Tool must first be registered with `nested_identity::register`;
+/// its identity must cover both Tool and callback configuration, and every host
+/// update must go through the returned `IdentityHandle`. The identity is held
+/// through claim commit. Older registrations without it require reconciliation.
 /// The handler is retained for a future cancellation integration; it is never
 /// dispatched by this registration. Abort continues to require reconciliation.
 #[allow(clippy::too_many_arguments)]

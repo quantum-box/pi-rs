@@ -680,6 +680,25 @@ impl Registry {
         entry.conversation_checkpointable = Some((identity, validate, selection));
         Ok(())
     }
+    pub(crate) fn enable_conversation_claim_handler(
+        &mut self,
+        adapter: &Arc<crate::task_tool::TaskTool>,
+    ) -> Result<(), String> {
+        let identity = adapter
+            .identity()
+            .ok_or("invalid checkpointable identity")?;
+        let entry = self
+            .entries
+            .get_mut(&identity.kind)
+            .ok_or("missing registration")?;
+        if entry.conversation_checkpointable.is_none()
+            || !Arc::ptr_eq(&entry.handler, &adapter.handler())
+        {
+            return Err("conversation registration changed".into());
+        }
+        entry.abort = Some(entry.handler.clone());
+        Ok(())
+    }
     pub(crate) fn conversation_checkpointable(
         &self,
     ) -> impl Iterator<Item = (&crate::task_tool::Identity, &Arc<dyn Handler>, bool)> {
@@ -1171,6 +1190,30 @@ impl PendingMaintenance {
 
 #[cfg(test)]
 type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn conversation_claim_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_claim_before_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_claim_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn conversation_claim_finished_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_claim_after_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_claim_finished_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
 #[cfg(test)]
 fn release_hooks() -> &'static BoundaryHooks {
     static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
@@ -2019,6 +2062,122 @@ impl DetachedInvocation {
 }
 
 impl AdmissionHandle<'_> {
+    /// Record a claim for a conversation-owned root park without dispatching
+    /// the external callback. Every authorization is checked in one commit.
+    pub(crate) fn record_conversation_park_claim(
+        &self,
+        handler: &dyn Handler,
+    ) -> Result<(), String> {
+        if !self.abort || self.standalone || self.lease.retired {
+            return Err("invalid conversation cleanup lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cleanup attempt or live child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation cancel registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
+            owner.store(),
+            &current.task,
+            boundary,
+        )?);
+        let key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-claim",
+            current.task.id()
+        )
+        .into_bytes();
+        checks.push(durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        let record = serde_json::json!({"version":1,"task":current.task.id(),"kind":kind,
+            "definition_version":current.task.definition_version(),"attempt":attempt,
+            "lease":self.lease.token,"checkpoint":current.task.checkpoint()});
+        #[cfg(test)]
+        if let Some(hook) = conversation_claim_hooks()
+            .lock()
+            .unwrap()
+            .remove(&current.task.id())
+        {
+            hook();
+        }
+        let commit = owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                }],
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string());
+        #[cfg(test)]
+        if let Some(hook) = conversation_claim_finished_hooks()
+            .lock()
+            .unwrap()
+            .remove(&current.task.id())
+        {
+            hook();
+        }
+        commit?;
+        Ok(())
+    }
+
     /// Preserve a joined unsafe result while the exact invocation lease is
     /// held. Abort may have marked the task; it must not erase this evidence.
     pub(crate) fn capture_unsafe_durable_outcome(
