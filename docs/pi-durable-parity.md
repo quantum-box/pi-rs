@@ -3,8 +3,11 @@
 
 child. Admission and the parent checkpoint/wait commit atomically; each wake
 reports ended direct children and keyed calls can reconnect to the same child.
-`WaitFor::Tasks` waits for all named children and `TasksAny` wakes on any. This
-is a synchronous registered-task-handler API: nested children run task handlers,
+`WaitFor::Tasks` waits for all named children and `TasksAny` wakes on any.
+The latter does not abort the remaining children: if a parent wakes while another child
+is admitting a descendant, conflicting graph observations are retried for a
+replay-safe child; an unsafe child remains subject to outcome reconciliation.
+This is a synchronous registered-task-handler API: nested children run task handlers,
 not the ordinary asynchronous `Tool` invocation or its nested tool-hook pipeline.
 It is separate from `KeyedHost` multi-level nested calls and does not establish
 parity with upstream `executeTool(..., { wait: false })` or its tool API.
