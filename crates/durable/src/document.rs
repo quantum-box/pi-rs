@@ -2453,6 +2453,13 @@ impl<'a> TaskDocuments<'a> {
     ) -> Result<bool, String> {
         crate::async_task_tool::unsafe_park_proof::after_is_incomplete(self.store, task, raw)
     }
+    /// Caller must have already fenced the unsafe child's evidence prefix.
+    pub(crate) fn unsafe_no_dispatch_host_failure(
+        &self,
+        task: &crate::task::Task,
+    ) -> Result<Option<pi_rs_core::Outcome>, String> {
+        crate::async_task_tool::unsafe_park_proof::no_dispatch_host_failure(self.store, task)
+    }
     pub(crate) fn verify_unsafe_rich_hook_final(
         &self,
         task: &crate::task::Task,

@@ -3252,7 +3252,12 @@ impl AdmissionHandle<'_> {
                     owner.store(),
                     &current.task,
                 )?);
-            } else if current.task.checkpoint().phase != "initial" {
+            } else if current.task.checkpoint().phase == "initial" {
+                checks.extend(crate::async_task_tool::unsafe_park_proof::dispatch_checks(
+                    owner.store(),
+                    &current.task,
+                )?);
+            } else {
                 return Err("unsafe hook is not in an authorized phase".into());
             }
         }

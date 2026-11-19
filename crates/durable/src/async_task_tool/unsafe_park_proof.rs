@@ -856,6 +856,24 @@ fn no_dispatch_checks(store: &Store, task: &Task) -> Result<(NoDispatchProof, Ve
     ))
 }
 
+/// Return a proved host failure only for the unsafe no-dispatch after phase.
+pub(crate) fn no_dispatch_host_failure(
+    store: &Store,
+    task: &Task,
+) -> Result<Option<pi_rs_core::Outcome>, String> {
+    if task.checkpoint().phase != "replay-safe-async-after"
+        || task
+            .checkpoint()
+            .data
+            .get("host_error")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Ok(None);
+    }
+    no_dispatch_checks(store, task)?;
+    host_error_outcome(task.checkpoint()).map(Some)
+}
+
 /// Bind a replayable after phase to the exact committed unsafe Complete and its joined receipt.
 pub(crate) fn after_checks(store: &Store, task: &Task) -> Result<Vec<Check>, String> {
     if task.replay_safe() || task.checkpoint().phase != "replay-safe-async-after" {
@@ -1105,7 +1123,7 @@ pub(crate) fn after_is_incomplete(
             .ok_or("missing unsafe hook final")?;
         let record: HookFinal =
             serde_json::from_slice(&entry.value).map_err(|_| "invalid unsafe hook final")?;
-        if record.version == 2 {
+        if matches!(record.version, 2 | 3) {
             let value = record
                 .final_rich
                 .as_ref()
@@ -1167,6 +1185,26 @@ pub(crate) fn rich_hook_final_checks(
     let no_dispatch = record.version == 3;
     let valid_origin = if no_dispatch {
         let (proof, _) = no_dispatch_checks(store, task)?;
+        let super::DurableTaskResult::Rich { task_content_v1 } =
+            serde_json::from_value(value.clone()).map_err(|_| "invalid no-dispatch rich result")?
+        else {
+            return Err("missing no-dispatch rich result".into());
+        };
+        let pi_rs_core::Outcome::Failed(message) = host_error_outcome(task.checkpoint())? else {
+            return Err("invalid no-dispatch host failure".into());
+        };
+        let code = task
+            .checkpoint()
+            .data
+            .get("host_error")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing host error code")?;
+        let required = crate::runtime::ToolDiagnostic {
+            severity: crate::runtime::DiagnosticSeverity::Error,
+            code: Some(code.into()),
+            message: super::replay_safe::bounded_diagnostic(&message),
+        };
+        super::replay_safe::validate_content_hook_result(&task_content_v1, Some(&required), false)?;
         receipts.is_empty()
             && record.raw_attempt == proof.before_attempt.unwrap_or(Uuid::nil())
             && record.raw == host_error_outcome(task.checkpoint())?
@@ -1180,7 +1218,8 @@ pub(crate) fn rich_hook_final_checks(
         || record.task != task.id()
         || record.final_outcome.is_some()
         || record.final_rich.as_ref() != Some(value)
-        || (matches!(task.state(), TaskState::Succeeded(_))
+        || ((matches!(task.state(), TaskState::Succeeded(_))
+            || (no_dispatch && matches!(task.state(), TaskState::Failed(_))))
             && record.final_attempt != task.retired_attempt_id())
         || record.final_attempt.is_none()
     {
@@ -1207,6 +1246,43 @@ pub(crate) fn rich_hook_final_checks(
 #[cfg(test)]
 mod no_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn initial_empty_prefix_check_fences_new_and_existing_intent() {
+        let store = Store::memory().unwrap();
+        let mut task = Task::new(
+            Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("pi-rs.unsafe-park-async.v1.hook.test".into(), false)
+        .into_task_tool();
+        task.start_attempt(Uuid::new_v4()).unwrap();
+        let checks = dispatch_checks(&store, &task).unwrap();
+        let prior = intent_key(task.id(), Uuid::new_v4());
+        store
+            .commit(
+                &[Check {
+                    key: prior.clone(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: prior,
+                    value: b"prior".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(dispatch_checks(&store, &task).is_err());
+    }
 
     #[test]
     fn prior_intent_racing_no_dispatch_commit_rejects_proof() {
@@ -1247,5 +1323,82 @@ mod no_dispatch_tests {
             Err(durable_store::Error::Conflict { .. })
         ));
         assert!(store.get(&no_dispatch_key(id)).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_task_validates_version_three_final_and_rejects_tampering() {
+        let store = Store::memory().unwrap();
+        let mut task = Task::new(
+            Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("pi-rs.unsafe-park-async.v1.hook.test".into(), false)
+        .into_task_tool();
+        task.start_attempt(Uuid::new_v4()).unwrap();
+        let checkpoint = super::super::invalid_raw_checkpoint().unwrap();
+        let raw = host_error_outcome(&checkpoint).unwrap();
+        let (checks, mutations) =
+            prepare_no_dispatch_proof(&store, &task, &checkpoint, false).unwrap();
+        store.commit(&checks, &mutations).unwrap();
+        task.advance(checkpoint).unwrap();
+        task.yield_ready().unwrap();
+        task.start_attempt(Uuid::new_v4()).unwrap();
+        let pi_rs_core::Outcome::Failed(message) = &raw else {
+            panic!("expected host failure")
+        };
+        let rich = serde_json::json!({"task_content_v1": {"output":[{"type":"text","text":"redacted"}], "isError":true, "diagnostics":[{"severity":"error","code":"invalid_arguments","message":message}]}});
+        let (checks, mutations) = prepare_hook_phase(
+            &store,
+            &task,
+            &crate::task_scheduler::Step::Succeed(rich.clone()),
+        )
+        .unwrap();
+        store.commit(&checks, &mutations).unwrap();
+        let running = task.clone();
+        task.hold_success(rich).unwrap();
+        task.record_completed_attempt(&running).unwrap();
+        task.finalize_with_unsafe_reconciliation(Uuid::new_v4())
+            .unwrap();
+        assert!(!after_is_incomplete(&store, &task, &raw).unwrap());
+        let key = hook_final_key(task.id());
+        let entry = store.get(&key).unwrap().unwrap();
+        let mut record: HookFinal = serde_json::from_slice(&entry.value).unwrap();
+        let original_attempt = record.final_attempt;
+        record.final_attempt = Some(Uuid::new_v4());
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(after_is_incomplete(&store, &task, &raw).is_err());
+        let entry = store.get(&key).unwrap().unwrap();
+        record.final_attempt = original_attempt;
+        record.final_rich = Some(serde_json::json!({"invalid":true}));
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(after_is_incomplete(&store, &task, &raw).is_err());
     }
 }

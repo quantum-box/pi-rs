@@ -763,7 +763,7 @@ fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result
     validate_content_result_with_limit(result, 60 * 1024)
 }
 
-fn bounded_diagnostic(message: &str) -> String {
+pub(super) fn bounded_diagnostic(message: &str) -> String {
     let mut end = message.len().min(4096);
     while !message.is_char_boundary(end) {
         end -= 1;
@@ -894,13 +894,14 @@ impl DurableTaskHost for Host<'_, '_> {
                     if expected != result { return Err("unsafe child result lacks matching final evidence".into()); }
                     AsyncTaskResult::Outcome(result)
                 }
-                TaskState::Failed(_) if task.checkpoint().phase == "replay-safe-async-after" && outcome.is_some() => {
-                    let raw = outcome.expect("checked outcome");
-                    if docs.unsafe_after_is_incomplete(&task, &raw)? {
-                        AsyncTaskResult::AfterIncomplete(raw)
-                    } else {
-                        AsyncTaskResult::Uncertain(raw)
-                    }
+                TaskState::Failed(_) if task.checkpoint().phase == "replay-safe-async-after" => {
+                    let raw = match outcome {
+                        Some(raw) => Some(raw),
+                        None => docs.unsafe_no_dispatch_host_failure(&task)?,
+                    };
+                    if let Some(raw) = raw {
+                        if docs.unsafe_after_is_incomplete(&task, &raw)? { AsyncTaskResult::AfterIncomplete(raw) } else { AsyncTaskResult::Uncertain(raw) }
+                    } else { AsyncTaskResult::Uncertain(Outcome::Unknown("unsafe child requires reconciliation: after outcome unavailable".into())) }
                 }
                 TaskState::Failed(reason) => AsyncTaskResult::Uncertain(outcome.unwrap_or_else(|| Outcome::Unknown(format!("unsafe child requires reconciliation: {reason}")))),
                 TaskState::Cancelled if has_intent => AsyncTaskResult::Uncertain(outcome.unwrap_or_else(|| Outcome::Unknown("unsafe child was cancelled after dispatch; reconciliation may be required".into()))),
@@ -1080,11 +1081,15 @@ impl Executor {
             return Err("before hook cancelled".into());
         }
         if let Some(error) = memo.failure() {
-            return Err(if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY {
-                error
-            } else {
-                "task-fenced hook memo failed".into()
-            });
+            return Err(
+                if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY
+                    || error == "prior unsafe execution evidence requires reconciliation"
+                {
+                    error
+                } else {
+                    "task-fenced hook memo failed".into()
+                },
+            );
         }
         memo.stage_signal_check(docs)?;
         let before = before?;

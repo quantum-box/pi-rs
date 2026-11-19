@@ -339,12 +339,17 @@ impl Hook for PriorIntentGate {
     async fn before_tool(
         &self,
         _: &pi_rs_durable::extension::ToolCall,
-        _: &Context<'_>,
+        ctx: &Context<'_>,
     ) -> Result<BeforeTool, String> {
         self.gate.store(1, Ordering::SeqCst);
         while self.gate.load(Ordering::SeqCst) != 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        // The hook ignores the error; a rejected access still fences its phase.
+        let _ = ctx
+            .memo
+            .get_or_insert("late-after-prior", json!(true))
+            .await;
         if self.pass {
             Ok(BeforeTool::Rewrite(json!({"prepared_by_hook":true})))
         } else {
@@ -482,6 +487,18 @@ async fn unsafe_before_rejects_prior_intent_without_publishing_known_failure() {
                 .get(
                     format!(
                         "durable/unsafe-park-async/{}/no-dispatch",
+                        tasks[0].task.id()
+                    )
+                    .as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(
+                    format!(
+                        "runtime/extension-memo/{}/late-after-prior",
                         tasks[0].task.id()
                     )
                     .as_bytes()
@@ -3259,4 +3276,327 @@ async fn rich_after_published_result_survives_process_kill() {
     assert_eq!(executions.load(Ordering::SeqCst), 0);
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
+}
+
+struct IncompleteHook {
+    gate: Option<Arc<AtomicUsize>>,
+}
+#[async_trait]
+impl Hook for IncompleteHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Context<'_>,
+    ) -> Result<BeforeTool, String> {
+        if call.name == "leaf" {
+            Ok(BeforeTool::Block("denied-leaf".into()))
+        } else {
+            Ok(BeforeTool::Pass)
+        }
+    }
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        ctx: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "leaf" {
+            return Ok(None);
+        }
+        ctx.memo
+            .get_or_insert("incomplete-after", json!("kept"))
+            .await?;
+        if let Some(path) = std::env::var_os("PI_INCOMPLETE_HOOK_CUT") {
+            std::fs::write(path, "entered").unwrap();
+            std::future::pending::<()>().await;
+        }
+        if let Some(gate) = &self.gate {
+            gate.store(1, Ordering::SeqCst);
+            while gate.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        Err("after hook failed".into())
+    }
+}
+struct IncompleteParent {
+    seen: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Tool for IncompleteParent {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "root".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for IncompleteParent {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        resume: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        if let Some(checkpoint) = resume.checkpoint {
+            let child: AsyncTaskCall =
+                serde_json::from_value(checkpoint).map_err(|e| e.to_string())?;
+            match host.child_result(&child).await? {
+                Some(AsyncTaskResult::AfterIncomplete(Outcome::Failed(reason)))
+                    if reason.contains("denied-leaf") =>
+                {
+                    self.seen.fetch_add(1, Ordering::SeqCst);
+                    return Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                        "parent-saw-incomplete".into(),
+                    )));
+                }
+                other => return Err(format!("expected known incomplete host failure: {other:?}")),
+            }
+        }
+        let child = host.start_child("leaf", "leaf", json!({})).await?;
+        Ok(DurableToolStep::Park {
+            checkpoint: serde_json::to_value(&child).unwrap(),
+            wait: DurableWait::All(vec![child]),
+        })
+    }
+}
+fn setup_incomplete(
+    seen: Arc<AtomicUsize>,
+    executions: Arc<AtomicUsize>,
+    gate: Option<Arc<AtomicUsize>>,
+) -> (Options, Registry, pi_rs_durable::extension::Registry) {
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install_identified(
+            Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(IncompleteHook { gate })],
+                ..Default::default()
+            },
+            ExtensionIdentity::new(1, "incomplete-v1".into(), vec!["hook-v1".into()]).unwrap(),
+        )
+        .unwrap();
+    let snapshot = extensions.snapshot();
+    let names = ["policy".into()];
+    let mut registry = Registry::default();
+    let child = register_conversation_unsafe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(Job {
+            name: "leaf",
+            child: None,
+            executions,
+        }),
+        "incomplete-leaf",
+        1,
+        vec![],
+        &snapshot,
+        &names,
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    let root = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(IncompleteParent { seen }),
+        "incomplete-parent",
+        1,
+        vec![child.clone()],
+        &snapshot,
+        &names,
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    (
+        Options {
+            model: Arc::new(ModelStub),
+            tools: vec![root.register(), child.register()],
+            restart_limit: 5,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+        extensions,
+    )
+}
+async fn start_incomplete(scheduler: &mut Scheduler) -> uuid::Uuid {
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    id
+}
+async fn wait_incomplete_parent(scheduler: &Scheduler, id: uuid::Uuid) {
+    tokio::time::timeout(Duration::from_secs(15), async { loop {
+        let c = scheduler.conversation(id).unwrap();
+        if let Some(i) = c.messages.iter().position(|m| matches!(m, Message::Tool { content, .. } if content == "parent-saw-incomplete")) && c.messages[i+1..].iter().any(|m| matches!(m, Message::Assistant { .. })) { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    } }).await.unwrap();
+}
+#[tokio::test]
+async fn unsafe_child_no_dispatch_after_failure_reaches_parent_as_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let seen = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_incomplete(seen.clone(), executions.clone(), None);
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start_incomplete(&mut scheduler).await;
+    wait_incomplete_parent(&scheduler, id).await;
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_child_incomplete_worker() {
+    let Some(dir) = std::env::var_os("PI_INCOMPLETE_HOOK_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let (options, registry, extensions) = setup_incomplete(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        None,
+    );
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.join("db"), options, extensions).unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
+    let id = start_incomplete(&mut scheduler).await;
+    std::fs::write(dir.join("conversation"), id.to_string()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_child_incomplete_after_survives_kill_and_reopen() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unsafe_child_incomplete_worker"])
+            .env("PI_INCOMPLETE_HOOK_DIR", dir.path())
+            .env("PI_INCOMPLETE_HOOK_CUT", dir.path().join("cut"))
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("cut").exists() || !dir.path().join("conversation").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id: uuid::Uuid = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let leaf = tasks
+        .iter()
+        .find(|t| matches!(t.task.owner(), pi_rs_durable::task::TaskOwner::Task(_)))
+        .unwrap()
+        .task
+        .id();
+    let memo_key = format!("runtime/extension-memo/{leaf}/incomplete-after");
+    let memo = store.get(memo_key.as_bytes()).unwrap().unwrap().value;
+    drop(store);
+    let seen = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_incomplete(seen.clone(), executions.clone(), None);
+    let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    wait_incomplete_parent(&scheduler, id).await;
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(store.get(memo_key.as_bytes()).unwrap().unwrap().value, memo);
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn late_receipt_conflicting_with_no_dispatch_never_reaches_parent_as_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let gate = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) =
+        setup_incomplete(seen.clone(), executions.clone(), Some(gate.clone()));
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start_incomplete(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let leaf = &tasks
+        .iter()
+        .find(|t| matches!(t.task.owner(), pi_rs_durable::task::TaskOwner::Task(_)))
+        .unwrap()
+        .task;
+    let task_id = leaf.id();
+    let prior = uuid::Uuid::new_v4();
+    let mut recorded = serde_json::to_value(leaf).unwrap();
+    recorded["attempt_id"] = json!(prior);
+    let intent = format!("durable/unsafe-park-async/{task_id}/{prior}/intent").into_bytes();
+    let mut receipt = intent.clone();
+    receipt.extend_from_slice(b"/receipt");
+    store.commit(&[durable_store::Check { key: intent.clone(), expected: durable_store::Expected::Missing }, durable_store::Check { key: receipt.clone(), expected: durable_store::Expected::Missing }], &[durable_store::Mutation::Put { key: intent, value: serde_json::to_vec(&recorded).unwrap() }, durable_store::Mutation::Put { key: receipt, value: serde_json::to_vec(&json!({"task_id":task_id,"attempt_id":prior,"outcome":Outcome::Succeeded("late-effect".into())})).unwrap() }]).unwrap();
+    drop(store);
+    gate.store(2, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert!(
+        !scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content == "parent-saw-incomplete")
+        )
+    );
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(
+        pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, task_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    let _ = driver.shutdown_with_pending();
+    let _ = scheduler.shutdown().await;
 }
