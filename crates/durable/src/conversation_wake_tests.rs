@@ -631,12 +631,24 @@ async fn runtime_wake_retries_overlapping_conversation_commits() {
     store_owner.store().commit(&[], &a).unwrap();
     let running = Arc::new(AtomicBool::new(true));
     let writer_running = running.clone();
+    let (started, wait_for_writer) = std::sync::mpsc::sync_channel(0);
     let writer = std::thread::spawn(move || {
-        while writer_running.load(Ordering::Acquire) {
-            store_owner.store().commit(&[], &b).unwrap();
+        // Begin with a committed alternate state, then contend with snapshots.
+        // A finite writer guarantees the reader eventually gets a quiet window
+        // even when the store mutex and snapshot retries are unfair.
+        store_owner.store().commit(&[], &b).unwrap();
+        if started.send(()).is_err() {
+            return;
+        }
+        for _ in 0..512 {
+            if !writer_running.load(Ordering::Acquire) {
+                break;
+            }
             store_owner.store().commit(&[], &a).unwrap();
+            store_owner.store().commit(&[], &b).unwrap();
         }
     });
+    wait_for_writer.recv().unwrap();
     let mut inconsistent = false;
     for _ in 0..100 {
         if let Ok(snapshot) = owner.wake_snapshot(0) {
