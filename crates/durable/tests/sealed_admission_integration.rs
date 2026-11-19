@@ -464,6 +464,7 @@ impl pi_rs_durable::extension::Hook for RewriteHook {
         Ok(pi_rs_durable::extension::BeforeTool::Rewrite(rewritten))
     }
 }
+#[allow(clippy::too_many_arguments)] // Explicit knobs keep crash and abort fixtures readable.
 fn hook_host(
     path: &Path,
     marker: Option<PathBuf>,
