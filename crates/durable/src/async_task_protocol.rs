@@ -267,6 +267,7 @@ fn prepare_authorized_phase(
             key,
             expected: Expected::Version(stored.version),
         });
+        checks.extend(attempt_record_check(store, &intent)?);
         let raw_key = raw_result_key(running.task.id());
         let raw = store.get(&raw_key)?.ok_or(Error::Invalid)?;
         let (raw_intent, _): (Intent, Outcome) = serde_json::from_slice(&raw.value)?;
@@ -751,6 +752,109 @@ mod tests {
         assert!(prepare_receipt(&store, &intent, &Outcome::Unknown("test".into())).is_err());
         assert!(prepare_receipt_read(&store, child).is_err());
         assert!(store.commit(&receipt.checks, &receipt.mutations).is_err());
+    }
+
+    #[test]
+    fn after_phase_fences_attempt_record_during_authorization_and_memo_commit() {
+        for replace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("db")).unwrap();
+            let (_, child, identity) = fixture(&store);
+            let identity = identity
+                .with_before_hook("hook-v1".into())
+                .unwrap()
+                .with_after_hook();
+            store
+                .commit(
+                    &[],
+                    &[Mutation::Put {
+                        key: identity_key(child),
+                        value: serde_json::to_vec(&identity).unwrap(),
+                    }],
+                )
+                .unwrap();
+            let running = TaskStore::new(&store).load(child).unwrap().unwrap();
+            let (intent, batch) = prepare_intent(&store, &running, &identity).unwrap();
+            commit(&store, batch);
+            commit(
+                &store,
+                prepare_raw_result(&store, &intent, &Outcome::Succeeded("raw".into())).unwrap(),
+            );
+            let (_, mut phase) = prepare_after_phase(&store, &running, &identity).unwrap();
+            // Model a fenced after-hook memo write in the same transaction.
+            let memo_key = b"test/after-memo".to_vec();
+            phase.checks.push(Check {
+                key: memo_key.clone(),
+                expected: Expected::Missing,
+            });
+            phase.mutations.push(Mutation::Put {
+                key: memo_key.clone(),
+                value: b"value".to_vec(),
+            });
+            let key = attempt_intent_key(child, intent.attempt);
+            let mutation = if replace {
+                let mut other = intent.clone();
+                other.attempt = Uuid::new_v4();
+                Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&other).unwrap(),
+                }
+            } else {
+                Mutation::Delete { key }
+            };
+            store.commit(&[], &[mutation]).unwrap();
+            assert!(matches!(
+                store.commit(&phase.checks, &phase.mutations),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(store.get(&memo_key).unwrap().is_none());
+            assert!(prepare_after_phase(&store, &running, &identity).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_after_phase_allows_intent_without_attempt_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let (_, child, identity) = fixture(&store);
+        let identity = identity
+            .with_before_hook("hook-v1".into())
+            .unwrap()
+            .with_after_hook();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: identity_key(child),
+                    value: serde_json::to_vec(&identity).unwrap(),
+                }],
+            )
+            .unwrap();
+        let running = TaskStore::new(&store).load(child).unwrap().unwrap();
+        let (mut intent, _) = prepare_intent(&store, &running, &identity).unwrap();
+        intent.attempt_record = false;
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: intent_key(child),
+                        value: serde_json::to_vec(&intent).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: raw_result_key(child),
+                        value: serde_json::to_vec(&(
+                            intent.clone(),
+                            Outcome::Succeeded("legacy".into()),
+                        ))
+                        .unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let (loaded, batch) = prepare_after_phase(&store, &running, &identity).unwrap();
+        assert_eq!(loaded, intent);
+        commit(&store, batch);
     }
 
     #[test]
