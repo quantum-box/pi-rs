@@ -103,6 +103,8 @@ pub fn read_raw_outcome_for_reconciliation(
 pub enum DurableWait {
     All(Vec<AsyncTaskCall>),
     Any(Vec<AsyncTaskCall>),
+    #[cfg(test)]
+    Signal(String),
 }
 
 /// A completed Tool outcome or an explicit durable park. A park is distinct
@@ -2100,6 +2102,386 @@ mod tests {
 }
 
     struct DurableStub(Arc<AtomicUsize>);
+
+    // This adapter deliberately exists only in unit tests. It exercises the
+    // real driver without granting an external Tool a replay-safe policy.
+    struct TestDurableHandler(Arc<dyn DurableAsyncTool>);
+    struct NoChildHost;
+    #[async_trait::async_trait]
+    impl DurableTaskHost for NoChildHost {
+        async fn start_child(
+            &self,
+            _: &str,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<AsyncTaskCall, String> {
+            Err("test host has no child admission".into())
+        }
+        async fn child_result(&self, _: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String> {
+            Err("test host has no child admission".into())
+        }
+    }
+    impl crate::task_scheduler::Handler for TestDurableHandler {
+        fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
+            Err("test executor requires admission".into())
+        }
+        fn run_with_admission(
+            &self,
+            task: &Task,
+            docs: &mut crate::document::TaskDocuments<'_>,
+            admission: &crate::task_scheduler::AdmissionHandle<'_>,
+        ) -> Result<crate::task_scheduler::Step, String> {
+            use crate::task_scheduler::Step;
+            let intent = admission.test_durable_intent()?;
+            let resume = match task.checkpoint().phase.as_str() {
+                "initial" => DurableToolResume {
+                    checkpoint: None,
+                    ended: vec![],
+                },
+                "test-park" if task.delivered_signal().is_some() => DurableToolResume {
+                    checkpoint: Some(task.checkpoint().data.clone()),
+                    ended: vec![],
+                },
+                _ => return Err("invalid test checkpoint or wake".into()),
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let result = runtime.block_on(self.0.execute_durable(
+                task.input().clone(),
+                ToolContext {
+                    operation_id: task.id(),
+                    cancellation: pi_rs_core::CancellationToken::new(),
+                },
+                resume,
+                &NoChildHost,
+            ))?;
+            docs.test_stage_durable_result(intent, &result)?;
+            match result {
+                DurableToolStep::Complete(outcome) => Ok(Step::Succeed(
+                    serde_json::to_value(outcome).map_err(|e| e.to_string())?,
+                )),
+                DurableToolStep::Park {
+                    checkpoint,
+                    wait: DurableWait::Signal(signal),
+                } if !signal.is_empty() => Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "test-park".into(),
+                        data: checkpoint,
+                    },
+                    condition: crate::task::WaitFor::Signal(signal),
+                    children: vec![],
+                }),
+                DurableToolStep::Park { .. } => Err("test host supports only signal waits".into()),
+            }
+        }
+    }
+    struct PureParkTool {
+        calls: Arc<AtomicUsize>,
+        barrier: Option<Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>>,
+        fail: bool,
+    }
+    #[async_trait::async_trait]
+    impl Tool for PureParkTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "pure-park".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for PureParkTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            resume: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(barrier) = &self.barrier {
+                let (lock, wake) = &**barrier;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                wake.notify_all();
+                while !state.1 {
+                    state = wake.wait(state).unwrap();
+                }
+            }
+            if self.fail {
+                return Err("test tool failure".into());
+            }
+            match resume.checkpoint {
+                None => Ok(DurableToolStep::Park {
+                    checkpoint: json!({"saved":42}),
+                    wait: DurableWait::Signal("go".into()),
+                }),
+                Some(value) if value == json!({"saved":42}) && resume.ended.is_empty() => Ok(
+                    DurableToolStep::Complete(Outcome::Succeeded("resumed".into())),
+                ),
+                _ => Err("invalid resumed state".into()),
+            }
+        }
+    }
+    fn pure_registry(tool: Arc<dyn DurableAsyncTool>) -> Registry {
+        let mut registry = Registry::default();
+        assert!(registry.register("test-durable", true, TestDurableHandler(tool)));
+        assert!(registry.set_abort("test-durable", |_: &Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!(null))
+        )));
+        registry
+    }
+    fn test_task() -> Task {
+        Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("test-durable".into(), true)
+        .into_task_tool()
+    }
+    fn wait_state(
+        driver: &crate::task_driver::Driver,
+        id: Uuid,
+        expected: impl Fn(&crate::task::TaskState) -> bool,
+    ) -> Task {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let task = driver.get(id).unwrap().unwrap();
+            if expected(task.state()) {
+                return task;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not reach expected state: {:?}",
+                task.state()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn pure_durable_tool_real_driver_parks_reopens_and_wakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(PureParkTool {
+            calls: calls.clone(),
+            barrier: None,
+            fail: false,
+        });
+        let scheduler =
+            crate::task_scheduler::Scheduler::open(&path, pure_registry(tool.clone())).unwrap();
+        let owner = scheduler.owner();
+        let task = test_task();
+        scheduler.submit(&task).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let parked = wait_state(
+            &driver,
+            task.id(),
+            |state| matches!(state, crate::task::TaskState::Waiting(crate::task::WaitFor::Signal(name)) if name == "go"),
+        );
+        assert_eq!(parked.checkpoint().data, json!({"saved":42}));
+        let prefix = format!("test/durable-async/{}/", task.id());
+        let before = owner.store().list(prefix.as_bytes()).unwrap();
+        assert_eq!(before.len(), 2);
+        driver.shutdown().unwrap();
+        drop(owner);
+        let scheduler = crate::task_scheduler::Scheduler::open(&path, pure_registry(tool)).unwrap();
+        let owner = scheduler.owner();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                task.id(),
+                "go".into(),
+                json!(null),
+            ))
+            .unwrap();
+        let finished = wait_state(&driver, task.id(), |state| {
+            matches!(state, crate::task::TaskState::Succeeded(_))
+        });
+        assert_eq!(
+            finished.state(),
+            &crate::task::TaskState::Succeeded(
+                serde_json::to_value(Outcome::Succeeded("resumed".into())).unwrap()
+            )
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let records = owner.store().list(prefix.as_bytes()).unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(before.iter().all(|entry| records.contains(entry)));
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pure_durable_tool_abort_discards_park_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new((
+            std::sync::Mutex::new((false, false)),
+            std::sync::Condvar::new(),
+        ));
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(PureParkTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+            barrier: Some(barrier.clone()),
+            fail: false,
+        });
+        let scheduler =
+            crate::task_scheduler::Scheduler::open(dir.path().join("db"), pure_registry(tool))
+                .unwrap();
+        let owner = scheduler.owner();
+        let task = test_task();
+        scheduler.submit(&task).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let (lock, wake) = &*barrier;
+        let mut state = lock.lock().unwrap();
+        while !state.0 {
+            state = wake
+                .wait_timeout(state, std::time::Duration::from_secs(10))
+                .unwrap()
+                .0;
+            assert!(state.0, "tool did not start");
+        }
+        drop(state);
+        driver.request_abort(task.id()).unwrap();
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        wake.notify_all();
+        drop(state);
+        wait_state(&driver, task.id(), |state| {
+            matches!(state, crate::task::TaskState::Cancelled)
+        });
+        let prefix = format!("test/durable-async/{}/", task.id());
+        let records = owner.store().list(prefix.as_bytes()).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "abort must discard the proposed park result"
+        );
+        assert!(!String::from_utf8_lossy(&records[0].0).ends_with("/result"));
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pure_durable_tool_failure_never_publishes_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(PureParkTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+            barrier: None,
+            fail: true,
+        });
+        let scheduler =
+            crate::task_scheduler::Scheduler::open(dir.path().join("db"), pure_registry(tool))
+                .unwrap();
+        let owner = scheduler.owner();
+        let task = test_task();
+        scheduler.submit(&task).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        wait_state(
+            &driver,
+            task.id(),
+            |state| matches!(state, crate::task::TaskState::Failed(reason) if reason.contains("test tool failure")),
+        );
+        let prefix = format!("test/durable-async/{}/", task.id());
+        let records = owner.store().list(prefix.as_bytes()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(!String::from_utf8_lossy(&records[0].0).ends_with("/result"));
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pure_durable_tool_kill_process_fixture() {
+        let Some(dir) = std::env::var_os("PI_TEST_PURE_DURABLE_KILL_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(PureParkTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+            barrier: None,
+            fail: false,
+        });
+        let scheduler =
+            crate::task_scheduler::Scheduler::open(dir.join("db"), pure_registry(tool)).unwrap();
+        let task = test_task();
+        scheduler.submit(&task).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        wait_state(&driver, task.id(), |state| {
+            matches!(state, crate::task::TaskState::Waiting(_))
+        });
+        std::fs::write(dir.join("ready.tmp"), task.id().to_string()).unwrap();
+        std::fs::rename(dir.join("ready.tmp"), dir.join("ready")).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn pure_durable_tool_kill_reopen_wakes_new_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::pure_durable_tool_kill_process_fixture")
+            .env("PI_TEST_PURE_DURABLE_KILL_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("ready").exists() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("park fixture did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(dir.path().join("ready"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(PureParkTool {
+            calls: calls.clone(),
+            barrier: None,
+            fail: false,
+        });
+        let scheduler =
+            crate::task_scheduler::Scheduler::open(dir.path().join("db"), pure_registry(tool))
+                .unwrap();
+        let owner = scheduler.owner();
+        let prefix = format!("test/durable-async/{id}/");
+        assert_eq!(owner.store().list(prefix.as_bytes()).unwrap().len(), 2);
+        let driver = crate::task_driver::Driver::start(scheduler);
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                id,
+                "go".into(),
+                json!(null),
+            ))
+            .unwrap();
+        let finished = wait_state(&driver, id, |state| {
+            matches!(state, crate::task::TaskState::Succeeded(_))
+        });
+        assert_eq!(
+            finished.state(),
+            &crate::task::TaskState::Succeeded(
+                serde_json::to_value(Outcome::Succeeded("resumed".into())).unwrap()
+            )
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(owner.store().list(prefix.as_bytes()).unwrap().len(), 4);
+        driver.shutdown().unwrap();
+    }
     #[async_trait::async_trait]
     impl Tool for DurableStub {
         fn spec(&self) -> ToolSpec {

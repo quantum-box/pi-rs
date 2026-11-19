@@ -2362,6 +2362,38 @@ impl DetachedTaskDocuments {
 }
 
 impl<'a> TaskDocuments<'a> {
+    #[cfg(test)]
+    pub(crate) fn test_stage_durable_result(
+        &mut self,
+        intent_key: Vec<u8>,
+        result: &impl serde::Serialize,
+    ) -> Result<(), String> {
+        let intent = self
+            .store
+            .get(&intent_key)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing intent")?;
+        let recorded: crate::task::Task =
+            serde_json::from_slice(&intent.value).map_err(|e| e.to_string())?;
+        if recorded != self.task {
+            return Err("stale attempt".into());
+        }
+        let mut key = intent_key.clone();
+        key.extend_from_slice(b"/result");
+        self.signals.batch.checks.push(Check {
+            key: intent_key,
+            expected: Expected::Version(intent.version),
+        });
+        self.signals.batch.checks.push(Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        });
+        self.signals.batch.mutations.push(Mutation::Put {
+            key,
+            value: serde_json::to_vec(result).map_err(|e| e.to_string())?,
+        });
+        Ok(())
+    }
     /// Discard a handler's staged work without performing further storage I/O.
     /// A panicked invocation must still be able to publish its failure even
     /// when the handler left a conflict or staged input in this context.

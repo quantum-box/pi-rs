@@ -1342,6 +1342,69 @@ impl DetachedInvocation {
 }
 
 impl AdmissionHandle<'_> {
+    #[cfg(test)]
+    pub(crate) fn test_durable_intent(&self) -> Result<Vec<u8>, String> {
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        if !self.standalone
+            || self.abort
+            || self.lease.retired
+            || !self.running.task.replay_safe()
+            || !matches!(self.running.task.owner(), TaskOwner::Conversation(_))
+        {
+            return Err("unsupported test executor".into());
+        }
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let current = TaskStore::new(owner.store())
+            .load(self.running.task.id())
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.failed_handlers.contains(&self.lease.id)
+            || state.published.iter().any(|(id, _)| *id == self.lease.id)
+            || current.task != self.running.task
+            || current.task.abort_requested()
+            || current.task.state() != &TaskState::Running
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || pending_abort_root_for_running(
+                &TaskStore::new(owner.store()),
+                current.task.id(),
+                true,
+            )
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err("stale or aborted test attempt".into());
+        }
+        let key = format!("test/durable-async/{}/{attempt}/intent", current.task.id()).into_bytes();
+        owner
+            .store()
+            .commit(
+                &[
+                    durable_store::Check {
+                        key: task_store::key(current.task.id()),
+                        expected: durable_store::Expected::Version(current.version),
+                    },
+                    durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    },
+                ],
+                &[durable_store::Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&current.task).map_err(|e| e.to_string())?,
+                }],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(key)
+    }
     /// Atomically admit or reconnect a keyed TaskTool child. The parent must be
     /// a live, non-aborted TaskTool attempt with this exact executor lease.
     /// A changed definition or input rejects reuse of an existing key.

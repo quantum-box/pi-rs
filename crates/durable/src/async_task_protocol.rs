@@ -124,6 +124,24 @@ pub(crate) struct Intent {
     task: Uuid,
     attempt: Uuid,
     identity: ToolIdentity,
+    // Pre-generation records lack this flag and remain readable after upgrade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    attempt_record: bool,
+}
+
+fn attempt_record_check(store: &Store, intent: &Intent) -> Result<Option<Check>, Error> {
+    if !intent.attempt_record {
+        return Ok(None);
+    }
+    let key = attempt_intent_key(intent.task, intent.attempt);
+    let entry = store.get(&key)?.ok_or(Error::Invalid)?;
+    if serde_json::from_slice::<Intent>(&entry.value)? != *intent {
+        return Err(Error::Invalid);
+    }
+    Ok(Some(Check {
+        key,
+        expected: Expected::Version(entry.version),
+    }))
 }
 
 /// Load a private intent for a joined driver attempt. The matching task attempt
@@ -134,6 +152,7 @@ pub(crate) fn load_intent(store: &Store, task: Uuid) -> Result<Intent, Error> {
     if intent.task != task || !intent.identity.is_valid() {
         return Err(Error::Invalid);
     }
+    attempt_record_check(store, &intent)?;
     Ok(intent)
 }
 
@@ -233,6 +252,7 @@ fn prepare_authorized_phase(
         task: running.task.id(),
         attempt,
         identity: identity.clone(),
+        attempt_record: true,
     };
     if after {
         if !identity.has_after_hook() {
@@ -312,7 +332,7 @@ pub(crate) fn prepare_arguments_record(
     {
         return Err(Error::Invalid);
     }
-    let checks = vec![
+    let mut checks = vec![
         Check {
             key: intent_key,
             expected: Expected::Version(stored_intent.version),
@@ -328,6 +348,7 @@ pub(crate) fn prepare_arguments_record(
                 .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
         },
     ];
+    checks.extend(attempt_record_check(store, intent)?);
     let mutations = if existing.is_none() {
         vec![Mutation::Put {
             key,
@@ -366,7 +387,7 @@ pub(crate) fn prepare_receipt(
     if existing.as_ref().is_some_and(|entry| entry.value != value) {
         return Err(Error::Invalid);
     }
-    let checks = vec![
+    let mut checks = vec![
         Check {
             key: definition_key,
             expected: Expected::Version(definition.version),
@@ -382,6 +403,7 @@ pub(crate) fn prepare_receipt(
                 .map_or(Expected::Missing, |e| Expected::Version(e.version)),
         },
     ];
+    checks.extend(attempt_record_check(store, intent)?);
     let mutations = if existing.is_none() {
         vec![Mutation::Put { key, value }]
     } else {
@@ -520,6 +542,7 @@ pub(crate) fn prepare_receipt_read(
             if intent.task != task || intent.identity != identity {
                 return Err(Error::Invalid);
             }
+            checks.extend(attempt_record_check(store, &intent)?);
             let Some(receipt) = receipt else {
                 if let Some(raw) = raw_entry {
                     let (raw_intent, outcome): (Intent, Outcome) =
@@ -550,6 +573,7 @@ pub(crate) fn read_receipt(store: &Store, intent: &Intent) -> Result<Option<Outc
     if serde_json::from_slice::<Intent>(&stored.value)? != *intent {
         return Err(Error::Invalid);
     }
+    attempt_record_check(store, intent)?;
     let definition = store
         .get(&identity_key(intent.task))?
         .ok_or(Error::Invalid)?;
@@ -689,6 +713,66 @@ mod tests {
                 .get(&attempt_intent_key(child, Uuid::new_v4()))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_attempt_record_fails_closed_for_dispatch_and_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let (_, child, identity) = fixture(&store);
+        let (intent, batch) = prepare_intent(
+            &store,
+            &TaskStore::new(&store).load(child).unwrap().unwrap(),
+            &identity,
+        )
+        .unwrap();
+        commit(&store, batch);
+        let receipt = prepare_receipt(&store, &intent, &Outcome::Unknown("test".into())).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Delete {
+                    key: attempt_intent_key(child, intent.attempt),
+                }],
+            )
+            .unwrap();
+        assert!(load_intent(&store, child).is_err());
+        assert!(prepare_arguments_record(&store, &intent, &json!({})).is_err());
+        assert!(prepare_receipt(&store, &intent, &Outcome::Unknown("test".into())).is_err());
+        assert!(prepare_receipt_read(&store, child).is_err());
+        assert!(store.commit(&receipt.checks, &receipt.mutations).is_err());
+    }
+
+    #[test]
+    fn legacy_task_intent_without_attempt_record_remains_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let (_, child, identity) = fixture(&store);
+        let (mut intent, _) = prepare_intent(
+            &store,
+            &TaskStore::new(&store).load(child).unwrap().unwrap(),
+            &identity,
+        )
+        .unwrap();
+        intent.attempt_record = false;
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: intent_key(child),
+                    value: serde_json::to_vec(&intent).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(load_intent(&store, child).unwrap(), intent);
+        commit(
+            &store,
+            prepare_receipt(&store, &intent, &Outcome::Unknown("legacy".into())).unwrap(),
+        );
+        assert_eq!(
+            read_receipt(&store, &intent).unwrap(),
+            Some(Outcome::Unknown("legacy".into()))
         );
     }
 
