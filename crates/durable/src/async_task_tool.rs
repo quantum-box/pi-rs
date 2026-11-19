@@ -9205,6 +9205,228 @@ mod tests {
         );
     }
 
+    struct UnsafePolicyHook;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for UnsafePolicyHook {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(Some(json!("unsafe-rewritten")))
+        }
+    }
+    fn combined_policy_host(
+        root: &std::path::Path,
+    ) -> (
+        StandaloneBeforeHookHost,
+        Vec<Arc<crate::task_tool::TaskTool>>,
+    ) {
+        let mut extensions = crate::extension::Registry::default();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hooks: Vec<(&str, Arc<dyn crate::extension::Hook>)> = vec![
+            (
+                "rich-first",
+                Arc::new(CombinedHooks {
+                    stage: 1,
+                    events: events.clone(),
+                }),
+            ),
+            ("rich-second", Arc::new(CombinedHooks { stage: 2, events })),
+            ("abort", Arc::new(AbortResultHook(root.to_owned()))),
+            ("restart", Arc::new(RestartCleanupHook(root.to_owned()))),
+        ];
+        for (name, hook) in hooks {
+            extensions
+                .install_identified(
+                    crate::extension::Extension {
+                        name: name.into(),
+                        hooks: vec![hook],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(
+                        1,
+                        format!("{name}-v1"),
+                        vec!["hook".into()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let snapshot = extensions.snapshot();
+        let mut host =
+            StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+        let unsafe_tool = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(Arc::new(AtomicUsize::new(0)))),
+                "shared-tool-v1",
+                1,
+                vec![],
+                "unsafe-hook-v1",
+                Arc::new(UnsafePolicyHook),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let rich = host
+            .register_replay_safe_durable_tool_with_content_hooks(
+                Arc::new(ImmediateDurable(Arc::new(AtomicUsize::new(0)))),
+                "shared-tool-v1",
+                1,
+                vec![],
+                &snapshot,
+                &["rich-first".into(), "rich-second".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let abort = host
+            .register_replay_safe_durable_tool_with_abort_after(
+                Arc::new(AbortResultTool(root.to_owned())),
+                "abort-v1",
+                1,
+                vec![],
+                &snapshot,
+                &["abort".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                AbortAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        let restart = host
+            .register_replay_safe_durable_tool_with_restart_after(
+                Arc::new(CrashUncertainTool(root.to_owned())),
+                "restart-v1",
+                1,
+                vec![],
+                &snapshot,
+                &["restart".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                RestartAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        (host, vec![unsafe_tool, rich, abort, restart])
+    }
+    #[test]
+    fn unsafe_hook_rich_abort_and_restart_coexist_across_recovery() {
+        const ENV: &str = "PI_RS_COMBINED_UNSAFE_HOOK_POLICIES";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tools) = combined_policy_host(&root);
+            let ids = vec![
+                host.start_unsafe_durable_root(&tools[0], json!({}), 4)
+                    .unwrap(),
+                host.start_replay_safe_root(&tools[1], json!({}), 4)
+                    .unwrap(),
+                host.start_replay_safe_root(&tools[2], json!({}), 4)
+                    .unwrap(),
+                host.start_replay_safe_root(&tools[3], json!({}), 1)
+                    .unwrap(),
+            ];
+            std::fs::write(root.join("policy-ids"), serde_json::to_vec(&ids).unwrap()).unwrap();
+            let driver = host.into_driver();
+            for id in &ids[..2] {
+                assert!(matches!(
+                    wait_terminal(&driver, *id).state(),
+                    crate::task::TaskState::Succeeded(_)
+                ));
+            }
+            wait_file(&root.join("tool-start"));
+            wait_file(&root.join("uncertain-ready"));
+            driver.request_abort(ids[2]).unwrap();
+            assert!(matches!(
+                wait_terminal(&driver, ids[2]).state(),
+                crate::task::TaskState::Cancelled
+            ));
+            std::fs::write(root.join("policies-ready"), b"ready").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("async_task_tool::tests::unsafe_hook_rich_abort_and_restart_coexist_across_recovery")
+            .env(ENV, root).spawn().unwrap();
+        wait_file(&root.join("policies-ready"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let ids: Vec<Uuid> =
+            serde_json::from_slice(&std::fs::read(root.join("policy-ids")).unwrap()).unwrap();
+        let (host, _) = combined_policy_host(root);
+        let driver = host.into_driver();
+        let unsafe_task = driver.get(ids[0]).unwrap().unwrap();
+        let rich_task = driver.get(ids[1]).unwrap().unwrap();
+        let abort_task = driver.get(ids[2]).unwrap().unwrap();
+        let restart_task = wait_terminal(&driver, ids[3]);
+        let kinds: std::collections::HashSet<_> =
+            [&unsafe_task, &rich_task, &abort_task, &restart_task]
+                .iter()
+                .map(|task| task.kind().unwrap().to_owned())
+                .collect();
+        assert_eq!(kinds.len(), 4);
+        assert!(
+            matches!(unsafe_task.state(), crate::task::TaskState::Succeeded(value) if serde_json::from_value::<Outcome>(value.clone()).unwrap() == Outcome::Succeeded("unsafe-rewritten".into()))
+        );
+        let crate::task::TaskState::Succeeded(rich_value) = rich_task.state() else {
+            panic!("rich task failed")
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: rich,
+        } = serde_json::from_value(rich_value.clone()).unwrap()
+        else {
+            panic!("missing rich result")
+        };
+        assert_eq!(rich.output.len(), 2);
+        assert_eq!(
+            rich.extra.get("structuredOutput"),
+            Some(&json!({"value":42}))
+        );
+        assert!(matches!(
+            abort_task.state(),
+            crate::task::TaskState::Cancelled
+        ));
+        assert!(
+            matches!(restart_task.state(), crate::task::TaskState::Failed(reason) if reason == "restart limit")
+        );
+        driver.shutdown().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let unsafe_receipts = read_unsafe_durable_receipts(&store, ids[0]).unwrap();
+        assert_eq!(unsafe_receipts.len(), 1);
+        assert_eq!(
+            unsafe_receipts[0].outcome,
+            Outcome::Succeeded("done".into())
+        );
+        for id in [ids[0], ids[1], ids[3]] {
+            assert!(read_aborted_after_result(&store, id).unwrap().is_none());
+        }
+        for id in [ids[0], ids[1], ids[2]] {
+            assert!(read_restart_after_result(&store, id).unwrap().is_none());
+        }
+        assert!(read_aborted_after_result(&store, ids[2]).unwrap().is_some());
+        assert!(read_restart_after_result(&store, ids[3]).unwrap().is_some());
+        assert_eq!(
+            std::fs::read_to_string(root.join("abort-hook-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("restart-hook-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("uncertain-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
     fn known_restart_host(
         root: &std::path::Path,
     ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
