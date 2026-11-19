@@ -87,7 +87,18 @@ addressed before the callback can be dispatched.
 Harness-mediated conversation signal delivery now takes the target mutation
 lease and checks its signal revision in the same transaction as the receipt.
 This excludes a callback first poll and allows independent conversations to
-progress. Direct public `Inbox` writes bypass the lease and are not protected.
+progress. A durable signal-start marker protocol additionally makes public
+`Inbox` receipt writes and prepared wake commits check the absence of the
+marker in the same Store transaction, including writes from a separately opened
+Store. A marker-start candidate checks the conversation signal revision, and
+retirement checks the exact marker version and value. A marker surviving a
+crash blocks the target until reconciliation; it does not block another
+conversation. These helpers are not connected to callback dispatch and are
+not by themselves authorization to invoke it: the start transaction must also
+fence the claim, identity, task and task-signal revision, owner, abort, late
+outcome and selection. Public `Inbox` APIs must retain their returned checks;
+discarding them or writing directly through raw `Store` is outside the
+cooperating host trust boundary.
 The synchronous Harness API reports `TaskPublicationBusy` when a callback has
 started; it has no automatic retry owner yet. Generic task signals and wake,
 direct abort, and their graph and revision checks remain unconnected. Callback

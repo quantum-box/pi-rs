@@ -11503,9 +11503,15 @@ impl Harness {
             .get(signal.conversation_id)
             .callback_start;
         let _lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
-        crate::conversation_signal::Inbox::new(self.owner.store())
-            .send_with_clock(signal, self.clock.as_ref())?;
-        Ok(())
+        match crate::conversation_signal::Inbox::new(self.owner.store())
+            .send_with_clock(signal, self.clock.as_ref())
+        {
+            Ok(()) => Ok(()),
+            Err(crate::conversation_signal::Error::CallbackStartBusy) => {
+                Err(Error::TaskPublicationBusy)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
     /// Observe live task and conversation executors without waiting on their locks.
     pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
@@ -25331,6 +25337,56 @@ mod scheduler_tests {
             callback
                 .poll_first(future.as_mut(), &mut context)
                 .is_pending()
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_signal_start_marker_defers_driver_and_independent_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let mut worker = scheduler.harness.worker();
+        let target = worker.create_conversation(config()).unwrap();
+        let other = worker.create_conversation(config()).unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let marker = b"test-claim";
+        let start =
+            crate::conversation_signal::prepare_callback_start_signal_fence(&store, target, marker)
+                .unwrap();
+        store.commit(&start.checks, &start.mutations).unwrap();
+        let signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            target,
+            "wake".into(),
+            serde_json::json!(1),
+        );
+        let other_signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            other,
+            "wake".into(),
+            serde_json::json!(2),
+        );
+        assert!(matches!(
+            scheduler.send_signal(&signal),
+            Err(Error::TaskPublicationBusy)
+        ));
+        assert!(matches!(
+            crate::conversation_signal::Inbox::new(&store).send(&signal),
+            Err(crate::conversation_signal::Error::CallbackStartBusy)
+        ));
+        scheduler.send_signal(&other_signal).unwrap();
+        let finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+            &store, target, marker,
+        )
+        .unwrap();
+        store.commit(&finish.checks, &finish.mutations).unwrap();
+        scheduler.send_signal(&signal).unwrap();
+        assert!(
+            crate::conversation_signal::Inbox::new(&store)
+                .receipt(target, signal.id)
+                .unwrap()
+                .is_some()
         );
         scheduler.shutdown().await.unwrap();
     }
