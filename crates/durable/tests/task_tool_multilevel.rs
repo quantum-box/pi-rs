@@ -70,6 +70,13 @@ impl Handler for Parent {
     ) -> Result<Step, String> {
         match task.checkpoint().phase.as_str() {
             "initial" => {
+                if self.level == "root" && std::env::var_os("PI_MULTILEVEL_RUNNING").is_some() {
+                    println!("RUNNING_ROOT {}", task.id());
+                    std::io::stdout().flush().unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 let call = self.child.start_child(task, docs, "child", json!({}))?;
                 let id = call.task_id();
                 self.ids.lock().unwrap().push((task.id(), id));
@@ -83,12 +90,24 @@ impl Handler for Parent {
                 })
             }
             "child" => {
+                if self.level == "root" && std::env::var_os("PI_MULTILEVEL_WAKE_RUNNING").is_some()
+                {
+                    println!("RUNNING_WAKE {}", task.id());
+                    std::io::stdout().flush().unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 let data = &task.checkpoint().data;
                 if data["level"] != self.level {
                     return Err("checkpoint lost".into());
                 }
                 let call: NestedTaskCall =
                     serde_json::from_value(data["call"].clone()).map_err(|e| e.to_string())?;
+                let reconnected = self.child.start_child(task, docs, "child", json!({}))?;
+                if reconnected.task_id() != call.task_id() {
+                    return Err("key reconnected to a different child".into());
+                }
                 if task.ended_children() != Some(&[call.task_id()][..]) {
                     return Err("wrong ended children".into());
                 }
@@ -181,7 +200,7 @@ impl Fixture {
             level: "root",
             ids: ids.clone(),
         });
-        let tool = Arc::new(TaskTool::new(spec("root"), "root", true, 1, root.clone()));
+        let tool = Arc::new(TaskTool::new(spec("root"), "root", false, 1, root.clone()));
         Self {
             root,
             middle,
@@ -206,7 +225,7 @@ impl Fixture {
             ("middle", &self.middle),
             ("leaf", &self.leaf),
         ] {
-            assert!(r.register_shared(name, true, handler.clone()));
+            assert!(r.register_shared(name, name != "root", handler.clone()));
             assert!(r.set_abort(name, |_: &Task| Ok(Step::Succeed(json!(null)))));
         }
         r
@@ -279,6 +298,16 @@ async fn multilevel_process_child() {
     let (root, middle, leaf) = found.unwrap();
     println!("MULTILEVEL_READY {conversation} {root} {middle} {leaf}");
     std::io::stdout().flush().unwrap();
+    if std::env::var_os("PI_MULTILEVEL_WAKE_RUNNING").is_some() {
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                middle,
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+    }
     std::future::pending::<()>().await;
 }
 struct KillOnDrop(Child);
@@ -330,6 +359,10 @@ async fn multilevel_kill_reopen_no_leaf_reexecution() {
     let root_task = driver.get(root).unwrap().unwrap();
     let middle_task = driver.get(middle).unwrap().unwrap();
     assert_eq!(root_task.checkpoint().phase, "child");
+    assert!(
+        f.ids.lock().unwrap().is_empty(),
+        "parked root was run on reopen"
+    );
     assert_eq!(child_id(&root_task), middle);
     assert_eq!(middle_task.checkpoint().phase, "gate");
     assert_eq!(child_id(&middle_task), leaf);
@@ -399,6 +432,116 @@ async fn multilevel_abort_cascades_after_kill() {
             &TaskState::Cancelled
         );
     }
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn unsafe_root_killed_while_running_is_not_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "multilevel_process_child", "--nocapture"])
+            .env("PI_MULTILEVEL_DIR", dir.path())
+            .env("PI_MULTILEVEL_RUNNING", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if let Some((_, id)) = line.split_once("RUNNING_ROOT ") {
+                tx.send(id.trim().parse::<Uuid>().unwrap()).unwrap();
+                break;
+            }
+        }
+    });
+    let root = rx
+        .recv_timeout(Duration::from_secs(25))
+        .expect("root did not start");
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let f = Fixture::new(dir.path(), false);
+    let scheduler = Scheduler::open(dir.path().join("db"), f.options()).unwrap();
+    let driver = scheduler.start_tasks(f.registry()).unwrap();
+    until(|| driver.get(root).unwrap().is_some_and(|t| t.is_terminal())).await;
+    let task = driver.get(root).unwrap().unwrap();
+    assert!(
+        matches!(task.state(), TaskState::Failed(reason) if reason.contains("outcome requires reconciliation")),
+        "{:?}",
+        task.state()
+    );
+    assert!(
+        f.ids.lock().unwrap().is_empty(),
+        "interrupted root was replayed"
+    );
+    assert!(!dir.path().join("count").exists());
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn unsafe_root_interrupted_after_wake_is_not_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "multilevel_process_child", "--nocapture"])
+            .env("PI_MULTILEVEL_DIR", dir.path())
+            .env("PI_MULTILEVEL_WAKE_RUNNING", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ready = None;
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if let Some((_, rest)) = line.split_once("MULTILEVEL_READY ") {
+                ready = Some(
+                    rest.split_whitespace()
+                        .map(|s| s.parse::<Uuid>().unwrap())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            if let Some((_, id)) = line.split_once("RUNNING_WAKE ") {
+                let ids = ready.unwrap();
+                assert_eq!(ids[1], id.trim().parse::<Uuid>().unwrap());
+                tx.send(ids).unwrap();
+                break;
+            }
+        }
+    });
+    let ids = rx
+        .recv_timeout(Duration::from_secs(25))
+        .expect("root did not wake");
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let f = Fixture::new(dir.path(), false);
+    let scheduler = Scheduler::open(dir.path().join("db"), f.options()).unwrap();
+    let driver = scheduler.start_tasks(f.registry()).unwrap();
+    until(|| driver.get(ids[1]).unwrap().is_some_and(|t| t.is_terminal())).await;
+    let root = driver.get(ids[1]).unwrap().unwrap();
+    assert!(
+        matches!(root.state(), TaskState::Failed(reason) if reason.contains("outcome requires reconciliation")),
+        "{:?}",
+        root.state()
+    );
+    assert_eq!(root.checkpoint().phase, "child");
+    assert!(f.ids.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     scheduler.shutdown().await.unwrap();
     driver.shutdown().unwrap();
 }

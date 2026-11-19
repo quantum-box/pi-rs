@@ -1,3 +1,28 @@
+**Task-backed multi-level waits:** A model-issued `TaskTool` can own a keyed
+`TaskTool::start_child` task whose handler starts another, independently owned
+child. Admission and the parent checkpoint/wait commit atomically; each wake
+reports ended direct children and keyed calls can reconnect to the same child.
+`WaitFor::Tasks` waits for all named children and `TasksAny` wakes on any. This
+is a synchronous registered-task-handler API: nested children run task handlers,
+not the ordinary asynchronous `Tool` invocation or its nested tool-hook pipeline.
+It is separate from `KeyedHost` multi-level nested calls and does not establish
+parity with upstream `executeTool(..., { wait: false })` or its tool API.
+
+The scheduler integration tests kill the OS process with an unsafe root parked
+and a leaf result already committed, reopen, reconnect the root's key on wake,
+and verify the leaf executes once. A separate parked chain is killed, reopened,
+and aborted through all three task levels. A distinct test kills an unsafe root
+while its initial handler is running before the park commits; on reopen its
+task fails with an outcome requiring reconciliation and is not rerun. The tests
+also cover task-backed all and any waits and same-key identity. They do not prove
+exactly-once effects when death precedes the leaf result commit. A further
+OS-kill test interrupts the unsafe root while its post-wake handler is running
+and confirms the same failure without rerunning the leaf. Upstream describes keeping
+parked unsafe tools and their children across restart, keyed child lookup, and
+ending an interrupted unsafe tool with an interrupted error; its tool cancellation
+and hook semantics are broader than this task-backed API. See the [upstream
+Durable README](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md).
+
 **Foreground task ancestry:** Task reservation and wake checks follow task ownership across foreground conversation edges. Interrupted or incompatible running ancestors, failure, and abort fence descendant execution; background edges remain independent. Successfully completed task anchors, including their task-owner chain, remain traversable for work later admitted in an owned conversation; failed and cancelled anchors block it. Invalid foreground ownership chains fail closed. A background task forms a boundary before its owning conversation’s abort mark; its foreground descendants remain runnable unless the task itself is aborted. Held TaskTool failures mark and drain foreground-owned work, including generic tasks in owned conversations, before the failure becomes terminal.
 **Run failure increment:** Runs ending without an answer persist their running submission IDs, a classified reason and optional detail in `Conversation.run_failure`. Model errors, abort, reset, turn limit, nothing to answer, and model restart limit are classified at their settlement sites; submission status reason strings remain unchanged. A later run clears the failure. A reset or `afterFailedRun::Continue` replacement run retains it, including across reopen. When no reset, independent summary, or unplaced write is pending, the replacement starts atomically in the failure commit. Otherwise selection remains deferred until the ordered work is placed; in that gap a new continue is rejected as busy, but the selected input is still withdrawable and abort and late steering can differ from upstream. Existing persisted records from before classification retain their original reason string and have no detail. Upstream task IDs, `first` lineage, other failure sources, and exact upstream interruption phase wording remain unsupported.
 

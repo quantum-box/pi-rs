@@ -1040,3 +1040,143 @@ async fn task_tool_child_registration_mismatch_commits_no_child_and_recovers() {
     scheduler.shutdown().await.unwrap();
     driver.shutdown().unwrap();
 }
+
+struct WaitAllParent {
+    fast: Arc<TaskTool>,
+    slow: Arc<TaskTool>,
+    ids: Arc<Mutex<Option<(Uuid, Uuid, Uuid)>>>,
+}
+impl Handler for WaitAllParent {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "initial" {
+            let a = self.fast.start_child(task, docs, "fast", json!({}))?;
+            let b = self.slow.start_child(task, docs, "slow", json!({}))?;
+            *self.ids.lock().unwrap() = Some((task.id(), a.task_id(), b.task_id()));
+            return Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "all".into(),
+                    data: json!({"a": a, "b": b}),
+                },
+                condition: WaitFor::Tasks(vec![a.task_id(), b.task_id()]),
+                children: vec![],
+            });
+        }
+        let a: NestedTaskCall = serde_json::from_value(task.checkpoint().data["a"].clone())
+            .map_err(|e| e.to_string())?;
+        let b: NestedTaskCall = serde_json::from_value(task.checkpoint().data["b"].clone())
+            .map_err(|e| e.to_string())?;
+        if task.ended_children() != Some(&[a.task_id(), b.task_id()][..]) {
+            return Err("all wake did not include both children".into());
+        }
+        if self
+            .fast
+            .start_child(task, docs, "fast", json!({}))?
+            .task_id()
+            != a.task_id()
+            || self
+                .slow
+                .start_child(task, docs, "slow", json!({}))?
+                .task_id()
+                != b.task_id()
+        {
+            return Err("key did not reconnect".into());
+        }
+        if a.result(task, docs)? != Some(NestedTaskResult::Succeeded(json!("fast-result")))
+            || b.result(task, docs)? != Some(NestedTaskResult::Succeeded(json!("slow-result")))
+        {
+            return Err("wrong child result".into());
+        }
+        Ok(Step::Succeed(json!("all results")))
+    }
+}
+
+#[tokio::test]
+async fn task_backed_wait_all_stays_parked_until_both_children_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let fast: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!("fast-result"))));
+    let slow: Arc<dyn Handler> = Arc::new(Slow);
+    let ids = Arc::new(Mutex::new(None));
+    let parent: Arc<dyn Handler> = Arc::new(WaitAllParent {
+        fast: Arc::new(TaskTool::new(spec("fast"), "fast", true, 1, fast.clone())),
+        slow: Arc::new(TaskTool::new(spec("slow"), "slow", true, 1, slow.clone())),
+        ids: ids.clone(),
+    });
+    let adapter = Arc::new(TaskTool::new(
+        spec("parent"),
+        "parent",
+        false,
+        1,
+        parent.clone(),
+    ));
+    let mut registry = Registry::default();
+    for (kind, safe, handler) in [
+        ("parent", false, parent),
+        ("fast", true, fast),
+        ("slow", true, slow),
+    ] {
+        assert!(registry.register_shared(kind, safe, handler));
+        assert!(registry.set_abort(kind, |_: &Task| Ok(Step::Succeed(json!(null)))));
+    }
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    until(|| {
+        ids.lock().unwrap().is_some_and(|(p, a, b)| {
+            matches!(
+                driver.get(p).unwrap().unwrap().state(),
+                TaskState::Waiting(WaitFor::Tasks(_))
+            ) && matches!(
+                driver.get(a).unwrap().unwrap().state(),
+                TaskState::Succeeded(_)
+            ) && matches!(
+                driver.get(b).unwrap().unwrap().state(),
+                TaskState::Waiting(_)
+            )
+        })
+    })
+    .await;
+    let (parent, _, slow) = ids.lock().unwrap().unwrap();
+    assert_eq!(
+        driver.get(parent).unwrap().unwrap().checkpoint().phase,
+        "all"
+    );
+    driver
+        .signal(&Signal::new(
+            Uuid::new_v4(),
+            slow,
+            "release".into(),
+            json!(null),
+        ))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        driver.get(parent).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!("all results"))
+    );
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
