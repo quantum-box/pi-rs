@@ -1953,4 +1953,13 @@ async fn exercise_conversation_park_claim(replace_attempt: bool) {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let _ = driver.shutdown_with_pending().unwrap();
+    if !replace_attempt {
+        // A claim alone is evidence of an unresolved cleanup, never a callback
+        // receipt. Reopening must not turn it into a completed callback.
+        let reopened = durable_store::Store::open(&path).unwrap();
+        assert!(reopened.get(key.as_bytes()).unwrap().is_some());
+        let receipt_key = format!("durable/replay-safe-async/{root_id}/abort-after");
+        assert!(reopened.get(receipt_key.as_bytes()).unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }
