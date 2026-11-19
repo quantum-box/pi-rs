@@ -17,6 +17,14 @@ conversation's root binding, active attempt, selected extension identity and
 abort state from the checked transactions. Normal conversation intent checks
 also reject an abort-marked conversation and cannot be reused unchanged.
 
+Unhooked unsafe conversation Tools may register a park-cancel handler using
+`register_conversation_unsafe_durable_tool_with_park_cancel`. The host supplies
+an identity that must change with handler implementation or configuration;
+that identity is included in the persisted task definition. Reopening a pending
+call with a different identity is rejected. This registration retains the
+handler but does not dispatch it or enable cancellation. Hooked registrations
+and callback retry policy are not included in this initial registration API.
+
 A safe implementation needs all of the following before dispatch is enabled:
 
 * Bind the callback identity, retry policy, Tool identity and selected hook

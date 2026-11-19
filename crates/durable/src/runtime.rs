@@ -32143,6 +32143,117 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn conversation_cancel_registration_identity_is_checked_after_reopen() {
+        use crate::async_task_tool::{
+            DurableAsyncTool, DurableParkCancel, DurableTaskHost, DurableToolResume,
+            DurableToolStep, UnsafeDurableAuthorization,
+            register_conversation_unsafe_durable_tool_with_park_cancel,
+        };
+        use crate::task_scheduler::Registry;
+        use pi_rs_core::{Outcome, Tool, ToolContext, ToolSpec};
+        use serde_json::Value;
+        struct Candidate;
+        #[async_trait::async_trait]
+        impl Tool for Candidate {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "job".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                panic!("not dispatched")
+            }
+        }
+        #[async_trait::async_trait]
+        impl DurableAsyncTool for Candidate {
+            async fn execute_durable(
+                &self,
+                _: Value,
+                _: ToolContext,
+                _: DurableToolResume,
+                _: &dyn DurableTaskHost,
+            ) -> Result<DurableToolStep, String> {
+                panic!("not dispatched")
+            }
+        }
+        struct Cancel(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl DurableParkCancel for Cancel {
+            async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build = |identity: &str| {
+            let mut registry = Registry::default();
+            let adapter = register_conversation_unsafe_durable_tool_with_park_cancel(
+                &mut registry,
+                Arc::new(Candidate),
+                "job-v1",
+                1,
+                vec![],
+                identity,
+                Arc::new(Cancel(calls.clone())),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+            .unwrap();
+            (registry, adapter)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let (_, original) = build("cancel-v1");
+        let mut opts = options(model.clone());
+        opts.tools = vec![original.register()];
+        let mut h = Harness::open_paused(&path, opts).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let op = Uuid::new_v4();
+        let task = original.task(id, op, serde_json::json!({}), 5).unwrap();
+        c.phase = Phase::TaskPending {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id: op,
+            arguments: serde_json::json!({}),
+            task: op,
+            identity: original.identity(),
+        };
+        h.save_composed(&c, Expected::Version(version), None, &[task])
+            .unwrap();
+        drop(h);
+        for (identity, accepted) in [("cancel-v1", true), ("cancel-v2", false)] {
+            let (registry, adapter) = build(identity);
+            let mut opts = options(model.clone());
+            opts.tools = vec![adapter.register()];
+            let h = Harness::open_paused(&path, opts).unwrap();
+            assert_eq!(h.attach_tasks(registry).is_ok(), accepted, "{identity}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let mut registry = Registry::default();
+        assert!(
+            register_conversation_unsafe_durable_tool_with_park_cancel(
+                &mut registry,
+                Arc::new(Candidate),
+                "job-v1",
+                1,
+                vec![],
+                "",
+                Arc::new(Cancel(calls)),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn legacy_pending_task_cannot_start_a_driver() {
         use crate::task::Task;
         use crate::task_scheduler::{Handler, Registry, Step};

@@ -40,6 +40,7 @@ pub fn register_conversation_replay_safe_durable_tool(
         children,
         None,
         true,
+        None,
     )
 }
 
@@ -66,6 +67,38 @@ pub fn register_conversation_unsafe_durable_tool(
         children,
         None,
         false,
+        None,
+    )
+}
+
+/// Register an unsafe, unhooked conversation Tool and its external park-cancel
+/// handler. `cancel_identity` must change whenever the handler implementation
+/// or configuration changes and must be restored after reopening the store.
+/// The handler is retained for a future cancellation integration; it is never
+/// dispatched by this registration. Abort continues to require reconciliation.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_park_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _authorization: UnsafeDurableAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+        return Err("invalid cancel identity".into());
+    }
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        None,
+        false,
+        Some((cancel_identity.to_owned(), cancel)),
     )
 }
 
@@ -119,6 +152,7 @@ pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
         true,
+        None,
     )
 }
 
@@ -165,6 +199,7 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks(
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
         false,
+        None,
     )
 }
 

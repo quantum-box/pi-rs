@@ -323,6 +323,7 @@ fn register_with_policy(
         block_results,
         unavailable,
         park_cancel: park_cancel.map(|(_, callback, retry, _)| (callback, retry)),
+        _conversation_cancel: None,
         woken_identity,
     });
     scheduler.install_checkpointable_async_handler(
@@ -353,6 +354,7 @@ pub(super) fn register_conversation_candidate(
         Arc<dyn crate::extension::Hook>,
     )>,
     replay_safe: bool,
+    conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
 ) -> Result<Arc<TaskTool>, String> {
     let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
     if let Some((selection, _, _)) = &selected {
@@ -394,6 +396,12 @@ pub(super) fn register_conversation_candidate(
         &child_identities,
     ))
     .map_err(|e| e.to_string())?;
+    let encoded = if let Some((cancel_identity, _)) = &conversation_cancel {
+        serde_json::to_vec(&("conversation-cancel-v1", encoded, cancel_identity))
+            .map_err(|e| e.to_string())?
+    } else {
+        encoded
+    };
     if encoded.len() > 65536 {
         return Err("definition identity too large".into());
     }
@@ -431,6 +439,7 @@ pub(super) fn register_conversation_candidate(
         block_results: has_hook,
         unavailable: false,
         park_cancel: None,
+        _conversation_cancel: conversation_cancel,
         woken_identity: None,
     });
     let mut adapter =
@@ -832,6 +841,8 @@ struct Executor {
     block_results: bool,
     unavailable: bool,
     park_cancel: Option<(Arc<dyn DurableParkCancel>, bool)>,
+    // Registered and identity-bound, but deliberately not dispatchable yet.
+    _conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
     woken_identity: Option<String>,
 }
 
