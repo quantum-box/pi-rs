@@ -3196,6 +3196,7 @@ pub struct Harness {
     summary_provider: Option<SummaryProviderIdentity>,
     extensions: Arc<std::sync::RwLock<crate::extension::Registry>>,
     extension_selection_gate: Arc<std::sync::Mutex<()>>,
+    extension_generation: Arc<std::sync::atomic::AtomicU64>,
     failed: bool,
     dirty: Arc<AtomicBool>,
     merge_admissions: bool,
@@ -4734,6 +4735,9 @@ impl Harness {
             summary_provider: None,
             extensions: Arc::new(std::sync::RwLock::new(crate::extension::Registry::default())),
             extension_selection_gate: Arc::new(std::sync::Mutex::new(())),
+            extension_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+                uuid::Uuid::new_v4().as_u128() as u64,
+            )),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: false,
@@ -4760,6 +4764,7 @@ impl Harness {
             summary_provider: self.summary_provider.clone(),
             extensions: self.extensions.clone(),
             extension_selection_gate: self.extension_selection_gate.clone(),
+            extension_generation: self.extension_generation.clone(),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: true,
@@ -4884,7 +4889,9 @@ impl Harness {
             .write()
             .map_err(|_| Error::Failed)?
             .install(extension)
-            .map_err(|e| Error::Invalid(format!("extension registry: {e}")))
+            .map_err(|e| Error::Invalid(format!("extension registry: {e}")))?;
+        self.extension_published();
+        Ok(())
     }
     /// Install an extension with a host-declared recovery identity. The host
     /// must update the identity whenever implementation or configuration changes.
@@ -4901,7 +4908,9 @@ impl Harness {
             .write()
             .map_err(|_| Error::Failed)?
             .install_identified(extension, identity)
-            .map_err(|e| Error::Invalid(format!("extension registry: {e}")))
+            .map_err(|e| Error::Invalid(format!("extension registry: {e}")))?;
+        self.extension_published();
+        Ok(())
     }
     pub fn uninstall_extension(&self, name: &str) -> Result<(), Error> {
         let _selection = self
@@ -4912,7 +4921,20 @@ impl Harness {
             .write()
             .map_err(|_| Error::Failed)?
             .uninstall(name);
+        self.extension_published();
         Ok(())
+    }
+    fn extension_published(&self) {
+        self.extension_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(driver) = self.task_driver.lock()
+            && let Some(driver) = driver.as_ref().and_then(std::sync::Weak::upgrade)
+        {
+            driver.notify_extension_publication();
+        }
+    }
+    pub(crate) fn checkpointable_extension_generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.extension_generation.clone()
     }
     pub(crate) fn checkpointable_extension_gate(&self) -> Arc<std::sync::Mutex<()>> {
         self.extension_selection_gate.clone()

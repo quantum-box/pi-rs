@@ -1013,6 +1013,9 @@ impl Drop for WorkerPool {
 }
 
 impl Shared {
+    pub(crate) fn notify_extension_publication(&self) {
+        self.notify_work();
+    }
     fn cancel_unhooked(&self) {
         let tokens: Vec<_> = self
             .unhooked_cancellations

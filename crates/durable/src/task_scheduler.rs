@@ -3030,6 +3030,12 @@ impl AdmissionHandle<'_> {
     pub(crate) fn is_conversation_checkpointable(&self) -> bool {
         !self.standalone
     }
+    pub(crate) fn checkpointable_extension_generation(&self) -> Option<u64> {
+        self.validator.map(|h| {
+            h.checkpointable_extension_generation()
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
     pub(crate) fn checkpointable_durable_intent(
         &self,
         test_namespace: bool,
@@ -4448,11 +4454,39 @@ pub(crate) struct WakeReader {
     owner: Arc<OwnedStore>,
     definitions: Arc<std::sync::RwLock<WakeDefinitions>>,
     live_invocations: Arc<Mutex<InvocationState>>,
+    extension_generation: Arc<std::sync::RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>>,
+}
+fn stale_hook_gate(task: &Task, registry: &Registry, generation: Option<u64>) -> bool {
+    let Some(generation) = generation else {
+        return false;
+    };
+    if !matches!(
+        task.state(),
+        TaskState::Waiting(WaitFor::Sleep { .. } | WaitFor::TypedSleep { .. })
+    ) || !task.replay_safe()
+        || task
+            .kind()
+            .and_then(|kind| registry.checkpointable_selection_for_kind(kind))
+            .is_none()
+    {
+        return false;
+    }
+    match task.checkpoint().phase.as_str() {
+        "initial" => true,
+        "replay-safe-async-hook-gate" => task.checkpoint().data.as_u64() != Some(generation),
+        _ => false,
+    }
 }
 impl WakeReader {
     pub(crate) fn snapshot(&self, now_millis: i64) -> Result<WakeSnapshot, Error> {
         let _gate = self.owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         let definitions = self.definitions.read().map_err(|_| Error::Poisoned)?;
+        let generation = self
+            .extension_generation
+            .read()
+            .map_err(|_| Error::Poisoned)?
+            .as_ref()
+            .map(|value| value.load(std::sync::atomic::Ordering::SeqCst));
         let ts = TaskStore::new(self.owner.store());
         let tasks = ts.list()?;
         let mut result = WakeSnapshot {
@@ -4540,7 +4574,8 @@ impl WakeReader {
                         | WaitFor::TypedSleep { until_millis, .. } => *until_millis,
                         _ => None,
                     };
-                    let ready = ts.wait_ready(item, now_millis)?;
+                    let ready = ts.wait_ready(item, now_millis)?
+                        || stale_hook_gate(task, &definitions.registry, generation);
                     if ready
                         && ((reason.is_none()
                             && definitions.ancestors_available(
@@ -6727,6 +6762,7 @@ impl Scheduler {
         let wake_reader = WakeReader {
             owner: owner.clone(),
             live_invocations: live_invocations.clone(),
+            extension_generation: Arc::new(std::sync::RwLock::new(None)),
             definitions: Arc::new(std::sync::RwLock::new(WakeDefinitions {
                 registry: registry.clone(),
                 failed_migrations: HashMap::new(),
@@ -6936,6 +6972,11 @@ impl Scheduler {
     }
     pub(crate) fn bind_harness(&mut self, harness: crate::runtime::Harness) {
         self.activity = harness.worker_activity();
+        *self
+            .wake_reader
+            .extension_generation
+            .write()
+            .expect("wake generation lock") = Some(harness.checkpointable_extension_generation());
         self.validator = Some(harness);
     }
     pub(crate) fn replace_registry_locked(&mut self, registry: Registry) -> Result<(), Error> {
@@ -6957,7 +6998,13 @@ impl Scheduler {
         self.registry = registry;
         self.publish_wake_definitions()?;
         self.activity.notify();
-        self.reconcile()
+        self.reconcile()?;
+        if let Some(harness) = &self.validator {
+            harness
+                .checkpointable_extension_generation()
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
     }
     /// Inspect compatibility without executing migration code.
     pub fn blocked_reason(&self, task: &Task) -> Option<BlockedReason> {
@@ -8454,7 +8501,21 @@ impl Scheduler {
             {
                 match self.ts().poll_wait(&snapshot, now_millis) {
                     Ok(WakeResult::Woken { .. }) => progress = true,
-                    Ok(WakeResult::Pending) => (),
+                    Ok(WakeResult::Pending) => {
+                        let generation = self.validator.as_ref().map(|h| {
+                            h.checkpointable_extension_generation()
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                        });
+                        if stale_hook_gate(&snapshot.task, &self.registry, generation) {
+                            match self.ts().update(&snapshot, |task| task.wake()) {
+                                Ok(_) => progress = true,
+                                Err(task_store::Error::Store(durable_store::Error::Conflict {
+                                    ..
+                                })) => progress = true,
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
+                    }
                     Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => {
                         // A concurrent signal or task transition changed the snapshot.
                         // Rescan on the next tick instead of failing the driver.

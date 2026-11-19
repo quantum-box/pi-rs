@@ -1015,6 +1015,12 @@ impl Executor {
         cancel: &pi_rs_core::CancellationToken,
     ) -> Result<Step, String> {
         admission.replay_safe_durable_check(cancel)?;
+        let generation = admission.checkpointable_extension_generation();
+        if task.checkpoint().phase == "replay-safe-async-hook-gate"
+            && task.checkpoint().data.as_u64().is_none()
+        {
+            return Err("invalid hook gate checkpoint".into());
+        }
         if self.unavailable {
             return self.host_result_checkpoint(
                 task.input().clone(),
@@ -1127,7 +1133,12 @@ impl Executor {
                     }
                 };
                 return Ok(Step::Wait {
-                    checkpoint: task.checkpoint().clone(),
+                    checkpoint: Checkpoint {
+                        phase: "replay-safe-async-hook-gate".into(),
+                        data: serde_json::json!(
+                            generation.ok_or("missing hook registry generation")?
+                        ),
+                    },
                     condition,
                     children: vec![],
                 });
@@ -1430,7 +1441,7 @@ impl Executor {
             return Ok(Step::Succeed(serde_json::Value::Null));
         }
         let args = match task.checkpoint().phase.as_str() {
-            "initial" => task.input().clone(),
+            "initial" | "replay-safe-async-hook-gate" => task.input().clone(),
             "replay-safe-async-prepared" => {
                 serde_json::from_value::<HookCheckpoint>(task.checkpoint().data.clone())
                     .map_err(|_| "invalid hook checkpoint")?
@@ -1703,7 +1714,7 @@ impl Handler for Executor {
             }
         }
         let args = match task.checkpoint().phase.as_str() {
-            "initial" => task.input().clone(),
+            "initial" | "replay-safe-async-hook-gate" => task.input().clone(),
             "replay-safe-async-prepared" | "replay-safe-async-after" => {
                 serde_json::from_value::<HookCheckpoint>(task.checkpoint().data.clone())
                     .map_err(|_| "invalid hook checkpoint")?
@@ -1811,10 +1822,10 @@ impl Handler for Executor {
         if self.hook.is_some()
             && matches!(
                 task.checkpoint().phase.as_str(),
-                "initial" | "replay-safe-async-after"
+                "initial" | "replay-safe-async-hook-gate" | "replay-safe-async-after"
             )
         {
-            let result = if task.checkpoint().phase == "initial" {
+            let result = if task.checkpoint().phase != "replay-safe-async-after" {
                 self.before(task, docs, admission, cancellation)
             } else {
                 self.after(task, docs, admission, cancellation)
