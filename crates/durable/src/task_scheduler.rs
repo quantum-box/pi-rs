@@ -4581,14 +4581,16 @@ impl DetachedInvocation {
             }
             return Err(ProtocolError::Invalid);
         }
-        if pending_abort_root_for_running(
+        let pending_abort = match pending_abort_root_for_running(
             &task_store::TaskStore::new(owner.store()),
             self.running.task.id(),
             true,
-        )
-        .map_err(|_| ProtocolError::Invalid)?
-        .is_some()
-        {
+        ) {
+            Ok(root) => root,
+            Err(Error::Busy) if !after => return Err(ProtocolError::Deferred),
+            Err(_) => return Err(ProtocolError::Invalid),
+        };
+        if pending_abort.is_some() {
             return Err(ProtocolError::Invalid);
         }
         let (intent, batch) = if after {
