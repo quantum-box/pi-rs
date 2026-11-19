@@ -686,9 +686,14 @@ remain bounded and fenced. A bounded raw outcome may expand past the final
 inspect and shrink that initial value. A no-op that leaves an oversized result
 still fails the final size check. The Tool itself still returns
 an `Outcome`, which is projected to an initial text block; native multi-block
-Tool results and structured-output schema validation are not supported. This
-mode runs block hooks, including their existing single-text legacy bridge, but
-does not run the separate `after_tool_result` API. Dynamic conversation
+Tool results and structured-output schema validation are not supported. For each selected extension in order, this mode runs `after_tool_result` on a
+single plain-text block, then its block hook (including the existing legacy
+text bridge). Each replacement is checked before another hook can observe it.
+The text-only result API is skipped when the current output is multiple blocks,
+an image, or a non-plain text block; block hooks still see the full result.
+This per-extension ordering adapts pi's single afterTool chain to two pi-rs
+hook APIs. The definition identity is versioned for this behavior; older
+in-flight registrations must be recovered with their matching implementation. Dynamic conversation
 selection, hook parking, and after hooks for host interrupted, unavailable,
 restart-limit and aborted results remain unsupported.
 

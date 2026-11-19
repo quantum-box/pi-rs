@@ -1470,6 +1470,59 @@ impl Resolved {
         }
         Ok((result, reports))
     }
+    fn durable_text_result(blocks: &ToolBlockResult) -> Result<Option<ToolResult>, String> {
+        let [block] = blocks.output.as_slice() else {
+            return Ok(None);
+        };
+        let Some(object) = block.as_object() else {
+            return Ok(None);
+        };
+        if object.len() != 2 || block.get("type").and_then(Value::as_str) != Some("text") {
+            return Ok(None);
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let attachments = blocks
+            .extra
+            .get("attachments")
+            .map(|value| serde_json::from_value(value.clone()).map_err(|e| e.to_string()))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(ToolResult {
+            output: text.to_owned(),
+            is_error: blocks
+                .extra
+                .get("isError")
+                .and_then(Value::as_bool)
+                .ok_or("invalid error status")?,
+            details: blocks.extra.get("details").cloned(),
+            structured_output: blocks.extra.get("structuredOutput").cloned(),
+            attachments,
+            diagnostics: blocks.diagnostics.clone(),
+        }))
+    }
+    fn durable_result_blocks(value: ToolResult) -> Result<ToolBlockResult, String> {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("isError".into(), Value::Bool(value.is_error));
+        if let Some(details) = value.details {
+            extra.insert("details".into(), details);
+        }
+        if let Some(data) = value.structured_output {
+            extra.insert("structuredOutput".into(), data);
+        }
+        if !value.attachments.is_empty() {
+            extra.insert(
+                "attachments".into(),
+                serde_json::to_value(value.attachments).map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text", "text":value.output})],
+            diagnostics: value.diagnostics,
+            extra,
+        })
+    }
     /// Run a durable hook chain, rejecting each invalid replacement before invoking the next hook.
     pub(crate) async fn after_tool_blocks_checked<F, G>(
         &self,
@@ -1487,6 +1540,22 @@ impl Resolved {
         validate_initial(&result)?;
         for extension in &self.extensions {
             for hook in &extension.hooks {
+                if let Some(input) = Self::durable_text_result(&result)? {
+                    match protect(async {
+                        hook.after_tool_result_with_provenance(call, &input, ctx)
+                            .await
+                    })
+                    .await
+                    {
+                        Ok(Some((value, _))) => {
+                            let candidate = Self::durable_result_blocks(value)?;
+                            validate(&candidate)?;
+                            result = candidate;
+                        }
+                        Ok(None) => (),
+                        Err(error) => return Err(error),
+                    }
+                }
                 match protect(async { hook.after_tool_blocks(call, &result, nested, ctx).await })
                     .await
                 {

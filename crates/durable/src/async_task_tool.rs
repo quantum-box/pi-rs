@@ -4343,6 +4343,291 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let _ = driver.shutdown_with_pending().unwrap();
     }
+    struct CombinedHooks {
+        stage: usize,
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for CombinedHooks {
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolResult,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("result{}", self.stage));
+            let mut out = input.clone();
+            if self.stage == 1 {
+                out.output = "rich-one".into();
+                out.details = Some(json!({"stage": 1}));
+                out.structured_output = Some(json!({"value": 42}));
+                out.diagnostics.push(crate::runtime::ToolDiagnostic {
+                    severity: crate::runtime::DiagnosticSeverity::Info,
+                    code: Some("rich".into()),
+                    message: "preserved".into(),
+                });
+            } else if input.output != "block-one"
+                || input.structured_output != Some(json!({"value":42}))
+                || input.details != Some(json!({"stage":1}))
+                || input.diagnostics.len() != 1
+            {
+                return Err("previous channels lost".into());
+            }
+            Ok(Some(out))
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("blocks{}", self.stage));
+            let mut out = input.clone();
+            if self.stage == 1 {
+                out.output = vec![json!({"type":"text","text":"block-one"})];
+            } else {
+                out.output
+                    .push(json!({"type":"image","data":"aGk=","mimeType":"image/png"}));
+            }
+            Ok(Some(out))
+        }
+    }
+    fn combined_content_host(
+        path: &std::path::Path,
+        first: Arc<dyn crate::extension::Hook>,
+        second: Arc<dyn crate::extension::Hook>,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        let mut registry = crate::extension::Registry::default();
+        for (name, hook) in [("first", first), ("second", second)] {
+            registry
+                .install_identified(
+                    crate::extension::Extension {
+                        name: name.into(),
+                        hooks: vec![hook],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(
+                        1,
+                        format!("{name}-v1"),
+                        vec!["hook".into()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut host = StandaloneBeforeHookHost::open(path, Registry::default()).unwrap();
+        let adapter = host
+            .register_replay_safe_durable_tool_with_content_hooks(
+                Arc::new(ImmediateDurable(Arc::new(AtomicUsize::new(0)))),
+                "combined-v1",
+                1,
+                vec![],
+                &registry.snapshot(),
+                &["first".into(), "second".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        (host, adapter)
+    }
+    #[test]
+    fn durable_combined_hooks_run_in_selection_order_and_keep_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first = Arc::new(CombinedHooks {
+            stage: 1,
+            events: events.clone(),
+        });
+        let second = Arc::new(CombinedHooks {
+            stage: 2,
+            events: events.clone(),
+        });
+        let (host, adapter) = combined_content_host(&path, first.clone(), second.clone());
+        let id = host.start_replay_safe_root(&adapter, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected {:?}", task.state())
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: result,
+        } = serde_json::from_value(value.clone()).unwrap()
+        else {
+            panic!("expected rich")
+        };
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["result1", "blocks1", "result2", "blocks2"]
+        );
+        assert_eq!(result.output.len(), 2);
+        assert_eq!(result.extra["structuredOutput"], json!({"value":42}));
+        assert_eq!(result.extra["details"], json!({"stage":1}));
+        assert_eq!(result.diagnostics[0].message, "preserved");
+        let _ = driver.shutdown_with_pending().unwrap();
+        let (host, _) = combined_content_host(&path, first, second);
+        let driver = host.into_driver();
+        assert_eq!(driver.get(id).unwrap().unwrap().state(), task.state());
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    struct InvalidRichGate;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for InvalidRichGate {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            Ok(crate::extension::BeforeTool::Block("denied".into()))
+        }
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolResult,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            let mut out = input.clone();
+            out.diagnostics.clear();
+            Ok(Some(out))
+        }
+    }
+    #[test]
+    fn durable_combined_invalid_rich_replacement_stops_later_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (host, adapter) = combined_content_host(
+            &path,
+            Arc::new(InvalidRichGate),
+            Arc::new(LateContentMemo(calls.clone())),
+        );
+        let id = host.start_replay_safe_root(&adapter, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        assert!(
+            store
+                .get(format!("runtime/extension-memo/{id}/must-not-run").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+    struct OversizeRich;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for OversizeRich {
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolResult,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            let mut result = input.clone();
+            let block = crate::extension::ToolBlockResult {
+                output: vec![json!({"type":"text","text":""})],
+                diagnostics: result.diagnostics.clone(),
+                extra: [("isError".into(), json!(false))].into_iter().collect(),
+            };
+            let overhead = serde_json::to_vec(&block).unwrap().len();
+            result.output = "x".repeat(60 * 1024 - overhead);
+            Ok(Some(result))
+        }
+    }
+    #[test]
+    fn durable_combined_envelope_limit_precedes_next_hook_and_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (host, adapter) = combined_content_host(
+            &path,
+            Arc::new(OversizeRich),
+            Arc::new(LateContentMemo(calls.clone())),
+        );
+        let id = host.start_replay_safe_root(&adapter, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        assert!(
+            store
+                .get(format!("runtime/extension-memo/{id}/must-not-run").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+    struct MakeImage;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for MakeImage {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let mut out = input.clone();
+            out.output
+                .push(json!({"type":"image","data":"aGk=","mimeType":"image/png"}));
+            Ok(Some(out))
+        }
+    }
+    struct ObserveImage(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for ObserveImage {
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::ToolResult,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            Err("image result cannot be represented".into())
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            if input.output.len() != 2 {
+                return Err("image lost".into());
+            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+    #[test]
+    fn durable_combined_image_skips_lossy_text_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (host, adapter) = combined_content_host(
+            &dir.path().join("db"),
+            Arc::new(MakeImage),
+            Arc::new(ObserveImage(calls.clone())),
+        );
+        let id = host.start_replay_safe_root(&adapter, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Succeeded(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
     struct InvalidContentHook;
     #[async_trait::async_trait]
     impl crate::extension::Hook for InvalidContentHook {
@@ -4810,6 +5095,31 @@ mod tests {
     struct ContentPause(std::path::PathBuf);
     #[async_trait::async_trait]
     impl crate::extension::Hook for ContentPause {
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolResult,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            if !self.0.join("rich-phase").exists() {
+                return Ok(None);
+            }
+            use std::io::Write;
+            ctx.memo
+                .get_or_insert("rich-phase", json!("stable"))
+                .await?;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(self.0.join("rich-count"))
+                .map_err(|e| e.to_string())?;
+            writeln!(file, "run").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            let mut out = input.clone();
+            out.output = "rich-before-block".into();
+            out.structured_output = Some(json!({"phase":1}));
+            Ok(Some(out))
+        }
         async fn after_tool_blocks(
             &self,
             _: &crate::extension::ToolCall,
@@ -4818,6 +5128,12 @@ mod tests {
             ctx: &crate::extension::Context<'_>,
         ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
             let exists = self.0.join("content-ready").exists();
+            if self.0.join("rich-phase").exists()
+                && (input.output[0]["text"] != json!("rich-before-block")
+                    || input.extra.get("structuredOutput") != Some(&json!({"phase":1})))
+            {
+                return Err("result phase was not preserved".into());
+            }
             if self.0.join("structured").exists()
                 && input
                     .extra
@@ -5077,6 +5393,72 @@ mod tests {
                 .lines()
                 .count(),
             1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    #[test]
+    fn durable_combined_result_then_blocks_recover_after_kill() {
+        const ENV: &str = "PI_RS_COMBINED_RESULT_KILL_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, adapter) = content_pause_host(&root);
+            let id = host.start_replay_safe_root(&adapter, json!({}), 4).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rich-phase"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::durable_combined_result_then_blocks_recover_after_kill")
+            .env(ENV, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("content-ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("hook did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(dir.path().join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = content_pause_host(dir.path());
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected {:?}", task.state())
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: result,
+        } = serde_json::from_value(value.clone()).unwrap()
+        else {
+            panic!("expected rich")
+        };
+        assert_eq!(result.extra["structuredOutput"], json!({"phase":1}));
+        assert_eq!(result.output.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tool-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("rich-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
         );
         let _ = driver.shutdown_with_pending().unwrap();
     }

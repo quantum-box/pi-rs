@@ -132,7 +132,7 @@ fn register_with_policy(
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
     let encoded = serde_json::to_vec(&(
-        if block_results { 2u32 } else { 1u32 },
+        if block_results { 3u32 } else { 1u32 },
         &identity,
         &child_identities,
     ))
@@ -313,17 +313,15 @@ pub(super) fn validate_content_hook_result(
     // checkpoint. Allow it to reach the first hook; replacements remain subject
     // to the final result bound before any later hook can observe them.
     validate_content_result_with_limit(result, if initial { 4 * 65536 } else { 60 * 1024 })?;
-    if !initial {
-        let envelope = DurableTaskResult::Rich {
+    if !initial
+        && serde_json::to_vec(&DurableTaskResult::Rich {
             task_content_v1: result.clone(),
-        };
-        if serde_json::to_vec(&envelope)
-            .map_err(|e| e.to_string())?
-            .len()
+        })
+        .map_err(|e| e.to_string())?
+        .len()
             > 60 * 1024
-        {
-            return Err("rich result exceeds size limit".into());
-        }
+    {
+        return Err("rich result exceeds size limit".into());
     }
     if let Some(gate) = required
         && (result.extra.get("isError") != Some(&serde_json::Value::Bool(true))
