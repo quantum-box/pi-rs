@@ -12019,18 +12019,18 @@ pub(crate) fn pending_abort_root_for_running(
     include_background: bool,
 ) -> Result<Option<Uuid>, Error> {
     let result = pending_abort_root_excluding_self(ts, running, include_background, false);
-    if include_background && matches!(result, Err(Error::Busy)) {
-        if let Some(task) = ts.load(running)?
-            && !task.task.holds_interrupted_cleanup()
-            && complete_foreground_chain(ts, &task.task)?
-            && task_ancestors_available(ts.store(), &task.task, &ts.list()?, |ancestor| {
-                ancestor.state() == &TaskState::Running
-            })
-        {
-            // The complete chain contains no background boundary. Rescan all
-            // fail-fast roots using the foreground ownership proof.
-            return pending_abort_root_excluding_self(ts, running, false, false);
-        }
+    if include_background
+        && matches!(result, Err(Error::Busy))
+        && let Some(task) = ts.load(running)?
+        && !task.task.holds_interrupted_cleanup()
+        && complete_foreground_chain(ts, &task.task)?
+        && task_ancestors_available(ts.store(), &task.task, &ts.list()?, |ancestor| {
+            ancestor.state() == &TaskState::Running
+        })
+    {
+        // The complete chain contains no background boundary. Rescan all
+        // fail-fast roots using the foreground ownership proof.
+        return pending_abort_root_excluding_self(ts, running, false, false);
     }
     result
 }
