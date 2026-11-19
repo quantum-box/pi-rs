@@ -61,6 +61,13 @@ pub trait Handler: Send + Sync {
     fn requires_park_cancel_claim(&self) -> bool {
         false
     }
+    /// Lease the host definition across an interrupted-wake recovery commit.
+    /// Handlers without the explicit host identity contract fail closed.
+    fn woken_cleanup_identity_lease(
+        &self,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<Option<String>>, String> {
+        Err("woken cleanup identity lease unavailable".into())
+    }
     /// Abort-only reservation. The default never grants ordinary admission or memo access.
     fn run_abort_with_admission(
         &self,
@@ -1154,6 +1161,21 @@ type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Se
 fn release_hooks() -> &'static BoundaryHooks {
     static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+fn woken_recovery_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn before_woken_recovery_commit_for_test(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    woken_recovery_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
 }
 #[cfg(test)]
 pub(crate) fn after_ready_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
@@ -7221,6 +7243,9 @@ impl Scheduler {
                     {
                         continue;
                     }
+                    let Ok(_definition_lease) = reg.handler.woken_cleanup_identity_lease() else {
+                        continue;
+                    };
                     let owner = self.owner();
                     let boundary = owner
                         .store()
@@ -7307,6 +7332,14 @@ impl Scheduler {
                             .map_err(task_store::Error::from)?;
                             batch.checks.push(check);
                             batch.mutations.push(mutation);
+                        }
+                        #[cfg(test)]
+                        if let Some(hook) = woken_recovery_hooks()
+                            .lock()
+                            .unwrap()
+                            .remove(&item.task.id())
+                        {
+                            hook();
                         }
                         match owner.store().commit_with_prefix_put_fence(
                             &batch.checks,

@@ -19,6 +19,18 @@ fn park_hooks() -> &'static ParkHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn cancel_dispatch_hooks() -> &'static ParkHooks {
+    static HOOKS: std::sync::OnceLock<ParkHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(super) fn before_woken_cancel_dispatch(id: uuid::Uuid, hook: impl FnOnce() + Send + 'static) {
+    cancel_dispatch_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 pub(super) fn after_unsafe_evidence(id: uuid::Uuid, hook: impl FnOnce() + Send + 'static) {
     park_hooks().lock().unwrap().insert(id, Box::new(hook));
 }
@@ -184,6 +196,25 @@ fn register_with_policy(
     unavailable: bool,
     park_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool, bool)>,
 ) -> Result<Arc<TaskTool>, String> {
+    let identity_tool: Arc<dyn Tool> = tool.clone();
+    let definition_lease = if park_cancel.as_ref().is_some_and(|(_, _, _, woken)| *woken) {
+        Some(
+            crate::nested_identity::execution_lease(&identity_tool)
+                .map_err(|_| "woken cancel identity busy")?
+                .ok_or("woken cancel requires a registered identity lease")?,
+        )
+    } else {
+        None
+    };
+    let woken_identity = match definition_lease.as_ref() {
+        Some(guard) => Some(
+            guard
+                .as_deref()
+                .ok_or("woken cancel identity missing")?
+                .to_owned(),
+        ),
+        None => None,
+    };
     if unavailable && (!block_results || abort_after || restart_after || !children.is_empty()) {
         return Err("invalid unavailable registration".into());
     }
@@ -236,9 +267,9 @@ fn register_with_policy(
         let legacy_fixture = false;
         serde_json::to_vec(&(
             if *woken && *retry {
-                14u32
+                16u32
             } else if *woken {
-                13u32
+                15u32
             } else if !replay_safe && *retry {
                 12u32
             } else if !replay_safe {
@@ -253,11 +284,17 @@ fn register_with_policy(
             &identity,
             &child_identities,
             cancel_id,
+            // Preserve older identities for all other registrations.
         ))
     } else {
         serde_json::to_vec(&(discriminator, &identity, &child_identities))
     }
     .map_err(|e| e.to_string())?;
+    let encoded = if let Some(expected) = &woken_identity {
+        serde_json::to_vec(&(encoded, expected)).map_err(|e| e.to_string())?
+    } else {
+        encoded
+    };
     if encoded.len() > 65536 {
         return Err("definition identity too large".into());
     }
@@ -286,6 +323,7 @@ fn register_with_policy(
         block_results,
         unavailable,
         park_cancel: park_cancel.map(|(_, callback, retry, _)| (callback, retry)),
+        woken_identity,
     });
     scheduler.install_checkpointable_async_handler(
         kind.clone(),
@@ -384,6 +422,7 @@ pub(super) fn register_conversation_candidate(
         block_results: has_hook,
         unavailable: false,
         park_cancel: None,
+        woken_identity: None,
     });
     let mut adapter = TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments();
     if has_hook {
@@ -734,6 +773,7 @@ struct Executor {
     block_results: bool,
     unavailable: bool,
     park_cancel: Option<(Arc<dyn DurableParkCancel>, bool)>,
+    woken_identity: Option<String>,
 }
 
 struct Host<'a, 'b> {
@@ -1354,6 +1394,24 @@ impl Handler for Executor {
     fn requires_park_cancel_claim(&self) -> bool {
         self.park_cancel.is_some()
     }
+    fn woken_cleanup_identity_lease(
+        &self,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<Option<String>>, String> {
+        let expected = self
+            .woken_identity
+            .as_deref()
+            .ok_or("woken identity unavailable")?;
+        let tool: Arc<dyn Tool> = self.tool.clone();
+        let lease = crate::nested_identity::checked_lease(&tool, expected)
+            .map_err(|_| "woken cancel identity unavailable; reconciliation required")?;
+        if !self
+            .identity
+            .matches(self.tool.as_ref(), &self.implementation, self.version)
+        {
+            return Err("woken cancel tool identity changed".into());
+        }
+        Ok(lease)
+    }
     fn run(&self, _: &Task) -> Result<Step, String> {
         Err("driver reservation required".into())
     }
@@ -1386,6 +1444,25 @@ impl Handler for Executor {
         if let Some((cancel, retry)) = &self.park_cancel
             && task.checkpoint().phase == "replay-safe-async-wait"
         {
+            // The host serializes every Tool and callback configuration change
+            // through this nonblocking identity lease. It is held through the
+            // bounded callback, not across any scheduler or store lock.
+            let identity_tool: Arc<dyn Tool> = self.tool.clone();
+            let _identity_lease = match &self.woken_identity {
+                Some(expected) => Some(
+                    crate::nested_identity::checked_lease(&identity_tool, expected).map_err(
+                        |_| "woken cancel identity unavailable; reconciliation required",
+                    )?,
+                ),
+                None => None,
+            };
+            if self.woken_identity.is_some()
+                && !self
+                    .identity
+                    .matches(self.tool.as_ref(), &self.implementation, self.version)
+            {
+                return Err("woken cancel tool identity changed".into());
+            }
             let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
                 .map_err(|_| "invalid parked cancel checkpoint")?;
             if stored.version != 2
@@ -1437,6 +1514,13 @@ impl Handler for Executor {
                         self.version,
                     ) {
                         return Err("cancel tool identity changed before dispatch".to_string());
+                    }
+                    #[cfg(test)]
+                    {
+                        let hook = cancel_dispatch_hooks().lock().unwrap().remove(&task.id());
+                        if let Some(hook) = hook {
+                            hook();
+                        }
                     }
                     Ok::<_, String>(
                         tokio::time::timeout(

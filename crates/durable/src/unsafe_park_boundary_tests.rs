@@ -1236,6 +1236,8 @@ fn woken_cancel_registry(root: &Path) -> crate::task_scheduler::Registry {
     let mut host =
         StandaloneBeforeHookHost::open(dir.path().join("db"), Default::default()).unwrap();
     let sentinel = Arc::new(WokenCancelSentinel(root.into()));
+    let identity_tool: Arc<dyn Tool> = sentinel.clone();
+    crate::nested_identity::register(&identity_tool, Some("sentinel-v1".into())).unwrap();
     host.register_unsafe_durable_tool_with_woken_cancel(
         sentinel.clone(),
         "sentinel-v1",

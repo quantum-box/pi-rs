@@ -1292,6 +1292,15 @@ impl StandaloneBeforeHookHost {
     /// This distinct registration does not cancel an unwoken park. The host must
     /// change `cancel_identity` when the callback or its configuration changes.
     /// Cleanup must be cooperative and must not spawn detached work.
+    /// Before registration, register this exact Tool allocation with
+    /// `nested_identity::register`. Its identity must cover Tool and callback
+    /// implementation, configuration and tenant. All changes to either must
+    /// go through the returned `IdentityHandle::update`; bypassing that host
+    /// contract cannot be fenced. Updates are nonblocking and return busy while
+    /// cleanup holds the lease. The 30-second timeout cannot preempt blocking
+    /// callback code, so a noncooperative callback can retain it longer.
+    /// This contract has a distinct definition identity from earlier versions;
+    /// older in-flight tasks require reconciliation or their original host.
     #[allow(clippy::too_many_arguments)]
     pub fn register_unsafe_durable_tool_with_woken_cancel(
         &mut self,
@@ -1932,7 +1941,7 @@ mod tests {
     use crate::task_store::{Save, TaskStore};
     use pi_rs_core::{ToolContext, ToolSpec};
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use uuid::Uuid;
 
     struct TestTool {
@@ -12945,6 +12954,22 @@ mod tests {
             if self.0.join("fail-cancel").exists() {
                 return Err("external outcome unknown".into());
             }
+            if self.0.join("reenter-update").exists() {
+                let handle = WOKEN_TEST_IDENTITIES
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get(&self.0)
+                    .unwrap()
+                    .clone();
+                let result = handle.update(Some("changed".into()), || {}).await;
+                std::fs::write(
+                    self.0.join("reenter-result"),
+                    if result.is_err() { "busy" } else { "updated" },
+                )
+                .unwrap();
+            }
             if self.0.join("pause-cancel").exists() {
                 std::fs::write(self.0.join("cancel-ready"), b"yes").map_err(|e| e.to_string())?;
                 while !self.0.join("cancel-release").exists() {
@@ -13047,6 +13072,11 @@ mod tests {
         unsafe_park_cancel_host_inner(root, retry, None, false)
     }
     type UnsafeCancelOuterSlot = Arc<std::sync::OnceLock<Arc<crate::task_tool::TaskTool>>>;
+    static WOKEN_TEST_IDENTITIES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, crate::nested_identity::IdentityHandle>,
+        >,
+    > = std::sync::OnceLock::new();
     struct UnsafeCancelOuter(UnsafeCancelOuterSlot);
     impl crate::task_scheduler::Handler for UnsafeCancelOuter {
         fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
@@ -13079,7 +13109,11 @@ mod tests {
         fn spec(&self) -> ToolSpec {
             ToolSpec {
                 name: "root".into(),
-                description: String::new(),
+                description: if self.0.join("any-spec-changed").exists() {
+                    "changed".into()
+                } else {
+                    String::new()
+                },
                 parameters: json!({"type":"object"}),
             }
         }
@@ -13150,7 +13184,12 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
+        let db = if root.join("separate-identity-db").exists() {
+            "identity-db"
+        } else {
+            "db"
+        };
+        let mut host = StandaloneBeforeHookHost::open(root.join(db), registry).unwrap();
         let child = Arc::new(crate::task_tool::TaskTool::new(
             ToolSpec {
                 name: "leaf".into(),
@@ -13173,6 +13212,21 @@ mod tests {
             })
         };
         let callback: Arc<dyn DurableParkCancel> = Arc::new(ParkCancelFixture(root.to_owned()));
+        if woken {
+            let identity_tool: Arc<dyn Tool> = definition.clone();
+            let handle = crate::nested_identity::register(
+                &identity_tool,
+                Some("test-woken-cancel-v1".into()),
+            )
+            .unwrap();
+            if root.join("capture-identity-handle").exists() {
+                WOKEN_TEST_IDENTITIES
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .insert(root.to_owned(), handle);
+            }
+        }
         let register = if woken {
             StandaloneBeforeHookHost::register_unsafe_durable_tool_with_woken_cancel
         } else {
@@ -14673,6 +14727,120 @@ mod tests {
         }
     }
     #[test]
+    fn woken_cancel_identity_lease_rejects_reentry_and_concurrent_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for marker in [
+            "woken-case",
+            "any-case",
+            "capture-identity-handle",
+            "pause-cancel",
+            "reenter-update",
+        ] {
+            std::fs::write(root.join(marker), b"yes").unwrap();
+        }
+        let (host, tool) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let handle = WOKEN_TEST_IDENTITIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap();
+        // Keep the handle visible to the callback for the reentrant update.
+        WOKEN_TEST_IDENTITIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .insert(root.to_owned(), handle.clone());
+        let id = host
+            .start_unsafe_durable_root(&tool, json!({"token":"prepared"}), 3)
+            .unwrap();
+        let dispatch_blocked = Arc::new(AtomicBool::new(false));
+        let observed = dispatch_blocked.clone();
+        let dispatch_handle = handle.clone();
+        replay_safe::before_woken_cancel_dispatch(id, move || {
+            use futures_util::FutureExt;
+            let result = dispatch_handle
+                .update(Some("changed".into()), || panic!("changed before callback"))
+                .now_or_never()
+                .expect("update must not wait");
+            observed.store(result.is_err(), Ordering::SeqCst);
+        });
+        let driver = host.into_driver();
+        wait_park_cancel(&driver, id);
+        let task = driver.get(id).unwrap().unwrap();
+        let child: AsyncTaskCall =
+            serde_json::from_value(task.checkpoint().data["checkpoint"]["call"].clone()).unwrap();
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                child.task_id(),
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        driver.request_abort(id).unwrap();
+        wait_file(&root.join("cancel-ready"));
+        assert!(dispatch_blocked.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(root.join("reenter-result")).unwrap(), b"busy");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let changed = Arc::new(AtomicBool::new(false));
+        let flag = changed.clone();
+        assert!(
+            runtime
+                .block_on(handle.update(Some("changed".into()), move || {
+                    flag.store(true, Ordering::SeqCst)
+                }))
+                .is_err()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!changed.load(Ordering::SeqCst));
+        assert!(driver.get(id).unwrap().is_some());
+        std::fs::write(root.join("cancel-release"), b"yes").unwrap();
+        wait_terminal(&driver, id);
+        runtime
+            .block_on(handle.update(Some("changed".into()), || {}))
+            .unwrap();
+        let _ = driver.shutdown_with_pending().unwrap();
+        WOKEN_TEST_IDENTITIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(root);
+    }
+    #[test]
+    fn woken_cancel_registration_requires_identity_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(WokenAnyTool(dir.path().to_owned()));
+        let result = host.register_unsafe_durable_tool_with_woken_cancel(
+            tool,
+            "tool-v1",
+            1,
+            vec![],
+            &crate::extension::Registry::default().snapshot(),
+            &[],
+            "cancel-v1",
+            Arc::new(ParkCancelFixture(dir.path().to_owned())),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+            AbortAfterAuthorization::host_attests_cleanup_safe(),
+            None,
+        );
+        assert!(
+            matches!(result, Err(error) if error.contains("requires a registered identity lease"))
+        );
+    }
+    #[test]
     fn unsafe_woken_cancel_late_receipt_before_callback_is_reconcilable() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -15022,6 +15190,103 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn woken_recovery_identity_change_does_not_abort_live_any_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for marker in [
+            "woken-case",
+            "any-case",
+            "capture-identity-handle",
+            "require-child-aborted",
+        ] {
+            std::fs::write(root.join(marker), b"yes").unwrap();
+        }
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        std::fs::write(root.join("separate-identity-db"), b"yes").unwrap();
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let registry = host.into_scheduler_for_test().registry_for_test();
+        let handle = WOKEN_TEST_IDENTITIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(handle.update(Some("test-woken-cancel-v1".into()), || {
+                std::fs::write(root.join("any-spec-changed"), b"yes").unwrap();
+            }))
+            .unwrap();
+        let scheduler =
+            crate::task_scheduler::Scheduler::open(root.join("db"), registry.clone()).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let task = driver.get(id).unwrap().unwrap();
+        assert_eq!(task.state(), &crate::task::TaskState::Running);
+        let child: AsyncTaskCall =
+            serde_json::from_value(task.checkpoint().data["checkpoint"]["other"].clone()).unwrap();
+        assert!(
+            !driver
+                .get(child.task_id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        assert!(!root.join("child-aborted").exists());
+        assert!(!root.join("cancel-count").exists());
+        let _ = driver.shutdown_with_pending().unwrap();
+        runtime
+            .block_on(handle.update(Some("test-woken-cancel-v1".into()), || {
+                std::fs::remove_file(root.join("any-spec-changed")).unwrap()
+            }))
+            .unwrap();
+        let blocked = Arc::new(AtomicBool::new(false));
+        let observed = blocked.clone();
+        crate::task_scheduler::before_woken_recovery_commit_for_test(id, move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(handle.update(Some("other".into()), || {
+                panic!("identity changed during recovery commit")
+            }));
+            observed.store(result.is_err(), Ordering::SeqCst);
+        });
+        let scheduler = crate::task_scheduler::Scheduler::open(root.join("db"), registry).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert!(root.join("child-aborted").exists());
+        assert!(root.join("cancel-count").exists());
+        assert!(blocked.load(Ordering::SeqCst));
+        let _ = driver.shutdown_with_pending().unwrap();
+        WOKEN_TEST_IDENTITIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(root);
     }
     struct SuppressGate;
     #[async_trait::async_trait]
