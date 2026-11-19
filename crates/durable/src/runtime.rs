@@ -3234,11 +3234,10 @@ thread_local! {
     static TASK_RESULT_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 #[cfg(test)]
-fn stopped_receipt_read_hooks()
--> &'static std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>> {
-    static HOOKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>,
-    > = std::sync::OnceLock::new();
+type StoppedReceiptReadHooks = std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn stopped_receipt_read_hooks() -> &'static StoppedReceiptReadHooks {
+    static HOOKS: std::sync::OnceLock<StoppedReceiptReadHooks> = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
