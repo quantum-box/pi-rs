@@ -290,6 +290,87 @@ pub(crate) fn prepare_park(
 
 /// Bind the next dispatch to the exact committed park and prior attempt.
 pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, String> {
+    park_checks(store, task, true)
+}
+
+/// Authenticate a committed unsafe park without authorizing a Tool wake.
+pub(crate) fn cancel_checks(
+    store: &Store,
+    task: &Task,
+    boundary: u64,
+) -> Result<Vec<Check>, String> {
+    if task.checkpoint().phase != "replay-safe-async-wait" || task.replay_safe() {
+        return Err("unsafe cancel requires a committed park".into());
+    }
+    let mut checks = park_checks(store, task, false)?;
+    let park_entry = store
+        .get(&key(task.id()))
+        .map_err(|e| e.to_string())?
+        .ok_or("missing park proof")?;
+    let proof: ParkProof =
+        serde_json::from_slice(&park_entry.value).map_err(|_| "invalid park proof")?;
+    if task.checkpoint().data.get("park_attempt")
+        != Some(&serde_json::to_value(proof.attempt).map_err(|e| e.to_string())?)
+    {
+        return Err("park attempt does not match proof".into());
+    }
+    let mut joined_key = intent_key(task.id(), proof.attempt);
+    joined_key.extend_from_slice(b"/park-evidence");
+    let joined = store
+        .get(&joined_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing joined park evidence")?;
+    let evidence: UnsafeDurableParkEvidence =
+        serde_json::from_slice(&joined.value).map_err(|_| "invalid joined park evidence")?;
+    if evidence.task_id != task.id()
+        || evidence.attempt_id != proof.attempt
+        || proof.checkpoint.data.get("checkpoint") != Some(&evidence.checkpoint)
+    {
+        return Err("joined park evidence mismatch".into());
+    }
+    let same_wait = match (&proof.wait, &evidence.wait) {
+        (WaitFor::Tasks(ids), DurableWait::All(calls))
+        | (WaitFor::TasksAny(ids), DurableWait::Any(calls)) => {
+            ids == &calls.iter().map(|c| c.task_id()).collect::<Vec<_>>()
+                && calls.iter().all(|c| c.0.belongs_to(task.id()))
+        }
+        _ => false,
+    };
+    if !same_wait {
+        return Err("joined park wait mismatch".into());
+    }
+    let prefix = format!("durable/unsafe-park-async/{}/", task.id()).into_bytes();
+    for (key, entry) in store.list(&prefix).map_err(|e| e.to_string())? {
+        if key.ends_with(b"/intent/receipt") || key.ends_with(b"/hook-final") {
+            return Err("unsafe Tool receipt exists; reconciliation required".into());
+        }
+        if !key.ends_with(b"/intent") {
+            continue;
+        }
+        let later: Task =
+            serde_json::from_slice(&entry.value).map_err(|_| "invalid unsafe execution intent")?;
+        if later.id() != task.id() {
+            return Err("unsafe execution identity mismatch".into());
+        }
+        if later.attempt_id() != Some(proof.attempt)
+            && later.checkpoint() == task.checkpoint()
+            && later.ended_children().is_some()
+        {
+            return Err("unsafe park epoch has already woken".into());
+        }
+    }
+    checks.push(Check {
+        key: joined_key,
+        expected: Expected::Version(joined.version),
+    });
+    checks.push(Check {
+        key: prefix,
+        expected: Expected::PrefixUnchangedSince(boundary),
+    });
+    Ok(checks)
+}
+
+fn park_checks(store: &Store, task: &Task, require_wake: bool) -> Result<Vec<Check>, String> {
     let park_key = key(task.id());
     let park_entry = store.get(&park_key).map_err(|e| e.to_string())?;
     if matches!(
@@ -314,18 +395,22 @@ pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, 
     {
         return Err("unsafe park proof does not match task".into());
     }
-    let ended = task
-        .ended_children()
-        .ok_or("unsafe wake lacks ended children")?;
     let wait_ids = match &proof.wait {
         WaitFor::Tasks(ids) | WaitFor::TasksAny(ids) if !ids.is_empty() => ids,
         _ => return Err("invalid unsafe wait".into()),
     };
-    if ended.is_empty()
-        || ended.iter().any(|id| !wait_ids.contains(id))
-        || matches!(&proof.wait, WaitFor::Tasks(_)) && ended.len() != wait_ids.len()
-    {
-        return Err("unsafe wake does not match committed wait".into());
+    if require_wake {
+        let ended = task
+            .ended_children()
+            .ok_or("unsafe wake lacks ended children")?;
+        if ended.is_empty()
+            || ended.iter().any(|id| !wait_ids.contains(id))
+            || matches!(&proof.wait, WaitFor::Tasks(_)) && ended.len() != wait_ids.len()
+        {
+            return Err("unsafe wake does not match committed wait".into());
+        }
+    } else if task.ended_children().is_some() {
+        return Err("unsafe park epoch already woken".into());
     }
     let previous_key = intent_key(task.id(), proof.attempt);
     let previous = store

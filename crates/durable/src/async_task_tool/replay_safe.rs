@@ -142,6 +142,32 @@ pub(super) fn register_unsafe(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn register_unsafe_park_cancel(
+    scheduler: &mut Scheduler,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<TaskTool>>,
+    hook: (String, Arc<dyn crate::extension::Hook>),
+    park_cancel: (String, Arc<dyn DurableParkCancel>, bool),
+) -> Result<Arc<TaskTool>, String> {
+    register_with_policy(
+        scheduler,
+        tool,
+        implementation,
+        version,
+        children,
+        false,
+        Some(hook),
+        true,
+        true,
+        false,
+        false,
+        Some(park_cancel),
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // Explicit policy and hook identity are part of registration.
 fn register_with_policy(
     scheduler: &mut Scheduler,
@@ -208,7 +234,11 @@ fn register_with_policy(
         #[cfg(not(test))]
         let legacy_fixture = false;
         serde_json::to_vec(&(
-            if *retry {
+            if !replay_safe && *retry {
+                12u32
+            } else if !replay_safe {
+                11u32
+            } else if *retry {
                 9u32
             } else if legacy_fixture {
                 8u32
@@ -277,6 +307,9 @@ pub(crate) fn park_cancel_provenance_checks(
     task: &Task,
     graph_version: u64,
 ) -> Result<Vec<durable_store::Check>, String> {
+    if !task.replay_safe() {
+        return super::unsafe_park_proof::cancel_checks(store, task, graph_version);
+    }
     if task.ended_children().is_some() {
         return Err("park epoch was already woken".into());
     }
@@ -1213,6 +1246,12 @@ impl Handler for Executor {
         if task.holds_restart_cleanup() {
             return self.run_with_restart_cleanup(task, admission);
         }
+        if !self.replay_safe
+            && self.park_cancel.is_some()
+            && task.checkpoint().phase != "replay-safe-async-wait"
+        {
+            return Err("unsafe execution is not a proven park; reconciliation required".into());
+        }
         if !self.block_results
             || !self
                 .identity
@@ -1237,7 +1276,12 @@ impl Handler for Executor {
             {
                 return Err("unsupported parked cancel checkpoint".into());
             }
-            if admission.park_cancel_claim(self, false, *retry)? {
+            let decision = admission.park_cancel_claim(self, false, *retry)?;
+            if !self.replay_safe && decision == crate::task_scheduler::ParkCancelDecision::Uncertain
+            {
+                return Err("unsafe cancel outcome uncertain; reconciliation required".into());
+            }
+            if decision == crate::task_scheduler::ParkCancelDecision::Invoke {
                 #[cfg(test)]
                 if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_SPEC_BARRIER") {
                     let dir = std::path::PathBuf::from(dir);
@@ -1266,6 +1310,7 @@ impl Handler for Executor {
                     .map_err(|e| e.to_string())?;
                 let cancellation = pi_rs_core::CancellationToken::new();
                 let result = runtime.block_on(async {
+                    admission.verify_park_cancel_dispatch(self, *retry)?;
                     if !self.identity.matches(
                         self.tool.as_ref(),
                         &self.implementation,
@@ -1302,6 +1347,8 @@ impl Handler for Executor {
                             std::thread::park();
                         }
                     }
+                } else if !self.replay_safe {
+                    return Err("unsafe cancel outcome uncertain; reconciliation required".into());
                 }
             }
         }

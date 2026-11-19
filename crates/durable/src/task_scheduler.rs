@@ -188,6 +188,13 @@ fn abort_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{id}/abort-intent/{attempt}").into_bytes()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParkCancelDecision {
+    Invoke,
+    Completed,
+    Uncertain,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ParkCancelClaim {
@@ -1877,6 +1884,121 @@ impl AdmissionHandle<'_> {
         Ok(())
     }
 
+    /// Recheck the exact live claim and outcome absence immediately before
+    /// crossing the external callback boundary.
+    pub(crate) fn verify_park_cancel_dispatch(
+        &self,
+        handler: &dyn Handler,
+        retryable: bool,
+    ) -> Result<(), String> {
+        if !self.abort || !self.standalone || self.lease.retired {
+            return Err("invalid cancel lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.running.task.id())
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cancel dispatch or live child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.version != current.task.definition_version()
+            || reg.replay_safe != current.task.replay_safe()
+            || !handler.requires_park_cancel_claim()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("cancel definition changed".into());
+        }
+        let key = park_cancel_key(current.task.id());
+        let entry = owner
+            .store()
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing cancel claim")?;
+        let claim: ParkCancelClaim =
+            serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+        if claim.version != if retryable { 2 } else { 1 }
+            || (retryable
+                && (claim
+                    .retry_count
+                    .is_none_or(|n| n == 0 || n > current.task.restart_limit())
+                    || claim.started_at_restart != Some(current.task.restarts())))
+            || (!retryable && (claim.retry_count.is_some() || claim.started_at_restart.is_some()))
+            || claim.task != current.task.id()
+            || claim.kind != kind
+            || claim.definition_version != current.task.definition_version()
+            || claim.checkpoint != *current.task.checkpoint()
+            || claim.attempt != attempt
+            || claim.lease != self.lease.token
+            || claim.finished
+        {
+            return Err("stale cancel claim".into());
+        }
+        let mut checks = crate::async_task_tool::park_cancel_provenance_checks(
+            owner.store(),
+            &current.task,
+            boundary,
+        )?;
+        checks.push(park_cancel_original_intent_check(owner.store(), &claim)?);
+        checks.push(durable_store::Check {
+            key,
+            expected: durable_store::Expected::Version(entry.version),
+        });
+        checks.push(durable_store::Check {
+            key: task_store::key(current.task.id()),
+            expected: durable_store::Expected::Version(current.version),
+        });
+        checks.push(durable_store::Check {
+            key: abort_receipt_key(current.task.id()),
+            expected: durable_store::Expected::Missing,
+        });
+        owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &[],
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string())
+    }
     /// Claim once before entering external cleanup. A persisted claim from an
     /// earlier attempt is evidence of uncertainty, never permission to replay.
     pub(crate) fn park_cancel_claim(
@@ -1884,7 +2006,7 @@ impl AdmissionHandle<'_> {
         handler: &dyn Handler,
         finish: bool,
         retryable: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<ParkCancelDecision, String> {
         if !self.abort || !self.standalone || self.lease.retired {
             return Err("invalid cancel lease".into());
         }
@@ -1932,7 +2054,12 @@ impl AdmissionHandle<'_> {
             .get(kind)
             .ok_or("missing definition")?;
         if reg.version != current.task.definition_version()
-            || !reg.replay_safe
+            || reg.replay_safe != current.task.replay_safe()
+            || !(reg.replay_safe
+                || (!current.task.replay_safe()
+                    && reg.cancellable_durable_async
+                    && reg.checkpointable_hooks
+                    && handler.requires_park_cancel_claim()))
             || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
             || reg
                 .abort
@@ -2016,7 +2143,11 @@ impl AdmissionHandle<'_> {
                     .store()
                     .commit(&recheck, &[])
                     .map_err(|e| e.to_string())?;
-                return Ok(false);
+                return Ok(if prior.finished {
+                    ParkCancelDecision::Completed
+                } else {
+                    ParkCancelDecision::Uncertain
+                });
             }
             if finish {
                 if prior.attempt != attempt || prior.lease != self.lease.token || prior.finished {
@@ -2098,7 +2229,7 @@ impl AdmissionHandle<'_> {
                 graph_version,
             )
             .map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(ParkCancelDecision::Invoke)
     }
     /// Abort cleanup has its own reservation and never grants ordinary task memo.
     /// A result is stored once only while the exact attempt and definition are live.
@@ -2151,8 +2282,13 @@ impl AdmissionHandle<'_> {
             .get(kind)
             .ok_or("missing cleanup definition")?;
         if registration.version != current.task.definition_version()
-            || !registration.replay_safe
-            || !std::ptr::eq(registration.handler.as_ref(), handler)
+            || registration.replay_safe != current.task.replay_safe()
+            || !(registration.replay_safe
+                || (!current.task.replay_safe()
+                    && registration.cancellable_durable_async
+                    && registration.checkpointable_hooks
+                    && handler.requires_park_cancel_claim()))
+            || !std::ptr::addr_eq(registration.handler.as_ref(), handler)
             || registration
                 .abort
                 .as_ref()
@@ -7920,7 +8056,13 @@ impl Scheduler {
                     .get(&key)
                     .map_err(task_store::Error::from)?;
                 let valid_registration = self.registered(&snapshot.task).ok().is_some_and(|reg| {
-                    reg.replay_safe
+                    reg.version == snapshot.task.definition_version()
+                        && reg.replay_safe == snapshot.task.replay_safe()
+                        && (reg.replay_safe
+                            || (!snapshot.task.replay_safe()
+                                && reg.cancellable_durable_async
+                                && reg.checkpointable_hooks
+                                && reg.handler.requires_park_cancel_claim()))
                         && reg
                             .abort
                             .as_ref()
