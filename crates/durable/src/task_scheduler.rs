@@ -2259,10 +2259,17 @@ impl DetachedInvocation {
                             };
                             if let Some(cancellation) = cancellation {
                                 handler.run_with_admission_and_cancellation(
-                                    &running.task, &mut documents, &admission, cancellation,
+                                    &running.task,
+                                    &mut documents,
+                                    &admission,
+                                    cancellation,
                                 )
                             } else {
-                                handler.run_with_admission(&running.task, &mut documents, &admission)
+                                handler.run_with_admission(
+                                    &running.task,
+                                    &mut documents,
+                                    &admission,
+                                )
                             }
                         }
                         _ => Err("invalid unhooked executor state".into()),

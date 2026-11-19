@@ -293,11 +293,20 @@ fn prepare_authorized_phase(
             expected: Expected::Missing,
         });
         let attempt_key = attempt_intent_key(expected.task, expected.attempt);
-        checks.push(Check { key: attempt_key.clone(), expected: Expected::Missing });
+        checks.push(Check {
+            key: attempt_key.clone(),
+            expected: Expected::Missing,
+        });
         let value = serde_json::to_vec(&expected)?;
         let mutations = vec![
-            Mutation::Put { key, value: value.clone() },
-            Mutation::Put { key: attempt_key, value },
+            Mutation::Put {
+                key,
+                value: value.clone(),
+            },
+            Mutation::Put {
+                key: attempt_key,
+                value,
+            },
         ];
         Ok((expected, OwnedBatch { checks, mutations }))
     }
