@@ -138,8 +138,12 @@ fn register_with_policy(
     let mut child_identities = Vec::new();
     for child in children {
         let id = child.identity().ok_or("invalid child identity")?;
-        if !id.replay_safe || child.is_direct() {
-            return Err("only replay-safe task-backed children are supported".into());
+        if child.is_direct()
+            || (!id.replay_safe && !scheduler.registered_unsafe_checkpointable_child(&child))
+        {
+            return Err(
+                "child must be replay-safe or a registered unsafe checkpointable tool".into(),
+            );
         }
         let name = child.spec().name;
         if name.is_empty() || names.insert(name.clone(), child).is_some() {
@@ -413,6 +417,33 @@ impl DurableTaskHost for Host<'_, '_> {
     }
     async fn child_result(&self, child: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String> {
         let mut docs = self.docs.lock().map_err(|e| e.to_string())?;
+        if !child.0.belongs_to(self.task.id()) {
+            return Err("child belongs to another parent".into());
+        }
+        let task = docs.get_owned_child(child.task_id())?;
+        if !task.replay_safe()
+            && task
+                .kind()
+                .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."))
+        {
+            use crate::task::TaskState;
+            if !task.is_terminal() {
+                return Ok(None);
+            }
+            let (receipts, has_intent) = docs.read_unsafe_child_evidence(child.task_id())?;
+            let outcome = receipts.into_iter().next().map(|receipt| receipt.outcome);
+            return Ok(Some(match task.state() {
+                TaskState::Succeeded(value) => {
+                    let result: Outcome = serde_json::from_value(value.clone()).map_err(|_| "invalid unsafe child result")?;
+                    if outcome.as_ref() != Some(&result) { return Err("unsafe child result lacks matching receipt".into()); }
+                    AsyncTaskResult::Outcome(result)
+                }
+                TaskState::Failed(reason) => AsyncTaskResult::Uncertain(outcome.unwrap_or_else(|| Outcome::Unknown(format!("unsafe child requires reconciliation: {reason}")))),
+                TaskState::Cancelled if has_intent => AsyncTaskResult::Uncertain(outcome.unwrap_or_else(|| Outcome::Unknown("unsafe child was cancelled after dispatch; reconciliation may be required".into()))),
+                TaskState::Cancelled => AsyncTaskResult::Cancelled,
+                _ => return Err("invalid unsafe child terminal state".into()),
+            }));
+        }
         Ok(match child.0.result(&self.task, &mut docs)? {
             None => None,
             Some(NestedTaskResult::Succeeded(value)) => {
@@ -945,8 +976,17 @@ impl Handler for Executor {
         if self.hook.is_some() && task.checkpoint().phase == "replay-safe-async-after" {
             return self.after(task, admission, cancellation);
         }
-        let intent =
-            admission.checkpointable_durable_intent(false, self.replay_safe, Some(cancellation))?;
+        let intent = match admission.checkpointable_durable_intent(
+            false,
+            self.replay_safe,
+            Some(cancellation),
+        ) {
+            Ok(intent) => intent,
+            Err(error) if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY => {
+                return Ok(Step::DeferUndispatched);
+            }
+            Err(error) => return Err(error),
+        };
         #[cfg(test)]
         crash_test_boundary(&self.tool.spec().name, task.id(), "intent");
         let (resume, saved_args) = match task.checkpoint().phase.as_str() {

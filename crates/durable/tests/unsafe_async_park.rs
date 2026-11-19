@@ -348,7 +348,7 @@ fn unsafe_parked_abort_after_kill_drains_child_without_resume() {
 }
 
 #[test]
-fn unsafe_registration_is_explicit_and_cannot_enter_replay_safe_path() {
+fn unsafe_registration_is_explicit_and_can_be_a_checked_safe_parent_child() {
     let dir = tempfile::tempdir().unwrap();
     let (mut host, unsafe_root) = host(dir.path(), None);
     assert!(
@@ -367,7 +367,7 @@ fn unsafe_registration_is_explicit_and_cannot_enter_replay_safe_path() {
             vec![unsafe_root],
             pi_rs_durable::async_task_tool::ReplaySafeAuthorization::host_attests_replay_safe()
         )
-        .is_err()
+        .is_ok()
     );
     host.into_driver().shutdown().unwrap();
 }

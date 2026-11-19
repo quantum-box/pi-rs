@@ -44,7 +44,8 @@ pub enum AsyncTaskResult {
     Outcome(Outcome),
     /// Ordered content and result metadata produced by block-aware after hooks.
     Rich(crate::extension::ToolBlockResult),
-    /// The external outcome is unresolved and must not be replayed automatically.
+    /// The child requires reconciliation; its retained outcome, if known, is
+    /// evidence rather than a finalized successful result.
     Uncertain(Outcome),
     /// The Tool outcome is known, but its after hook did not finish. It is
     /// evidence for reconciliation, not a finalized model-facing result.
@@ -295,7 +296,8 @@ impl StandaloneNoHooksHost {
 
     /// Register a checkpointable tool for a standalone scheduler. The host
     /// must attest that every attempt is pure or otherwise safe to replay.
-    /// Child definitions must themselves be registered replay-safe TaskTools.
+    /// Children must be replay-safe TaskTools or explicitly registered unsafe
+    /// checkpointable tools from this host. Their replay policies stay separate.
     pub fn register_replay_safe_durable_tool(
         &mut self,
         tool: Arc<dyn DurableAsyncTool>,
@@ -330,7 +332,8 @@ impl StandaloneNoHooksHost {
 
     /// Register an unsafe checkpointable Tool. Interruption of a running
     /// attempt requires reconciliation; only a committed park may resume.
-    /// Children are limited to replay-safe TaskTools.
+    /// Children must be replay-safe TaskTools or explicitly registered unsafe
+    /// checkpointable tools from this host.
     pub fn register_unsafe_durable_tool(
         &mut self,
         tool: Arc<dyn DurableAsyncTool>,
@@ -2522,6 +2525,96 @@ mod tests {
         calls: Arc<AtomicUsize>,
         barrier: Option<ParkBarrier>,
         fail: bool,
+    }
+
+    #[test]
+    fn reserved_unsafe_child_defers_if_unsafe_parent_starts_before_dispatch() {
+        use crate::task_scheduler::{Step, TickReservation};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        assert!(
+            registry.register("unsafe-parent-test", false, |_: &Task| Ok(Step::Succeed(
+                json!(null)
+            )))
+        );
+        let mut host = StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            registry,
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let child_tool = host
+            .register_unsafe_durable_tool(
+                Arc::new(PureParkTool {
+                    calls: calls.clone(),
+                    barrier: None,
+                    fail: false,
+                }),
+                "reserved-child-v1",
+                1,
+                vec![],
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+            .unwrap();
+        let mut scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let parent = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("unsafe-parent-test".into(), false)
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let tasks = TaskStore::new(owner.store());
+        let parent_snapshot = tasks.load(parent.id()).unwrap().unwrap();
+        tasks
+            .update(&parent_snapshot, |task| {
+                task.start_attempt(Uuid::new_v4())?;
+                task.wait(crate::task::WaitFor::Signal("hold".into()))
+            })
+            .unwrap();
+        let waiting_parent = tasks.load(parent.id()).unwrap().unwrap().task;
+        let (_, child) = child_tool
+            .child_candidate(&waiting_parent, json!({}))
+            .unwrap();
+        tasks.save(&[Save::Create(&child)]).unwrap();
+        let TickReservation::Invocation(job) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("child not reserved");
+        };
+        assert_eq!(job.task_id(), child.id());
+        let parent_snapshot = tasks.load(parent.id()).unwrap().unwrap();
+        tasks
+            .update(&parent_snapshot, |task| {
+                task.wake()?;
+                task.start_attempt(Uuid::new_v4())
+            })
+            .unwrap();
+        let completed = job.execute().unwrap();
+        assert!(matches!(
+            completed.handler_result(),
+            Some(Ok(Step::DeferUndispatched))
+        ));
+        scheduler.settle_invocation(completed).unwrap();
+        assert!(matches!(
+            scheduler.get(child.id()).unwrap().unwrap().state(),
+            crate::task::TaskState::Ready
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            owner
+                .store()
+                .list(format!("durable/unsafe-park-async/{}/", child.id()).as_bytes())
+                .unwrap()
+                .is_empty()
+        );
     }
     #[async_trait::async_trait]
     impl Tool for PureParkTool {

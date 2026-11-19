@@ -97,6 +97,9 @@ where
 #[derive(Clone)]
 pub enum Step {
     Continue(Checkpoint),
+    /// Internal pre-dispatch yield for checkpointable Tools.
+    #[doc(hidden)]
+    DeferUndispatched,
     Wait {
         checkpoint: Checkpoint,
         condition: WaitFor,
@@ -105,6 +108,8 @@ pub enum Step {
     Succeed(Value),
     Fail(String),
 }
+
+pub(crate) const UNSAFE_ANCESTOR_BUSY: &str = "checkpointable unsafe ancestor is not parked";
 
 pub type Migration =
     dyn Fn(&Value, &Checkpoint, u32) -> Result<(Value, Checkpoint), String> + Send + Sync;
@@ -445,6 +450,15 @@ fn live_task_tool_parent(task: &Task, invocations: &Mutex<InvocationState>) -> b
     if !task.is_task_tool() || task.state() != &TaskState::Running {
         return false;
     }
+    // A checkpointable unsafe parent's live invocation is not an admission
+    // boundary: its children can dispatch only after it durably parks.
+    if !task.replay_safe()
+        && task
+            .kind()
+            .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."))
+    {
+        return false;
+    }
     let Ok(state) = invocations.lock() else {
         return false;
     };
@@ -452,6 +466,14 @@ fn live_task_tool_parent(task: &Task, invocations: &Mutex<InvocationState>) -> b
         && state.attempts.contains(&task.id())
         && !state.failed_handlers.contains(&task.id())
         && !state.published.iter().any(|(id, _)| *id == task.id())
+}
+
+fn unsafe_checkpointable_ready(task: &Task) -> bool {
+    task.state() == &TaskState::Ready
+        && !task.replay_safe()
+        && task
+            .kind()
+            .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."))
 }
 
 /// Shared publication gate used by the driver without taking the scheduler mutex.
@@ -1772,13 +1794,16 @@ impl AdmissionHandle<'_> {
                     && !(ancestor.retains_task_children_on_success()
                         && matches!(ancestor.state(), TaskState::Completing(_))))
                 || ancestor.is_background()
-                || (ancestor.id() != current.task.id()
-                    && !ancestor.replay_safe()
-                    && !matches!(ancestor.state(), TaskState::Waiting(_))
-                    && !(ancestor.retains_task_children_on_success()
-                        && matches!(ancestor.state(), TaskState::Completing(_))))
             {
                 return Err("unsafe or unavailable owner".into());
+            }
+            if ancestor.id() != current.task.id()
+                && !ancestor.replay_safe()
+                && !matches!(ancestor.state(), TaskState::Waiting(_))
+                && !(ancestor.retains_task_children_on_success()
+                    && matches!(ancestor.state(), TaskState::Completing(_)))
+            {
+                return Err(UNSAFE_ANCESTOR_BUSY.into());
             }
             match ancestor.owner() {
                 TaskOwner::Task(id) => {
@@ -3013,6 +3038,7 @@ impl WakeDefinitions {
         task_ancestors_available(store, task, tasks, |parent| {
             parent.abort_requested()
                 || parent.is_terminal()
+                || unsafe_checkpointable_ready(parent)
                 || matches!(parent.state(), TaskState::CompletingFailed(_))
                 || (parent.state() == &TaskState::Running && !live_task_tool_parent(parent, live))
                 || self.blocked_reason(parent).is_some()
@@ -4633,6 +4659,24 @@ impl Scheduler {
         self.replace_registry(registry).map_err(|e| e.to_string())
     }
 
+    pub(crate) fn registered_unsafe_checkpointable_child(
+        &self,
+        tool: &Arc<crate::task_tool::TaskTool>,
+    ) -> bool {
+        let Some(identity) = tool.identity() else {
+            return false;
+        };
+        self.validator.is_none()
+            && !identity.replay_safe
+            && identity.kind.starts_with("pi-rs.unsafe-park-async.v1.")
+            && self
+                .registry
+                .entries
+                .get(&identity.kind)
+                .is_some_and(|entry| entry.cancellable_durable_async && !entry.replay_safe)
+            && self.registry.matches_task_tool(&identity, &tool.handler())
+    }
+
     pub(crate) fn submit_checkpointable_async_root(
         &self,
         tool: &Arc<crate::task_tool::TaskTool>,
@@ -5615,8 +5659,28 @@ impl Scheduler {
             }
             if !live {
                 let mut next = snapshot.clone();
-                next.task.finalize().map_err(Error::Transition)?;
-                let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                let (uncertain, checks) =
+                    if matches!(snapshot.task.state(), TaskState::Completing(_))
+                        && snapshot.task.retains_task_children_on_success()
+                    {
+                        unsafe_descendant_reconciliation(
+                            owner.store(),
+                            snapshot.task.id(),
+                            &held_tasks,
+                            graph_version,
+                        )?
+                    } else {
+                        (None, Vec::new())
+                    };
+                if let Some(child) = uncertain {
+                    next.task
+                        .finalize_with_unsafe_reconciliation(child)
+                        .map_err(Error::Transition)?;
+                } else {
+                    next.task.finalize().map_err(Error::Transition)?;
+                }
+                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                batch.checks.extend(checks);
                 match owner.store().commit_with_prefix_put_fence(
                     &batch.checks,
                     &batch.mutations,
@@ -6072,9 +6136,30 @@ impl Scheduler {
         let mut next = running.clone();
         let mut children = Vec::new();
         let mut wait_graph_fence = false;
+        let mut undispatched_check = None;
         match step {
             Step::Continue(checkpoint) => {
                 next.task.advance(checkpoint).map_err(Error::Transition)?;
+                next.task.yield_ready().map_err(Error::Transition)?;
+            }
+            Step::DeferUndispatched => {
+                let registration = self.registered(&running.task)?;
+                if !registration.cancellable_durable_async
+                    || !staged.is_empty()
+                    || self.validator.is_some()
+                {
+                    return Err(Error::Registration);
+                }
+                let attempt = running.task.attempt_id().ok_or(Error::Ownership)?;
+                let prefix = if running.task.replay_safe() {
+                    "durable/replay-safe-async"
+                } else {
+                    "durable/unsafe-park-async"
+                };
+                undispatched_check = Some(durable_store::Check {
+                    key: format!("{prefix}/{}/{attempt}/intent", running.task.id()).into_bytes(),
+                    expected: durable_store::Expected::Missing,
+                });
                 next.task.yield_ready().map_err(Error::Transition)?;
             }
             Step::Wait {
@@ -6172,11 +6257,23 @@ impl Scheduler {
             Step::Succeed(value) => {
                 // Include children staged in this transaction, which are not
                 // present in the committed graph snapshot yet.
+                let records = self.ts().list()?;
                 if staged.iter().any(|(_, _, p)| !p.mutations.is_empty())
-                    || has_live_owned(owner.store(), next.task.id(), &self.ts().list()?)?
+                    || has_live_owned(owner.store(), next.task.id(), &records)?
                 {
                     next.task.hold_success(value).map_err(Error::Transition)?;
                 } else {
+                    if next.task.retains_task_children_on_success() {
+                        let (uncertain, _) = unsafe_descendant_reconciliation(
+                            owner.store(),
+                            next.task.id(),
+                            &records,
+                            success_graph_version,
+                        )?;
+                        if let Some(child) = uncertain {
+                            return self.finish_running_failure(&running, format!("unsafe descendant {child} requires reconciliation; success was not published"), &owner, _gate, nonblocking_abort, deferred);
+                        }
+                    }
                     next.task.succeed(value).map_err(Error::Transition)?;
                 }
             }
@@ -6382,6 +6479,9 @@ impl Scheduler {
         // Both use the captured version, so aborts and competing graph writers
         // fence the whole transaction, without a self-conflict.
         let mut graph = self.ts().prepare_save(&batch)?;
+        if let Some(check) = undispatched_check {
+            graph.checks.push(check);
+        }
         let mut staged_signal_checks = HashSet::new();
         for (_, _, prepared) in staged {
             for check in prepared.checks {
@@ -6741,6 +6841,7 @@ impl Scheduler {
         task_ancestors_available(self.owner().store(), task, tasks, |parent| {
             parent.abort_requested()
                 || parent.is_terminal()
+                || unsafe_checkpointable_ready(parent)
                 || matches!(parent.state(), TaskState::CompletingFailed(_))
                 || (parent.state() == &TaskState::Running
                     && !live_task_tool_parent(parent, &self.live_invocations))
@@ -7445,6 +7546,58 @@ fn has_unmarked_nested(parent: Uuid, tasks: &[task_store::StoredTask]) -> bool {
             && !child.task.is_terminal()
             && !child.task.abort_requested()
     })
+}
+
+// A held success was decided while descendants still ran. Never publish it if
+// any unsafe descendant ended without a resolved task outcome. The evidence
+// namespace is fenced alongside the graph commit, including absent intents.
+fn unsafe_descendant_reconciliation(
+    store: &durable_store::Store,
+    parent: Uuid,
+    tasks: &[task_store::StoredTask],
+    boundary: u64,
+) -> Result<(Option<Uuid>, Vec<durable_store::Check>), Error> {
+    let mut pending = vec![parent];
+    let mut seen = HashSet::new();
+    let mut checks = Vec::new();
+    let mut unresolved = None;
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            return Err(Error::Ownership);
+        }
+        for item in tasks
+            .iter()
+            .filter(|item| item.task.owner() == &TaskOwner::Task(id) && !item.task.is_background())
+        {
+            pending.push(item.task.id());
+            if item.task.replay_safe()
+                || !item
+                    .task
+                    .kind()
+                    .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."))
+                || !matches!(
+                    item.task.state(),
+                    TaskState::Failed(_) | TaskState::Cancelled
+                )
+            {
+                continue;
+            }
+            let prefix = format!("durable/unsafe-park-async/{}/", item.task.id()).into_bytes();
+            let has_intent = store
+                .list(&prefix)
+                .map_err(task_store::Error::from)?
+                .iter()
+                .any(|(key, _)| key.ends_with(b"/intent"));
+            checks.push(durable_store::Check {
+                key: prefix,
+                expected: durable_store::Expected::PrefixUnchangedSince(boundary),
+            });
+            if has_intent {
+                unresolved.get_or_insert(item.task.id());
+            }
+        }
+    }
+    Ok((unresolved, checks))
 }
 
 fn cancels_nested_on_completion(task: &Task) -> bool {

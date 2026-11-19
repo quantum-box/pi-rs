@@ -405,6 +405,19 @@ impl Task {
         Ok(())
     }
 
+    pub(crate) fn finalize_with_unsafe_reconciliation(
+        &mut self,
+        child: Uuid,
+    ) -> Result<(), TransitionError> {
+        if !matches!(self.state, TaskState::Completing(_)) {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Failed(format!(
+            "unsafe descendant {child} requires reconciliation; held success was not published"
+        ));
+        Ok(())
+    }
+
     pub fn fail(&mut self, reason: String) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Failed(reason);

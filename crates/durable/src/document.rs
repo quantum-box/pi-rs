@@ -2362,6 +2362,47 @@ impl DetachedTaskDocuments {
 }
 
 impl<'a> TaskDocuments<'a> {
+    /// Read unsafe child evidence together with a prefix fence for the
+    /// parent's eventual checked transition. Terminal state is checked by the
+    /// caller and its own child read remains part of the same transaction.
+    pub(crate) fn read_unsafe_child_evidence(
+        &mut self,
+        id: uuid::Uuid,
+    ) -> Result<(Vec<crate::async_task_tool::UnsafeDurableReceipt>, bool), String> {
+        if self.input_validator.is_some() {
+            return Err("unsafe child evidence requires a standalone scheduler".into());
+        }
+        let boundary = self.store.put_version().map_err(|e| e.to_string())?;
+        let prefix = format!("durable/unsafe-park-async/{id}/").into_bytes();
+        let has_intent = self
+            .store
+            .list(&prefix)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|(key, _)| key.ends_with(b"/intent"));
+        let receipts = crate::async_task_tool::unsafe_park_proof::read_receipts(self.store, id)?;
+        if receipts.len() > 1 {
+            return Err("unsafe child has conflicting terminal receipts".into());
+        }
+        if let Some(check) = self
+            .signals
+            .batch
+            .checks
+            .iter_mut()
+            .find(|check| check.key == prefix)
+        {
+            match &mut check.expected {
+                Expected::PrefixUnchangedSince(old) => *old = (*old).min(boundary),
+                _ => return Err("incompatible unsafe child evidence fence".into()),
+            }
+        } else {
+            self.signals.batch.checks.push(Check {
+                key: prefix,
+                expected: Expected::PrefixUnchangedSince(boundary),
+            });
+        }
+        Ok((receipts, has_intent))
+    }
     pub(crate) fn stage_unsafe_park_proof(
         &mut self,
         checkpoint: &crate::task::Checkpoint,
@@ -3957,6 +3998,70 @@ mod nested_entry_tests {
             tx.commit(&db),
             Err(Error::Store(durable_store::Error::Conflict { .. }))
         ));
+    }
+
+    #[test]
+    fn unsafe_child_evidence_read_fences_later_intent_or_receipt() {
+        for suffix in ["intent", "intent/receipt"] {
+            let db = Store::memory().unwrap();
+            let tasks = TaskStore::new(&db);
+            let parent = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+            let child = task(2, TaskOwner::Task(parent.id()));
+            tasks
+                .save(&[Save::Create(&parent), Save::Create(&child)])
+                .unwrap();
+            let mut docs = TaskDocuments::new(&db, &parent).unwrap();
+            docs.get_owned_child(child.id()).unwrap();
+            let (receipts, has_intent) = docs.read_unsafe_child_evidence(child.id()).unwrap();
+            assert!(receipts.is_empty() && !has_intent);
+            let key = format!(
+                "durable/unsafe-park-async/{}/{}/{}",
+                child.id(),
+                Uuid::new_v4(),
+                suffix
+            )
+            .into_bytes();
+            db.commit(
+                &[],
+                &[Mutation::Put {
+                    key,
+                    value: b"{}".to_vec(),
+                }],
+            )
+            .unwrap();
+            let mut tx = Transaction::new();
+            tx.append(docs.into_batch().unwrap()).unwrap();
+            assert!(matches!(
+                tx.commit(&db),
+                Err(Error::Store(durable_store::Error::Conflict { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn repeated_unsafe_child_evidence_reads_coalesce_fences() {
+        let db = Store::memory().unwrap();
+        let tasks = TaskStore::new(&db);
+        let parent = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        let child = task(2, TaskOwner::Task(parent.id()));
+        tasks
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        let mut docs = TaskDocuments::new(&db, &parent).unwrap();
+        docs.get_owned_child(child.id()).unwrap();
+        docs.read_unsafe_child_evidence(child.id()).unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: b"unrelated".to_vec(),
+                value: vec![1],
+            }],
+        )
+        .unwrap();
+        docs.read_unsafe_child_evidence(child.id()).unwrap();
+        let mut tx = Transaction::new();
+        tx.append(docs.into_batch().unwrap()).unwrap();
+        tx.commit(&db).unwrap();
     }
 
     #[test]

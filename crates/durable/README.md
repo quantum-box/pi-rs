@@ -643,8 +643,10 @@ Provide a stable implementation identity and increase the version when the
 implementation or checkpoint interpretation changes. A digest of the identity,
 tool specification and allowed child definitions determines the task kind, so
 a missing or changed registration blocks older tasks. Register the same child
-definitions after reopening. Only replay-safe task-backed child adapters are
-accepted; their successful JSON result must encode a `pi_rs_core::Outcome`.
+definitions after reopening. Children can be replay-safe task-backed adapters
+or explicitly registered unsafe checkpointable tools from the same host;
+arbitrary unsafe handlers are rejected. A child's successful JSON result must
+encode a `pi_rs_core::Outcome`.
 Use `start_replay_safe_root` on the host before transferring it to the driver;
 the root adapter must belong to that host. Raw arguments must be JSON objects.
 Normalization runs before schema validation, and normalized arguments are
@@ -731,10 +733,19 @@ the host is responsible for ensuring replay safety and joining its own work.
 Tool results and the combined normalized-arguments/checkpoint record are each
 limited to 64 KiB, and waits to 256
 distinct direct children. A durable tool cannot itself complete with `Pending`
-or `Unknown`; those values returned by an allowed generic child are exposed as
-uncertain child results. Signal waits, UI, progress, extension state, unsafe
-Tool attempts and conversation hooks are not
-supported by this path. After an `Any` wake, a successful tool remains
+or `Unknown`; those values returned by a child are exposed as uncertain child
+results. A failed unsafe child is conservatively reported as `Uncertain`,
+including its captured outcome when available; a cancelled unsafe child with
+a prior intent is also uncertain. This is evidence for reconciliation, not
+permission to replay the child. A checkpointable parent does not publish a
+successful outcome if an owned unsafe descendant has failed or been cancelled
+after an intent: the parent fails with a reconciliation message naming the
+descendant. This includes a success already held in `completing` before the
+descendant was interrupted. There is currently no in-band proof to clear that
+fence, even if a Tool observes and handles the uncertain result; reconcile the
+external effect separately. This conservative behavior is a pi-rs limitation.
+Signal waits, UI, progress, extension state,
+and conversation hooks are not supported by this path. After an `Any` wake, a successful tool remains
 `completing` until its remaining owned children finish; failure or abort still
 cancels those children. An abort during `completing` preserves the already
 decided successful parent outcome while cancelling the remaining work. Tasks
@@ -747,12 +758,17 @@ The generic `register_durable_tool` entry remains disabled.
 `StandaloneNoHooksHost::register_unsafe_durable_tool` separately opts an
 unsafe checkpointable Tool in with
 `UnsafeDurableAuthorization::interruption_requires_reconciliation()`;
-`start_unsafe_durable_root` admits its standalone root. This path accepts only
-replay-safe TaskTool children. Its implementation identity, version, Tool
+`start_unsafe_durable_root` admits its standalone root. This path accepts
+replay-safe TaskTool children and explicitly registered unsafe checkpointable
+children from the same host. Its implementation identity, version, Tool
 specification and allowed children form a separate registration identity.
 Restore exactly the same definitions when reopening. It is not a hook-enabled
-conversation ToolTask and does not permit unsafe children through the existing
-replay-safe registration.
+conversation ToolTask. A replay-safe parent and its unsafe child each retain
+their own replay policy; a parent's safe policy does not make the child safe.
+While an unsafe parent attempt is running, new dispatches below it wait until
+the parent has safely parked or reached a committed successful completing state.
+Already-running descendants remain fenced by the existing abort and failure
+publication rules.
 
 Each running attempt records a distinct dispatch intent. A returned Park, its
 checkpoint and prepared arguments, the owned child admission and wait, and a
