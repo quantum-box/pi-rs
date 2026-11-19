@@ -2676,6 +2676,16 @@ mod tests {
             }
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(scheduler);
+        let store = Store::open(dir.path().join("db")).unwrap();
+        assert!(matches!(
+            crate::async_task_tool::read_sealed_outcome_evidence(&store, child).unwrap(),
+            Some(crate::async_task_tool::SealedOutcomeEvidence::Uncertain(
+                Outcome::Unknown(_)
+            ))
+        ));
+        assert_eq!(load_intent(&store, child).unwrap(), intent);
+        assert_eq!(read_receipt(&store, &intent).unwrap(), None);
     }
     #[test]
     fn worker_pins_host_tool_identity_until_joined_receipt() {

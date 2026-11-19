@@ -735,7 +735,31 @@ identity and evidence. `read_restart_after_result` reads this receipt after
 failure; a parent's `child_result` continues to report the failed task. A
 checkpointed Tool outcome is never replaced by the synthetic restart-limit
 result. The host must ensure hooks finish cooperatively and have
-no detached work. Host interrupted and unavailable results remain unsupported.
+no detached work. Host interrupted results remain unsupported.
+
+`register_unavailable_tool_with_content_hooks` is a separate, explicitly
+attested placeholder for a named tool that the host knows is not offered for
+this task. The host supplies the exact stable hook selection and a placeholder
+identity; a selected extension that provides the named tool is rejected. The
+host must use a new definition if availability changes. This path does not
+resolve or execute a Tool, does not write a Tool intent, and runs neither
+argument preparation nor before hooks. It
+commits `tool_unavailable` before running after; hooks cannot suppress its
+error diagnostic or status or add structured output or attachments. After
+execution uses the ordinary attempt/ancestor-abort fenced memo and restart
+limit. This is not a fallback for a missing or changed registration, a Tool
+that disappears after dispatch, or an uncertain external operation; those
+remain blocked or require reconciliation.
+
+For terminal sealed unsafe Tool tasks, `read_sealed_outcome_evidence` checks
+the task, identity, dispatch intent, attempt and receipts under a read fence.
+It distinguishes no dispatch, an uncertain or pending outcome, a known raw
+outcome whose after did not finish, and a final outcome. It never authorizes
+replay. Unsafe interrupted after remains unsupported: its supplemental result
+would need a failure reservation bound to the sealed intent and checks that
+neither a raw result nor a final receipt was concurrently reconciled, without
+turning the unknown external outcome into a known Tool result.
+
 `read_replay_safe_after_evidence` exposes a committed raw Tool outcome, or a
 distinct host error, from the after checkpoint of a failed or cancelled
 replay-safe task. It is reconciliation evidence only: it is not a final hook

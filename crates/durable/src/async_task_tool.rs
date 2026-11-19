@@ -246,6 +246,61 @@ pub(crate) fn validate_restart_after_result(value: &serde_json::Value) -> Result
     replay_safe::validate_content_hook_result(&result, Some(&gate), false)
 }
 
+/// Evidence for a terminal sealed Tool task. Unknown and pending outcomes are
+/// unresolved; an incomplete after result is not a final hook result.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SealedOutcomeEvidence {
+    NotDispatched,
+    Uncertain(Outcome),
+    AfterIncomplete(Outcome),
+    Final(Outcome),
+}
+
+/// Read sealed dispatch and outcome evidence without authorizing another Tool call.
+/// The task, identity, intent, attempt and receipt are checked in one read fence.
+pub fn read_sealed_outcome_evidence(
+    store: &durable_store::Store,
+    task_id: uuid::Uuid,
+) -> Result<Option<SealedOutcomeEvidence>, String> {
+    for _ in 0..8 {
+        let Some(record) = crate::task_store::TaskStore::new(store)
+            .load(task_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        if !record.task.is_terminal() || record.task.replay_safe() || !record.task.is_task_tool() {
+            return Ok(None);
+        }
+        let (receipt, mut checks) =
+            crate::async_task_protocol::prepare_receipt_read(store, task_id)
+                .map_err(|e| e.to_string())?;
+        checks.push(durable_store::Check {
+            key: crate::task_store::key(task_id),
+            expected: durable_store::Expected::Version(record.version),
+        });
+        match store.commit(&checks, &[]) {
+            Ok(()) => {
+                return Ok(Some(match receipt {
+                    None => SealedOutcomeEvidence::NotDispatched,
+                    Some(crate::async_task_protocol::ReceiptRead::AfterIncomplete(outcome)) => {
+                        SealedOutcomeEvidence::AfterIncomplete(outcome)
+                    }
+                    Some(crate::async_task_protocol::ReceiptRead::Final(
+                        outcome @ (Outcome::Unknown(_) | Outcome::Pending { .. }),
+                    )) => SealedOutcomeEvidence::Uncertain(outcome),
+                    Some(crate::async_task_protocol::ReceiptRead::Final(outcome)) => {
+                        SealedOutcomeEvidence::Final(outcome)
+                    }
+                }));
+            }
+            Err(durable_store::Error::Conflict { .. }) => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("sealed outcome evidence changed during read".into())
+}
+
 /// Read the durable pre-after Tool outcome for reconciliation after shutdown.
 /// This is evidence only: it does not authorize dispatch or imply that the
 /// after hook completed, and must not be used as a finalized tool result.
@@ -311,6 +366,37 @@ pub trait DurableAsyncTool: Tool {
         resume: DurableToolResume,
         host: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String>;
+}
+
+/// The host attests that this named tool is unavailable for this task and that
+/// the supplied hook selection is the exact intended immutable selection.
+pub struct UnavailableAfterAuthorization(());
+impl UnavailableAfterAuthorization {
+    pub fn host_attests_unavailable_and_selection() -> Self {
+        Self(())
+    }
+}
+struct UnavailablePlaceholder(ToolSpec);
+#[async_trait::async_trait]
+impl Tool for UnavailablePlaceholder {
+    fn spec(&self) -> ToolSpec {
+        self.0.clone()
+    }
+    async fn invoke(&self, _: serde_json::Value, _: pi_rs_core::ToolContext) -> Outcome {
+        Outcome::Skipped("unavailable placeholder cannot execute".into())
+    }
+}
+#[async_trait::async_trait]
+impl DurableAsyncTool for UnavailablePlaceholder {
+    async fn execute_durable(
+        &self,
+        _: serde_json::Value,
+        _: pi_rs_core::ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        Err("unavailable placeholder cannot execute".into())
+    }
 }
 
 /// The host explicitly attests that its standalone task application does not
@@ -393,6 +479,7 @@ impl StandaloneNoHooksHost {
             version,
             children,
             None,
+            false,
             false,
             false,
             false,
@@ -658,6 +745,7 @@ impl StandaloneBeforeHookHost {
             false,
             false,
             false,
+            false,
         )
     }
     /// Register a stable ordered selection of replay-safe block-aware hooks.
@@ -741,6 +829,46 @@ impl StandaloneBeforeHookHost {
             true,
             abort_after,
             restart_after,
+            false,
+        )
+    }
+    /// Register an explicitly unavailable name and its exact selected hooks.
+    /// This never resolves or executes a Tool and must not replace an existing task definition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_unavailable_tool_with_content_hooks(
+        &mut self,
+        spec: ToolSpec,
+        placeholder_identity: &str,
+        version: u32,
+        snapshot: &crate::extension::Snapshot,
+        names: &[String],
+        _authorization: ReplaySafeAuthorization,
+        _unavailable: UnavailableAfterAuthorization,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        let selection = snapshot
+            .stable_selection(names)
+            .ok_or("extension selection is missing, duplicated, or unidentified")?;
+        let resolved = snapshot
+            .resolve_stable(names, &selection)
+            .ok_or("extension selection changed")?;
+        if resolved.tool(&spec.name).is_some() {
+            return Err("selected extension provides the supposedly unavailable tool".into());
+        }
+        let identity = format!(
+            "selection-v1:{}",
+            serde_json::to_string(&selection).map_err(|e| e.to_string())?
+        );
+        replay_safe::register(
+            &mut self.scheduler,
+            Arc::new(UnavailablePlaceholder(spec)),
+            placeholder_identity,
+            version,
+            vec![],
+            Some((identity, Arc::new(SelectedBeforeHooks(resolved)))),
+            true,
+            false,
+            false,
+            true,
         )
     }
     pub fn start_replay_safe_root(
@@ -796,7 +924,13 @@ impl crate::extension::Hook for SelectedBeforeHooks {
         let required = result.diagnostics.iter().find(|diagnostic| {
             matches!(
                 diagnostic.code.as_deref(),
-                Some("blocked" | "invalid_arguments" | "aborted" | "restart_limit")
+                Some(
+                    "blocked"
+                        | "invalid_arguments"
+                        | "aborted"
+                        | "restart_limit"
+                        | "tool_unavailable"
+                )
             )
         });
         let value = self
@@ -1374,6 +1508,18 @@ mod tests {
             }
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             let _ = driver.shutdown_with_pending().unwrap();
+            if mode != 1 {
+                let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+                let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+                let child = records
+                    .iter()
+                    .find(|r| r.task.owner() == &TaskOwner::Task(parent.id()))
+                    .unwrap();
+                assert_eq!(
+                    read_sealed_outcome_evidence(&store, child.task.id()).unwrap(),
+                    Some(SealedOutcomeEvidence::NotDispatched)
+                );
+            }
         }
     }
     #[test]
@@ -1868,6 +2014,9 @@ mod tests {
         let _ = driver.shutdown_with_pending().unwrap();
         let store = durable_store::Store::open(dir.path().join("db")).unwrap();
         assert!(
+            matches!(read_sealed_outcome_evidence(&store,child.task_id()).unwrap(),Some(SealedOutcomeEvidence::Final(Outcome::SucceededWithDetails {output,details})) if output=="rewritten" && details==json!({"important":42}))
+        );
+        assert!(
             matches!(crate::async_task_protocol::prepare_receipt_read(&store, child.task_id()).unwrap().0,
             Some(crate::async_task_protocol::ReceiptRead::Final(Outcome::SucceededWithDetails { output, details })) if output == "rewritten" && details == json!({"important":42}))
         );
@@ -1923,6 +2072,9 @@ mod tests {
         assert!(
             matches!(crate::async_task_protocol::prepare_receipt_read(&store, child.task_id()).unwrap().0,
             Some(crate::async_task_protocol::ReceiptRead::AfterIncomplete(Outcome::Structured { data, .. })) if data == json!({"done":true}))
+        );
+        assert!(
+            matches!(read_sealed_outcome_evidence(&store,child.task_id()).unwrap(),Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Structured {data,..})) if data==json!({"done":true}))
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("invocations"))
@@ -8739,6 +8891,461 @@ mod tests {
         assert!(read_restart_after_result(&store, id).unwrap().is_none());
         assert_eq!(
             std::fs::read_to_string(root.join("tool-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    struct UnavailableFixture {
+        root: std::path::PathBuf,
+        stage: usize,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for UnavailableFixture {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            std::fs::write(self.root.join("unexpected-before"), b"bad")
+                .map_err(|e| e.to_string())?;
+            Ok(crate::extension::BeforeTool::Pass)
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            if !input
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("tool_unavailable"))
+                || input.extra.get("isError") != Some(&json!(true))
+            {
+                return Err("missing unavailable error".into());
+            }
+            if self.stage == 1 {
+                let value = ctx
+                    .memo
+                    .get_or_insert("unavailable", json!("first"))
+                    .await?;
+                if value != json!("first") {
+                    return Err("memo changed".into());
+                }
+                if self.root.join("bad-unavailable").exists() {
+                    let mut out = input.clone();
+                    out.extra
+                        .insert("structuredOutput".into(), json!({"bad":true}));
+                    return Ok(Some(out));
+                }
+                if self.root.join("pause-unavailable").exists()
+                    && !self.root.join("unavailable-ready").exists()
+                {
+                    std::fs::write(self.root.join("unavailable-ready"), b"ready")
+                        .map_err(|e| e.to_string())?;
+                    std::future::pending::<()>().await;
+                }
+                let mut out = input.clone();
+                out.output = vec![
+                    json!({"type":"text","text":"unavailable"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                ];
+                out.extra.insert("details".into(), json!({"stage":1}));
+                Ok(Some(out))
+            } else {
+                if input.output.len() != 2
+                    || input.extra.get("details") != Some(&json!({"stage":1}))
+                    || ctx.memo.get("unavailable").await? != Some(json!("first"))
+                {
+                    return Err("previous result lost".into());
+                }
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.root.join("unavailable-second"))
+                    .map_err(|e| e.to_string())?;
+                writeln!(file, "called").map_err(|e| e.to_string())?;
+                file.sync_all().map_err(|e| e.to_string())?;
+                Ok(None)
+            }
+        }
+    }
+    fn unavailable_host(
+        root: &std::path::Path,
+        identity: &str,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        let mut registry = crate::extension::Registry::default();
+        for (name, stage) in [("first", 1), ("second", 2)] {
+            registry
+                .install_identified(
+                    crate::extension::Extension {
+                        name: name.into(),
+                        hooks: vec![Arc::new(UnavailableFixture {
+                            root: root.to_owned(),
+                            stage,
+                        })],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(
+                        1,
+                        format!("{identity}-{name}"),
+                        vec!["hook".into()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut host =
+            StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_unavailable_tool_with_content_hooks(
+                ToolSpec {
+                    name: "missing".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object","required":["required"]}),
+                },
+                "missing-placeholder-v1",
+                1,
+                &registry.snapshot(),
+                &["first".into(), "second".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                UnavailableAfterAuthorization::host_attests_unavailable_and_selection(),
+            )
+            .unwrap();
+        (host, tool)
+    }
+    #[test]
+    fn unavailable_after_kill_reopen_preserves_selection_memo_and_diagnostic() {
+        const ENV: &str = "PI_RS_UNAVAILABLE_AFTER_FIXTURE";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tool) = unavailable_host(&root, "v1");
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("pause-unavailable"), b"yes").unwrap();
+        let mut process=std::process::Command::new(std::env::current_exe().unwrap()).arg("--exact").arg("async_task_tool::tests::unavailable_after_kill_reopen_preserves_selection_memo_and_diagnostic").env(ENV,root).spawn().unwrap();
+        wait_file(&root.join("unavailable-ready"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = unavailable_host(root, "v2");
+        let driver = host.into_driver();
+        assert!(!driver.get(id).unwrap().unwrap().is_terminal());
+        assert!(!root.join("unavailable-second").exists());
+        let _ = driver.shutdown_with_pending().unwrap();
+        let (host, _) = unavailable_host(root, "v1");
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected {:?}", task.state())
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: result,
+        } = serde_json::from_value(value.clone()).unwrap()
+        else {
+            panic!("missing rich result")
+        };
+        assert_eq!(result.output.len(), 2);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("tool_unavailable"))
+        );
+        assert!(root.join("unavailable-second").exists());
+        assert!(!root.join("unexpected-before").exists());
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(
+            store
+                .list(format!("durable/replay-safe-async/{id}/").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        let (host, _) = unavailable_host(root, "v1");
+        let driver = host.into_driver();
+        assert_eq!(driver.get(id).unwrap().unwrap().state(), task.state());
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("unavailable-second"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn unavailable_after_rejects_unsupported_metadata_before_later_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("bad-unavailable"), b"yes").unwrap();
+        let (host, tool) = unavailable_host(root, "v1");
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert!(!root.join("unavailable-second").exists());
+        assert!(!root.join("unexpected-before").exists());
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(
+            matches!(read_replay_safe_after_evidence(&store,id).unwrap(),Some(ReplaySafeAfterEvidence::HostError {code,..}) if code=="tool_unavailable")
+        );
+    }
+    #[test]
+    fn unavailable_after_abort_fences_late_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (entered, rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (result, result_rx) = std::sync::mpsc::channel();
+        let mut registry = crate::extension::Registry::default();
+        registry
+            .install_identified(
+                crate::extension::Extension {
+                    name: "hook".into(),
+                    hooks: vec![Arc::new(AbortAfterHook {
+                        entered,
+                        release: std::sync::Mutex::new(release_rx),
+                        result,
+                    })],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(1, "hook-v1".into(), vec!["hook".into()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_unavailable_tool_with_content_hooks(
+                ToolSpec {
+                    name: "missing".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                },
+                "missing-v1",
+                1,
+                &registry.snapshot(),
+                &["hook".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                UnavailableAfterAuthorization::host_attests_unavailable_and_selection(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        driver.request_abort(id).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(
+            store
+                .get(format!("runtime/extension-memo/{id}/late-after").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(read_replay_safe_after_evidence(&store,id).unwrap(),Some(ReplaySafeAfterEvidence::HostError{code,..}) if code=="tool_unavailable")
+        );
+    }
+    #[test]
+    fn unavailable_after_restart_limit_retains_host_evidence() {
+        const ENV: &str = "PI_RS_UNAVAILABLE_LIMIT_FIXTURE";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tool) = unavailable_host(&root, "v1");
+            let id = host.start_replay_safe_root(&tool, json!({}), 1).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("pause-unavailable"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unavailable_after_restart_limit_retains_host_evidence")
+            .env(ENV, root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("unavailable-ready"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = unavailable_host(root, "v1");
+        let driver = host.into_driver();
+        assert!(
+            matches!(wait_terminal(&driver,id).state(),crate::task::TaskState::Failed(reason) if reason=="restart limit")
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert!(!root.join("unavailable-second").exists());
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(
+            matches!(read_replay_safe_after_evidence(&store,id).unwrap(),Some(ReplaySafeAfterEvidence::HostError{code,..}) if code=="tool_unavailable")
+        );
+    }
+    #[test]
+    fn unavailable_registration_rejects_selected_matching_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(TextTool);
+        let mut registry = crate::extension::Registry::default();
+        registry
+            .install_identified(
+                crate::extension::Extension {
+                    name: "hook".into(),
+                    tools: vec![tool.clone()],
+                    hooks: vec![Arc::new(NoopDurableHook)],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(1, "hook-v1".into(), vec!["hook".into()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        assert!(
+            host.register_unavailable_tool_with_content_hooks(
+                tool.spec(),
+                "missing-v1",
+                1,
+                &registry.snapshot(),
+                &["hook".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                UnavailableAfterAuthorization::host_attests_unavailable_and_selection()
+            )
+            .is_err()
+        );
+    }
+    struct UnsafeCrashFixture(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for UnsafeCrashFixture {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "unsafe-crash".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(self.0.join("unsafe-invocations"))
+                .unwrap();
+            writeln!(f, "run").unwrap();
+            f.sync_all().unwrap();
+            std::fs::write(self.0.join("unsafe-ready"), b"yes").unwrap();
+            std::future::pending().await
+        }
+    }
+    struct UnsafeAfterProbe(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for UnsafeAfterProbe {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            std::fs::write(self.0.join("unsafe-after"), b"called").map_err(|e| e.to_string())?;
+            Ok(Some(json!("pretend success")))
+        }
+    }
+    #[test]
+    fn unsafe_interrupted_after_stays_unknown_and_does_not_run_unfenced_hook() {
+        const ENV: &str = "PI_RS_UNSAFE_AFTER_FIXTURE";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.clone()));
+            let binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = after_fixture_host(
+                &root.join("db"),
+                tool,
+                Arc::new(UnsafeAfterProbe(root.clone())),
+            )
+            .into_scheduler_for_test();
+            let parent = before_parent();
+            scheduler.submit(&parent).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            wait_file(&root.join("unsafe-ready"));
+            let parent_task = driver.get(parent.id()).unwrap().unwrap();
+            let child: AsyncTaskCall =
+                serde_json::from_value(parent_task.checkpoint().data.clone()).unwrap();
+            std::fs::write(root.join("parent-id"), parent.id().to_string()).unwrap();
+            std::fs::write(root.join("child-id"), child.task_id().to_string()).unwrap();
+            loop {
+                std::hint::black_box((&driver, &binding));
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process=std::process::Command::new(std::env::current_exe().unwrap()).arg("--exact").arg("async_task_tool::tests::unsafe_interrupted_after_stays_unknown_and_does_not_run_unfenced_hook").env(ENV,root).spawn().unwrap();
+        wait_file(&root.join("child-id"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let child: Uuid = std::fs::read_to_string(root.join("child-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let parent: Uuid = std::fs::read_to_string(root.join("parent-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = after_fixture_host(
+            &root.join("db"),
+            tool,
+            Arc::new(UnsafeAfterProbe(root.to_owned())),
+        )
+        .into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, parent).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(matches!(
+            read_sealed_outcome_evidence(&store, child).unwrap(),
+            Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+        ));
+        assert!(!root.join("unsafe-after").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("unsafe-invocations"))
                 .unwrap()
                 .lines()
                 .count(),

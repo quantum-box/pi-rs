@@ -99,6 +99,7 @@ pub(super) fn register(
     block_results: bool,
     abort_after: bool,
     restart_after: bool,
+    unavailable: bool,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -111,6 +112,7 @@ pub(super) fn register(
         block_results,
         abort_after,
         restart_after,
+        unavailable,
     )
 }
 
@@ -132,6 +134,7 @@ pub(super) fn register_unsafe(
         false,
         false,
         false,
+        false,
     )
 }
 
@@ -147,7 +150,11 @@ fn register_with_policy(
     block_results: bool,
     abort_after: bool,
     restart_after: bool,
+    unavailable: bool,
 ) -> Result<Arc<TaskTool>, String> {
+    if unavailable && (!block_results || abort_after || restart_after || !children.is_empty()) {
+        return Err("invalid unavailable registration".into());
+    }
     if (abort_after || restart_after) && !block_results {
         return Err("abort hooks require content hooks".into());
     }
@@ -178,7 +185,9 @@ fn register_with_policy(
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
     let encoded = serde_json::to_vec(&(
-        if restart_after {
+        if unavailable {
+            7u32
+        } else if restart_after {
             6u32
         } else if abort_after {
             5u32
@@ -210,6 +219,7 @@ fn register_with_policy(
         hook: hook.map(|(_, hook)| hook),
         replay_safe,
         block_results,
+        unavailable,
     });
     scheduler.install_checkpointable_async_handler(
         kind.clone(),
@@ -264,8 +274,10 @@ pub(super) fn after_checkpoint_evidence(
     }
     match checkpoint.host_error {
         Some(code)
-            if matches!(code.as_str(), "blocked" | "invalid_arguments")
-                && matches!(outcome, Outcome::Failed(_)) =>
+            if matches!(
+                code.as_str(),
+                "blocked" | "invalid_arguments" | "tool_unavailable"
+            ) && matches!(outcome, Outcome::Failed(_)) =>
         {
             Ok(super::ReplaySafeAfterEvidence::HostError { code, outcome })
         }
@@ -418,9 +430,11 @@ pub(super) fn validate_content_hook_result(
     if let Some(gate) = required
         && (result.extra.get("isError") != Some(&serde_json::Value::Bool(true))
             || !result.diagnostics.contains(gate)
-            || (matches!(gate.code.as_deref(), Some("aborted" | "restart_limit"))
-                && (result.extra.contains_key("structuredOutput")
-                    || result.extra.contains_key("attachments"))))
+            || (matches!(
+                gate.code.as_deref(),
+                Some("aborted" | "restart_limit" | "tool_unavailable")
+            ) && (result.extra.contains_key("structuredOutput")
+                || result.extra.contains_key("attachments"))))
     {
         return Err("host error metadata cannot be suppressed".into());
     }
@@ -453,6 +467,7 @@ struct Executor {
     hook: Option<Arc<dyn crate::extension::Hook>>,
     replay_safe: bool,
     block_results: bool,
+    unavailable: bool,
 }
 
 struct Host<'a, 'b> {
@@ -578,7 +593,7 @@ impl Executor {
         reason: &str,
     ) -> Result<Step, String> {
         self.bounded_hook_arguments(&args)?;
-        if !matches!(code, "blocked" | "invalid_arguments") {
+        if !matches!(code, "blocked" | "invalid_arguments" | "tool_unavailable") {
             return Err("unsupported host result".into());
         }
         // Bound bytes, not characters: diagnostic validation has a 4 KiB
@@ -588,10 +603,10 @@ impl Executor {
             end -= 1;
         }
         let reason = &reason[..end];
-        let message = if code == "blocked" {
-            format!("Tool call blocked: {reason}")
-        } else {
-            format!("Invalid tool arguments: {reason}")
+        let message = match code {
+            "blocked" => format!("Tool call blocked: {reason}"),
+            "tool_unavailable" => format!("Tool {reason} is not available"),
+            _ => format!("Invalid tool arguments: {reason}"),
         };
         let data = serde_json::to_value(HookCheckpoint {
             version: 1,
@@ -626,6 +641,13 @@ impl Executor {
         cancel: &pi_rs_core::CancellationToken,
     ) -> Result<Step, String> {
         admission.replay_safe_durable_check(cancel)?;
+        if self.unavailable {
+            return self.host_result_checkpoint(
+                task.input().clone(),
+                "tool_unavailable",
+                &self.identity.spec.name,
+            );
+        }
         let memo = HookMemo {
             admission,
             cancellation: cancel,
@@ -839,14 +861,15 @@ impl Executor {
             return Err("invalid after checkpoint version".into());
         }
         self.bounded_hook_arguments(&stored.arguments)?;
+        if self.unavailable != (stored.host_error.as_deref() == Some("tool_unavailable")) {
+            return Err("unavailable checkpoint identity mismatch".into());
+        }
         if stored.host_error.is_none() {
             self.validate_hook_arguments(&stored.arguments)?;
         }
-        if stored
-            .host_error
-            .as_deref()
-            .is_some_and(|code| !matches!(code, "blocked" | "invalid_arguments"))
-        {
+        if stored.host_error.as_deref().is_some_and(|code| {
+            !matches!(code, "blocked" | "invalid_arguments" | "tool_unavailable")
+        }) {
             return Err("invalid host result code".into());
         }
         let outcome = stored.outcome.ok_or("missing completed outcome")?;
