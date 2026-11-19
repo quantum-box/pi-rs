@@ -2842,6 +2842,9 @@ impl AdmissionHandle<'_> {
             .insert(self.lease.id, original);
         denied && missing
     }
+    pub(crate) fn is_conversation_checkpointable(&self) -> bool {
+        !self.standalone
+    }
     pub(crate) fn checkpointable_durable_intent(
         &self,
         test_namespace: bool,

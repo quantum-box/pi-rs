@@ -30758,6 +30758,179 @@ mod scheduler_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn checkpointable_conflict_retry_without_restart_keeps_prepare_failure_uncertain() {
+        use crate::async_task_tool::{
+            DurableAsyncTool, DurableTaskHost, DurableToolResume, DurableToolStep,
+            ReplaySafeAuthorization, register_conversation_replay_safe_durable_tool,
+        };
+        use crate::task_scheduler::Registry;
+        struct Tool {
+            prepares: Arc<AtomicUsize>,
+            executions: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl pi_rs_core::Tool for Tool {
+            fn spec(&self) -> pi_rs_core::ToolSpec {
+                pi_rs_core::ToolSpec {
+                    name: "job".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            async fn prepare_arguments(
+                &self,
+                _: serde_json::Value,
+            ) -> pi_rs_core::ExtensionResult<serde_json::Value> {
+                if self.prepares.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(serde_json::json!({}))
+                } else {
+                    Err("second preparation failed".into())
+                }
+            }
+            async fn invoke(
+                &self,
+                _: serde_json::Value,
+                _: pi_rs_core::ToolContext,
+            ) -> pi_rs_core::Outcome {
+                unreachable!()
+            }
+        }
+        #[async_trait::async_trait]
+        impl DurableAsyncTool for Tool {
+            async fn execute_durable(
+                &self,
+                _: serde_json::Value,
+                _: pi_rs_core::ToolContext,
+                _: DurableToolResume,
+                _: &dyn DurableTaskHost,
+            ) -> Result<DurableToolStep, String> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok(DurableToolStep::Complete(pi_rs_core::Outcome::Succeeded(
+                    "first effect".into(),
+                )))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let prepares = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        let adapter = register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            Arc::new(Tool {
+                prepares: prepares.clone(),
+                executions: executions.clone(),
+            }),
+            "conflict",
+            1,
+            vec![],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap();
+        let mut opts = options(model);
+        opts.tools = vec![adapter.register()];
+        let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let op = Uuid::new_v4();
+        let tool_attempt = ToolAttempt {
+            operation_id: op,
+            attempt_id: Uuid::new_v4(),
+        };
+        let args = serde_json::json!({});
+        let identity = adapter.identity().unwrap();
+        let task = adapter.task(id, op, args.clone(), 5).unwrap();
+        let binding = CheckpointableRootBinding {
+            version: 1,
+            conversation: id,
+            tool_attempt,
+            task: op,
+            identity: identity.clone(),
+            arguments: args.clone(),
+        };
+        let key = checkpointable_root_binding_key(op);
+        let evidence = crate::task_store::OwnedBatch {
+            checks: vec![Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            }],
+            mutations: vec![Mutation::Put {
+                key,
+                value: serde_json::to_vec(&binding).unwrap(),
+            }],
+        };
+        c.tool_attempt = Some(tool_attempt);
+        c.phase = Phase::TaskPending {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id: op,
+            arguments: args.clone(),
+            task: op,
+            identity: Some(identity.clone()),
+        };
+        h.save_composed_locked(
+            &c,
+            Expected::Version(version),
+            None,
+            &[task],
+            &[],
+            Some(&evidence),
+        )
+        .unwrap();
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        let changed = Arc::new(AtomicUsize::new(0));
+        let hook_changed = changed.clone();
+        scheduler.set_result_commit_hook(Arc::new(move |_, store| {
+            if hook_changed.fetch_add(1, Ordering::SeqCst) == 0 {
+                let key = format!("durable/replay-safe-async/{op}/conflict").into_bytes();
+                store
+                    .commit(
+                        &[],
+                        &[Mutation::Put {
+                            key,
+                            value: vec![1],
+                        }],
+                    )
+                    .unwrap();
+            }
+        }));
+        let driver = crate::task_driver::Driver::start_with_harness(scheduler, h.worker());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let task = crate::task_store::TaskStore::new(h.owner.store())
+                    .load(op)
+                    .unwrap()
+                    .unwrap();
+                if matches!(task.task.state(), crate::task::TaskState::Failed(_)) {
+                    assert_eq!(task.task.restarts(), 0);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(prepares.load(Ordering::SeqCst), 2);
+        let (outcome, _) = h
+            .task_tool_result(id, op, op, &args, &identity)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, pi_rs_core::Outcome::Unknown(_)));
+        let _ = driver.shutdown_with_pending();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn checkpointable_driver_rejects_intent_and_park_commit_races() {
         use crate::async_task_tool::{
             DurableAsyncTool, DurableTaskHost, DurableToolResume, DurableToolStep, DurableWait,

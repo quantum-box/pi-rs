@@ -1625,6 +1625,16 @@ impl Handler for Executor {
             }
             _ => return Err("invalid durable checkpoint or wake".into()),
         };
+        let fresh_unhooked = if admission.is_conversation_checkpointable()
+            && saved_args.is_none()
+            && task.restarts() == 0
+            && self.replay_safe
+            && self.hook.is_none()
+        {
+            docs.prove_first_checkpointable_intent(&intent)?
+        } else {
+            false
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1641,7 +1651,11 @@ impl Handler for Executor {
                 None => tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => return Err("argument preparation cancelled".into()),
-                    prepared = self.tool.prepare_arguments(task.input().clone()) => prepared.map_err(|e| e.to_string())?,
+                    prepared = self.tool.prepare_arguments(task.input().clone()) => match prepared {
+                        Ok(args) => args,
+                        Err(_) if fresh_unhooked && !cancellation.is_cancelled() => return Ok((DurableToolStep::Complete(Outcome::Failed("argument preparation failed".into())), serde_json::Value::Null)),
+                        Err(error) => return Err(error.to_string()),
+                    },
                 },
             };
             if cancellation.is_cancelled() { return Err("tool execution cancelled".into()); }
@@ -1650,6 +1664,9 @@ impl Handler for Executor {
                 || !jsonschema::validator_for(&self.tool.spec().parameters)
                     .is_ok_and(|v| v.is_valid(&args))
             {
+                if fresh_unhooked {
+                    return Ok((DurableToolStep::Complete(Outcome::Failed("normalized arguments do not match schema".into())), serde_json::Value::Null));
+                }
                 return Err("normalized arguments do not match schema".into());
             }
             let result = self

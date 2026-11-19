@@ -4,6 +4,7 @@ use pi_rs_core::{
     Error, Message, Model, ModelEvent, ModelRequest, ModelStream, Outcome, Tool, ToolCall,
     ToolContext, ToolSpec,
 };
+use pi_rs_durable::task::TaskState;
 use pi_rs_durable::{
     async_task_tool::{
         AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
@@ -397,6 +398,419 @@ async fn invalid_arguments_return_failed_tool_result_without_task_execution() {
                 .unwrap()
                 .is_empty()
         );
+        driver.shutdown().unwrap();
+    }
+}
+
+struct InvalidPreparedTool(Arc<std::sync::atomic::AtomicUsize>, bool);
+#[async_trait]
+impl Tool for InvalidPreparedTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "root".into(),
+            description: "".into(),
+            parameters: json!({"type":"object","required":["required"]}),
+        }
+    }
+    async fn prepare_arguments(&self, _: Value) -> pi_rs_core::ExtensionResult<Value> {
+        if self.1 {
+            Err("private preparation details".into())
+        } else {
+            Ok(json!({"wrong":true}))
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for InvalidPreparedTool {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(DurableToolStep::Complete(Outcome::Succeeded(
+            "must not execute".into(),
+        )))
+    }
+}
+fn invalid_prepared_setup(
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    fail: bool,
+) -> (Options, Registry) {
+    let mut registry = Registry::default();
+    let adapter = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(InvalidPreparedTool(count, fail)),
+        "invalid-prepared",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    (
+        Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: vec![adapter.register()],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+    )
+}
+#[tokio::test]
+async fn invalid_prepared_arguments_fail_without_tool_execution_and_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (options, registry) = invalid_prepared_setup(count.clone(), false);
+    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10),async { loop { let c=scheduler.conversation(id).unwrap(); if let Some(pos)=c.messages.iter().position(|m| matches!(m,Message::Tool {content,..} if content.contains("normalized arguments do not match schema"))) && c.messages[pos+1..].iter().any(|m| matches!(m,Message::Assistant {..})) { break; } tokio::time::sleep(Duration::from_millis(10)).await; } }).await.unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+    let (options, registry) = invalid_prepared_setup(count.clone(), false);
+    let scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    assert!(scheduler.conversation(id).unwrap().messages.iter().any(|m| matches!(m,Message::Tool {content,..} if content.contains("normalized arguments do not match schema"))));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+}
+
+struct ValidatingRoot(Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait]
+impl Tool for ValidatingRoot {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "root".into(),
+            description: "".into(),
+            parameters: json!({"type":"object","required":["required"]}),
+        }
+    }
+    async fn prepare_arguments(&self, _: Value) -> pi_rs_core::ExtensionResult<Value> {
+        Ok(json!({"required":true}))
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for ValidatingRoot {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        resume: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if resume.checkpoint.is_some() {
+            return Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "unexpected".into(),
+            )));
+        }
+        let child = host.start_child("leaf", "leaf", json!({})).await?;
+        Ok(DurableToolStep::Park {
+            checkpoint: serde_json::to_value(&child).unwrap(),
+            wait: DurableWait::All(vec![child]),
+        })
+    }
+}
+#[tokio::test]
+async fn malformed_resumed_arguments_do_not_run_tool_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut registry = Registry::default();
+    let leaf = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(AsyncTool {
+            name: "leaf",
+            child: None,
+            early: false,
+            gate: Some(gate.clone()),
+        }),
+        "leaf",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let root = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(ValidatingRoot(count.clone())),
+        "valid-root",
+        1,
+        vec![leaf.clone()],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![root.register(), leaf.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !gate.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let root=tasks.iter().find(|t| matches!(t.task.owner(),pi_rs_durable::task::TaskOwner::Conversation(owner) if *owner==id)).unwrap();
+    assert!(matches!(root.task.state(), TaskState::Waiting(_)));
+    let root_id = root.task.id();
+    let mut value = serde_json::to_value(&root.task).unwrap();
+    value["checkpoint"]["data"]["arguments"] = json!({});
+    let mut key = b"durable/task/".to_vec();
+    key.extend_from_slice(root_id.as_bytes());
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Version(root.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+    gate.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let task = pi_rs_durable::task_store::TaskStore::new(&store)
+                .load(root_id)
+                .unwrap()
+                .unwrap();
+            if matches!(task.task.state(), TaskState::Failed(_)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn prepare_error_is_known_failure_without_execution_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (options, registry) = invalid_prepared_setup(count.clone(), true);
+    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10),async { loop { let c=scheduler.conversation(id).unwrap(); if let Some(pos)=c.messages.iter().position(|m| matches!(m,Message::Tool {content,..} if content.contains("argument preparation failed"))) && c.messages[pos+1..].iter().any(|m| matches!(m,Message::Assistant {..})) { break; } tokio::time::sleep(Duration::from_millis(10)).await; } }).await.unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+    let (options, registry) = invalid_prepared_setup(count.clone(), true);
+    let scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let c = scheduler.conversation(id).unwrap();
+    assert!(c.messages.iter().any(|m| matches!(m,Message::Tool {content,..} if content.contains("argument preparation failed") && !content.contains("private preparation details"))));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+struct CrashThenInvalid {
+    directory: std::path::PathBuf,
+    fail: bool,
+}
+#[cfg(unix)]
+#[async_trait]
+impl Tool for CrashThenInvalid {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "root".into(),
+            description: "".into(),
+            parameters: json!({"type":"object","required":["valid"]}),
+        }
+    }
+    async fn prepare_arguments(&self, _: Value) -> pi_rs_core::ExtensionResult<Value> {
+        if self.directory.join("executed").exists() {
+            if self.fail {
+                Err("retry preparation error".into())
+            } else {
+                Ok(json!({"invalid":true}))
+            }
+        } else {
+            Ok(json!({"valid":true}))
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[cfg(unix)]
+#[async_trait]
+impl DurableAsyncTool for CrashThenInvalid {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        std::fs::write(self.directory.join("executed"), "started").unwrap();
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+#[cfg(unix)]
+fn crash_then_invalid_setup(directory: &std::path::Path, fail: bool) -> (Options, Registry) {
+    let mut registry = Registry::default();
+    let root = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(CrashThenInvalid {
+            directory: directory.to_owned(),
+            fail,
+        }),
+        "crash-then-invalid",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    (
+        Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: vec![root.register()],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+    )
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn crash_then_invalid_prepare_worker() {
+    let Some(path) = std::env::var_os("PI_CONV_PREPARE_CRASH_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(path);
+    let fail = std::env::var_os("PI_CONV_PREPARE_CRASH_ERROR").is_some();
+    let (options, registry) = crash_then_invalid_setup(&dir, fail);
+    let mut scheduler = Scheduler::open(dir.join("db"), options).unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(dir.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn crash_after_execution_then_prepare_failure_remains_uncertain() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for fail in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "crash_then_invalid_prepare_worker"])
+            .env("PI_CONV_PREPARE_CRASH_DIR", dir.path());
+        if fail {
+            cmd.env("PI_CONV_PREPARE_CRASH_ERROR", "1");
+        }
+        let mut process = Kill(cmd.spawn().unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !dir.path().join("executed").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        let id: uuid::Uuid = std::fs::read_to_string(dir.path().join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (options, registry) = crash_then_invalid_setup(dir.path(), fail);
+        let scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((_, reason)) = scheduler.blocked(id).unwrap()
+                    && !reason.starts_with("pending task:")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let c = scheduler.conversation(id).unwrap();
+        assert!(
+            !c.messages.iter().any(|m| matches!(m, Message::Tool { .. })),
+            "previous external effect must not be reported as a known failure"
+        );
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        assert!(matches!(tasks[0].task.state(), TaskState::Failed(_)));
         driver.shutdown().unwrap();
     }
 }

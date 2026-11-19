@@ -2430,6 +2430,34 @@ impl<'a> TaskDocuments<'a> {
     ) -> Result<pi_rs_core::Outcome, String> {
         crate::async_task_tool::unsafe_park_proof::read_hook_final(self.store, task, raw)
     }
+
+    /// Prove there was no earlier checkpointable intent for this task. The
+    /// prefix fence must accompany any known pre-dispatch failure settlement.
+    pub(crate) fn prove_first_checkpointable_intent(
+        &mut self,
+        intent_key: &[u8],
+    ) -> Result<bool, String> {
+        let boundary = self.store.put_version().map_err(|e| e.to_string())?;
+        let prefix = format!("durable/replay-safe-async/{}/", self.task.id()).into_bytes();
+        let entries = self.store.list(&prefix).map_err(|e| e.to_string())?;
+        if entries.len() != 1 || entries[0].0 != intent_key {
+            return Ok(false);
+        }
+        let intent: crate::task::Task =
+            serde_json::from_slice(&entries[0].1.value).map_err(|e| e.to_string())?;
+        if intent != self.task {
+            return Err("intent does not match task attempt".into());
+        }
+        self.signals.batch.checks.push(Check {
+            key: intent_key.to_vec(),
+            expected: Expected::Version(entries[0].1.version),
+        });
+        self.signals.batch.checks.push(Check {
+            key: prefix,
+            expected: Expected::PrefixUnchangedSince(boundary),
+        });
+        Ok(true)
+    }
     pub(crate) fn stage_unsafe_park_proof(
         &mut self,
         checkpoint: &crate::task::Checkpoint,
@@ -4025,6 +4053,65 @@ mod nested_entry_tests {
             tx.commit(&db),
             Err(Error::Store(durable_store::Error::Conflict { .. }))
         ));
+    }
+
+    #[test]
+    fn first_checkpointable_intent_proof_fences_late_and_deleted_prior_intents() {
+        let db = Store::memory().unwrap();
+        let task = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        let current = format!(
+            "durable/replay-safe-async/{}/{}/intent",
+            task.id(),
+            Uuid::new_v4()
+        )
+        .into_bytes();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: current.clone(),
+                value: serde_json::to_vec(&task).unwrap(),
+            }],
+        )
+        .unwrap();
+        let mut docs = TaskDocuments::new(&db, &task).unwrap();
+        assert!(docs.prove_first_checkpointable_intent(&current).unwrap());
+        let prior = format!(
+            "durable/replay-safe-async/{}/{}/intent",
+            task.id(),
+            Uuid::new_v4()
+        )
+        .into_bytes();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: prior.clone(),
+                value: serde_json::to_vec(&task).unwrap(),
+            }],
+        )
+        .unwrap();
+        db.commit(&[], &[Mutation::Delete { key: prior }]).unwrap();
+        let mut tx = Transaction::new();
+        tx.append(docs.into_batch().unwrap()).unwrap();
+        assert!(matches!(
+            tx.commit(&db),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        let prior = format!(
+            "durable/replay-safe-async/{}/{}/intent",
+            task.id(),
+            Uuid::new_v4()
+        )
+        .into_bytes();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: prior,
+                value: serde_json::to_vec(&task).unwrap(),
+            }],
+        )
+        .unwrap();
+        let mut docs = TaskDocuments::new(&db, &task).unwrap();
+        assert!(!docs.prove_first_checkpointable_intent(&current).unwrap());
     }
 
     #[test]
