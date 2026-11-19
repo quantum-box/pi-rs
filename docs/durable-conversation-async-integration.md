@@ -37,3 +37,25 @@ All and Any must preserve child identity and results through reopen; Any cannot 
 Use the real conversation Harness and driver with network-isolated tests: public root admission, two nested parks and result propagation, All/Any, prepare exactly once across wake, before/after ordering and durable memo replay. Kill/reopen at intent, raw receipt and park commit boundaries; exercise abort and cancellation in each phase, sibling waits, graph/evidence races and unknown outcomes. Test missing/foreign identity, changed extension registrations or ordering, stale generations, conflicting writers and old-format upgrades. Require checked atomic commits and explicit reconciliation wherever evidence is insufficient. The current tests exercise selected before/after hooks, two park levels, retained children, abort, selection and memo fences, and kill/reopen. External-job cancellation, multiple selected hooks and the remaining race and upgrade cases above are not implemented.
 
 The test `restart_after_waits_for_owned_child_abort_cleanup` gates its fast sibling until the grandchild has entered execution; this stabilizes its cleanup-order scenario. It does not establish liveness when Any wakes before the slow child admits its descendant.
+
+## Synchronous task settlement under contention
+
+A synchronous `Scheduler::tick` retains the completed invocation, its exclusive
+lease and any prepared candidate when a checked settlement cannot start because
+another SQLite writer holds the lock. It returns `Error::Busy`; the host must
+call `tick` again after contention or a relevant ownership change. Each retry
+rechecks the task, attempt, abort and ownership/evidence fences before committing.
+Other synchronous ticks cannot reserve independent work while that lease remains
+pending; the concurrent driver is available when independent progress is needed.
+The retained outcome is in memory: after process loss, existing durable evidence
+and unsafe interruption reconciliation still govern recovery.
+
+A caller using `settle_invocation` directly owns any `Pending` or
+`PendingPrepared` result and must use `try_resume_pending` (and, when required,
+checked cleanup) rather than rerunning the handler. `take_serial_pending` can
+transfer an outcome retained by `tick`. It does not make an indeterminate commit
+safe to retry: storage errors after a transaction starts remain fail-closed and
+require reconciliation, including when an unsafe Tool may have external effects.
+A pending synchronous outcome is transferred to the concurrent driver when the
+scheduler is handed to it. An indeterminate retained outcome stops that driver
+and remains available for reconciliation instead of being retried.

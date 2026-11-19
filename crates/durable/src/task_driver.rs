@@ -150,9 +150,10 @@ impl Driver {
         Self::start_inner(scheduler, Some(harness))
     }
     fn start_inner(
-        scheduler: task_scheduler::Scheduler,
+        mut scheduler: task_scheduler::Scheduler,
         harness: Option<crate::runtime::Harness>,
     ) -> Self {
+        let (serial_pending, serial_pending_failed) = scheduler.take_serial_pending_for_driver();
         let owner = scheduler.owner();
         let activity = scheduler.worker_activity();
         let wake_reader = scheduler.wake_reader();
@@ -175,7 +176,7 @@ impl Driver {
                 definitions,
                 ..State::default()
             }),
-            pending: Mutex::new(Vec::new()),
+            pending: Mutex::new(serial_pending.into_iter().collect()),
             wake: Condvar::new(),
             harness: harness.map(Mutex::new),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -183,6 +184,10 @@ impl Driver {
             notifications: Mutex::new(Some(notify_tx)),
             subscription: Mutex::new(Some(notify_rx)),
         });
+        if serial_pending_failed {
+            shared
+                .stop_for_failure("indeterminate serial settlement requires reconciliation".into());
+        }
         if let Some(harness) = &shared.harness {
             let bound = harness.lock().map_err(|_| ()).and_then(|harness| {
                 harness

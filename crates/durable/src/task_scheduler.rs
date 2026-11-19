@@ -5499,6 +5499,9 @@ pub struct Scheduler {
     // Interrupted invocations held until pending fail-fast marks have landed.
     deferred_recovery: HashSet<Uuid>,
     unbound_cancel_roots: HashSet<Uuid>,
+    // Synchronous tick cannot transfer a pending invocation in its return type.
+    serial_pending: Option<PendingSettlement>,
+    serial_pending_failed: bool,
     #[cfg(test)]
     result_commit_hook: Option<CommitHook>,
     #[cfg(test)]
@@ -5605,8 +5608,27 @@ impl Scheduler {
     /// settlement are serialized by the same fence.
     pub fn settle_invocation(
         &mut self,
-        completed: CompletedInvocation,
+        mut completed: CompletedInvocation,
     ) -> Result<bool, SettlementError> {
+        if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+            || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+        {
+            return Err(SettlementError::Rejected {
+                error: Error::Ownership,
+                completed: Box::new(completed),
+            });
+        }
+        if let Err(error) = completed.capture_marked_receipt() {
+            if error.pre_transaction_busy() {
+                return Err(SettlementError::Pending {
+                    completed: Box::new(completed),
+                });
+            }
+            return Err(SettlementError::Rejected {
+                error: Error::Handler(format!("uncertain receipt capture: {error}")),
+                completed: Box::new(completed),
+            });
+        }
         let multiple = match self.live_invocations.lock() {
             Ok(state) => state.attempts.len() > 1,
             Err(_) => {
@@ -5749,14 +5771,9 @@ impl Scheduler {
                 .task
                 .kind()
                 .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken."));
-        let mut backup = if nonblocking_abort
-            || completed.running.task.holds_interrupted_cleanup()
-            || woken_abort
-        {
-            Some((completed.running.clone(), completed.result.clone()))
-        } else {
-            None
-        };
+        // The original invocation remains available if BEGIN IMMEDIATE fails
+        // before any settlement transaction starts, including serial calls.
+        let mut backup = Some((completed.running.clone(), completed.result.clone()));
         let CompletedInvocation {
             running,
             result,
@@ -7586,6 +7603,8 @@ impl Scheduler {
             failed_migrations: HashMap::new(),
             deferred_recovery: HashSet::new(),
             unbound_cancel_roots: HashSet::new(),
+            serial_pending: None,
+            serial_pending_failed: false,
             #[cfg(test)]
             result_commit_hook: None,
             #[cfg(test)]
@@ -8575,11 +8594,17 @@ impl Scheduler {
     }
 
     /// Reevaluate waits, then run one ready task. Returns whether progress occurred.
-    /// Errors after reservation poison this instance, including handler errors.
-    /// Checked-document conflicts are recovered without returning an error.
+    /// A pre-transaction busy result is retained with its lease and returns
+    /// `Error::Busy`; call `tick` again to revalidate and resume it.
+    /// An indeterminate error remains fail closed and is never retried.
     pub fn tick(&mut self, now_millis: i64) -> Result<bool, Error> {
-        // A synchronous tick cannot transfer a blocked outcome to its caller.
-        // Do not start one while detached invocations still own their attempts.
+        if self.serial_pending_failed {
+            return Err(Error::Poisoned);
+        }
+        if let Some(pending) = self.serial_pending.take() {
+            let result = self.try_resume_pending(pending);
+            return self.finish_serial_tick(result);
+        }
         if self.has_live_invocations()? {
             return Err(Error::Busy);
         }
@@ -8600,25 +8625,77 @@ impl Scheduler {
             TickReservation::Maintenance(_) => {
                 unreachable!("serial reservation does not defer maintenance")
             }
-            TickReservation::Invocation(invocation) => self
-                .settle_invocation(invocation.execute()?)
-                .map_err(|failure| match failure {
-                    SettlementError::Rejected { error, .. }
-                    | SettlementError::Handler(error)
-                    | SettlementError::Indeterminate(error) => error,
-                    SettlementError::Pending { .. }
-                    | SettlementError::PendingPrepared { .. }
-                    | SettlementError::RejectedPrepared { .. }
-                    | SettlementError::IndeterminatePrepared { .. }
-                    | SettlementError::IndeterminateOwned { .. } => {
-                        unreachable!("serial settlement does not return pending")
-                    }
-                    #[cfg(test)]
-                    SettlementError::Yielded { .. } => {
-                        unreachable!("test yield is not enabled for serial tick")
-                    }
-                }),
+            TickReservation::Invocation(invocation) => {
+                let completed = invocation.execute()?;
+                let result = self.settle_invocation(completed);
+                self.finish_serial_tick(result)
+            }
         }
+    }
+
+    fn finish_serial_tick(&mut self, result: Result<bool, SettlementError>) -> Result<bool, Error> {
+        let pending = match result {
+            Ok(progress) => return Ok(progress),
+            Err(SettlementError::Pending { completed }) => {
+                PendingSettlement::Unprepared(*completed)
+            }
+            Err(SettlementError::PendingPrepared { pending }) => *pending,
+            Err(SettlementError::Rejected { error, completed })
+                if matches!(error, Error::Busy) || pre_transaction_busy(&error) =>
+            {
+                PendingSettlement::Unprepared(*completed)
+            }
+            Err(SettlementError::RejectedPrepared { error, pending })
+                if matches!(error, Error::Busy) || pre_transaction_busy(&error) =>
+            {
+                *pending
+            }
+            Err(SettlementError::Rejected { error, completed }) => {
+                self.serial_pending = Some(PendingSettlement::Unprepared(*completed));
+                self.serial_pending_failed = true;
+                return Err(error);
+            }
+            Err(
+                SettlementError::RejectedPrepared { error, pending }
+                | SettlementError::IndeterminatePrepared { error, pending }
+                | SettlementError::IndeterminateOwned { error, pending },
+            ) => {
+                self.serial_pending = Some(*pending);
+                self.serial_pending_failed = true;
+                return Err(error);
+            }
+            Err(SettlementError::Handler(error)) => return Err(error),
+            Err(SettlementError::Indeterminate(error)) => {
+                self.serial_pending_failed = true;
+                return Err(error);
+            }
+            #[cfg(test)]
+            Err(SettlementError::Yielded { pending }) => *pending,
+        };
+        // As in the driver, attempt a checked ownership cleanup after a
+        // deferred settlement; this never authorizes a result by itself.
+        if let Some(harness) = self.validator.as_mut() {
+            match pending.try_cleanup(harness) {
+                Ok(_) => (),
+                Err(error) => {
+                    self.serial_pending = Some(pending);
+                    self.serial_pending_failed = true;
+                    return Err(error);
+                }
+            }
+        }
+        self.serial_pending = Some(pending);
+        Err(Error::Busy)
+    }
+
+    /// Transfer a retained serial result and its lease to the caller. A result
+    /// following an indeterminate error requires reconciliation, not retry.
+    pub fn take_serial_pending(&mut self) -> Option<PendingSettlement> {
+        self.serial_pending.take()
+    }
+
+    pub(crate) fn take_serial_pending_for_driver(&mut self) -> (Option<PendingSettlement>, bool) {
+        (self.serial_pending.take(), self.serial_pending_failed)
     }
 
     /// Failures of individual conversation cleanup callbacks, keyed by conversation.
@@ -10526,7 +10603,9 @@ impl Scheduler {
             nonblocking_abort,
             deferred,
         );
-        if nonblocking_abort && matches!(result, Err(Error::PendingAbort(_) | Error::Busy)) {
+        if matches!(result, Err(Error::Busy))
+            || (nonblocking_abort && matches!(result, Err(Error::PendingAbort(_))))
+        {
             if deferred.is_none() {
                 *deferred = Some(DeferredSettlement::Prepared(prepared));
             }
@@ -10537,7 +10616,7 @@ impl Scheduler {
             self.yielded_prepared = Some(prepared);
             return result;
         }
-        if nonblocking_abort && result.is_err() && deferred.is_none() {
+        if result.is_err() && deferred.is_none() {
             *deferred = Some(DeferredSettlement::IndeterminatePrepared(prepared));
         }
         result
@@ -11017,7 +11096,7 @@ impl Scheduler {
                 }
                 self.abort_failed_running(owner, root, parent.task.id(), gate)?;
             }
-            Err(Error::Busy) if nonblocking_abort => {
+            Err(Error::Busy) => {
                 *deferred = Some(DeferredSettlement::Failure(settlement));
                 return Err(Error::Busy);
             }
@@ -26125,6 +26204,76 @@ mod standalone_foreground_cleanup_tests {
                 }
             }
         }
+    }
+    #[test]
+    fn serial_tick_never_retries_an_indeterminate_committed_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        registry.register("work", false, move |_: &Task| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Step::Succeed(json!("result")))
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("work".into(), false);
+        scheduler.submit(&task).unwrap();
+        scheduler.inject_post_commit_error = true;
+        assert!(scheduler.tick(0).is_err());
+        assert!(matches!(scheduler.tick(0), Err(Error::Poisoned)));
+        let retained = scheduler
+            .take_serial_pending()
+            .expect("indeterminate settlement must retain its lease");
+        assert_eq!(retained.task_id(), task.id());
+        assert!(
+            matches!(retained.observed_task().unwrap().unwrap().state(), TaskState::Succeeded(value) if value == &json!("result"))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn serial_indeterminate_handoff_stops_driver_and_retains_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        registry.register("work", false, move |_: &Task| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Step::Succeed(json!("result")))
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("work".into(), false);
+        scheduler.submit(&task).unwrap();
+        scheduler.inject_post_commit_error = true;
+        assert!(scheduler.tick(0).is_err());
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_some());
+        assert_eq!(report.pending().len(), 1);
+        assert_eq!(report.pending()[0].task_id(), task.id());
+        assert!(
+            matches!(report.pending()[0].observed_task().unwrap().unwrap().state(), TaskState::Succeeded(value) if value == &json!("result"))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
 
