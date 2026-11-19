@@ -1573,15 +1573,45 @@ mod tests {
         assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
         drop(parent_job);
     }
+    struct CancellationObservedTool {
+        entered: std::sync::mpsc::Sender<()>,
+        cancelled: std::sync::mpsc::Sender<()>,
+        resume: std::sync::Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for CancellationObservedTool {
+        fn spec(&self) -> ToolSpec {
+            Stub.spec()
+        }
+        async fn invoke(&self, _: serde_json::Value, context: ToolContext) -> Outcome {
+            self.entered.send(()).unwrap();
+            context.cancellation.cancelled().await;
+            self.cancelled.send(()).unwrap();
+            self.resume.notified().await;
+            Outcome::Pending {
+                reference: "observed-cancellation".into(),
+            }
+        }
+    }
     fn released_attempt_boundary(mode: u8) {
         let dir = tempfile::tempdir().unwrap();
         let (entered, observed) = std::sync::mpsc::channel();
         let tool_release =
             std::sync::Arc::new((std::sync::Mutex::new(mode == 0), std::sync::Condvar::new()));
-        let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(RealTool {
-            entered,
-            release: tool_release.clone(),
-        });
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        let tool: std::sync::Arc<dyn Tool> = if mode == 1 || mode == 2 {
+            std::sync::Arc::new(CancellationObservedTool {
+                entered,
+                cancelled: cancel_tx,
+                resume: resume.clone(),
+            })
+        } else {
+            std::sync::Arc::new(RealTool {
+                entered,
+                release: tool_release.clone(),
+            })
+        };
         let identity =
             crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
         let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
@@ -1652,8 +1682,9 @@ mod tests {
                     let (started_tx, started_rx) = std::sync::mpsc::channel();
                     let driver_ref = &driver;
                     let abort = scope.spawn(move || {
-                        started_tx.send(()).unwrap();
-                        driver_ref.request_abort(parent)
+                        driver_ref.request_abort_with_contention_probe_for_test(parent, || {
+                            started_tx.send(()).unwrap();
+                        })
                     });
                     started_rx
                         .recv_timeout(std::time::Duration::from_secs(5))
@@ -1688,26 +1719,27 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
             assert_eq!(driver.active_unhooked_count_for_test(), 2);
+            if mode == 1 {
+                driver.request_abort(parent).unwrap();
+            } else {
+                driver.stop_worker_for_test();
+            }
+            cancel_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             release_tx.send(()).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while driver.active_unhooked_count_for_test() != 1 {
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::yield_now();
             }
-            if mode == 1 {
-                driver.request_abort(parent).unwrap();
-            } else {
-                driver.stop_worker_for_test();
-            }
-            {
-                let (lock, wake) = &*tool_release;
-                *lock.lock().unwrap() = true;
-                wake.notify_all();
-            }
-            assert!(matches!(
+            resume.notify_one();
+            assert_eq!(
                 await_receipt(owner.store(), child).1,
-                Outcome::Pending { .. }
-            ));
+                Outcome::Pending {
+                    reference: "observed-cancellation".into()
+                }
+            );
         }
         assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
         drop(parent_job);

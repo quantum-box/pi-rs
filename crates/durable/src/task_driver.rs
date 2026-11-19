@@ -473,6 +473,21 @@ impl Driver {
         self.request_abort_after_check(id, || {})
     }
 
+    #[cfg(test)]
+    pub(crate) fn request_abort_with_contention_probe_for_test(
+        &self,
+        id: Uuid,
+        observed: impl FnOnce(),
+    ) -> Result<(), Error> {
+        self.request_abort_after_check(id, || {
+            assert!(matches!(
+                self.shared.owner.task_gate().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            observed();
+        })
+    }
+
     fn request_abort_after_check(&self, id: Uuid, after_check: impl FnOnce()) -> Result<(), Error> {
         // A conversation worker can consult driver state while holding its
         // execution gate. Do not hold driver state while fencing those gates.
