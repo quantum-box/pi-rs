@@ -1275,6 +1275,7 @@ pub struct AdmissionHandle<'a> {
     abort: bool,
     definitions: &'a std::sync::RwLock<WakeDefinitions>,
     activity: &'a crate::worker_activity::WorkerActivity,
+    standalone: bool,
 }
 
 impl DetachedInvocation {
@@ -1301,6 +1302,7 @@ impl DetachedInvocation {
             abort: self.abort,
             definitions: &self.definitions,
             activity: &self.activity,
+            standalone: self.validator.is_none(),
         }
         .admit_task_tool_child(tool, key, input)
     }
@@ -1314,6 +1316,31 @@ impl AdmissionHandle<'_> {
     pub fn admit_task_tool_child(
         &self,
         tool: &crate::task_tool::TaskTool,
+        key: &str,
+        input: Value,
+    ) -> Result<Uuid, Error> {
+        self.admit_child(tool, None, key, input)
+    }
+
+    pub(crate) fn admit_sealed_child(
+        &self,
+        tool: &crate::task_tool::TaskTool,
+        sealed: &crate::async_task_tool::ToolIdentity,
+        key: &str,
+        input: Value,
+    ) -> Result<(Uuid, Uuid), Error> {
+        if !self.standalone {
+            return Err(Error::Registration);
+        }
+        let parent = self.running.task.id();
+        self.admit_child(tool, Some(sealed), key, input)
+            .map(|child| (parent, child))
+    }
+
+    fn admit_child(
+        &self,
+        tool: &crate::task_tool::TaskTool,
+        sealed: Option<&crate::async_task_tool::ToolIdentity>,
         key: &str,
         input: Value,
     ) -> Result<Uuid, Error> {
@@ -1360,6 +1387,20 @@ impl AdmissionHandle<'_> {
         {
             return Err(Error::Registration);
         }
+        if let Some(identity) = sealed {
+            let registration = definitions
+                .registry
+                .entries
+                .get(&tool_identity.kind)
+                .ok_or(Error::Registration)?;
+            if registration
+                .receipt_capture
+                .as_ref()
+                .is_none_or(|capture| &capture.identity != identity)
+            {
+                return Err(Error::Registration);
+            }
+        }
         if pending_abort_root_for_running(&tasks, parent.task.id(), false)?.is_some() {
             return Err(Error::Ownership);
         }
@@ -1377,6 +1418,15 @@ impl AdmissionHandle<'_> {
             checks: prepared.checks,
             mutations: prepared.mutations,
         })?;
+        if let Some(identity) = sealed {
+            let identity_batch = crate::async_task_protocol::prepare_child_identity(
+                owner.store(),
+                prepared.child,
+                identity,
+            )
+            .map_err(|error| Error::Handler(error.to_string()))?;
+            transaction.append(identity_batch)?;
+        }
         let checks = crate::ownership_edge::owner_chain_admission_checks(
             owner.store(),
             parent.task.id(),
@@ -1684,6 +1734,7 @@ impl DetachedInvocation {
                             abort,
                             definitions: &definitions,
                             activity: &activity,
+                            standalone: validator.is_none(),
                         };
                         handler.run_with_admission(&running.task, &mut documents, &admission)
                     }

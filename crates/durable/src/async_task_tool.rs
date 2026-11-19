@@ -333,6 +333,22 @@ pub struct AsyncTaskTool {
     identity: ToolIdentity,
 }
 impl AsyncTaskTool {
+    /// Immediately admit a keyed sealed child using the caller's live task lease.
+    /// The returned handle may be persisted in a subsequent checkpoint.
+    pub fn start_child_now(
+        &self,
+        admission: &crate::task_scheduler::AdmissionHandle<'_>,
+        key: &str,
+        input: serde_json::Value,
+    ) -> Result<AsyncTaskCall, String> {
+        let (parent, child) = admission
+            .admit_sealed_child(&self.adapter, &self.identity, key, input)
+            .map_err(|error| error.to_string())?;
+        Ok(AsyncTaskCall(crate::task_tool::NestedTaskCall::new(
+            parent, child,
+        )))
+    }
+
     /// Stage a direct task-owned call. Its identity, admission and parent
     /// transition commit together; it runs only while the parent is active or
     /// durably waiting on this direct child.
@@ -448,10 +464,51 @@ mod tests {
         assert!(!restored.is_terminal());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
-    struct CheckpointParent(Arc<std::sync::OnceLock<Arc<AsyncTaskTool>>>);
+    struct CheckpointParent(Arc<std::sync::OnceLock<Arc<AsyncTaskTool>>>, bool);
     impl crate::task_scheduler::Handler for CheckpointParent {
         fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
             unreachable!()
+        }
+        fn run_with_admission(
+            &self,
+            parent: &Task,
+            docs: &mut crate::document::TaskDocuments<'_>,
+            admission: &crate::task_scheduler::AdmissionHandle<'_>,
+        ) -> Result<crate::task_scheduler::Step, String> {
+            if self.1 && parent.checkpoint().phase == "initial" {
+                let handle = self.0.get().ok_or("missing tool")?.start_child_now(
+                    admission,
+                    "child",
+                    json!({}),
+                )?;
+                let repeated = self.0.get().ok_or("missing tool")?.start_child_now(
+                    admission,
+                    "child",
+                    json!({}),
+                )?;
+                if repeated != handle {
+                    return Err("keyed child did not reconnect".into());
+                }
+                if self
+                    .0
+                    .get()
+                    .ok_or("missing tool")?
+                    .start_child_now(admission, "child", json!({"changed":true}))
+                    .is_ok()
+                {
+                    return Err("keyed child accepted changed input".into());
+                }
+                let id = handle.task_id();
+                return Ok(crate::task_scheduler::Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "waiting".into(),
+                        data: serde_json::to_value(handle).map_err(|e| e.to_string())?,
+                    },
+                    condition: crate::task::WaitFor::Tasks(vec![id]),
+                    children: vec![],
+                });
+            }
+            self.run_with_documents(parent, docs)
         }
         fn run_with_documents(
             &self,
@@ -526,7 +583,7 @@ mod tests {
         let make_host = || {
             let cell = Arc::new(std::sync::OnceLock::new());
             let mut registry = Registry::default();
-            assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+            assert!(registry.register("parent", true, CheckpointParent(cell.clone(), mode == 3)));
             let mut host = StandaloneNoHooksHost::open(
                 &path,
                 registry,
@@ -563,7 +620,7 @@ mod tests {
         if mode == 2 {
             let cell = Arc::new(std::sync::OnceLock::new());
             let mut registry = Registry::default();
-            assert!(registry.register("parent", true, CheckpointParent(cell)));
+            assert!(registry.register("parent", true, CheckpointParent(cell, false)));
             let forged_calls = Arc::new(AtomicUsize::new(0));
             let observed = forged_calls.clone();
             assert!(registry.register("fixture", false, move |_: &Task| {
@@ -627,6 +684,10 @@ mod tests {
     #[test]
     fn driver_rejects_replacement_handler_after_reopen() {
         driver_checkpoint_reopen(2);
+    }
+    #[test]
+    fn immediate_sealed_child_handle_survives_checkpoint_and_reopen() {
+        driver_checkpoint_reopen(3);
     }
     struct ChangedSchema;
     #[async_trait::async_trait]

@@ -508,6 +508,12 @@ publication and lease retirement share the scheduler fence. Cancellation entries
 are scoped to the individual reservation, so an older worker cannot remove a
 newer attempt's entry.
 
+A synchronous task handler with a live `AdmissionHandle` may use
+`AsyncTaskTool::start_child_now` to atomically admit or reconnect a keyed sealed
+leaf child and checkpoint its `AsyncTaskCall`. The child's registered Tool
+identity is committed with admission. This is not an async ToolHost API: async
+Tools still cannot start children or park and resume through this interface.
+
 A durable intent committed under the task gate is logical dispatch start. A prior
 abort rejects dispatch; a later abort requests cancellation and the driver joins
 the Tool future. A Tool can ignore cancellation and block shutdown indefinitely.

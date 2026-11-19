@@ -33,6 +33,9 @@ pub enum NestedTaskResult {
 }
 
 impl NestedTaskCall {
+    pub(crate) fn new(parent: uuid::Uuid, task_id: uuid::Uuid) -> Self {
+        Self { parent, task_id }
+    }
     pub fn task_id(&self) -> uuid::Uuid {
         self.task_id
     }
