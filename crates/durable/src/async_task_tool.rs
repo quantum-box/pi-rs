@@ -3244,7 +3244,7 @@ mod tests {
         }
     }
 
-    fn recovery_busy_fixture(unsafe_hook: bool) {
+    fn recovery_busy_fixture(unsafe_hook: bool, driver_recovery: bool) {
         use crate::task_scheduler::Step;
         use std::time::{Duration, Instant};
         const ENV: &str = "PI_TEST_RECOVERY_BUSY_1120";
@@ -3340,6 +3340,57 @@ mod tests {
         .unwrap()
         .registered("independent".into(), true);
         tasks.save(&[Save::Create(&other)]).unwrap();
+        // A pending failure owns the target's conversation. Removing this
+        // test edge after registration releases recovery only when the driver starts.
+        let blocked_edge = if driver_recovery {
+            let root = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("independent".into(), true);
+            tasks.save(&[Save::Create(&root)]).unwrap();
+            tasks
+                .update(&tasks.load(root.id()).unwrap().unwrap(), |task| {
+                    task.start()?;
+                    task.hold_failure("pending abort".into())
+                })
+                .unwrap();
+            let mut item = tasks.load(target).unwrap().unwrap().task;
+            let conversation = loop {
+                match *item.owner() {
+                    TaskOwner::Conversation(id) => break id,
+                    TaskOwner::Task(id) => item = tasks.load(id).unwrap().unwrap().task,
+                }
+            };
+            let edge = crate::ownership_edge::Edge {
+                task: root.id(),
+                task_owner: root.owner().clone(),
+                child: conversation,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let key = crate::ownership_edge::edge_key(conversation);
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&edge).unwrap(),
+                    }],
+                )
+                .unwrap();
+            Some(key)
+        } else {
+            None
+        };
         drop(store);
         std::fs::write(dir.path().join("resume"), b"resume").unwrap();
         let (writer_tx, writer_rx) = std::sync::mpsc::channel();
@@ -3382,6 +3433,23 @@ mod tests {
                 ReplaySafeAuthorization::host_attests_replay_safe(),
             )
             .unwrap();
+            if let Some(edge) = &blocked_edge {
+                assert!(
+                    busy_rx.try_recv().is_err(),
+                    "recovery ran during registration"
+                );
+                let store = durable_store::Store::open(&path).unwrap();
+                let item = store.get(edge).unwrap().unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: edge.clone(),
+                            expected: durable_store::Expected::Version(item.version),
+                        }],
+                        &[durable_store::Mutation::Delete { key: edge.clone() }],
+                    )
+                    .unwrap();
+            }
             host.into_driver()
         } else {
             let cell = Arc::new(std::sync::OnceLock::new());
@@ -3403,10 +3471,27 @@ mod tests {
                 )
                 .unwrap();
             assert!(cell.set(adapter).is_ok());
+            if let Some(edge) = &blocked_edge {
+                assert!(
+                    busy_rx.try_recv().is_err(),
+                    "recovery ran during registration"
+                );
+                let store = durable_store::Store::open(&path).unwrap();
+                let item = store.get(edge).unwrap().unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: edge.clone(),
+                            expected: durable_store::Expected::Version(item.version),
+                        }],
+                        &[durable_store::Mutation::Delete { key: edge.clone() }],
+                    )
+                    .unwrap();
+            }
             host.into_driver()
         };
         busy_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(10))
             .expect("writer timeout was not observed");
         writer_rx
             .recv_timeout(Duration::from_secs(1))
@@ -3437,12 +3522,22 @@ mod tests {
 
     #[test]
     fn unsafe_hook_recovery_retries_writer_timeout() {
-        recovery_busy_fixture(true);
+        recovery_busy_fixture(true, false);
     }
 
     #[test]
     fn sealed_after_recovery_retries_writer_timeout() {
-        recovery_busy_fixture(false);
+        recovery_busy_fixture(false, false);
+    }
+
+    #[test]
+    fn unsafe_hook_deferred_driver_recovery_retries_writer_timeout() {
+        recovery_busy_fixture(true, true);
+    }
+
+    #[test]
+    fn sealed_after_deferred_driver_recovery_retries_writer_timeout() {
+        recovery_busy_fixture(false, true);
     }
 
     #[test]
