@@ -489,14 +489,31 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
-`async_task_tool::AsyncTaskTool` is intentionally disabled. Its constructor
-always returns an error, including for explicitly authorized unhooked standalone
-use. No task handler or tool dispatch is registered. Safe support still requires
-task-owned hook authorization, an abort/dispatch ordering fence, retention and
-reconciliation of pending or unknown outcomes after abort, and persisted tool
-specification and implementation identity checks across reopen. A conversation
-attempt fence cannot establish task-attempt ownership. `AsyncTaskCall` is serializable for checkpoints, but this disabled bridge
-cannot create or execute calls. Existing scheduler and `TaskTool` APIs are unaffected.
+`StandaloneNoHooksHost` constructs a standalone scheduler and transfers it to a
+task driver. Its explicit authorization is the host's assertion that no hook
+policy applies; the type cannot prove anything about policy outside this runtime.
+`ToolIdentity` can be persisted and compared across reopen using a full tool spec,
+host-assigned implementation/backend identity and version. It is not yet bound
+to a task or enforced at dispatch, and its implementation identity is an assertion,
+not a cryptographic measurement.
+
+A private storage-only prototype composes a keyed child and its identity in one
+checked transaction. It also stores an attempt-specific intent and an independent
+`Pending`/`Unknown` receipt, including after an abort mark. These records are not
+wired to the scheduler, driver, or `TaskTool`: the intent is not a lease or
+authority to run effects, and the receipt writer does not authenticate an executor.
+An intent left without a receipt is uncertain, not permission to retry. Operators
+cannot yet use this private protocol for reconciliation.
+
+`async_task_tool::AsyncTaskTool` remains disabled even with this host capability:
+its constructor returns an error, and no async tool handler is registered. Safe
+dispatch still requires task-owned hook authorization, a linearized abort/dispatch
+boundary, retention and reconciliation of pending or unknown outcomes after abort,
+and atomic persistence and enforcement of identity with each task. A conversation
+attempt fence cannot establish task-attempt ownership. A pre-dispatch check alone
+cannot close the race with a subsequent abort. `AsyncTaskCall` is serializable for
+checkpoints, but this bridge cannot create or execute calls. Existing scheduler and
+`TaskTool` APIs are unaffected.
 
 Within a task-backed tool handler, `TaskTool::stage_child` stages another
 registered TaskTool under a stable key. Return a task wait step to commit the

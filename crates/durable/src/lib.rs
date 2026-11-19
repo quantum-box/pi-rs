@@ -4,6 +4,8 @@
 //! under development; it does not yet provide a complete agent harness.
 
 pub mod application_entry;
+#[allow(dead_code)] // Storage protocol only; it cannot authorize dispatch.
+mod async_task_protocol;
 pub mod async_task_tool;
 mod chord_ops;
 #[cfg(feature = "coding-tools")]
