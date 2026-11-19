@@ -1038,7 +1038,12 @@ impl Shared {
         for ((id, _), token) in active.iter() {
             match tasks.load(*id) {
                 Ok(Some(task)) if !task.task.abort_requested() => {
-                    match task_scheduler::pending_abort_root_for_running(&tasks, *id, true) {
+                    match task_scheduler::pending_abort_root_excluding_self(
+                        &tasks,
+                        *id,
+                        true,
+                        task.task.holds_interrupted_cleanup(),
+                    ) {
                         Ok(Some(_)) => token.cancel(),
                         Ok(None) => (),
                         Err(error) => {

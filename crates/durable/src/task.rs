@@ -54,6 +54,7 @@ impl Task {
             retain_task_children_on_success: false,
             restart_cleanup: false,
             restart_internal_abort: false,
+            interrupted_dispatch_attempt: None,
         })
     }
 
@@ -144,6 +145,7 @@ impl Task {
         self.state == TaskState::Ready
             && !self.abort_requested
             && !self.restart_cleanup
+            && self.interrupted_dispatch_attempt.is_none()
             && self.restarts == 0
             && self.attempt_id.is_none()
             && self.retired_attempt_id.is_none()
@@ -391,6 +393,69 @@ impl Task {
         )
     }
 
+    pub(crate) fn interrupted_dispatch_attempt(&self) -> Option<Uuid> {
+        self.interrupted_dispatch_attempt
+    }
+    pub(crate) fn holds_interrupted_cleanup(&self) -> bool {
+        self.interrupted_dispatch_attempt.is_some()
+    }
+    pub(crate) fn hold_interrupted_failure(&mut self) -> Result<(), TransitionError> {
+        let attempt = self.attempt_id.ok_or(TransitionError::InvalidState)?;
+        self.hold_failure("interrupted: execution outcome requires reconciliation".into())?;
+        self.interrupted_dispatch_attempt = Some(attempt);
+        self.restarts = 0;
+        Ok(())
+    }
+    pub(crate) fn start_interrupted_cleanup(
+        &mut self,
+        attempt: Uuid,
+    ) -> Result<(), TransitionError> {
+        if !self.holds_interrupted_cleanup()
+            || self.abort_requested
+            || self.attempt_id.is_some()
+            || !matches!(&self.state,TaskState::CompletingFailed(reason) if reason=="interrupted: execution outcome requires reconciliation")
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.attempt_id = Some(attempt);
+        self.retired_attempt_id = None;
+        Ok(())
+    }
+    pub(crate) fn finish_interrupted_cleanup(&mut self) -> Result<(), TransitionError> {
+        if !self.holds_interrupted_cleanup()
+            || !matches!(self.state, TaskState::CompletingFailed(_))
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state =
+            TaskState::Failed("interrupted: execution outcome requires reconciliation".into());
+        self.attempt_id = None;
+        self.retired_attempt_id = None;
+        Ok(())
+    }
+    pub(crate) fn cancel_interrupted_cleanup(&mut self) -> Result<(), TransitionError> {
+        if !self.holds_interrupted_cleanup()
+            || !self.abort_requested
+            || !matches!(self.state, TaskState::CompletingFailed(_))
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Cancelled;
+        self.attempt_id = None;
+        self.retired_attempt_id = None;
+        Ok(())
+    }
+    pub(crate) fn finish_interrupted_known(&mut self) -> Result<(), TransitionError> {
+        if !self.holds_interrupted_cleanup()
+            || !matches!(self.state, TaskState::CompletingFailed(_))
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Failed("sealed outcome requires reconciliation".into());
+        self.attempt_id = None;
+        self.retired_attempt_id = None;
+        Ok(())
+    }
     pub(crate) fn holds_restart_cleanup(&self) -> bool {
         self.restart_cleanup
     }

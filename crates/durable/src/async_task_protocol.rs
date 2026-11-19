@@ -461,6 +461,154 @@ pub(crate) fn prepare_raw_result(
     }
     Ok(batch)
 }
+/// Read the persisted sealed identity to decide whether a missing definition
+/// must remain blocked for an explicitly opted-in interrupted cleanup.
+pub(crate) fn interrupted_identity(
+    store: &Store,
+    task: Uuid,
+) -> Result<Option<ToolIdentity>, Error> {
+    let Some(entry) = store.get(&identity_key(task))? else {
+        return Ok(None);
+    };
+    let identity: ToolIdentity = serde_json::from_slice(&entry.value)?;
+    if !identity.is_valid() {
+        return Err(Error::Invalid);
+    };
+    Ok(identity.has_interrupted_after().then_some(identity))
+}
+/// Checks identify the original dispatch and require raw and final receipts to
+/// remain absent. No record is changed or treated as an external outcome.
+pub(crate) fn interrupted_evidence(
+    store: &Store,
+    task: &Task,
+    identity: &ToolIdentity,
+    require_running_attempt: bool,
+) -> Result<Option<Vec<Check>>, Error> {
+    if !identity.has_interrupted_after()
+        || task.replay_safe()
+        || task.checkpoint().phase != "sealed.execute.v1"
+        || task.checkpoint().data.get("identity") != Some(&serde_json::to_value(identity)?)
+    {
+        return Err(Error::Invalid);
+    }
+    let definition = store.get(&identity_key(task.id()))?.ok_or(Error::Invalid)?;
+    if serde_json::from_slice::<ToolIdentity>(&definition.value)? != *identity {
+        return Err(Error::Invalid);
+    }
+    let Some(intent_entry) = store.get(&intent_key(task.id()))? else {
+        return Ok(None);
+    };
+    let intent: Intent = serde_json::from_slice(&intent_entry.value)?;
+    if intent.task != task.id()
+        || intent.identity != *identity
+        || !intent.attempt_record
+        || (require_running_attempt && !intent.matches_attempt(task))
+        || (!require_running_attempt && task.interrupted_dispatch_attempt() != Some(intent.attempt))
+    {
+        return Err(Error::Invalid);
+    }
+    let Some(attempt_check) = attempt_record_check(store, &intent)? else {
+        return Err(Error::Invalid);
+    };
+    let raw = raw_result_key(task.id());
+    let final_key = receipt_key(task.id());
+    if store.get(&raw)?.is_some() || store.get(&final_key)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(vec![
+        Check {
+            key: identity_key(task.id()),
+            expected: Expected::Version(definition.version),
+        },
+        Check {
+            key: intent_key(task.id()),
+            expected: Expected::Version(intent_entry.version),
+        },
+        attempt_check,
+        Check {
+            key: raw,
+            expected: Expected::Missing,
+        },
+        Check {
+            key: final_key,
+            expected: Expected::Missing,
+        },
+    ]))
+}
+
+/// Prove that this checkpoint never published a dispatch intent or outcome.
+pub(crate) fn undispatched_interrupted_evidence(
+    store: &Store,
+    task: &Task,
+    identity: &ToolIdentity,
+) -> Result<Option<Vec<Check>>, Error> {
+    if !identity.has_interrupted_after()
+        || task.replay_safe()
+        || task.checkpoint().phase != "sealed.execute.v1"
+        || task.checkpoint().data.get("identity") != Some(&serde_json::to_value(identity)?)
+    {
+        return Err(Error::Invalid);
+    }
+    let definition = store.get(&identity_key(task.id()))?.ok_or(Error::Invalid)?;
+    if serde_json::from_slice::<ToolIdentity>(&definition.value)? != *identity {
+        return Err(Error::Invalid);
+    }
+    let keys = [
+        intent_key(task.id()),
+        raw_result_key(task.id()),
+        receipt_key(task.id()),
+    ];
+    for key in &keys {
+        if store.get(key)?.is_some() {
+            return Ok(None);
+        }
+    }
+    let mut checks = vec![Check {
+        key: identity_key(task.id()),
+        expected: Expected::Version(definition.version),
+    }];
+    checks.extend(keys.into_iter().map(|key| Check {
+        key,
+        expected: Expected::Missing,
+    }));
+    Ok(Some(checks))
+}
+
+/// A real raw or final receipt, tied to the original interrupted dispatch.
+/// The synthetic Unknown returned by `prepare_receipt_read` is not a receipt.
+pub(crate) fn known_interrupted_evidence(
+    store: &Store,
+    task: &Task,
+    identity: &ToolIdentity,
+) -> Result<Option<Vec<Check>>, Error> {
+    let entry = store.get(&intent_key(task.id()))?.ok_or(Error::Invalid)?;
+    let intent: Intent = serde_json::from_slice(&entry.value)?;
+    if !identity.has_interrupted_after()
+        || task.replay_safe()
+        || task.checkpoint().phase != "sealed.execute.v1"
+        || task.checkpoint().data.get("identity") != Some(&serde_json::to_value(identity)?)
+        || intent.task != task.id()
+        || !intent.attempt_record
+        || intent.identity != *identity
+        || task.interrupted_dispatch_attempt() != Some(intent.attempt)
+    {
+        return Err(Error::Invalid);
+    }
+    let (_, checks) = prepare_receipt_read(store, task.id())?;
+    if !checks.iter().any(|check| {
+        check.key == intent_key(task.id()) && check.expected == Expected::Version(entry.version)
+    }) {
+        return Err(Error::Invalid);
+    }
+    if !checks.iter().any(|check| {
+        (check.key == raw_result_key(task.id()) || check.key == receipt_key(task.id()))
+            && matches!(check.expected, Expected::Version(_))
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(checks))
+}
+
 pub(crate) fn prepare_after_recovery(
     store: &Store,
     running: &StoredTask,

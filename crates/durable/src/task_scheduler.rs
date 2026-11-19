@@ -62,6 +62,7 @@ pub trait Handler: Send + Sync {
         &self,
         task: &Task,
         _admission: &AdmissionHandle<'_>,
+        _cancellation: Option<&pi_rs_core::CancellationToken>,
     ) -> Result<Step, String> {
         self.run(task)
     }
@@ -270,6 +271,111 @@ pub(crate) fn restart_receipt_evidence(
             },
         ],
     ))
+}
+
+fn interrupted_receipt_key(id: Uuid) -> Vec<u8> {
+    format!("durable/async-task/interrupted-after/{id}").into_bytes()
+}
+fn interrupted_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("durable/async-task/interrupted-after-intent/{id}/{attempt}").into_bytes()
+}
+fn interrupted_owner_checks(
+    store: &durable_store::Store,
+    task: &Task,
+) -> Result<Vec<durable_store::Check>, String> {
+    let tasks = TaskStore::new(store);
+    let mut current = task.clone();
+    let mut seen = HashSet::new();
+    let mut checks = Vec::new();
+    loop {
+        if !seen.insert(current.id()) {
+            return Err("owner cycle".into());
+        }
+        checks.push(
+            crate::ownership_edge::abort_fence_check(store, current.owner())
+                .map_err(|e| e.to_string())?,
+        );
+        match current.owner() {
+            TaskOwner::Task(id) => {
+                let parent = tasks
+                    .load(*id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("missing owner")?;
+                if parent.task.abort_requested()
+                    || parent.task.is_terminal()
+                    || parent.task.is_completing()
+                {
+                    return Err("owner no longer authorizes cleanup".into());
+                }
+                checks.push(durable_store::Check {
+                    key: task_store::key(*id),
+                    expected: durable_store::Expected::Version(parent.version),
+                });
+                current = parent.task;
+            }
+            TaskOwner::Conversation(id) => {
+                let key = format!("runtime/conversation/{id}").into_bytes();
+                let edge = crate::ownership_edge::edge_key(*id);
+                if store.get(&key).map_err(|e| e.to_string())?.is_some()
+                    || store.get(&edge).map_err(|e| e.to_string())?.is_some()
+                {
+                    return Err("conversation attachment unsupported".into());
+                }
+                checks.push(durable_store::Check {
+                    key,
+                    expected: durable_store::Expected::Missing,
+                });
+                checks.push(durable_store::Check {
+                    key: edge,
+                    expected: durable_store::Expected::Missing,
+                });
+                break;
+            }
+        }
+    }
+    Ok(checks)
+}
+pub(crate) fn interrupted_receipt_evidence(
+    store: &durable_store::Store,
+    task: &Task,
+    identity: &crate::async_task_tool::ToolIdentity,
+    entry: &durable_store::Entry,
+) -> Result<(Value, Vec<durable_store::Check>), String> {
+    let receipt: AbortHookReceipt =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    let intent = &receipt.intent;
+    if intent.version != 1
+        || intent.task != task.id()
+        || Some(intent.kind.as_str()) != task.kind()
+        || intent.definition_version != task.definition_version()
+        || intent.attempt.is_nil()
+        || intent.lease.is_nil()
+    {
+        return Err("interrupted receipt identity mismatch".into());
+    }
+    crate::async_task_tool::validate_interrupted_after_result(&receipt.result)?;
+    let key = interrupted_intent_key(task.id(), intent.attempt);
+    let stored = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing cleanup intent")?;
+    let persisted: AbortHookIntent =
+        serde_json::from_slice(&stored.value).map_err(|e| e.to_string())?;
+    if persisted != *intent {
+        return Err("cleanup intent mismatch".into());
+    }
+    let mut checks = crate::async_task_protocol::interrupted_evidence(store, task, identity, false)
+        .map_err(|e| e.to_string())?
+        .ok_or("external result became known")?;
+    checks.push(durable_store::Check {
+        key: interrupted_receipt_key(task.id()),
+        expected: durable_store::Expected::Version(entry.version),
+    });
+    checks.push(durable_store::Check {
+        key,
+        expected: durable_store::Expected::Version(stored.version),
+    });
+    Ok((receipt.result, checks))
 }
 
 #[derive(Clone)]
@@ -1866,6 +1972,155 @@ impl AdmissionHandle<'_> {
             .map_err(|e| e.to_string())?;
         Ok(None)
     }
+    pub(crate) fn interrupted_hook_receipt(
+        &self,
+        handler: &dyn Handler,
+        identity: &crate::async_task_tool::ToolIdentity,
+        result: Option<&Value>,
+    ) -> Result<Option<Value>, String> {
+        if !self.abort || !self.standalone || self.lease.retired {
+            return Err("invalid interrupted cleanup lease".into());
+        }
+        let attempt = self
+            .running
+            .task
+            .attempt_id()
+            .ok_or("missing cleanup attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.running.task.id())
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || current != *self.running
+            || !matches!(current.task.state(), TaskState::CompletingFailed(_))
+            || !current.task.holds_interrupted_cleanup()
+            || current.task.abort_requested()
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale interrupted lease or abort".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        let capture = reg
+            .receipt_capture
+            .as_ref()
+            .ok_or("missing sealed registration")?;
+        if reg.version != current.task.definition_version()
+            || capture.identity != *identity
+            || !identity.has_interrupted_after()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || !identity.matches(
+                capture.executor.tool().as_ref(),
+                &capture.implementation,
+                capture.version,
+            )
+        {
+            return Err("interrupted definition changed".into());
+        }
+        let mut checks = crate::async_task_protocol::interrupted_evidence(
+            owner.store(),
+            &current.task,
+            identity,
+            false,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or("external result became known")?;
+        checks.extend(interrupted_owner_checks(owner.store(), &current.task)?);
+        checks.push(durable_store::Check {
+            key: task_store::key(current.task.id()),
+            expected: durable_store::Expected::Version(current.version),
+        });
+        let key = interrupted_receipt_key(current.task.id());
+        if let Some(existing) = owner.store().get(&key).map_err(|e| e.to_string())? {
+            let (value, existing_checks) =
+                interrupted_receipt_evidence(owner.store(), &current.task, identity, &existing)?;
+            checks.extend(existing_checks);
+            owner
+                .store()
+                .commit(&checks, &[])
+                .map_err(|e| e.to_string())?;
+            return Ok(Some(value));
+        }
+        checks.push(durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        let intent = AbortHookIntent {
+            version: 1,
+            task: current.task.id(),
+            kind: kind.into(),
+            definition_version: current.task.definition_version(),
+            attempt,
+            lease: self.lease.token,
+        };
+        let intent_key = interrupted_intent_key(current.task.id(), attempt);
+        if let Some(result) = result {
+            crate::async_task_tool::validate_interrupted_after_result(result)?;
+            let entry = owner
+                .store()
+                .get(&intent_key)
+                .map_err(|e| e.to_string())?
+                .ok_or("missing cleanup intent")?;
+            let saved: AbortHookIntent =
+                serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if saved != intent {
+                return Err("stale cleanup intent".into());
+            }
+            checks.push(durable_store::Check {
+                key: intent_key,
+                expected: durable_store::Expected::Version(entry.version),
+            });
+            let bytes = serde_json::to_vec(&AbortHookReceipt {
+                intent,
+                result: result.clone(),
+            })
+            .map_err(|e| e.to_string())?;
+            owner
+                .store()
+                .commit(
+                    &checks,
+                    &[durable_store::Mutation::Put { key, value: bytes }],
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(Some(result.clone()));
+        }
+        checks.push(durable_store::Check {
+            key: intent_key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        owner
+            .store()
+            .commit(
+                &checks,
+                &[durable_store::Mutation::Put {
+                    key: intent_key,
+                    value: serde_json::to_vec(&intent).map_err(|e| e.to_string())?,
+                }],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(None)
+    }
     #[cfg(test)]
     pub(crate) fn test_abort_stale_lease(&self, handler: &dyn Handler, result: &Value) -> bool {
         let original = {
@@ -2652,6 +2907,21 @@ impl DetachedInvocation {
         checks.extend_from_slice(extra.0);
         let mut mutations = if commit { batch.mutations } else { Vec::new() };
         mutations.extend_from_slice(extra.1);
+        #[cfg(test)]
+        if !after
+            && commit
+            && identity.has_interrupted_after()
+            && let Some(dir) = std::env::var_os("PI_TEST_INTERRUPTED_BEFORE_INTENT")
+        {
+            std::fs::write(
+                std::path::PathBuf::from(dir).join("before-intent"),
+                self.running.task.id().to_string(),
+            )
+            .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
         owner.store().commit(&checks, &mutations)?;
         Ok(intent)
     }
@@ -3027,7 +3297,11 @@ impl DetachedInvocation {
                     activity: &activity,
                     standalone: validator.is_none(),
                 };
-                handler.run_abort_with_admission(&running.task, &admission)
+                handler.run_abort_with_admission(
+                    &running.task,
+                    &admission,
+                    unhooked_cancellation.as_ref(),
+                )
             }));
             let outcome = match result {
                 Ok(Ok(Step::Succeed(_))) => None,
@@ -3484,7 +3758,12 @@ impl Scheduler {
         let id = running.task.id();
         let registration = self.registered(&running.task)?;
         let abort_definition = (abort
-            && ((running.task.holds_restart_cleanup() && registration.restart_after)
+            && ((running.task.holds_interrupted_cleanup()
+                && registration
+                    .receipt_capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.identity.has_interrupted_after()))
+                || (running.task.holds_restart_cleanup() && registration.restart_after)
                 || registration
                     .abort
                     .as_ref()
@@ -3501,9 +3780,10 @@ impl Scheduler {
         let token = Uuid::new_v4();
         state.leases.insert(id, (token, running.task.attempt_id()));
         drop(state);
-        let unhooked_cancellation = (!abort
+        let unhooked_cancellation = ((!abort
             && (receipt_capture.is_some() || cancellable_durable_async))
-            .then(pi_rs_core::CancellationToken::new);
+            || (abort && running.task.holds_interrupted_cleanup()))
+        .then(pi_rs_core::CancellationToken::new);
         Ok(DetachedInvocation {
             running,
             handler,
@@ -3675,7 +3955,8 @@ impl Scheduler {
         }
         // Preserve the exact handler input until all preparation and commit
         // paths have either succeeded or returned a more precise owned candidate.
-        let backup = if nonblocking_abort {
+        let mut backup = if nonblocking_abort || completed.running.task.holds_interrupted_cleanup()
+        {
             Some((completed.running.clone(), completed.result.clone()))
         } else {
             None
@@ -3721,6 +4002,152 @@ impl Scheduler {
                     (running, outcome)
                 };
                 match outcome {
+                    outcome if running.task.holds_interrupted_cleanup() => {
+                        let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+                        let key = interrupted_receipt_key(current.task.id());
+                        let mut next = current.clone();
+                        let mut batch;
+                        if current.task.abort_requested() {
+                            next.task
+                                .cancel_interrupted_cleanup()
+                                .map_err(Error::Transition)?;
+                            batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            if let Some(entry) = self
+                                .ts()
+                                .store()
+                                .get(&key)
+                                .map_err(task_store::Error::from)?
+                            {
+                                batch.checks.push(durable_store::Check {
+                                    key: key.clone(),
+                                    expected: durable_store::Expected::Version(entry.version),
+                                });
+                                batch
+                                    .mutations
+                                    .push(durable_store::Mutation::Delete { key });
+                            } else {
+                                batch.checks.push(durable_store::Check {
+                                    key,
+                                    expected: durable_store::Expected::Missing,
+                                });
+                            }
+                        } else {
+                            if current != running {
+                                return Err(Error::Ownership);
+                            }
+                            let reg = self.registered(&current.task)?;
+                            if abort_definition
+                                .as_ref()
+                                .is_none_or(|id| !Arc::ptr_eq(id, &reg.identity))
+                            {
+                                return Err(Error::Registration);
+                            }
+                            let capture =
+                                reg.receipt_capture.as_ref().ok_or(Error::Registration)?;
+                            let identity = &capture.identity;
+                            let proof = crate::async_task_protocol::interrupted_evidence(
+                                self.ts().store(),
+                                &current.task,
+                                identity,
+                                false,
+                            )
+                            .map_err(|e| Error::Handler(e.to_string()))?;
+                            if let Some(mut proof) = proof {
+                                proof.extend(
+                                    interrupted_owner_checks(self.ts().store(), &current.task)
+                                        .map_err(Error::Handler)?,
+                                );
+                                next.task
+                                    .finish_interrupted_cleanup()
+                                    .map_err(Error::Transition)?;
+                                batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                                batch.checks.extend(proof);
+                                let entry = self
+                                    .ts()
+                                    .store()
+                                    .get(&key)
+                                    .map_err(task_store::Error::from)?;
+                                match (outcome, entry) {
+                                    (None, Some(entry)) => {
+                                        let (_, checks) = interrupted_receipt_evidence(
+                                            self.ts().store(),
+                                            &current.task,
+                                            identity,
+                                            &entry,
+                                        )
+                                        .map_err(Error::Handler)?;
+                                        batch.checks.extend(checks);
+                                    }
+                                    (None, None) => return Err(Error::Ownership),
+                                    (Some(_), Some(entry)) => {
+                                        batch.checks.push(durable_store::Check {
+                                            key: key.clone(),
+                                            expected: durable_store::Expected::Version(
+                                                entry.version,
+                                            ),
+                                        });
+                                        batch
+                                            .mutations
+                                            .push(durable_store::Mutation::Delete { key });
+                                    }
+                                    (Some(_), None) => batch.checks.push(durable_store::Check {
+                                        key,
+                                        expected: durable_store::Expected::Missing,
+                                    }),
+                                }
+                            } else {
+                                let checks =
+                                    crate::async_task_protocol::known_interrupted_evidence(
+                                        self.ts().store(),
+                                        &current.task,
+                                        identity,
+                                    )
+                                    .map_err(|e| Error::Handler(e.to_string()))?
+                                    .ok_or(Error::Ownership)?;
+                                next.task
+                                    .finish_interrupted_known()
+                                    .map_err(Error::Transition)?;
+                                batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                                batch.checks.extend(checks);
+                                if let Some(entry) = self
+                                    .ts()
+                                    .store()
+                                    .get(&key)
+                                    .map_err(task_store::Error::from)?
+                                {
+                                    batch.checks.push(durable_store::Check {
+                                        key: key.clone(),
+                                        expected: durable_store::Expected::Version(entry.version),
+                                    });
+                                    batch
+                                        .mutations
+                                        .push(durable_store::Mutation::Delete { key });
+                                } else {
+                                    batch.checks.push(durable_store::Check {
+                                        key,
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                            }
+                        }
+                        #[cfg(test)]
+                        if let Some(hook) = &self.reservation_commit_hook {
+                            hook(0, self.ts().store());
+                        }
+                        self.ts()
+                            .store()
+                            .commit_with_prefix_put_fence(
+                                &batch.checks,
+                                &batch.mutations,
+                                &[
+                                    task_store::PREFIX,
+                                    crate::ownership_edge::PREFIX,
+                                    b"runtime/conversation/",
+                                ],
+                                ordering_graph_version,
+                            )
+                            .map_err(task_store::Error::from)?;
+                    }
                     None if running.task.holds_restart_cleanup() => {
                         let reg = self.registered(&running.task)?;
                         if !reg.restart_after
@@ -3906,6 +4333,30 @@ impl Scheduler {
             drop(guard);
             return Err(SettlementError::Yielded {
                 pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+            });
+        }
+        // A checked store conflict is known not to have committed. Keep the
+        // same invocation and lease, then re-read task, graph and evidence.
+        if matches!(
+            &result,
+            Err(Error::Store(task_store::Error::Store(
+                durable_store::Error::Conflict { .. }
+            )))
+        ) && backup
+            .as_ref()
+            .is_some_and(|(running, _)| running.task.holds_interrupted_cleanup())
+        {
+            let (running, result) = backup.take().expect("checked above");
+            drop(guard);
+            return Err(SettlementError::Pending {
+                completed: Box::new(CompletedInvocation {
+                    running,
+                    result,
+                    lease,
+                    receipt_capture,
+                    abort_definition,
+                    _identity_lease: None,
+                }),
             });
         }
         if result.is_err()
@@ -5007,9 +5458,10 @@ impl Scheduler {
         ),
         String,
     > {
-        self.install_sealed_tool_with_hook(kind, tool, implementation, version, None, false)
+        self.install_sealed_tool_with_hook(kind, tool, implementation, version, None, false, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn install_sealed_tool_with_hook(
         &mut self,
         kind: String,
@@ -5018,6 +5470,7 @@ impl Scheduler {
         version: u32,
         hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
         after: bool,
+        interrupted_after: bool,
     ) -> Result<
         (
             Arc<crate::async_task_tool::SealedExecutor>,
@@ -5040,6 +5493,12 @@ impl Scheduler {
                 return Err("after hook requires a hook registration".into());
             }
             identity = identity.with_after_hook();
+        }
+        if interrupted_after {
+            if !after {
+                return Err("interrupted hook requires after".into());
+            }
+            identity = identity.with_interrupted_after();
         }
         if serde_json::to_vec(&identity)
             .map_err(|e| e.to_string())?
@@ -5809,6 +6268,76 @@ impl Scheduler {
                     continue;
                 }
                 if !item.task.replay_safe() {
+                    if item.task.checkpoint().phase == "sealed.execute.v1"
+                        && let Some(identity) = crate::async_task_protocol::interrupted_identity(
+                            self.ts().store(),
+                            item.task.id(),
+                        )
+                        .map_err(|e| Error::Handler(e.to_string()))?
+                    {
+                        let Ok(reg) = self.registered(&item.task) else {
+                            continue;
+                        };
+                        let matching = reg.version == item.task.definition_version()
+                            && reg.receipt_capture.as_ref().is_some_and(|capture| {
+                                capture.identity == identity
+                                    && capture.identity.matches(
+                                        capture.executor.tool().as_ref(),
+                                        &capture.implementation,
+                                        capture.version,
+                                    )
+                            });
+                        if !matching {
+                            continue;
+                        }
+                        match crate::async_task_protocol::interrupted_evidence(
+                            self.ts().store(),
+                            &item.task,
+                            &identity,
+                            true,
+                        ) {
+                            Ok(Some(checks)) => {
+                                let mut next = item.clone();
+                                next.task
+                                    .hold_interrupted_failure()
+                                    .map_err(Error::Transition)?;
+                                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                                batch.checks.extend(checks);
+                                match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                                    Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                        self.deferred_recovery.extend(deferred);
+                                        continue 'scan;
+                                    }
+                                    Err(error) => return Err(task_store::Error::from(error).into()),
+                                }
+                            }
+                            Ok(None) => {
+                                let Ok(Some(checks)) =
+                                    crate::async_task_protocol::undispatched_interrupted_evidence(
+                                        self.ts().store(),
+                                        &item.task,
+                                        &identity,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                let mut next = item.clone();
+                                next.task
+                                    .fail("interrupted before dispatch".into())
+                                    .map_err(Error::Transition)?;
+                                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                                batch.checks.extend(checks);
+                                match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                                    Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                        self.deferred_recovery.extend(deferred);
+                                        continue 'scan;
+                                    }
+                                    Err(error) => return Err(task_store::Error::from(error).into()),
+                                }
+                            }
+                            Err(_) => continue,
+                        }
+                    }
                     self.finish_failed(
                         &item,
                         "interrupted: execution outcome requires reconciliation".into(),
@@ -6200,7 +6729,9 @@ impl Scheduler {
                 continue;
             }
             if matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
-                && (!snapshot.task.abort_requested() || snapshot.task.holds_restart_cleanup())
+                && (!snapshot.task.abort_requested()
+                    || snapshot.task.holds_restart_cleanup()
+                    || snapshot.task.holds_interrupted_cleanup())
                 && owned_graph_uncertain(owner.store(), snapshot.task.id())?
             {
                 // Do not turn an unproven graph into cancellation authority.
@@ -6251,6 +6782,223 @@ impl Scheduler {
                     request_abort_subtree(&self.ts(), snapshot.task.id())?;
                 }
                 return Ok(TickReservation::Progress(true));
+            }
+            if !live && snapshot.task.holds_interrupted_cleanup() {
+                let active = self
+                    .live_invocations
+                    .lock()
+                    .map_err(|_| Error::Poisoned)?
+                    .attempts
+                    .contains(&snapshot.task.id());
+                if active {
+                    continue;
+                }
+                let key = interrupted_receipt_key(snapshot.task.id());
+                if snapshot.task.abort_requested() {
+                    let mut next = snapshot.clone();
+                    next.task
+                        .cancel_interrupted_cleanup()
+                        .map_err(Error::Transition)?;
+                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                    if let Some(entry) = owner.store().get(&key).map_err(task_store::Error::from)? {
+                        batch.checks.push(durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        });
+                        batch
+                            .mutations
+                            .push(durable_store::Mutation::Delete { key });
+                    } else {
+                        batch.checks.push(durable_store::Check {
+                            key,
+                            expected: durable_store::Expected::Missing,
+                        });
+                    }
+                    match owner.store().commit_with_prefix_put_fence(
+                        &batch.checks,
+                        &batch.mutations,
+                        &[
+                            task_store::PREFIX,
+                            crate::ownership_edge::PREFIX,
+                            b"runtime/conversation/",
+                        ],
+                        graph_version,
+                    ) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                            return Ok(TickReservation::Progress(true));
+                        }
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
+                }
+                let Some(identity) = crate::async_task_protocol::interrupted_identity(
+                    owner.store(),
+                    snapshot.task.id(),
+                )
+                .map_err(|e| Error::Handler(e.to_string()))?
+                else {
+                    continue;
+                };
+                let Ok(reg) = self.registered(&snapshot.task) else {
+                    continue;
+                };
+                if reg.version != snapshot.task.definition_version()
+                    || reg.receipt_capture.as_ref().is_none_or(|capture| {
+                        capture.identity != identity
+                            || !capture.identity.matches(
+                                capture.executor.tool().as_ref(),
+                                &capture.implementation,
+                                capture.version,
+                            )
+                    })
+                {
+                    continue;
+                }
+                let Some(mut proof) = crate::async_task_protocol::interrupted_evidence(
+                    owner.store(),
+                    &snapshot.task,
+                    &identity,
+                    false,
+                )
+                .map_err(|e| Error::Handler(e.to_string()))?
+                else {
+                    let Some(checks) = crate::async_task_protocol::known_interrupted_evidence(
+                        owner.store(),
+                        &snapshot.task,
+                        &identity,
+                    )
+                    .map_err(|e| Error::Handler(e.to_string()))?
+                    else {
+                        continue;
+                    };
+                    let mut next = snapshot.clone();
+                    next.task
+                        .finish_interrupted_known()
+                        .map_err(Error::Transition)?;
+                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                    batch.checks.extend(checks);
+                    if let Some(entry) = owner.store().get(&key).map_err(task_store::Error::from)? {
+                        batch.checks.push(durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        });
+                        batch
+                            .mutations
+                            .push(durable_store::Mutation::Delete { key });
+                    } else {
+                        batch.checks.push(durable_store::Check {
+                            key,
+                            expected: durable_store::Expected::Missing,
+                        });
+                    }
+                    match owner.store().commit_with_prefix_put_fence(
+                        &batch.checks,
+                        &batch.mutations,
+                        &[
+                            task_store::PREFIX,
+                            crate::ownership_edge::PREFIX,
+                            b"runtime/conversation/",
+                        ],
+                        graph_version,
+                    ) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                            return Ok(TickReservation::Progress(true));
+                        }
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
+                };
+                let Ok(owner_checks) = interrupted_owner_checks(owner.store(), &snapshot.task)
+                else {
+                    continue;
+                };
+                proof.extend(owner_checks);
+                if snapshot.task.attempt_id().is_some() {
+                    let receipt = owner.store().get(&key).map_err(task_store::Error::from)?;
+                    let mut next = snapshot.clone();
+                    next.task
+                        .finish_interrupted_cleanup()
+                        .map_err(Error::Transition)?;
+                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                    batch.checks.extend(proof);
+                    if let Some(entry) = receipt {
+                        match interrupted_receipt_evidence(
+                            owner.store(),
+                            &snapshot.task,
+                            &identity,
+                            &entry,
+                        ) {
+                            Ok((_, checks)) => batch.checks.extend(checks),
+                            Err(_) => {
+                                batch.checks.push(durable_store::Check {
+                                    key: key.clone(),
+                                    expected: durable_store::Expected::Version(entry.version),
+                                });
+                                batch
+                                    .mutations
+                                    .push(durable_store::Mutation::Delete { key });
+                            }
+                        }
+                    } else {
+                        batch.checks.push(durable_store::Check {
+                            key,
+                            expected: durable_store::Expected::Missing,
+                        });
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = &self.reservation_commit_hook {
+                        hook(0, owner.store());
+                    }
+                    match owner.store().commit_with_prefix_put_fence(
+                        &batch.checks,
+                        &batch.mutations,
+                        &[
+                            task_store::PREFIX,
+                            crate::ownership_edge::PREFIX,
+                            b"runtime/conversation/",
+                        ],
+                        graph_version,
+                    ) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                            return Ok(TickReservation::Progress(true));
+                        }
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
+                }
+                let handler = reg.handler.clone();
+                let mut next = snapshot.clone();
+                next.task
+                    .start_interrupted_cleanup(Uuid::new_v4())
+                    .map_err(Error::Transition)?;
+                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                batch.checks.extend(proof);
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                match owner.store().commit_with_prefix_put_fence(
+                    &batch.checks,
+                    &batch.mutations,
+                    &[
+                        task_store::PREFIX,
+                        crate::ownership_edge::PREFIX,
+                        b"runtime/conversation/",
+                    ],
+                    graph_version,
+                ) {
+                    Ok(()) => (),
+                    Err(durable_store::Error::Conflict { .. }) => {
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(true));
+                    }
+                    Err(error) => return Err(task_store::Error::from(error).into()),
+                }
+                let running = self
+                    .ts()
+                    .load(snapshot.task.id())?
+                    .ok_or(Error::Ownership)?;
+                let invocation = self.make_invocation(running, handler, true)?;
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                drop(gate);
+                return Ok(TickReservation::Invocation(Box::new(invocation)));
             }
             if !live && snapshot.task.holds_restart_cleanup() {
                 let active = self
@@ -8140,6 +8888,15 @@ pub(crate) fn pending_abort_root_for_running(
     running: Uuid,
     include_background: bool,
 ) -> Result<Option<Uuid>, Error> {
+    pending_abort_root_excluding_self(ts, running, include_background, false)
+}
+
+pub(crate) fn pending_abort_root_excluding_self(
+    ts: &TaskStore<'_>,
+    running: Uuid,
+    include_background: bool,
+    exclude_self: bool,
+) -> Result<Option<Uuid>, Error> {
     let records = ts.list()?;
     let mut roots = Vec::new();
     for parent in &records {
@@ -8158,6 +8915,7 @@ pub(crate) fn pending_abort_root_for_running(
         }
         if matches!(parent.task.state(), TaskState::CompletingFailed(_))
             && !parent.task.abort_requested()
+            && !(exclude_self && parent.task.id() == running)
         {
             roots.push(parent.task.id());
         }

@@ -301,6 +301,90 @@ pub fn read_sealed_outcome_evidence(
     Err("sealed outcome evidence changed during read".into())
 }
 
+pub(crate) fn validate_interrupted_after_result(value: &serde_json::Value) -> Result<(), String> {
+    if serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > 60 * 1024 {
+        return Err("interrupted result exceeds limit".into());
+    }
+    let DurableTaskResult::Rich {
+        task_content_v1: result,
+    } = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?
+    else {
+        return Err("invalid interrupted result".into());
+    };
+    let gate = crate::runtime::ToolDiagnostic {
+        severity: crate::runtime::DiagnosticSeverity::Error,
+        code: Some("interrupted".into()),
+        message: "Tool was interrupted; external effects may be unknown".into(),
+    };
+    replay_safe::validate_content_hook_result(&result, Some(&gate), false)
+}
+/// Read supplemental interrupted-hook output only while the external outcome
+/// remains unresolved. This never replaces or finalizes sealed Tool evidence.
+pub fn read_interrupted_after_result(
+    store: &durable_store::Store,
+    task_id: uuid::Uuid,
+) -> Result<Option<DurableTaskResult>, String> {
+    for _ in 0..8 {
+        let Some(task) = crate::task_store::TaskStore::new(store)
+            .load(task_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        if !matches!(task.task.state(),crate::task::TaskState::Failed(reason) if reason=="interrupted: execution outcome requires reconciliation")
+            || !task.task.holds_interrupted_cleanup()
+        {
+            return Ok(None);
+        }
+        let identity = crate::async_task_protocol::interrupted_identity(store, task_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing interrupted identity")?;
+        if crate::async_task_protocol::interrupted_evidence(store, &task.task, &identity, false)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let key = format!("durable/async-task/interrupted-after/{task_id}");
+        let Some(entry) = store.get(key.as_bytes()).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let (value, mut checks) = crate::task_scheduler::interrupted_receipt_evidence(
+            store, &task.task, &identity, &entry,
+        )?;
+        checks.push(durable_store::Check {
+            key: crate::task_store::key(task_id),
+            expected: durable_store::Expected::Version(task.version),
+        });
+        match store.commit(&checks, &[]) {
+            Ok(()) => {
+                return serde_json::from_value(value)
+                    .map(Some)
+                    .map_err(|e| e.to_string());
+            }
+            Err(durable_store::Error::Conflict { .. }) => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("interrupted evidence changed during read".into())
+}
+struct InterruptedMemo(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl crate::extension::Memo for InterruptedMemo {
+    async fn get(&self, _: &str) -> Result<Option<serde_json::Value>, String> {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        Err("memo unavailable during interrupted cleanup".into())
+    }
+    async fn get_or_insert(
+        &self,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        Err("memo unavailable during interrupted cleanup".into())
+    }
+}
+
 /// Read the durable pre-after Tool outcome for reconciliation after shutdown.
 /// This is evidence only: it does not authorize dispatch or imply that the
 /// after hook completed, and must not be used as a finalized tool result.
@@ -396,6 +480,15 @@ impl DurableAsyncTool for UnavailablePlaceholder {
         _: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String> {
         Err("unavailable placeholder cannot execute".into())
+    }
+}
+
+/// The host attests that interrupted-after hooks are replay-safe, cooperative,
+/// and start no detached work; external Tool effects remain uncertain.
+pub struct InterruptedAfterAuthorization(());
+impl InterruptedAfterAuthorization {
+    pub fn host_attests_cleanup_safe() -> Self {
+        Self(())
     }
 }
 
@@ -576,6 +669,7 @@ impl StandaloneBeforeHookHost {
             hook_identity,
             hook,
             false,
+            false,
         )
     }
     /// Opt in to replay-safe after hooks. Hook code and configuration must be
@@ -598,6 +692,30 @@ impl StandaloneBeforeHookHost {
             hook_identity,
             hook,
             true,
+            false,
+        )
+    }
+    /// Opt in to one fenced after invocation for an interrupted sealed Tool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_tool_with_interrupted_after(
+        &mut self,
+        kind: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        implementation: &str,
+        version: u32,
+        hook_identity: &str,
+        hook: Arc<dyn crate::extension::Hook>,
+        _authorization: InterruptedAfterAuthorization,
+    ) -> Result<Arc<AsyncTaskTool>, String> {
+        self.register_tool_inner(
+            kind,
+            tool,
+            implementation,
+            version,
+            hook_identity,
+            hook,
+            true,
+            true,
         )
     }
     #[allow(clippy::too_many_arguments)] // Keep registration parameters explicit at this private boundary.
@@ -610,6 +728,7 @@ impl StandaloneBeforeHookHost {
         hook_identity: &str,
         hook: Arc<dyn crate::extension::Hook>,
         after: bool,
+        interrupted_after: bool,
     ) -> Result<Arc<AsyncTaskTool>, String> {
         let kind = kind.into();
         let (executor, identity) = self.scheduler.install_sealed_tool_with_hook(
@@ -619,6 +738,7 @@ impl StandaloneBeforeHookHost {
             version,
             Some((hook_identity.into(), hook)),
             after,
+            interrupted_after,
         )?;
         let handler: Arc<dyn crate::task_scheduler::Handler> = executor;
         let adapter = Arc::new(crate::task_tool::TaskTool::new(
@@ -726,6 +846,7 @@ impl StandaloneBeforeHookHost {
             &identity,
             Arc::new(SelectedBeforeHooks(resolved)),
             after,
+            false,
         )
     }
     /// Register a replay-safe durable Tool and one replay-safe hook. The hook
@@ -970,6 +1091,7 @@ impl crate::extension::Hook for SelectedBeforeHooks {
                         | "aborted"
                         | "restart_limit"
                         | "tool_unavailable"
+                        | "interrupted"
                 )
             )
         });
@@ -1000,6 +1122,8 @@ pub struct ToolIdentity {
     before_hook: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     after_hook: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    interrupted_after: bool,
 }
 impl ToolIdentity {
     pub fn new(
@@ -1022,6 +1146,7 @@ impl ToolIdentity {
             version,
             before_hook: None,
             after_hook: false,
+            interrupted_after: false,
         })
     }
 
@@ -1041,8 +1166,16 @@ impl ToolIdentity {
         self.after_hook
     }
 
+    pub(crate) fn with_interrupted_after(mut self) -> Self {
+        self.interrupted_after = true;
+        self
+    }
+    pub(crate) fn has_interrupted_after(&self) -> bool {
+        self.interrupted_after
+    }
     pub(crate) fn is_valid(&self) -> bool {
-        (!self.after_hook || self.before_hook.is_some())
+        (!self.interrupted_after || self.after_hook)
+            && (!self.after_hook || self.before_hook.is_some())
             && !self.implementation.is_empty()
             && self.implementation.len() <= 4096
             && self.version != 0
@@ -1311,6 +1444,102 @@ impl SealedExecutor {
 }
 
 impl crate::task_scheduler::Handler for SealedExecutor {
+    fn run_abort_with_admission(
+        &self,
+        task: &Task,
+        admission: &crate::task_scheduler::AdmissionHandle<'_>,
+        cancellation: Option<&pi_rs_core::CancellationToken>,
+    ) -> Result<crate::task_scheduler::Step, String> {
+        let cancellation = cancellation.ok_or("missing interrupted cancellation")?;
+        if cancellation.is_cancelled() {
+            return Err("interrupted cleanup cancelled".into());
+        }
+        if !task.holds_interrupted_cleanup() || !self.identity.has_interrupted_after() {
+            return Err("interrupted cleanup not authorized".into());
+        }
+        let _identity_lease =
+            crate::nested_identity::checked_lease(&self.tool, &self.implementation)
+                .map_err(|_| "sealed identity unavailable or changed")?;
+        if let Some(value) = admission.interrupted_hook_receipt(self, &self.identity, None)? {
+            validate_interrupted_after_result(&value)?;
+            return Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::Value::Null,
+            ));
+        }
+        let args = self.checkpoint_arguments(task)?;
+        if serde_json::to_vec(&args).map_err(|e| e.to_string())?.len() > 60 * 1024 {
+            return Err("interrupted hook arguments exceed limit".into());
+        }
+        let gate = crate::runtime::ToolDiagnostic {
+            severity: crate::runtime::DiagnosticSeverity::Error,
+            code: Some("interrupted".into()),
+            message: "Tool was interrupted; external effects may be unknown".into(),
+        };
+        let initial = crate::extension::ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text","text":gate.message})],
+            diagnostics: vec![gate.clone()],
+            extra: [("isError".into(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        };
+        let memo = InterruptedMemo(std::sync::atomic::AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let result = rt.block_on(async {
+            let call = crate::extension::ToolCall {
+                name: self.identity.spec.name.clone(),
+                arguments: args,
+            };
+            let snapshot = serde_json::Value::Null;
+            let ctx = crate::extension::Context {
+                snapshot: &snapshot,
+                memo: &memo,
+            };
+            let mut registry = crate::extension::Registry::default();
+            registry
+                .install(crate::extension::Extension {
+                    name: "interrupted".into(),
+                    hooks: vec![self.before_hook.as_ref().ok_or("missing hook")?.clone()],
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())?;
+            let selected=registry.snapshot().resolve(None);
+            tokio::select! { biased;
+                _=cancellation.cancelled()=>Err("interrupted cleanup cancelled".to_string()),
+                result=selected.after_tool_blocks_checked(&call,initial,true,&ctx,
+                    |candidate|replay_safe::validate_content_hook_result(candidate,Some(&gate),true),
+                    |candidate|replay_safe::validate_content_hook_result(candidate,Some(&gate),false))=>result,
+            }
+        })?;
+        if memo.0.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("interrupted hook used unavailable memo".into());
+        }
+        let value = serde_json::to_value(DurableTaskResult::Rich {
+            task_content_v1: result,
+        })
+        .map_err(|e| e.to_string())?;
+        validate_interrupted_after_result(&value)?;
+        if cancellation.is_cancelled() {
+            return Err("interrupted cleanup cancelled".into());
+        }
+        admission.interrupted_hook_receipt(self, &self.identity, Some(&value))?;
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os("PI_TEST_INTERRUPTED_AFTER_RECEIPT") {
+            std::fs::write(
+                std::path::PathBuf::from(dir).join("interrupted-receipt"),
+                b"yes",
+            )
+            .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        Ok(crate::task_scheduler::Step::Succeed(
+            serde_json::Value::Null,
+        ))
+    }
     fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
         Err("sealed executor requires its driver-owned task reservation".into())
     }
@@ -10250,6 +10479,638 @@ mod tests {
                 .count(),
             1
         );
+    }
+    struct InterruptedAfterFixture(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for InterruptedAfterFixture {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            if !input
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("interrupted") && d.message.contains("unknown"))
+                || input.extra.get("isError") != Some(&json!(true))
+            {
+                return Err("missing interrupted status".into());
+            }
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("interrupted-hook-count"))
+                .map_err(|e| e.to_string())?;
+            writeln!(file, "hook").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            if self.0.join("interrupted-memo").exists() {
+                let _ = ctx
+                    .memo
+                    .get_or_insert("interrupted-write", json!(true))
+                    .await;
+            }
+            if self.0.join("interrupted-pause").exists() {
+                std::fs::write(self.0.join("interrupted-ready"), b"yes")
+                    .map_err(|e| e.to_string())?;
+                while !self.0.join("interrupted-release").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+            let mut out = input.clone();
+            out.output = vec![json!({"type":"text","text":"interrupted after hook"})];
+            Ok(Some(out))
+        }
+    }
+    fn interrupted_host(
+        root: &std::path::Path,
+        tool: Arc<dyn Tool>,
+        hook_identity: &str,
+    ) -> StandaloneBeforeHookHost {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
+        let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
+        let adapter = host
+            .register_tool_with_interrupted_after(
+                "leaf",
+                tool,
+                "backend",
+                1,
+                hook_identity,
+                Arc::new(InterruptedAfterFixture(root.to_owned())),
+                InterruptedAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        assert!(cell.set(adapter).is_ok());
+        host
+    }
+    #[test]
+    fn interrupted_after_fixture() {
+        let Ok(root) = std::env::var("PI_RS_INTERRUPTED_FIXTURE") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.clone()));
+        let binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let scheduler = interrupted_host(&root, tool, "hook-v1").into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        wait_file(&root.join("unsafe-ready"));
+        let task = driver.get(parent.id()).unwrap().unwrap();
+        let child: AsyncTaskCall = serde_json::from_value(task.checkpoint().data.clone()).unwrap();
+        std::fs::write(root.join("parent-id"), parent.id().to_string()).unwrap();
+        std::fs::write(root.join("child-id"), child.task_id().to_string()).unwrap();
+        loop {
+            std::hint::black_box((&driver, &binding));
+            std::thread::park();
+        }
+    }
+    fn interrupted_kill_tool(root: &std::path::Path) -> (Uuid, Uuid) {
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::interrupted_after_fixture")
+            .env("PI_RS_INTERRUPTED_FIXTURE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("child-id"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        (
+            std::fs::read_to_string(root.join("parent-id"))
+                .unwrap()
+                .parse()
+                .unwrap(),
+            std::fs::read_to_string(root.join("child-id"))
+                .unwrap()
+                .parse()
+                .unwrap(),
+        )
+    }
+    #[test]
+    fn interrupted_after_keeps_external_outcome_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (parent, child) = interrupted_kill_tool(root);
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = interrupted_host(root, tool, "hook-v1").into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, parent).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(matches!(
+            read_sealed_outcome_evidence(&store, child).unwrap(),
+            Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+        ));
+        let Some(DurableTaskResult::Rich {
+            task_content_v1: result,
+        }) = read_interrupted_after_result(&store, child).unwrap()
+        else {
+            panic!(
+                "missing interrupted receipt: child={:?}, keys={:?}, hook={:?}",
+                crate::task_store::TaskStore::new(&store)
+                    .load(child)
+                    .unwrap(),
+                store
+                    .list(b"durable/async-task/")
+                    .unwrap()
+                    .iter()
+                    .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
+                    .collect::<Vec<_>>(),
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+            )
+        };
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("interrupted") && d.message.contains("unknown"))
+        );
+        assert_eq!(result.extra["isError"], json!(true));
+        assert_eq!(
+            std::fs::read_to_string(root.join("unsafe-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("interrupted-hook-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn interrupted_after_abort_and_memo_fail_closed() {
+        for abort in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (_, child) = interrupted_kill_tool(root);
+            std::fs::write(
+                root.join(if abort {
+                    "interrupted-pause"
+                } else {
+                    "interrupted-memo"
+                }),
+                b"yes",
+            )
+            .unwrap();
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let driver = interrupted_host(root, tool, "hook-v1").into_driver();
+            if abort {
+                wait_file(&root.join("interrupted-ready"));
+                driver.request_abort(child).unwrap();
+            }
+            let task = wait_terminal(&driver, child);
+            if abort {
+                assert!(matches!(task.state(), crate::task::TaskState::Cancelled));
+            } else {
+                assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+            }
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            assert!(matches!(
+                read_sealed_outcome_evidence(&store, child).unwrap(),
+                Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+            ));
+            assert!(
+                read_interrupted_after_result(&store, child)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .list(format!("runtime/extension-memo/{child}/").as_bytes())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+    #[test]
+    fn interrupted_after_waits_for_matching_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (parent, child) = interrupted_kill_tool(root);
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, CheckpointParent(cell, false)));
+        let driver = StandaloneBeforeHookHost::open(root.join("db"), registry)
+            .unwrap()
+            .into_driver();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!driver.get(child).unwrap().unwrap().is_terminal());
+        let _ = driver.shutdown_with_pending().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = interrupted_host(root, tool, "hook-v2").into_driver();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!driver.get(child).unwrap().unwrap().is_terminal());
+        assert!(!root.join("interrupted-hook-count").exists());
+        let _ = driver.shutdown_with_pending().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = interrupted_host(root, tool, "hook-v1").into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, parent).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    #[test]
+    fn interrupted_after_late_raw_and_final_receipts_win() {
+        for final_receipt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (_, child) = interrupted_kill_tool(root);
+            std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            wait_file(&root.join("interrupted-ready"));
+            let intent = crate::async_task_protocol::load_intent(owner.store(), child).unwrap();
+            let outcome = Outcome::Succeeded("late evidence".into());
+            let batch = if final_receipt {
+                crate::async_task_protocol::prepare_receipt(owner.store(), &intent, &outcome)
+            } else {
+                crate::async_task_protocol::prepare_raw_result(owner.store(), &intent, &outcome)
+            }
+            .unwrap();
+            owner
+                .store()
+                .commit(&batch.checks, &batch.mutations)
+                .unwrap();
+            std::fs::write(root.join("interrupted-release"), b"yes").unwrap();
+            assert!(matches!(
+                wait_terminal(&driver, child).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            let evidence = read_sealed_outcome_evidence(owner.store(), child).unwrap();
+            if final_receipt {
+                assert!(matches!(
+                    evidence,
+                    Some(SealedOutcomeEvidence::Final(Outcome::Succeeded(_)))
+                ));
+            } else {
+                assert!(matches!(
+                    evidence,
+                    Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Succeeded(
+                        _
+                    )))
+                ));
+            }
+            assert!(
+                read_interrupted_after_result(owner.store(), child)
+                    .unwrap()
+                    .is_none()
+            );
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+    #[test]
+    fn interrupted_after_recovery_fixture() {
+        let Ok(root) = std::env::var("PI_RS_INTERRUPTED_RECOVERY_FIXTURE") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.clone()));
+        let binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = interrupted_host(&root, tool, "hook-v1").into_driver();
+        loop {
+            std::hint::black_box((&driver, &binding));
+            std::thread::park();
+        }
+    }
+    #[test]
+    fn interrupted_after_crash_before_and_after_receipt() {
+        for after_receipt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (_, child) = interrupted_kill_tool(root);
+            if !after_receipt {
+                std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("async_task_tool::tests::interrupted_after_recovery_fixture")
+                .env("PI_RS_INTERRUPTED_RECOVERY_FIXTURE", root);
+            if after_receipt {
+                command.env("PI_TEST_INTERRUPTED_AFTER_RECEIPT", root);
+            }
+            let mut process = command.spawn().unwrap();
+            wait_file(&root.join(if after_receipt {
+                "interrupted-receipt"
+            } else {
+                "interrupted-ready"
+            }));
+            process.kill().unwrap();
+            process.wait().unwrap();
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let driver = interrupted_host(root, tool, "hook-v1").into_driver();
+            assert!(matches!(
+                wait_terminal(&driver, child).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            assert!(matches!(
+                read_sealed_outcome_evidence(&store, child).unwrap(),
+                Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+            ));
+            assert_eq!(
+                read_interrupted_after_result(&store, child)
+                    .unwrap()
+                    .is_some(),
+                after_receipt
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn interrupted_after_receipt_arrives_during_failure_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (_, child) = interrupted_kill_tool(root);
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::interrupted_after_recovery_fixture")
+            .env("PI_RS_INTERRUPTED_RECOVERY_FIXTURE", root)
+            .env("PI_TEST_INTERRUPTED_AFTER_RECEIPT", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("interrupted-receipt"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let mut scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+        let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = injected.clone();
+        scheduler.set_reservation_commit_hook(Arc::new(move |_, store| {
+            if !marker.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let intent = crate::async_task_protocol::load_intent(store, child).unwrap();
+                let batch = crate::async_task_protocol::prepare_raw_result(
+                    store,
+                    &intent,
+                    &Outcome::Succeeded("racing raw".into()),
+                )
+                .unwrap();
+                store.commit(&batch.checks, &batch.mutations).unwrap();
+            }
+        }));
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert!(matches!(
+            wait_terminal(&driver, child).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert!(injected.load(std::sync::atomic::Ordering::SeqCst));
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(matches!(
+            read_sealed_outcome_evidence(&store, child).unwrap(),
+            Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Succeeded(
+                _
+            )))
+        ));
+        assert!(
+            read_interrupted_after_result(&store, child)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("interrupted-hook-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn interrupted_after_crash_before_intent_is_not_dispatched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::interrupted_after_fixture")
+            .env("PI_RS_INTERRUPTED_FIXTURE", root)
+            .env("PI_TEST_INTERRUPTED_BEFORE_INTENT", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("before-intent"));
+        let child: Uuid = std::fs::read_to_string(root.join("before-intent"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = interrupted_host(root, tool, "hook-v1").into_driver();
+        assert!(
+            matches!(wait_terminal(&driver, child).state(), crate::task::TaskState::Failed(reason) if reason == "interrupted before dispatch")
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(matches!(
+            read_sealed_outcome_evidence(&store, child).unwrap(),
+            Some(SealedOutcomeEvidence::NotDispatched)
+        ));
+        assert!(
+            read_interrupted_after_result(&store, child)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!root.join("interrupted-hook-count").exists());
+        assert!(!root.join("unsafe-invocations").exists());
+    }
+    #[test]
+    fn interrupted_after_live_settlement_rechecks_graph_and_receipt_conflicts() {
+        for receipt_race in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (parent, child) = interrupted_kill_tool(root);
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let mut scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+            let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let marker = injected.clone();
+            scheduler.set_reservation_commit_hook(Arc::new(move |_, store| {
+                if marker.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                if receipt_race {
+                    let intent = crate::async_task_protocol::load_intent(store, child).unwrap();
+                    let batch = crate::async_task_protocol::prepare_raw_result(
+                        store,
+                        &intent,
+                        &Outcome::Succeeded("live racing raw".into()),
+                    )
+                    .unwrap();
+                    store.commit(&batch.checks, &batch.mutations).unwrap();
+                } else {
+                    let key = crate::task_store::key(parent);
+                    let entry = store.get(&key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: entry.value,
+                            }],
+                        )
+                        .unwrap();
+                }
+            }));
+            let driver = crate::task_driver::Driver::start(scheduler);
+            assert!(matches!(
+                wait_terminal(&driver, child).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            let _ = driver.shutdown_with_pending().unwrap();
+            assert!(injected.load(std::sync::atomic::Ordering::SeqCst));
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            if receipt_race {
+                assert!(matches!(
+                    read_sealed_outcome_evidence(&store, child).unwrap(),
+                    Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Succeeded(
+                        _
+                    )))
+                ));
+                assert!(
+                    read_interrupted_after_result(&store, child)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(matches!(
+                    read_sealed_outcome_evidence(&store, child).unwrap(),
+                    Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+                ));
+                assert!(
+                    read_interrupted_after_result(&store, child)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn interrupted_after_blocking_settlement_retains_conflicted_invocation() {
+        for receipt_race in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (parent, child) = interrupted_kill_tool(root);
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let mut scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+            let invocation = loop {
+                match scheduler.reserve_tick(0).unwrap() {
+                    crate::task_scheduler::TickReservation::Invocation(invocation) => {
+                        break invocation;
+                    }
+                    crate::task_scheduler::TickReservation::Progress(true) => continue,
+                    _ => panic!("expected interrupted cleanup reservation"),
+                }
+            };
+            let completed = invocation.execute().unwrap();
+            let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let marker = injected.clone();
+            scheduler.set_reservation_commit_hook(Arc::new(move |_, store| {
+                if marker.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                if receipt_race {
+                    let intent = crate::async_task_protocol::load_intent(store, child).unwrap();
+                    let batch = crate::async_task_protocol::prepare_raw_result(
+                        store,
+                        &intent,
+                        &Outcome::Succeeded("blocking racing raw".into()),
+                    )
+                    .unwrap();
+                    store.commit(&batch.checks, &batch.mutations).unwrap();
+                } else {
+                    let key = crate::task_store::key(parent);
+                    let entry = store.get(&key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: entry.value,
+                            }],
+                        )
+                        .unwrap();
+                }
+            }));
+            let completed = match scheduler.settle_invocation(completed) {
+                Err(crate::task_scheduler::SettlementError::Pending { completed }) => *completed,
+                other => panic!("expected retained invocation, got {other:?}"),
+            };
+            assert!(scheduler.settle_invocation(completed).unwrap());
+            assert!(injected.load(std::sync::atomic::Ordering::SeqCst));
+            let owner = scheduler.owner();
+            if receipt_race {
+                assert!(matches!(
+                    read_sealed_outcome_evidence(owner.store(), child).unwrap(),
+                    Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Succeeded(
+                        _
+                    )))
+                ));
+                assert!(
+                    read_interrupted_after_result(owner.store(), child)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(matches!(
+                    read_sealed_outcome_evidence(owner.store(), child).unwrap(),
+                    Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+                ));
+                assert!(
+                    read_interrupted_after_result(owner.store(), child)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
     }
     struct SuppressGate;
     #[async_trait::async_trait]

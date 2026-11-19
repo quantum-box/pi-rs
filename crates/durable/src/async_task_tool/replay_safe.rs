@@ -437,7 +437,7 @@ pub(super) fn validate_content_hook_result(
             || !result.diagnostics.contains(gate)
             || (matches!(
                 gate.code.as_deref(),
-                Some("aborted" | "restart_limit" | "tool_unavailable")
+                Some("aborted" | "restart_limit" | "tool_unavailable" | "interrupted")
             ) && (result.extra.contains_key("structuredOutput")
                 || result.extra.contains_key("attachments"))))
     {
@@ -1097,6 +1097,7 @@ impl Handler for Executor {
         &self,
         task: &Task,
         admission: &AdmissionHandle<'_>,
+        _cancellation: Option<&pi_rs_core::CancellationToken>,
     ) -> Result<Step, String> {
         if task.holds_restart_cleanup() {
             return self.run_with_restart_cleanup(task, admission);

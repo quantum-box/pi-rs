@@ -153,6 +153,8 @@ macro_rules! declare_task_schema {
             /// The abort mark was issued by restart-failure child drainage.
             #[serde(default, skip_serializing_if = "task_tool_is_false")]
             restart_internal_abort: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            interrupted_dispatch_attempt: Option<Uuid>,
         }
     };
 }
