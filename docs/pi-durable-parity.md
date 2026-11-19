@@ -394,7 +394,12 @@ hook-transformed result are stored separately and checked before the intermediat
 wakes and when completed siblings are included in a later park. Older records without a
 final projection retain the original exact-match check. Before-tool hooks run
 before intent and are not repeated on a child wake; the ordered result hooks
-finish before the intermediate wakes. A crash before hook-result commit can
+finish before the intermediate wakes. During an any wait, a staged terminal
+poll ends the current poll round: remaining inline poll futures are dropped and
+their cancellation guards run before the result hooks start. A slow sibling
+therefore does not delay hook finalization or the early wake; its accepted job
+remains pending and can be polled again after re-parking. This does not cancel
+the external job or join work detached by a tool implementation. A crash before hook-result commit can
 repeat hooks; durable per-operation memos preserve decisions but cannot make
 external side effects exactly once. Hosts must keep extension and tool
 registrations compatible across reopen. Memo operations and result publication

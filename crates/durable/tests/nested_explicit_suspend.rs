@@ -6667,3 +6667,361 @@ async fn mixed_any_reconciled_hook_recovers_after_process_loss() {
     );
     scheduler.shutdown().await.unwrap();
 }
+
+struct StagedAnyHook {
+    active: Arc<AtomicUsize>,
+    entered: Arc<AtomicUsize>,
+    hold: bool,
+}
+
+struct VerifyStagedAnyMiddle {
+    active: Arc<AtomicUsize>,
+    wakes: Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>,
+}
+#[async_trait]
+impl KeyedTool for VerifyStagedAnyMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if host.pending_wake().is_some() {
+            assert_eq!(self.active.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                host.call_keyed_unpolled("a", "child", json!({"job":"a"}))
+                    .await,
+                Outcome::Succeeded("hook:done".into())
+            );
+        }
+        AnyMiddle(self.wakes.clone())
+            .invoke(args, context, state, host)
+            .await
+    }
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for StagedAnyHook {
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        assert_eq!(
+            self.active.load(Ordering::SeqCst),
+            0,
+            "sibling poll must stop before hook"
+        );
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        if self.hold {
+            std::future::pending::<()>().await;
+        }
+        Ok(Some(json!(format!("hook:{}", result.as_str().unwrap()))))
+    }
+}
+
+fn staged_any_options(
+    active: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+    wakes: Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>,
+    release_a: Arc<std::sync::atomic::AtomicBool>,
+) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(VerifyStagedAnyMiddle {
+                active: active.clone(),
+                wakes,
+            }))
+            .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(AnyHangingPoll {
+                    in_flight: active,
+                    invoked: calls,
+                    release_a,
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+
+async fn staged_any_case(abort_in_hook: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let options = staged_any_options(
+        active.clone(),
+        calls.clone(),
+        wakes.clone(),
+        release.clone(),
+    );
+    let registry = hook_registry(Arc::new(StagedAnyHook {
+        active: active.clone(),
+        entered: entered.clone(),
+        hold: abort_in_hook,
+    }));
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.path().join("db"), options, registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| active.load(Ordering::SeqCst) == 1).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs
+        .iter()
+        .find(|job| job.reference == "a")
+        .unwrap()
+        .clone();
+    let b = jobs
+        .iter()
+        .find(|job| job.reference == "b")
+        .unwrap()
+        .clone();
+    release.store(true, Ordering::SeqCst);
+    until(|| entered.load(Ordering::SeqCst) == 1).await;
+    if abort_in_hook {
+        scheduler.abort(id).unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.conversation(id).unwrap().abort_requested);
+        assert!(wakes.lock().unwrap().is_empty());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        scheduler.shutdown().await.unwrap();
+        let options = staged_any_options(
+            active.clone(),
+            calls.clone(),
+            wakes.clone(),
+            release.clone(),
+        );
+        let registry = hook_registry(Arc::new(StagedAnyHook {
+            active: active.clone(),
+            entered: entered.clone(),
+            hold: false,
+        }));
+        let mut reopened =
+            Scheduler::open_with_extensions(dir.path().join("db"), options, registry).unwrap();
+        wait(&mut reopened, id).await;
+        assert!(reopened.conversation(id).unwrap().abort_requested);
+        assert!(wakes.lock().unwrap().is_empty());
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        reopened.shutdown().await.unwrap();
+    } else {
+        until(|| !wakes.lock().unwrap().is_empty()).await;
+        assert_eq!(*wakes.lock().unwrap(), vec![vec![a.operation_id]]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A's hook completed and only B remains unresolved after the repark.
+        until(|| {
+            scheduler
+                .conversation(id)
+                .is_ok_and(|c| c.nested_suspended())
+        })
+        .await;
+        assert_eq!(scheduler.nested_pending_jobs(id, root).unwrap(), vec![b]);
+        scheduler.abort(id).unwrap();
+        scheduler.shutdown().await.unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn any_staged_poll_retires_slow_sibling_before_hook_and_wake() {
+    staged_any_case(false).await;
+}
+#[tokio::test]
+async fn abort_after_staged_any_poll_during_hook_fences_wake_after_reopen() {
+    staged_any_case(true).await;
+}
+
+struct DiskStagedAnyPoll(std::path::PathBuf);
+struct DiskPollGuard(std::path::PathBuf);
+impl Drop for DiskPollGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+#[async_trait]
+impl Tool for DiskStagedAnyPoll {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        use std::io::Write;
+        let job = args["job"].as_str().unwrap();
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("dispatches"))
+                .unwrap(),
+            "{job}"
+        )
+        .unwrap();
+        Outcome::Pending {
+            reference: job.into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        if reference == "a" {
+            while !self.0.join("b-poll-active").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return Some(Outcome::Succeeded("a raw".into()));
+        }
+        let marker = self.0.join("b-poll-active");
+        std::fs::write(&marker, b"yes").unwrap();
+        let _guard = DiskPollGuard(marker);
+        std::future::pending().await
+    }
+}
+struct DiskStagedAnyHook(std::path::PathBuf);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for DiskStagedAnyHook {
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        context: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        use std::io::Write;
+        assert!(
+            !self.0.join("b-poll-active").exists(),
+            "sibling poll still active"
+        );
+        let candidate = if self.0.join("release-hook").exists() {
+            "later"
+        } else {
+            "first"
+        };
+        let memo = context
+            .memo
+            .get_or_insert("staged-any", json!(candidate))
+            .await?;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("hook-attempts"))
+                .unwrap(),
+            "{}:{}",
+            memo.as_str().unwrap(),
+            result.as_str().unwrap()
+        )
+        .unwrap();
+        if !self.0.join("release-hook").exists() {
+            std::fs::write(self.0.join("hook-entered"), b"yes").unwrap();
+            std::future::pending::<()>().await;
+        }
+        Ok(Some(json!(format!("hook:{}", result.as_str().unwrap()))))
+    }
+}
+fn disk_staged_any_open(path: &std::path::Path) -> Scheduler {
+    let mut options = any_disk_options(path);
+    options.tools[2] = RegisteredTool {
+        tool: Arc::new(DiskStagedAnyPoll(path.into())),
+        replay: ReplayPolicy::Unsafe,
+    };
+    Scheduler::open_with_extensions(
+        path.join("db"),
+        options,
+        hook_registry(Arc::new(DiskStagedAnyHook(path.into()))),
+    )
+    .unwrap()
+}
+#[tokio::test]
+async fn staged_any_poll_crash_worker() {
+    let Some(path) = std::env::var_os("PI_STAGED_ANY_POLL_CRASH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let mut scheduler = disk_staged_any_open(&path);
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(path.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn staged_any_poll_crash_replays_hook_then_wakes_without_redispatch() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "staged_any_poll_crash_worker"])
+            .env("PI_STAGED_ANY_POLL_CRASH", path)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| path.join("hook-entered").exists()).await;
+    assert!(!path.join("b-poll-active").exists());
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(path.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(path.join("release-hook"), b"yes").unwrap();
+    let mut scheduler = disk_staged_any_open(path);
+    until(|| path.join("wakes").exists()).await;
+    assert_eq!(
+        std::fs::read_to_string(path.join("hook-attempts")).unwrap(),
+        "first:a raw\nfirst:a raw\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("dispatches")).unwrap(),
+        "a\nb\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("wakes"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    scheduler.abort(id).unwrap();
+    scheduler.shutdown().await.unwrap();
+    assert!(!path.join("b-poll-active").exists());
+}

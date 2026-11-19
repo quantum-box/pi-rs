@@ -22642,6 +22642,15 @@ async fn poll_suspended_nested(
             _ = cancel.cancelled() => return Ok(gates_woken),
             _ = tokio::time::sleep(Duration::from_millis(100)), if gate_scan => {
                 if any_park {
+                    // A terminal poll with hooks is staged, so it cannot make
+                    // the any-wait ready until the hook chain commits. Drop
+                    // the joined poll futures before returning: they are
+                    // polled inline, so dropping them synchronously retires
+                    // every other poll and its child cancellation guard. The
+                    // next round finalizes the staged result before wake.
+                    if crate::nested::has_staged_results(worker.owner.store(), *operation_id)? {
+                        return Ok(true);
+                    }
                     match worker.prepare_nested_resume(&mut state.clone()) {
                         Ok(NestedResumeDecision::Ready) => return Ok(true),
                         Ok(NestedResumeDecision::Busy) if crate::nested::has_frozen_any(worker.owner.store(), id, *operation_id)? => return Ok(true),
