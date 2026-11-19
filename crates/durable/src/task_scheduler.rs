@@ -1463,6 +1463,17 @@ impl DetachedInvocation {
         implementation: &str,
         version: u32,
     ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
+        self.check_or_commit_unhooked_intent(identity, tool, implementation, version, true)
+    }
+
+    fn check_or_commit_unhooked_intent(
+        &self,
+        identity: &crate::async_task_tool::ToolIdentity,
+        tool: &dyn pi_rs_core::Tool,
+        implementation: &str,
+        version: u32,
+        commit: bool,
+    ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
         use crate::async_task_protocol::Error as ProtocolError;
         if self.abort
             || self.validator.is_some()
@@ -1515,6 +1526,8 @@ impl DetachedInvocation {
             || state.handler_failed
             || self.lease.retired
             || !state.attempts.contains(&self.running.task.id())
+            || state.leases.get(&self.lease.id)
+                != Some(&(self.lease.token, self.running.task.attempt_id()))
             || state
                 .published
                 .iter()
@@ -1537,7 +1550,27 @@ impl DetachedInvocation {
         }
         let (intent, batch) =
             crate::async_task_protocol::prepare_intent(owner.store(), &self.running, identity)?;
-        owner.store().commit(&batch.checks, &batch.mutations)?;
+        let definitions = self
+            .definitions
+            .read()
+            .map_err(|_| ProtocolError::Invalid)?;
+        let registered = self
+            .running
+            .task
+            .kind()
+            .and_then(|kind| definitions.registry.entries.get(kind))
+            .and_then(|entry| entry.receipt_capture.as_ref())
+            .ok_or(ProtocolError::Invalid)?;
+        if !self
+            .receipt_capture
+            .as_ref()
+            .is_some_and(|captured| Arc::ptr_eq(captured, registered))
+        {
+            return Err(ProtocolError::Invalid);
+        }
+        owner
+            .store()
+            .commit(&batch.checks, if commit { &batch.mutations } else { &[] })?;
         Ok(intent)
     }
 
@@ -1651,7 +1684,44 @@ impl DetachedInvocation {
         } else {
             None
         };
-        let intent = if let Some(capture) = &self.receipt_capture {
+        let preflight = self.receipt_capture.as_ref().is_some_and(|capture| {
+            capture.executor.has_before_hook() && self.running.task.checkpoint().phase == "initial"
+        });
+        if preflight {
+            let capture = self.receipt_capture.as_ref().expect("preflight capture");
+            if self
+                .check_or_commit_unhooked_intent(
+                    &capture.identity,
+                    capture.executor.tool().as_ref(),
+                    &capture.implementation,
+                    capture.version,
+                    false,
+                )
+                .is_err()
+            {
+                if self
+                    .unhooked_cancellation
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                    || self.abort_precedes_unhooked_dispatch()?
+                {
+                    return self.release_undispatched();
+                }
+                return Err(Error::Handler("preflight authorization rejected".into()));
+            }
+        }
+        let prepared = match &self.receipt_capture {
+            Some(capture) if capture.executor.has_before_hook() && !preflight => Some(
+                capture
+                    .executor
+                    .checkpoint_arguments(&self.running.task)
+                    .map_err(Error::Handler)?,
+            ),
+            _ => None,
+        };
+        let intent = if preflight {
+            None
+        } else if let Some(capture) = &self.receipt_capture {
             #[cfg(test)]
             if let Some(before) = &capture.before_intent {
                 before();
@@ -1724,10 +1794,13 @@ impl DetachedInvocation {
             documents.set_input_validator(validator.as_ref());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match (&receipt_capture, &intent, &unhooked_cancellation) {
+                    (Some(capture), None, Some(cancel)) if preflight => {
+                        capture.executor.preflight(&running.task, cancel)
+                    }
                     (Some(capture), Some(intent), Some(cancel)) => {
                         capture
                             .executor
-                            .run(&running.task, intent, owner.store(), cancel)
+                            .run(&running.task, intent, owner.store(), cancel, prepared)
                     }
                     (Some(_), None, Some(_)) => Ok(Step::Fail("aborted before dispatch".into())),
                     (None, None, None) => {
@@ -3543,13 +3616,33 @@ impl Scheduler {
         ),
         String,
     > {
+        self.install_sealed_tool_with_hook(kind, tool, implementation, version, None)
+    }
+
+    pub(crate) fn install_sealed_tool_with_hook(
+        &mut self,
+        kind: String,
+        tool: Arc<dyn pi_rs_core::Tool>,
+        implementation: &str,
+        version: u32,
+        hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
+    ) -> Result<
+        (
+            Arc<crate::async_task_tool::SealedExecutor>,
+            crate::async_task_tool::ToolIdentity,
+        ),
+        String,
+    > {
         if self.validator.is_some() || kind.is_empty() {
             return Err("sealed tool requires a standalone scheduler and task kind".into());
         }
         let _identity_lease = crate::nested_identity::checked_lease(&tool, implementation)
             .map_err(|_| "tool identity is missing, busy, or changed")?;
-        let identity =
+        let mut identity =
             crate::async_task_tool::ToolIdentity::new(tool.as_ref(), implementation, version)?;
+        if let Some((id, _)) = &hook {
+            identity = identity.with_before_hook(id.clone())?;
+        }
         if serde_json::to_vec(&identity)
             .map_err(|e| e.to_string())?
             .len()
@@ -3562,6 +3655,7 @@ impl Scheduler {
             identity.clone(),
             implementation.into(),
             version,
+            hook.map(|(_, hook)| hook),
         ));
         let handler: Arc<dyn Handler> = executor.clone();
         let mut registry = self.registry.clone();

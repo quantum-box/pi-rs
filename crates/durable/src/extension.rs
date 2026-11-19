@@ -509,6 +509,38 @@ pub struct Extension {
     pub tasks: Vec<(String, Arc<dyn crate::task_scheduler::Handler>)>,
 }
 
+/// Host assertion for one extension implementation and its configuration.
+/// The fingerprint and hook identifiers must not contain secrets. The host
+/// must change them whenever behavior, configuration, or hook order changes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionIdentity {
+    version: u32,
+    fingerprint: String,
+    hooks: Vec<String>,
+}
+impl ExtensionIdentity {
+    pub fn new(version: u32, fingerprint: String, hooks: Vec<String>) -> Result<Self, String> {
+        let identity = Self {
+            version,
+            fingerprint,
+            hooks,
+        };
+        if !identity.valid() {
+            return Err("invalid extension or hook identity".into());
+        }
+        Ok(identity)
+    }
+    fn valid(&self) -> bool {
+        let valid = |s: &str| !s.trim().is_empty() && s.len() <= 4096;
+        self.version != 0
+            && valid(&self.fingerprint)
+            && self.hooks.len() <= 256
+            && self.hooks.iter().all(|s| valid(s))
+            && self.hooks.iter().collect::<HashSet<_>>().len() == self.hooks.len()
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RegistryError {
     #[error("extension name must not be empty")]
@@ -529,9 +561,22 @@ pub enum RegistryError {
 pub struct Registry {
     current: Snapshot,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Snapshot {
     extensions: Vec<Arc<Extension>>,
+    epoch: uuid::Uuid,
+    registration_ids: Vec<uuid::Uuid>,
+    stable_ids: Vec<Option<ExtensionIdentity>>,
+}
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            extensions: Vec::new(),
+            epoch: uuid::Uuid::new_v4(),
+            registration_ids: Vec::new(),
+            stable_ids: Vec::new(),
+        }
+    }
 }
 impl Registry {
     pub fn snapshot(&self) -> Snapshot {
@@ -539,12 +584,37 @@ impl Registry {
     }
     /// Validate the entire candidate before publishing; replacement keeps position.
     pub fn install(&mut self, extension: Extension) -> Result<(), RegistryError> {
+        self.install_inner(extension, None)
+    }
+    /// Opt in to host-declared recovery identity for this exact registration.
+    pub fn install_identified(
+        &mut self,
+        extension: Extension,
+        identity: ExtensionIdentity,
+    ) -> Result<(), String> {
+        if !identity.valid() || identity.hooks.len() != extension.hooks.len() {
+            return Err("invalid extension or hook identity".into());
+        }
+        self.install_inner(extension, Some(identity))
+            .map_err(|error| error.to_string())
+    }
+    fn install_inner(
+        &mut self,
+        extension: Extension,
+        identity: Option<ExtensionIdentity>,
+    ) -> Result<(), RegistryError> {
         validate(&extension)?;
         let mut next = self.current.extensions.clone();
+        let mut ids = self.current.registration_ids.clone();
+        let mut stable = self.current.stable_ids.clone();
         if let Some(i) = next.iter().position(|x| x.name == extension.name) {
             next[i] = Arc::new(extension);
+            ids[i] = uuid::Uuid::new_v4();
+            stable[i] = identity;
         } else {
             next.push(Arc::new(extension));
+            ids.push(uuid::Uuid::new_v4());
+            stable.push(identity);
         }
         let mut tasks = HashSet::new();
         for ext in &next {
@@ -557,11 +627,20 @@ impl Registry {
                 }
             }
         }
-        self.current = Snapshot { extensions: next };
+        self.current = Snapshot {
+            extensions: next,
+            epoch: self.current.epoch,
+            registration_ids: ids,
+            stable_ids: stable,
+        };
         Ok(())
     }
     pub fn uninstall(&mut self, name: &str) {
-        self.current.extensions.retain(|x| x.name != name);
+        if let Some(i) = self.current.extensions.iter().position(|x| x.name == name) {
+            self.current.extensions.remove(i);
+            self.current.registration_ids.remove(i);
+            self.current.stable_ids.remove(i);
+        }
     }
 }
 fn validate(ext: &Extension) -> Result<(), RegistryError> {
@@ -664,15 +743,364 @@ mod panic_boundary_tests {
     }
 }
 
+#[cfg(test)]
+mod task_hook_registration_tests {
+    use super::{BeforeTool, Context, Extension, Hook, Memo, Registry, ToolCall};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+
+    struct Memory;
+    #[async_trait::async_trait]
+    impl Memo for Memory {
+        async fn get(&self, _: &str) -> Result<Option<Value>, String> {
+            Ok(None)
+        }
+        async fn get_or_insert(&self, _: &str, value: Value) -> Result<Value, String> {
+            Ok(value)
+        }
+    }
+    struct Change {
+        block: bool,
+        invalid: bool,
+    }
+
+    #[tokio::test]
+    async fn stable_selection_reopens_only_with_matching_host_identity() {
+        use super::{ExtensionIdentity, StableExtensionSelection};
+        use durable_store::{Check, Expected, Mutation, Store};
+        fn install(registry: &mut Registry, fingerprint: &str, hook_id: &str) {
+            registry
+                .install_identified(
+                    Extension {
+                        name: "hook".into(),
+                        hooks: vec![Arc::new(Change {
+                            block: false,
+                            invalid: false,
+                        })],
+                        ..Default::default()
+                    },
+                    ExtensionIdentity::new(1, fingerprint.into(), vec![hook_id.into()]).unwrap(),
+                )
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let names = vec!["hook".to_string()];
+        let mut original = Registry::default();
+        install(&mut original, "implementation-config-v1", "before-after-v1");
+        let evidence = original.snapshot().stable_selection(&names).unwrap();
+        let store = Store::open(&path).unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: b"selection".to_vec(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: b"selection".to_vec(),
+                    value: serde_json::to_vec(&evidence).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let saved: StableExtensionSelection =
+            serde_json::from_slice(&store.get(b"selection").unwrap().unwrap().value).unwrap();
+        let mut reopened = Registry::default();
+        install(&mut reopened, "implementation-config-v1", "before-after-v1");
+        let snapshot = reopened.snapshot();
+        let selected = snapshot.resolve_stable(&names, &saved).unwrap();
+        let state = json!({});
+        let memo = Memory;
+        let context = Context {
+            snapshot: &state,
+            memo: &memo,
+        };
+        let (call, decision, _) = selected
+            .before_tool_checked(
+                ToolCall {
+                    name: "tool".into(),
+                    arguments: json!({"n":1}),
+                },
+                &context,
+                &json!({"type":"object"}),
+            )
+            .await;
+        assert_eq!(decision, BeforeTool::Pass);
+        assert_eq!(call.arguments, json!({"n":2}));
+        assert_eq!(
+            selected
+                .after_tool(&call, json!("original"), &context)
+                .await
+                .0,
+            json!("changed")
+        );
+        install(&mut reopened, "changed-config", "before-after-v1");
+        assert!(reopened.snapshot().resolve_stable(&names, &saved).is_none());
+        install(&mut reopened, "implementation-config-v1", "different-hook");
+        assert!(reopened.snapshot().resolve_stable(&names, &saved).is_none());
+        reopened
+            .install(Extension {
+                name: "hook".into(),
+                hooks: vec![Arc::new(Change {
+                    block: false,
+                    invalid: false,
+                })],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(reopened.snapshot().resolve_stable(&names, &saved).is_none());
+        assert!(snapshot.resolve_stable(&[], &saved).is_none());
+        let forged: StableExtensionSelection =
+            serde_json::from_value(json!({"selected":[]})).unwrap();
+        assert!(snapshot.resolve_stable(&names, &forged).is_none());
+        assert!(
+            serde_json::from_value::<StableExtensionSelection>(
+                json!({"selected":[],"unexpected":true})
+            )
+            .is_err()
+        );
+        assert!(ExtensionIdentity::new(0, "id".into(), vec![]).is_err());
+        assert!(ExtensionIdentity::new(1, "".into(), vec![]).is_err());
+        assert!(ExtensionIdentity::new(1, "id".into(), vec!["dup".into(), "dup".into()]).is_err());
+        reopened
+            .install_identified(
+                Extension {
+                    name: "second".into(),
+                    ..Default::default()
+                },
+                ExtensionIdentity::new(1, "second-v1".into(), vec![]).unwrap(),
+            )
+            .unwrap();
+        install(&mut reopened, "implementation-config-v1", "before-after-v1");
+        let ordered = vec!["hook".to_string(), "second".to_string()];
+        let reverse = vec!["second".to_string(), "hook".to_string()];
+        let ordered_evidence = reopened.snapshot().stable_selection(&ordered).unwrap();
+        assert!(
+            reopened
+                .snapshot()
+                .resolve_stable(&reverse, &ordered_evidence)
+                .is_none()
+        );
+    }
+    #[async_trait::async_trait]
+    impl Hook for Change {
+        async fn before_tool(&self, _: &ToolCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+            Ok(if self.block {
+                BeforeTool::Block("denied".into())
+            } else if self.invalid {
+                BeforeTool::Rewrite(json!({"n":"bad"}))
+            } else {
+                BeforeTool::Rewrite(json!({"n":2}))
+            })
+        }
+        async fn after_tool(
+            &self,
+            _: &ToolCall,
+            _: &Value,
+            _: &Context<'_>,
+        ) -> Result<Option<Value>, String> {
+            Ok(Some(json!("changed")))
+        }
+    }
+
+    #[tokio::test]
+    async fn real_hook_blocks_rewrites_revalidates_and_changes_result() {
+        let schema =
+            json!({"type":"object", "required":["n"], "properties":{"n":{"type":"integer"}}});
+        let snapshot = json!({});
+        let memo = Memory;
+        let ctx = Context {
+            snapshot: &snapshot,
+            memo: &memo,
+        };
+        for (block, invalid) in [(true, false), (false, false), (false, true)] {
+            let mut registry = Registry::default();
+            registry
+                .install(Extension {
+                    name: "hook".into(),
+                    hooks: vec![Arc::new(Change { block, invalid })],
+                    ..Default::default()
+                })
+                .unwrap();
+            let selected = registry.snapshot().resolve_exact(&["hook".into()]).unwrap();
+            let (call, decision, reports) = selected
+                .before_tool_checked(
+                    ToolCall {
+                        name: "tool".into(),
+                        arguments: json!({"n":1}),
+                    },
+                    &ctx,
+                    &schema,
+                )
+                .await;
+            assert!(reports.is_empty());
+            if block || invalid {
+                assert!(matches!(decision, BeforeTool::Block(_)));
+            } else {
+                assert_eq!(decision, BeforeTool::Pass);
+                assert_eq!(call.arguments, json!({"n":2}));
+                let (result, reports) = selected.after_tool(&call, json!("original"), &ctx).await;
+                assert_eq!(result, json!("changed"));
+                assert!(reports.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exact_selection_detects_missing_replacement_and_order() {
+        let mut registry = Registry::default();
+        for name in ["first", "second"] {
+            registry
+                .install(Extension {
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let names = vec!["first".to_string(), "second".to_string()];
+        let old = registry.snapshot().resolve_exact(&names).unwrap();
+        let evidence = old.registration_evidence().unwrap();
+        let encoded = serde_json::to_vec(&evidence).unwrap();
+        let restored: super::RegistrationEvidence = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, evidence);
+        assert!(old.same_registrations(&registry.snapshot().resolve_exact(&names).unwrap()));
+        assert_eq!(
+            Some(evidence.clone()),
+            registry
+                .snapshot()
+                .resolve_exact(&names)
+                .unwrap()
+                .registration_evidence()
+        );
+        let reversed = vec!["second".to_string(), "first".to_string()];
+        assert!(!old.same_registrations(&registry.snapshot().resolve_exact(&reversed).unwrap()));
+        registry
+            .install(Extension {
+                name: "first".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!old.same_registrations(&registry.snapshot().resolve_exact(&names).unwrap()));
+        assert_ne!(
+            Some(evidence.clone()),
+            registry
+                .snapshot()
+                .resolve_exact(&names)
+                .unwrap()
+                .registration_evidence()
+        );
+        let mut reopened = Registry::default();
+        assert_ne!(
+            registry
+                .snapshot()
+                .resolve_exact(&[])
+                .unwrap()
+                .registration_evidence(),
+            reopened
+                .snapshot()
+                .resolve_exact(&[])
+                .unwrap()
+                .registration_evidence()
+        );
+        for name in ["first", "second"] {
+            reopened
+                .install(Extension {
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_ne!(
+            Some(evidence),
+            reopened
+                .snapshot()
+                .resolve_exact(&names)
+                .unwrap()
+                .registration_evidence()
+        );
+        registry.uninstall("second");
+        assert!(registry.snapshot().resolve_exact(&names).is_none());
+    }
+}
+
 /// An immutable phase-local selection, in the requested order. Missing names are
 /// ignored and duplicate selections use their first occurrence.
 #[derive(Clone, Default)]
 pub struct Resolved {
     extensions: Vec<Arc<Extension>>,
+    epoch: uuid::Uuid,
+    registration_ids: Vec<uuid::Uuid>,
+}
+
+/// Process-local registration evidence suitable for persistence. A fresh
+/// registry has a new epoch, so recovery must reject rather than infer that
+/// new registrations implement the same hooks.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RegistrationEvidence {
+    epoch: uuid::Uuid,
+    selected: Vec<(String, uuid::Uuid)>,
+}
+
+/// Persistable host-declared ordered selection. This is evidence, not an
+/// authorization token; durable writers and the host identity declarations
+/// must be trusted, and dispatch still requires attempt and abort fencing.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableExtensionSelection {
+    selected: Vec<(String, ExtensionIdentity)>,
 }
 impl Snapshot {
     pub fn names(&self) -> Vec<&str> {
         self.extensions.iter().map(|x| x.name.as_str()).collect()
+    }
+    /// Capture exactly the requested ordered selection, rejecting missing or
+    /// unidentified registrations and duplicate names.
+    pub fn stable_selection(&self, names: &[String]) -> Option<StableExtensionSelection> {
+        let mut seen = HashSet::new();
+        let mut selected = Vec::with_capacity(names.len());
+        for name in names {
+            if !seen.insert(name) {
+                return None;
+            }
+            let i = self.extensions.iter().position(|e| e.name == *name)?;
+            let identity = self.stable_ids.get(i)?.as_ref()?;
+            if !identity.valid() || identity.hooks.len() != self.extensions[i].hooks.len() {
+                return None;
+            }
+            selected.push((name.clone(), identity.clone()));
+        }
+        Some(StableExtensionSelection { selected })
+    }
+    /// Resolve only when the durable selection matches current registrations
+    /// and the caller's independently obtained conversation selection.
+    pub fn resolve_stable(
+        &self,
+        names: &[String],
+        saved: &StableExtensionSelection,
+    ) -> Option<Resolved> {
+        if self.stable_selection(names).as_ref() != Some(saved) {
+            return None;
+        }
+        self.resolve_exact(names)
+    }
+    /// Resolve every requested name, failing closed when any is unavailable.
+    pub(crate) fn resolve_exact(&self, names: &[String]) -> Option<Resolved> {
+        let mut seen = HashSet::new();
+        let mut extensions = Vec::new();
+        let mut registration_ids = Vec::new();
+        for name in names {
+            if seen.insert(name) {
+                let i = self.extensions.iter().position(|e| e.name == *name)?;
+                extensions.push(self.extensions[i].clone());
+                registration_ids.push(self.registration_ids[i]);
+            }
+        }
+        Some(Resolved {
+            extensions,
+            epoch: self.epoch,
+            registration_ids,
+        })
     }
     pub fn resolve(&self, names: Option<&[String]>) -> Resolved {
         let extensions = match names {
@@ -686,10 +1114,76 @@ impl Snapshot {
                     .collect()
             }
         };
-        Resolved { extensions }
+        let registration_ids = extensions
+            .iter()
+            .map(|extension| {
+                let i = self
+                    .extensions
+                    .iter()
+                    .position(|candidate| Arc::ptr_eq(candidate, extension))
+                    .expect("snapshot member");
+                self.registration_ids[i]
+            })
+            .collect();
+        Resolved {
+            extensions,
+            epoch: self.epoch,
+            registration_ids,
+        }
     }
 }
 impl Resolved {
+    #[allow(dead_code)] // Not yet connected to task admission or dispatch.
+    pub(crate) fn registration_evidence(&self) -> Option<RegistrationEvidence> {
+        if self.epoch.is_nil() || self.extensions.len() != self.registration_ids.len() {
+            return None;
+        }
+        Some(RegistrationEvidence {
+            epoch: self.epoch,
+            selected: self
+                .extensions
+                .iter()
+                .zip(&self.registration_ids)
+                .map(|(extension, id)| (extension.name.clone(), *id))
+                .collect(),
+        })
+    }
+    /// Run the before chain and reject a rewritten value that no longer
+    /// matches the tool schema. The caller must validate the original input
+    /// before invoking this chain and use `tool::restore` after it to enforce
+    /// size and schema limits. This alone is not dispatch authority: callers
+    /// must bind the selection, attempt, cancellation, and durable result.
+    #[allow(dead_code)]
+    pub(crate) async fn before_tool_checked(
+        &self,
+        call: ToolCall,
+        ctx: &Context<'_>,
+        schema: &Value,
+    ) -> (ToolCall, BeforeTool, Vec<Report>) {
+        let (call, decision, reports) = self.before_tool(call, ctx).await;
+        if matches!(decision, BeforeTool::Pass)
+            && (!call.arguments.is_object()
+                || !jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(&call.arguments)))
+        {
+            return (
+                call,
+                BeforeTool::Block("hook arguments do not match tool schema".into()),
+                reports,
+            );
+        }
+        (call, decision, reports)
+    }
+    /// Compare the actual ordered registrations, not only their names.
+    /// This is a snapshot comparison and does not grant dispatch authority.
+    #[allow(dead_code)]
+    pub(crate) fn same_registrations(&self, other: &Self) -> bool {
+        self.extensions.len() == other.extensions.len()
+            && self
+                .extensions
+                .iter()
+                .zip(&other.extensions)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+    }
     pub fn tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.extensions
             .iter()

@@ -4791,6 +4791,19 @@ impl Harness {
             .install(extension)
             .map_err(|e| Error::Invalid(format!("extension registry: {e}")))
     }
+    /// Install an extension with a host-declared recovery identity. The host
+    /// must update the identity whenever implementation or configuration changes.
+    pub fn install_identified_extension(
+        &self,
+        extension: crate::extension::Extension,
+        identity: crate::extension::ExtensionIdentity,
+    ) -> Result<(), Error> {
+        self.extensions
+            .write()
+            .map_err(|_| Error::Failed)?
+            .install_identified(extension, identity)
+            .map_err(|e| Error::Invalid(format!("extension registry: {e}")))
+    }
     pub fn uninstall_extension(&self, name: &str) -> Result<(), Error> {
         self.extensions
             .write()
@@ -4824,7 +4837,9 @@ impl Harness {
                 "selected extension unavailable: {missing}"
             )));
         }
-        Ok(snapshot.resolve(Some(&c.extensions)))
+        snapshot.resolve_exact(&c.extensions).ok_or_else(|| {
+            Error::Invalid("selected extension unavailable during resolution".into())
+        })
     }
     fn resolved_tools(&self, c: &Conversation) -> Result<HashMap<String, RegisteredTool>, Error> {
         let mut tools = self.tools.clone();
