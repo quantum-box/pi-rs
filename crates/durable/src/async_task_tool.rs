@@ -12591,6 +12591,88 @@ mod tests {
             1
         );
     }
+    /// Constructs the discriminator-8, version-1 checkpoint written by a587.
+    #[test]
+    fn legacy_park_cancel_fixture() {
+        let Ok(root) = std::env::var("PI_TEST_LEGACY_PARK_CANCEL") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let (host, tool) = park_cancel_host(&root);
+        let id = host
+            .start_replay_safe_root(&tool, json!({"token":"prepared"}), 3)
+            .unwrap();
+        std::fs::write(root.join("legacy-task-id"), id.to_string()).unwrap();
+        let driver = host.into_driver();
+        wait_park_cancel(&driver, id);
+        std::fs::write(root.join("legacy-parked"), b"yes").unwrap();
+        loop {
+            std::hint::black_box(&driver);
+            std::thread::park();
+        }
+    }
+    #[test]
+    fn legacy_park_cancel_reopen_requires_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::legacy_park_cancel_fixture")
+            .env("PI_TEST_LEGACY_PARK_CANCEL", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("legacy-parked"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("legacy-task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let previous = crate::task_store::TaskStore::new(&store)
+            .load(id)
+            .unwrap()
+            .unwrap()
+            .task;
+        assert_eq!(previous.checkpoint().data["version"], json!(1));
+        assert!(previous.checkpoint().data.get("park_attempt").is_none());
+        let old_kind = previous.kind().unwrap().to_owned();
+        let prefix = format!("durable/replay-safe-async/{id}/");
+        let old_evidence = store.list(prefix.as_bytes()).unwrap();
+        assert!(
+            old_evidence
+                .iter()
+                .any(|(key, _)| key.ends_with(b"/intent/result"))
+        );
+        drop(store);
+        let (host, tool) = park_cancel_host(root);
+        let current_kind = tool.identity().unwrap().kind;
+        assert_ne!(current_kind, old_kind);
+        let driver = host.into_driver();
+        assert!(matches!(
+            driver.get(id).unwrap().unwrap().state(),
+            crate::task::TaskState::Waiting(_)
+        ));
+        driver.request_abort(id).unwrap();
+        let ended = wait_terminal(&driver, id);
+        assert!(
+            matches!(ended.state(), crate::task::TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        assert_eq!(ended.checkpoint(), previous.checkpoint());
+        assert!(!root.join("cancel-count").exists());
+        assert!(!root.join("abort-hook-count").exists());
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(read_park_cancel_evidence(&store, id).unwrap().is_none());
+        for (key, old) in old_evidence {
+            assert_eq!(store.get(&key).unwrap().unwrap().value, old.value);
+        }
+        drop(store);
+        let (host, retry_tool) = park_cancel_host_with_retry(root, true);
+        assert_ne!(retry_tool.identity().unwrap().kind, old_kind);
+        assert_ne!(retry_tool.identity().unwrap().kind, current_kind);
+        drop(host);
+    }
     struct SuppressGate;
     #[async_trait::async_trait]
     impl crate::extension::Hook for SuppressGate {

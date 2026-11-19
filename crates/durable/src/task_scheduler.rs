@@ -7968,7 +7968,13 @@ impl Scheduler {
                 return Ok(TickReservation::Progress(true));
             }
             if let Some(reason) = self.blocked_reason(&snapshot.task) {
-                let diagnostic = orphan_diagnostic(&reason);
+                let diagnostic = if matches!(reason, BlockedReason::MissingTask)
+                    && snapshot.task.checkpoint().phase == "replay-safe-async-wait"
+                {
+                    "orphaned: missing task definition; parked external work requires reconciliation".into()
+                } else {
+                    orphan_diagnostic(&reason)
+                };
                 self.ts().update(snapshot, |t| {
                     t.start()?;
                     t.fail(diagnostic)

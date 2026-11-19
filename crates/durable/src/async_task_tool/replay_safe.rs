@@ -198,8 +198,20 @@ fn register_with_policy(
         1u32
     };
     let encoded = if let Some((cancel_id, _, retry)) = &park_cancel {
+        // 8 names the legacy at-most-once contract without park provenance;
+        // 9 and 10 bind the retryable and provenance-required contracts.
+        #[cfg(test)]
+        let legacy_fixture = std::env::var_os("PI_TEST_LEGACY_PARK_CANCEL").is_some();
+        #[cfg(not(test))]
+        let legacy_fixture = false;
         serde_json::to_vec(&(
-            if *retry { 9u32 } else { 8u32 },
+            if *retry {
+                9u32
+            } else if legacy_fixture {
+                8u32
+            } else {
+                10u32
+            },
             &identity,
             &child_identities,
             cancel_id,
@@ -1571,11 +1583,16 @@ impl Handler for Executor {
                     #[cfg(test)]
                     DurableWait::Signal(_) => return Err("signal waits are unsupported".into()),
                 };
+                #[cfg(test)]
+                let legacy_fixture = std::env::var_os("PI_TEST_LEGACY_PARK_CANCEL").is_some();
+                #[cfg(not(test))]
+                let legacy_fixture = false;
+                let proven_park = self.park_cancel.is_some() && !legacy_fixture;
                 let data = serde_json::to_value(ParkCheckpoint {
-                    version: if self.park_cancel.is_some() { 2 } else { 1 },
+                    version: if proven_park { 2 } else { 1 },
                     arguments: args.clone(),
                     checkpoint: checkpoint.clone(),
-                    park_attempt: if self.park_cancel.is_some() {
+                    park_attempt: if proven_park {
                         Some(task.attempt_id().ok_or("missing park attempt")?)
                     } else {
                         None
