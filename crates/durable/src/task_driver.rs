@@ -1149,6 +1149,15 @@ impl Shared {
                     })) {
                         Ok(Ok(mut completed)) => match completed.capture_marked_receipt() {
                             Ok(()) => WorkerEvent::Completed(Box::new(completed)),
+                            Err(error) if error.pre_transaction_busy() => {
+                                // The outcome and lease remain owned until receipt capture succeeds.
+                                shared
+                                    .pending
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(task_scheduler::PendingSettlement::Unprepared(completed));
+                                WorkerEvent::Released
+                            }
                             Err(error) => {
                                 let message = format!("uncertain receipt capture: {error}");
                                 // Publish the failure before exposing the unsaved result;

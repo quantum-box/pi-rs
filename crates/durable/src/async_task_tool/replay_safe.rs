@@ -640,10 +640,12 @@ pub(crate) fn after_checkpoint_evidence(
     }
 }
 
+use crate::task_scheduler::HookFenceError;
+
 struct HookMemo<'a, 'b> {
     admission: &'a AdmissionHandle<'b>,
     cancellation: &'a pi_rs_core::CancellationToken,
-    failed: Mutex<Option<String>>,
+    failed: Mutex<Option<HookFenceError>>,
     signal_check: Mutex<Option<durable_store::Check>>,
 }
 impl HookMemo<'_, '_> {
@@ -651,7 +653,7 @@ impl HookMemo<'_, '_> {
         &self,
         key: &str,
         value: Option<serde_json::Value>,
-    ) -> Result<Option<serde_json::Value>, String> {
+    ) -> Result<Option<serde_json::Value>, HookFenceError> {
         // Serialize access with failure publication: a concurrent operation
         // cannot commit after another operation has failed.
         let mut failed = self.failed.lock().map_err(|_| "hook memo unavailable")?;
@@ -663,7 +665,7 @@ impl HookMemo<'_, '_> {
             .signal_check
             .lock()
             .map(|check| check.clone())
-            .map_err(|_| "hook signal fence unavailable".to_owned());
+            .map_err(|_| HookFenceError::from("hook signal fence unavailable"));
         let result = signal_check
             .and_then(|check| {
                 self.admission
@@ -681,7 +683,7 @@ impl HookMemo<'_, '_> {
         }
         result
     }
-    fn failure(&self) -> Option<String> {
+    fn failure(&self) -> Option<HookFenceError> {
         self.failed.lock().map_or_else(
             |_| Some("hook memo unavailable".into()),
             |failed| failed.clone(),
@@ -705,14 +707,15 @@ impl HookMemo<'_, '_> {
 #[async_trait::async_trait]
 impl crate::extension::Memo for HookMemo<'_, '_> {
     async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
-        self.access(key, None)
+        self.access(key, None).map_err(|error| error.to_string())
     }
     async fn get_or_insert(
         &self,
         key: &str,
         value: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        self.access(key, Some(value))?
+        self.access(key, Some(value))
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "memo insertion failed".into())
     }
     async fn read_signal(
@@ -723,7 +726,7 @@ impl crate::extension::Memo for HookMemo<'_, '_> {
         if failed.is_some() {
             return Err("hook memo unavailable after failure".into());
         }
-        let result = self
+        let result: Result<_, HookFenceError> = self
             .admission
             .replay_safe_hook_signal_state(key, self.cancellation)
             .and_then(|(state, check)| {
@@ -740,7 +743,7 @@ impl crate::extension::Memo for HookMemo<'_, '_> {
         if let Err(error) = &result {
             *failed = Some(error.clone());
         }
-        result
+        result.map_err(|error| error.to_string())
     }
 }
 
@@ -1073,7 +1076,7 @@ impl Executor {
         docs: &mut crate::document::TaskDocuments<'_>,
         admission: &AdmissionHandle<'_>,
         cancel: &pi_rs_core::CancellationToken,
-    ) -> Result<Step, String> {
+    ) -> Result<Step, HookFenceError> {
         admission.replay_safe_durable_check(cancel)?;
         let generation = admission.checkpointable_extension_generation();
         if task.checkpoint().phase == "replay-safe-async-hook-gate"
@@ -1082,11 +1085,11 @@ impl Executor {
             return Err("invalid hook gate checkpoint".into());
         }
         if self.unavailable {
-            return self.host_result_checkpoint(
+            return Ok(self.host_result_checkpoint(
                 task.input().clone(),
                 "tool_unavailable",
                 &self.identity.spec.name,
-            );
+            )?);
         }
         let memo = HookMemo {
             admission,
@@ -1125,8 +1128,8 @@ impl Executor {
         }
         if let Some(error) = memo.failure() {
             return Err(
-                if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY
-                    || error == "prior unsafe execution evidence requires reconciliation"
+                if matches!(error, HookFenceError::WriteLockBusy)
+                    || matches!(&error, HookFenceError::Other(reason) if reason == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY || reason == "prior unsafe execution evidence requires reconciliation")
                 {
                     error
                 } else {
@@ -1139,14 +1142,14 @@ impl Executor {
         admission.replay_safe_durable_check(cancel)?;
         let (call, decision) = match before {
             BeforeResult::Invalid(args, reason) => {
-                return self.host_result_checkpoint(args, "invalid_arguments", &reason);
+                return Ok(self.host_result_checkpoint(args, "invalid_arguments", &reason)?);
             }
             BeforeResult::Decision(call, decision) => (call, decision),
         };
         match decision {
             crate::extension::BeforeTool::Pass => (),
             crate::extension::BeforeTool::Block(reason) => {
-                return self.host_result_checkpoint(call.arguments, "blocked", &reason);
+                return Ok(self.host_result_checkpoint(call.arguments, "blocked", &reason)?);
             }
             crate::extension::BeforeTool::Sleep(sleep)
                 if admission.is_conversation_checkpointable() && self.replay_safe =>
@@ -1163,11 +1166,11 @@ impl Executor {
                         .enumerate()
                         .any(|(i, key)| sleep.signals[..i].contains(key));
                 if invalid {
-                    return self.host_result_checkpoint(
+                    return Ok(self.host_result_checkpoint(
                         call.arguments,
                         "invalid_park",
                         "invalid extension sleep",
-                    );
+                    )?);
                 }
                 let condition = if sleep.signals.is_empty() {
                     WaitFor::Sleep {
@@ -1185,11 +1188,11 @@ impl Executor {
                         admission.replay_safe_hook_wait_keys_available(&keys, cancel)?;
                     docs.stage_hook_signal_check(check)?;
                     if !available {
-                        return self.host_result_checkpoint(
+                        return Ok(self.host_result_checkpoint(
                             call.arguments,
                             "invalid_park",
                             "signal key already consumed or expired",
-                        );
+                        )?);
                     }
                     WaitFor::TypedSleep {
                         until_millis: sleep.until_millis,
@@ -1211,7 +1214,11 @@ impl Executor {
         }
         self.bounded_hook_arguments(&call.arguments)?;
         if let Err(reason) = self.validate_hook_arguments(&call.arguments) {
-            return self.host_result_checkpoint(call.arguments, "invalid_arguments", &reason);
+            return Ok(self.host_result_checkpoint(
+                call.arguments,
+                "invalid_arguments",
+                &reason,
+            )?);
         }
         let data = serde_json::to_value(HookCheckpoint {
             version: 1,
@@ -1238,7 +1245,7 @@ impl Executor {
         args: serde_json::Value,
         outcome: Outcome,
         host_error: Option<String>,
-    ) -> Result<Step, String> {
+    ) -> Result<Step, HookFenceError> {
         let mut extra = std::collections::BTreeMap::new();
         extra.insert(
             "isError".into(),
@@ -1356,11 +1363,15 @@ impl Executor {
             return Err("after hook cancelled".into());
         }
         if let Some(error) = memo.failure() {
-            return Err(if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY {
-                error
-            } else {
-                "task-fenced hook memo failed".into()
-            });
+            return Err(
+                if matches!(error, HookFenceError::WriteLockBusy)
+                    || matches!(&error, HookFenceError::Other(reason) if reason == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY)
+                {
+                    error
+                } else {
+                    "task-fenced hook memo failed".into()
+                },
+            );
         }
         memo.stage_signal_check(docs)?;
         let result = result?;
@@ -1382,7 +1393,7 @@ impl Executor {
         docs: &mut crate::document::TaskDocuments<'_>,
         admission: &AdmissionHandle<'_>,
         cancel: &pi_rs_core::CancellationToken,
-    ) -> Result<Step, String> {
+    ) -> Result<Step, HookFenceError> {
         admission.replay_safe_durable_check(cancel)?;
         let stored: HookCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
             .map_err(|_| "invalid after checkpoint")?;
@@ -1456,11 +1467,15 @@ impl Executor {
             return Err("after hook cancelled".into());
         }
         if let Some(error) = memo.failure() {
-            return Err(if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY {
-                error
-            } else {
-                "task-fenced hook memo failed".into()
-            });
+            return Err(
+                if matches!(error, HookFenceError::WriteLockBusy)
+                    || matches!(&error, HookFenceError::Other(reason) if reason == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY)
+                {
+                    error
+                } else {
+                    "task-fenced hook memo failed".into()
+                },
+            );
         }
         memo.stage_signal_check(docs)?;
         let value = value?;
@@ -1922,14 +1937,18 @@ impl Handler for Executor {
                 return Err("tool identity changed during hook".into());
             }
             return match result {
-                Err(error) if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY => {
+                Err(HookFenceError::WriteLockBusy) => Ok(Step::DeferUndispatched),
+                Err(HookFenceError::Other(error))
+                    if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY =>
+                {
                     Ok(Step::DeferUndispatched)
                 }
                 Ok(step) if !self.replay_safe => {
                     docs.stage_unsafe_hook_phase(&step)?;
                     Ok(step)
                 }
-                result => result,
+                Err(error) => Err(error.to_string()),
+                Ok(step) => Ok(step),
             };
         }
         let intent = match admission.checkpointable_durable_intent(
@@ -1938,10 +1957,13 @@ impl Handler for Executor {
             Some(cancellation),
         ) {
             Ok(intent) => intent,
-            Err(error) if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY => {
+            Err(HookFenceError::WriteLockBusy) => return Ok(Step::DeferUndispatched),
+            Err(HookFenceError::Other(error))
+                if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY =>
+            {
                 return Ok(Step::DeferUndispatched);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.to_string()),
         };
         #[cfg(test)]
         crash_test_boundary(&self.tool.spec().name, task.id(), "intent");

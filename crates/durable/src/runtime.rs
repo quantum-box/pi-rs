@@ -8010,7 +8010,10 @@ impl Harness {
         };
         match result {
             Ok(()) => Ok(()),
-            Err(e @ durable_store::Error::Conflict { .. }) => Err(e.into()),
+            Err(
+                e
+                @ (durable_store::Error::Conflict { .. } | durable_store::Error::WriteLockBusy(_)),
+            ) => Err(e.into()),
             Err(e) => {
                 self.failed = true;
                 self.storage_failed.store(true, Ordering::Release);
@@ -24871,6 +24874,32 @@ mod scheduler_tests {
         }
     }
 
+    #[test]
+    fn conversation_save_writer_busy_does_not_poison_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(writer_path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(6500));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            harness.create_conversation(config()),
+            Err(Error::Storage(durable_store::Error::WriteLockBusy(_)))
+        ));
+        writer.join().unwrap();
+        let id = harness.create_conversation(config()).unwrap();
+        assert_eq!(harness.conversation(id).unwrap().id, id);
+    }
+
     #[tokio::test]
     async fn unbound_conversation_cancel_recovery_holds_owned_work_but_not_unrelated() {
         check_unbound_cancel_holds_owned_work(false).await;
@@ -24879,6 +24908,104 @@ mod scheduler_tests {
     #[tokio::test]
     async fn unbound_conversation_parked_abort_holds_owned_work_but_not_unrelated() {
         check_unbound_cancel_holds_owned_work(true).await;
+    }
+
+    #[tokio::test]
+    async fn unbound_root_does_not_block_other_graph_recovery_after_abort_mark() {
+        use crate::task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor};
+        use crate::task_scheduler::{Registry, Scheduler as TaskScheduler, Step};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let checkpoint = || Checkpoint {
+            phase: "initial".into(),
+            data: serde_json::json!({}),
+        };
+        let root_id = Uuid::new_v4();
+        let mut root = Task::new(
+            root_id,
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "replay-safe-async-wait".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered_versioned(
+            "pi-rs.unsafe-park-async.v1.hook.woken.fixture".into(),
+            false,
+            1,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_task_tool();
+        root.start_attempt(Uuid::new_v4()).unwrap();
+        let parent_id = Uuid::new_v4();
+        let failed_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(Uuid::new_v4()),
+            checkpoint(),
+            4,
+        )
+        .unwrap()
+        .registered("independent".into(), true);
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![failed_id, child_id]))
+            .unwrap();
+        let mut failed = Task::new(failed_id, TaskOwner::Task(parent_id), checkpoint(), 4)
+            .unwrap()
+            .registered("independent".into(), true);
+        failed.start().unwrap();
+        failed.fail("failed sibling".into()).unwrap();
+        let mut child = Task::new(child_id, TaskOwner::Task(parent_id), checkpoint(), 4)
+            .unwrap()
+            .registered("independent".into(), true);
+        child.start().unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[
+                Save::Create(&root),
+                Save::Create(&parent),
+                Save::Create(&failed),
+                Save::Create(&child),
+            ])
+            .unwrap();
+        let mut registry = Registry::default();
+        registry.register("independent", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!("done")))
+        });
+        let scheduler = TaskScheduler::attach(h.owner.clone(), registry).unwrap();
+        assert!(scheduler.recovery_is_deferred_for_test(root_id));
+        assert!(scheduler.recovery_is_deferred_for_test(child_id));
+        let driver = crate::task_driver::Driver::start(scheduler);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let child = driver.get(child_id).unwrap().unwrap();
+                if child.is_terminal() && child.abort_requested() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "independent child: {:?}, parent: {:?}, root: {:?}",
+                driver.get(child_id),
+                driver.get(parent_id),
+                driver.get(root_id)
+            )
+        });
+        assert_eq!(
+            driver.get(root_id).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
     }
 
     async fn check_unbound_cancel_holds_owned_work(parked_abort: bool) {

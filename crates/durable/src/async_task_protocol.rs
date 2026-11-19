@@ -21,6 +21,12 @@ pub(crate) enum Error {
     Invalid,
 }
 
+impl Error {
+    pub(crate) fn pre_transaction_busy(&self) -> bool {
+        matches!(self, Self::Store(durable_store::Error::WriteLockBusy(_)))
+    }
+}
+
 pub(crate) fn has_sealed_identity(store: &Store, task: Uuid) -> Result<bool, Error> {
     Ok(store.get(&identity_key(task))?.is_some())
 }

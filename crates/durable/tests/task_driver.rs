@@ -467,3 +467,147 @@ fn wake_channel_is_bounded_and_closes_on_handler_panic() {
     assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     assert!(driver.shutdown().is_err());
 }
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn busy_failure_settlement_preserves_reason_and_lease() {
+    use pi_rs_durable::{
+        task_driver::Driver,
+        task_scheduler::{self, hook_fence_test_hook},
+    };
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let id = Uuid::new_v4();
+    let task = Task::new(
+        id,
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("fail".into(), true);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut registry = Registry::default();
+    registry.register("fail", true, move |_: &Task| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Step::Fail("exact failure".into()))
+    });
+    let scheduler = task_scheduler::Scheduler::open(&path, registry).unwrap();
+    scheduler.submit(&task).unwrap();
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(id, "failure-settlement", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(id, "failure-busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    let driver = Driver::start(scheduler);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(6500));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("failure settlement did not reach busy timeout");
+    writer.join().unwrap();
+    let settled = tokio::time::timeout(
+        Duration::from_secs(10),
+        driver.wait_for_task(id, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(settled.state(), &TaskState::Failed("exact failure".into()));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn busy_abort_settlement_retains_joined_result_and_lease() {
+    use pi_rs_durable::{
+        task_driver::Driver,
+        task_scheduler::{self, hook_fence_test_hook},
+    };
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let id = Uuid::new_v4();
+    let task = Task::new(
+        id,
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("abortable".into(), true);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut registry = Registry::default();
+    registry.register_with_abort(
+        "abortable",
+        true,
+        |_: &Task| Ok(Step::Succeed(json!("unexpected"))),
+        move |_: &Task| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Step::Succeed(json!(null)))
+        },
+    );
+    let mut scheduler = task_scheduler::Scheduler::open(&path, registry).unwrap();
+    scheduler.submit(&task).unwrap();
+    scheduler.request_abort(id).unwrap();
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(id, "abort-settlement", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(id, "abort-busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    let driver = Driver::start(scheduler);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(6500));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("abort settlement did not reach busy timeout");
+    writer.join().unwrap();
+    let settled = tokio::time::timeout(
+        Duration::from_secs(10),
+        driver.wait_for_task(id, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(settled.state(), &TaskState::Cancelled);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+}

@@ -3406,7 +3406,9 @@ mod tests {
             admission: &crate::task_scheduler::AdmissionHandle<'_>,
         ) -> Result<crate::task_scheduler::Step, String> {
             use crate::task_scheduler::Step;
-            let intent = admission.checkpointable_durable_intent(true, true, None)?;
+            let intent = admission
+                .checkpointable_durable_intent(true, true, None)
+                .map_err(|e| e.to_string())?;
             let resume = match task.checkpoint().phase.as_str() {
                 "initial" => DurableToolResume {
                     checkpoint: None,

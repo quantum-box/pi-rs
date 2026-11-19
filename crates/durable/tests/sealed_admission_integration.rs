@@ -829,3 +829,77 @@ fn parent_observes_raw_result_when_after_memo_fails() {
     );
     driver.shutdown().unwrap();
 }
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn sealed_receipt_busy_retains_outcome_and_revalidates_lease() {
+    use pi_rs_durable::task_scheduler::hook_fence_test_hook;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let root = seed(&path);
+    let release = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let driver = host(
+        &path,
+        Mode::Abort,
+        true,
+        None,
+        release.clone(),
+        None,
+        calls.clone(),
+    );
+    let store = durable_store::Store::open(&path).unwrap();
+    until(|| {
+        pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()
+            .iter()
+            .any(|item| item.task.kind() == Some("leaf"))
+    });
+    let child = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.task.kind() == Some("leaf"))
+        .unwrap()
+        .task
+        .id();
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(child, "receipt", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(child, "receipt-busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    release.store(true, Ordering::SeqCst);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(6500));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("receipt capture did not reach busy timeout");
+    writer.join().unwrap();
+    until(|| {
+        driver
+            .get(root)
+            .unwrap()
+            .is_some_and(|task| task.is_terminal())
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        driver.get(root).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!({"Succeeded":"ok"}))
+    );
+    driver.shutdown().unwrap();
+}

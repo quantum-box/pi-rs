@@ -125,7 +125,25 @@ pub enum Step {
 }
 
 pub(crate) const UNSAFE_ANCESTOR_BUSY: &str = "checkpointable unsafe ancestor is not parked";
-const HOOK_FENCE_CONFLICT: &str = "checkpointable hook fence conflict";
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum HookFenceError {
+    #[error("checkpointable hook fence conflict")]
+    Conflict,
+    #[error("writer lock unavailable before transaction")]
+    WriteLockBusy,
+    #[error("{0}")]
+    Other(String),
+}
+impl From<String> for HookFenceError {
+    fn from(value: String) -> Self {
+        Self::Other(value)
+    }
+}
+impl From<&str> for HookFenceError {
+    fn from(value: &str) -> Self {
+        Self::Other(value.to_owned())
+    }
+}
 #[cfg(test)]
 pub(crate) type IntentCommitHook =
     std::sync::Arc<dyn Fn(&durable_store::Store, bool) + Send + Sync>;
@@ -907,6 +925,30 @@ pub enum Error {
     TestYield,
 }
 
+fn pre_transaction_busy(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Store(task_store::Error::Store(
+            durable_store::Error::WriteLockBusy(_)
+        )) | Error::Document(crate::document::Error::Store(
+            durable_store::Error::WriteLockBusy(_)
+        )) | Error::Document(crate::document::Error::Signal(task_store::Error::Store(
+            durable_store::Error::WriteLockBusy(_)
+        )))
+    )
+}
+
+fn runtime_pre_transaction_busy(error: &crate::runtime::Error) -> bool {
+    match error {
+        crate::runtime::Error::Storage(durable_store::Error::WriteLockBusy(_)) => true,
+        crate::runtime::Error::TaskScheduler(error) => pre_transaction_busy(error),
+        crate::runtime::Error::Document(crate::document::Error::Store(
+            durable_store::Error::WriteLockBusy(_),
+        )) => true,
+        _ => false,
+    }
+}
+
 // The owner lock prevents another OwnedStore for the same database, but Arc
 // clones share that lock. Fence recovery and execution across those clones too.
 fn attachments() -> &'static Mutex<HashSet<usize>> {
@@ -1174,6 +1216,7 @@ impl PendingMaintenance {
             }
             match harness.abort_maintenance_checked(self.intent) {
                 Ok(affected) => Ok(affected.unwrap_or_default()),
+                Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
                 Err(error) => {
                     self.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
                     Err(Error::Handler(format!("maintenance abort: {error}")))
@@ -1425,7 +1468,14 @@ impl CompletedInvocation {
             return Err(ProtocolError::Invalid);
         }
         let batch = crate::async_task_protocol::prepare_receipt(owner.store(), intent, &outcome)?;
-        owner.store().commit(&batch.checks, &batch.mutations)?;
+        #[cfg(feature = "test-hooks")]
+        hook_fence_test_hook::run(self.running.task.id(), "receipt");
+        let result = owner.store().commit(&batch.checks, &batch.mutations);
+        #[cfg(feature = "test-hooks")]
+        if matches!(result, Err(durable_store::Error::WriteLockBusy(_))) {
+            hook_fence_test_hook::run(self.running.task.id(), "receipt-busy");
+        }
+        result?;
         Ok(())
     }
 }
@@ -1767,6 +1817,7 @@ impl PendingSettlement {
             match harness.abort_pending_task_graph(lease.id) {
                 Ok(affected) => Ok(affected.unwrap_or_default()),
                 Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
                 Err(error) => {
                     lease.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
                     Err(Error::Handler(format!("checked pending abort: {error}")))
@@ -3201,7 +3252,7 @@ impl AdmissionHandle<'_> {
         test_namespace: bool,
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, HookFenceError> {
         match self.replay_safe_durable_fence(
             test_namespace,
             expected_replay_safe,
@@ -3210,7 +3261,7 @@ impl AdmissionHandle<'_> {
             false,
             (&[], &[]),
         ) {
-            Err(error) if error == HOOK_FENCE_CONFLICT => {
+            Err(HookFenceError::Conflict) => {
                 // The intent did not commit. Recheck the lease, abort and
                 // intent absence before returning an undispatched defer.
                 for _ in 0..8 {
@@ -3223,7 +3274,7 @@ impl AdmissionHandle<'_> {
                         (&[], &[]),
                     ) {
                         Ok(_) => return Err(UNSAFE_ANCESTOR_BUSY.into()),
-                        Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                        Err(HookFenceError::Conflict) => continue,
                         Err(error) => return Err(error),
                     }
                 }
@@ -3298,7 +3349,7 @@ impl AdmissionHandle<'_> {
     pub(crate) fn replay_safe_durable_check(
         &self,
         cancellation: &pi_rs_core::CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), HookFenceError> {
         self.replay_safe_durable_fence(
             false,
             self.running.task.replay_safe(),
@@ -3309,8 +3360,8 @@ impl AdmissionHandle<'_> {
         )
         .map(|_| ())
         .map_err(|error| {
-            if error == HOOK_FENCE_CONFLICT {
-                UNSAFE_ANCESTOR_BUSY.into()
+            if matches!(error, HookFenceError::Conflict) {
+                HookFenceError::Other(UNSAFE_ANCESTOR_BUSY.into())
             } else {
                 error
             }
@@ -3324,7 +3375,7 @@ impl AdmissionHandle<'_> {
         write_intent: bool,
         hook_phase: bool,
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, HookFenceError> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         if (!self.standalone && (test_namespace || self.validator.is_none()))
             || self.abort
@@ -3479,7 +3530,7 @@ impl AdmissionHandle<'_> {
                                 {
                                     existing.expected = check.expected;
                                 } else if existing.expected != check.expected {
-                                    return Err(HOOK_FENCE_CONFLICT.into());
+                                    return Err(HookFenceError::Conflict);
                                 }
                             } else {
                                 checks.push(check);
@@ -3537,12 +3588,35 @@ impl AdmissionHandle<'_> {
                 hook(owner.store(), write_intent);
             }
         }
+        #[cfg(feature = "test-hooks")]
+        let test_phase = if extra
+            .0
+            .iter()
+            .any(|check| check.key.starts_with(b"runtime/extension-memo/"))
+        {
+            "memo"
+        } else if extra
+            .0
+            .iter()
+            .any(|check| check.key == task_store::signal_revision_key(current.task.id()))
+        {
+            "signal"
+        } else {
+            "fence"
+        };
+        #[cfg(feature = "test-hooks")]
+        hook_fence_test_hook::run(current.task.id(), test_phase);
         owner
             .store()
             .commit(&checks, &mutations)
             .map_err(|error| match error {
-                durable_store::Error::Conflict { .. } => HOOK_FENCE_CONFLICT.to_owned(),
-                other => other.to_string(),
+                durable_store::Error::Conflict { .. } => HookFenceError::Conflict,
+                durable_store::Error::WriteLockBusy(_) => {
+                    #[cfg(feature = "test-hooks")]
+                    hook_fence_test_hook::run(current.task.id(), "busy");
+                    HookFenceError::WriteLockBusy
+                }
+                other => HookFenceError::Other(other.to_string()),
             })?;
         Ok(key)
     }
@@ -3552,13 +3626,13 @@ impl AdmissionHandle<'_> {
         value: Option<serde_json::Value>,
         cancel: &pi_rs_core::CancellationToken,
         signal_check: Option<&durable_store::Check>,
-    ) -> Result<Option<serde_json::Value>, String> {
+    ) -> Result<Option<serde_json::Value>, HookFenceError> {
         if key.is_empty() || key.len() > 4096 {
             return Err("invalid memo key".into());
         }
         for _ in 0..8 {
             match self.replay_safe_hook_memo_once(key, value.clone(), cancel, signal_check) {
-                Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                Err(HookFenceError::Conflict) => continue,
                 result => return result,
             }
         }
@@ -3568,7 +3642,7 @@ impl AdmissionHandle<'_> {
         &self,
         key: &str,
         cancel: &pi_rs_core::CancellationToken,
-    ) -> Result<(Option<task_store::SignalState>, durable_store::Check), String> {
+    ) -> Result<(Option<task_store::SignalState>, durable_store::Check), HookFenceError> {
         if !self.is_conversation_checkpointable() || key.is_empty() || key.len() > 4096 {
             return Err("invalid checkpointable hook signal".into());
         }
@@ -3595,7 +3669,7 @@ impl AdmissionHandle<'_> {
                 (std::slice::from_ref(&check), &[]),
             ) {
                 Ok(_) => return Ok((state, check)),
-                Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                Err(HookFenceError::Conflict) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -3605,7 +3679,7 @@ impl AdmissionHandle<'_> {
         &self,
         keys: &[task_store::SignalKey],
         cancel: &pi_rs_core::CancellationToken,
-    ) -> Result<(bool, durable_store::Check), String> {
+    ) -> Result<(bool, durable_store::Check), HookFenceError> {
         let store = self.lease.attachment.owner.store();
         for _ in 0..8 {
             let key = task_store::signal_revision_key(self.running.task.id());
@@ -3615,7 +3689,7 @@ impl AdmissionHandle<'_> {
             {
                 Ok(()) => true,
                 Err(task_store::Error::SignalKeyConsumed) => false,
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error.to_string().into()),
             };
             let check = durable_store::Check {
                 key,
@@ -3632,7 +3706,7 @@ impl AdmissionHandle<'_> {
                 (std::slice::from_ref(&check), &[]),
             ) {
                 Ok(_) => return Ok((available, check)),
-                Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                Err(HookFenceError::Conflict) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -3644,7 +3718,7 @@ impl AdmissionHandle<'_> {
         value: Option<serde_json::Value>,
         cancel: &pi_rs_core::CancellationToken,
         signal_check: Option<&durable_store::Check>,
-    ) -> Result<Option<serde_json::Value>, String> {
+    ) -> Result<Option<serde_json::Value>, HookFenceError> {
         let store = self.lease.attachment.owner.store();
         let storage_key =
             format!("runtime/extension-memo/{}/{}", self.running.task.id(), key).into_bytes();
@@ -4670,6 +4744,33 @@ pub mod registry_wake_test_hook {
     }
 }
 
+/// Opt-in synchronization for real-driver hook fence contention tests.
+#[cfg(feature = "test-hooks")]
+pub mod hook_fence_test_hook {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use uuid::Uuid;
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: OnceLock<Mutex<HashMap<(Uuid, &'static str), Hook>>> = OnceLock::new();
+    pub fn install(task: Uuid, phase: &'static str, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert((task, phase), Box::new(hook));
+    }
+    pub(super) fn run(task: Uuid, phase: &'static str) {
+        let hook = HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&(task, phase));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 fn stale_hook_gate(task: &Task, registry: &Registry, generation: Option<u64>) -> bool {
     let Some(generation) = generation else {
         return false;
@@ -5314,6 +5415,8 @@ impl Scheduler {
                 &mut deferred,
             ),
             InvocationResult::Abort(outcome) => {
+                #[cfg(feature = "test-hooks")]
+                hook_fence_test_hook::run(running.task.id(), "abort-settlement");
                 let _gate = task_gate;
                 #[cfg(test)]
                 if self.inject_abort_commit_error == 1 {
@@ -5731,6 +5834,24 @@ impl Scheduler {
                 pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
             });
         }
+        if result.as_ref().is_err_and(pre_transaction_busy) && backup.is_some() {
+            #[cfg(feature = "test-hooks")]
+            if let Some((running, InvocationResult::Abort(_))) = &backup {
+                hook_fence_test_hook::run(running.task.id(), "abort-busy");
+            }
+            let (running, result) = backup.take().expect("checked above");
+            drop(guard);
+            return Err(SettlementError::Pending {
+                completed: Box::new(CompletedInvocation {
+                    running,
+                    result,
+                    lease,
+                    receipt_capture,
+                    abort_definition,
+                    _identity_lease: None,
+                }),
+            });
+        }
         // A checked store conflict is known not to have committed. Keep the
         // same invocation and lease, then re-read task, graph and evidence.
         if matches!(
@@ -5814,8 +5935,27 @@ impl Scheduler {
     /// in particular, a new abort discovered after this check uses serial cleanup.
     pub fn try_settle_invocation(
         &mut self,
-        completed: CompletedInvocation,
+        mut completed: CompletedInvocation,
     ) -> Result<bool, SettlementError> {
+        if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+            || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+        {
+            return Err(SettlementError::Rejected {
+                error: Error::Ownership,
+                completed: Box::new(completed),
+            });
+        }
+        if let Err(error) = completed.capture_marked_receipt() {
+            if error.pre_transaction_busy() {
+                return Err(SettlementError::Pending {
+                    completed: Box::new(completed),
+                });
+            }
+            return Err(SettlementError::Rejected {
+                error: Error::Handler(format!("uncertain receipt capture: {error}")),
+                completed: Box::new(completed),
+            });
+        }
         let fence = self.failure_fence.clone();
         let guard = match fence.try_lock() {
             Ok(guard) => guard,
@@ -5952,6 +6092,7 @@ impl Scheduler {
                 match worker.abort_pending_task_graph(running) {
                     Ok(affected) => Ok(affected.unwrap_or_default()),
                     Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                    Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
                     Err(error) => {
                         state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
                         Err(Error::Handler(format!("checked pending abort: {error}")))
@@ -6110,7 +6251,9 @@ impl Scheduler {
                 });
             }
         };
-        if matches!(result, Err(Error::PendingAbort(_) | Error::Busy)) {
+        if matches!(result, Err(Error::PendingAbort(_) | Error::Busy))
+            || result.as_ref().is_err_and(pre_transaction_busy)
+        {
             drop(guard);
             return Err(SettlementError::PendingPrepared {
                 pending: Box::new(match deferred {
@@ -6348,7 +6491,9 @@ impl Scheduler {
                 });
             }
         };
-        if matches!(result, Err(Error::PendingAbort(_) | Error::Busy)) {
+        if matches!(result, Err(Error::PendingAbort(_) | Error::Busy))
+            || result.as_ref().is_err_and(pre_transaction_busy)
+        {
             drop(guard);
             return Err(SettlementError::PendingPrepared {
                 pending: Box::new(pending!()),
@@ -7435,8 +7580,8 @@ impl Scheduler {
         };
         match commit {
             Ok(()) => (),
-            Err(durable_store::Error::Conflict { .. }) => {
-                // No reservation or effects committed; rescan on a CAS miss.
+            Err(durable_store::Error::Conflict { .. } | durable_store::Error::WriteLockBusy(_)) => {
+                // No reservation or effects committed; rescan on a CAS miss or a writer lock timeout.
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
                 return Ok(false);
@@ -7556,21 +7701,26 @@ impl Scheduler {
                     }
                 }
                 let owner = self.owner();
-                self.deferred_recovery
-                    .extend(records.iter().filter_map(|item| {
-                        (item.task.state() == &TaskState::Running
-                            && !live.contains(&item.task.id())
-                            && (task_ids.contains(&item.task.id())
-                                || uncertain.iter().any(|root| {
-                                    !task_ancestors_available(
-                                        owner.store(),
-                                        &item.task,
-                                        &records,
-                                        |parent| parent.id() == *root,
-                                    )
-                                })))
-                        .then_some(item.task.id())
-                    }));
+                let mut blocked = self.unbound_cancel_roots.clone();
+                blocked.extend(records.iter().filter_map(|item| {
+                    (item.task.state() == &TaskState::Running
+                        && !live.contains(&item.task.id())
+                        && (task_ids.contains(&item.task.id())
+                            || uncertain.iter().any(|root| {
+                                !task_ancestors_available(
+                                    owner.store(),
+                                    &item.task,
+                                    &records,
+                                    |parent| parent.id() == *root,
+                                )
+                            })))
+                    .then_some(item.task.id())
+                }));
+                // A root may have finished marking its own graph while an
+                // unrelated root remains pending. Retain only current graph
+                // members so that the released graph can recover independently.
+                self.deferred_recovery.retain(|id| blocked.contains(id));
+                self.deferred_recovery.extend(blocked);
             }
             let deferred = if pending {
                 HashSet::new()
@@ -10044,9 +10194,24 @@ impl Scheduler {
             if let Some(hook) = &self.result_commit_hook {
                 hook(prepared.attempts, owner.store());
             }
+            #[cfg(feature = "test-hooks")]
+            hook_fence_test_hook::run(prepared.running.task.id(), "settlement");
             let result = prepared
                 .transaction
                 .commit_task_graph(owner.store(), prepared.graph_version);
+            if matches!(
+                result,
+                Err(crate::document::Error::Store(
+                    durable_store::Error::WriteLockBusy(_)
+                ))
+            ) {
+                #[cfg(feature = "test-hooks")]
+                hook_fence_test_hook::run(prepared.running.task.id(), "settlement-busy");
+                // BEGIN IMMEDIATE failed before a transaction existed. Keep the
+                // exact candidate and lease; the next attempt revalidates them.
+                prepared.commit_uncertain = false;
+                return Err(Error::Busy);
+            }
             let Err(crate::document::Error::Store(durable_store::Error::Conflict { ref key })) =
                 result
             else {
@@ -10641,6 +10806,8 @@ impl Scheduler {
             if self.inject_failure_commit_error == 1 {
                 return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
             }
+            #[cfg(feature = "test-hooks")]
+            hook_fence_test_hook::run(settlement.running.task.id(), "failure-settlement");
             let commit = store.store().commit_with_prefix_put_fence(
                 &candidate.batch.checks,
                 &candidate.batch.mutations,
@@ -10694,6 +10861,11 @@ impl Scheduler {
                     }
                     settlement.attempt += 1;
                     continue;
+                }
+                Err(durable_store::Error::WriteLockBusy(_)) => {
+                    #[cfg(feature = "test-hooks")]
+                    hook_fence_test_hook::run(settlement.running.task.id(), "failure-busy");
+                    return Err(Error::Busy);
                 }
                 Err(error) => return Err(task_store::Error::from(error).into()),
             }

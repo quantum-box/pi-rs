@@ -3600,3 +3600,99 @@ async fn late_receipt_conflicting_with_no_dispatch_never_reaches_parent_as_known
     let _ = driver.shutdown_with_pending();
     let _ = scheduler.shutdown().await;
 }
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn unsafe_initial_memo_busy_retries_without_dispatching_early() {
+    use pi_rs_durable::task_scheduler::hook_fence_test_hook;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let gate = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_unsafe_gated(
+        1,
+        before.clone(),
+        after.clone(),
+        executions.clone(),
+        "busy-v1",
+        Some(("before", gate.clone())),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .task;
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(task.id(), "memo", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(task.id(), "busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    gate.store(2, Ordering::SeqCst);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let writer_path = path.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(writer_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(6500));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("unsafe initial memo did not reach busy timeout");
+    writer.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .list(format!("durable/unsafe-park-async/{}/", task.id()).as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    gate.store(2, Ordering::SeqCst);
+    until_result(&scheduler, id).await;
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(before.load(Ordering::SeqCst), 1);
+    assert_eq!(after.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}

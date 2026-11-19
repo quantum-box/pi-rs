@@ -848,6 +848,14 @@ impl Hook for SignalHook {
             return Err("memo changed".into());
         }
         if self.id == "b2" {
+            if let Some(gate) = &self.gate
+                && gate.load(Ordering::SeqCst) == 20
+            {
+                gate.store(21, Ordering::SeqCst);
+                while gate.load(Ordering::SeqCst) != 22 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             match ctx.read_signal("first").await? {
                 None => {
                     if let Some(gate) = &self.gate
@@ -2034,4 +2042,328 @@ async fn registry_wake_waiting_for_writer_cannot_cross_deadline() {
 #[tokio::test]
 async fn registry_wake_retries_writer_lock_timeout() {
     registry_wake_writer_race(true).await;
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn memo_busy_after_signal_read_defers_and_rechecks_lease() {
+    use pi_rs_durable::task_scheduler::hook_fence_test_hook;
+    use pi_rs_durable::task_store::SignalResult;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicUsize::new(10));
+    let (options, registry, extensions) = setup_signal_gate(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        calls.clone(),
+        Some(gate.clone()),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.load(Ordering::SeqCst) != 11 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .task;
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(task.id(), "memo", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(task.id(), "busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    gate.store(12, Ordering::SeqCst);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let writer_path = path.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(writer_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(6500));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("memo commit never reached busy timeout");
+    writer.join().unwrap();
+    let task = wait_signal_sleep(&path, "first").await;
+    assert!(
+        store
+            .get(format!("runtime/extension-memo/{}/review-decision", task.id()).as_bytes())
+            .unwrap()
+            .is_none()
+    );
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    wait_signal_sleep(&path, "second").await;
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "second", json!("two"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    wait_result(&scheduler, id).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn busy_park_settlement_rechecks_abort_before_retry() {
+    use pi_rs_durable::task_scheduler::hook_fence_test_hook;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_signal_gate(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        calls.clone(),
+        Some(gate.clone()),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    start(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .task;
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(task.id(), "settlement", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(task.id(), "settlement-busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    gate.store(2, Ordering::SeqCst);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let writer_path = path.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(writer_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(7000));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("settlement did not hit busy timeout");
+    driver.request_abort(task.id()).unwrap();
+    writer.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let task = driver.get(task.id()).unwrap().unwrap();
+            if task.is_terminal() && task.abort_requested() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn busy_park_settlement_revalidates_and_resumes() {
+    use pi_rs_durable::task_scheduler::hook_fence_test_hook;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_signal_gate(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        calls.clone(),
+        Some(gate.clone()),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .task;
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(task.id(), "settlement", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(task.id(), "settlement-busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    gate.store(2, Ordering::SeqCst);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let writer_path = path.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(writer_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(7000));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("settlement did not hit busy timeout");
+    writer.join().unwrap();
+    let task = wait_signal_sleep(&path, "first").await;
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        pi_rs_durable::task_store::SignalResult::Delivered
+    );
+    wait_signal_sleep(&path, "second").await;
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "second", json!("two"))
+            .unwrap(),
+        pi_rs_durable::task_store::SignalResult::Delivered
+    );
+    wait_result(&scheduler, id).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn signal_read_busy_defers_and_rechecks_lease() {
+    use pi_rs_durable::task_scheduler::hook_fence_test_hook;
+    use pi_rs_durable::task_store::SignalResult;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicUsize::new(20));
+    let (options, registry, extensions) = setup_signal_gate(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        calls.clone(),
+        Some(gate.clone()),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.load(Ordering::SeqCst) != 21 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .task;
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(task.id(), "signal", move || {
+        at_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    hook_fence_test_hook::install(task.id(), "busy", move || {
+        busy_tx.send(()).unwrap();
+    });
+    gate.store(22, Ordering::SeqCst);
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let writer_path = path.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(writer_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(6500));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    busy_rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("signal read never reached busy timeout");
+    writer.join().unwrap();
+    let task = wait_signal_sleep(&path, "first").await;
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    wait_signal_sleep(&path, "second").await;
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "second", json!("two"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    wait_result(&scheduler, id).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
 }
