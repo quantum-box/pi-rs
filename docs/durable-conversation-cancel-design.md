@@ -70,6 +70,11 @@ only: callback dispatch and most mutation paths do not yet use it. Existing
 graphs; blocking abort and signal delivery are not protected by this primitive.
 The task wake and signal revision must be checked before dispatch is enabled.
 
+The `Scheduler::schedule` worker also fences its ModelReady-to-ModelRunning
+save before model dispatch. Busy leaves the durable state unchanged and retries
+through the scheduled worker. This does not yet fence the general Harness save
+path, post-effect result saves, signal delivery, or blocking abort.
+
 A safe implementation needs all of the following before dispatch is enabled:
 
 * Bind the callback identity, retry policy, Tool identity and selected hook

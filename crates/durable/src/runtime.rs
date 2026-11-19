@@ -16937,6 +16937,28 @@ impl Harness {
                             Err(error) => return Err(error),
                         }
                     }
+                    // This is the pre-dispatch ModelReady -> ModelRunning
+                    // save. No model call has begun, so a busy gate can leave
+                    // the durable ModelReady state for the worker to retry.
+                    let _start_lease = if matches!(c.phase, Phase::ModelRunning { .. }) {
+                        if let Some(gate) = &self.scheduled_placement_gate {
+                            let Some(lease) = gate.try_enter() else {
+                                #[cfg(test)]
+                                if let Some(signal) =
+                                    placement_start_busy_hooks().lock().unwrap().remove(&id)
+                                {
+                                    signal.add_permits(1);
+                                }
+                                *identity_busy = true;
+                                return Ok(());
+                            };
+                            Some(lease)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::ModelRunning {
@@ -25189,6 +25211,55 @@ mod scheduler_tests {
         let reset = scheduler.reset(id, Some("handoff".into())).unwrap();
         let after = scheduler.conversation(id).unwrap();
         assert!(after.resets.iter().any(|entry| entry.id == reset));
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_start_save_waits_for_callback_start_gate_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = placement_model();
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let gate = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .callback_start;
+        let lease = gate.try_enter().unwrap();
+        let busy = Arc::new(Semaphore::new(0));
+        placement_start_busy_hooks()
+            .lock()
+            .unwrap()
+            .insert(id, busy.clone());
+        let submission = scheduler.submit(id, None, "input".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), busy.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let during = scheduler.conversation(id).unwrap();
+        assert!(matches!(during.phase, Phase::ModelReady { .. }));
+        assert_eq!(model.started.available_permits(), 0);
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(5), model.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        model.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            scheduler
+                .conversation(id)
+                .unwrap()
+                .submissions
+                .iter()
+                .any(|s| s.id == submission && matches!(s.status, Status::Done { .. }))
+        );
         scheduler.shutdown().await.unwrap();
     }
 
