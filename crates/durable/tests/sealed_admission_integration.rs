@@ -396,3 +396,283 @@ fn abort_after_sealed_admission_before_park() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     driver.shutdown().unwrap();
 }
+
+struct RewriteLeaf {
+    invocations: Arc<AtomicUsize>,
+    log: Option<PathBuf>,
+}
+#[async_trait]
+impl Tool for RewriteLeaf {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "rewrite-leaf".into(),
+            description: String::new(),
+            parameters: json!({"type":"object", "required":["normalized", "value"], "properties":{"normalized":{"const":true},"value":{"type":"string"}}}),
+        }
+    }
+    async fn prepare_arguments(&self, mut input: Value) -> pi_rs_core::ExtensionResult<Value> {
+        input["normalized"] = json!(true);
+        input["value"] = json!("prepared");
+        Ok(input)
+    }
+    async fn invoke(&self, input: Value, _: ToolContext) -> Outcome {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        if let Some(path) = &self.log {
+            record(
+                path,
+                &format!("invoke:{}", input["value"].as_str().unwrap()),
+            );
+        }
+        Outcome::Succeeded(input["value"].as_str().unwrap().to_string())
+    }
+}
+fn record(path: &Path, line: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{line}").unwrap();
+    file.sync_all().unwrap();
+}
+struct RewriteHook {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<AtomicBool>,
+    pending: bool,
+    log: Option<PathBuf>,
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for RewriteHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        assert_eq!(call.arguments["value"], json!("prepared"));
+        assert_eq!(call.arguments["normalized"], json!(true));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(path) = &self.log {
+            record(path, "hook");
+        }
+        self.entered.store(true, Ordering::SeqCst);
+        if self.pending {
+            std::future::pending::<()>().await;
+        }
+        let mut rewritten = call.arguments.clone();
+        rewritten["value"] = json!("rewritten");
+        Ok(pi_rs_durable::extension::BeforeTool::Rewrite(rewritten))
+    }
+}
+fn hook_host(
+    path: &Path,
+    marker: Option<PathBuf>,
+    release: Arc<AtomicBool>,
+    pending: bool,
+    entered: Arc<AtomicBool>,
+    hook_calls: Arc<AtomicUsize>,
+    invocations: Arc<AtomicUsize>,
+    log: Option<PathBuf>,
+) -> Driver {
+    let tool: Arc<dyn Tool> = Arc::new(RewriteLeaf {
+        invocations,
+        log: log.clone(),
+    });
+    let _binding = nested_identity::register(&tool, Some("hook-backend".into())).unwrap();
+    let cell = Arc::new(OnceLock::new());
+    let parent: Arc<dyn Handler> = Arc::new(Parent {
+        leaf: cell.clone(),
+        mode: Mode::Immediate,
+        marker,
+        release,
+    });
+    let parent_tool = Arc::new(TaskTool::new(
+        spec("parent"),
+        "parent",
+        true,
+        1,
+        parent.clone(),
+    ));
+    let mut registry = Registry::default();
+    assert!(registry.register_shared("parent", true, parent));
+    assert!(registry.register(
+        "root",
+        true,
+        Root {
+            parent: parent_tool
+        }
+    ));
+    assert!(registry.set_abort("parent", |_: &Task| Ok(Step::Succeed(Value::Null))));
+    assert!(registry.set_abort("root", |_: &Task| Ok(Step::Succeed(Value::Null))));
+    let mut host =
+        pi_rs_durable::async_task_tool::StandaloneBeforeHookHost::open(path, registry).unwrap();
+    let hook = Arc::new(RewriteHook {
+        calls: hook_calls,
+        entered,
+        pending,
+        log,
+    });
+    let leaf = host
+        .register_tool("leaf", tool, "hook-backend", 1, "rewrite-hook-v1", hook)
+        .unwrap();
+    assert!(cell.set(leaf).is_ok());
+    host.into_driver()
+}
+#[test]
+fn immediate_before_hook_rewrites_while_parent_is_before_park() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("admitted");
+    let root = seed(&dir.path().join("db"));
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let invokes = Arc::new(AtomicUsize::new(0));
+    let driver = hook_host(
+        &dir.path().join("db"),
+        Some(marker.clone()),
+        release.clone(),
+        false,
+        entered,
+        hooks.clone(),
+        invokes.clone(),
+        None,
+    );
+    until(|| marker.exists());
+    let (parent, child) = marker_ids(&marker);
+    until(|| driver.get(child).unwrap().is_some_and(|t| t.is_terminal()));
+    assert_eq!(
+        driver.get(parent).unwrap().unwrap().state(),
+        &TaskState::Running
+    );
+    assert_eq!(hooks.load(Ordering::SeqCst), 1);
+    assert_eq!(invokes.load(Ordering::SeqCst), 1);
+    release.store(true, Ordering::SeqCst);
+    until(|| driver.get(root).unwrap().is_some_and(|t| t.is_terminal()));
+    assert_eq!(
+        driver.get(root).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!({"Succeeded":"rewritten"}))
+    );
+    driver.shutdown().unwrap();
+}
+#[test]
+fn immediate_before_hook_abort_during_preflight_before_parent_park() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("admitted");
+    let _root = seed(&dir.path().join("db"));
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let invokes = Arc::new(AtomicUsize::new(0));
+    let driver = hook_host(
+        &dir.path().join("db"),
+        Some(marker.clone()),
+        release.clone(),
+        true,
+        entered.clone(),
+        hooks.clone(),
+        invokes.clone(),
+        None,
+    );
+    until(|| marker.exists() && entered.load(Ordering::SeqCst));
+    let (parent, child) = marker_ids(&marker);
+    assert_eq!(
+        driver.get(parent).unwrap().unwrap().state(),
+        &TaskState::Running
+    );
+    driver.request_abort(parent).unwrap();
+    release.store(true, Ordering::SeqCst);
+    until(|| {
+        driver.get(parent).unwrap().is_some_and(|t| t.is_terminal())
+            && driver.get(child).unwrap().is_some_and(|t| t.is_terminal())
+    });
+    assert!(driver.get(parent).unwrap().unwrap().abort_requested());
+    assert_eq!(hooks.load(Ordering::SeqCst), 1);
+    assert_eq!(invokes.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+}
+#[test]
+fn immediate_before_hook_kill_worker() {
+    let Some(dir) = std::env::var_os("PI_HOOK_IMMEDIATE_KILL_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let root = seed(&dir.join("db"));
+    let driver = hook_host(
+        &dir.join("db"),
+        Some(dir.join("admitted")),
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Some(dir.join("events")),
+    );
+    std::fs::write(dir.join("root"), root.to_string()).unwrap();
+    until(|| dir.join("admitted").exists());
+    let (parent, child) = marker_ids(&dir.join("admitted"));
+    until(|| driver.get(child).unwrap().is_some_and(|t| t.is_terminal()));
+    assert_eq!(
+        driver.get(parent).unwrap().unwrap().state(),
+        &TaskState::Running
+    );
+    std::fs::write(dir.join("ready"), "ready").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[test]
+fn immediate_before_hook_reconnects_after_kill_before_parent_park() {
+    let dir = tempfile::tempdir().unwrap();
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut process = Guard(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "immediate_before_hook_kill_worker"])
+            .env("PI_HOOK_IMMEDIATE_KILL_DIR", dir.path())
+            .spawn()
+            .unwrap(),
+    );
+    until(|| dir.path().join("ready").exists() || process.0.try_wait().unwrap().is_some());
+    assert!(
+        dir.path().join("ready").exists(),
+        "worker failed before ready"
+    );
+    let (parent, child) = marker_ids(&dir.path().join("admitted"));
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let root: Uuid = std::fs::read_to_string(dir.path().join("root"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let invokes = Arc::new(AtomicUsize::new(0));
+    let driver = hook_host(
+        &dir.path().join("db"),
+        None,
+        Arc::new(AtomicBool::new(true)),
+        false,
+        Arc::new(AtomicBool::new(false)),
+        hooks.clone(),
+        invokes.clone(),
+        Some(dir.path().join("events")),
+    );
+    until(|| driver.get(root).unwrap().is_some_and(|t| t.is_terminal()));
+    assert_eq!(
+        driver.get(root).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!({"Succeeded":"rewritten"}))
+    );
+    assert!(driver.get(parent).unwrap().unwrap().is_terminal());
+    assert!(driver.get(child).unwrap().unwrap().is_terminal());
+    assert_eq!(hooks.load(Ordering::SeqCst), 0);
+    assert_eq!(invokes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("events")).unwrap(),
+        "hook\ninvoke:rewritten\n"
+    );
+    driver.shutdown().unwrap();
+}
