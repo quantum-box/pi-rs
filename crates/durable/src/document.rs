@@ -2394,9 +2394,6 @@ impl<'a> TaskDocuments<'a> {
         &mut self,
         id: uuid::Uuid,
     ) -> Result<(Vec<crate::async_task_tool::UnsafeDurableReceipt>, bool), String> {
-        if self.input_validator.is_some() {
-            return Err("unsafe child evidence requires a standalone scheduler".into());
-        }
         let boundary = self.store.put_version().map_err(|e| e.to_string())?;
         let prefix = format!("durable/unsafe-park-async/{id}/").into_bytes();
         let has_intent = self

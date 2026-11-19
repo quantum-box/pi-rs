@@ -3231,6 +3231,7 @@ fn checkpointable_root_binding_key(task: Uuid) -> Vec<u8> {
 
 struct TaskResultFence {
     rich: Option<crate::extension::ToolBlockResult>,
+    evidence: Vec<Check>,
     task: crate::task::Task,
     check: Check,
     binding: Option<Check>,
@@ -5895,6 +5896,7 @@ impl Harness {
             });
             let mut checks = vec![fence.check.clone()];
             checks.extend(fence.binding.clone());
+            checks.extend(fence.evidence.clone());
             let batch = crate::task_store::OwnedBatch {
                 checks,
                 mutations: vec![],
@@ -11570,7 +11572,8 @@ impl Harness {
                 .map_err(|e| Error::Invalid(format!("task load: {e}")))?
                 .ok_or_else(|| Error::Invalid("checkpointable owner missing".into()))?;
             if (next == task.id() && stored.task != *task)
-                || !stored.task.replay_safe()
+                || (!stored.task.replay_safe()
+                    && !registry.is_conversation_checkpointable_task(&stored.task))
                 || stored.task.abort_requested()
                 || stored.task.is_terminal()
                 || (stored.task.is_completing()
@@ -11687,7 +11690,7 @@ impl Harness {
                             .matches_conversation_checkpointable(identity, &adapter.handler())
                         || stored.task.kind() != Some(identity.kind.as_str())
                         || stored.task.definition_version() != identity.definition_version
-                        || !identity.replay_safe
+                        || stored.task.replay_safe() != identity.replay_safe
                     {
                         return Err(Error::Invalid(
                             "checkpointable registration mismatch".into(),
@@ -15122,6 +15125,7 @@ impl Harness {
             None
         };
         let mut rich_result = None;
+        let mut result_evidence = Vec::new();
         let outcome = match child.task.state() {
             crate::task::TaskState::Succeeded(value)
                 if child.task.kind() == Some(crate::foreground_subagent::KIND)
@@ -15157,6 +15161,24 @@ impl Harness {
             crate::task::TaskState::Succeeded(value) if identity.is_checkpointable() => {
                 let outcome: Outcome = serde_json::from_value(value.clone())
                     .map_err(|_| Error::Invalid("invalid checkpointable tool outcome".into()))?;
+                if !identity.replay_safe {
+                    let boundary = self.owner.store().put_version()?;
+                    let receipts = crate::async_task_tool::unsafe_park_proof::read_receipts(
+                        self.owner.store(),
+                        task,
+                    )
+                    .map_err(|e| Error::Invalid(format!("unsafe task receipt: {e}")))?;
+                    if receipts.len() != 1
+                        || Some(receipts[0].attempt_id) != child.task.retired_attempt_id()
+                        || receipts[0].outcome != outcome
+                    {
+                        return Err(Error::Invalid("unsafe task result receipt mismatch".into()));
+                    }
+                    result_evidence.push(Check {
+                        key: format!("durable/unsafe-park-async/{task}/").into_bytes(),
+                        expected: Expected::PrefixUnchangedSince(boundary),
+                    });
+                }
                 if matches!(outcome, Outcome::Unknown(_) | Outcome::Pending { .. }) {
                     return Err(Error::Invalid(
                         "uncertain checkpointable tool outcome".into(),
@@ -15173,6 +15195,13 @@ impl Harness {
             // Generic task failures do not distinguish a handler-reported error
             // from an interrupted effect. Do not turn uncertainty into a known result.
             crate::task::TaskState::Failed(reason) => Some(Outcome::Unknown(reason.clone())),
+            crate::task::TaskState::Cancelled
+                if identity.is_checkpointable() && !identity.replay_safe =>
+            {
+                Some(Outcome::Unknown(
+                    "unsafe task cancelled; reconciliation required".into(),
+                ))
+            }
             crate::task::TaskState::Cancelled => Some(Outcome::Failed("task cancelled".into())),
             _ => None,
         };
@@ -15181,6 +15210,7 @@ impl Harness {
                 outcome,
                 TaskResultFence {
                     rich: rich_result,
+                    evidence: result_evidence,
                     task: child.task.clone(),
                     binding: binding_check,
                     check: Check {

@@ -352,7 +352,11 @@ pub(super) fn register_conversation_candidate(
         crate::extension::RegistrationEvidence,
         Arc<dyn crate::extension::Hook>,
     )>,
+    replay_safe: bool,
 ) -> Result<Arc<TaskTool>, String> {
+    if !replay_safe && selected.is_some() {
+        return Err("unsafe conversation hooks unsupported".into());
+    }
     let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
     if let Some((selection, _, _)) = &selected {
         let hook_id = format!(
@@ -367,7 +371,8 @@ pub(super) fn register_conversation_candidate(
     for child in children {
         let id = child.identity().ok_or("invalid child identity")?;
         if child.is_direct()
-            || !id.replay_safe
+            || ((!id.replay_safe || !replay_safe)
+                && !registry.matches_conversation_checkpointable(&id, &child.handler()))
             || !registry.matches_task_tool(&id, &child.handler())
         {
             return Err("child must be a registered replay-safe task tool".into());
@@ -395,7 +400,12 @@ pub(super) fn register_conversation_candidate(
     if encoded.len() > 65536 {
         return Err("definition identity too large".into());
     }
-    let kind = format!("pi-rs.replay-safe-async.v1.{:x}", Sha256::digest(encoded));
+    let prefix = if replay_safe {
+        "pi-rs.replay-safe-async.v1."
+    } else {
+        "pi-rs.unsafe-park-async.v1."
+    };
+    let kind = format!("{prefix}{:x}", Sha256::digest(encoded));
     let spec = tool.spec();
     if spec != identity.spec {
         return Err("tool specification changed during registration".into());
@@ -418,13 +428,14 @@ pub(super) fn register_conversation_candidate(
         version,
         children: names,
         hook,
-        replay_safe: true,
+        replay_safe,
         block_results: has_hook,
         unavailable: false,
         park_cancel: None,
         woken_identity: None,
     });
-    let mut adapter = TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments();
+    let mut adapter =
+        TaskTool::new(spec, kind, replay_safe, version, handler).with_deferred_arguments();
     if has_hook {
         adapter = adapter.with_conversation_hooks(
             selection.clone().ok_or("missing selection")?,

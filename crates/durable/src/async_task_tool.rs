@@ -1,7 +1,7 @@
 //! Standalone task-backed async tools with explicit hook policy. Checkpointable
 //! tools have separate replay-safe and unsafe registrations. Conversation-
 //! attached checkpointable execution supports explicitly registered replay-safe
-//! task trees and one explicitly selected hook. Unsafe tools are rejected.
+//! task trees, one selected replay-safe hook, and unhooked unsafe task trees.
 
 use crate::task::Task;
 use pi_rs_core::{Outcome, Tool, ToolSpec};
@@ -39,6 +39,33 @@ pub fn register_conversation_replay_safe_durable_tool(
         version,
         children,
         None,
+        true,
+    )
+}
+
+/// Register a conversation-owned non-replayable checkpointable tool without
+/// hooks. Interrupted execution requires reconciliation; only a committed
+/// park authorizes a later wake. All children must use matching conversation
+/// checkpointable registrations with no selected hooks. Cancellation only
+/// stops and joins local execution; no external cancellation API is provided.
+/// Abort and interrupted execution require reconciliation, and joined receipts
+/// remain available through `read_unsafe_durable_receipts`.
+pub fn register_conversation_unsafe_durable_tool(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    _authorization: UnsafeDurableAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        None,
+        false,
     )
 }
 
@@ -91,6 +118,7 @@ pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
             registration,
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
+        true,
     )
 }
 

@@ -665,14 +665,12 @@ impl Registry {
         let identity = adapter
             .identity()
             .ok_or("invalid checkpointable identity")?;
-        if !identity.replay_safe
-            || !self.register_shared_versioned(
-                identity.kind.clone(),
-                identity.definition_version,
-                true,
-                adapter.handler(),
-            )
-        {
+        if !self.register_shared_versioned(
+            identity.kind.clone(),
+            identity.definition_version,
+            identity.replay_safe,
+            adapter.handler(),
+        ) {
             return Err("checkpointable kind already registered or invalid".into());
         }
         let entry = self.entries.get_mut(&identity.kind).expect("inserted");
@@ -703,6 +701,18 @@ impl Registry {
                 .is_some_and(|(saved, validate, _)| saved == identity && validate())
                 && self.matches_task_tool(identity, handler)
         })
+    }
+    pub(crate) fn is_conversation_checkpointable_task(&self, task: &Task) -> bool {
+        task.kind()
+            .and_then(|kind| self.entries.get(kind))
+            .is_some_and(|entry| {
+                entry.version == task.definition_version()
+                    && entry.replay_safe == task.replay_safe()
+                    && entry
+                        .conversation_checkpointable
+                        .as_ref()
+                        .is_some_and(|(_, validate, _)| validate())
+            })
     }
     pub(crate) fn conversation_hook_selection(
         &self,
@@ -2016,7 +2026,7 @@ impl AdmissionHandle<'_> {
         result: &crate::async_task_tool::DurableToolStep,
         arguments: &serde_json::Value,
     ) -> Result<(), String> {
-        if !self.standalone || self.abort || self.lease.retired || self.running.task.replay_safe() {
+        if self.abort || self.lease.retired || self.running.task.replay_safe() {
             return Err("invalid unsafe result executor".into());
         }
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
@@ -2038,6 +2048,10 @@ impl AdmissionHandle<'_> {
             || current.task.attempt_id() != Some(attempt)
             || current.task.owner() != self.running.task.owner()
             || current.task.kind() != self.running.task.kind()
+            || current.task.input() != self.running.task.input()
+            || current.task.checkpoint() != self.running.task.checkpoint()
+            || current.task.definition_version() != self.running.task.definition_version()
+            || current.task.replay_safe() != self.running.task.replay_safe()
         {
             return Err("stale unsafe result task".into());
         }
@@ -3146,8 +3160,7 @@ impl AdmissionHandle<'_> {
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<Vec<u8>, String> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
-        if (!self.standalone
-            && (test_namespace || !expected_replay_safe || self.validator.is_none()))
+        if (!self.standalone && (test_namespace || self.validator.is_none()))
             || self.abort
             || self.lease.retired
             || self.running.task.replay_safe() != expected_replay_safe

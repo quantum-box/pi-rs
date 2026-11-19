@@ -8,8 +8,8 @@ use pi_rs_durable::task::TaskState;
 use pi_rs_durable::{
     async_task_tool::{
         AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
-        DurableToolStep, DurableWait, ReplaySafeAuthorization,
-        register_conversation_replay_safe_durable_tool,
+        DurableToolStep, DurableWait, ReplaySafeAuthorization, UnsafeDurableAuthorization,
+        register_conversation_replay_safe_durable_tool, register_conversation_unsafe_durable_tool,
     },
     recovery::UncertainPolicy,
     runtime::{Config, Options, Scheduler},
@@ -88,6 +88,12 @@ impl DurableAsyncTool for AsyncTool {
             return Ok(DurableToolStep::Complete(Outcome::Succeeded("leaf".into())));
         };
         if let Some(checkpoint) = resume.checkpoint {
+            if self.name == "root"
+                && let Some(path) = std::env::var_os("PI_CONV_ASYNC_KILL_WAKE")
+            {
+                std::fs::write(path, "root-woken").unwrap();
+                std::future::pending::<()>().await;
+            }
             let child: AsyncTaskCall =
                 serde_json::from_value(checkpoint).map_err(|e| e.to_string())?;
             if !resume.ended.contains(&child.task_id()) {
@@ -162,6 +168,102 @@ fn setup_with_gate(
         registry,
     )
 }
+fn setup_unsafe_tree(unsafe_leaf: bool) -> (Options, Registry) {
+    setup_unsafe_tree_with_gate(unsafe_leaf, None)
+}
+fn setup_unsafe_tree_with_gate(
+    unsafe_leaf: bool,
+    gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> (Options, Registry) {
+    let mut registry = Registry::default();
+    let mut adapters = vec![];
+    let mut child = None;
+    for (name, next) in [
+        ("leaf", None),
+        ("middle", Some("leaf")),
+        ("root", Some("middle")),
+    ] {
+        let tool = Arc::new(AsyncTool {
+            name,
+            child: next,
+            gate: if name == "leaf" { gate.clone() } else { None },
+            early: false,
+        });
+        let adapter = if name != "leaf" || unsafe_leaf {
+            register_conversation_unsafe_durable_tool(
+                &mut registry,
+                tool,
+                name,
+                1,
+                child.into_iter().collect(),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+            .unwrap()
+        } else {
+            register_conversation_replay_safe_durable_tool(
+                &mut registry,
+                tool,
+                name,
+                1,
+                child.into_iter().collect(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap()
+        };
+        adapters.push(adapter.register());
+        child = Some(adapter);
+    }
+    (
+        Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: adapters,
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+    )
+}
+#[tokio::test]
+async fn conversation_unsafe_tree_executes_two_park_levels() {
+    let dir = tempfile::tempdir().unwrap();
+    let (options, registry) = setup_unsafe_tree(true);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id)).await;
+    if !matches!(result, Ok(Ok(_))) {
+        let tasks = pi_rs_durable::task_store::TaskStore::new(
+            &durable_store::Store::open(dir.path().join("db")).unwrap(),
+        )
+        .list()
+        .unwrap();
+        panic!("result: {result:?}, tasks: {tasks:?}");
+    }
+    let conversation = scheduler.conversation(id).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(
+        &durable_store::Store::open(dir.path().join("db")).unwrap(),
+    )
+    .list()
+    .unwrap();
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "root")),
+        "{conversation:?}, {tasks:?}"
+    );
+    driver.shutdown().unwrap();
+}
 #[tokio::test]
 async fn conversation_executes_two_park_levels() {
     let dir = tempfile::tempdir().unwrap();
@@ -200,6 +302,71 @@ async fn conversation_executes_two_park_levels() {
     driver.shutdown().unwrap();
 }
 
+#[tokio::test]
+async fn unsafe_conversation_rejects_selected_extension_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut registry = Registry::default();
+    let adapter = register_conversation_unsafe_durable_tool(
+        &mut registry,
+        Arc::new(UncertainUnsafeTool {
+            late: false,
+            started: started.clone(),
+        }),
+        "unhooked-root",
+        1,
+        vec![],
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![adapter.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install(pi_rs_durable::extension::Extension {
+            name: "policy".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    assert!(
+        pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    let _ = driver.shutdown_with_pending().unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn conversation_checkpointable_kill_worker() {
@@ -207,7 +374,11 @@ async fn conversation_checkpointable_kill_worker() {
         return;
     };
     let directory = std::path::PathBuf::from(directory);
-    let (options, registry) = setup();
+    let (options, registry) = match std::env::var("PI_CONV_UNSAFE_TREE").ok().as_deref() {
+        Some("unsafe-leaf") => setup_unsafe_tree(true),
+        Some("safe-leaf") => setup_unsafe_tree(false),
+        _ => setup(),
+    };
     let mut scheduler = Scheduler::open(directory.join("db"), options).unwrap();
     let _driver = scheduler.start_tasks(registry).unwrap();
     let id = scheduler
@@ -220,6 +391,184 @@ async fn conversation_checkpointable_kill_worker() {
     std::fs::write(directory.join("conversation"), id.to_string()).unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
     std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_park_wakes_after_kill_but_interrupted_unsafe_leaf_is_not_replayed() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for unsafe_leaf in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "conversation_checkpointable_kill_worker"])
+                .env("PI_CONV_ASYNC_KILL_DIR", dir.path())
+                .env("PI_CONV_ASYNC_KILL_READY", dir.path().join("ready"))
+                .env(
+                    "PI_CONV_UNSAFE_TREE",
+                    if unsafe_leaf {
+                        "unsafe-leaf"
+                    } else {
+                        "safe-leaf"
+                    },
+                )
+                .spawn()
+                .unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !dir.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let id = std::fs::read_to_string(dir.path().join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|t| matches!(t.task.state(), TaskState::Waiting(_)))
+                .count(),
+            2
+        );
+        let leaf = tasks
+            .iter()
+            .find(|t| t.task.state() == &TaskState::Running)
+            .unwrap()
+            .task
+            .id();
+        drop(store);
+        let (options, registry) = setup_unsafe_tree(unsafe_leaf);
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = scheduler.conversation(id).unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        let leaf_task = tasks.iter().find(|t| t.task.id() == leaf).unwrap();
+        if unsafe_leaf {
+            assert!(
+                matches!(leaf_task.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+                "{tasks:?}"
+            );
+            assert!(
+                !conversation
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Tool { .. })),
+                "{conversation:?}"
+            );
+        } else {
+            assert!(
+                matches!(leaf_task.task.state(), TaskState::Succeeded(_)),
+                "{tasks:?}"
+            );
+            assert!(
+                conversation
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Tool {content,..} if content == "root")),
+                "{conversation:?}"
+            );
+        }
+        drop(store);
+        let _ = driver.shutdown_with_pending().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_woken_unsafe_conversation_root_never_replays() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "conversation_checkpointable_kill_worker"])
+            .env("PI_CONV_ASYNC_KILL_DIR", dir.path())
+            .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
+            .env("PI_CONV_UNSAFE_TREE", "unsafe-leaf")
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("wake").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (options, registry) = setup_unsafe_tree(true);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let conversation = scheduler.conversation(id).unwrap();
+    assert!(
+        !conversation
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. })),
+        "{conversation:?}"
+    );
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let root = tasks
+        .iter()
+        .find(|t| {
+            matches!(
+                t.task.owner(),
+                pi_rs_durable::task::TaskOwner::Conversation(_)
+            )
+        })
+        .unwrap();
+    assert!(
+        matches!(root.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+        "{tasks:?}"
+    );
+    assert_eq!(
+        pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, root.task.id())
+            .unwrap()
+            .len(),
+        0
+    );
+    drop(store);
+    let _ = driver.shutdown_with_pending().unwrap();
 }
 
 #[cfg(unix)]
@@ -324,6 +673,184 @@ async fn conversation_abort_cancels_running_child_and_drains_two_parks() {
             .all(|t| !matches!(t.task.state(), pi_rs_durable::task::TaskState::Succeeded(_)))
     );
     driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn unsafe_conversation_abort_drains_children_without_publishing_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (options, registry) = setup_unsafe_tree_with_gate(true, Some(gate.clone()));
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !gate.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let abort = tokio::time::timeout(Duration::from_secs(10), scheduler.abort_and_wait(id))
+        .await
+        .unwrap();
+    assert!(
+        abort.is_err(),
+        "unsafe aborted work requires reconciliation"
+    );
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert_eq!(tasks.len(), 3);
+    assert!(tasks.iter().all(|t| t.task.is_terminal()), "{tasks:?}");
+    assert!(
+        tasks
+            .iter()
+            .all(|t| !matches!(t.task.state(), TaskState::Succeeded(_))),
+        "{tasks:?}"
+    );
+    assert!(
+        !scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content,..} if content == "root"))
+    );
+    driver.shutdown().unwrap();
+}
+
+struct UncertainUnsafeTool {
+    late: bool,
+    started: Arc<std::sync::atomic::AtomicBool>,
+}
+#[async_trait]
+impl Tool for UncertainUnsafeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "root".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for UncertainUnsafeTool {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        ctx: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.late {
+            ctx.cancellation.cancelled().await;
+            Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "external-effect-id".into(),
+            )))
+        } else {
+            Ok(DurableToolStep::Complete(Outcome::Pending {
+                reference: "remote-job-id".into(),
+            }))
+        }
+    }
+}
+#[tokio::test]
+async fn unsafe_conversation_retains_pending_and_late_abort_receipts() {
+    for late in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = Registry::default();
+        let adapter = register_conversation_unsafe_durable_tool(
+            &mut registry,
+            Arc::new(UncertainUnsafeTool {
+                late,
+                started: started.clone(),
+            }),
+            "uncertain-root",
+            1,
+            vec![],
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        )
+        .unwrap();
+        let options = Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: vec![adapter.register()],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if late {
+            let _ = tokio::time::timeout(Duration::from_secs(10), scheduler.abort_and_wait(id))
+                .await
+                .unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        let receipts = pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(
+            &store,
+            tasks[0].task.id(),
+        )
+        .unwrap();
+        let expected = if late {
+            Outcome::Succeeded("external-effect-id".into())
+        } else {
+            Outcome::Pending {
+                reference: "remote-job-id".into(),
+            }
+        };
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].outcome, expected);
+        assert!(
+            !scheduler
+                .conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. }))
+        );
+        drop(store);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
 }
 
 #[tokio::test]

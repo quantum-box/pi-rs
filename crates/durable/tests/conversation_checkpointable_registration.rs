@@ -6,7 +6,8 @@ use pi_rs_core::{
 use pi_rs_durable::{
     async_task_tool::{
         DurableAsyncTool, DurableTaskHost, DurableToolResume, DurableToolStep,
-        ReplaySafeAuthorization, register_conversation_replay_safe_durable_tool,
+        ReplaySafeAuthorization, UnsafeDurableAuthorization,
+        register_conversation_replay_safe_durable_tool, register_conversation_unsafe_durable_tool,
     },
     recovery::UncertainPolicy,
     runtime::{Harness, Options},
@@ -103,6 +104,44 @@ fn matching_registration_reopens_and_rejects_substitution() {
     }
     let (registry, adapter) = registration("original", 1, calls.clone());
     let h = Harness::open_paused(&path, options(&adapter)).unwrap();
+    drop(h.attach_tasks(registry).unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn unsafe_registration_rejects_substituted_handler_and_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    let adapter = register_conversation_unsafe_durable_tool(
+        &mut registry,
+        Arc::new(Candidate {
+            description: "original",
+            calls: calls.clone(),
+        }),
+        "implementation",
+        1,
+        vec![],
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let mut foreign_registry = Registry::default();
+    let _ = register_conversation_unsafe_durable_tool(
+        &mut foreign_registry,
+        Arc::new(Candidate {
+            description: "original",
+            calls: calls.clone(),
+        }),
+        "implementation",
+        1,
+        vec![],
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let h = Harness::open_paused(dir.path().join("db"), options(&adapter)).unwrap();
+    assert!(h.attach_tasks(foreign_registry).is_err());
+    let (safe_registry, _) = registration("original", 1, calls.clone());
+    assert!(h.attach_tasks(safe_registry).is_err());
     drop(h.attach_tasks(registry).unwrap());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
