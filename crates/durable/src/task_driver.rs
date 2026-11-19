@@ -1046,6 +1046,13 @@ impl Shared {
                     ) {
                         Ok(Some(_)) => token.cancel(),
                         Ok(None) => (),
+                        Err(task_scheduler::Error::Busy)
+                            if task.task.holds_interrupted_cleanup() =>
+                        {
+                            // Stop the hook until ownership can be proven, but keep its
+                            // completed invocation available for checked settlement.
+                            token.cancel();
+                        }
                         Err(error) => {
                             token.cancel();
                             return Err(error.to_string());

@@ -1245,10 +1245,12 @@ impl PendingSettlement {
             return false;
         };
         matches!(
-            pending_abort_root_for_running(
+            pending_abort_root_excluding_self(
                 &TaskStore::new(owner.store()),
                 self.task_id(),
                 include_background,
+                self.completed()
+                    .is_some_and(|completed| completed.running.task.holds_interrupted_cleanup()),
             ),
             Err(Error::Busy)
         )
@@ -4416,6 +4418,7 @@ impl Scheduler {
         if matches!(
             &result,
             Err(Error::InterruptedEvidenceChanged
+                | Error::Busy
                 | Error::Store(task_store::Error::Store(
                     durable_store::Error::Conflict { .. }
                 )))

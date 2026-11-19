@@ -10615,6 +10615,123 @@ mod tests {
         }
     }
     #[test]
+    fn interrupted_cleanup_waits_for_independent_uncertain_graph() {
+        use crate::task_store::{Save, TaskStore};
+        for shutdown_before_repair in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (_, child) = interrupted_kill_tool(root);
+            std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            wait_file(&root.join("interrupted-ready"));
+            let tasks = TaskStore::new(owner.store());
+            let mut unrelated = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("parent".into(), true);
+            unrelated.start_attempt(Uuid::new_v4()).unwrap();
+            unrelated.hold_failure("unrelated failure".into()).unwrap();
+            let edge = crate::ownership_edge::edge_key(Uuid::new_v4());
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                tasks.save(&[Save::Create(&unrelated)]).unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[durable_store::Check {
+                            key: edge.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key: edge.clone(),
+                            value: b"invalid edge".to_vec(),
+                        }],
+                    )
+                    .unwrap();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !driver.has_pending_task(child) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "interrupted settlement was not retained"
+                );
+                assert!(!driver.get(child).unwrap().unwrap().is_terminal());
+                std::thread::yield_now();
+            }
+            let held = driver.get(child).unwrap().unwrap();
+            assert!(held.holds_interrupted_cleanup());
+            assert!(!held.abort_requested());
+            assert!(
+                read_interrupted_after_result(owner.store(), child)
+                    .unwrap()
+                    .is_none()
+            );
+            if shutdown_before_repair {
+                let report = driver.shutdown_with_pending().unwrap();
+                assert!(report.failure().is_none());
+                assert_eq!(report.pending().len(), 1);
+                assert_eq!(report.pending()[0].task_id(), child);
+                assert!(report.pending()[0].completed().is_some());
+                continue;
+            }
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                let entry = owner.store().get(&edge).unwrap().unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[durable_store::Check {
+                            key: edge.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        }],
+                        &[durable_store::Mutation::Delete { key: edge }],
+                    )
+                    .unwrap();
+            }
+            let task = wait_terminal(&driver, child);
+            assert!(
+                matches!(task.state(), crate::task::TaskState::Failed(reason) if reason == "interrupted: execution outcome requires reconciliation")
+            );
+            assert!(!task.abort_requested());
+            assert!(matches!(
+                read_sealed_outcome_evidence(owner.store(), child).unwrap(),
+                Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+            ));
+            assert!(
+                read_interrupted_after_result(owner.store(), child)
+                    .unwrap()
+                    .is_none()
+            );
+            let _ = driver.shutdown_with_pending().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("unsafe-invocations"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn interrupted_cleanup_parent_failure_cascades_before_settlement() {
         use crate::task_store::TaskStore;
         for after_receipt in [false, true] {
