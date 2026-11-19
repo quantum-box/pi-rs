@@ -1,8 +1,8 @@
-//! Disabled task-backed async tool bridge.
+//! Task-backed async leaf tools for an explicitly unhooked standalone host.
 //!
-//! The candidate is intentionally unavailable until task-owned dispatch can
-//! enforce hook authorization, abort ordering, and durable uncertain results.
-//! These boundaries cannot be established by a conversation attempt fence.
+//! Conversation-attached execution and nested async calls remain unsupported.
+//! Task-owned dispatch uses its own attempt fence, cancellation and durable
+//! receipts rather than relying on a conversation attempt fence.
 
 use crate::task::Task;
 use pi_rs_core::{Outcome, Tool, ToolSpec};
@@ -134,7 +134,7 @@ impl StandaloneNoHooksHost {
         self.scheduler
     }
 
-    /// Transfer this standalone scheduler to its real task driver. Async tool
+    /// Transfer this standalone scheduler to its real task driver.
     /// Registered sealed tools execute only through this driver.
     pub fn into_driver(self) -> crate::task_driver::Driver {
         crate::task_driver::Driver::start(self.scheduler)
