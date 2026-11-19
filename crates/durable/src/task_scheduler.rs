@@ -5109,7 +5109,11 @@ impl Scheduler {
             .get_mut(&kind)
             .expect("registered")
             .restart_after = restart_after;
-        registry.entries.get_mut(&kind).expect("registered").checkpointable_hooks = checkpointable_hooks;
+        registry
+            .entries
+            .get_mut(&kind)
+            .expect("registered")
+            .checkpointable_hooks = checkpointable_hooks;
         if abort_hook {
             registry.entries.get_mut(&kind).expect("registered").abort = Some(handler);
         } else if !registry.set_abort(&kind, |_: &Task| Ok(Step::Succeed(Value::Null))) {
