@@ -1319,6 +1319,10 @@ pub struct PendingMaintenance {
 }
 
 impl PendingMaintenance {
+    pub(crate) fn intent(&self) -> MaintenanceIntent {
+        self.intent
+    }
+
     /// Try the poll fences before the failure fence; busy makes no mutation.
     /// Call without the scheduler mutex or a task or poll gate.
     pub fn try_cleanup(&self, harness: &mut crate::runtime::Harness) -> Result<bool, Error> {
@@ -1475,6 +1479,21 @@ fn independent_wake_hooks() -> &'static BoundaryHooks {
 #[cfg(test)]
 pub(crate) fn before_independent_wake_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
     independent_wake_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn independent_wake_conflict_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_independent_wake_conflict_for_test(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    independent_wake_conflict_hooks()
         .lock()
         .unwrap()
         .insert(id, Box::new(hook));
@@ -7564,9 +7583,48 @@ impl Scheduler {
             && self.foreground_ancestors_available(owner, task)?)
     }
 
+    // Revalidate the exact maintenance target while holding the task gate. A
+    // missing, malformed or cyclic ownership proof cannot authorize a wake.
+    fn separate_from_maintenance(
+        &self,
+        owner: &OwnedStore,
+        task: &Task,
+        intent: MaintenanceIntent,
+    ) -> bool {
+        let Some(candidate) = Self::foreground_root(owner, task) else {
+            return false;
+        };
+        let parent = match intent {
+            MaintenanceIntent::Nested(id)
+            | MaintenanceIntent::Failed(id)
+            | MaintenanceIntent::FailFast(id) => id,
+        };
+        let Ok(Some((fixed, nested))) = resolve_maintenance(&self.ts(), intent) else {
+            return false;
+        };
+        let mut targets = vec![parent];
+        targets.extend(fixed);
+        targets.extend(nested);
+        targets.into_iter().all(|id| {
+            self.ts()
+                .load(id)
+                .ok()
+                .flatten()
+                .and_then(|record| Self::foreground_root(owner, &record.task))
+                .is_some_and(|root| root != candidate)
+        })
+    }
+
     /// Reserve a foreground-independent task without running graph maintenance.
     /// Every ownership ancestor is checked under the task gate.
     pub fn reserve_independent_root(&mut self) -> Result<Option<Box<DetachedInvocation>>, Error> {
+        self.reserve_independent_root_excluding(None)
+    }
+
+    pub(crate) fn reserve_independent_root_excluding(
+        &mut self,
+        excluded: Option<MaintenanceIntent>,
+    ) -> Result<Option<Box<DetachedInvocation>>, Error> {
         let fence = self.failure_fence.clone();
         let _failure = fence.lock().map_err(|_| Error::Poisoned)?;
         self.check()?;
@@ -7595,6 +7653,33 @@ impl Scheduler {
             }
             if self.has_related_published(&owner, &snapshot.task) {
                 continue;
+            }
+            if excluded.is_some_and(|intent| {
+                !self.separate_from_maintenance(&owner, &snapshot.task, intent)
+            }) {
+                continue;
+            }
+            if let Some(intent) = excluded {
+                let ids = snapshot
+                    .task
+                    .wake_children()
+                    .into_iter()
+                    .flatten()
+                    .chain(snapshot.task.ended_children().into_iter().flatten());
+                let mut blocked = false;
+                for id in ids {
+                    let Some(record) = self.ts().load(*id)? else {
+                        blocked = true;
+                        break;
+                    };
+                    if !self.separate_from_maintenance(&owner, &record.task, intent) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if blocked {
+                    continue;
+                }
             }
             let pending = pending_abort_root_for_running(
                 &self.ts(),
@@ -9361,6 +9446,7 @@ impl Scheduler {
             false,
             false,
             true,
+            None,
             std::time::Instant::now(),
         )
     }
@@ -9374,6 +9460,7 @@ impl Scheduler {
             false,
             false,
             true,
+            None,
             std::time::Instant::now(),
         )
     }
@@ -9391,6 +9478,7 @@ impl Scheduler {
             true,
             false,
             true,
+            None,
             std::time::Instant::now(),
         )
     }
@@ -9403,16 +9491,17 @@ impl Scheduler {
         // first, so scheduling delays cannot extend the wall-clock deadline.
         let anchor = std::time::Instant::now();
         let now = crate::runtime::wall_time_millis();
-        self.reserve_tick_inner(now, true, task_tool_child_only, false, true, anchor)
+        self.reserve_tick_inner(now, true, task_tool_child_only, false, true, None, anchor)
     }
 
     pub(crate) fn try_reserve_independent_maintenance(
         &mut self,
         allow_maintenance: bool,
+        excluded: Option<MaintenanceIntent>,
     ) -> Result<TickReservation, Error> {
         let anchor = std::time::Instant::now();
         let now = crate::runtime::wall_time_millis();
-        self.reserve_tick_inner(now, true, false, true, allow_maintenance, anchor)
+        self.reserve_tick_inner(now, true, false, true, allow_maintenance, excluded, anchor)
     }
 
     fn deferred_maintenance(
@@ -9437,6 +9526,7 @@ impl Scheduler {
         task_tool_child_only: bool,
         independent_only: bool,
         allow_maintenance: bool,
+        excluded: Option<MaintenanceIntent>,
         tick_started: std::time::Instant,
     ) -> Result<TickReservation, Error> {
         let fence = self.failure_fence.clone();
@@ -9977,7 +10067,11 @@ impl Scheduler {
                 continue;
             }
             if independent_only {
-                if !self.independent_root_safe(&owner, &snapshot.task)? {
+                if !self.independent_root_safe(&owner, &snapshot.task)?
+                    || excluded.is_some_and(|intent| {
+                        !self.separate_from_maintenance(&owner, &snapshot.task, intent)
+                    })
+                {
                     continue;
                 }
                 if let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state() {
@@ -10022,7 +10116,7 @@ impl Scheduler {
                 return Ok(TickReservation::Progress(true));
             }
         }
-        if !self.deferred_recovery.is_empty() {
+        if excluded.is_none() && !self.deferred_recovery.is_empty() {
             let before = self.deferred_recovery.clone();
             self.reconcile_inner(independent_only)?;
             // A graph that remains uncertain must not starve independent work.
@@ -10032,7 +10126,11 @@ impl Scheduler {
         }
         for snapshot in self.ts().list()? {
             if independent_only {
-                if !self.independent_root_safe(&owner, &snapshot.task)? {
+                if !self.independent_root_safe(&owner, &snapshot.task)?
+                    || excluded.is_some_and(|intent| {
+                        !self.separate_from_maintenance(&owner, &snapshot.task, intent)
+                    })
+                {
                     continue;
                 }
                 if let TaskState::Waiting(
@@ -10041,10 +10139,12 @@ impl Scheduler {
                 {
                     let records = self.ts().list()?;
                     if ids.iter().any(|id| {
-                        records
-                            .iter()
-                            .find(|r| r.task.id() == *id)
-                            .is_none_or(|r| self.has_related_published(&owner, &r.task))
+                        records.iter().find(|r| r.task.id() == *id).is_none_or(|r| {
+                            self.has_related_published(&owner, &r.task)
+                                || excluded.is_some_and(|intent| {
+                                    !self.separate_from_maintenance(&owner, &r.task, intent)
+                                })
+                        })
                     }) {
                         continue;
                     }
@@ -10165,6 +10265,16 @@ impl Scheduler {
                         }
                     }
                     Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => {
+                        #[cfg(test)]
+                        if independent_only {
+                            let hook = independent_wake_conflict_hooks()
+                                .lock()
+                                .unwrap()
+                                .remove(&snapshot.task.id());
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                        }
                         // A concurrent signal or task transition changed the snapshot.
                         // Rescan on the next tick instead of failing the driver.
                         progress = true;

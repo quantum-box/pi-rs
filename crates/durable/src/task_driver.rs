@@ -939,6 +939,18 @@ pub(crate) fn before_execute_for_test(
 #[cfg(test)]
 type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
 #[cfg(test)]
+fn maintenance_reserved_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_maintenance_reserved_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    maintenance_reserved_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 fn abort_scan_busy_hooks() -> &'static BoundaryHooks {
     static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
@@ -1371,24 +1383,18 @@ impl Shared {
                             || pending
                             || scheduler.has_published_outcomes().unwrap_or(true)
                         {
-                            if maintenance.is_some() {
-                                if active >= WORKERS {
-                                    Ok(task_scheduler::TickReservation::Progress(false))
-                                } else {
-                                    scheduler.reserve_independent_root().map(|value| {
-                                        value
-                                            .map(task_scheduler::TickReservation::Invocation)
-                                            .unwrap_or(task_scheduler::TickReservation::Progress(
-                                                false,
-                                            ))
-                                    })
-                                }
-                            } else {
-                                match scheduler.try_reserve_independent_maintenance(true) {
-                                    Ok(task_scheduler::TickReservation::Progress(false))
-                                        if active < WORKERS =>
-                                    {
-                                        scheduler.reserve_independent_root().map(|value| {
+                            match scheduler.try_reserve_independent_maintenance(
+                                maintenance.is_none(),
+                                maintenance.as_ref().map(|intent| intent.intent()),
+                            ) {
+                                Ok(task_scheduler::TickReservation::Progress(false))
+                                    if active < WORKERS =>
+                                {
+                                    scheduler
+                                        .reserve_independent_root_excluding(
+                                            maintenance.as_ref().map(|intent| intent.intent()),
+                                        )
+                                        .map(|value| {
                                             value
                                                 .map(task_scheduler::TickReservation::Invocation)
                                                 .unwrap_or(
@@ -1397,9 +1403,8 @@ impl Shared {
                                                     ),
                                                 )
                                         })
-                                    }
-                                    result => result,
                                 }
+                                result => result,
                             }
                         } else if active >= WORKERS {
                             scheduler.try_reserve_tick_live(true)
@@ -1441,6 +1446,18 @@ impl Shared {
                         progressed = true;
                     }
                     Ok(task_scheduler::TickReservation::Maintenance(intent)) => {
+                        #[cfg(test)]
+                        {
+                            let id = match intent.intent() {
+                                task_scheduler::MaintenanceIntent::Nested(id)
+                                | task_scheduler::MaintenanceIntent::Failed(id)
+                                | task_scheduler::MaintenanceIntent::FailFast(id) => id,
+                            };
+                            let hook = maintenance_reserved_hooks().lock().unwrap().remove(&id);
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                        }
                         maintenance = Some(intent);
                         progressed = true;
                     }
@@ -2215,6 +2232,370 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    fn maintenance_wait_fixture(root: &std::path::Path, reopen: bool, mutation: bool, park: bool) {
+        use crate::runtime::{Harness, Options};
+        use crate::task_store::{Save, Signal};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::time::{Duration, Instant};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        let harness = Harness::open_paused(
+            root.join("db"),
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", true, |_: &Task| {
+            Ok(task_scheduler::Step::Succeed(json!("ok")))
+        });
+        let scheduler = harness.attach_tasks(registry).unwrap();
+        let owner = scheduler.owner();
+        let tasks = TaskStore::new(owner.store());
+        let cp = Checkpoint {
+            phase: "initial".into(),
+            data: json!(null),
+        };
+        let parent_id = Uuid::from_u128(1);
+        let child_id = Uuid::from_u128(2);
+        let owner_id = Uuid::from_u128(100);
+        if !reopen {
+            let mut parent = Task::new(parent_id, TaskOwner::Conversation(owner_id), cp.clone(), 3)
+                .unwrap()
+                .registered("work".into(), true);
+            parent.start().unwrap();
+            let child = Task::new(child_id, TaskOwner::Task(parent_id), cp.clone(), 3)
+                .unwrap()
+                .registered("work".into(), true);
+            let mut related = Task::new(
+                Uuid::from_u128(3),
+                TaskOwner::Task(parent_id),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), true);
+            related.start().unwrap();
+            related.wait(WaitFor::Signal("related".into())).unwrap();
+            tasks
+                .save(&[
+                    Save::Create(&parent),
+                    Save::Create(&child),
+                    Save::Create(&related),
+                ])
+                .unwrap();
+            tasks
+                .update(&tasks.load(parent_id).unwrap().unwrap(), |task| {
+                    task.hold_failure("held failure".into())
+                })
+                .unwrap();
+            tasks
+                .send_signal(&Signal::new(
+                    Uuid::new_v4(),
+                    related.id(),
+                    "related".into(),
+                    json!(1),
+                ))
+                .unwrap();
+        }
+        let offset = if reopen { 20 } else { 10 };
+        let mut signal_task = Task::new(
+            Uuid::from_u128(offset),
+            TaskOwner::Conversation(Uuid::from_u128(offset + 100)),
+            cp.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        signal_task.start().unwrap();
+        signal_task.wait(WaitFor::Signal("go".into())).unwrap();
+        let mut timer = Task::new(
+            Uuid::from_u128(offset + 1),
+            TaskOwner::Conversation(Uuid::from_u128(offset + 101)),
+            cp.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        timer.start().unwrap();
+        timer
+            .wait(WaitFor::DeadlineMillis(
+                crate::runtime::wall_time_millis() - 1,
+            ))
+            .unwrap();
+        let mut aborted = Task::new(
+            Uuid::from_u128(offset + 2),
+            TaskOwner::Conversation(Uuid::from_u128(offset + 102)),
+            cp,
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        aborted.start().unwrap();
+        aborted.wait(WaitFor::Signal("stop".into())).unwrap();
+        tasks
+            .save(&[
+                Save::Create(&signal_task),
+                Save::Create(&timer),
+                Save::Create(&aborted),
+            ])
+            .unwrap();
+        let cp = signal_task.checkpoint().clone();
+        let mut ended = Task::new(
+            Uuid::from_u128(offset + 3),
+            TaskOwner::Conversation(Uuid::from_u128(offset + 103)),
+            cp.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        ended.start().unwrap();
+        ended.succeed(json!("done")).unwrap();
+        let mut dependent = Task::new(
+            Uuid::from_u128(offset + 4),
+            TaskOwner::Conversation(Uuid::from_u128(offset + 104)),
+            cp,
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        dependent.start().unwrap();
+        dependent
+            .wait(WaitFor::TasksAny(vec![Uuid::from_u128(3), ended.id()]))
+            .unwrap();
+        tasks
+            .save(&[Save::Create(&ended), Save::Create(&dependent)])
+            .unwrap();
+        let mut ready_dependent = Task::new(
+            Uuid::from_u128(offset + 5),
+            TaskOwner::Conversation(Uuid::from_u128(offset + 105)),
+            signal_task.checkpoint().clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        ready_dependent.start().unwrap();
+        ready_dependent
+            .wait(WaitFor::TasksAny(vec![Uuid::from_u128(3), ended.id()]))
+            .unwrap();
+        tasks.save(&[Save::Create(&ready_dependent)]).unwrap();
+        tasks
+            .poll_wait(
+                &tasks.load(ready_dependent.id()).unwrap().unwrap(),
+                crate::runtime::wall_time_millis(),
+            )
+            .unwrap();
+        tasks
+            .send_signal(&Signal::new(
+                Uuid::new_v4(),
+                signal_task.id(),
+                "go".into(),
+                json!(1),
+            ))
+            .unwrap();
+        let control = owner.conversation_controls().get(Uuid::from_u128(999));
+        let poll = control.gate.lock().unwrap();
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        on_maintenance_reserved_for_test(parent_id, move || reserved_tx.send(()).unwrap());
+        let (mutation_tx, mutation_rx) = mpsc::channel();
+        let edge_key = crate::ownership_edge::edge_key(Uuid::from_u128(offset + 100));
+        if mutation {
+            let edge = crate::ownership_edge::Edge {
+                task: parent_id,
+                task_owner: TaskOwner::Conversation(owner_id),
+                child: Uuid::from_u128(offset + 100),
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let edge_key = edge_key.clone();
+            let path = root.join("db");
+            crate::task_scheduler::before_independent_wake_for_test(signal_task.id(), move || {
+                let store = durable_store::Store::open(path).unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: edge_key.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key: edge_key,
+                            value: serde_json::to_vec(&edge).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+            });
+            crate::task_scheduler::on_independent_wake_conflict_for_test(
+                signal_task.id(),
+                move || mutation_tx.send(()).unwrap(),
+            );
+        }
+        let driver = Driver::start_with_harness(scheduler, harness.worker());
+        reserved_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("maintenance not reserved");
+        let abort_signal_id = Uuid::new_v4();
+        {
+            let _gate = owner.task_gate().lock().unwrap();
+            tasks
+                .update(&tasks.load(aborted.id()).unwrap().unwrap(), |task| {
+                    task.request_abort()
+                })
+                .unwrap();
+            tasks
+                .send_signal(&Signal::new(
+                    abort_signal_id,
+                    aborted.id(),
+                    "stop".into(),
+                    json!(1),
+                ))
+                .unwrap();
+        }
+        if mutation {
+            mutation_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("wake boundary not reached");
+            let held = tasks.load(signal_task.id()).unwrap().unwrap();
+            assert!(matches!(held.task.state(), TaskState::Waiting(_)));
+            let entry = owner.store().get(&edge_key).unwrap().unwrap();
+            owner
+                .store()
+                .commit(
+                    &[durable_store::Check {
+                        key: edge_key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Delete { key: edge_key }],
+                )
+                .unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        for id in [signal_task.id(), timer.id()] {
+            loop {
+                let task = driver.get(id).unwrap().unwrap();
+                if task.is_terminal() {
+                    assert_eq!(task.state(), &TaskState::Succeeded(json!("ok")));
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "independent wait stalled: {:?}",
+                    task.state()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            tasks
+                .load(aborted.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(
+            !tasks
+                .signal(aborted.id(), abort_signal_id)
+                .unwrap()
+                .unwrap()
+                .is_consumed()
+        );
+        assert!(matches!(
+            tasks.load(dependent.id()).unwrap().unwrap().task.state(),
+            TaskState::Waiting(_)
+        ));
+        assert_eq!(
+            tasks
+                .load(ready_dependent.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Ready
+        );
+        assert!(matches!(
+            tasks.load(parent_id).unwrap().unwrap().task.state(),
+            TaskState::CompletingFailed(_)
+        ));
+        assert!(
+            !tasks
+                .load(child_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(matches!(
+            tasks
+                .load(Uuid::from_u128(3))
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            TaskState::Waiting(_)
+        ));
+        if park {
+            std::fs::write(root.join("maintenance-ready"), b"ready").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        drop(poll);
+        let until = Instant::now() + Duration::from_secs(10);
+        while !driver.get(parent_id).unwrap().unwrap().is_terminal() {
+            assert!(Instant::now() < until, "maintenance did not settle");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let related = driver.get(Uuid::from_u128(3)).unwrap().unwrap();
+        assert!(related.abort_requested());
+        assert!(!matches!(related.state(), TaskState::Succeeded(_)));
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
+    fn maintenance_blocks_only_related_wait_graphs() {
+        for mutation in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            maintenance_wait_fixture(dir.path(), false, mutation, false);
+        }
+    }
+
+    #[test]
+    fn maintenance_waits_survive_kill_reopen() {
+        const ENV: &str = "PI_TEST_MAINTENANCE_WAKE_KILL_1120";
+        if let Some(root) = std::env::var_os(ENV) {
+            maintenance_wait_fixture(std::path::Path::new(&root), false, false, true);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_driver::tests::maintenance_waits_survive_kill_reopen",
+            ])
+            .env(ENV, dir.path())
+            .spawn()
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !dir.path().join("maintenance-ready").exists() {
+            assert!(worker.try_wait().unwrap().is_none(), "worker exited");
+            assert!(std::time::Instant::now() < until, "worker timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        maintenance_wait_fixture(dir.path(), true, false, false);
+    }
 
     #[test]
     fn panic_cleanup_commit_error_retains_parent_and_child_outcomes() {
@@ -3450,6 +3831,9 @@ mod tests {
                 other_tx.send(()).unwrap();
                 Ok(task_scheduler::Step::Succeed(json!("other")))
             });
+            registry.register("wake-other", true, |_: &Task| {
+                Ok(task_scheduler::Step::Succeed(json!("woken")))
+            });
             let replacement_registry = registry.clone();
             let scheduler = harness.attach_tasks(registry).unwrap();
             let owner = scheduler.owner();
@@ -3549,6 +3933,111 @@ mod tests {
                 );
                 thread::yield_now();
             }
+            let maintenance_parent_id = Uuid::from_u128(1000);
+            let (maintenance_tx, maintenance_rx) = mpsc::channel();
+            on_maintenance_reserved_for_test(maintenance_parent_id, move || {
+                maintenance_tx.send(()).unwrap()
+            });
+            let mut maintenance_parent = Task::new(
+                maintenance_parent_id,
+                TaskOwner::Conversation(Uuid::from_u128(1002)),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("wake-other".into(), true);
+            maintenance_parent.start().unwrap();
+            let maintenance_child = Task::new(
+                Uuid::from_u128(1001),
+                TaskOwner::Task(maintenance_parent_id),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("wake-other".into(), true);
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                tasks
+                    .save(&[
+                        Save::Create(&maintenance_parent),
+                        Save::Create(&maintenance_child),
+                    ])
+                    .unwrap();
+                tasks
+                    .update(
+                        &tasks.load(maintenance_parent_id).unwrap().unwrap(),
+                        |task| task.hold_failure("independent maintenance".into()),
+                    )
+                    .unwrap();
+            }
+            driver.shared.notify_work();
+            maintenance_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("independent maintenance was not reserved");
+            let mut signal = Task::new(
+                Uuid::from_u128(1010),
+                TaskOwner::Conversation(Uuid::from_u128(1011)),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("wake-other".into(), true);
+            signal.start().unwrap();
+            signal.wait(WaitFor::Signal("go".into())).unwrap();
+            let mut timer = Task::new(
+                Uuid::from_u128(1012),
+                TaskOwner::Conversation(Uuid::from_u128(1013)),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("wake-other".into(), true);
+            timer.start().unwrap();
+            timer
+                .wait(WaitFor::DeadlineMillis(
+                    crate::runtime::wall_time_millis() - 1,
+                ))
+                .unwrap();
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                tasks
+                    .save(&[Save::Create(&signal), Save::Create(&timer)])
+                    .unwrap();
+                tasks
+                    .send_signal(&crate::task_store::Signal::new(
+                        Uuid::new_v4(),
+                        signal.id(),
+                        "go".into(),
+                        json!(true),
+                    ))
+                    .unwrap();
+            }
+            driver.shared.notify_work();
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            for id in [signal.id(), timer.id()] {
+                loop {
+                    let task = driver.get(id).unwrap().unwrap();
+                    if task.is_terminal() {
+                        assert_eq!(task.state(), &TaskState::Succeeded(json!("woken")));
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "wait stalled while settlement and maintenance are pending: {:?}",
+                        task.state()
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            assert!(matches!(
+                tasks
+                    .load(maintenance_parent_id)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                TaskState::CompletingFailed(_)
+            ));
             let replacing = driver.clone();
             let (replaced_tx, replaced_rx) = mpsc::channel();
             let replacement = thread::spawn(move || {
