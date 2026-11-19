@@ -1934,6 +1934,14 @@ async fn exercise_conversation_park_claim(replace_attempt: bool) {
         let claim: Value = serde_json::from_slice(&entry.value).unwrap();
         assert_eq!(claim["task"], json!(root_id));
         assert_eq!(claim["definition_version"], 1);
+        assert_eq!(claim["version"], 2);
+        assert_eq!(claim["policy"], "at_most_once");
+        assert!(
+            claim["claim_id"]
+                .as_str()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .is_some_and(|id| !id.is_nil())
+        );
         assert!(claim["attempt"].as_str().is_some());
         assert!(claim["lease"].as_str().is_some());
         let final_state = tokio::time::timeout(Duration::from_secs(10), async {

@@ -18,7 +18,11 @@ abort state from the checked transactions. Normal conversation intent checks
 also reject an abort-marked conversation and cannot be reused unchanged.
 
 A root-owned unsafe Tool registered for cancellation can write a claim for a
-committed park after its owned work is drained. The claim does not dispatch the
+committed park after its owned work is drained. Version 2 claims contain an
+immutable claim ID, original cleanup attempt and lease, and an at-most-once
+callback policy. A dependent transaction must carry the version check returned
+by claim reading. Version 1 claims lack the ID and policy; they cannot be
+safely upgraded automatically and require explicit reconciliation. The claim does not dispatch the
 callback and is followed by a reconciliation-required task failure. Its commit
 checks the conversation, task and park evidence; the selected Tool identity
 lease is held through the commit. Nested roots, interrupted wake cancellation,

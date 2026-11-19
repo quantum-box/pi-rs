@@ -220,6 +220,64 @@ fn abort_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{id}/abort-intent/{attempt}").into_bytes()
 }
 
+/// Immutable identity of a conversation cleanup claim. A record is evidence
+/// of authorization only; it is not evidence that a callback ran.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConversationCancelClaim {
+    pub version: u32,
+    pub claim_id: Uuid,
+    pub task: Uuid,
+    pub kind: String,
+    pub definition_version: u32,
+    pub attempt: Uuid,
+    pub lease: Uuid,
+    pub checkpoint: crate::task::Checkpoint,
+    pub policy: crate::async_task_tool::ConversationCancelPolicy,
+}
+
+fn conversation_cancel_claim_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/conversation-park-cancel-claim").into_bytes()
+}
+
+/// Read evidence for the exact original attempt. The returned check must be
+/// included unchanged in a dependent transaction. Version 1 cannot prove a
+/// durable claim identity or policy and therefore requires reconciliation.
+#[allow(dead_code)]
+pub(crate) fn read_conversation_cancel_claim(
+    store: &durable_store::Store,
+    task: Uuid,
+    attempt: Uuid,
+    claim_id: Uuid,
+) -> Result<Option<(ConversationCancelClaim, durable_store::Check)>, String> {
+    let key = conversation_cancel_claim_key(task);
+    let Some(entry) = store.get(&key).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let claim: ConversationCancelClaim = serde_json::from_slice(&entry.value)
+        .map_err(|_| "unsupported or invalid conversation cancel claim")?;
+    if claim.version != 2
+        || claim.task != task
+        || claim.attempt != attempt
+        || claim.claim_id != claim_id
+        || claim.claim_id.is_nil()
+        || claim.attempt.is_nil()
+        || claim.lease.is_nil()
+        || claim.kind.is_empty()
+        || claim.definition_version == 0
+        || claim.checkpoint.phase != "replay-safe-async-wait"
+    {
+        return Err("conversation cancel claim identity mismatch".into());
+    }
+    Ok(Some((
+        claim,
+        durable_store::Check {
+            key,
+            expected: durable_store::Expected::Version(entry.version),
+        },
+    )))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkCancelDecision {
     Invoke,
@@ -2118,6 +2176,7 @@ impl AdmissionHandle<'_> {
     pub(crate) fn record_conversation_park_claim(
         &self,
         handler: &dyn Handler,
+        policy: crate::async_task_tool::ConversationCancelPolicy,
     ) -> Result<(), String> {
         if !self.abort || self.standalone || self.lease.retired {
             return Err("invalid conversation cleanup lease".into());
@@ -2181,18 +2240,22 @@ impl AdmissionHandle<'_> {
             &current.task,
             boundary,
         )?);
-        let key = format!(
-            "durable/replay-safe-async/{}/conversation-park-cancel-claim",
-            current.task.id()
-        )
-        .into_bytes();
+        let key = conversation_cancel_claim_key(current.task.id());
         checks.push(durable_store::Check {
             key: key.clone(),
             expected: durable_store::Expected::Missing,
         });
-        let record = serde_json::json!({"version":1,"task":current.task.id(),"kind":kind,
-            "definition_version":current.task.definition_version(),"attempt":attempt,
-            "lease":self.lease.token,"checkpoint":current.task.checkpoint()});
+        let record = ConversationCancelClaim {
+            version: 2,
+            claim_id: Uuid::new_v4(),
+            task: current.task.id(),
+            kind: kind.into(),
+            definition_version: current.task.definition_version(),
+            attempt,
+            lease: self.lease.token,
+            checkpoint: current.task.checkpoint().clone(),
+            policy,
+        };
         #[cfg(test)]
         if let Some(hook) = conversation_claim_hooks()
             .lock()
@@ -25761,5 +25824,115 @@ mod standalone_foreground_cleanup_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod conversation_cancel_claim_schema_tests {
+    use super::*;
+    use crate::async_task_tool::ConversationCancelPolicy;
+    use crate::task::Checkpoint;
+    use serde_json::json;
+
+    #[test]
+    fn claim_identity_policy_and_attempt_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let claim = ConversationCancelClaim {
+            version: 2,
+            claim_id: Uuid::new_v4(),
+            task: Uuid::new_v4(),
+            kind: "registered-kind".into(),
+            definition_version: 1,
+            attempt: Uuid::new_v4(),
+            lease: Uuid::new_v4(),
+            checkpoint: Checkpoint {
+                phase: "replay-safe-async-wait".into(),
+                data: json!({"job":"remote"}),
+            },
+            policy: ConversationCancelPolicy::AtMostOnce,
+        };
+        let key = conversation_cancel_claim_key(claim.task);
+        {
+            let store = durable_store::Store::open(&path).unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&claim).unwrap(),
+                    }],
+                )
+                .unwrap();
+        }
+        let store = durable_store::Store::open(&path).unwrap();
+        let (saved, check) =
+            read_conversation_cancel_claim(&store, claim.task, claim.attempt, claim.claim_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(saved, claim);
+        assert!(
+            read_conversation_cancel_claim(&store, claim.task, Uuid::new_v4(), claim.claim_id)
+                .is_err()
+        );
+        assert!(
+            read_conversation_cancel_claim(&store, claim.task, claim.attempt, Uuid::new_v4())
+                .is_err()
+        );
+        assert!(
+            read_conversation_cancel_claim(&store, Uuid::new_v4(), claim.attempt, claim.claim_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&claim).unwrap()
+                    }]
+                )
+                .is_err()
+        );
+        let entry = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: key.clone(),
+                    value: entry.value,
+                }],
+            )
+            .unwrap();
+        assert!(store.commit(&[check], &[]).is_err());
+        let legacy = json!({"version":1,"task":claim.task,"kind":claim.kind,"definition_version":1,
+            "attempt":claim.attempt,"lease":claim.lease,"checkpoint":claim.checkpoint});
+        let entry = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&legacy).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(
+            read_conversation_cancel_claim(&store, claim.task, claim.attempt, claim.claim_id)
+                .is_err()
+        );
     }
 }

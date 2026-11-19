@@ -1676,7 +1676,11 @@ impl Handler for Executor {
             {
                 return Err("conversation cancel tool identity changed".into());
             }
-            admission.record_conversation_park_claim(self)?;
+            let (_, cancel) = self
+                ._conversation_cancel
+                .as_ref()
+                .ok_or("missing cancel registration")?;
+            admission.record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
             return Err(
                 "conversation cancel callback is not enabled; reconciliation required".into(),
             );

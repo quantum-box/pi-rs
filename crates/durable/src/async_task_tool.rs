@@ -646,11 +646,24 @@ pub trait DurableAsyncTool: Tool {
     ) -> Result<DurableToolStep, String>;
 }
 
+/// Persisted callback replay policy. The initial protocol only permits a
+/// single dispatch; a claimed callback is never automatically retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationCancelPolicy {
+    AtMostOnce,
+}
+
 /// Explicitly registered cleanup for external work left by a parked tool.
 /// Implementations must be cooperative, start no detached work, and cannot
 /// admit nested tasks. A committed invocation claim is never replayed.
 #[async_trait::async_trait]
 pub trait DurableParkCancel: Send + Sync {
+    /// Policy stored with a conversation claim; no callback is dispatched by
+    /// merely recording this policy.
+    fn conversation_cancel_policy(&self) -> ConversationCancelPolicy {
+        ConversationCancelPolicy::AtMostOnce
+    }
     async fn cancel(
         &self,
         arguments: serde_json::Value,
