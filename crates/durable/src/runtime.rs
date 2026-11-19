@@ -5077,6 +5077,7 @@ impl Harness {
                     Some(
                         "blocked"
                             | "invalid_arguments"
+                            | "invalid_park"
                             | "tool_unavailable"
                             | "tool_failed"
                             | "tool_skipped"

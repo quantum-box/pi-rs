@@ -458,3 +458,351 @@ fn repeated_selection_is_rejected() {
     );
     assert!(result.is_err());
 }
+
+struct SleepHook {
+    id: &'static str,
+    deadline: i64,
+    events: Arc<Mutex<Vec<String>>>,
+}
+#[async_trait]
+impl Hook for SleepHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        ctx: &Context<'_>,
+    ) -> Result<BeforeTool, String> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("before-{}", self.id));
+        let saved = ctx
+            .memo
+            .get_or_insert("sleep-deadline", json!(self.deadline))
+            .await?;
+        let deadline = saved.as_i64().ok_or("invalid memo")?;
+        if self.id == "b2" && deadline == -1 {
+            return Ok(BeforeTool::Sleep(pi_rs_durable::extension::Sleep {
+                signals: vec![],
+                until_millis: None,
+            }));
+        }
+        if self.id == "b2" && now_ms() < deadline {
+            return Ok(BeforeTool::Sleep(pi_rs_durable::extension::Sleep {
+                signals: vec![],
+                until_millis: Some(deadline),
+            }));
+        }
+        let mut args = call.arguments.clone();
+        args.as_object_mut()
+            .unwrap()
+            .entry("trace")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(json!(self.id));
+        Ok(BeforeTool::Rewrite(args))
+    }
+    async fn after_tool(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("after-{}", self.id));
+        if self.id == "b1" && self.deadline == -1 {
+            return Ok(Some(json!("redacted")));
+        }
+        Ok(Some(json!(format!(
+            "{}/{}",
+            result.as_str().ok_or("missing text")?,
+            self.id
+        ))))
+    }
+}
+
+#[tokio::test]
+async fn invalid_sleep_runs_after_without_tool_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_sleep(-1, events.clone(), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let task = wait_task(&path).await;
+    let pi_rs_durable::task::TaskState::Succeeded(result) = task.state() else {
+        panic!("unexpected state {:?}", task.state());
+    };
+    assert_eq!(
+        result["task_content_v1"]["diagnostics"][0]["code"],
+        "invalid_park"
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["before-b1", "before-b2", "after-b1", "after-b2", "after-a"]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let c = scheduler.conversation(id).unwrap();
+            if let Some(index) = c.messages.iter().position(
+                |m| matches!(m, Message::Tool { content, .. } if content == "redacted/b2/a"),
+            ) && c.messages[index + 1..]
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let _ = driver.shutdown_with_pending();
+    let _ = scheduler.shutdown().await;
+}
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+fn setup_sleep(
+    deadline: i64,
+    events: Arc<Mutex<Vec<String>>>,
+    calls: Arc<AtomicUsize>,
+) -> (Options, Registry, pi_rs_durable::extension::Registry) {
+    let hook = |id| {
+        Arc::new(SleepHook {
+            id,
+            deadline,
+            events: events.clone(),
+        }) as Arc<dyn Hook>
+    };
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    for (name, hooks, ids) in [
+        ("a", vec![hook("a")], vec!["a"]),
+        ("b", vec![hook("b1"), hook("b2")], vec!["b1", "b2"]),
+    ] {
+        extensions
+            .install_identified(
+                Extension {
+                    name: name.into(),
+                    hooks,
+                    ..Default::default()
+                },
+                ExtensionIdentity::new(
+                    1,
+                    name.into(),
+                    ids.into_iter().map(str::to_owned).collect(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    let mut registry = Registry::default();
+    let adapter = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(Job { calls }),
+        "root",
+        1,
+        vec![],
+        &extensions.snapshot(),
+        &["b".into(), "a".into()],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    (
+        Options {
+            model: Arc::new(ModelStub),
+            tools: vec![adapter.register()],
+            restart_limit: 5,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+        extensions,
+    )
+}
+async fn wait_sleep(path: &std::path::Path) -> pi_rs_durable::task::Task {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let store = durable_store::Store::open(path).unwrap();
+            if let Some(item) = pi_rs_durable::task_store::TaskStore::new(&store)
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|t| {
+                    matches!(
+                        t.task.state(),
+                        pi_rs_durable::task::TaskState::Waiting(
+                            pi_rs_durable::task::WaitFor::Sleep { .. }
+                        )
+                    )
+                })
+            {
+                break item.task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn before_sleep_replays_whole_chain_with_memo_and_wakes_at_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let deadline = now_ms() + 1200;
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_sleep(deadline, events.clone(), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let task = wait_sleep(&path).await;
+    assert_eq!(task.checkpoint().phase, "initial");
+    assert_eq!(*events.lock().unwrap(), ["before-b1", "before-b2"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    wait_result(&scheduler, id).await;
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "before-b1",
+            "before-b2",
+            "before-b1",
+            "before-b2",
+            "before-a",
+            "after-b1",
+            "after-b2",
+            "after-a"
+        ]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn sleep_worker() {
+    let Some(dir) = std::env::var_os("PI_MULTI_SLEEP_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let deadline = std::env::var("PI_MULTI_SLEEP_DEADLINE")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (options, registry, extensions) = setup_sleep(
+        deadline,
+        Arc::new(Mutex::new(vec![])),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.join("db"), options, extensions).unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["b".into(), "a".into()])
+        .unwrap();
+    std::fs::write(dir.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn before_sleep_survives_process_kill_and_wakes_automatically() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let deadline = now_ms() + 4000;
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sleep_worker"])
+            .env("PI_MULTI_SLEEP_DIR", dir.path())
+            .env("PI_MULTI_SLEEP_DEADLINE", deadline.to_string())
+            .spawn()
+            .unwrap(),
+    );
+    let task = wait_sleep(&path).await;
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id: uuid::Uuid = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let key = format!("runtime/extension-memo/{}/sleep-deadline", task.id());
+    let memo = store.get(key.as_bytes()).unwrap().unwrap().value;
+    drop(store);
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_sleep(deadline, events.clone(), calls.clone());
+    let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    wait_result(&scheduler, id).await;
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "before-b1",
+            "before-b2",
+            "before-a",
+            "after-b1",
+            "after-b2",
+            "after-a"
+        ]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(store.get(key.as_bytes()).unwrap().unwrap().value, memo);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_while_before_sleeping_never_dispatches_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) =
+        setup_sleep(now_ms() + 60_000, events.clone(), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let task = wait_sleep(&path).await;
+    tokio::time::timeout(Duration::from_secs(10), scheduler.abort_and_wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .load(task.id())
+        .unwrap()
+        .unwrap()
+        .task;
+    assert!(matches!(
+        task.state(),
+        pi_rs_durable::task::TaskState::Cancelled
+    ));
+    assert_eq!(*events.lock().unwrap(), ["before-b1", "before-b2"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+}

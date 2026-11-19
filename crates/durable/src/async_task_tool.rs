@@ -1408,6 +1408,7 @@ impl crate::extension::Hook for SelectedBeforeHooks {
                 Some(
                     "blocked"
                         | "invalid_arguments"
+                        | "invalid_park"
                         | "aborted"
                         | "restart_limit"
                         | "tool_unavailable"

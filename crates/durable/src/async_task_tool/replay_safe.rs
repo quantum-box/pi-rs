@@ -580,7 +580,7 @@ pub(super) fn after_checkpoint_evidence(
         Some(code)
             if matches!(
                 code.as_str(),
-                "blocked" | "invalid_arguments" | "tool_unavailable"
+                "blocked" | "invalid_arguments" | "invalid_park" | "tool_unavailable"
             ) && matches!(outcome, Outcome::Failed(_)) =>
         {
             Ok(super::ReplaySafeAfterEvidence::HostError { code, outcome })
@@ -909,7 +909,10 @@ impl Executor {
         reason: &str,
     ) -> Result<Step, String> {
         self.bounded_hook_arguments(&args)?;
-        if !matches!(code, "blocked" | "invalid_arguments" | "tool_unavailable") {
+        if !matches!(
+            code,
+            "blocked" | "invalid_arguments" | "invalid_park" | "tool_unavailable"
+        ) {
             return Err("unsupported host result".into());
         }
         // Bound bytes, not characters: diagnostic validation has a 4 KiB
@@ -921,6 +924,7 @@ impl Executor {
         let reason = &reason[..end];
         let message = match code {
             "blocked" => format!("Tool call blocked: {reason}"),
+            "invalid_park" => format!("Tool call cannot wait at its gates: {reason}"),
             "tool_unavailable" => format!("Tool {reason} is not available"),
             _ => format!("Invalid tool arguments: {reason}"),
         };
@@ -1017,6 +1021,29 @@ impl Executor {
             crate::extension::BeforeTool::Pass => (),
             crate::extension::BeforeTool::Block(reason) => {
                 return self.host_result_checkpoint(call.arguments, "blocked", &reason);
+            }
+            crate::extension::BeforeTool::Sleep(sleep)
+                if admission.is_conversation_checkpointable() && self.replay_safe =>
+            {
+                if !sleep.signals.is_empty() {
+                    return Err("checkpointable hook signal waits are unsupported".into());
+                }
+                let Some(until_millis) = sleep.until_millis.filter(|deadline| *deadline >= 0)
+                else {
+                    return self.host_result_checkpoint(
+                        call.arguments,
+                        "invalid_park",
+                        "invalid extension sleep",
+                    );
+                };
+                return Ok(Step::Wait {
+                    checkpoint: task.checkpoint().clone(),
+                    condition: WaitFor::Sleep {
+                        until_millis: Some(until_millis),
+                        signals: vec![],
+                    },
+                    children: vec![],
+                });
             }
             _ => return Err("hook sleep is unsupported".into()),
         }
@@ -1184,7 +1211,10 @@ impl Executor {
             self.validate_hook_arguments(&stored.arguments)?;
         }
         if stored.host_error.as_deref().is_some_and(|code| {
-            !matches!(code, "blocked" | "invalid_arguments" | "tool_unavailable")
+            !matches!(
+                code,
+                "blocked" | "invalid_arguments" | "invalid_park" | "tool_unavailable"
+            )
         }) {
             return Err("invalid host result code".into());
         }
