@@ -3152,7 +3152,7 @@ impl<'a> TaskDocuments<'a> {
     pub(crate) fn read_sealed_child_receipt(
         &mut self,
         id: uuid::Uuid,
-    ) -> Result<Option<pi_rs_core::Outcome>, String> {
+    ) -> Result<Option<crate::async_task_protocol::ReceiptRead>, String> {
         if self.input_validator.is_some() {
             return Err("sealed tools require a standalone scheduler".into());
         }

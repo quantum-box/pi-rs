@@ -44,6 +44,9 @@ fn prepared_key(task: Uuid) -> Vec<u8> {
 fn receipt_key(task: Uuid) -> Vec<u8> {
     format!("durable/async-task/receipt/{task}").into_bytes()
 }
+fn raw_result_key(task: Uuid) -> Vec<u8> {
+    format!("durable/async-task/raw-result/{task}").into_bytes()
+}
 
 /// Compose the child, keyed admission, and definition identity in one batch.
 /// This neither validates the current tool registration nor transfers a lease.
@@ -144,6 +147,25 @@ pub(crate) fn prepare_intent(
     running: &StoredTask,
     identity: &ToolIdentity,
 ) -> Result<(Intent, OwnedBatch), Error> {
+    prepare_authorized_phase(store, running, identity, false)
+}
+
+/// Like intent preparation, but authorizes only a completed durable raw
+/// outcome. The raw result is tied to the original dispatch intent while the
+/// task and ancestor checks bind the current (possibly recovered) attempt.
+pub(crate) fn prepare_after_phase(
+    store: &Store,
+    running: &StoredTask,
+    identity: &ToolIdentity,
+) -> Result<(Intent, OwnedBatch), Error> {
+    prepare_authorized_phase(store, running, identity, true)
+}
+fn prepare_authorized_phase(
+    store: &Store,
+    running: &StoredTask,
+    identity: &ToolIdentity,
+    after: bool,
+) -> Result<(Intent, OwnedBatch), Error> {
     if !identity.is_valid() {
         return Err(Error::Invalid);
     }
@@ -202,23 +224,55 @@ pub(crate) fn prepare_intent(
         expected: Expected::Version(stored_identity.version),
     });
     let key = intent_key(running.task.id());
-    if store.get(&key)?.is_some() {
-        return Err(Error::Invalid);
-    }
-    checks.push(Check {
-        key: key.clone(),
-        expected: Expected::Missing,
-    });
-    let intent = Intent {
+    let expected = Intent {
         task: running.task.id(),
         attempt,
         identity: identity.clone(),
     };
-    let mutations = vec![Mutation::Put {
-        key,
-        value: serde_json::to_vec(&intent)?,
-    }];
-    Ok((intent, OwnedBatch { checks, mutations }))
+    if after {
+        if !identity.has_after_hook() {
+            return Err(Error::Invalid);
+        }
+        let stored = store.get(&key)?.ok_or(Error::Invalid)?;
+        let intent: Intent = serde_json::from_slice(&stored.value)?;
+        if intent.task != running.task.id() || intent.identity != *identity {
+            return Err(Error::Invalid);
+        }
+        checks.push(Check {
+            key,
+            expected: Expected::Version(stored.version),
+        });
+        let raw_key = raw_result_key(running.task.id());
+        let raw = store.get(&raw_key)?.ok_or(Error::Invalid)?;
+        let (raw_intent, _): (Intent, Outcome) = serde_json::from_slice(&raw.value)?;
+        if raw_intent != intent {
+            return Err(Error::Invalid);
+        }
+        checks.push(Check {
+            key: raw_key,
+            expected: Expected::Version(raw.version),
+        });
+        Ok((
+            intent,
+            OwnedBatch {
+                checks,
+                mutations: vec![],
+            },
+        ))
+    } else {
+        if store.get(&key)?.is_some() {
+            return Err(Error::Invalid);
+        }
+        checks.push(Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        });
+        let mutations = vec![Mutation::Put {
+            key,
+            value: serde_json::to_vec(&expected)?,
+        }];
+        Ok((expected, OwnedBatch { checks, mutations }))
+    }
 }
 
 /// Persist the exact normalized arguments before invoking the tool. This does
@@ -328,12 +382,93 @@ pub(crate) fn prepare_receipt(
     Ok(OwnedBatch { checks, mutations })
 }
 
+/// Persist the joined Tool result separately; it is not a final receipt and
+/// does not by itself authorize the after hook.
+pub(crate) fn prepare_raw_result(
+    store: &Store,
+    intent: &Intent,
+    outcome: &Outcome,
+) -> Result<OwnedBatch, Error> {
+    if !intent.identity.has_after_hook() {
+        return Err(Error::Invalid);
+    }
+    let mut batch = prepare_receipt(store, intent, outcome)?;
+    let final_key = receipt_key(intent.task);
+    if store.get(&final_key)?.is_some() {
+        return Err(Error::Invalid);
+    }
+    let raw_key = raw_result_key(intent.task);
+    // A final receipt must not already exist when publishing raw output.
+    let raw = store.get(&raw_key)?;
+    let encoded = serde_json::to_vec(&(intent, outcome))?;
+    if raw.as_ref().is_some_and(|entry| entry.value != encoded) {
+        return Err(Error::Invalid);
+    }
+    batch.checks.push(Check {
+        key: raw_key.clone(),
+        expected: raw
+            .as_ref()
+            .map_or(Expected::Missing, |e| Expected::Version(e.version)),
+    });
+    batch
+        .mutations
+        .retain(|m| !matches!(m, Mutation::Put { key, .. } if *key == final_key));
+    if raw.is_none() {
+        batch.mutations.push(Mutation::Put {
+            key: raw_key,
+            value: encoded,
+        });
+    }
+    Ok(batch)
+}
+pub(crate) fn prepare_after_recovery(
+    store: &Store,
+    running: &StoredTask,
+) -> Result<OwnedBatch, Error> {
+    if running.task.checkpoint().phase != "sealed.execute.v1" {
+        return Err(Error::Invalid);
+    }
+    let (intent, _) = read_raw_result(store, running.task.id())?.ok_or(Error::Invalid)?;
+    let (checked, batch) = prepare_after_phase(store, running, &intent.identity)?;
+    if intent != checked {
+        return Err(Error::Invalid);
+    }
+    Ok(batch)
+}
+
+pub(crate) fn read_raw_result(
+    store: &Store,
+    task: Uuid,
+) -> Result<Option<(Intent, Outcome)>, Error> {
+    let Some(raw) = store.get(&raw_result_key(task))? else {
+        return Ok(None);
+    };
+    let (intent, outcome): (Intent, Outcome) = serde_json::from_slice(&raw.value)?;
+    if intent.task != task
+        || !intent.identity.has_after_hook()
+        || load_intent(store, task)? != intent
+    {
+        return Err(Error::Invalid);
+    }
+    let definition = store.get(&identity_key(task))?.ok_or(Error::Invalid)?;
+    if serde_json::from_slice::<ToolIdentity>(&definition.value)? != intent.identity {
+        return Err(Error::Invalid);
+    }
+    Ok(Some((intent, outcome)))
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReceiptRead {
+    Final(Outcome),
+    AfterIncomplete(Outcome),
+}
+
 /// Read a receipt with checks suitable for a parent task transition. Every
 /// record read here is fenced by the parent's eventual atomic commit.
 pub(crate) fn prepare_receipt_read(
     store: &Store,
     task: Uuid,
-) -> Result<(Option<Outcome>, Vec<Check>), Error> {
+) -> Result<(Option<ReceiptRead>, Vec<Check>), Error> {
     let definition_key = identity_key(task);
     let definition = store.get(&definition_key)?.ok_or(Error::Invalid)?;
     let identity: ToolIdentity = serde_json::from_slice(&definition.value)?;
@@ -360,8 +495,17 @@ pub(crate) fn prepare_receipt_read(
             .as_ref()
             .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
     });
+    let raw_key = raw_result_key(task);
+    let raw_entry = store.get(&raw_key)?;
+    checks.push(Check {
+        key: raw_key,
+        expected: raw_entry
+            .as_ref()
+            .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+    });
     match (intent_entry, receipt_entry) {
-        (None, None) => Ok((None, checks)),
+        (None, None) if raw_entry.is_none() => Ok((None, checks)),
+        (None, None) => Err(Error::Invalid),
         (None, Some(_)) => Err(Error::Invalid),
         (Some(intent), receipt) => {
             let intent: Intent = serde_json::from_slice(&intent.value)?;
@@ -369,10 +513,18 @@ pub(crate) fn prepare_receipt_read(
                 return Err(Error::Invalid);
             }
             let Some(receipt) = receipt else {
+                if let Some(raw) = raw_entry {
+                    let (raw_intent, outcome): (Intent, Outcome) =
+                        serde_json::from_slice(&raw.value)?;
+                    if raw_intent != intent || !identity.has_after_hook() {
+                        return Err(Error::Invalid);
+                    }
+                    return Ok((Some(ReceiptRead::AfterIncomplete(outcome)), checks));
+                }
                 return Ok((
-                    Some(Outcome::Unknown(
+                    Some(ReceiptRead::Final(Outcome::Unknown(
                         "dispatch intent has no durable receipt; reconcile external effects".into(),
-                    )),
+                    ))),
                     checks,
                 ));
             };
@@ -380,7 +532,7 @@ pub(crate) fn prepare_receipt_read(
             if stored != intent {
                 return Err(Error::Invalid);
             }
-            Ok((Some(outcome), checks))
+            Ok((Some(ReceiptRead::Final(outcome)), checks))
         }
     }
 }
@@ -709,7 +861,7 @@ mod tests {
         assert_eq!(read_receipt(&store, &intent).unwrap(), None);
         assert!(matches!(
             prepare_receipt_read(&store, id).unwrap().0,
-            Some(Outcome::Unknown(_))
+            Some(ReceiptRead::Final(Outcome::Unknown(_)))
         ));
         let task = TaskStore::new(&store).load(id).unwrap().unwrap();
         assert!(prepare_intent(&store, &task, &intent.identity).is_err());

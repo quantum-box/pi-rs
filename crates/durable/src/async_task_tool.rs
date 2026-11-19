@@ -21,6 +21,9 @@ pub enum AsyncTaskResult {
     Outcome(Outcome),
     /// The external outcome is unresolved and must not be replayed automatically.
     Uncertain(Outcome),
+    /// The Tool outcome is known, but its after hook did not finish. It is
+    /// evidence for reconciliation, not a finalized model-facing result.
+    AfterIncomplete(Outcome),
     /// A host operation or state update was unsupported; the output is retained.
     Unsupported {
         reason: String,
@@ -43,14 +46,17 @@ impl AsyncTaskCall {
         let Some(result) = self.0.result(parent, documents)? else {
             return Ok(None);
         };
-        if let Some(outcome) = documents.read_sealed_child_receipt(self.task_id())? {
-            return Ok(Some(
-                if matches!(outcome, Outcome::Unknown(_) | Outcome::Pending { .. }) {
+        if let Some(receipt) = documents.read_sealed_child_receipt(self.task_id())? {
+            use crate::async_task_protocol::ReceiptRead;
+            return Ok(Some(match receipt {
+                ReceiptRead::AfterIncomplete(outcome) => AsyncTaskResult::AfterIncomplete(outcome),
+                ReceiptRead::Final(outcome)
+                    if matches!(outcome, Outcome::Unknown(_) | Outcome::Pending { .. }) =>
+                {
                     AsyncTaskResult::Uncertain(outcome)
-                } else {
-                    AsyncTaskResult::Outcome(outcome)
-                },
-            ));
+                }
+                ReceiptRead::Final(outcome) => AsyncTaskResult::Outcome(outcome),
+            }));
         }
         let result = match result {
             NestedTaskResult::Succeeded(_) => {
@@ -78,6 +84,18 @@ impl AsyncTaskCall {
         };
         Ok(Some(result))
     }
+}
+
+/// Read the durable pre-after Tool outcome for reconciliation after shutdown.
+/// This is evidence only: it does not authorize dispatch or imply that the
+/// after hook completed, and must not be used as a finalized tool result.
+pub fn read_raw_outcome_for_reconciliation(
+    store: &durable_store::Store,
+    task_id: uuid::Uuid,
+) -> Result<Option<Outcome>, String> {
+    crate::async_task_protocol::read_raw_result(store, task_id)
+        .map(|record| record.map(|(_, outcome)| outcome))
+        .map_err(|error| error.to_string())
 }
 
 /// The host explicitly attests that its standalone task application does not
@@ -141,10 +159,10 @@ impl StandaloneNoHooksHost {
     }
 }
 
-/// A standalone host for one replay-safe, stateless before-tool hook per tool.
-/// The caller must change `hook_identity` whenever hook code or configuration changes.
-/// Hooks must be side-effect-free: preflight can be retried after interruption.
-/// Task-fenced memo is supported; sleep, conversation state and after-tool hooks are not.
+/// A standalone host for replay-safe task hooks. The caller must change
+/// `hook_identity` whenever hook code or configuration changes. Hook effects
+/// other than task-fenced memo are unsupported. An opted-in after hook may be
+/// retried after interruption; sleep and conversation state are unavailable.
 pub struct StandaloneBeforeHookHost {
     scheduler: crate::task_scheduler::Scheduler,
 }
@@ -166,6 +184,48 @@ impl StandaloneBeforeHookHost {
         hook_identity: &str,
         hook: Arc<dyn crate::extension::Hook>,
     ) -> Result<Arc<AsyncTaskTool>, String> {
+        self.register_tool_inner(
+            kind,
+            tool,
+            implementation,
+            version,
+            hook_identity,
+            hook,
+            false,
+        )
+    }
+    /// Opt in to replay-safe after hooks. Hook code and configuration must be
+    /// covered by `hook_identity`; hooks may use task-fenced memo but must not
+    /// perform other side effects, because an interrupted after can be retried.
+    pub fn register_tool_with_after(
+        &mut self,
+        kind: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        implementation: &str,
+        version: u32,
+        hook_identity: &str,
+        hook: Arc<dyn crate::extension::Hook>,
+    ) -> Result<Arc<AsyncTaskTool>, String> {
+        self.register_tool_inner(
+            kind,
+            tool,
+            implementation,
+            version,
+            hook_identity,
+            hook,
+            true,
+        )
+    }
+    fn register_tool_inner(
+        &mut self,
+        kind: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        implementation: &str,
+        version: u32,
+        hook_identity: &str,
+        hook: Arc<dyn crate::extension::Hook>,
+        after: bool,
+    ) -> Result<Arc<AsyncTaskTool>, String> {
         let kind = kind.into();
         let (executor, identity) = self.scheduler.install_sealed_tool_with_hook(
             kind.clone(),
@@ -173,6 +233,7 @@ impl StandaloneBeforeHookHost {
             implementation,
             version,
             Some((hook_identity.into(), hook)),
+            after,
         )?;
         let handler: Arc<dyn crate::task_scheduler::Handler> = executor;
         let adapter = Arc::new(crate::task_tool::TaskTool::new(
@@ -197,6 +258,46 @@ impl StandaloneBeforeHookHost {
         snapshot: &crate::extension::Snapshot,
         names: &[String],
     ) -> Result<Arc<AsyncTaskTool>, String> {
+        self.register_selected_tool_inner(
+            kind,
+            tool,
+            implementation,
+            version,
+            snapshot,
+            names,
+            false,
+        )
+    }
+    /// Opt the exact ordered selection into replay-safe legacy text after hooks.
+    pub fn register_selected_tool_with_after(
+        &mut self,
+        kind: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        implementation: &str,
+        version: u32,
+        snapshot: &crate::extension::Snapshot,
+        names: &[String],
+    ) -> Result<Arc<AsyncTaskTool>, String> {
+        self.register_selected_tool_inner(
+            kind,
+            tool,
+            implementation,
+            version,
+            snapshot,
+            names,
+            true,
+        )
+    }
+    fn register_selected_tool_inner(
+        &mut self,
+        kind: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        implementation: &str,
+        version: u32,
+        snapshot: &crate::extension::Snapshot,
+        names: &[String],
+        after: bool,
+    ) -> Result<Arc<AsyncTaskTool>, String> {
         let selection = snapshot
             .stable_selection(names)
             .ok_or("extension selection is missing, duplicated, or unidentified")?;
@@ -207,13 +308,14 @@ impl StandaloneBeforeHookHost {
             "selection-v1:{}",
             serde_json::to_string(&selection).map_err(|e| e.to_string())?
         );
-        self.register_tool(
+        self.register_tool_inner(
             kind,
             tool,
             implementation,
             version,
             &identity,
             Arc::new(SelectedBeforeHooks(resolved)),
+            after,
         )
     }
     pub fn into_driver(self) -> crate::task_driver::Driver {
@@ -241,6 +343,15 @@ impl crate::extension::Hook for SelectedBeforeHooks {
             other => other,
         })
     }
+    async fn after_tool(
+        &self,
+        call: &crate::extension::ToolCall,
+        result: &serde_json::Value,
+        context: &crate::extension::Context<'_>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let (value, _reports) = self.0.after_tool(call, result.clone(), context).await;
+        Ok((value != *result).then_some(value))
+    }
 }
 
 /// Persistable registration identity. The host-assigned implementation ID must
@@ -253,6 +364,8 @@ pub struct ToolIdentity {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before_hook: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    after_hook: bool,
 }
 impl ToolIdentity {
     pub fn new(
@@ -274,6 +387,7 @@ impl ToolIdentity {
             implementation,
             version,
             before_hook: None,
+            after_hook: false,
         })
     }
 
@@ -285,8 +399,17 @@ impl ToolIdentity {
         Ok(self)
     }
 
+    pub(crate) fn with_after_hook(mut self) -> Self {
+        self.after_hook = true;
+        self
+    }
+    pub(crate) fn has_after_hook(&self) -> bool {
+        self.after_hook
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
-        !self.implementation.is_empty()
+        (!self.after_hook || self.before_hook.is_some())
+            && !self.implementation.is_empty()
             && self.implementation.len() <= 4096
             && self.version != 0
             && !self.spec.name.is_empty()
@@ -337,6 +460,9 @@ impl SealedExecutor {
 
     pub(crate) fn has_before_hook(&self) -> bool {
         self.before_hook.is_some()
+    }
+    pub(crate) fn has_after_hook(&self) -> bool {
+        self.identity.has_after_hook()
     }
 
     pub(crate) fn checkpoint_arguments(&self, task: &Task) -> Result<serde_json::Value, String> {
@@ -405,6 +531,62 @@ impl SealedExecutor {
             };
             tokio::select! { biased; _ = cancel.cancelled() => Err("before-hook cancelled".into()), result = operation => result }
         })
+    }
+
+    /// Run the limited legacy text after hook. Non-text replacements are
+    /// ignored as in the ordinary runtime; structured outcome replacement is
+    /// rejected because this standalone path cannot preserve all channels.
+    pub(crate) fn after(
+        &self,
+        task: &Task,
+        outcome: Outcome,
+        cancel: &pi_rs_core::CancellationToken,
+        memo: &dyn crate::extension::Memo,
+    ) -> Result<crate::task_scheduler::Step, String> {
+        let args = self.checkpoint_arguments(task)?;
+        let hook = self
+            .before_hook
+            .as_ref()
+            .ok_or("missing after hook")?
+            .clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let text = outcome.tool_content();
+        let replacement = runtime.block_on(async {
+            let call = crate::extension::ToolCall { name: self.identity.spec.name.clone(), arguments: args };
+            let snapshot = serde_json::Value::Null;
+            let context = crate::extension::Context { snapshot: &snapshot, memo };
+            let mut registry = crate::extension::Registry::default();
+            registry.install(crate::extension::Extension { name: "task-after".into(), hooks: vec![hook], ..Default::default() }).map_err(|e| e.to_string())?;
+            let selected = registry.snapshot().resolve(None);
+            tokio::select! { biased;
+                _ = cancel.cancelled() => Err("after-hook cancelled".to_string()),
+                result = selected.after_tool(&call, serde_json::Value::String(text.clone()), &context) => Ok(result.0),
+            }
+        })?;
+        let outcome = match replacement.as_str() {
+            Some(value) if value != text => match outcome {
+                Outcome::Succeeded(_) => Outcome::Succeeded(value.to_owned()),
+                Outcome::SucceededWithDetails { details, .. } => Outcome::SucceededWithDetails {
+                    output: value.to_owned(),
+                    details,
+                },
+                _ => return Err("after-hook replacement of non-text outcome is unsupported".into()),
+            },
+            _ => outcome,
+        };
+        if serde_json::to_vec(&outcome)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 60 * 1024
+        {
+            return Err("after-hook outcome exceeds receipt limit".into());
+        }
+        Ok(crate::task_scheduler::Step::Succeed(
+            serde_json::to_value(outcome).map_err(|e| e.to_string())?,
+        ))
     }
 
     /// Called only after the driver has committed its task-owned intent and
@@ -971,6 +1153,610 @@ mod tests {
         let _ = driver.shutdown_with_pending().unwrap();
     }
 
+    struct AfterFixture {
+        root: std::path::PathBuf,
+        block: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for AfterFixture {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            let proposed = if self.root.join("after-ready").exists() {
+                "second"
+            } else {
+                "first"
+            };
+            let value = ctx.memo.get_or_insert("after", json!(proposed)).await?;
+            if value != json!("first") {
+                return Err("memo changed".into());
+            }
+            if self.block && !self.root.join("after-ready").exists() {
+                std::fs::write(self.root.join("after-ready"), b"ready")
+                    .map_err(|e| e.to_string())?;
+                std::future::pending().await
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    struct PersistentCountTool(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for PersistentCountTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "persistent-count".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(self.0.join("invocations"))
+                .unwrap();
+            writeln!(file, "invoked").unwrap();
+            file.sync_all().unwrap();
+            Outcome::Structured {
+                data: json!({"done":true}),
+                attachments: vec![],
+            }
+        }
+    }
+    fn after_fixture_host(
+        path: &std::path::Path,
+        tool: Arc<dyn Tool>,
+        hook: Arc<dyn crate::extension::Hook>,
+    ) -> StandaloneBeforeHookHost {
+        after_fixture_host_with_id(path, tool, hook, "after-v1")
+    }
+    fn after_fixture_host_with_id(
+        path: &std::path::Path,
+        tool: Arc<dyn Tool>,
+        hook: Arc<dyn crate::extension::Hook>,
+        identity: &str,
+    ) -> StandaloneBeforeHookHost {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+        let mut host = StandaloneBeforeHookHost::open(path, registry).unwrap();
+        let adapter = host
+            .register_tool_with_after("leaf", tool, "backend", 1, identity, hook)
+            .unwrap();
+        assert!(cell.set(adapter).is_ok());
+        host
+    }
+    #[test]
+    fn after_driver_persists_result_and_runs_fenced_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let scheduler = after_fixture_host(
+            &dir.path().join("db"),
+            tool,
+            Arc::new(AfterFixture {
+                root: dir.path().to_owned(),
+                block: false,
+            }),
+        )
+        .into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let task = wait_terminal(&driver, parent.id());
+        assert_eq!(
+            task.state(),
+            &crate::task::TaskState::Succeeded(json!({"done":true}))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    struct TextTool;
+    #[async_trait::async_trait]
+    impl Tool for TextTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "text".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded("original".into())
+        }
+    }
+    struct RewriteAfter;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for RewriteAfter {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            result: &serde_json::Value,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            assert_eq!(result, &json!("original"));
+            Ok(Some(json!("rewritten")))
+        }
+    }
+    #[test]
+    fn after_driver_returns_rewritten_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(TextTool);
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let scheduler = after_fixture_host(&dir.path().join("db"), tool, Arc::new(RewriteAfter))
+            .into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert_eq!(
+            wait_terminal(&driver, parent.id()).state(),
+            &crate::task::TaskState::Succeeded(json!("rewritten"))
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    struct AppendAfter(&'static str);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for AppendAfter {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            value: &serde_json::Value,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(Some(json!(format!(
+                "{}{}",
+                value.as_str().ok_or("nontext")?,
+                self.0
+            ))))
+        }
+    }
+    #[test]
+    fn after_driver_runs_selected_extensions_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(TextTool);
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let mut extensions = crate::extension::Registry::default();
+        for (name, suffix) in [("one", "+one"), ("two", "+two")] {
+            extensions
+                .install_identified(
+                    crate::extension::Extension {
+                        name: name.into(),
+                        hooks: vec![Arc::new(AppendAfter(suffix))],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(1, name.into(), vec!["hook".into()])
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+        let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
+        let adapter = host
+            .register_selected_tool_with_after(
+                "leaf",
+                tool,
+                "backend",
+                1,
+                &extensions.snapshot(),
+                &["two".into(), "one".into()],
+            )
+            .unwrap();
+        assert!(cell.set(adapter).is_ok());
+        let scheduler = host.into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert_eq!(
+            wait_terminal(&driver, parent.id()).state(),
+            &crate::task::TaskState::Succeeded(json!("original+two+one"))
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    struct DetailedTextTool;
+    #[async_trait::async_trait]
+    impl Tool for DetailedTextTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "details".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            Outcome::SucceededWithDetails {
+                output: "original".into(),
+                details: json!({"important":42}),
+            }
+        }
+    }
+    #[test]
+    fn after_driver_text_rewrite_retains_details_in_final_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(DetailedTextTool);
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let mut scheduler =
+            after_fixture_host(&dir.path().join("db"), tool, Arc::new(RewriteAfter))
+                .into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        let parent_task = scheduler.get(parent.id()).unwrap().unwrap();
+        let child: AsyncTaskCall =
+            serde_json::from_value(parent_task.checkpoint().data.clone()).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert_eq!(
+            wait_terminal(&driver, parent.id()).state(),
+            &crate::task::TaskState::Succeeded(
+                json!({"output":"rewritten", "details":{"important":42}})
+            )
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        assert!(
+            matches!(crate::async_task_protocol::prepare_receipt_read(&store, child.task_id()).unwrap().0,
+            Some(crate::async_task_protocol::ReceiptRead::Final(Outcome::SucceededWithDetails { output, details })) if output == "rewritten" && details == json!({"important":42}))
+        );
+    }
+    #[test]
+    fn after_driver_restart_limit_retains_raw_structured_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let hook = Arc::new(AfterFixture {
+            root: dir.path().to_owned(),
+            block: false,
+        });
+        let mut scheduler =
+            after_fixture_host(&path, tool.clone(), hook.clone()).into_scheduler_for_test();
+        let parent = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            1,
+        )
+        .unwrap()
+        .registered("parent".into(), true)
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        let parent_task = scheduler.get(parent.id()).unwrap().unwrap();
+        let child: AsyncTaskCall =
+            serde_json::from_value(parent_task.checkpoint().data.clone()).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        let crate::task_scheduler::TickReservation::Invocation(job) =
+            scheduler.reserve_tick(0).unwrap()
+        else {
+            panic!("missing tool invocation")
+        };
+        let completed = job.execute().unwrap();
+        drop(completed);
+        drop(scheduler);
+        let driver = after_fixture_host(&path, tool, hook).into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, parent.id()).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        assert!(
+            matches!(read_raw_outcome_for_reconciliation(&store, child.task_id()).unwrap(), Some(Outcome::Structured { data, .. }) if data == json!({"done":true}))
+        );
+        assert!(
+            matches!(crate::async_task_protocol::prepare_receipt_read(&store, child.task_id()).unwrap().0,
+            Some(crate::async_task_protocol::ReceiptRead::AfterIncomplete(Outcome::Structured { data, .. })) if data == json!({"done":true}))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    struct CountRewrite(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for CountRewrite {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(json!("finished")))
+        }
+    }
+    #[test]
+    fn after_driver_reopen_after_final_receipt_does_not_repeat_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let tool: Arc<dyn Tool> = Arc::new(TextTool);
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let hook = Arc::new(CountRewrite(count.clone()));
+        let mut scheduler =
+            after_fixture_host(&path, tool.clone(), hook.clone()).into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.tick(0).unwrap());
+        let crate::task_scheduler::TickReservation::Invocation(job) =
+            scheduler.reserve_tick(0).unwrap()
+        else {
+            panic!("missing tool invocation")
+        };
+        let mut completed = job.execute().unwrap();
+        completed.capture_marked_receipt().unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(completed);
+        drop(scheduler);
+        let driver = after_fixture_host(&path, tool, hook).into_driver();
+        assert_eq!(
+            wait_terminal(&driver, parent.id()).state(),
+            &crate::task::TaskState::Succeeded(json!("finished"))
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    #[test]
+    fn after_driver_reopen_rejects_changed_hook_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let hook = Arc::new(AfterFixture {
+            root: dir.path().to_owned(),
+            block: false,
+        });
+        let mut scheduler =
+            after_fixture_host(&path, tool.clone(), hook.clone()).into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.tick(0).unwrap());
+        let crate::task_scheduler::TickReservation::Invocation(job) =
+            scheduler.reserve_tick(0).unwrap()
+        else {
+            panic!("missing tool invocation")
+        };
+        let completed = job.execute().unwrap();
+        drop(completed);
+        drop(scheduler);
+        let driver = after_fixture_host_with_id(&path, tool, hook, "after-v2").into_driver();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match driver.get(parent.id()) {
+                Err(error) => {
+                    assert!(error.to_string().contains("registration changed"));
+                    break;
+                }
+                Ok(Some(task)) if task.is_terminal() => {
+                    assert!(!matches!(
+                        task.state(),
+                        crate::task::TaskState::Succeeded(_)
+                    ));
+                    break;
+                }
+                _ => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending();
+    }
+
+    struct BadAfterMemo;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for BadAfterMemo {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            let _ = ctx.memo.get_or_insert("", json!(1)).await;
+            Ok(Some(json!("should-not-publish")))
+        }
+    }
+    #[test]
+    fn after_driver_rejects_ignored_memo_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(TextTool);
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let scheduler = after_fixture_host(&dir.path().join("db"), tool, Arc::new(BadAfterMemo))
+            .into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let task = wait_terminal(&driver, parent.id());
+        assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    struct AbortAfterHook {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        result: std::sync::mpsc::Sender<bool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for AbortAfterHook {
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            self.result
+                .send(
+                    ctx.memo
+                        .get_or_insert("late-after", json!(1))
+                        .await
+                        .is_err(),
+                )
+                .unwrap();
+            Ok(None)
+        }
+    }
+    #[test]
+    fn after_driver_abort_rejects_late_memo_and_does_not_repeat_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (result, result_rx) = std::sync::mpsc::channel();
+        let hook = AbortAfterHook {
+            entered,
+            release: std::sync::Mutex::new(release_rx),
+            result,
+        };
+        let scheduler = after_fixture_host(&dir.path().join("db"), tool, Arc::new(hook))
+            .into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let running_parent = driver.get(parent.id()).unwrap().unwrap();
+        let child: AsyncTaskCall =
+            serde_json::from_value(running_parent.checkpoint().data.clone()).unwrap();
+        driver.request_abort(parent.id()).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        let task = wait_terminal(&driver, parent.id());
+        assert!(!matches!(
+            task.state(),
+            crate::task::TaskState::Succeeded(_)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let outcome = read_raw_outcome_for_reconciliation(&store, child.task_id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Structured { data, .. } if data == json!({"done":true}))
+        );
+        assert!(
+            matches!(crate::async_task_protocol::prepare_receipt_read(&store, child.task_id()).unwrap().0,
+            Some(crate::async_task_protocol::ReceiptRead::AfterIncomplete(Outcome::Structured { data, .. })) if data == json!({"done":true}))
+        );
+    }
+
+    #[test]
+    fn after_driver_kill_reopen_reuses_result_and_memo() {
+        const ENV: &str = "PI_RS_TASK_AFTER_KILL_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(root.clone()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = after_fixture_host(
+                &root.join("db"),
+                tool,
+                Arc::new(AfterFixture {
+                    root: root.clone(),
+                    block: true,
+                }),
+            )
+            .into_scheduler_for_test();
+            let parent = before_parent();
+            scheduler.submit(&parent).unwrap();
+            std::fs::write(root.join("parent"), parent.id().to_string()).unwrap();
+            let _driver = crate::task_driver::Driver::start(scheduler);
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::after_driver_kill_reopen_reuses_result_and_memo")
+            .env(ENV, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("after-ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("after hook did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let parent: Uuid = std::fs::read_to_string(dir.path().join("parent"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(PersistentCountTool(dir.path().to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let driver = after_fixture_host(
+            &dir.path().join("db"),
+            tool,
+            Arc::new(AfterFixture {
+                root: dir.path().to_owned(),
+                block: true,
+            }),
+        )
+        .into_driver();
+        let task = wait_terminal(&driver, parent);
+        assert_eq!(
+            task.state(),
+            &crate::task::TaskState::Succeeded(json!({"done":true}))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
     struct KillBeforeHook(std::path::PathBuf);
     #[async_trait::async_trait]
     impl crate::extension::Hook for KillBeforeHook {
@@ -1271,6 +2057,13 @@ mod tests {
                 Some(AsyncTaskResult::Outcome(Outcome::Structured { data, .. })) => {
                     Ok(Step::Succeed(data))
                 }
+                Some(AsyncTaskResult::Outcome(Outcome::Succeeded(output))) => {
+                    Ok(Step::Succeed(json!(output)))
+                }
+                Some(AsyncTaskResult::Outcome(Outcome::SucceededWithDetails {
+                    output,
+                    details,
+                })) => Ok(Step::Succeed(json!({"output":output, "details":details}))),
                 other => Err(format!("unexpected child outcome: {other:?}")),
             }
         }

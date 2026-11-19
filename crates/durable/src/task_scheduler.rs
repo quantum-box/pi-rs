@@ -647,7 +647,13 @@ impl CompletedInvocation {
             self.lease.attachment.owner.store(),
             self.running.task.id(),
         )?;
-        if !intent.matches_attempt(&self.running.task) {
+        if !intent.matches_attempt(&self.running.task)
+            && !crate::async_task_protocol::read_raw_result(
+                self.lease.attachment.owner.store(),
+                self.running.task.id(),
+            )?
+            .is_some_and(|(raw, _)| raw == intent)
+        {
             return Err(ProtocolError::Invalid);
         }
         let InvocationResult::Handler(Ok(Step::Succeed(value)), _) = &self.result else {
@@ -676,7 +682,14 @@ impl CompletedInvocation {
         intent: &crate::async_task_protocol::Intent,
     ) -> Result<(), crate::async_task_protocol::Error> {
         use crate::async_task_protocol::Error as ProtocolError;
-        if !intent.matches_attempt(&self.running.task) || self.lease.retired {
+        if self.lease.retired
+            || (!intent.matches_attempt(&self.running.task)
+                && !crate::async_task_protocol::read_raw_result(
+                    self.lease.attachment.owner.store(),
+                    self.running.task.id(),
+                )?
+                .is_some_and(|(raw, _)| raw == *intent))
+        {
             return Err(ProtocolError::Invalid);
         }
         let InvocationResult::Handler(Ok(Step::Succeed(value)), _) = &self.result else {
@@ -698,7 +711,10 @@ impl CompletedInvocation {
             .state
             .lock()
             .map_err(|_| ProtocolError::Invalid)?;
-        if !state.attempts.contains(&self.running.task.id()) {
+        if !state.attempts.contains(&self.running.task.id())
+            || state.leases.get(&self.lease.id)
+                != Some(&(self.lease.token, self.running.task.attempt_id()))
+        {
             return Err(ProtocolError::Invalid);
         }
         let batch = crate::async_task_protocol::prepare_receipt(owner.store(), intent, &outcome)?;
@@ -1456,6 +1472,7 @@ impl AdmissionHandle<'_> {
 /// including when a hook ignores its error.
 struct TaskHookMemo<'a> {
     invocation: &'a DetachedInvocation,
+    after: bool,
     failed: std::sync::atomic::AtomicBool,
 }
 impl TaskHookMemo<'_> {
@@ -1520,7 +1537,7 @@ impl TaskHookMemo<'_> {
                     capture.executor.tool().as_ref(),
                     &capture.implementation,
                     capture.version,
-                    false,
+                    (false, self.after),
                     (&[check], &mutations),
                 )
                 .map_err(|e| e.to_string())?;
@@ -1571,7 +1588,7 @@ impl DetachedInvocation {
         version: u32,
         commit: bool,
     ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
-        self.checked_tool_transaction(identity, tool, implementation, version, commit, (&[], &[]))
+        self.checked_tool_transaction(identity, tool, implementation, version, (commit, false), (&[], &[]))
     }
 
     fn checked_tool_transaction(
@@ -1580,10 +1597,11 @@ impl DetachedInvocation {
         tool: &dyn pi_rs_core::Tool,
         implementation: &str,
         version: u32,
-        commit: bool,
+        phase: (bool, bool),
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
         use crate::async_task_protocol::Error as ProtocolError;
+        let (commit, after) = phase;
         if self.abort
             || self.validator.is_some()
             || !self.running.task.is_task_tool()
@@ -1657,8 +1675,11 @@ impl DetachedInvocation {
         {
             return Err(ProtocolError::Invalid);
         }
-        let (intent, batch) =
-            crate::async_task_protocol::prepare_intent(owner.store(), &self.running, identity)?;
+        let (intent, batch) = if after {
+            crate::async_task_protocol::prepare_after_phase(owner.store(), &self.running, identity)?
+        } else {
+            crate::async_task_protocol::prepare_intent(owner.store(), &self.running, identity)?
+        };
         let definitions = self
             .definitions
             .read()
@@ -1683,6 +1704,32 @@ impl DetachedInvocation {
         mutations.extend_from_slice(extra.1);
         owner.store().commit(&checks, &mutations)?;
         Ok(intent)
+    }
+
+    fn persist_raw_tool_result(
+        &self,
+        intent: &crate::async_task_protocol::Intent,
+        outcome: &pi_rs_core::Outcome,
+    ) -> Result<(), String> {
+        if !intent.matches_attempt(&self.running.task) || self.lease.retired {
+            return Err("stale tool attempt".into());
+        }
+        let _failure = self.lease.failure_fence.lock().map_err(|e| e.to_string())?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        if !state.attempts.contains(&self.running.task.id())
+            || state.leases.get(&self.lease.id)
+                != Some(&(self.lease.token, self.running.task.attempt_id()))
+        {
+            return Err("stale tool lease".into());
+        }
+        let batch = crate::async_task_protocol::prepare_raw_result(owner.store(), intent, outcome)
+            .map_err(|e| e.to_string())?;
+        owner
+            .store()
+            .commit(&batch.checks, &batch.mutations)
+            .map_err(|e| e.to_string())
     }
 
     fn release_undispatched(mut self) -> Result<CompletedInvocation, Error> {
@@ -1830,8 +1877,25 @@ impl DetachedInvocation {
             ),
             _ => None,
         };
+        let raw_result = if !preflight
+            && !self.abort
+            && self
+                .receipt_capture
+                .as_ref()
+                .is_some_and(|c| c.executor.has_after_hook())
+        {
+            crate::async_task_protocol::read_raw_result(
+                self.lease.attachment.owner.store(),
+                self.running.task.id(),
+            )
+            .map_err(|e| Error::Handler(format!("raw result rejected: {e}")))?
+        } else {
+            None
+        };
         let intent = if preflight {
             None
+        } else if let Some((intent, _)) = &raw_result {
+            Some(intent.clone())
         } else if let Some(capture) = &self.receipt_capture {
             #[cfg(test)]
             if let Some(before) = &capture.before_intent {
@@ -1879,6 +1943,7 @@ impl DetachedInvocation {
                 .expect("preflight cancellation");
             let memo = TaskHookMemo {
                 invocation: &self,
+                after: false,
                 failed: std::sync::atomic::AtomicBool::new(false),
             };
             Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -1893,9 +1958,104 @@ impl DetachedInvocation {
                     }
                 },
             )))
+        } else if self
+            .receipt_capture
+            .as_ref()
+            .is_some_and(|c| c.executor.has_after_hook())
+            && intent.is_some()
+            && !self.abort
+        {
+            let capture = self.receipt_capture.as_ref().unwrap();
+            let intent_ref = intent.as_ref().unwrap();
+            let cancel = self.unhooked_cancellation.as_ref().unwrap();
+            let memo = TaskHookMemo {
+                invocation: &self,
+                after: true,
+                failed: std::sync::atomic::AtomicBool::new(false),
+            };
+            Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || {
+                    let outcome = if let Some((_, outcome)) = raw_result {
+                        outcome
+                    } else {
+                        let result = capture.executor.run(
+                            &self.running.task,
+                            intent_ref,
+                            self.lease.attachment.owner.store(),
+                            cancel,
+                            prepared.clone(),
+                        )?;
+                        let Step::Succeed(value) = result else {
+                            return Err("invalid tool result".into());
+                        };
+                        let outcome: pi_rs_core::Outcome =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        if matches!(
+                            outcome,
+                            pi_rs_core::Outcome::Unknown(_) | pi_rs_core::Outcome::Pending { .. }
+                        ) {
+                            return Ok(Step::Succeed(
+                                serde_json::to_value(outcome).map_err(|e| e.to_string())?,
+                            ));
+                        }
+                        self.persist_raw_tool_result(intent_ref, &outcome)?;
+                        outcome
+                    };
+                    self.checked_tool_transaction(
+                        &capture.identity,
+                        capture.executor.tool().as_ref(),
+                        &capture.implementation,
+                        capture.version,
+                        false,
+                        true,
+                        &[],
+                        &[],
+                    )
+                    .map_err(|e| format!("after authorization rejected: {e}"))?;
+                    // A previous attempt may have committed the final receipt
+                    // before dying during settlement. Do not invoke after twice.
+                    if let Some(final_outcome) = crate::async_task_protocol::read_receipt(
+                        self.lease.attachment.owner.store(),
+                        intent_ref,
+                    )
+                    .map_err(|e| e.to_string())?
+                    {
+                        return Ok(Step::Succeed(
+                            serde_json::to_value(final_outcome).map_err(|e| e.to_string())?,
+                        ));
+                    }
+                    let result = capture
+                        .executor
+                        .after(&self.running.task, outcome, cancel, &memo);
+                    if memo.failed.load(std::sync::atomic::Ordering::Acquire) {
+                        Err("task-fenced memo failed".into())
+                    } else {
+                        self.checked_tool_transaction(
+                            &capture.identity,
+                            capture.executor.tool().as_ref(),
+                            &capture.implementation,
+                            capture.version,
+                            false,
+                            true,
+                            &[],
+                            &[],
+                        )
+                        .map_err(|e| format!("after completion rejected: {e}"))?;
+                        result
+                    }
+                },
+            )))
         } else {
             None
         };
+        let after_enabled = self
+            .receipt_capture
+            .as_ref()
+            .is_some_and(|c| c.executor.has_after_hook())
+            && !preflight;
+        let after_success = preflight_result
+            .as_ref()
+            .is_some_and(|r| matches!(r, Ok(Ok(Step::Succeed(_)))));
         let Self {
             running,
             handler,
@@ -1908,7 +2068,8 @@ impl DetachedInvocation {
             unhooked_cancellation,
             sealed_registration: _,
         } = self;
-        let capture_enabled = receipt_capture.is_some() && intent.is_some();
+        let capture_enabled =
+            receipt_capture.is_some() && intent.is_some() && (!after_enabled || after_success);
         let result = if abort {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler.run(&running.task)
@@ -3755,7 +3916,7 @@ impl Scheduler {
         ),
         String,
     > {
-        self.install_sealed_tool_with_hook(kind, tool, implementation, version, None)
+        self.install_sealed_tool_with_hook(kind, tool, implementation, version, None, false)
     }
 
     pub(crate) fn install_sealed_tool_with_hook(
@@ -3765,6 +3926,7 @@ impl Scheduler {
         implementation: &str,
         version: u32,
         hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
+        after: bool,
     ) -> Result<
         (
             Arc<crate::async_task_tool::SealedExecutor>,
@@ -3781,6 +3943,12 @@ impl Scheduler {
             crate::async_task_tool::ToolIdentity::new(tool.as_ref(), implementation, version)?;
         if let Some((id, _)) = &hook {
             identity = identity.with_before_hook(id.clone())?;
+        }
+        if after {
+            if hook.is_none() {
+                return Err("after hook requires a hook registration".into());
+            }
+            identity = identity.with_after_hook();
         }
         if serde_json::to_vec(&identity)
             .map_err(|e| e.to_string())?
@@ -4295,6 +4463,44 @@ impl Scheduler {
                 if item.task.abort_requested() {
                     // Defer even restart-limit failure until owned cleanup settles.
                     self.ts().update(&item, |task| task.recover())?;
+                    continue;
+                }
+                let after_recovery = if !item.task.replay_safe() {
+                    match crate::async_task_protocol::read_raw_result(
+                        self.ts().store(),
+                        item.task.id(),
+                    ) {
+                        Ok(Some(_)) => Some(
+                            crate::async_task_protocol::prepare_after_recovery(
+                                self.ts().store(),
+                                &item,
+                            )
+                            .map_err(|e| Error::Handler(format!("after recovery rejected: {e}")))?,
+                        ),
+                        Ok(None) => None,
+                        Err(error) => {
+                            return Err(Error::Handler(format!(
+                                "raw result recovery failed: {error}"
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(proof) = after_recovery {
+                    if item.task.restarts().saturating_add(1) >= item.task.restart_limit() {
+                        self.finish_failed(&item, "after hook restart limit".into())?;
+                        self.deferred_recovery.extend(deferred);
+                        continue 'scan;
+                    }
+                    let mut next = item.clone();
+                    next.task.recover().map_err(Error::Transition)?;
+                    let mut batch = self.ts().prepare_save(&[task_store::Save::Update(&next)])?;
+                    batch.checks.extend(proof.checks);
+                    self.ts()
+                        .store()
+                        .commit(&batch.checks, &batch.mutations)
+                        .map_err(task_store::Error::from)?;
                     continue;
                 }
                 if !item.task.replay_safe() {
