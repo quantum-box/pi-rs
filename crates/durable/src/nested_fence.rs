@@ -517,6 +517,169 @@ mod tests {
             Err(Error::Stale)
         ));
     }
+
+    struct AnyRaceFixture {
+        harness: Rc<RefCell<Harness>>,
+        store: Store,
+        binding: Binding,
+        middle: Uuid,
+        a: Uuid,
+        b: Uuid,
+        b_key: Vec<u8>,
+    }
+
+    fn any_race_fixture(path: &std::path::Path) -> AnyRaceFixture {
+        use pi_rs_core::Outcome;
+        let (harness, id, mut binding) = fixture(path);
+        let attempt = binding.attempt;
+        rewrite(path, id, |v| {
+            v["phase"] = json!({"Blocked":{"turns":1,"calls":[],"index":0,"operation_id":attempt.operation_id,"reason":"parked","arguments":{}}});
+            v["nested_resume"] = json!({"operation_id":attempt.operation_id,"restarts":0,"dispatch_identity":"Other","explicit_suspend":true});
+        });
+        binding.suspended = true;
+        let store = Store::open(path).unwrap();
+        let root = attempt.operation_id;
+        let middle = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let suspension = Uuid::new_v4();
+        let a_key = format!("nested/{root}/{middle}/k61").into_bytes();
+        let b_key = format!("nested/{root}/{middle}/k62").into_bytes();
+        let parent = json!({"name":"middle","arguments":{},"prepared":{},"policy":"Safe","operation_id":middle,"outcome":Outcome::Pending {reference:format!("nested-child-park:{suspension}")},"child_park":{"suspension":suspension,"root_attempt":attempt.attempt_id,"leaf_key":a_key,"additional_leaf_keys":[b_key],"any":true}});
+        let a_record = json!({"name":"child","arguments":{},"prepared":{},"policy":"Safe","operation_id":a,"hooks_required":true,"outcome":Outcome::Succeeded("hook:a".into()),"resolution":{"reference":"a","outcome":Outcome::Succeeded("raw-a".into()),"finalized_outcome":Outcome::Succeeded("hook:a".into())}});
+        let b_record = json!({"name":"child","arguments":{},"prepared":{},"policy":"Safe","operation_id":b,"hooks_required":true,"outcome":Outcome::Pending {reference:"b".into()}});
+        let batch = crate::nested_suspension::prepare_retired(
+            id,
+            middle,
+            suspension,
+            attempt.attempt_id,
+            json!({}),
+            vec![
+                crate::nested_suspension::PendingJob {
+                    operation_id: a,
+                    reference: "a".into(),
+                },
+                crate::nested_suspension::PendingJob {
+                    operation_id: b,
+                    reference: "b".into(),
+                },
+            ],
+        )
+        .unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: format!("nested/{root}/{root}/k6d").into_bytes(),
+                        value: serde_json::to_vec(&parent).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: a_key,
+                        value: serde_json::to_vec(&a_record).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: b_key.clone(),
+                        value: serde_json::to_vec(&b_record).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        AnyRaceFixture {
+            harness,
+            store,
+            binding,
+            middle,
+            a,
+            b,
+            b_key,
+        }
+    }
+
+    #[test]
+    fn any_freeze_retries_if_reconciliation_commits_before_its_cas() {
+        use pi_rs_core::Outcome;
+        let dir = tempfile::tempdir().unwrap();
+        let f = any_race_fixture(&dir.path().join("db"));
+        let id = f.binding.conversation;
+        let root = f.binding.attempt.operation_id;
+        let b = f.b;
+        let host = f.harness.clone();
+        // Real freeze_any_wake has read both leaves. Commit B's receipt in the
+        // host at the boundary immediately before its version-checked freeze.
+        BEFORE_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                host.borrow_mut()
+                    .reconcile_nested_pending(id, root, b, "b", Outcome::Succeeded("raw-b".into()))
+                    .unwrap();
+            }))
+        });
+        assert!(matches!(
+            crate::nested::freeze_any_wake(&f.store, &f.binding).unwrap(),
+            crate::nested::AnyWake::Retry
+        ));
+        let snapshot = crate::nested_suspension::load(&f.store, id, f.middle)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.frozen_ended().is_none());
+        let staged: serde_json::Value =
+            serde_json::from_slice(&f.store.get(&f.b_key).unwrap().unwrap().value).unwrap();
+        assert_eq!(
+            staged["staged_outcome"],
+            json!(Outcome::Succeeded("raw-b".into()))
+        );
+        assert!(matches!(
+            crate::nested::freeze_any_wake(&f.store, &f.binding).unwrap(),
+            crate::nested::AnyWake::Retry
+        ));
+    }
+
+    #[test]
+    fn abort_after_any_freeze_accepts_authoritative_pending_receipt() {
+        use pi_rs_core::Outcome;
+        for cancelled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = any_race_fixture(&dir.path().join("db"));
+            let id = f.binding.conversation;
+            let root = f.binding.attempt.operation_id;
+            assert!(
+                matches!(crate::nested::freeze_any_wake(&f.store,&f.binding).unwrap(),crate::nested::AnyWake::Ready {ended,..} if ended == vec![f.a])
+            );
+            f.harness.borrow_mut().request_abort(id).unwrap();
+            if cancelled {
+                f.harness
+                    .borrow_mut()
+                    .cancel_nested_pending(id, root, f.b, "b", "cancelled".into())
+                    .unwrap();
+            } else {
+                f.harness
+                    .borrow_mut()
+                    .reconcile_nested_pending(
+                        id,
+                        root,
+                        f.b,
+                        "b",
+                        Outcome::Succeeded("raw-b".into()),
+                    )
+                    .unwrap();
+            }
+            let record: serde_json::Value =
+                serde_json::from_slice(&f.store.get(&f.b_key).unwrap().unwrap().value).unwrap();
+            let expected = if cancelled {
+                Outcome::Failed("cancelled".into())
+            } else {
+                Outcome::Succeeded("raw-b".into())
+            };
+            assert_eq!(record["staged_outcome"], json!(expected));
+            assert_eq!(record["resolution"]["cancelled"], json!(cancelled));
+            assert!(f.harness.borrow().conversation(id).unwrap().abort_requested);
+            let snapshot = crate::nested_suspension::load(&f.store, id, f.middle)
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.frozen_ended(), Some(&[f.a][..]));
+        }
+    }
     #[tokio::test]
     async fn replaced_root_cannot_admit_a_nested_intent() {
         use crate::{nested::NestedHost, recovery::ReplayPolicy, runtime::RegisteredTool};
