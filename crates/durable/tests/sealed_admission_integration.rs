@@ -140,6 +140,9 @@ impl Handler for Parent {
                 Some(AsyncTaskResult::Outcome(Outcome::Succeeded(s))) => {
                     Ok(Step::Succeed(json!(s)))
                 }
+                Some(AsyncTaskResult::AfterIncomplete(Outcome::Succeeded(s))) => {
+                    Ok(Step::Succeed(json!(format!("after-incomplete:{s}"))))
+                }
                 Some(AsyncTaskResult::Uncertain(Outcome::Unknown(reason)))
                     if reason.contains("normalized arguments") =>
                 {
@@ -674,6 +677,155 @@ fn immediate_before_hook_reconnects_after_kill_before_parent_park() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("events")).unwrap(),
         "hook\ninvoke:rewritten\n"
+    );
+    driver.shutdown().unwrap();
+}
+
+struct IntegrationAfterHook {
+    fail_memo: bool,
+    before_calls: Arc<AtomicUsize>,
+    after_calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for IntegrationAfterHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        assert_eq!(call.arguments["value"], json!("prepared"));
+        self.before_calls.fetch_add(1, Ordering::SeqCst);
+        let mut args = call.arguments.clone();
+        args["value"] = json!("before");
+        Ok(pi_rs_durable::extension::BeforeTool::Rewrite(args))
+    }
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        assert_eq!(call.arguments["value"], json!("before"));
+        assert_eq!(*result, json!("before"));
+        self.after_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_memo {
+            // Even if ignored by the hook, the failed fenced operation rejects
+            // the after phase and preserves the raw result for the parent.
+            let _ = ctx.memo.get_or_insert("", json!(true)).await;
+        } else {
+            assert_eq!(
+                ctx.memo.get_or_insert("phase", json!("after")).await?,
+                json!("after")
+            );
+        }
+        Ok(Some(json!("after")))
+    }
+}
+fn after_integration_host(
+    path: &Path,
+    fail_memo: bool,
+    before_calls: Arc<AtomicUsize>,
+    after_calls: Arc<AtomicUsize>,
+    invocations: Arc<AtomicUsize>,
+) -> Driver {
+    let tool: Arc<dyn Tool> = Arc::new(RewriteLeaf {
+        invocations,
+        log: None,
+    });
+    let _binding = nested_identity::register(&tool, Some("after-backend".into())).unwrap();
+    let cell = Arc::new(OnceLock::new());
+    let parent: Arc<dyn Handler> = Arc::new(Parent {
+        leaf: cell.clone(),
+        mode: Mode::Immediate,
+        marker: None,
+        release: Arc::new(AtomicBool::new(true)),
+    });
+    let parent_tool = Arc::new(TaskTool::new(
+        spec("parent"),
+        "parent",
+        true,
+        1,
+        parent.clone(),
+    ));
+    let mut registry = Registry::default();
+    assert!(registry.register_shared("parent", true, parent));
+    assert!(registry.register(
+        "root",
+        true,
+        Root {
+            parent: parent_tool
+        }
+    ));
+    assert!(registry.set_abort("parent", |_: &Task| Ok(Step::Succeed(Value::Null))));
+    assert!(registry.set_abort("root", |_: &Task| Ok(Step::Succeed(Value::Null))));
+    let mut host =
+        pi_rs_durable::async_task_tool::StandaloneBeforeHookHost::open(path, registry).unwrap();
+    let hook = Arc::new(IntegrationAfterHook {
+        fail_memo,
+        before_calls,
+        after_calls,
+    });
+    let adapter = host
+        .register_tool_with_after("leaf", tool, "after-backend", 1, "both-hooks-v1", hook)
+        .unwrap();
+    assert!(cell.set(adapter).is_ok());
+    host.into_driver()
+}
+#[test]
+fn immediate_child_runs_before_and_after_with_fenced_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = seed(&dir.path().join("db"));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let driver = after_integration_host(
+        &dir.path().join("db"),
+        false,
+        before.clone(),
+        after.clone(),
+        calls.clone(),
+    );
+    until(|| driver.get(root).unwrap().is_some_and(|t| t.is_terminal()));
+    assert_eq!(
+        driver.get(root).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!({"Succeeded":"after"}))
+    );
+    assert_eq!(
+        (
+            before.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst),
+            after.load(Ordering::SeqCst)
+        ),
+        (1, 1, 1)
+    );
+    driver.shutdown().unwrap();
+}
+#[test]
+fn parent_observes_raw_result_when_after_memo_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = seed(&dir.path().join("db"));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let driver = after_integration_host(
+        &dir.path().join("db"),
+        true,
+        before.clone(),
+        after.clone(),
+        calls.clone(),
+    );
+    until(|| driver.get(root).unwrap().is_some_and(|t| t.is_terminal()));
+    assert_eq!(
+        driver.get(root).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!({"Succeeded":"after-incomplete:before"}))
+    );
+    assert_eq!(
+        (
+            before.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst),
+            after.load(Ordering::SeqCst)
+        ),
+        (1, 1, 1)
     );
     driver.shutdown().unwrap();
 }
