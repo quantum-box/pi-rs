@@ -9982,6 +9982,283 @@ mod tests {
         }
     }
 
+    fn conversation_candidate_combined_host(
+        root: &std::path::Path,
+        sealed: Arc<dyn Tool>,
+        candidate_calls: Arc<AtomicUsize>,
+    ) -> (
+        StandaloneBeforeHookHost,
+        Arc<crate::task_tool::TaskTool>,
+        Arc<crate::task_tool::TaskTool>,
+        Arc<crate::task_tool::TaskTool>,
+        String,
+    ) {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
+        let leaf: Arc<dyn crate::task_scheduler::Handler> = Arc::new(ChainLeaf);
+        assert!(registry.register_shared("cross-cancel-leaf", true, leaf.clone()));
+        let marker = root.join("child-aborted");
+        assert!(registry.set_abort("cross-cancel-leaf", move |_: &Task| {
+            std::fs::write(&marker, b"yes").map_err(|e| e.to_string())?;
+            Ok(crate::task_scheduler::Step::Succeed(json!(null)))
+        }));
+        let candidate = register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            Arc::new(ImmediateDurable(candidate_calls)),
+            "shared-tool-v1",
+            1,
+            vec![],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap();
+        let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
+        let unsafe_tool = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(Arc::new(AtomicUsize::new(0)))),
+                "shared-tool-v1",
+                1,
+                vec![],
+                "unsafe-hook-v1",
+                Arc::new(UnsafePolicyHook),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let mut extensions = crate::extension::Registry::default();
+        extensions
+            .install_identified(
+                crate::extension::Extension {
+                    name: "cancel".into(),
+                    hooks: vec![Arc::new(AbortResultHook(root.to_owned()))],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(
+                    1,
+                    "cross-cancel-v1".into(),
+                    vec!["hook".into()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "leaf".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "cross-cancel-leaf",
+            true,
+            1,
+            leaf,
+        ));
+        let cancel_tool = host
+            .register_replay_safe_durable_tool_with_park_cancel(
+                Arc::new(ChainTool {
+                    name: "root",
+                    child: "leaf",
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    any: false,
+                }),
+                "cross-cancel-v1",
+                1,
+                vec![child],
+                &extensions.snapshot(),
+                &["cancel".into()],
+                "cancel-v1",
+                Arc::new(ParkCancelFixture(root.to_owned())),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                AbortAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        let sealed_adapter = host
+            .register_tool_with_interrupted_after(
+                "leaf",
+                sealed,
+                "backend",
+                1,
+                "interrupted-v1",
+                Arc::new(InterruptedAfterFixture(root.to_owned())),
+                InterruptedAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        let sealed_kind = sealed_adapter.adapter.identity().unwrap().kind;
+        assert!(cell.set(sealed_adapter).is_ok());
+        (host, candidate, unsafe_tool, cancel_tool, sealed_kind)
+    }
+
+    fn assert_conversation_candidate_disabled(
+        candidate: &crate::task_tool::TaskTool,
+        calls: &AtomicUsize,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(candidate.invoke(
+            json!({}),
+            ToolContext {
+                operation_id: Uuid::new_v4(),
+                cancellation: pi_rs_core::CancellationToken::new(),
+            },
+        ));
+        assert!(matches!(outcome, Outcome::Skipped(reason) if reason.contains("not enabled")));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn conversation_candidate_unsafe_hook_and_interrupted_cleanup_recover_together() {
+        const ENV: &str = "PI_CONVERSATION_CANDIDATE_COMBINED_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let sealed: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.clone()));
+            let binding =
+                crate::nested_identity::register(&sealed, Some("backend".into())).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (host, candidate, unsafe_tool, cancel_tool, sealed_kind) =
+                conversation_candidate_combined_host(&root, sealed, calls.clone());
+            assert_conversation_candidate_disabled(&candidate, &calls);
+            let kinds = vec![
+                candidate.identity().unwrap().kind,
+                unsafe_tool.identity().unwrap().kind,
+                cancel_tool.identity().unwrap().kind,
+                sealed_kind,
+            ];
+            assert_eq!(
+                kinds.iter().collect::<std::collections::HashSet<_>>().len(),
+                4
+            );
+            let cancel_id = host
+                .start_replay_safe_root(&cancel_tool, json!({"token":"prepared"}), 4)
+                .unwrap();
+            let unsafe_id = host
+                .start_unsafe_durable_root(&unsafe_tool, json!({}), 4)
+                .unwrap();
+            let scheduler = host.into_scheduler_for_test();
+            let parent = before_parent();
+            scheduler.submit(&parent).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            assert!(matches!(
+                wait_terminal(&driver, unsafe_id).state(),
+                crate::task::TaskState::Succeeded(_)
+            ));
+            wait_park_cancel(&driver, cancel_id);
+            wait_file(&root.join("unsafe-ready"));
+            let task = driver.get(parent.id()).unwrap().unwrap();
+            let child: AsyncTaskCall =
+                serde_json::from_value(task.checkpoint().data.clone()).unwrap();
+            std::fs::write(
+                root.join("combined-ids"),
+                serde_json::to_vec(&(unsafe_id, parent.id(), child.task_id(), cancel_id, kinds))
+                    .unwrap(),
+            )
+            .unwrap();
+            loop {
+                std::hint::black_box((&driver, &binding));
+                std::thread::park();
+            }
+        }
+        struct KillChild(std::process::Child);
+        impl Drop for KillChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = KillChild(std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("async_task_tool::tests::conversation_candidate_unsafe_hook_and_interrupted_cleanup_recover_together")
+            .env(ENV, root).spawn().unwrap());
+        wait_file(&root.join("combined-ids"));
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        let (unsafe_id, parent, child, cancel_id, old_kinds): (
+            Uuid,
+            Uuid,
+            Uuid,
+            Uuid,
+            Vec<String>,
+        ) = serde_json::from_slice(&std::fs::read(root.join("combined-ids")).unwrap()).unwrap();
+        let sealed: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&sealed, Some("backend".into())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (host, candidate, unsafe_tool, cancel_tool, sealed_kind) =
+            conversation_candidate_combined_host(root, sealed, calls.clone());
+        assert_eq!(
+            old_kinds,
+            vec![
+                candidate.identity().unwrap().kind,
+                unsafe_tool.identity().unwrap().kind,
+                cancel_tool.identity().unwrap().kind,
+                sealed_kind
+            ]
+        );
+        assert_conversation_candidate_disabled(&candidate, &calls);
+        let driver = host.into_driver();
+        driver.request_abort(cancel_id).unwrap();
+        assert!(matches!(
+            wait_terminal(&driver, cancel_id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        assert!(matches!(
+            wait_terminal(&driver, parent).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert!(
+            matches!(driver.get(unsafe_id).unwrap().unwrap().state(), crate::task::TaskState::Succeeded(value) if serde_json::from_value::<Outcome>(value.clone()).unwrap() == Outcome::Succeeded("unsafe-rewritten".into()))
+        );
+        driver.shutdown().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(
+            crate::task_store::TaskStore::new(&store)
+                .list()
+                .unwrap()
+                .iter()
+                .all(|record| record.task.kind() != Some(old_kinds[0].as_str()))
+        );
+        assert_eq!(
+            read_park_cancel_evidence(&store, cancel_id).unwrap(),
+            Some(ParkCancelEvidence::CallbackReturned)
+        );
+        assert!(
+            read_aborted_after_result(&store, cancel_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            read_sealed_outcome_evidence(&store, child).unwrap(),
+            Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+        ));
+        assert!(
+            read_interrupted_after_result(&store, child)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            read_unsafe_durable_receipts(&store, unsafe_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        for name in [
+            "unsafe-invocations",
+            "interrupted-hook-count",
+            "cancel-count",
+            "abort-hook-count",
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(root.join(name))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     struct UnsafePolicyHook;
     #[async_trait::async_trait]
     impl crate::extension::Hook for UnsafePolicyHook {
