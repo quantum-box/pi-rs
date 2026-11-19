@@ -21148,7 +21148,13 @@ mod standalone_foreground_cleanup_tests {
             .unwrap()
             .child;
         let intermediate = task(2, TaskOwner::Conversation(child), "parent");
-        let descendant = task(3, TaskOwner::Task(intermediate.id()), "submit");
+        // Test hooks are process-wide, so give this task a unique ID even
+        // when other scheduler tests run concurrently.
+        let descendant = task(
+            Uuid::new_v4().as_u128(),
+            TaskOwner::Task(intermediate.id()),
+            "submit",
+        );
         tasks
             .save(&[Save::Create(&intermediate), Save::Create(&descendant)])
             .unwrap();
@@ -21237,7 +21243,36 @@ mod standalone_foreground_cleanup_tests {
         })
         .await
         .expect("independent task was blocked");
-        assert!(driver.has_pending_task(descendant.id()));
+        // A retry temporarily owns the settlement outside the pending queue.
+        // Stop exactly in that interval to test the previously racy observation.
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        crate::task_driver::after_pending_take_for_test(descendant.id(), move || {
+            taken_tx.send(()).unwrap();
+            retry_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        taken_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pending retry did not start");
+        assert!(
+            !driver.has_pending_task(descendant.id()),
+            "retry owns the removed outcome"
+        );
+        assert_eq!(
+            driver.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(h.conversation(child).unwrap().application_writes.is_empty());
+        assert!(Documents::new(&db).get(&address).unwrap().is_none());
+        let (requeued_tx, requeued_rx) = mpsc::channel();
+        crate::task_driver::after_pending_enqueue_for_test(descendant.id(), move || {
+            requeued_tx.send(()).unwrap();
+        });
+        retry_tx.send(()).unwrap();
+        requeued_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("outcome was not retained after retry");
         assert!(h.conversation(child).unwrap().application_writes.is_empty());
         assert!(Documents::new(&db).get(&address).unwrap().is_none());
         let entry = db.get(&key).unwrap().unwrap();

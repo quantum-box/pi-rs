@@ -948,6 +948,32 @@ pub(crate) fn abort_gate_contention_for_test(id: Uuid, hook: impl FnOnce() + Sen
         .insert(id, Box::new(hook));
 }
 
+#[cfg(test)]
+fn pending_take_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_pending_take_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    pending_take_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
+#[cfg(test)]
+fn pending_enqueue_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_pending_enqueue_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    pending_enqueue_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
 struct WorkerPool {
     jobs: Option<mpsc::Sender<Box<task_scheduler::DetachedInvocation>>>,
     done: mpsc::Receiver<WorkerEvent>,
@@ -1491,10 +1517,22 @@ impl Shared {
             #[cfg(test)]
             Err(SettlementError::Yielded { pending }) => (*pending, None),
         };
+        #[cfg(test)]
+        let pending_task = pending.task_id();
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(pending);
+        #[cfg(test)]
+        {
+            let hook = pending_enqueue_hooks()
+                .lock()
+                .unwrap()
+                .remove(&pending_task);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         if let Some(error) = failure {
             Err(error)
         } else {
@@ -1519,6 +1557,16 @@ impl Shared {
             }
             pending.remove(0)
         };
+        #[cfg(test)]
+        {
+            let hook = pending_take_hooks()
+                .lock()
+                .unwrap()
+                .remove(&pending.task_id());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let result = match self.scheduler.lock() {
             Ok(mut scheduler) => scheduler.try_resume_pending(pending),
             Err(_) => {
