@@ -161,7 +161,7 @@ struct Registration {
     handler: Arc<dyn Handler>,
     abort: Option<Arc<dyn Handler>>,
     receipt_capture: Option<Arc<ReceiptCapture>>,
-    cancellable_replay_safe: bool,
+    cancellable_durable_async: bool,
 }
 /// Clones preserve definition identity for migration retry decisions.
 #[derive(Clone, Default)]
@@ -210,7 +210,7 @@ impl Registry {
                     handler,
                     abort: None,
                     receipt_capture: None,
-                    cancellable_replay_safe: false,
+                    cancellable_durable_async: false,
                 });
                 true
             }
@@ -234,7 +234,7 @@ impl Registry {
                     handler: Arc::new(handler),
                     abort: None,
                     receipt_capture: None,
-                    cancellable_replay_safe: false,
+                    cancellable_durable_async: false,
                 });
                 true
             }
@@ -1354,9 +1354,71 @@ impl DetachedInvocation {
 }
 
 impl AdmissionHandle<'_> {
-    pub(crate) fn replay_safe_durable_intent(
+    /// Preserve a joined unsafe result while the exact invocation lease is
+    /// held. Abort may have marked the task; it must not erase this evidence.
+    pub(crate) fn capture_unsafe_durable_outcome(
+        &self,
+        intent: &[u8],
+        result: &crate::async_task_tool::DurableToolStep,
+    ) -> Result<(), String> {
+        if !self.standalone || self.abort || self.lease.retired || self.running.task.replay_safe() {
+            return Err("invalid unsafe result executor".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let _failure = self.lease.failure_fence.lock().map_err(|e| e.to_string())?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        if state.poisoned
+            || !state.attempts.contains(&self.lease.id)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+        {
+            return Err("stale unsafe result lease".into());
+        }
+        let current = TaskStore::new(owner.store())
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing unsafe task")?;
+        if current.task.state() != &TaskState::Running
+            || current.task.attempt_id() != Some(attempt)
+            || current.task.owner() != self.running.task.owner()
+            || current.task.kind() != self.running.task.kind()
+        {
+            return Err("stale unsafe result task".into());
+        }
+        let (mut checks, mutations) = match result {
+            crate::async_task_tool::DurableToolStep::Complete(outcome) => {
+                crate::async_task_tool::unsafe_park_proof::prepare_receipt(
+                    owner.store(),
+                    &self.running.task,
+                    intent,
+                    outcome,
+                )?
+            }
+            crate::async_task_tool::DurableToolStep::Park { checkpoint, wait } => {
+                crate::async_task_tool::unsafe_park_proof::prepare_park_evidence(
+                    owner.store(),
+                    &self.running.task,
+                    intent,
+                    checkpoint,
+                    wait,
+                )?
+            }
+        };
+        checks.push(durable_store::Check {
+            key: task_store::key(current.task.id()),
+            expected: durable_store::Expected::Version(current.version),
+        });
+        owner
+            .store()
+            .commit(&checks, &mutations)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub(crate) fn checkpointable_durable_intent(
         &self,
         test_namespace: bool,
+        expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
     ) -> Result<Vec<u8>, String> {
         self.replay_safe_durable_fence(test_namespace, cancellation, true, &[], &[])
@@ -1380,7 +1442,7 @@ impl AdmissionHandle<'_> {
         if !self.standalone
             || self.abort
             || self.lease.retired
-            || !self.running.task.replay_safe()
+            || self.running.task.replay_safe() != expected_replay_safe
             || !self.running.task.is_task_tool()
         {
             return Err("unsupported replay-safe executor".into());
@@ -1416,8 +1478,23 @@ impl AdmissionHandle<'_> {
         {
             return Err("stale or aborted test attempt".into());
         }
+        if !test_namespace {
+            let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+            let registration = current
+                .task
+                .kind()
+                .and_then(|kind| definitions.registry.entries.get(kind))
+                .ok_or("missing durable registration")?;
+            if !registration.cancellable_durable_async
+                || registration.replay_safe != expected_replay_safe
+            {
+                return Err("durable registration or replay policy changed".into());
+            }
+        }
         let prefix = if test_namespace {
             "test/durable-async"
+        } else if !expected_replay_safe {
+            "durable/unsafe-park-async"
         } else {
             "durable/replay-safe-async"
         };
@@ -1428,6 +1505,12 @@ impl AdmissionHandle<'_> {
             Uuid::nil(),
         )
         .map_err(|e| e.to_string())?;
+        if !expected_replay_safe && !test_namespace {
+            checks.extend(crate::async_task_tool::unsafe_park_proof::dispatch_checks(
+                owner.store(),
+                &current.task,
+            )?);
+        }
         let tasks = TaskStore::new(owner.store());
         let mut ancestor = current.task.clone();
         let mut seen = std::collections::HashSet::new();
@@ -1441,7 +1524,9 @@ impl AdmissionHandle<'_> {
                 || ancestor.is_background()
                 || (ancestor.id() != current.task.id()
                     && !ancestor.replay_safe()
-                    && !matches!(ancestor.state(), TaskState::Waiting(_)))
+                    && !matches!(ancestor.state(), TaskState::Waiting(_))
+                    && !(ancestor.retains_task_children_on_success()
+                        && matches!(ancestor.state(), TaskState::Completing(_))))
             {
                 return Err("unsafe or unavailable owner".into());
             }
@@ -2739,7 +2824,7 @@ impl Scheduler {
     ) -> Result<DetachedInvocation, Error> {
         let id = running.task.id();
         let registration = self.registered(&running.task)?;
-        let cancellable_replay_safe = registration.cancellable_replay_safe;
+        let cancellable_durable_async = registration.cancellable_durable_async;
         let registered_capture = registration.receipt_capture.clone();
         let sealed_registration = registered_capture.is_some();
         let receipt_capture = if abort { None } else { registered_capture };
@@ -2751,7 +2836,7 @@ impl Scheduler {
         state.leases.insert(id, (token, running.task.attempt_id()));
         drop(state);
         let unhooked_cancellation = (!abort
-            && (receipt_capture.is_some() || cancellable_replay_safe))
+            && (receipt_capture.is_some() || cancellable_durable_async))
             .then(pi_rs_core::CancellationToken::new);
         Ok(DetachedInvocation {
             running,
@@ -4220,35 +4305,37 @@ impl Scheduler {
         Ok((executor, identity))
     }
 
-    pub(crate) fn install_replay_safe_async_handler(
+    pub(crate) fn install_checkpointable_async_handler(
         &mut self,
         kind: String,
         version: u32,
+        replay_safe: bool,
         handler: Arc<dyn Handler>,
     ) -> Result<(), String> {
         if self.validator.is_some() {
             return Err("standalone scheduler required".into());
         }
         let mut registry = self.registry.clone();
-        if !registry.register_shared_versioned(kind.clone(), version, true, handler) {
+        if !registry.register_shared_versioned(kind.clone(), version, replay_safe, handler) {
             return Err("task kind already registered or invalid".into());
         }
         registry
             .entries
             .get_mut(&kind)
             .expect("registered")
-            .cancellable_replay_safe = true;
+            .cancellable_durable_async = true;
         if !registry.set_abort(&kind, |_: &Task| Ok(Step::Succeed(Value::Null))) {
             return Err("failed to install abort handler".into());
         }
         self.replace_registry(registry).map_err(|e| e.to_string())
     }
 
-    pub(crate) fn submit_replay_safe_async_root(
+    pub(crate) fn submit_checkpointable_async_root(
         &self,
         tool: &Arc<crate::task_tool::TaskTool>,
         input: Value,
         restart_limit: u32,
+        replay_safe: bool,
     ) -> Result<Uuid, String> {
         if self.validator.is_some()
             || !input.is_object()
@@ -4263,7 +4350,8 @@ impl Scheduler {
             .entries
             .get(&identity.kind)
             .ok_or("root tool not registered")?;
-        if !registered.cancellable_replay_safe
+        if !registered.cancellable_durable_async
+            || registered.replay_safe != replay_safe
             || !self.registry.matches_task_tool(&identity, &tool.handler())
         {
             return Err("root is not this host's replay-safe durable tool".into());

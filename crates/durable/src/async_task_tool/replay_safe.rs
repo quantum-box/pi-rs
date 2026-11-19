@@ -1,4 +1,4 @@
-//! Standalone checkpointable tools whose host explicitly guarantees replay safety.
+//! Standalone checkpointable tools with an explicitly registered replay policy.
 use super::{
     AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
     DurableToolStep, DurableWait, ToolIdentity,
@@ -10,6 +10,18 @@ use pi_rs_core::{Outcome, Tool, ToolContext};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+type ParkHooks = Mutex<HashMap<uuid::Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn park_hooks() -> &'static ParkHooks {
+    static HOOKS: std::sync::OnceLock<ParkHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(super) fn after_unsafe_park_evidence(id: uuid::Uuid, hook: impl FnOnce() + Send + 'static) {
+    park_hooks().lock().unwrap().insert(id, Box::new(hook));
+}
 
 #[cfg(test)]
 fn crash_test_boundary(tool: &str, task: uuid::Uuid, stage: &str) {
@@ -36,12 +48,45 @@ impl ReplaySafeAuthorization {
     }
 }
 
+/// Explicitly accepts reconciliation after any interrupted running attempt.
+/// A committed park is recoverable; external effects and parked cancellation
+/// are the host's responsibility.
+pub struct UnsafeDurableAuthorization(());
+impl UnsafeDurableAuthorization {
+    pub fn interruption_requires_reconciliation() -> Self {
+        Self(())
+    }
+}
+
 pub(super) fn register(
     scheduler: &mut Scheduler,
     tool: Arc<dyn DurableAsyncTool>,
     implementation: &str,
     version: u32,
     children: Vec<Arc<TaskTool>>,
+    hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
+) -> Result<Arc<TaskTool>, String> {
+    register_with_policy(scheduler, tool, implementation, version, children, true, hook)
+}
+
+pub(super) fn register_unsafe(
+    scheduler: &mut Scheduler,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<TaskTool>>,
+) -> Result<Arc<TaskTool>, String> {
+    register_with_policy(scheduler, tool, implementation, version, children, false, None)
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit policy and hook identity are part of registration.
+fn register_with_policy(
+    scheduler: &mut Scheduler,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<TaskTool>>,
+    replay_safe: bool,
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
 ) -> Result<Arc<TaskTool>, String> {
     let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
@@ -69,7 +114,11 @@ pub(super) fn register(
         return Err("definition identity too large".into());
     }
     let hash = Sha256::digest(encoded);
-    let kind = format!("pi-rs.replay-safe-async.v1.{hash:x}");
+    let kind = if replay_safe {
+        format!("pi-rs.replay-safe-async.v1.{hash:x}")
+    } else {
+        format!("pi-rs.unsafe-park-async.v1.{hash:x}")
+    };
     let spec = tool.spec();
     let handler: Arc<dyn Handler> = Arc::new(Executor {
         tool,
@@ -78,10 +127,16 @@ pub(super) fn register(
         version,
         children: names,
         hook: hook.map(|(_, hook)| hook),
+        replay_safe,
     });
-    scheduler.install_replay_safe_async_handler(kind.clone(), version, handler.clone())?;
+    scheduler.install_checkpointable_async_handler(
+        kind.clone(),
+        version,
+        replay_safe,
+        handler.clone(),
+    )?;
     Ok(Arc::new(
-        TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments(),
+        TaskTool::new(spec, kind, replay_safe, version, handler).with_deferred_arguments(),
     ))
 }
 
@@ -161,6 +216,7 @@ struct Executor {
     version: u32,
     children: HashMap<String, Arc<TaskTool>>,
     hook: Option<Arc<dyn crate::extension::Hook>>,
+    replay_safe: bool,
 }
 
 struct Host<'a, 'b> {
@@ -482,7 +538,7 @@ impl Handler for Executor {
         if self.hook.is_some() && task.checkpoint().phase == "replay-safe-async-after" {
             return self.after(task, admission, cancellation);
         }
-        let intent = admission.replay_safe_durable_intent(false, Some(cancellation))?;
+        let intent = admission.checkpointable_durable_intent(false, self.replay_safe, Some(cancellation))?;
         #[cfg(test)]
         crash_test_boundary(&self.tool.spec().name, task.id(), "intent");
         let (resume, saved_args) = match task.checkpoint().phase.as_str() {
@@ -564,6 +620,16 @@ impl Handler for Executor {
                 .await?;
             Ok::<_, String>((result, args))
         })?;
+        if !self.replay_safe {
+            admission.capture_unsafe_durable_outcome(&intent, &result)?;
+            #[cfg(test)]
+            if matches!(result, DurableToolStep::Park { .. }) {
+                let hook = park_hooks().lock().unwrap().remove(&task.id());
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+        }
         if !self
             .identity
             .matches(self.tool.as_ref(), &self.implementation, self.version)
@@ -579,7 +645,7 @@ impl Handler for Executor {
         }
         let step = match &result {
             DurableToolStep::Complete(Outcome::Pending { .. } | Outcome::Unknown(_)) => {
-                return Err("uncertain outcomes are unsupported for replay-safe tools".into());
+                return Err("uncertain tool outcome requires reconciliation".into());
             }
             DurableToolStep::Complete(outcome) if self.hook.is_some() => {
                 let data = serde_json::to_value(HookCheckpoint {
@@ -627,7 +693,16 @@ impl Handler for Executor {
             }
         };
         let docs = host.docs.into_inner().map_err(|e| e.to_string())?;
-        docs.stage_replay_safe_durable_result(intent, &result)?;
+        docs.stage_checkpointable_durable_result(intent, &result)?;
+        if !self.replay_safe
+            && let Step::Wait {
+                checkpoint,
+                condition,
+                ..
+            } = &step
+        {
+            docs.stage_unsafe_park_proof(checkpoint, condition)?;
+        }
         #[cfg(test)]
         crash_test_boundary(&self.tool.spec().name, task.id(), "result");
         Ok(step)

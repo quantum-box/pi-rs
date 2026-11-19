@@ -1,13 +1,33 @@
-//! Standalone task-backed async tools with explicit hook policy and a
-//! host-attested replay-safe checkpointable bridge. Conversation-attached
-//! execution and unsafe checkpointable tools remain unsupported.
+//! Standalone task-backed async tools with explicit hook policy. Checkpointable
+//! tools have separate replay-safe and unsafe registrations. Conversation-
+//! attached checkpointable execution remains unsupported.
 
 use crate::task::Task;
 use pi_rs_core::{Outcome, Tool, ToolSpec};
 use std::sync::Arc;
 
 mod replay_safe;
-pub use replay_safe::ReplaySafeAuthorization;
+pub(crate) mod unsafe_park_proof;
+pub use replay_safe::{ReplaySafeAuthorization, UnsafeDurableAuthorization};
+pub use unsafe_park_proof::{UnsafeDurableParkEvidence, UnsafeDurableReceipt};
+
+/// Read joined unsafe outcomes retained even if abort won settlement. These
+/// records are reconciliation evidence and do not authorize re-execution.
+pub fn read_unsafe_durable_receipts(
+    store: &durable_store::Store,
+    task: uuid::Uuid,
+) -> Result<Vec<UnsafeDurableReceipt>, String> {
+    unsafe_park_proof::read_receipts(store, task)
+}
+
+/// Read returned Park proposals for reconciliation. A proposal does not
+/// prove a park committed and must never be used to authorize a wake.
+pub fn read_unsafe_durable_park_evidence(
+    store: &durable_store::Store,
+    task: uuid::Uuid,
+) -> Result<Vec<UnsafeDurableParkEvidence>, String> {
+    unsafe_park_proof::read_park_evidence(store, task)
+}
 
 const UNCERTAIN_PREFIX: &str = "tool outcome requires reconciliation: ";
 const UNSUPPORTED_PREFIX: &str = "unsupported tool result: ";
@@ -245,7 +265,32 @@ impl StandaloneNoHooksHost {
         restart_limit: u32,
     ) -> Result<uuid::Uuid, String> {
         self.scheduler
-            .submit_replay_safe_async_root(tool, input, restart_limit)
+            .submit_checkpointable_async_root(tool, input, restart_limit, true)
+    }
+
+    /// Register an unsafe checkpointable Tool. Interruption of a running
+    /// attempt requires reconciliation; only a committed park may resume.
+    /// Children are limited to replay-safe TaskTools.
+    pub fn register_unsafe_durable_tool(
+        &mut self,
+        tool: Arc<dyn DurableAsyncTool>,
+        implementation: &str,
+        version: u32,
+        children: Vec<Arc<crate::task_tool::TaskTool>>,
+        _authorization: UnsafeDurableAuthorization,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        replay_safe::register_unsafe(&mut self.scheduler, tool, implementation, version, children)
+    }
+
+    /// Admit an unsafe root belonging to this standalone host.
+    pub fn start_unsafe_durable_root(
+        &self,
+        tool: &Arc<crate::task_tool::TaskTool>,
+        input: serde_json::Value,
+        restart_limit: u32,
+    ) -> Result<uuid::Uuid, String> {
+        self.scheduler
+            .submit_checkpointable_async_root(tool, input, restart_limit, false)
     }
 
     #[cfg(test)]
@@ -2225,7 +2270,7 @@ mod tests {
             admission: &crate::task_scheduler::AdmissionHandle<'_>,
         ) -> Result<crate::task_scheduler::Step, String> {
             use crate::task_scheduler::Step;
-            let intent = admission.replay_safe_durable_intent(true, None)?;
+            let intent = admission.checkpointable_durable_intent(true, true, None)?;
             let resume = match task.checkpoint().phase.as_str() {
                 "initial" => DurableToolResume {
                     checkpoint: None,
@@ -2259,7 +2304,7 @@ mod tests {
                 &host,
             ))?;
             let docs = host.docs.into_inner().map_err(|e| e.to_string())?;
-            docs.stage_replay_safe_durable_result(intent, &result)?;
+            docs.stage_checkpointable_durable_result(intent, &result)?;
             match result {
                 DurableToolStep::Complete(outcome) => Ok(Step::Succeed(
                     serde_json::to_value(outcome).map_err(|e| e.to_string())?,
@@ -2432,6 +2477,113 @@ mod tests {
         }
     }
     struct ChainLeaf;
+
+    struct ParkEvidenceTool;
+    #[async_trait::async_trait]
+    impl Tool for ParkEvidenceTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "park-evidence".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for ParkEvidenceTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            let call = host
+                .start_child("child", "proposal-child", json!({}))
+                .await?;
+            Ok(DurableToolStep::Park {
+                checkpoint: json!({"remote_job":"external-park-42", "call":call}),
+                wait: DurableWait::All(vec![call]),
+            })
+        }
+    }
+    #[test]
+    fn unsafe_park_proposal_survives_abort_before_settlement_without_authorizing_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let child_handler: Arc<dyn crate::task_scheduler::Handler> = Arc::new(ChainLeaf);
+        let mut registry = Registry::default();
+        assert!(registry.register_shared("proposal-child", true, child_handler.clone()));
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "proposal-child".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "proposal-child",
+            true,
+            1,
+            child_handler,
+        ));
+        let mut host =
+            StandaloneNoHooksHost::open(&path, registry, UnhookedAuthorization::standalone_only())
+                .unwrap();
+        let tool = host
+            .register_unsafe_durable_tool(
+                Arc::new(ParkEvidenceTool),
+                "park-evidence-v1",
+                1,
+                vec![child],
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+            .unwrap();
+        let id = host.start_unsafe_durable_root(&tool, json!({}), 3).unwrap();
+        let (entered, receiver) = std::sync::mpsc::channel();
+        let barrier = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_barrier = barrier.clone();
+        replay_safe::after_unsafe_park_evidence(id, move || {
+            entered.send(()).unwrap();
+            let (lock, wake) = &*worker_barrier;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        });
+        let driver = host.into_driver();
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        driver.request_abort(id).unwrap();
+        let (lock, wake) = &*barrier;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        wait_state(&driver, id, |s| {
+            matches!(s, crate::task::TaskState::Cancelled)
+        });
+        driver.shutdown().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let evidence = read_unsafe_durable_park_evidence(&store, id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].checkpoint["remote_job"], "external-park-42");
+        assert!(matches!(&evidence[0].wait, DurableWait::All(children) if children.len() == 1));
+        assert!(
+            store
+                .get(format!("durable/unsafe-park-async/{id}/park").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !crate::task_store::TaskStore::new(&store)
+                .list()
+                .unwrap()
+                .iter()
+                .any(|task| task.task.owner() == &TaskOwner::Task(id))
+        );
+        assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
+    }
     impl crate::task_scheduler::Handler for ChainLeaf {
         fn run(&self, task: &Task) -> Result<crate::task_scheduler::Step, String> {
             use crate::task_scheduler::Step;

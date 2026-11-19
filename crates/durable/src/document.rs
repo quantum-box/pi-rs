@@ -2362,7 +2362,19 @@ impl DetachedTaskDocuments {
 }
 
 impl<'a> TaskDocuments<'a> {
-    pub(crate) fn stage_replay_safe_durable_result(
+    pub(crate) fn stage_unsafe_park_proof(
+        &mut self,
+        checkpoint: &crate::task::Checkpoint,
+        wait: &crate::task::WaitFor,
+    ) -> Result<(), String> {
+        let (check, mutation) = crate::async_task_tool::unsafe_park_proof::prepare_park(
+            self.store, &self.task, checkpoint, wait,
+        )?;
+        self.signals.batch.checks.push(check);
+        self.signals.batch.mutations.push(mutation);
+        Ok(())
+    }
+    pub(crate) fn stage_checkpointable_durable_result(
         &mut self,
         intent_key: Vec<u8>,
         result: &impl serde::Serialize,

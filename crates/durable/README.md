@@ -696,6 +696,43 @@ honor the new marker and may cancel retained children; do not downgrade a store
 containing these tasks to an older executor.
 The generic `register_durable_tool` entry remains disabled.
 
+`StandaloneNoHooksHost::register_unsafe_durable_tool` separately opts an
+unsafe checkpointable Tool in with
+`UnsafeDurableAuthorization::interruption_requires_reconciliation()`;
+`start_unsafe_durable_root` admits its standalone root. This path accepts only
+replay-safe TaskTool children. Its implementation identity, version, Tool
+specification and allowed children form a separate registration identity.
+Restore exactly the same definitions when reopening. It is not a hook-enabled
+conversation ToolTask and does not permit unsafe children through the existing
+replay-safe registration.
+
+Each running attempt records a distinct dispatch intent. A returned Park, its
+checkpoint and prepared arguments, the owned child admission and wait, and a
+park proof commit together. A wake can dispatch a fresh unsafe attempt only
+after checking the committed park proof, its original attempt intent and Park
+result against the checkpoint and ended children. Missing or inconsistent
+proof fails closed. Killing an execution before its park commits, or killing a
+resumed execution before its next park or completion commits, leaves an
+interrupted unsafe attempt requiring reconciliation; it is not replayed.
+
+An executor-joined `Complete` outcome is stored independently of settlement,
+including if abort was requested during execution. After stopping the driver,
+`read_unsafe_durable_receipts` reads these per-attempt outcomes from the store
+as reconciliation evidence. `Pending` and `Unknown` results are retained
+there and leave the task failed for reconciliation, rather than being replayed
+or treated as completed. A returned Park proposal is also retained independently
+and can be read using `read_unsafe_durable_park_evidence`, including when abort
+prevents settlement. It may contain external job identifiers, but is evidence
+only: it does not mean the child or park committed and cannot authorize wake.
+Receipts and Park proposals are bounded to 64 KiB. A process loss before
+the result has been returned and durably captured cannot retain that result;
+effects require destination-side reconciliation. A Tool may ignore cancellation
+or detach work, and this API has no parked cancellation callback, so hosts must
+manage external jobs and cleanup themselves. A cancelled task without a
+receipt or Park proposal may still have external effects and can require
+reconciliation; absence of a record is not proof that nothing ran. No before/after hooks, UI,
+progress or extension state are supported on this path.
+
 Pending nested jobs are resolved by tool name and replay policy; their stored
 references are not bound to an implementation or tenant identity. On reopen,
 the host must restore the same nested tool configuration and tenant before
