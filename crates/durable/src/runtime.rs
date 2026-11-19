@@ -21520,6 +21520,28 @@ impl Scheduler {
     pub fn send_signal(&self, signal: &crate::conversation_signal::Signal) -> Result<(), Error> {
         self.harness.send_signal(signal)
     }
+    /// Retry a conversation signal without holding a gate while waiting.
+    pub async fn send_signal_with_retry(
+        &self,
+        signal: &crate::conversation_signal::Signal,
+        cancel: &CancellationToken,
+    ) -> Result<(), Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::Interrupted);
+            }
+            match self.send_signal(signal) {
+                Err(Error::TaskPublicationBusy) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Interrupted),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub fn attach_tasks(
         &self,
         registry: crate::task_scheduler::Registry,
@@ -25727,6 +25749,70 @@ mod scheduler_tests {
             store.commit(&stale_start.checks, &stale_start.mutations),
             Err(durable_store::Error::Conflict { .. })
         ));
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_signal_retry_waits_for_marker_and_honors_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let mut worker = scheduler.harness.worker();
+        let target = worker.create_conversation(config()).unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let start = crate::conversation_signal::prepare_callback_start_signal_fence(
+            &store, target, b"claim",
+        )
+        .unwrap();
+        store.commit(&start.checks, &start.mutations).unwrap();
+        let inbox = crate::conversation_signal::Inbox::new(&store);
+        let cancelled_signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            target,
+            "cancelled".into(),
+            serde_json::json!(1),
+        );
+        let cancel = CancellationToken::new();
+        let mut cancelled = Box::pin(inbox.send_with_retry(&cancelled_signal, &cancel));
+        assert!(matches!(
+            futures_util::poll!(&mut cancelled),
+            std::task::Poll::Pending
+        ));
+        cancel.cancel();
+        assert!(matches!(
+            cancelled.await,
+            Err(crate::conversation_signal::Error::Cancelled)
+        ));
+        assert!(
+            inbox
+                .receipt(target, cancelled_signal.id)
+                .unwrap()
+                .is_none()
+        );
+        let signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            target,
+            "wake".into(),
+            serde_json::json!(2),
+        );
+        let live = CancellationToken::new();
+        let mut retry = Box::pin(scheduler.send_signal_with_retry(&signal, &live));
+        assert!(matches!(
+            futures_util::poll!(&mut retry),
+            std::task::Poll::Pending
+        ));
+        assert!(inbox.receipt(target, signal.id).unwrap().is_none());
+        let finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+            &store, target, b"claim",
+        )
+        .unwrap();
+        store.commit(&finish.checks, &finish.mutations).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut retry)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(retry);
+        assert!(inbox.receipt(target, signal.id).unwrap().is_some());
         scheduler.shutdown().await.unwrap();
     }
 

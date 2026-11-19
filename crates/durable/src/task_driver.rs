@@ -584,6 +584,31 @@ impl Driver {
         self.shared.notify_work();
         Ok(())
     }
+    /// Deliver a legacy signal, yielding while a callback-start marker owns
+    /// the task. Cancellation while retrying leaves the signal unqueued.
+    pub async fn signal_with_retry(
+        &self,
+        signal: &Signal,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<(), Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            match self.signal(signal) {
+                Err(Error::Task(task_scheduler::Error::Store(
+                    task_store::Error::CallbackStartBusy,
+                ))) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Deliver a typed signal and wake the background scheduler when accepted.
     pub fn deliver_signal(
         &self,
@@ -607,6 +632,34 @@ impl Driver {
         }
         Ok(result)
     }
+    /// Deliver a typed signal, yielding while callback start owns the target.
+    /// No signal is written on a busy attempt; cancellation stops the retry.
+    pub async fn deliver_signal_with_retry(
+        &self,
+        task_id: Uuid,
+        token: &task_store::SignalToken,
+        key: &str,
+        value: serde_json::Value,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<task_store::SignalResult, Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            match self.deliver_signal(task_id, token, key, value.clone()) {
+                Err(Error::Task(task_scheduler::Error::Store(
+                    task_store::Error::CallbackStartBusy,
+                ))) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub fn get(&self, id: Uuid) -> Result<Option<Task>, Error> {
         let _state = self.check()?;
         Ok(TaskStore::new(self.shared.owner.store())
@@ -6038,6 +6091,101 @@ mod tests {
         while !driver.get(id).unwrap().unwrap().is_terminal() {
             assert!(std::time::Instant::now() < deadline);
             thread::yield_now();
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_signal_retry_waits_for_marker_and_honors_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", true, |_: &Task| {
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let tasks = TaskStore::new(owner.store());
+        let token = task_store::SignalToken::new("answer", 1).unwrap();
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        tasks.save(&[Save::Create(&task)]).unwrap();
+        tasks
+            .reserve(&tasks.load(task.id()).unwrap().unwrap())
+            .unwrap();
+        tasks
+            .update(&tasks.load(task.id()).unwrap().unwrap(), |task| {
+                task.wait(WaitFor::TypedSignal(token.key("go").unwrap()))
+            })
+            .unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        let cancel = pi_rs_core::CancellationToken::new();
+        let mut cancelled = Box::pin(driver.deliver_signal_with_retry(
+            task.id(),
+            &token,
+            "cancelled",
+            json!(1),
+            &cancel,
+        ));
+        assert!(matches!(
+            futures_util::poll!(&mut cancelled),
+            std::task::Poll::Pending
+        ));
+        cancel.cancel();
+        assert!(matches!(cancelled.await, Err(Error::WaitCancelled)));
+        assert!(
+            tasks
+                .read_typed_signal_state(task.id(), &token, "cancelled")
+                .unwrap()
+                .is_none()
+        );
+        let live = pi_rs_core::CancellationToken::new();
+        let mut retry =
+            Box::pin(driver.deliver_signal_with_retry(task.id(), &token, "go", json!(2), &live));
+        assert!(matches!(
+            futures_util::poll!(&mut retry),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            tasks
+                .read_typed_signal_state(task.id(), &token, "go")
+                .unwrap()
+                .is_none()
+        );
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), &mut retry)
+                .await
+                .unwrap()
+                .unwrap(),
+            task_store::SignalResult::Delivered
+        );
+        drop(retry);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(task.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
         }
         driver.shutdown().unwrap();
     }

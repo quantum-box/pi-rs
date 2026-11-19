@@ -29,6 +29,8 @@ pub enum Error {
     Corrupt,
     #[error("callback start is temporarily fenced")]
     CallbackStartBusy,
+    #[error("signal retry cancelled")]
+    Cancelled,
 }
 
 /// Signal IDs are scoped to a conversation and remain reserved after delivery.
@@ -199,6 +201,29 @@ impl<'a> Inbox<'a> {
     /// Insert once, checking the target version so deletion cannot race insertion.
     pub fn send(&self, signal: &Signal) -> Result<(), Error> {
         self.send_with_clock(signal, &crate::runtime::wall_time_millis)
+    }
+
+    /// Retry a signal while a durable callback-start marker owns the target.
+    /// Cancellation while waiting leaves the signal unqueued.
+    pub async fn send_with_retry(
+        &self,
+        signal: &Signal,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<(), Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            match self.send(signal) {
+                Err(Error::CallbackStartBusy) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => (),
+                    }
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Deliver using an injected Unix-millisecond timestamp.

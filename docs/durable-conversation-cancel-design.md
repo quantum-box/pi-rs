@@ -111,7 +111,10 @@ Direct abort transactions now check marker absence for their discovered tasks
 and conversations; an existing marker makes abort return busy without writes,
 and a concurrent marker insertion forces transaction conflict and rescan.
 Deferred task cleanup retries this busy condition. The synchronous abort and
-signal APIs still expose busy to the caller and have no automatic retry owner.
+signal APIs still expose busy to the caller. The async `abort_and_wait` paths,
+`Inbox::send_with_retry`, `Scheduler::send_signal_with_retry`, and the task
+`Driver` signal retry methods yield and retry marker busy; signal retries take
+cancellation tokens. Existing synchronous calls do not automatically retry.
 Generic public task save and update batches now also check marker absence;
 known pre-transaction conflicts defer reservation instead of poisoning the
 driver. The async `abort_and_wait` paths discover and fence only the reached
