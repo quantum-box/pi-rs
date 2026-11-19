@@ -4,8 +4,8 @@ from pi-rs commit `216a7eb581227614ae0d09c8eccfb037857f0460`, with
 reported its first committed unsafe park. SQLite's backup API copied the
 complete database, including its history, into this standalone file.
 
-Root task: `da2eeafe-c46e-45e2-b10f-9340416d225f`  
-Gate task: `35bdc178-6356-4825-a6e8-eb518f419688`  
+Root task: `da2eeafe-c46e-45e2-b10f-9340416d225f`
+Gate task: `35bdc178-6356-4825-a6e8-eb518f419688`
 SHA-256: `a11627ce291c8afc7bba30efb75f6ed05ad751651fa45f6ccf8879e103657e51`
 
 This historical format has the original attempt intent, joined park proposal,
@@ -20,6 +20,6 @@ production crate sources were unchanged. SQLite backup produced the standalone
 file. The second parked attempt's intent contains its previous parked
 checkpoint and prepared arguments; that is sufficient for a checked upgrade.
 
-Root task: `5d55f889-2b38-4ed4-98b2-3e5407c00e46`  
-Second gate task: `eb023929-9980-4e32-a28b-2d184563ac1a`  
+Root task: `5d55f889-2b38-4ed4-98b2-3e5407c00e46`
+Second gate task: `eb023929-9980-4e32-a28b-2d184563ac1a`
 SHA-256: `7f79cbbcc263f9a60a8b097fb6e412bdd2beab78909650e3f9e71db11a78ef52`
