@@ -259,7 +259,13 @@ impl Executor {
         if !matches!(code, "blocked" | "invalid_arguments") {
             return Err("unsupported host result".into());
         }
-        let reason: String = reason.chars().take(2048).collect();
+        // Bound bytes, not characters: diagnostic validation has a 4 KiB
+        // byte limit, and UTF-8 characters can occupy up to four bytes.
+        let mut end = reason.len().min(2048);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        let reason = &reason[..end];
         let message = if code == "blocked" {
             format!("Tool call blocked: {reason}")
         } else {

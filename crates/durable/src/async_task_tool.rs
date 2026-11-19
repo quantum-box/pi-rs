@@ -3429,6 +3429,7 @@ mod tests {
             Ok(match self.mode {
                 0 => crate::extension::BeforeTool::Block("denied".into()),
                 1 => crate::extension::BeforeTool::Rewrite(json!({"bad":true})),
+                3 => crate::extension::BeforeTool::Block("漢".repeat(2048)),
                 _ => crate::extension::BeforeTool::Pass,
             })
         }
@@ -3438,6 +3439,11 @@ mod tests {
             result: &crate::extension::ToolResult,
             ctx: &crate::extension::Context<'_>,
         ) -> Result<Option<crate::extension::ToolResult>, String> {
+            if self.mode == 3 {
+                let diagnostic = result.diagnostics.first().ok_or("missing diagnostic")?;
+                assert!(diagnostic.message.starts_with("Tool call blocked: 漢"));
+                assert!(diagnostic.message.len() <= 4096);
+            }
             let code = result
                 .diagnostics
                 .first()
@@ -3452,7 +3458,7 @@ mod tests {
     }
     #[test]
     fn hooked_durable_blocked_and_invalid_run_after_without_tool_dispatch() {
-        for mode in [0, 1, 2] {
+        for mode in [0, 1, 2, 3] {
             let dir = tempfile::tempdir().unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             let before_calls = Arc::new(AtomicUsize::new(0));
@@ -3491,7 +3497,7 @@ mod tests {
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap(),
                 (
-                    if mode == 0 {
+                    if mode == 0 || mode == 3 {
                         "blocked".into()
                     } else {
                         "invalid_arguments".into()
