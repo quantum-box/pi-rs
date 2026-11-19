@@ -496,7 +496,7 @@ impl StandaloneBeforeHookHost {
         restart_limit: u32,
     ) -> Result<uuid::Uuid, String> {
         self.scheduler
-            .submit_replay_safe_async_root(tool, input, restart_limit)
+            .submit_checkpointable_async_root(tool, input, restart_limit, true)
     }
     pub fn into_driver(self) -> crate::task_driver::Driver {
         crate::task_driver::Driver::start(self.scheduler)

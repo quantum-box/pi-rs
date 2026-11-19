@@ -1421,22 +1421,22 @@ impl AdmissionHandle<'_> {
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
     ) -> Result<Vec<u8>, String> {
-        self.replay_safe_durable_fence(test_namespace, cancellation, true, &[], &[])
+        self.replay_safe_durable_fence(test_namespace, expected_replay_safe, cancellation, true, (&[], &[]))
     }
     pub(crate) fn replay_safe_durable_check(
         &self,
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Result<(), String> {
-        self.replay_safe_durable_fence(false, Some(cancellation), false, &[], &[])
+        self.replay_safe_durable_fence(false, true, Some(cancellation), false, (&[], &[]))
             .map(|_| ())
     }
     fn replay_safe_durable_fence(
         &self,
         test_namespace: bool,
+        expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
         write_intent: bool,
-        extra_checks: &[durable_store::Check],
-        extra_mutations: &[durable_store::Mutation],
+        extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<Vec<u8>, String> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         if !self.standalone
@@ -1560,7 +1560,7 @@ impl AdmissionHandle<'_> {
             key: key.clone(),
             expected: durable_store::Expected::Missing,
         });
-        checks.extend_from_slice(extra_checks);
+        checks.extend_from_slice(extra.0);
         let mut mutations = if write_intent {
             vec![durable_store::Mutation::Put {
                 key: key.clone(),
@@ -1569,7 +1569,7 @@ impl AdmissionHandle<'_> {
         } else {
             vec![]
         };
-        mutations.extend_from_slice(extra_mutations);
+        mutations.extend_from_slice(extra.1);
         owner
             .store()
             .commit(&checks, &mutations)
@@ -1617,7 +1617,7 @@ impl AdmissionHandle<'_> {
             }
             (None, None) => (None, vec![]),
         };
-        self.replay_safe_durable_fence(false, Some(cancel), false, &[check], &mutations)?;
+        self.replay_safe_durable_fence(false, true, Some(cancel), false, (&[check], &mutations))?;
         Ok(result)
     }
     /// Atomically admit or reconnect a keyed TaskTool child. The parent must be
