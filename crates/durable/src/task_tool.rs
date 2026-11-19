@@ -15,6 +15,7 @@ pub struct TaskTool {
     handler: Arc<dyn crate::task_scheduler::Handler>,
     direct_binding: Option<Value>,
     deferred_arguments: bool,
+    conversation_hooks: bool,
 }
 /// Handle for a keyed task-backed nested tool. It can be stored in a checkpoint
 /// and resolved after a child wake. The child is admitted only when the parent
@@ -85,6 +86,7 @@ impl TaskTool {
             handler,
             direct_binding: None,
             deferred_arguments: false,
+            conversation_hooks: false,
         }
     }
     pub(crate) fn with_direct_binding(mut self, binding: Value) -> Self {
@@ -100,6 +102,13 @@ impl TaskTool {
     }
     pub(crate) fn is_checkpointable(&self) -> bool {
         self.deferred_arguments
+    }
+    pub(crate) fn with_conversation_hooks(mut self) -> Self {
+        self.conversation_hooks = true;
+        self
+    }
+    pub(crate) fn has_conversation_hooks(&self) -> bool {
+        self.conversation_hooks
     }
     /// Register this exact adapter. The same handler must be registered with the task driver.
     pub fn register(self: &Arc<Self>) -> crate::runtime::RegisteredTool {
@@ -267,6 +276,7 @@ impl TaskTool {
             replay_safe: self.replay_safe,
             direct_binding: self.direct_binding.clone(),
             deferred_arguments: self.deferred_arguments,
+            conversation_hooks: self.conversation_hooks,
         })
     }
     pub(crate) fn task(
@@ -320,6 +330,8 @@ pub(crate) struct Identity {
     direct_binding: Option<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     deferred_arguments: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    conversation_hooks: bool,
 }
 impl Identity {
     pub(crate) fn is_checkpointable(&self) -> bool {

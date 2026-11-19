@@ -176,3 +176,84 @@ fn attachment_rejects_tool_whose_live_spec_changes() {
     tool.0.store(true, Ordering::SeqCst);
     assert!(h.attach_tasks(registry).is_err());
 }
+
+struct HookStub;
+#[async_trait]
+impl pi_rs_durable::extension::Hook for HookStub {}
+
+#[tokio::test]
+async fn selected_hook_candidate_requires_identified_order_and_stays_closed() {
+    use pi_rs_durable::async_task_tool::{
+        ReplaySafeConversationHooksAuthorization,
+        register_conversation_replay_safe_durable_tool_with_selected_hooks,
+    };
+    use pi_rs_durable::extension::{Extension, ExtensionIdentity};
+    let hook: Arc<dyn pi_rs_durable::extension::Hook> = Arc::new(HookStub);
+    let ext = || Extension {
+        name: "policy".into(),
+        hooks: vec![hook.clone()],
+        ..Default::default()
+    };
+    let identity =
+        || ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()]).unwrap();
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions.install_identified(ext(), identity()).unwrap();
+    let snapshot = extensions.snapshot();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let candidate = || {
+        Arc::new(Candidate {
+            description: "original",
+            calls: calls.clone(),
+        })
+    };
+    let mut registry = Registry::default();
+    assert!(
+        register_conversation_replay_safe_durable_tool_with_selected_hooks(
+            &mut registry,
+            candidate(),
+            "v1",
+            1,
+            vec![],
+            &snapshot,
+            &["missing".into()],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+            ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()
+        )
+        .is_err()
+    );
+    let adapter = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+        &mut registry,
+        candidate(),
+        "v1",
+        1,
+        vec![],
+        &snapshot,
+        &["policy".into()],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options(&adapter)).unwrap();
+    h.install_identified_extension(ext(), identity()).unwrap();
+    let id = h
+        .create_conversation(pi_rs_durable::runtime::Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["policy".into()]).unwrap();
+    drop(h.attach_tasks(registry).unwrap());
+    let result = adapter
+        .invoke(
+            json!({}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: pi_rs_core::CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(matches!(result, Outcome::Skipped(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}

@@ -292,17 +292,28 @@ fn register_with_policy(
     ))
 }
 
-/// Build an unhooked replay-safe definition before opening a conversation
-/// harness. This only creates matching registrations; conversation execution
-/// remains disabled until its attempt and ownership fences are connected.
+/// Build a replay-safe definition before opening a conversation harness.
+/// Selected-hook registrations remain unavailable for conversation dispatch
+/// until their hook-phase and memo fences are connected.
 pub(super) fn register_conversation_candidate(
     registry: &mut crate::task_scheduler::Registry,
     tool: Arc<dyn DurableAsyncTool>,
     implementation: &str,
     version: u32,
     children: Vec<Arc<TaskTool>>,
+    selected: Option<(
+        crate::extension::StableExtensionSelection,
+        Arc<dyn crate::extension::Hook>,
+    )>,
 ) -> Result<Arc<TaskTool>, String> {
-    let identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
+    let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
+    if let Some((selection, _)) = &selected {
+        let hook_id = format!(
+            "selection-v1:{}",
+            serde_json::to_string(selection).map_err(|e| e.to_string())?
+        );
+        identity = identity.with_before_hook(hook_id)?.with_after_hook();
+    }
     jsonschema::validator_for(&tool.spec().parameters).map_err(|_| "invalid tool schema")?;
     let mut names = HashMap::new();
     let mut child_identities = Vec::new();
@@ -321,8 +332,12 @@ pub(super) fn register_conversation_candidate(
         child_identities.push((name, id));
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
-    let encoded =
-        serde_json::to_vec(&(1u32, &identity, &child_identities)).map_err(|e| e.to_string())?;
+    let encoded = serde_json::to_vec(&(
+        if selected.is_some() { 4u32 } else { 1u32 },
+        &identity,
+        &child_identities,
+    ))
+    .map_err(|e| e.to_string())?;
     if encoded.len() > 65536 {
         return Err("definition identity too large".into());
     }
@@ -337,21 +352,29 @@ pub(super) fn register_conversation_candidate(
     let validate = Arc::new(move || {
         validate_identity.matches(validate_tool.as_ref(), &validate_implementation, version)
     });
+    let (selection, hook) = match selected {
+        Some((selection, hook)) => (Some(selection), Some(hook)),
+        None => (None, None),
+    };
+    let has_hook = hook.is_some();
     let handler: Arc<dyn Handler> = Arc::new(Executor {
         tool,
         identity,
         implementation: implementation.into(),
         version,
         children: names,
-        hook: None,
+        hook,
         replay_safe: true,
-        block_results: false,
+        block_results: has_hook,
         unavailable: false,
         park_cancel: None,
     });
-    let adapter =
-        Arc::new(TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments());
-    registry.register_conversation_checkpointable(&adapter, validate)?;
+    let mut adapter = TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments();
+    if has_hook {
+        adapter = adapter.with_conversation_hooks();
+    }
+    let adapter = Arc::new(adapter);
+    registry.register_conversation_checkpointable(&adapter, validate, selection)?;
     Ok(adapter)
 }
 

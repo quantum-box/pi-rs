@@ -29,7 +29,54 @@ pub fn register_conversation_replay_safe_durable_tool(
     children: Vec<Arc<crate::task_tool::TaskTool>>,
     _authorization: ReplaySafeAuthorization,
 ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
-    replay_safe::register_conversation_candidate(registry, tool, implementation, version, children)
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        None,
+    )
+}
+
+/// Host attestation that the selected before/after hooks are replay-safe,
+/// cooperate with cancellation, and do not leave detached effects.
+pub struct ReplaySafeConversationHooksAuthorization(());
+impl ReplaySafeConversationHooksAuthorization {
+    pub fn host_attests_hooks_replay_safe() -> Self {
+        Self(())
+    }
+}
+
+/// Register an identified ordered hook selection for future conversation
+/// checkpointable execution. Dispatch with selected extensions remains
+/// fail-closed until conversation hook and memo fences are connected.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    _tool_authorization: ReplaySafeAuthorization,
+    _hook_authorization: ReplaySafeConversationHooksAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    let selection = snapshot
+        .stable_selection(names)
+        .ok_or("extension selection is missing, duplicated, or unidentified")?;
+    let resolved = snapshot
+        .resolve_stable(names, &selection)
+        .ok_or("extension selection changed")?;
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        Some((selection, Arc::new(SelectedBeforeHooks(resolved)))),
+    )
 }
 
 /// Read joined unsafe outcomes retained even if abort won settlement. These

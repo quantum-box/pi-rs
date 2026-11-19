@@ -11217,6 +11217,18 @@ impl Harness {
                     .load(task)
                     .map_err(|e| Error::Invalid(format!("task load: {e}")))?
                     .ok_or_else(|| Error::Invalid("task-backed tool task missing".into()))?;
+                if let Some(saved) = registry.conversation_hook_selection(identity) {
+                    let snapshot = self
+                        .extensions
+                        .read()
+                        .map_err(|_| Error::Failed)?
+                        .snapshot();
+                    if snapshot.resolve_stable(&c.extensions, saved).is_none() {
+                        return Err(Error::Invalid(
+                            "checkpointable extension selection changed or missing".into(),
+                        ));
+                    }
+                }
                 if task != operation_id
                     || adapter.identity().as_ref() != Some(identity)
                     || !registry.matches_task_tool(identity, &adapter.handler())
@@ -17239,7 +17251,7 @@ impl Harness {
                         && let Some(adapter) = crate::task_tool::lookup(&registered.tool)
                             .filter(|adapter| adapter.is_checkpointable())
                     {
-                        if !c.extensions.is_empty() {
+                        if adapter.has_conversation_hooks() || !c.extensions.is_empty() {
                             return Err(Error::Invalid(
                                 "conversation checkpointable tools do not support hooks".into(),
                             ));
@@ -30716,7 +30728,8 @@ mod scheduler_tests {
                 1,
                 handler,
             )
-            .with_deferred_arguments(),
+            .with_deferred_arguments()
+            .with_conversation_hooks(),
         );
         let mut opts = options(model);
         opts.tools = vec![adapter.register()];
@@ -30733,7 +30746,8 @@ mod scheduler_tests {
             index: 0,
         };
         h.save(&c, Expected::Version(version)).unwrap();
-        assert!(h.drive(id, &CancellationToken::new()).await.is_err());
+        let error = h.drive(id, &CancellationToken::new()).await.unwrap_err();
+        assert!(error.to_string().contains("do not support hooks"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(
             crate::task_store::TaskStore::new(h.owner.store())
@@ -30983,7 +30997,7 @@ mod scheduler_tests {
                 );
                 let mut registry = Registry::default();
                 registry
-                    .register_conversation_checkpointable(&adapter, Arc::new(|| true))
+                    .register_conversation_checkpointable(&adapter, Arc::new(|| true), None)
                     .unwrap();
                 let mut opts = options(model);
                 opts.tools = vec![adapter.register()];
@@ -31094,6 +31108,124 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn pending_checkpointable_hook_selection_requires_matching_reopen_identity() {
+        use crate::async_task_tool::{
+            DurableAsyncTool, DurableTaskHost, DurableToolResume, DurableToolStep,
+            ReplaySafeAuthorization, ReplaySafeConversationHooksAuthorization,
+            register_conversation_replay_safe_durable_tool_with_selected_hooks,
+        };
+        use crate::extension::{Extension, ExtensionIdentity};
+        use crate::task_scheduler::Registry;
+        struct Hook;
+        #[async_trait::async_trait]
+        impl crate::extension::Hook for Hook {}
+        struct Tool;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Tool for Tool {
+            fn spec(&self) -> pi_rs_core::ToolSpec {
+                pi_rs_core::ToolSpec {
+                    name: "job".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            async fn invoke(
+                &self,
+                _: serde_json::Value,
+                _: pi_rs_core::ToolContext,
+            ) -> pi_rs_core::Outcome {
+                unreachable!()
+            }
+        }
+        #[async_trait::async_trait]
+        impl DurableAsyncTool for Tool {
+            async fn execute_durable(
+                &self,
+                _: serde_json::Value,
+                _: pi_rs_core::ToolContext,
+                _: DurableToolResume,
+                _: &dyn DurableTaskHost,
+            ) -> Result<DurableToolStep, String> {
+                unreachable!()
+            }
+        }
+        let ext = || Extension {
+            name: "policy".into(),
+            hooks: vec![Arc::new(Hook)],
+            ..Default::default()
+        };
+        let ext_id = |fingerprint: &str| {
+            ExtensionIdentity::new(1, fingerprint.into(), vec!["hook-v1".into()]).unwrap()
+        };
+        let mut extensions = crate::extension::Registry::default();
+        extensions.install_identified(ext(), ext_id("v1")).unwrap();
+        let snapshot = extensions.snapshot();
+        let make = || {
+            let mut registry = Registry::default();
+            let adapter = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+                &mut registry,
+                Arc::new(Tool),
+                "tool",
+                1,
+                vec![],
+                &snapshot,
+                &["policy".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+            )
+            .unwrap();
+            (registry, adapter)
+        };
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (_, adapter) = make();
+        let mut opts = options(model.clone());
+        opts.tools = vec![adapter.register()];
+        let mut h = Harness::open_paused(&path, opts).unwrap();
+        h.install_identified_extension(ext(), ext_id("v1")).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["policy".into()]).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let op = Uuid::new_v4();
+        let task = adapter.task(id, op, serde_json::json!({}), 5).unwrap();
+        c.phase = Phase::TaskPending {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id: op,
+            arguments: serde_json::json!({}),
+            task: op,
+            identity: adapter.identity(),
+        };
+        h.save_composed(&c, Expected::Version(version), None, &[task])
+            .unwrap();
+        drop(h);
+        for (fingerprint, accepted) in [("v1", true), ("v2", false)] {
+            let (registry, adapter) = make();
+            let mut opts = options(model.clone());
+            opts.tools = vec![adapter.register()];
+            let h = Harness::open_paused(&path, opts).unwrap();
+            h.install_identified_extension(ext(), ext_id(fingerprint))
+                .unwrap();
+            assert_eq!(
+                h.validate_task_tool_registry(&registry).is_ok(),
+                accepted,
+                "{fingerprint}"
+            );
+        }
+    }
+
+    #[test]
     fn checkpointable_pending_registration_is_checked_after_reopen() {
         use crate::task::Task;
         use crate::task_scheduler::{Handler, Registry, Step};
@@ -31156,7 +31288,7 @@ mod scheduler_tests {
             let adapter = build(version, description);
             let mut registry = Registry::default();
             registry
-                .register_conversation_checkpointable(&adapter, Arc::new(|| true))
+                .register_conversation_checkpointable(&adapter, Arc::new(|| true), None)
                 .unwrap();
             let mut opts = options(model.clone());
             opts.tools = vec![adapter.register()];

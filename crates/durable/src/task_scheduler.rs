@@ -567,6 +567,11 @@ struct ReceiptCapture {
     after_intent: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+type ConversationCheckpointableRegistration = (
+    crate::task_tool::Identity,
+    Arc<dyn Fn() -> bool + Send + Sync>,
+    Option<crate::extension::StableExtensionSelection>,
+);
 #[derive(Clone)]
 struct Registration {
     identity: Arc<()>,
@@ -577,10 +582,7 @@ struct Registration {
     abort: Option<Arc<dyn Handler>>,
     receipt_capture: Option<Arc<ReceiptCapture>>,
     cancellable_durable_async: bool,
-    conversation_checkpointable: Option<(
-        crate::task_tool::Identity,
-        Arc<dyn Fn() -> bool + Send + Sync>,
-    )>,
+    conversation_checkpointable: Option<ConversationCheckpointableRegistration>,
     restart_after: bool,
     checkpointable_hooks: bool,
 }
@@ -605,6 +607,7 @@ impl Registry {
         &mut self,
         adapter: &Arc<crate::task_tool::TaskTool>,
         validate: Arc<dyn Fn() -> bool + Send + Sync>,
+        selection: Option<crate::extension::StableExtensionSelection>,
     ) -> Result<(), String> {
         let identity = adapter
             .identity()
@@ -622,7 +625,7 @@ impl Registry {
         let entry = self.entries.get_mut(&identity.kind).expect("inserted");
         entry.cancellable_durable_async = true;
         entry.abort = Some(Arc::new(|_: &Task| Ok(Step::Succeed(Value::Null))));
-        entry.conversation_checkpointable = Some((identity, validate));
+        entry.conversation_checkpointable = Some((identity, validate, selection));
         Ok(())
     }
     pub(crate) fn conversation_checkpointable(
@@ -632,7 +635,7 @@ impl Registry {
             entry
                 .conversation_checkpointable
                 .as_ref()
-                .map(|(identity, validate)| (identity, &entry.handler, validate()))
+                .map(|(identity, validate, _)| (identity, &entry.handler, validate()))
         })
     }
     pub(crate) fn matches_conversation_checkpointable(
@@ -644,9 +647,20 @@ impl Registry {
             entry
                 .conversation_checkpointable
                 .as_ref()
-                .is_some_and(|(saved, validate)| saved == identity && validate())
+                .is_some_and(|(saved, validate, _)| saved == identity && validate())
                 && self.matches_task_tool(identity, handler)
         })
+    }
+    pub(crate) fn conversation_hook_selection(
+        &self,
+        identity: &crate::task_tool::Identity,
+    ) -> Option<&crate::extension::StableExtensionSelection> {
+        self.entries
+            .get(&identity.kind)?
+            .conversation_checkpointable
+            .as_ref()?
+            .2
+            .as_ref()
     }
     pub fn register_shared(
         &mut self,
@@ -3052,8 +3066,14 @@ impl AdmissionHandle<'_> {
                             .kind()
                             .and_then(|kind| definitions.registry.entries.get(kind))
                             .ok_or("missing checkpointable registration")?;
-                        if registration.conversation_checkpointable.is_none() {
-                            return Err("conversation checkpointable registration required".into());
+                        if registration
+                            .conversation_checkpointable
+                            .as_ref()
+                            .is_none_or(|(_, _, selection)| selection.is_some())
+                        {
+                            return Err(
+                                "conversation checkpointable hooks are not supported".into()
+                            );
                         }
                         for check in harness
                             .checkpointable_conversation_checks(
