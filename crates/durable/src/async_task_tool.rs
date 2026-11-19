@@ -664,7 +664,7 @@ mod tests {
     ) -> StandaloneBeforeHookHost {
         let cell = Arc::new(std::sync::OnceLock::new());
         let mut registry = Registry::default();
-        assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
         let mut host = StandaloneBeforeHookHost::open(path, registry).unwrap();
         let adapter = host
             .register_tool("leaf", tool, "backend", 1, hook_id, hook)
@@ -1100,7 +1100,7 @@ mod tests {
         let names = vec!["first".into(), "second".into()];
         let mut registry = Registry::default();
         let cell = Arc::new(std::sync::OnceLock::new());
-        assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
         let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
         assert!(
             host.register_selected_tool(

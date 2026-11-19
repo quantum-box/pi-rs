@@ -1521,8 +1521,7 @@ impl TaskHookMemo<'_> {
                     &capture.implementation,
                     capture.version,
                     false,
-                    &[check],
-                    &mutations,
+                    (&[check], &mutations),
                 )
                 .map_err(|e| e.to_string())?;
             Ok(result)
@@ -1572,7 +1571,7 @@ impl DetachedInvocation {
         version: u32,
         commit: bool,
     ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
-        self.checked_tool_transaction(identity, tool, implementation, version, commit, &[], &[])
+        self.checked_tool_transaction(identity, tool, implementation, version, commit, (&[], &[]))
     }
 
     fn checked_tool_transaction(
@@ -1582,8 +1581,7 @@ impl DetachedInvocation {
         implementation: &str,
         version: u32,
         commit: bool,
-        extra_checks: &[durable_store::Check],
-        extra_mutations: &[durable_store::Mutation],
+        extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
         use crate::async_task_protocol::Error as ProtocolError;
         if self.abort
@@ -1680,9 +1678,9 @@ impl DetachedInvocation {
             return Err(ProtocolError::Invalid);
         }
         let mut checks = batch.checks;
-        checks.extend_from_slice(extra_checks);
+        checks.extend_from_slice(extra.0);
         let mut mutations = if commit { batch.mutations } else { Vec::new() };
-        mutations.extend_from_slice(extra_mutations);
+        mutations.extend_from_slice(extra.1);
         owner.store().commit(&checks, &mutations)?;
         Ok(intent)
     }
