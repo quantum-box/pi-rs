@@ -1534,31 +1534,30 @@ impl DetachedInvocation {
             ));
         }
         let identity_lease = if let Some(capture) = &self.receipt_capture {
-            loop {
-                match crate::nested_identity::checked_lease(
-                    capture.executor.tool(),
-                    &capture.implementation,
-                ) {
-                    Ok(lease) => break Some(lease),
-                    Err(crate::nested_identity::LeaseFailure::Mismatch) => {
-                        return Err(Error::Handler(
-                            "unhooked tool identity unavailable or changed".into(),
-                        ));
+            match crate::nested_identity::checked_lease(
+                capture.executor.tool(),
+                &capture.implementation,
+            ) {
+                Ok(lease) => Some(lease),
+                Err(crate::nested_identity::LeaseFailure::Busy) => {
+                    #[cfg(test)]
+                    if let Some(hook) = &capture.busy_hook {
+                        hook();
                     }
-                    Err(crate::nested_identity::LeaseFailure::Busy) => {
-                        #[cfg(test)]
-                        if let Some(hook) = &capture.busy_hook {
-                            hook();
-                        }
-                        if self
-                            .unhooked_cancellation
-                            .as_ref()
-                            .is_some_and(|token| token.is_cancelled())
-                        {
-                            return self.release_undispatched();
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    return self.release_undispatched();
+                }
+                Err(crate::nested_identity::LeaseFailure::Mismatch) => {
+                    if self
+                        .unhooked_cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                        || self.abort_precedes_unhooked_dispatch()?
+                    {
+                        return self.release_undispatched();
                     }
+                    return Err(Error::Handler(
+                        "unhooked tool identity unavailable or changed".into(),
+                    ));
                 }
             }
         } else {
@@ -3268,6 +3267,22 @@ impl Scheduler {
         self.reservation_stop.clone()
     }
 
+    // A busy identity is transient: leave the task Ready and let the driver
+    // revisit it on a later scheduling pass without consuming a worker.
+    fn sealed_identity_not_busy(&self, task: &Task) -> bool {
+        let Some(capture) = self
+            .registered(task)
+            .ok()
+            .and_then(|entry| entry.receipt_capture.as_ref())
+        else {
+            return true;
+        };
+        !matches!(
+            crate::nested_identity::checked_lease(capture.executor.tool(), &capture.implementation),
+            Err(crate::nested_identity::LeaseFailure::Busy)
+        )
+    }
+
     /// Reserve a foreground-independent task without running graph maintenance.
     /// Every ownership ancestor is checked under the task gate.
     pub fn reserve_independent_root(&mut self) -> Result<Option<Box<DetachedInvocation>>, Error> {
@@ -3292,6 +3307,7 @@ impl Scheduler {
             if snapshot.task.state() != &TaskState::Ready
                 || snapshot.task.abort_requested()
                 || self.blocked_reason(&snapshot.task).is_some()
+                || !self.sealed_identity_not_busy(&snapshot.task)
                 || !self.foreground_ancestors_available(&owner, &snapshot.task)?
             {
                 continue;
@@ -4643,6 +4659,7 @@ impl Scheduler {
                     && s.task.state() == &TaskState::Ready
                     && !s.task.abort_requested()
                     && self.blocked_reason(&s.task).is_none()
+                    && self.sealed_identity_not_busy(&s.task)
                     && self.ancestors_available(&s.task, &tasks)
             })
             .cloned()

@@ -898,7 +898,7 @@ mod tests {
         tool: std::sync::Arc<dyn Tool>,
         before_intent: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         after_intent: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-        setup: Option<Box<dyn FnOnce()>>,
+        setup: Option<Box<dyn FnOnce(Uuid)>>,
         busy_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> (
         crate::task_driver::Driver,
@@ -964,7 +964,7 @@ mod tests {
             prepare_child(owner.store(), &parent_snapshot, "child", &child, &identity).unwrap();
         commit(owner.store(), batch);
         if let Some(setup) = setup {
-            setup();
+            setup(child.id());
         }
         (
             crate::task_driver::Driver::start(scheduler),
@@ -1287,7 +1287,7 @@ mod tests {
         drop(parent_job);
     }
 
-    fn identity_update_during_reserved_dispatch(changed: bool) {
+    fn identity_update_during_reserved_dispatch(mode: u8) {
         let dir = tempfile::tempdir().unwrap();
         let (entered, observed) = std::sync::mpsc::channel();
         let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(RealTool {
@@ -1299,23 +1299,32 @@ mod tests {
         let waiting = gate.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (join_tx, join_rx) = std::sync::mpsc::channel();
-        let setup = Box::new(move || {
+        let setup = Box::new(move |_: Uuid| {
             let thread = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .build()
                     .unwrap();
                 runtime
-                    .block_on(handle.update(
-                        Some(if changed { "different" } else { "real-backend" }.into()),
-                        move || {
-                            started_tx.send(()).unwrap();
-                            let (lock, wake) = &*waiting;
-                            let mut ready = lock.lock().unwrap();
-                            while !*ready {
-                                ready = wake.wait(ready).unwrap();
-                            }
-                        },
-                    ))
+                    .block_on(
+                        handle.update(
+                            Some(
+                                if mode == 1 {
+                                    "different"
+                                } else {
+                                    "real-backend"
+                                }
+                                .into(),
+                            ),
+                            move || {
+                                started_tx.send(()).unwrap();
+                                let (lock, wake) = &*waiting;
+                                let mut ready = lock.lock().unwrap();
+                                while !*ready {
+                                    ready = wake.wait(ready).unwrap();
+                                }
+                            },
+                        ),
+                    )
                     .unwrap();
             });
             started_rx
@@ -1323,21 +1332,14 @@ mod tests {
                 .unwrap();
             join_tx.send(thread).unwrap();
         });
-        let (busy_tx, busy_rx) = std::sync::mpsc::sync_channel(1);
-        let busy_hook = std::sync::Arc::new(move || {
-            let _ = busy_tx.try_send(());
-        });
-        let (driver, parent_job, owner, _, child) = actual_driver_fixture_with_setup(
+        let (driver, parent_job, owner, parent, child) = actual_driver_fixture_with_setup(
             &dir.path().join("db"),
             tool,
             None,
             None,
             Some(setup),
-            Some(busy_hook),
+            None,
         );
-        busy_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
         let unrelated = Task::new(
             Uuid::new_v4(),
             TaskOwner::Conversation(Uuid::new_v4()),
@@ -1362,13 +1364,19 @@ mod tests {
         }
         assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
         assert!(observed.try_recv().is_err());
+        if mode == 2 {
+            driver.request_abort(parent).unwrap();
+        }
+        if mode == 3 {
+            driver.stop_worker_for_test();
+        }
         {
             let (lock, wake) = &*gate;
             *lock.lock().unwrap() = true;
             wake.notify_all();
         }
         join_rx.recv().unwrap().join().unwrap();
-        if changed {
+        if mode == 1 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while driver.get(child).is_ok() {
                 assert!(std::time::Instant::now() < deadline);
@@ -1376,6 +1384,9 @@ mod tests {
             }
             assert!(observed.try_recv().is_err());
             assert!(driver.shutdown_with_pending().unwrap().failure().is_some());
+        } else if mode >= 2 {
+            assert!(observed.try_recv().is_err());
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
         } else {
             observed
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -1390,11 +1401,282 @@ mod tests {
     }
     #[test]
     fn busy_identity_update_retries_matching_identity() {
-        identity_update_during_reserved_dispatch(false);
+        identity_update_during_reserved_dispatch(0);
     }
     #[test]
     fn busy_identity_update_rejects_changed_identity() {
-        identity_update_during_reserved_dispatch(true);
+        identity_update_during_reserved_dispatch(1);
+    }
+    #[test]
+    fn busy_identity_abort_does_not_dispatch() {
+        identity_update_during_reserved_dispatch(2);
+    }
+    #[test]
+    fn busy_identity_shutdown_does_not_dispatch() {
+        identity_update_during_reserved_dispatch(3);
+    }
+    #[test]
+    fn abort_before_identity_mismatch_does_not_stop_other_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(RealTool {
+            entered,
+            release: std::sync::Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let identity =
+            crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let waiting = gate.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let setup = Box::new(move |child| {
+            crate::task_driver::before_execute_for_test(child, move |_| {
+                ready_tx.send(()).unwrap();
+                let (lock, wake) = &*waiting;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = wake.wait(ready).unwrap();
+                }
+            });
+        });
+        let (driver, parent_job, owner, parent, child) = actual_driver_fixture_with_setup(
+            &dir.path().join("db"),
+            tool,
+            None,
+            None,
+            Some(setup),
+            None,
+        );
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(identity.update(Some("different".into()), || {}))
+            .unwrap();
+        driver.request_abort(parent).unwrap();
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        let other = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "other".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&other)])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !driver.get(other.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        while !driver.get(child).unwrap().unwrap().is_terminal() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abort cleanup did not complete"
+            );
+            std::thread::yield_now();
+        }
+        assert!(observed.try_recv().is_err());
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        drop(parent_job);
+    }
+    #[test]
+    fn identity_turning_busy_after_reservation_releases_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(RealTool {
+            entered,
+            release: std::sync::Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let binding = crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let setup = Box::new(move |child| {
+            crate::task_driver::before_execute_for_test(child, move |_| {
+                reserved_tx.send(()).unwrap();
+                go_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            });
+        });
+        let (busy_tx, busy_rx) = std::sync::mpsc::sync_channel(1);
+        let busy_hook = std::sync::Arc::new(move || {
+            let _ = busy_tx.try_send(());
+        });
+        let (driver, parent_job, owner, _, child) = actual_driver_fixture_with_setup(
+            &dir.path().join("db"),
+            tool,
+            None,
+            None,
+            Some(setup),
+            Some(busy_hook),
+        );
+        reserved_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (updating_tx, updating_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(binding.update(Some("real-backend".into()), move || {
+                    updating_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }))
+                .unwrap();
+        });
+        updating_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        go_tx.send(()).unwrap();
+        busy_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while TaskStore::new(owner.store())
+            .load(child)
+            .unwrap()
+            .unwrap()
+            .task
+            .state()
+            != &TaskState::Ready
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        updater.join().unwrap();
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            await_receipt(owner.store(), child).1,
+            Outcome::Pending { .. }
+        ));
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        drop(parent_job);
+    }
+    #[test]
+    fn busy_identity_for_four_children_does_not_starve_update_dependency() {
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(RealTool {
+            entered,
+            release: std::sync::Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let binding = crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
+        let identity = ToolIdentity::new(tool.as_ref(), "real-backend", 1).unwrap();
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null)))));
+        assert!(registry.register("other", false, move |_: &Task| {
+            task_tx.send(()).unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }));
+        let mut host = crate::async_task_tool::StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            registry,
+            crate::async_task_tool::UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        host.register_tool("leaf", tool, "real-backend", 1).unwrap();
+        let scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let parent_id = Uuid::new_v4();
+        let ids: Vec<_> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: json!({}),
+        };
+        let mut parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(Uuid::new_v4()),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false)
+        .into_task_tool();
+        parent.start().unwrap();
+        parent
+            .wait(crate::task::WaitFor::Tasks(ids.clone()))
+            .unwrap();
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&parent)])
+            .unwrap();
+        for id in &ids {
+            let child = Task::new(*id, TaskOwner::Task(parent_id), checkpoint.clone(), 3)
+                .unwrap()
+                .registered_versioned("leaf".into(), false, 1, json!({}))
+                .unwrap()
+                .into_task_tool();
+            TaskStore::new(owner.store())
+                .save(&[Save::Create(&child)])
+                .unwrap();
+            commit(
+                owner.store(),
+                prepare_child_identity(owner.store(), *id, &identity).unwrap(),
+            );
+        }
+        let other = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), false);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&other)])
+            .unwrap();
+        let (updating_tx, updating_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(binding.update(Some("real-backend".into()), move || {
+                    updating_tx.send(()).unwrap();
+                    task_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }))
+                .unwrap();
+        });
+        updating_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        updater.join().unwrap();
+        for _ in 0..4 {
+            observed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        for id in ids {
+            assert!(matches!(
+                await_receipt(owner.store(), id).1,
+                Outcome::Pending { .. }
+            ));
+        }
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
     }
     struct CancellableTool(std::sync::mpsc::Sender<()>);
     #[async_trait::async_trait]

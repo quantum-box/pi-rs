@@ -499,9 +499,9 @@ dispatch. The identity is a host assertion, not a cryptographic measurement.
 The driver invokes the registered Tool itself; arbitrary handlers cannot stand in
 for it. The standalone leaf host rejects nested calls, progress and UI requests.
 
-While an identity update holds the identity lease, a reserved worker waits and
-rechecks it; a changed identity is rejected. A busy identity occupies a worker
-slot, so enough simultaneous updates can delay unrelated work. Cancellation
+While an identity update holds the identity lease, admission skips that task;
+a reservation racing the update is released before retry. A changed identity
+is rejected. Cancellation
 before an intent is committed releases the attempt back to Ready using an
 atomic missing-intent check; after restart it can be reserved again.
 

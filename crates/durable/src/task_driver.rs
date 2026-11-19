@@ -880,6 +880,17 @@ fn before_execute_hooks() -> &'static Mutex<std::collections::HashMap<Uuid, Befo
     HOOKS.get_or_init(Default::default)
 }
 
+#[cfg(test)]
+pub(crate) fn before_execute_for_test(
+    id: Uuid,
+    hook: impl FnOnce(&task_scheduler::DetachedInvocation) + Send + 'static,
+) {
+    before_execute_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
 struct WorkerPool {
     jobs: Option<mpsc::Sender<Box<task_scheduler::DetachedInvocation>>>,
     done: mpsc::Receiver<WorkerEvent>,
