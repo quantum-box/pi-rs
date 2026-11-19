@@ -1406,10 +1406,8 @@ fn staged_graph_with_orphan_waiting_on_new_parent_is_rejected_atomically() {
     let path = dir.path().join("db");
     let mut h = Harness::open_paused(&path, options()).unwrap();
     let c = h.create_conversation(config()).unwrap();
-    let (driver, started, release) = driver(&h);
-    let blocker = task(TaskOwner::Conversation(c), "parent", 0);
-    driver.submit(&blocker).unwrap();
-    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The deliberately corrupt graph is an admission fixture. Do not start a
+    // driver that could independently poll it before the transaction runs.
     let root = task(TaskOwner::Conversation(c), "child", 1);
     let child = task(TaskOwner::Task(root.id()), "child", 2);
     let mut orphan = task(TaskOwner::Task(root.id()), "child", 3);
@@ -1429,23 +1427,9 @@ fn staged_graph_with_orphan_waiting_on_new_parent_is_rejected_atomically() {
     assert!(TaskStore::new(&store).load(root.id()).unwrap().is_none());
     assert!(TaskStore::new(&store).load(child.id()).unwrap().is_none());
     assert!(Documents::new(&store).get(&address()).unwrap().is_none());
-    // Remove the deliberately corrupt orphan before allowing the worker to resume.
-    let mut key = b"durable/task/".to_vec();
-    key.extend_from_slice(orphan.id().as_bytes());
-    let entry = store.get(&key).unwrap().unwrap();
-    store
-        .commit(
-            &[durable_store::Check {
-                key: key.clone(),
-                expected: durable_store::Expected::Version(entry.version),
-            }],
-            &[durable_store::Mutation::Delete { key }],
-        )
-        .unwrap();
-    release.send(()).unwrap();
-    driver.shutdown().unwrap();
+    let saved_orphan = TaskStore::new(&store).load(orphan.id()).unwrap().unwrap();
+    assert_eq!(saved_orphan.task, orphan);
 }
-
 #[test]
 fn staged_child_signal_missing_observation_rejects_create_delete_aba() {
     use durable_store::{Check, Expected, Mutation};
