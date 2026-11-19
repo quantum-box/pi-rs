@@ -84,6 +84,15 @@ and other blocking graph fences remain outside this change. The controls
 registry is still held through commit. These remaining boundaries must be
 addressed before the callback can be dispatched.
 
+Harness-mediated conversation signal delivery now takes the target mutation
+lease and checks its signal revision in the same transaction as the receipt.
+This excludes a callback first poll and allows independent conversations to
+progress. Direct public `Inbox` writes bypass the lease and are not protected.
+The synchronous Harness API reports `TaskPublicationBusy` when a callback has
+started; it has no automatic retry owner yet. Generic task signals and wake,
+direct abort, and their graph and revision checks remain unconnected. Callback
+dispatch remains disabled until every boundary and retry path is complete.
+
 The `Scheduler::schedule` worker also fences its ModelReady-to-ModelRunning
 save before model dispatch. Busy leaves the durable state unchanged and retries
 through the scheduled worker. This does not yet fence the general Harness save

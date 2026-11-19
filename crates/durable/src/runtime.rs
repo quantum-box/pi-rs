@@ -11497,6 +11497,12 @@ impl Harness {
     /// Durably deliver an idempotent signal to a conversation hook gate.
     pub fn send_signal(&self, signal: &crate::conversation_signal::Signal) -> Result<(), Error> {
         self.conversation(signal.conversation_id)?;
+        let gate = self
+            .owner
+            .conversation_controls()
+            .get(signal.conversation_id)
+            .callback_start;
+        let _lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
         crate::conversation_signal::Inbox::new(self.owner.store())
             .send_with_clock(signal, self.clock.as_ref())?;
         Ok(())
@@ -25235,6 +25241,97 @@ mod scheduler_tests {
                 .any(|entry| entry.id == reset)
         );
         drop(_other_mutation);
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_signal_fences_callback_first_poll_per_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let mut worker = scheduler.harness.worker();
+        let target = worker.create_conversation(config()).unwrap();
+        let other = worker.create_conversation(config()).unwrap();
+        let signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            target,
+            "wake".into(),
+            serde_json::json!(1),
+        );
+        let other_signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            other,
+            "wake".into(),
+            serde_json::json!(2),
+        );
+        let control = scheduler.harness.owner.conversation_controls().get(target);
+        let callback = control.callback_start.try_start().unwrap();
+        let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+            assert!(matches!(
+                scheduler.send_signal(&signal),
+                Err(Error::TaskPublicationBusy)
+            ));
+            scheduler.send_signal(&other_signal).unwrap();
+            std::task::Poll::<()>::Pending
+        }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            callback
+                .poll_first(future.as_mut(), &mut context)
+                .is_pending()
+        );
+        let inbox = crate::conversation_signal::Inbox::new(scheduler.harness.owner.store());
+        assert!(inbox.receipt(target, signal.id).unwrap().is_none());
+        assert!(inbox.receipt(other, other_signal.id).unwrap().is_some());
+        scheduler.send_signal(&signal).unwrap();
+        assert!(inbox.receipt(target, signal.id).unwrap().is_some());
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_signal_commit_precedes_callback_first_poll() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let mut worker = scheduler.harness.worker();
+        let target = worker.create_conversation(config()).unwrap();
+        let other = worker.create_conversation(config()).unwrap();
+        let signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            target,
+            "wake".into(),
+            serde_json::json!(1),
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        crate::conversation_signal::on_signal_before_commit(signal.id, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let worker_signal = signal.clone();
+        let sender = std::thread::spawn(move || worker.send_signal(&worker_signal));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let control = scheduler.harness.owner.conversation_controls().get(target);
+        let unrelated = scheduler.harness.owner.conversation_controls().get(other);
+        assert!(control.callback_start.try_start().is_none());
+        assert!(unrelated.callback_start.try_start().is_some());
+        release_tx.send(()).unwrap();
+        sender.join().unwrap().unwrap();
+        let callback = control.callback_start.try_start().unwrap();
+        let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+            assert!(
+                crate::conversation_signal::Inbox::new(scheduler.harness.owner.store())
+                    .receipt(target, signal.id)
+                    .unwrap()
+                    .is_some()
+            );
+            std::task::Poll::<()>::Pending
+        }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            callback
+                .poll_first(future.as_mut(), &mut context)
+                .is_pending()
+        );
         scheduler.shutdown().await.unwrap();
     }
 

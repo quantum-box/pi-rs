@@ -77,6 +77,33 @@ enum Slot {
     Expired,
 }
 
+#[cfg(test)]
+type SignalHooks = std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn before_signal_commit_hooks() -> &'static SignalHooks {
+    static HOOKS: std::sync::OnceLock<SignalHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_signal_before_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    before_signal_commit_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn signal_conflict_hooks() -> &'static SignalHooks {
+    static HOOKS: std::sync::OnceLock<SignalHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+fn run_signal_hook(hooks: &SignalHooks, id: Uuid) {
+    let hook = hooks.lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub struct Inbox<'a> {
     store: &'a Store,
 }
@@ -119,6 +146,13 @@ impl<'a> Inbox<'a> {
                 };
             }
             let entry = self.store.get(&target)?.ok_or(Error::NotFound)?;
+            let revision_key = revision(signal.conversation_id);
+            let observed_revision = self.store.get(&revision_key)?;
+            let revision_check = Check {
+                key: revision_key,
+                expected: observed_revision
+                    .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            };
             if signal.name.is_empty() {
                 return Err(Error::InvalidWait);
             }
@@ -149,6 +183,7 @@ impl<'a> Inbox<'a> {
             let closed = crate::runtime::signal_target_closed(&entry.value, &signal.name, clock())?;
             if closed {
                 let checks = [
+                    revision_check.clone(),
                     Check {
                         key: target.clone(),
                         expected: Expected::Version(entry.version),
@@ -175,6 +210,7 @@ impl<'a> Inbox<'a> {
                 }
             }
             let checks = [
+                revision_check,
                 Check {
                     key: sk.clone(),
                     expected: Expected::Missing,
@@ -202,9 +238,15 @@ impl<'a> Inbox<'a> {
                     value: vec![],
                 },
             ];
+            #[cfg(test)]
+            run_signal_hook(before_signal_commit_hooks(), signal.id);
             match self.store.commit(&checks, &writes) {
                 Ok(()) => return Ok(()),
-                Err(durable_store::Error::Conflict { .. }) => continue,
+                Err(durable_store::Error::Conflict { .. }) => {
+                    #[cfg(test)]
+                    run_signal_hook(signal_conflict_hooks(), signal.id);
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -364,6 +406,54 @@ mod tests {
             value: b"awake".to_vec(),
         });
         store.commit(&wake.checks, &wake.mutations)
+    }
+
+    #[test]
+    fn delivery_retries_when_signal_revision_changes_before_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let store = Arc::new(Store::memory().unwrap());
+        let conversation = Uuid::new_v4();
+        create(&store, conversation);
+        let first = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "first".into(),
+            serde_json::json!(1),
+        );
+        let second = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "second".into(),
+            serde_json::json!(2),
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (conflict_tx, conflict_rx) = mpsc::channel();
+        before_signal_commit_hooks().lock().unwrap().insert(
+            first.id,
+            Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }),
+        );
+        signal_conflict_hooks().lock().unwrap().insert(
+            first.id,
+            Box::new(move || {
+                conflict_tx.send(()).unwrap();
+            }),
+        );
+        let worker_store = store.clone();
+        let worker_signal = first.clone();
+        let worker = std::thread::spawn(move || Inbox::new(&worker_store).send(&worker_signal));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        Inbox::new(&store).send(&second).unwrap();
+        release_tx.send(()).unwrap();
+        conflict_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap().unwrap();
+        let inbox = Inbox::new(&store);
+        assert!(inbox.receipt(conversation, first.id).unwrap().is_some());
+        assert!(inbox.receipt(conversation, second.id).unwrap().is_some());
     }
 
     #[test]
