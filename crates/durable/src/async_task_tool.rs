@@ -12361,7 +12361,11 @@ mod tests {
             }
             if self.0.join("pause-cancel").exists() {
                 std::fs::write(self.0.join("cancel-ready"), b"yes").map_err(|e| e.to_string())?;
-                std::future::pending::<()>().await;
+                while !self.0.join("cancel-release").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                std::fs::write(self.0.join("cancel-returning"), b"yes")
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         }
@@ -13809,6 +13813,66 @@ mod tests {
         );
         assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
         assert!(!root.join("abort-hook-count").exists());
+    }
+    #[test]
+    fn unsafe_park_cancel_late_receipt_while_callback_paused_requires_reconciliation() {
+        for retry in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("pause-cancel"), b"yes").unwrap();
+            let (host, tool) = unsafe_park_cancel_host(root, retry);
+            let id = host
+                .start_unsafe_durable_root(&tool, json!({"token":"prepared"}), 3)
+                .unwrap();
+            let scheduler = host.into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            wait_park_cancel(&driver, id);
+            driver.request_abort(id).unwrap();
+            wait_file(&root.join("cancel-ready"));
+            assert!(!root.join("cancel-returning").exists());
+            let store = owner.store();
+            let task = crate::task_store::TaskStore::new(store)
+                .load(id)
+                .unwrap()
+                .unwrap()
+                .task;
+            let attempt: Uuid =
+                serde_json::from_value(task.checkpoint().data["park_attempt"].clone()).unwrap();
+            let key = format!("durable/unsafe-park-async/{id}/{attempt}/intent").into_bytes();
+            let entry = store.get(&key).unwrap().unwrap();
+            let intent: Task = serde_json::from_slice(&entry.value).unwrap();
+            let expected = Outcome::Succeeded("joined late Tool outcome".into());
+            let (checks, mutations) =
+                unsafe_park_proof::prepare_receipt(store, &intent, &key, &expected).unwrap();
+            store.commit(&checks, &mutations).unwrap();
+            let receipt = read_unsafe_durable_receipts(store, id).unwrap();
+            assert_eq!(receipt.len(), 1);
+            assert_eq!(receipt[0].outcome, expected);
+            std::fs::write(root.join("cancel-release"), b"yes").unwrap();
+            wait_file(&root.join("cancel-returning"));
+            let ended = wait_terminal(&driver, id);
+            assert!(
+                matches!(ended.state(), crate::task::TaskState::Failed(reason) if reason.contains("reconciliation")),
+                "retry={retry}: {:?}",
+                ended.state()
+            );
+            let _ = driver.shutdown_with_pending().unwrap();
+            assert_eq!(read_unsafe_durable_receipts(store, id).unwrap(), receipt);
+            assert_eq!(
+                read_park_cancel_evidence(store, id).unwrap(),
+                Some(ParkCancelEvidence::AttemptedUnknown)
+            );
+            assert!(read_aborted_after_result(store, id).unwrap().is_none());
+            assert!(!root.join("abort-hook-count").exists());
+            assert_eq!(
+                std::fs::read_to_string(root.join("cancel-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
     }
     #[test]
     fn unsafe_park_cancel_late_receipt_after_callback_wins_on_reopen() {
