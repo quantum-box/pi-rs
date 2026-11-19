@@ -104,8 +104,11 @@ pub struct SummaryGuard {
 }
 
 #[cfg(all(test, unix))]
+type OwnerLockHook = Box<dyn FnOnce(&File, &Path)>;
+
+#[cfg(all(test, unix))]
 thread_local! {
-    static AFTER_OWNER_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce(&File, &Path)>>> = std::cell::RefCell::new(None);
+    static AFTER_OWNER_LOCK: std::cell::RefCell<Option<OwnerLockHook>> = std::cell::RefCell::new(None);
 }
 
 impl OwnedStore {
