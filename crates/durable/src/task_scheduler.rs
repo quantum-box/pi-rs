@@ -3392,6 +3392,80 @@ impl AdmissionHandle<'_> {
         }
         Err(UNSAFE_ANCESTOR_BUSY.into())
     }
+    pub(crate) fn replay_safe_hook_signal_state(
+        &self,
+        key: &str,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<(Option<task_store::SignalState>, durable_store::Check), String> {
+        if !self.is_conversation_checkpointable() || key.is_empty() || key.len() > 4096 {
+            return Err("invalid checkpointable hook signal".into());
+        }
+        let store = self.lease.attachment.owner.store();
+        let token = crate::extension::checkpointable_hook_signal_token();
+        for _ in 0..8 {
+            let revision_key = task_store::signal_revision_key(self.running.task.id());
+            let revision = store.get(&revision_key).map_err(|e| e.to_string())?;
+            let state = TaskStore::new(store)
+                .read_typed_signal_state(self.running.task.id(), &token, key)
+                .map_err(|e| e.to_string())?;
+            let check = durable_store::Check {
+                key: revision_key,
+                expected: revision.map_or(durable_store::Expected::Missing, |e| {
+                    durable_store::Expected::Version(e.version)
+                }),
+            };
+            match self.replay_safe_durable_fence(
+                false,
+                true,
+                Some(cancel),
+                false,
+                true,
+                (std::slice::from_ref(&check), &[]),
+            ) {
+                Ok(_) => return Ok((state, check)),
+                Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(UNSAFE_ANCESTOR_BUSY.into())
+    }
+    pub(crate) fn replay_safe_hook_wait_keys_available(
+        &self,
+        keys: &[task_store::SignalKey],
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<(bool, durable_store::Check), String> {
+        let store = self.lease.attachment.owner.store();
+        for _ in 0..8 {
+            let key = task_store::signal_revision_key(self.running.task.id());
+            let revision = store.get(&key).map_err(|e| e.to_string())?;
+            let available = match TaskStore::new(store)
+                .validate_typed_wait_keys(self.running.task.id(), keys)
+            {
+                Ok(()) => true,
+                Err(task_store::Error::SignalKeyConsumed) => false,
+                Err(error) => return Err(error.to_string()),
+            };
+            let check = durable_store::Check {
+                key,
+                expected: revision.map_or(durable_store::Expected::Missing, |e| {
+                    durable_store::Expected::Version(e.version)
+                }),
+            };
+            match self.replay_safe_durable_fence(
+                false,
+                true,
+                Some(cancel),
+                false,
+                true,
+                (std::slice::from_ref(&check), &[]),
+            ) {
+                Ok(_) => return Ok((available, check)),
+                Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(UNSAFE_ANCESTOR_BUSY.into())
+    }
     fn replay_safe_hook_memo_once(
         &self,
         key: &str,

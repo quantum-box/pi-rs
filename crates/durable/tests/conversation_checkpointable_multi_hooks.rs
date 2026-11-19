@@ -806,3 +806,515 @@ async fn abort_while_before_sleeping_never_dispatches_tool() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     driver.shutdown().unwrap();
 }
+
+struct SignalHook {
+    id: &'static str,
+    deadline: Option<i64>,
+    events: Arc<Mutex<Vec<String>>>,
+    gate: Option<Arc<AtomicUsize>>,
+}
+#[async_trait]
+impl Hook for SignalHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        ctx: &Context<'_>,
+    ) -> Result<BeforeTool, String> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("before-{}", self.id));
+        if ctx
+            .memo
+            .get_or_insert("shared-signal-memo", json!("same"))
+            .await?
+            != "same"
+        {
+            return Err("memo changed".into());
+        }
+        if self.id == "b2" {
+            match ctx.read_signal("first").await? {
+                None => {
+                    if let Some(gate) = &self.gate
+                        && gate.load(Ordering::SeqCst) == 0
+                    {
+                        gate.store(1, Ordering::SeqCst);
+                        while gate.load(Ordering::SeqCst) != 2 {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                    return Ok(BeforeTool::Sleep(pi_rs_durable::extension::Sleep {
+                        signals: vec!["first".into()],
+                        until_millis: self.deadline,
+                    }));
+                }
+                Some(pi_rs_durable::task_store::SignalState::Value(v)) if v == json!("one") => {
+                    if self.deadline == Some(i64::MAX) {
+                        return Ok(BeforeTool::Sleep(pi_rs_durable::extension::Sleep {
+                            signals: vec!["first".into()],
+                            until_millis: None,
+                        }));
+                    }
+                    if ctx.read_signal("second").await?.is_none() {
+                        return Ok(BeforeTool::Sleep(pi_rs_durable::extension::Sleep {
+                            signals: vec!["second".into()],
+                            until_millis: self.deadline,
+                        }));
+                    }
+                }
+                Some(pi_rs_durable::task_store::SignalState::Expired) => (),
+                _ => return Err("unexpected first signal".into()),
+            }
+        }
+        let mut args = call.arguments.clone();
+        args.as_object_mut()
+            .unwrap()
+            .entry("trace")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(json!(self.id));
+        Ok(BeforeTool::Rewrite(args))
+    }
+    async fn after_tool(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("after-{}", self.id));
+        Ok(Some(json!(format!(
+            "{}/{}",
+            result.as_str().ok_or("missing text")?,
+            self.id
+        ))))
+    }
+}
+
+#[tokio::test]
+async fn used_signal_key_is_invalid_park_and_runs_after_hooks() {
+    use pi_rs_durable::task_store::SignalResult;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) =
+        setup_signal(Some(i64::MAX), Arc::new(Mutex::new(vec![])), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    start(&mut scheduler).await;
+    let task = wait_signal_sleep(&path, "first").await;
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    let task = wait_task(&path).await;
+    let pi_rs_durable::task::TaskState::Succeeded(value) = task.state() else {
+        panic!("unexpected state {:?}", task.state());
+    };
+    assert_eq!(
+        value["task_content_v1"]["diagnostics"][0]["code"],
+        "invalid_park"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let _ = driver.shutdown_with_pending();
+    let _ = scheduler.shutdown().await;
+}
+
+#[tokio::test]
+async fn abort_while_signal_sleeping_closes_target_without_dispatch() {
+    use pi_rs_durable::task_store::SignalResult;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) =
+        setup_signal(None, Arc::new(Mutex::new(vec![])), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let task = wait_signal_sleep(&path, "first").await;
+    scheduler.abort_and_wait(id).await.unwrap();
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Closed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+}
+fn setup_signal(
+    deadline: Option<i64>,
+    events: Arc<Mutex<Vec<String>>>,
+    calls: Arc<AtomicUsize>,
+) -> (Options, Registry, pi_rs_durable::extension::Registry) {
+    setup_signal_gate(deadline, events, calls, None)
+}
+fn setup_signal_gate(
+    deadline: Option<i64>,
+    events: Arc<Mutex<Vec<String>>>,
+    calls: Arc<AtomicUsize>,
+    gate: Option<Arc<AtomicUsize>>,
+) -> (Options, Registry, pi_rs_durable::extension::Registry) {
+    let hook = |id| {
+        Arc::new(SignalHook {
+            id,
+            deadline,
+            events: events.clone(),
+            gate: gate.clone(),
+        }) as Arc<dyn Hook>
+    };
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    for (name, hooks, ids) in [
+        ("a", vec![hook("a")], vec!["a"]),
+        ("b", vec![hook("b1"), hook("b2")], vec!["b1", "b2"]),
+    ] {
+        extensions
+            .install_identified(
+                Extension {
+                    name: name.into(),
+                    hooks,
+                    ..Default::default()
+                },
+                ExtensionIdentity::new(
+                    1,
+                    name.into(),
+                    ids.into_iter().map(str::to_owned).collect(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    let mut registry = Registry::default();
+    let adapter = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(Job { calls }),
+        "root",
+        1,
+        vec![],
+        &extensions.snapshot(),
+        &["b".into(), "a".into()],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    (
+        Options {
+            model: Arc::new(ModelStub),
+            tools: vec![adapter.register()],
+            restart_limit: 5,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+        extensions,
+    )
+}
+async fn wait_signal_sleep(path: &std::path::Path, key: &str) -> pi_rs_durable::task::Task {
+    tokio::time::timeout(Duration::from_secs(10), async { loop {
+        let store = durable_store::Store::open(path).unwrap();
+        if let Some(item) = pi_rs_durable::task_store::TaskStore::new(&store).list().unwrap().into_iter().find(|t| matches!(t.task.state(), pi_rs_durable::task::TaskState::Waiting(pi_rs_durable::task::WaitFor::TypedSleep { signals, .. }) if signals.iter().any(|k| k.key() == key))) { break item.task; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    } }).await.unwrap()
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn signal_sleep_worker() {
+    let Some(dir) = std::env::var_os("PI_MULTI_SIGNAL_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let (options, registry, extensions) = setup_signal(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.join("db"), options, extensions).unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["b".into(), "a".into()])
+        .unwrap();
+    std::fs::write(dir.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn signal_sleep_reopens_and_handles_two_distinct_keys_once() {
+    use pi_rs_durable::task_store::SignalResult;
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "signal_sleep_worker"])
+            .env("PI_MULTI_SIGNAL_DIR", dir.path())
+            .spawn()
+            .unwrap(),
+    );
+    let task = wait_signal_sleep(&path, "first").await;
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id: uuid::Uuid = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_signal(None, events.clone(), calls.clone());
+    let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Duplicate
+    );
+    wait_signal_sleep(&path, "second").await;
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "second", json!("two"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    wait_result(&scheduler, id).await;
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "before-b1",
+            "before-b2",
+            "before-b1",
+            "before-b2",
+            "before-a",
+            "after-b1",
+            "after-b2",
+            "after-a"
+        ]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(
+        pi_rs_durable::task_store::TaskStore::new(&store)
+            .read_typed_signal_state(task.id(), &token, "first")
+            .unwrap(),
+        Some(pi_rs_durable::task_store::SignalState::Value(json!("one")))
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn signal_sleep_expiry_is_durable_and_rejects_late_delivery() {
+    use pi_rs_durable::task_store::{SignalResult, SignalState};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) =
+        setup_signal(Some(now_ms() + 1000), events, calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let task = wait_signal_sleep(&path, "first").await;
+    wait_result(&scheduler, id).await;
+    let store = durable_store::Store::open(&path).unwrap();
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        pi_rs_durable::task_store::TaskStore::new(&store)
+            .read_typed_signal_state(task.id(), &token, "first")
+            .unwrap(),
+        Some(SignalState::Expired)
+    );
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Closed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn signal_arriving_after_hook_read_retries_before_dispatch() {
+    use pi_rs_durable::task_store::SignalResult;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let gate = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_signal_gate(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        calls.clone(),
+        Some(gate.clone()),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    let task_id = tasks[0].task.id();
+    drop(store);
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task_id, &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    gate.store(2, Ordering::SeqCst);
+    wait_signal_sleep(&path, "second").await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        driver
+            .deliver_signal(task_id, &token, "second", json!("two"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    wait_result(&scheduler, id).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_races_signal_during_paused_hook() {
+    use pi_rs_durable::task_store::SignalResult;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let gate = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_signal_gate(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        calls.clone(),
+        Some(gate.clone()),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let task_id = tasks[0].task.id();
+    drop(store);
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task_id, &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    tokio::time::timeout(Duration::from_secs(10), scheduler.abort_and_wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    gate.store(2, Ordering::SeqCst);
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .load(task_id)
+        .unwrap()
+        .unwrap()
+        .task;
+    assert!(matches!(
+        task.state(),
+        pi_rs_durable::task::TaskState::Cancelled
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn signal_competing_with_timeout_has_one_durable_outcome() {
+    use pi_rs_durable::task_store::{SignalResult, SignalState};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let deadline = now_ms() + 1500;
+    let (options, registry, extensions) =
+        setup_signal(Some(deadline), Arc::new(Mutex::new(vec![])), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let task = wait_signal_sleep(&path, "first").await;
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    while now_ms() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let result = driver
+        .deliver_signal(task.id(), &token, "first", json!("one"))
+        .unwrap();
+    assert!(matches!(
+        result,
+        SignalResult::Delivered | SignalResult::Closed
+    ));
+    if result == SignalResult::Delivered {
+        assert_eq!(
+            driver
+                .deliver_signal(task.id(), &token, "second", json!("two"))
+                .unwrap(),
+            SignalResult::Delivered
+        );
+    }
+    wait_result(&scheduler, id).await;
+    let store = durable_store::Store::open(&path).unwrap();
+    let state = pi_rs_durable::task_store::TaskStore::new(&store)
+        .read_typed_signal_state(task.id(), &token, "first")
+        .unwrap();
+    assert_eq!(
+        state,
+        Some(if result == SignalResult::Delivered {
+            SignalState::Value(json!("one"))
+        } else {
+            SignalState::Expired
+        })
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}

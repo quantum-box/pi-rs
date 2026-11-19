@@ -605,6 +605,7 @@ struct HookMemo<'a, 'b> {
     admission: &'a AdmissionHandle<'b>,
     cancellation: &'a pi_rs_core::CancellationToken,
     failed: Mutex<Option<String>>,
+    signal_check: Mutex<Option<durable_store::Check>>,
 }
 impl HookMemo<'_, '_> {
     fn access(
@@ -640,6 +641,20 @@ impl HookMemo<'_, '_> {
             |failed| failed.clone(),
         )
     }
+    fn stage_signal_check(
+        &self,
+        docs: &mut crate::document::TaskDocuments<'_>,
+    ) -> Result<(), String> {
+        if let Some(check) = self
+            .signal_check
+            .lock()
+            .map_err(|_| "hook signal fence unavailable")?
+            .clone()
+        {
+            docs.stage_hook_signal_check(check)?;
+        }
+        Ok(())
+    }
 }
 #[async_trait::async_trait]
 impl crate::extension::Memo for HookMemo<'_, '_> {
@@ -653,6 +668,33 @@ impl crate::extension::Memo for HookMemo<'_, '_> {
     ) -> Result<serde_json::Value, String> {
         self.access(key, Some(value))?
             .ok_or_else(|| "memo insertion failed".into())
+    }
+    async fn read_signal(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::task_store::SignalState>, String> {
+        let mut failed = self.failed.lock().map_err(|_| "hook memo unavailable")?;
+        if failed.is_some() {
+            return Err("hook memo unavailable after failure".into());
+        }
+        let result = self
+            .admission
+            .replay_safe_hook_signal_state(key, self.cancellation)
+            .and_then(|(state, check)| {
+                let mut saved = self
+                    .signal_check
+                    .lock()
+                    .map_err(|_| "hook signal fence unavailable")?;
+                if saved.as_ref().is_some_and(|old| old != &check) {
+                    return Err(crate::task_scheduler::UNSAFE_ANCESTOR_BUSY.into());
+                }
+                *saved = Some(check);
+                Ok(state)
+            });
+        if let Err(error) = &result {
+            *failed = Some(error.clone());
+        }
+        result
     }
 }
 
@@ -968,6 +1010,7 @@ impl Executor {
     fn before(
         &self,
         task: &Task,
+        docs: &mut crate::document::TaskDocuments<'_>,
         admission: &AdmissionHandle<'_>,
         cancel: &pi_rs_core::CancellationToken,
     ) -> Result<Step, String> {
@@ -983,6 +1026,7 @@ impl Executor {
             admission,
             cancellation: cancel,
             failed: Mutex::new(None),
+            signal_check: Mutex::new(None),
         };
         let snapshot = admission.checkpointable_hook_snapshot()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1020,6 +1064,7 @@ impl Executor {
                 "task-fenced hook memo failed".into()
             });
         }
+        memo.stage_signal_check(docs)?;
         let before = before?;
         admission.replay_safe_durable_check(cancel)?;
         let (call, decision) = match before {
@@ -1036,23 +1081,54 @@ impl Executor {
             crate::extension::BeforeTool::Sleep(sleep)
                 if admission.is_conversation_checkpointable() && self.replay_safe =>
             {
-                if !sleep.signals.is_empty() {
-                    return Err("checkpointable hook signal waits are unsupported".into());
-                }
-                let Some(until_millis) = sleep.until_millis.filter(|deadline| *deadline >= 0)
-                else {
+                let invalid = (sleep.until_millis.is_none() && sleep.signals.is_empty())
+                    || sleep.until_millis.is_some_and(|deadline| deadline < 0)
+                    || sleep
+                        .signals
+                        .iter()
+                        .any(|key| key.is_empty() || key.len() > 4096)
+                    || sleep
+                        .signals
+                        .iter()
+                        .enumerate()
+                        .any(|(i, key)| sleep.signals[..i].contains(key));
+                if invalid {
                     return self.host_result_checkpoint(
                         call.arguments,
                         "invalid_park",
                         "invalid extension sleep",
                     );
+                }
+                let condition = if sleep.signals.is_empty() {
+                    WaitFor::Sleep {
+                        until_millis: sleep.until_millis,
+                        signals: vec![],
+                    }
+                } else {
+                    let token = crate::extension::checkpointable_hook_signal_token();
+                    let keys = sleep
+                        .signals
+                        .iter()
+                        .map(|key| token.key(key.clone()).map_err(|e| e.to_string()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let (available, check) =
+                        admission.replay_safe_hook_wait_keys_available(&keys, cancel)?;
+                    docs.stage_hook_signal_check(check)?;
+                    if !available {
+                        return self.host_result_checkpoint(
+                            call.arguments,
+                            "invalid_park",
+                            "signal key already consumed or expired",
+                        );
+                    }
+                    WaitFor::TypedSleep {
+                        until_millis: sleep.until_millis,
+                        signals: keys,
+                    }
                 };
                 return Ok(Step::Wait {
                     checkpoint: task.checkpoint().clone(),
-                    condition: WaitFor::Sleep {
-                        until_millis: Some(until_millis),
-                        signals: vec![],
-                    },
+                    condition,
                     children: vec![],
                 });
             }
@@ -1077,9 +1153,11 @@ impl Executor {
             data,
         }))
     }
+    #[allow(clippy::too_many_arguments)] // Fenced hook context and the stored result channels are independent.
     fn after_blocks(
         &self,
         task: &Task,
+        docs: &mut crate::document::TaskDocuments<'_>,
         admission: &AdmissionHandle<'_>,
         cancel: &pi_rs_core::CancellationToken,
         args: serde_json::Value,
@@ -1173,6 +1251,7 @@ impl Executor {
             admission,
             cancellation: cancel,
             failed: Mutex::new(None),
+            signal_check: Mutex::new(None),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1208,6 +1287,7 @@ impl Executor {
                 "task-fenced hook memo failed".into()
             });
         }
+        memo.stage_signal_check(docs)?;
         let result = result?;
         admission.replay_safe_durable_check(cancel)?;
         validate_content_hook_result(&result, required.as_ref(), false)?;
@@ -1224,6 +1304,7 @@ impl Executor {
     fn after(
         &self,
         task: &Task,
+        docs: &mut crate::document::TaskDocuments<'_>,
         admission: &AdmissionHandle<'_>,
         cancel: &pi_rs_core::CancellationToken,
     ) -> Result<Step, String> {
@@ -1255,6 +1336,7 @@ impl Executor {
         if self.block_results {
             return self.after_blocks(
                 task,
+                docs,
                 admission,
                 cancel,
                 stored.arguments,
@@ -1271,6 +1353,7 @@ impl Executor {
             admission,
             cancellation: cancel,
             failed: Mutex::new(None),
+            signal_check: Mutex::new(None),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1304,6 +1387,7 @@ impl Executor {
                 "task-fenced hook memo failed".into()
             });
         }
+        memo.stage_signal_check(docs)?;
         let value = value?;
         admission.replay_safe_durable_check(cancel)?;
         let result = match value.as_str() {
@@ -1731,9 +1815,9 @@ impl Handler for Executor {
             )
         {
             let result = if task.checkpoint().phase == "initial" {
-                self.before(task, admission, cancellation)
+                self.before(task, docs, admission, cancellation)
             } else {
-                self.after(task, admission, cancellation)
+                self.after(task, docs, admission, cancellation)
             };
             if !self
                 .identity

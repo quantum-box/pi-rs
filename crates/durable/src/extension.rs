@@ -79,6 +79,18 @@ mod yield_input_tests {
 pub trait Memo: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Value>, String>;
     async fn get_or_insert(&self, key: &str, value: Value) -> Result<Value, String>;
+    /// Read a checkpointable task hook's durable gate signal, including expiry.
+    async fn read_signal(
+        &self,
+        _key: &str,
+    ) -> Result<Option<crate::task_store::SignalState>, String> {
+        Err("hook signal reads are unavailable in this context".into())
+    }
+}
+
+/// Token used with `task_driver::Driver::deliver_signal` for checkpointable hook gates.
+pub fn checkpointable_hook_signal_token() -> crate::task_store::SignalToken {
+    crate::task_store::SignalToken::new("pi-rs.hook-gate", 1).expect("valid built-in token")
 }
 
 /// Durable first-writer-wins values scoped to one stable task identity.
@@ -211,6 +223,15 @@ impl Memo for DurableMemo {
 pub struct Context<'a> {
     pub snapshot: &'a Value,
     pub memo: &'a dyn Memo,
+}
+impl Context<'_> {
+    /// Read this task's committed hook-gate signal; values remain readable after wake.
+    pub async fn read_signal(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::task_store::SignalState>, String> {
+        self.memo.read_signal(key).await
+    }
 }
 
 #[async_trait]

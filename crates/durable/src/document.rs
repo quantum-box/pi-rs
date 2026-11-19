@@ -2480,6 +2480,22 @@ impl<'a> TaskDocuments<'a> {
         });
         Ok(true)
     }
+    pub(crate) fn stage_hook_signal_check(&mut self, check: Check) -> Result<(), String> {
+        if let Some(existing) = self
+            .signals
+            .batch
+            .checks
+            .iter()
+            .find(|old| old.key == check.key)
+        {
+            if existing != &check {
+                return Err(crate::task_scheduler::UNSAFE_ANCESTOR_BUSY.into());
+            }
+        } else {
+            self.signals.batch.checks.push(check);
+        }
+        Ok(())
+    }
     pub(crate) fn stage_unsafe_park_proof(
         &mut self,
         checkpoint: &crate::task::Checkpoint,
