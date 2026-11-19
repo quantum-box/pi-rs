@@ -10786,6 +10786,14 @@ impl Scheduler {
                                 .load(std::sync::atomic::Ordering::SeqCst)
                         });
                         if stale_hook_gate(&snapshot.task, &self.registry, generation) {
+                            let callback_start = match task_store::clear_callback_start_check(
+                                owner.store(),
+                                snapshot.task.id(),
+                            ) {
+                                Ok(check) => check,
+                                Err(task_store::Error::CallbackStartBusy) => continue,
+                                Err(error) => return Err(error.into()),
+                            };
                             let deadline = match snapshot.task.state() {
                                 TaskState::Waiting(
                                     WaitFor::Sleep { until_millis, .. }
@@ -10823,6 +10831,7 @@ impl Scheduler {
                                     boundary,
                                 );
                             }
+                            batch.checks.push(callback_start);
                             batch.checks.push(durable_store::Check {
                                 key: revision_key,
                                 expected: revision

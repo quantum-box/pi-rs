@@ -99,10 +99,19 @@ fence the claim, identity, task and task-signal revision, owner, abort, late
 outcome and selection. Public `Inbox` APIs must retain their returned checks;
 discarding them or writing directly through raw `Store` is outside the
 cooperating host trust boundary.
-The synchronous Harness API reports `TaskPublicationBusy` when a callback has
-started; it has no automatic retry owner yet. Generic task signals and wake,
-direct abort, and their graph and revision checks remain unconnected. Callback
-dispatch remains disabled until every boundary and retry path is complete.
+A separate per-task durable marker protocol now fences the task record and
+signal revision at start, and makes public task signal delivery and task wake
+transactions check for marker absence. The scheduler leaves an affected waiting
+task parked and periodically retries after marker retirement. The start and
+retirement helpers still require the owning claim and graph checks; they are
+not connected to callback dispatch, and a root marker alone does not cover a
+nested task graph.
+
+The synchronous Harness and task signal APIs still return a busy error when a
+marker or callback start wins; they have no automatic retry owner yet. Direct
+abort, full graph marker coverage and the composed callback start transaction
+remain unconnected. Callback dispatch remains disabled until every boundary
+and retry path is complete.
 
 The pre-dispatch conversation cancel claim transaction also checks the root
 task signal revision and conversation signal revision. A public Inbox or task

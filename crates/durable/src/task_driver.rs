@@ -5892,6 +5892,101 @@ mod tests {
     }
 
     #[test]
+    fn task_start_marker_defers_signal_and_driver_wake_until_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = task_scheduler::Registry::default();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        registry.register("work", true, move |task: &Task| {
+            ran_tx.send(task.id()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let tasks = TaskStore::new(owner.store());
+        let checkpoint = Checkpoint {
+            phase: "waiting".into(),
+            data: json!({}),
+        };
+        let mut waiting = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        waiting.start().unwrap();
+        waiting.wait(WaitFor::Signal("wake".into())).unwrap();
+        let unrelated = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        tasks
+            .save(&[Save::Create(&waiting), Save::Create(&unrelated)])
+            .unwrap();
+        tasks
+            .send_signal(&Signal::new(
+                Uuid::new_v4(),
+                waiting.id(),
+                "wake".into(),
+                json!(1),
+            ))
+            .unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), waiting.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        task_store::on_callback_wake_blocked(waiting.id(), move || {
+            blocked_tx.send(()).unwrap();
+        });
+        let driver = Driver::start(scheduler);
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("driver did not evaluate waiting task");
+        assert!(matches!(
+            driver.get(waiting.id()).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ));
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            unrelated.id()
+        );
+        let extra = Signal::new(Uuid::new_v4(), waiting.id(), "later".into(), json!(2));
+        assert!(matches!(
+            driver.signal(&extra),
+            Err(Error::Task(task_scheduler::Error::Store(
+                task_store::Error::CallbackStartBusy
+            )))
+        ));
+        assert!(tasks.signal(waiting.id(), extra.id).unwrap().is_none());
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), waiting.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            waiting.id()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(waiting.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
     fn signal_delivery_waits_for_task_snapshot_gate() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = task_scheduler::Registry::default();
