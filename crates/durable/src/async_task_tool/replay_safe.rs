@@ -1690,20 +1690,44 @@ impl Handler for Executor {
                     result: "test evidence only".into(),
                 };
                 if admission
-                    .read_live_conversation_cancel_receipt(self, _claim.claim_id)?
+                    .read_live_conversation_cancel_receipt(
+                        self,
+                        _claim.claim_id,
+                        &_identity_lease,
+                        expected,
+                    )?
                     .is_some()
                 {
                     return Err("unexpected pre-existing receipt".into());
                 }
-                admission.store_conversation_cancel_receipt(self, &receipt)?;
-                admission.store_conversation_cancel_receipt(self, &receipt)?;
-                if admission.read_live_conversation_cancel_receipt(self, _claim.claim_id)?
-                    != Some(receipt.clone())
+                admission.store_conversation_cancel_receipt(
+                    self,
+                    &receipt,
+                    &_identity_lease,
+                    expected,
+                )?;
+                admission.store_conversation_cancel_receipt(
+                    self,
+                    &receipt,
+                    &_identity_lease,
+                    expected,
+                )?;
+                if admission.read_live_conversation_cancel_receipt(
+                    self,
+                    _claim.claim_id,
+                    &_identity_lease,
+                    expected,
+                )? != Some(receipt.clone())
                 {
                     return Err("receipt read mismatch".into());
                 }
                 if admission
-                    .read_live_conversation_cancel_receipt(self, uuid::Uuid::new_v4())
+                    .read_live_conversation_cancel_receipt(
+                        self,
+                        uuid::Uuid::new_v4(),
+                        &_identity_lease,
+                        expected,
+                    )
                     .is_ok()
                 {
                     return Err("foreign claim accepted".into());
@@ -1711,7 +1735,7 @@ impl Handler for Executor {
                 let mut foreign = receipt.clone();
                 foreign.claim.attempt = uuid::Uuid::new_v4();
                 if admission
-                    .store_conversation_cancel_receipt(self, &foreign)
+                    .store_conversation_cancel_receipt(self, &foreign, &_identity_lease, expected)
                     .is_ok()
                 {
                     return Err("foreign attempt accepted".into());

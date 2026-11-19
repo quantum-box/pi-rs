@@ -2348,7 +2348,12 @@ impl AdmissionHandle<'_> {
         &self,
         handler: &dyn Handler,
         receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
     ) -> Result<(), String> {
+        if identity_lease.as_deref() != Some(expected_identity) {
+            return Err("conversation identity lease mismatch".into());
+        }
         if !self.abort || self.standalone || self.lease.retired {
             return Err("invalid conversation cleanup lease".into());
         }
@@ -2475,7 +2480,12 @@ impl AdmissionHandle<'_> {
         &self,
         handler: &dyn Handler,
         claim_id: Uuid,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
     ) -> Result<Option<ConversationCancelReceipt>, String> {
+        if identity_lease.as_deref() != Some(expected_identity) {
+            return Err("conversation identity lease mismatch".into());
+        }
         if !self.abort || self.standalone || self.lease.retired {
             return Err("invalid conversation cleanup lease".into());
         }
