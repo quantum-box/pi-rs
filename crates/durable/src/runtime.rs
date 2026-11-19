@@ -122,15 +122,6 @@ pub(crate) fn cleanup_attempt_id(value: &[u8]) -> Option<Uuid> {
 }
 
 #[cfg(test)]
-fn placement_start_busy_hooks()
--> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>> {
-    static HOOKS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>,
-    > = std::sync::OnceLock::new();
-    HOOKS.get_or_init(Default::default)
-}
-
-#[cfg(test)]
 pub(crate) fn cleanup_marker_hooks()
 -> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>> {
     static HOOKS: std::sync::OnceLock<
@@ -3232,7 +3223,6 @@ pub struct Harness {
     /// conflicts from changes to execution state.
     loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
     execution_gate: Option<Arc<std::sync::Mutex<()>>>,
-    scheduled_placement_gate: Option<durable_store::controls::CallbackStartGate>,
     task_driver: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::task_driver::Shared>>>>,
     pub(crate) task_publication:
         Arc<std::sync::Mutex<Option<crate::task_scheduler::FailurePublication>>>,
@@ -3244,8 +3234,7 @@ thread_local! {
     static TASK_RESULT_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 #[cfg(test)]
-type StoppedReceiptReadHooks =
-    std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+type StoppedReceiptReadHooks = std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
 #[cfg(test)]
 fn stopped_receipt_read_hooks() -> &'static StoppedReceiptReadHooks {
     static HOOKS: std::sync::OnceLock<StoppedReceiptReadHooks> = std::sync::OnceLock::new();
@@ -4791,7 +4780,6 @@ impl Harness {
             storage_failed: Arc::new(AtomicBool::new(false)),
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
-            scheduled_placement_gate: None,
             task_driver: Arc::new(std::sync::Mutex::new(None)),
             task_publication: Arc::new(std::sync::Mutex::new(None)),
             activity: Default::default(),
@@ -4819,7 +4807,6 @@ impl Harness {
             storage_failed: self.storage_failed.clone(),
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
-            scheduled_placement_gate: None,
             task_driver: self.task_driver.clone(),
             task_publication: self.task_publication.clone(),
             activity: self.activity.clone(),
@@ -12767,11 +12754,7 @@ impl Harness {
         Ok(page)
     }
     /// Persist a reset; busy conversations place it at the next safe boundary.
-    /// A callback-start fence returns `TaskPublicationBusy` before any write;
-    /// callers may retry the same operation after the fence is released.
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
-        let gate = self.owner.conversation_controls().get(id).callback_start;
-        let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
         loop {
             let (mut state, version) = self.load(id)?;
@@ -14221,14 +14204,11 @@ impl Harness {
         }
     }
     /// Withdraw an input or write only while queued. Request IDs remain reserved.
-    /// A callback-start fence returns `TaskPublicationBusy` before any write.
     pub fn withdraw_submission(
         &mut self,
         id: Uuid,
         submission: Uuid,
     ) -> Result<WithdrawResult, Error> {
-        let gate = self.owner.conversation_controls().get(id).callback_start;
-        let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
         loop {
             let (mut c, version) = self.load(id)?;
             if let Some(item) = c.submissions.iter_mut().find(|item| item.id == submission) {
@@ -16532,27 +16512,6 @@ impl Harness {
                     c.retry_state = RetryState::default();
                     c.overflow_compaction_attempted = false;
                     c.phase = Phase::ModelReady { turns: 0 };
-                    // This placement has no external work in flight. If a
-                    // callback is starting, abandon this uncommitted candidate
-                    // and retry from the persisted Idle state after yielding.
-                    // Only the scheduled worker has a retry owner for this
-                    // busy signal; direct Harness driving is a separate path.
-                    let _placement_lease = if let Some(start_gate) = &self.scheduled_placement_gate
-                    {
-                        let Some(lease) = start_gate.try_enter() else {
-                            #[cfg(test)]
-                            if let Some(signal) =
-                                placement_start_busy_hooks().lock().unwrap().remove(&id)
-                            {
-                                signal.add_permits(1);
-                            }
-                            *identity_busy = true;
-                            return Ok(());
-                        };
-                        Some(lease)
-                    } else {
-                        None
-                    };
                     // Placement races with withdrawal and queued resets. Re-read
                     // rather than merging a stale placement over a newer inbox.
                     let merge = self.merge_admissions;
@@ -16937,28 +16896,6 @@ impl Harness {
                             Err(error) => return Err(error),
                         }
                     }
-                    // This is the pre-dispatch ModelReady -> ModelRunning
-                    // save. No model call has begun, so a busy gate can leave
-                    // the durable ModelReady state for the worker to retry.
-                    let _start_lease = if matches!(c.phase, Phase::ModelRunning { .. }) {
-                        if let Some(gate) = &self.scheduled_placement_gate {
-                            let Some(lease) = gate.try_enter() else {
-                                #[cfg(test)]
-                                if let Some(signal) =
-                                    placement_start_busy_hooks().lock().unwrap().remove(&id)
-                                {
-                                    signal.add_permits(1);
-                                }
-                                *identity_busy = true;
-                                return Ok(());
-                            };
-                            Some(lease)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::ModelRunning {
@@ -22226,7 +22163,6 @@ impl Scheduler {
         let lock = control.worker;
         let cancel = control.cancel;
         let mut worker = self.harness.worker();
-        worker.scheduled_placement_gate = Some(control.callback_start);
         worker.execution_gate = Some(control.gate);
         let errors = self.worker_errors.clone();
         let activity = self.harness.activity.enter_at(
@@ -25131,200 +25067,6 @@ mod scheduler_tests {
         writer.join().unwrap();
         let id = harness.create_conversation(config()).unwrap();
         assert_eq!(harness.conversation(id).unwrap().id, id);
-    }
-
-    #[tokio::test]
-    async fn direct_withdraw_is_retryable_while_callback_start_gate_is_held() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut scheduler =
-            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
-        let id = scheduler.create_conversation(config()).unwrap();
-        let (mut state, version) = scheduler.harness.load(id).unwrap();
-        let submission = Uuid::new_v4();
-        state.admit_initial_input(submission, "queued input".into());
-        state.submissions[0].status = Status::Queued;
-        state.active = None;
-        state.messages.clear();
-        state.phase = Phase::Idle;
-        scheduler
-            .harness
-            .save(&state, Expected::Version(version))
-            .unwrap();
-        let (before, version) = scheduler.harness.load(id).unwrap();
-        let gate = scheduler
-            .harness
-            .owner
-            .conversation_controls()
-            .get(id)
-            .callback_start;
-        let lease = gate.try_enter().unwrap();
-        assert!(matches!(
-            scheduler.withdraw_submission(id, submission),
-            Err(Error::TaskPublicationBusy)
-        ));
-        let (during, during_version) = scheduler.harness.load(id).unwrap();
-        assert_eq!(during_version, version);
-        assert_eq!(
-            serde_json::to_value(&during).unwrap(),
-            serde_json::to_value(&before).unwrap()
-        );
-        drop(lease);
-        assert!(matches!(
-            scheduler.withdraw_submission(id, submission).unwrap(),
-            WithdrawResult::Aborted
-        ));
-        let after = scheduler.conversation(id).unwrap();
-        assert!(
-            after
-                .submissions
-                .iter()
-                .any(|s| s.id == submission && matches!(s.status, Status::Unanswered { .. }))
-        );
-        scheduler.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn direct_reset_is_retryable_while_callback_start_gate_is_held() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut scheduler =
-            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
-        let id = scheduler.create_conversation(config()).unwrap();
-        let (before, version) = scheduler.harness.load(id).unwrap();
-        let gate = scheduler
-            .harness
-            .owner
-            .conversation_controls()
-            .get(id)
-            .callback_start;
-        let lease = gate.try_enter().unwrap();
-        assert!(matches!(
-            scheduler.reset(id, Some("handoff".into())),
-            Err(Error::TaskPublicationBusy)
-        ));
-        let (during, during_version) = scheduler.harness.load(id).unwrap();
-        assert_eq!(during_version, version);
-        assert_eq!(
-            serde_json::to_value(&during).unwrap(),
-            serde_json::to_value(&before).unwrap()
-        );
-        drop(lease);
-        let reset = scheduler.reset(id, Some("handoff".into())).unwrap();
-        let after = scheduler.conversation(id).unwrap();
-        assert!(after.resets.iter().any(|entry| entry.id == reset));
-        scheduler.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn model_start_save_waits_for_callback_start_gate_and_retries() {
-        let dir = tempfile::tempdir().unwrap();
-        let model = placement_model();
-        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
-        let id = scheduler.create_conversation(config()).unwrap();
-        let gate = scheduler
-            .harness
-            .owner
-            .conversation_controls()
-            .get(id)
-            .callback_start;
-        let lease = gate.try_enter().unwrap();
-        let busy = Arc::new(Semaphore::new(0));
-        placement_start_busy_hooks()
-            .lock()
-            .unwrap()
-            .insert(id, busy.clone());
-        let submission = scheduler.submit(id, None, "input".into()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), busy.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        let during = scheduler.conversation(id).unwrap();
-        assert!(matches!(during.phase, Phase::ModelReady { .. }));
-        assert_eq!(model.started.available_permits(), 0);
-        drop(lease);
-        tokio::time::timeout(Duration::from_secs(5), model.started.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        model.release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            scheduler
-                .conversation(id)
-                .unwrap()
-                .submissions
-                .iter()
-                .any(|s| s.id == submission && matches!(s.status, Status::Done { .. }))
-        );
-        scheduler.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn idle_placement_waits_for_callback_start_gate_and_retries() {
-        let dir = tempfile::tempdir().unwrap();
-        let model = placement_model();
-        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
-        let id = scheduler.create_conversation(config()).unwrap();
-        let (mut state, version) = scheduler.harness.load(id).unwrap();
-        let submission = Uuid::new_v4();
-        state.admit_initial_input(submission, "queued input".into());
-        state.submissions[0].status = Status::Queued;
-        state.active = None;
-        state.messages.clear();
-        state.phase = Phase::Idle;
-        scheduler
-            .harness
-            .save(&state, Expected::Version(version))
-            .unwrap();
-        let (before, before_version) = scheduler.harness.load(id).unwrap();
-        let start_gate = scheduler
-            .harness
-            .owner
-            .conversation_controls()
-            .get(id)
-            .callback_start;
-        let held = start_gate.try_enter().unwrap();
-        let busy = Arc::new(Semaphore::new(0));
-        placement_start_busy_hooks()
-            .lock()
-            .unwrap()
-            .insert(id, busy.clone());
-        scheduler.schedule(id);
-        tokio::time::timeout(Duration::from_secs(5), busy.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        let (during, during_version) = scheduler.harness.load(id).unwrap();
-        assert_eq!(during_version, before_version);
-        assert_eq!(
-            serde_json::to_value(&during).unwrap(),
-            serde_json::to_value(&before).unwrap()
-        );
-        assert_eq!(model.started.available_permits(), 0);
-        drop(held);
-        tokio::time::timeout(Duration::from_secs(5), model.started.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        model.release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
-            .await
-            .unwrap()
-            .unwrap();
-        let final_state = scheduler.conversation(id).unwrap();
-        assert!(
-            final_state
-                .submissions
-                .iter()
-                .any(|s| s.id == submission && matches!(s.status, Status::Done { .. }))
-        );
-        scheduler.shutdown().await.unwrap();
     }
 
     #[tokio::test]

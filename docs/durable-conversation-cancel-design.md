@@ -49,32 +49,6 @@ match. Recovery remains limited to a failed, abort-marked unhooked root while
 the conversation retains its pending binding. It does not authorize callback
 dispatch or establish that a callback ran.
 
-The scheduled worker's Idle-to-ModelReady input placement now takes the
-callback-start gate without blocking. If it is busy, the uncommitted placement
-is discarded and the worker retries from durable state. Other save and direct
-Harness paths do not yet take this gate, so it does not authorize dispatch.
-
-The direct `Harness::reset` and `Harness::withdraw_submission` paths also try the gate before constructing or
-saving a reset, returning `TaskPublicationBusy` for the caller to retry. This
-is not an automatic retry. Other direct mutation APIs (input and write
-admission, session transactions, reset-with-blocks, abort and
-extension selection) and the general Harness save/commit paths have not been
-connected. Some of those compose task and document writes or use the blocking
-conversation fence; their lock ordering and retry owners still need separate
-verification before dispatch can be enabled.
-
-A nonblocking target-specific start lease can bracket exactly the first poll
-of a future without holding registry, task or poll mutexes. It is a primitive
-only: callback dispatch and most mutation paths do not yet use it. Existing
-`try_fence` still acquires all registered start gates and can defer unrelated
-graphs; blocking abort and signal delivery are not protected by this primitive.
-The task wake and signal revision must be checked before dispatch is enabled.
-
-The `Scheduler::schedule` worker also fences its ModelReady-to-ModelRunning
-save before model dispatch. Busy leaves the durable state unchanged and retries
-through the scheduled worker. This does not yet fence the general Harness save
-path, post-effect result saves, signal delivery, or blocking abort.
-
 A safe implementation needs all of the following before dispatch is enabled:
 
 * Bind the callback identity, retry policy, Tool identity and selected hook
