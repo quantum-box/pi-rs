@@ -343,6 +343,7 @@ fn register_with_policy(
 
 /// Build a replay-safe definition before opening a conversation harness.
 /// Selected children must share the same stable and live hook registration.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn register_conversation_candidate(
     registry: &mut crate::task_scheduler::Registry,
     tool: Arc<dyn DurableAsyncTool>,
