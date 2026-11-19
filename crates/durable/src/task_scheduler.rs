@@ -3387,12 +3387,13 @@ impl AdmissionHandle<'_> {
         key: &str,
         value: Option<serde_json::Value>,
         cancel: &pi_rs_core::CancellationToken,
+        signal_check: Option<&durable_store::Check>,
     ) -> Result<Option<serde_json::Value>, String> {
         if key.is_empty() || key.len() > 4096 {
             return Err("invalid memo key".into());
         }
         for _ in 0..8 {
-            match self.replay_safe_hook_memo_once(key, value.clone(), cancel) {
+            match self.replay_safe_hook_memo_once(key, value.clone(), cancel, signal_check) {
                 Err(error) if error == HOOK_FENCE_CONFLICT => continue,
                 result => return result,
             }
@@ -3478,6 +3479,7 @@ impl AdmissionHandle<'_> {
         key: &str,
         value: Option<serde_json::Value>,
         cancel: &pi_rs_core::CancellationToken,
+        signal_check: Option<&durable_store::Check>,
     ) -> Result<Option<serde_json::Value>, String> {
         let store = self.lease.attachment.owner.store();
         let storage_key =
@@ -3511,13 +3513,17 @@ impl AdmissionHandle<'_> {
             }
             (None, None) => (None, vec![]),
         };
+        let mut checks = vec![check];
+        if let Some(signal_check) = signal_check {
+            checks.push(signal_check.clone());
+        }
         self.replay_safe_durable_fence(
             false,
             self.running.task.replay_safe(),
             Some(cancel),
             false,
             true,
-            (&[check], &mutations),
+            (&checks, &mutations),
         )?;
         Ok(result)
     }

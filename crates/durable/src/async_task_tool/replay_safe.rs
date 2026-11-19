@@ -619,9 +619,16 @@ impl HookMemo<'_, '_> {
             return Err("hook memo unavailable after failure".into());
         }
         let inserting = value.is_some();
-        let result = self
-            .admission
-            .replay_safe_hook_memo(key, value, self.cancellation)
+        let signal_check = self
+            .signal_check
+            .lock()
+            .map(|check| check.clone())
+            .map_err(|_| "hook signal fence unavailable".to_owned());
+        let result = signal_check
+            .and_then(|check| {
+                self.admission
+                    .replay_safe_hook_memo(key, value, self.cancellation, check.as_ref())
+            })
             .and_then(|value| {
                 if inserting && value.is_none() {
                     Err("memo insertion failed".into())

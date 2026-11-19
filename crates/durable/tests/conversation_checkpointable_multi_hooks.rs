@@ -851,6 +851,17 @@ impl Hook for SignalHook {
             match ctx.read_signal("first").await? {
                 None => {
                     if let Some(gate) = &self.gate
+                        && gate.load(Ordering::SeqCst) == 10
+                    {
+                        gate.store(11, Ordering::SeqCst);
+                        while gate.load(Ordering::SeqCst) != 12 {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        ctx.memo
+                            .get_or_insert("review-decision", json!("denied-before-signal"))
+                            .await?;
+                    }
+                    if let Some(gate) = &self.gate
                         && gate.load(Ordering::SeqCst) == 0
                     {
                         gate.store(1, Ordering::SeqCst);
@@ -864,6 +875,13 @@ impl Hook for SignalHook {
                     }));
                 }
                 Some(pi_rs_durable::task_store::SignalState::Value(v)) if v == json!("one") => {
+                    if let Some(gate) = &self.gate
+                        && gate.load(Ordering::SeqCst) == 12
+                        && ctx.memo.get("review-decision").await?
+                            == Some(json!("denied-before-signal"))
+                    {
+                        return Ok(BeforeTool::Block("stale memo denied approval".into()));
+                    }
                     if self.deadline == Some(i64::MAX) {
                         return Ok(BeforeTool::Sleep(pi_rs_durable::extension::Sleep {
                             signals: vec!["first".into()],
@@ -1835,6 +1853,65 @@ async fn review_abort_sleep_result_is_not_duplicated_after_reopen() {
         messages
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn signal_revision_fences_memo_and_retries_fresh() {
+    use pi_rs_durable::task_store::SignalResult;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let gate = Arc::new(AtomicUsize::new(10));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_signal_gate(
+        None,
+        Arc::new(Mutex::new(vec![])),
+        calls.clone(),
+        Some(gate.clone()),
+    );
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.load(Ordering::SeqCst) != 11 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()[0]
+        .task
+        .id();
+    drop(store);
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    assert_eq!(
+        driver
+            .deliver_signal(task, &token, "first", json!("one"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    gate.store(12, Ordering::SeqCst);
+    let task = wait_signal_sleep(&path, "second").await;
+    let store = durable_store::Store::open(&path).unwrap();
+    assert!(
+        store
+            .get(format!("runtime/extension-memo/{}/review-decision", task.id()).as_bytes())
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    assert_eq!(
+        driver
+            .deliver_signal(task.id(), &token, "second", json!("two"))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    wait_result(&scheduler, id).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
 }
