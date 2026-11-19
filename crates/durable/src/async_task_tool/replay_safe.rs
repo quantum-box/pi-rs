@@ -313,6 +313,18 @@ pub(super) fn validate_content_hook_result(
     // checkpoint. Allow it to reach the first hook; replacements remain subject
     // to the final result bound before any later hook can observe them.
     validate_content_result_with_limit(result, if initial { 4 * 65536 } else { 60 * 1024 })?;
+    if !initial {
+        let envelope = DurableTaskResult::Rich {
+            task_content_v1: result.clone(),
+        };
+        if serde_json::to_vec(&envelope)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 60 * 1024
+        {
+            return Err("rich result exceeds size limit".into());
+        }
+    }
     if let Some(gate) = required
         && (result.extra.get("isError") != Some(&serde_json::Value::Bool(true))
             || !result.diagnostics.contains(gate))

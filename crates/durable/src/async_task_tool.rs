@@ -4610,7 +4610,13 @@ mod tests {
                     _ => "tool_skipped",
                 })
             );
-            assert!(diagnostic.message.len() <= 4096 && diagnostic.message.len() >= 4093);
+            if mode == 0 {
+                // Host-generated reasons are capped at 2048 UTF-8 bytes before
+                // adding the diagnostic prefix; tool reasons have a 4096-byte cap.
+                assert!((2048..=2080).contains(&diagnostic.message.len()));
+            } else {
+                assert!((4093..=4096).contains(&diagnostic.message.len()));
+            }
             assert!(result.output[0]["text"].as_str().unwrap().len() > diagnostic.message.len());
             assert_eq!(result.extra.get("isError"), Some(&json!(true)));
             assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -4697,6 +4703,107 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+        }
+    }
+
+    struct EnvelopeBoundaryHook(usize);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for EnvelopeBoundaryHook {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let mut output = input.clone();
+            output.output = vec![json!({"type":"text", "text":""})];
+            let empty_envelope = serde_json::to_vec(&DurableTaskResult::Rich {
+                task_content_v1: output.clone(),
+            })
+            .map_err(|e| e.to_string())?
+            .len();
+            output.output[0]["text"] = json!("x".repeat(self.0 - empty_envelope));
+            let raw_size = serde_json::to_vec(&output)
+                .map_err(|e| e.to_string())?
+                .len();
+            let envelope_size = serde_json::to_vec(&DurableTaskResult::Rich {
+                task_content_v1: output.clone(),
+            })
+            .map_err(|e| e.to_string())?
+            .len();
+            assert!(raw_size <= 60 * 1024);
+            assert_eq!(envelope_size, self.0);
+            Ok(Some(output))
+        }
+    }
+
+    #[test]
+    fn durable_content_envelope_boundary_fences_later_hook_and_memo() {
+        for oversized in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let later = Arc::new(AtomicUsize::new(0));
+            let mut extensions = crate::extension::Registry::default();
+            for (name, hook) in [
+                (
+                    "first",
+                    Arc::new(EnvelopeBoundaryHook(60 * 1024 + usize::from(oversized)))
+                        as Arc<dyn crate::extension::Hook>,
+                ),
+                (
+                    "second",
+                    Arc::new(LateContentMemo(later.clone())) as Arc<dyn crate::extension::Hook>,
+                ),
+            ] {
+                extensions
+                    .install_identified(
+                        crate::extension::Extension {
+                            name: name.into(),
+                            hooks: vec![hook],
+                            ..Default::default()
+                        },
+                        crate::extension::ExtensionIdentity::new(
+                            1,
+                            format!("{name}-v1"),
+                            vec!["hook".into()],
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let mut host = StandaloneBeforeHookHost::open(&path, Registry::default()).unwrap();
+            let tool = host
+                .register_replay_safe_durable_tool_with_content_hooks(
+                    Arc::new(ImmediateDurable(calls.clone())),
+                    "immediate-v1",
+                    1,
+                    vec![],
+                    &extensions.snapshot(),
+                    &["first".into(), "second".into()],
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, id);
+            if oversized {
+                assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+            } else {
+                let crate::task::TaskState::Succeeded(value) = task.state() else {
+                    panic!("boundary result failed: {:?}", task.state());
+                };
+                assert_eq!(serde_json::to_vec(value).unwrap().len(), 60 * 1024);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(later.load(Ordering::SeqCst), usize::from(!oversized));
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            let memo = store
+                .get(format!("runtime/extension-memo/{id}/must-not-run").as_bytes())
+                .unwrap();
+            assert_eq!(memo.is_some(), !oversized);
         }
     }
 
