@@ -1359,6 +1359,23 @@ impl AdmissionHandle<'_> {
         test_namespace: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
     ) -> Result<Vec<u8>, String> {
+        self.replay_safe_durable_fence(test_namespace, cancellation, true, &[], &[])
+    }
+    pub(crate) fn replay_safe_durable_check(
+        &self,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> Result<(), String> {
+        self.replay_safe_durable_fence(false, Some(cancellation), false, &[], &[])
+            .map(|_| ())
+    }
+    fn replay_safe_durable_fence(
+        &self,
+        test_namespace: bool,
+        cancellation: Option<&pi_rs_core::CancellationToken>,
+        write_intent: bool,
+        extra_checks: &[durable_store::Check],
+        extra_mutations: &[durable_store::Mutation],
+    ) -> Result<Vec<u8>, String> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         if !self.standalone
             || self.abort
@@ -1458,17 +1475,65 @@ impl AdmissionHandle<'_> {
             key: key.clone(),
             expected: durable_store::Expected::Missing,
         });
+        checks.extend_from_slice(extra_checks);
+        let mut mutations = if write_intent {
+            vec![durable_store::Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&current.task).map_err(|e| e.to_string())?,
+            }]
+        } else {
+            vec![]
+        };
+        mutations.extend_from_slice(extra_mutations);
         owner
             .store()
-            .commit(
-                &checks,
-                &[durable_store::Mutation::Put {
-                    key: key.clone(),
-                    value: serde_json::to_vec(&current.task).map_err(|e| e.to_string())?,
-                }],
-            )
+            .commit(&checks, &mutations)
             .map_err(|e| e.to_string())?;
         Ok(key)
+    }
+    pub(crate) fn replay_safe_hook_memo(
+        &self,
+        key: &str,
+        value: Option<serde_json::Value>,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<Option<serde_json::Value>, String> {
+        if key.is_empty() || key.len() > 4096 {
+            return Err("invalid memo key".into());
+        }
+        let store = self.lease.attachment.owner.store();
+        let storage_key =
+            format!("runtime/extension-memo/{}/{}", self.running.task.id(), key).into_bytes();
+        let existing = store.get(&storage_key).map_err(|e| e.to_string())?;
+        let check = durable_store::Check {
+            key: storage_key.clone(),
+            expected: existing
+                .as_ref()
+                .map_or(durable_store::Expected::Missing, |e| {
+                    durable_store::Expected::Version(e.version)
+                }),
+        };
+        let (result, mutations) = match (existing, value) {
+            (Some(entry), _) => (
+                Some(serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?),
+                vec![],
+            ),
+            (None, Some(value)) => {
+                let encoded = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+                if encoded.len() > 65536 {
+                    return Err("memo value exceeds 64 KiB".into());
+                }
+                (
+                    Some(value),
+                    vec![durable_store::Mutation::Put {
+                        key: storage_key,
+                        value: encoded,
+                    }],
+                )
+            }
+            (None, None) => (None, vec![]),
+        };
+        self.replay_safe_durable_fence(false, Some(cancel), false, &[check], &mutations)?;
+        Ok(result)
     }
     /// Atomically admit or reconnect a keyed TaskTool child. The parent must be
     /// a live, non-aborted TaskTool attempt with this exact executor lease.

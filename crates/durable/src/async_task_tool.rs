@@ -226,7 +226,14 @@ impl StandaloneNoHooksHost {
         children: Vec<Arc<crate::task_tool::TaskTool>>,
         _authorization: ReplaySafeAuthorization,
     ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
-        replay_safe::register(&mut self.scheduler, tool, implementation, version, children)
+        replay_safe::register(
+            &mut self.scheduler,
+            tool,
+            implementation,
+            version,
+            children,
+            None,
+        )
     }
 
     /// Create a standalone root before transferring this host to its driver.
@@ -413,6 +420,37 @@ impl StandaloneBeforeHookHost {
             Arc::new(SelectedBeforeHooks(resolved)),
             after,
         )
+    }
+    /// Register a replay-safe durable Tool and one replay-safe hook. The hook
+    /// identity covers code and configuration. Memo is task-fenced; hook
+    /// parking is not available in this initial integration.
+    pub fn register_replay_safe_durable_tool_with_hook(
+        &mut self,
+        tool: Arc<dyn DurableAsyncTool>,
+        implementation: &str,
+        version: u32,
+        children: Vec<Arc<crate::task_tool::TaskTool>>,
+        hook_identity: &str,
+        hook: Arc<dyn crate::extension::Hook>,
+        _authorization: ReplaySafeAuthorization,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        replay_safe::register(
+            &mut self.scheduler,
+            tool,
+            implementation,
+            version,
+            children,
+            Some((hook_identity.into(), hook)),
+        )
+    }
+    pub fn start_replay_safe_root(
+        &self,
+        tool: &Arc<crate::task_tool::TaskTool>,
+        input: serde_json::Value,
+        restart_limit: u32,
+    ) -> Result<uuid::Uuid, String> {
+        self.scheduler
+            .submit_replay_safe_async_root(tool, input, restart_limit)
     }
     pub fn into_driver(self) -> crate::task_driver::Driver {
         crate::task_driver::Driver::start(self.scheduler)
@@ -2656,6 +2694,557 @@ mod tests {
         });
         (root.task_id(), middle.task_id(), leaf.task_id())
     }
+    struct DurableHooks {
+        before: Arc<AtomicUsize>,
+        after: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for DurableHooks {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            if ctx.memo.get_or_insert("phase", json!("prepared")).await? != json!("prepared") {
+                return Err("memo changed".into());
+            }
+            self.before.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::extension::BeforeTool::Rewrite(json!({"bound":true})))
+        }
+        async fn after_tool(
+            &self,
+            call: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if call.arguments != json!({"bound":true}) {
+                return Err("rewritten arguments changed".into());
+            }
+            if ctx.memo.get("phase").await? != Some(json!("prepared")) {
+                return Err("memo missing after wake".into());
+            }
+            self.after.fetch_add(1, Ordering::SeqCst);
+            if call.name == "root"
+                && let Some(root) = std::env::var_os("PI_RS_HOOKED_AFTER_CUT_1120")
+            {
+                std::fs::write(std::path::PathBuf::from(root).join("after-cut"), b"ready")
+                    .map_err(|e| e.to_string())?;
+                std::future::pending::<()>().await;
+            }
+            Ok(None)
+        }
+    }
+    struct HookedChainTool(ChainTool);
+    #[async_trait::async_trait]
+    impl Tool for HookedChainTool {
+        fn spec(&self) -> ToolSpec {
+            self.0.spec()
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for HookedChainTool {
+        async fn execute_durable(
+            &self,
+            args: serde_json::Value,
+            context: ToolContext,
+            resume: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            if args != json!({"bound":true}) {
+                return Err("rewritten arguments lost across wake".into());
+            }
+            self.0.execute_durable(args, context, resume, host).await
+        }
+    }
+    fn hooked_chain_scheduler(
+        path: &std::path::Path,
+        any: bool,
+        root_calls: Arc<AtomicUsize>,
+        middle_calls: Arc<AtomicUsize>,
+        before: Arc<AtomicUsize>,
+        after: Arc<AtomicUsize>,
+    ) -> crate::task_scheduler::Scheduler {
+        use crate::task_scheduler::Handler;
+        let root_slot = Arc::new(std::sync::OnceLock::new());
+        let outer: Arc<dyn Handler> = Arc::new(ProductionOuter(root_slot.clone()));
+        let leaf: Arc<dyn Handler> = Arc::new(ChainLeaf);
+        let mut registry = Registry::default();
+        for (kind, handler) in [
+            ("production-outer", outer),
+            ("production-leaf", leaf.clone()),
+        ] {
+            assert!(registry.register_shared(kind, true, handler));
+            assert!(
+                registry.set_abort(kind, |_: &Task| Ok(crate::task_scheduler::Step::Succeed(
+                    json!(null)
+                )))
+            );
+        }
+        let mut host = StandaloneBeforeHookHost::open(path, registry).unwrap();
+        let leaf_tool = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "leaf".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "production-leaf",
+            true,
+            1,
+            leaf,
+        ));
+        let middle: Arc<dyn DurableAsyncTool> = Arc::new(HookedChainTool(ChainTool {
+            name: "middle",
+            child: "leaf",
+            calls: middle_calls,
+            any,
+        }));
+        let middle_tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                middle,
+                "pure-middle-v1",
+                1,
+                vec![leaf_tool],
+                "middle-hook-v1",
+                Arc::new(DurableHooks {
+                    before: before.clone(),
+                    after: after.clone(),
+                }),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let root: Arc<dyn DurableAsyncTool> = Arc::new(HookedChainTool(ChainTool {
+            name: "root",
+            child: "middle",
+            calls: root_calls,
+            any,
+        }));
+        let root_tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                root,
+                "pure-root-v1",
+                1,
+                vec![middle_tool],
+                "root-hook-v1",
+                Arc::new(DurableHooks { before, after }),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        assert!(root_slot.set(root_tool).is_ok());
+        host.into_scheduler_for_test()
+    }
+    #[test]
+    fn hooked_durable_multilevel_park_wake_runs_hooks_once() {
+        for any in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let before = Arc::new(AtomicUsize::new(0));
+            let after = Arc::new(AtomicUsize::new(0));
+            let root_calls = Arc::new(AtomicUsize::new(0));
+            let middle_calls = Arc::new(AtomicUsize::new(0));
+            let scheduler = hooked_chain_scheduler(
+                &dir.path().join("db"),
+                any,
+                root_calls.clone(),
+                middle_calls.clone(),
+                before.clone(),
+                after.clone(),
+            );
+            let parent = production_outer_task();
+            scheduler.submit(&parent).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let (_, _, leaf) = production_chain_parked(&driver, parent.id());
+            assert_eq!(before.load(Ordering::SeqCst), 2);
+            assert_eq!(after.load(Ordering::SeqCst), 0);
+            release_chain(&driver, parent.id(), leaf);
+            assert_eq!(root_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(before.load(Ordering::SeqCst), 2);
+            assert_eq!(after.load(Ordering::SeqCst), 2);
+            driver.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn hooked_durable_multilevel_park_survives_process_kill() {
+        const ENV: &str = "PI_RS_HOOKED_PARK_KILL_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let scheduler = hooked_chain_scheduler(
+                &root.join("db"),
+                false,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            let parent = production_outer_task();
+            scheduler.submit(&parent).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let (_, _, leaf) = production_chain_parked(&driver, parent.id());
+            std::fs::write(root.join("parked"), format!("{} {}", parent.id(), leaf)).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::hooked_durable_multilevel_park_survives_process_kill")
+            .env(ENV, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("parked").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("hooked durable chain did not park");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let saved = std::fs::read_to_string(dir.path().join("parked")).unwrap();
+        let mut fields = saved.split_whitespace();
+        let parent: Uuid = fields.next().unwrap().parse().unwrap();
+        let leaf: Uuid = fields.next().unwrap().parse().unwrap();
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let root_calls = Arc::new(AtomicUsize::new(0));
+        let middle_calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = hooked_chain_scheduler(
+            &dir.path().join("db"),
+            false,
+            root_calls.clone(),
+            middle_calls.clone(),
+            before.clone(),
+            after.clone(),
+        );
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let (_, _, recovered_leaf) = production_chain_parked(&driver, parent);
+        assert_eq!(leaf, recovered_leaf);
+        assert_eq!(before.load(Ordering::SeqCst), 0);
+        assert_eq!(after.load(Ordering::SeqCst), 0);
+        release_chain(&driver, parent, leaf);
+        assert_eq!(before.load(Ordering::SeqCst), 0);
+        assert_eq!(after.load(Ordering::SeqCst), 2);
+        assert_eq!(root_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(middle_calls.load(Ordering::SeqCst), 1);
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hooked_durable_after_kill_reopens_without_tool_reexecution() {
+        const ENV: &str = "PI_RS_HOOKED_AFTER_WORKER_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let scheduler = hooked_chain_scheduler(
+                &root.join("db"),
+                false,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            let parent = production_outer_task();
+            scheduler.submit(&parent).unwrap();
+            std::fs::write(root.join("parent"), parent.id().to_string()).unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let (_, _, leaf) = production_chain_parked(&driver, parent.id());
+            driver
+                .signal(&crate::task_store::Signal::new(
+                    Uuid::new_v4(),
+                    leaf,
+                    "release".into(),
+                    json!(null),
+                ))
+                .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap()).arg("--exact").arg("async_task_tool::tests::hooked_durable_after_kill_reopens_without_tool_reexecution").env(ENV, dir.path()).env("PI_RS_HOOKED_AFTER_CUT_1120", dir.path()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("after-cut").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("after hook did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let parent: Uuid = std::fs::read_to_string(dir.path().join("parent"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let root_calls = Arc::new(AtomicUsize::new(0));
+        let middle_calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = hooked_chain_scheduler(
+            &dir.path().join("db"),
+            false,
+            root_calls.clone(),
+            middle_calls.clone(),
+            before.clone(),
+            after.clone(),
+        );
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let task = wait_state(&driver, parent, |s| {
+            matches!(s, crate::task::TaskState::Succeeded(_))
+        });
+        assert_eq!(
+            task.state(),
+            &crate::task::TaskState::Succeeded(
+                serde_json::to_value(Outcome::Succeeded("root".into())).unwrap()
+            )
+        );
+        assert_eq!(before.load(Ordering::SeqCst), 0);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        assert_eq!(root_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middle_calls.load(Ordering::SeqCst), 0);
+        driver.shutdown().unwrap();
+    }
+
+    struct ImmediateDurable(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for ImmediateDurable {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "immediate".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for ImmediateDurable {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableToolStep::Complete(Outcome::Succeeded("done".into())))
+        }
+    }
+    #[test]
+    fn hooked_durable_after_abort_rejects_stale_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (result, result_rx) = std::sync::mpsc::channel();
+        let hook = Arc::new(AbortAfterHook {
+            entered,
+            release: std::sync::Mutex::new(release_rx),
+            result,
+        });
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(calls.clone())),
+                "immediate-v1",
+                1,
+                vec![],
+                "hook-v1",
+                hook,
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        driver.request_abort(id).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        let task = wait_terminal(&driver, id);
+        assert!(matches!(task.state(), crate::task::TaskState::Cancelled));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    struct StrictDurable(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for StrictDurable {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "strict".into(),
+                description: String::new(),
+                parameters: json!({"type":"object", "properties":{"bad":false}}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for StrictDurable {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableToolStep::Complete(Outcome::Succeeded("done".into())))
+        }
+    }
+    #[test]
+    fn hooked_durable_rejects_invalid_and_oversize_before_rewrite() {
+        for decision in [3, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut host =
+                StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+            let hook = Arc::new(BeforeFixture {
+                decision,
+                entered: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let tool = host
+                .register_replay_safe_durable_tool_with_hook(
+                    Arc::new(StrictDurable(calls.clone())),
+                    "strict-v1",
+                    1,
+                    vec![],
+                    "hook-v1",
+                    hook,
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            assert!(matches!(
+                wait_terminal(&driver, id).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+
+    #[test]
+    fn hooked_durable_after_ignored_memo_error_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(calls.clone())),
+                "immediate-v1",
+                1,
+                vec![],
+                "hook-v1",
+                Arc::new(BadAfterMemo),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    #[test]
+    fn hooked_durable_before_abort_rejects_stale_memo_and_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (result, result_rx) = std::sync::mpsc::channel();
+        let hook = Arc::new(StaleMemoHook {
+            entered,
+            release: std::sync::Mutex::new(release_rx),
+            result,
+        });
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(calls.clone())),
+                "immediate-v1",
+                1,
+                vec![],
+                "hook-v1",
+                hook,
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        driver.request_abort(id).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    #[test]
+    fn hooked_durable_before_block_never_dispatches_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = Arc::new(BeforeFixture {
+            decision: 0,
+            entered: None,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(calls.clone())),
+                "immediate-v1",
+                1,
+                vec![],
+                "hook-v1",
+                hook,
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
     #[test]
     fn production_replay_safe_async_children_all_and_any_wake() {
         for any in [false, true] {

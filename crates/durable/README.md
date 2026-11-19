@@ -652,6 +652,20 @@ committed with the park checkpoint and reused after wake or reopening. A crash
 before the first park commit can cause normalization to run again, so it too
 must satisfy the replay-safe attestation.
 
+`StandaloneBeforeHookHost::register_replay_safe_durable_tool_with_hook` offers
+an initial hook-enabled version of the same replay-safe task path. It binds one
+host-identified hook to the Tool definition; the host must update that identity
+when hook code or configuration changes and attest that hook effects are safe to
+replay. Before runs once before the first committed prepared checkpoint; its
+rewritten arguments are validated again and reused after wake. After runs only
+after a terminal Tool result, not on a park. The completed result is committed
+before after, allowing after to restart without repeating the Tool. Task-scoped
+memo reads and writes are fenced by the current reservation and ancestor abort;
+failures stop the phase. Hook sleep, selection chains, rich result replacement,
+and after on host-generated block/error/abort are not supported on this path.
+The hook snapshot is null; external effects and detached work remain the host's
+responsibility.
+
 An attempt may stage keyed direct children and return `Park` with an `All` or
 `Any` wait. Child admissions, checkpoint, wait and the attempt result commit
 together; the worker is released and the wake runs a new attempt with the

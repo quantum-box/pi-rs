@@ -42,8 +42,12 @@ pub(super) fn register(
     implementation: &str,
     version: u32,
     children: Vec<Arc<TaskTool>>,
+    hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
 ) -> Result<Arc<TaskTool>, String> {
-    let identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
+    let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
+    if let Some((id, _)) = &hook {
+        identity = identity.with_before_hook(id.clone())?.with_after_hook();
+    }
     jsonschema::validator_for(&tool.spec().parameters).map_err(|_| "invalid tool schema")?;
     let mut names = HashMap::new();
     let mut child_identities = Vec::new();
@@ -73,6 +77,7 @@ pub(super) fn register(
         implementation: implementation.into(),
         version,
         children: names,
+        hook: hook.map(|(_, hook)| hook),
     });
     scheduler.install_replay_safe_async_handler(kind.clone(), version, handler.clone())?;
     Ok(Arc::new(
@@ -88,12 +93,54 @@ struct ParkCheckpoint {
     checkpoint: serde_json::Value,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookCheckpoint {
+    version: u32,
+    arguments: serde_json::Value,
+    outcome: Option<Outcome>,
+}
+struct HookMemo<'a, 'b> {
+    admission: &'a AdmissionHandle<'b>,
+    cancellation: &'a pi_rs_core::CancellationToken,
+    failed: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl crate::extension::Memo for HookMemo<'_, '_> {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        let result = self
+            .admission
+            .replay_safe_hook_memo(key, None, self.cancellation);
+        if result.is_err() {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+    async fn get_or_insert(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let result = self
+            .admission
+            .replay_safe_hook_memo(key, Some(value), self.cancellation)
+            .and_then(|v| v.ok_or("memo insertion failed".into()));
+        if result.is_err() {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+}
+
 struct Executor {
     tool: Arc<dyn DurableAsyncTool>,
     identity: ToolIdentity,
     implementation: String,
     version: u32,
     children: HashMap<String, Arc<TaskTool>>,
+    hook: Option<Arc<dyn crate::extension::Hook>>,
 }
 
 struct Host<'a, 'b> {
@@ -163,6 +210,134 @@ impl Host<'_, '_> {
     }
 }
 
+impl Executor {
+    fn validate_hook_arguments(&self, args: &serde_json::Value) -> Result<(), String> {
+        if !args.is_object()
+            || serde_json::to_vec(args).map_err(|e| e.to_string())?.len() > 60 * 1024
+            || !jsonschema::validator_for(&self.identity.spec.parameters)
+                .is_ok_and(|v| v.is_valid(args))
+        {
+            return Err("hook arguments exceed limit or do not match schema".into());
+        }
+        Ok(())
+    }
+    fn hook_registry(&self) -> Result<crate::extension::Resolved, String> {
+        let mut registry = crate::extension::Registry::default();
+        registry
+            .install(crate::extension::Extension {
+                name: "durable-hook".into(),
+                hooks: vec![self.hook.as_ref().ok_or("missing hook")?.clone()],
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(registry.snapshot().resolve(None))
+    }
+    fn before(
+        &self,
+        task: &Task,
+        admission: &AdmissionHandle<'_>,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<Step, String> {
+        admission.replay_safe_durable_check(cancel)?;
+        let memo = HookMemo {
+            admission,
+            cancellation: cancel,
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let (call, decision) = runtime.block_on(async {
+            let operation = async {
+                let args = self.tool.prepare_arguments(task.input().clone()).await.map_err(|e| e.to_string())?;
+                self.validate_hook_arguments(&args)?;
+                let snapshot = serde_json::Value::Null;
+                let ctx = crate::extension::Context { snapshot: &snapshot, memo: &memo };
+                let (call, decision, _) = self.hook_registry()?.before_tool(crate::extension::ToolCall { name: self.identity.spec.name.clone(), arguments: args }, &ctx).await;
+                Ok::<_, String>((call, decision))
+            };
+            tokio::select! { biased; _ = cancel.cancelled() => Err("before hook cancelled".into()), result = operation => result }
+        })?;
+        if memo.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("task-fenced hook memo failed".into());
+        }
+        admission.replay_safe_durable_check(cancel)?;
+        match decision {
+            crate::extension::BeforeTool::Pass => (),
+            crate::extension::BeforeTool::Block(reason) => {
+                return Ok(Step::Fail(format!("tool call blocked: {reason}")));
+            }
+            _ => return Err("hook sleep is unsupported".into()),
+        }
+        self.validate_hook_arguments(&call.arguments)?;
+        let data = serde_json::to_value(HookCheckpoint {
+            version: 1,
+            arguments: call.arguments,
+            outcome: None,
+        })
+        .map_err(|e| e.to_string())?;
+        if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
+            return Err("hook checkpoint too large".into());
+        }
+        Ok(Step::Continue(Checkpoint {
+            phase: "replay-safe-async-prepared".into(),
+            data,
+        }))
+    }
+    fn after(
+        &self,
+        task: &Task,
+        admission: &AdmissionHandle<'_>,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<Step, String> {
+        admission.replay_safe_durable_check(cancel)?;
+        let stored: HookCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
+            .map_err(|_| "invalid after checkpoint")?;
+        if stored.version != 1 {
+            return Err("invalid after checkpoint version".into());
+        }
+        self.validate_hook_arguments(&stored.arguments)?;
+        let outcome = stored.outcome.ok_or("missing completed outcome")?;
+        let text = outcome.tool_content();
+        let memo = HookMemo {
+            admission,
+            cancellation: cancel,
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let value = runtime.block_on(async {
+            let call = crate::extension::ToolCall { name: self.identity.spec.name.clone(), arguments: stored.arguments };
+            let snapshot = serde_json::Value::Null; let ctx = crate::extension::Context { snapshot: &snapshot, memo: &memo };
+            let selected = self.hook_registry()?;
+            tokio::select! { biased; _ = cancel.cancelled() => Err("after hook cancelled".to_string()), value = selected.after_tool(&call, serde_json::Value::String(text.clone()), &ctx) => Ok(value.0) }
+        })?;
+        if memo.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("task-fenced hook memo failed".into());
+        }
+        admission.replay_safe_durable_check(cancel)?;
+        let result = match value.as_str() {
+            Some(output) if output != text => match outcome {
+                Outcome::Succeeded(_) => Outcome::Succeeded(output.to_owned()),
+                Outcome::SucceededWithDetails { details, .. } => Outcome::SucceededWithDetails {
+                    output: output.to_owned(),
+                    details,
+                },
+                _ => return Err("non-text after replacement unsupported".into()),
+            },
+            _ => outcome,
+        };
+        let value = serde_json::to_value(result).map_err(|e| e.to_string())?;
+        if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > 65536 {
+            return Err("hook result too large".into());
+        }
+        Ok(Step::Succeed(value))
+    }
+}
+
 impl Handler for Executor {
     fn run(&self, _: &Task) -> Result<Step, String> {
         Err("driver reservation required".into())
@@ -180,6 +355,12 @@ impl Handler for Executor {
         {
             return Err("tool identity changed".into());
         }
+        if self.hook.is_some() && task.checkpoint().phase == "initial" {
+            return self.before(task, admission, cancellation);
+        }
+        if self.hook.is_some() && task.checkpoint().phase == "replay-safe-async-after" {
+            return self.after(task, admission, cancellation);
+        }
         let intent = admission.replay_safe_durable_intent(false, Some(cancellation))?;
         #[cfg(test)]
         crash_test_boundary(&self.tool.spec().name, task.id(), "intent");
@@ -191,6 +372,20 @@ impl Handler for Executor {
                 },
                 None,
             ),
+            "replay-safe-async-prepared" if self.hook.is_some() => {
+                let stored: HookCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
+                    .map_err(|_| "invalid hook checkpoint")?;
+                if stored.version != 1 || stored.outcome.is_some() {
+                    return Err("invalid prepared hook checkpoint".into());
+                }
+                (
+                    DurableToolResume {
+                        checkpoint: None,
+                        ended: vec![],
+                    },
+                    Some(stored.arguments),
+                )
+            }
             "replay-safe-async-wait" if task.ended_children().is_some() => {
                 let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
                     .map_err(|_| "invalid durable checkpoint")?;
@@ -264,6 +459,21 @@ impl Handler for Executor {
         let step = match &result {
             DurableToolStep::Complete(Outcome::Pending { .. } | Outcome::Unknown(_)) => {
                 return Err("uncertain outcomes are unsupported for replay-safe tools".into());
+            }
+            DurableToolStep::Complete(outcome) if self.hook.is_some() => {
+                let data = serde_json::to_value(HookCheckpoint {
+                    version: 1,
+                    arguments: args.clone(),
+                    outcome: Some(outcome.clone()),
+                })
+                .map_err(|e| e.to_string())?;
+                if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
+                    return Err("after checkpoint too large".into());
+                }
+                Step::Continue(Checkpoint {
+                    phase: "replay-safe-async-after".into(),
+                    data,
+                })
             }
             DurableToolStep::Complete(outcome) => {
                 Step::Succeed(serde_json::to_value(outcome).map_err(|e| e.to_string())?)
