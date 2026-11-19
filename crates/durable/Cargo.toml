@@ -8,6 +8,8 @@ description = "Experimental durable agent runtime for pi-rs"
 
 [features]
 default = []
+# Explicitly enabled only by synchronization tests.
+test-hooks = []
 coding-tools = ["dep:pi-rs-workbench"]
 builtin-images = ["dep:image"]
 

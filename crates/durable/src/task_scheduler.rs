@@ -4468,6 +4468,49 @@ pub(crate) struct WakeReader {
     live_invocations: Arc<Mutex<InvocationState>>,
     extension_generation: Arc<std::sync::RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>>,
 }
+/// Synchronization seam for real-driver tests; absent from normal builds.
+#[cfg(feature = "test-hooks")]
+pub mod registry_wake_test_hook {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use uuid::Uuid;
+    type Hook = Box<dyn FnOnce() + Send>;
+    static NEXT: OnceLock<Mutex<HashMap<Uuid, Hook>>> = OnceLock::new();
+    static BUSY: OnceLock<Mutex<HashMap<Uuid, Hook>>> = OnceLock::new();
+    pub fn install_busy(task: Uuid, hook: impl FnOnce() + Send + 'static) {
+        BUSY.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(task, Box::new(hook));
+    }
+    pub(super) fn busy(task: Uuid) {
+        let hook = BUSY
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&task);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    pub fn install(task: Uuid, hook: impl FnOnce() + Send + 'static) {
+        NEXT.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(task, Box::new(hook));
+    }
+    pub(super) fn run(task: Uuid) {
+        let hook = NEXT
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&task);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 fn stale_hook_gate(task: &Task, registry: &Registry, generation: Option<u64>) -> bool {
     let Some(generation) = generation else {
         return false;
@@ -8055,22 +8098,34 @@ impl Scheduler {
 
     /// Reserve at most one invocation; run it outside the scheduler mutex.
     pub fn reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
-        self.reserve_tick_inner(now_millis, false, false)
+        self.reserve_tick_inner(now_millis, false, false, std::time::Instant::now())
     }
 
     /// Reserve without waiting for conversation poll fences. A maintenance
     /// value must be retried outside the scheduler mutex when a fence is busy.
     pub fn try_reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
-        self.reserve_tick_inner(now_millis, true, false)
+        self.reserve_tick_inner(now_millis, true, false, std::time::Instant::now())
     }
 
     // The driver's overflow worker is reserved for direct generic children of
     // live TaskTool invocations, so ordinary handlers cannot consume it.
+    #[cfg(test)]
     pub(crate) fn try_reserve_task_tool_child(
         &mut self,
         now_millis: i64,
     ) -> Result<TickReservation, Error> {
-        self.reserve_tick_inner(now_millis, true, true)
+        self.reserve_tick_inner(now_millis, true, true, std::time::Instant::now())
+    }
+
+    pub(crate) fn try_reserve_tick_live(
+        &mut self,
+        task_tool_child_only: bool,
+    ) -> Result<TickReservation, Error> {
+        // Sample while holding the scheduler lock. The monotonic anchor comes
+        // first, so scheduling delays cannot extend the wall-clock deadline.
+        let anchor = std::time::Instant::now();
+        let now = crate::runtime::wall_time_millis();
+        self.reserve_tick_inner(now, true, task_tool_child_only, anchor)
     }
 
     fn deferred_maintenance(&self, intent: MaintenanceIntent) -> TickReservation {
@@ -8088,6 +8143,7 @@ impl Scheduler {
         now_millis: i64,
         nonblocking: bool,
         task_tool_child_only: bool,
+        tick_started: std::time::Instant,
     ) -> Result<TickReservation, Error> {
         let fence = self.failure_fence.clone();
         let _failure_guard = if nonblocking {
@@ -8657,6 +8713,11 @@ impl Scheduler {
                 && !snapshot.task.abort_requested()
                 && matches!(snapshot.task.state(), TaskState::Waiting(_))
             {
+                let revision_key = task_store::signal_revision_key(snapshot.task.id());
+                let revision = owner
+                    .store()
+                    .get(&revision_key)
+                    .map_err(task_store::Error::from)?;
                 match self.ts().poll_wait(&snapshot, now_millis) {
                     Ok(WakeResult::Woken { .. }) => progress = true,
                     Ok(WakeResult::Pending) => {
@@ -8665,11 +8726,68 @@ impl Scheduler {
                                 .load(std::sync::atomic::Ordering::SeqCst)
                         });
                         if stale_hook_gate(&snapshot.task, &self.registry, generation) {
-                            match self.ts().update(&snapshot, |task| task.wake()) {
+                            let deadline = match snapshot.task.state() {
+                                TaskState::Waiting(
+                                    WaitFor::Sleep { until_millis, .. }
+                                    | WaitFor::TypedSleep { until_millis, .. },
+                                ) => *until_millis,
+                                _ => None,
+                            };
+                            let effective_now = now_millis.saturating_add(
+                                i64::try_from(tick_started.elapsed().as_millis())
+                                    .unwrap_or(i64::MAX),
+                            );
+                            if deadline.is_some_and(|deadline| effective_now >= deadline) {
+                                // Retry with a fresh clock; ordinary wake atomically
+                                // consumes a signal or persists expiry.
+                                progress = true;
+                                continue;
+                            }
+                            let mut next = snapshot.clone();
+                            next.task.wake().map_err(Error::Transition)?;
+                            let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            if let Some(deadline) = deadline {
+                                let boundary = crate::runtime::conservative_deadline(
+                                    tick_started,
+                                    now_millis,
+                                    deadline,
+                                );
+                                let task_key = task_store::key(snapshot.task.id());
+                                let check = batch
+                                    .checks
+                                    .iter_mut()
+                                    .find(|check| check.key == task_key)
+                                    .ok_or(Error::Ownership)?;
+                                check.expected = durable_store::Expected::VersionBefore(
+                                    snapshot.version,
+                                    boundary,
+                                );
+                            }
+                            batch.checks.push(durable_store::Check {
+                                key: revision_key,
+                                expected: revision
+                                    .map_or(durable_store::Expected::Missing, |entry| {
+                                        durable_store::Expected::Version(entry.version)
+                                    }),
+                            });
+                            #[cfg(feature = "test-hooks")]
+                            registry_wake_test_hook::run(snapshot.task.id());
+                            match owner
+                                .store()
+                                .commit(&batch.checks, &batch.mutations)
+                                .map_err(task_store::Error::from)
+                            {
                                 Ok(_) => progress = true,
                                 Err(task_store::Error::Store(durable_store::Error::Conflict {
                                     ..
                                 })) => progress = true,
+                                Err(task_store::Error::Store(
+                                    durable_store::Error::WriteLockBusy(_),
+                                )) => {
+                                    #[cfg(feature = "test-hooks")]
+                                    registry_wake_test_hook::busy(snapshot.task.id());
+                                    return Err(Error::Busy);
+                                }
                                 Err(error) => return Err(error.into()),
                             }
                         }
@@ -8678,6 +8796,9 @@ impl Scheduler {
                         // A concurrent signal or task transition changed the snapshot.
                         // Rescan on the next tick instead of failing the driver.
                         progress = true;
+                    }
+                    Err(task_store::Error::Store(durable_store::Error::WriteLockBusy(_))) => {
+                        return Err(Error::Busy);
                     }
                     Err(error) => return Err(error.into()),
                 }

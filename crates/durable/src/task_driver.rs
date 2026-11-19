@@ -14,7 +14,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -1310,11 +1310,6 @@ impl Shared {
                     || graph_pending)
                 && active < TOTAL_WORKERS
             {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(i64::MAX as u128) as i64;
                 let pending = !self
                     .pending
                     .lock()
@@ -1343,9 +1338,9 @@ impl Shared {
                                 })
                             }
                         } else if active >= WORKERS {
-                            scheduler.try_reserve_task_tool_child(now)
+                            scheduler.try_reserve_tick_live(true)
                         } else {
-                            scheduler.try_reserve_tick(now)
+                            scheduler.try_reserve_tick_live(false)
                         }
                     }
                     Err(_) => Err(task_scheduler::Error::Poisoned),

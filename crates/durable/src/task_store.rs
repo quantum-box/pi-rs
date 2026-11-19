@@ -993,10 +993,7 @@ impl<'a> TaskStore<'a> {
         if let Some((deadline, now)) = deadline.zip(sampled_now).filter(|_| !expired) {
             // Anchor the caller's clock to elapsed monotonic time so a staged
             // delivery cannot cross its deadline while waiting for the writer lock.
-            let remaining = (deadline as i128 - now as i128) as u64;
-            let boundary = clock_start
-                .checked_add(std::time::Duration::from_millis(remaining))
-                .unwrap_or(clock_start);
+            let boundary = crate::runtime::conservative_deadline(clock_start, now, deadline);
             batch.checks[0].expected = stored
                 .as_ref()
                 .map_or(Expected::MissingBefore(boundary), |item| {

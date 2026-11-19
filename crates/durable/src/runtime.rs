@@ -23716,6 +23716,19 @@ async fn fenced_poll<F: std::future::Future>(
     }
 }
 
+// `now_millis` is truncated: its true wall time can already be almost one
+// millisecond later. The monotonic anchor is captured before sampling it.
+pub(crate) fn conservative_deadline(
+    anchor: std::time::Instant,
+    now_millis: i64,
+    deadline: i64,
+) -> std::time::Instant {
+    let remaining = (i128::from(deadline) - i128::from(now_millis) - 1).max(0) as u64;
+    anchor
+        .checked_add(std::time::Duration::from_millis(remaining))
+        .unwrap_or(anchor)
+}
+
 pub(crate) fn wall_time_millis() -> i64 {
     unix_ms().try_into().unwrap_or(i64::MAX)
 }
@@ -33557,3 +33570,17 @@ mod document_fork_retry_tests {
 #[cfg(test)]
 #[path = "conversation_wake_tests.rs"]
 mod conversation_wake_tests;
+
+#[cfg(test)]
+mod conservative_deadline_tests {
+    #[test]
+    fn truncation_never_extends_the_wall_deadline() {
+        let anchor = std::time::Instant::now();
+        assert_eq!(super::conservative_deadline(anchor, 100, 101), anchor);
+        assert_eq!(
+            super::conservative_deadline(anchor, 100, 110),
+            anchor + std::time::Duration::from_millis(9)
+        );
+        assert_eq!(super::conservative_deadline(anchor, 101, 100), anchor);
+    }
+}

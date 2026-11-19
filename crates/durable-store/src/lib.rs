@@ -102,8 +102,12 @@ pub enum Mutation {
 
 #[derive(Debug)]
 pub enum Error {
-    Conflict { key: Vec<u8> },
+    Conflict {
+        key: Vec<u8>,
+    },
     Storage(rusqlite::Error),
+    /// The SQLite writer lock was unavailable before a transaction began.
+    WriteLockBusy(rusqlite::Error),
     LockPoisoned,
     VersionExhausted,
     InvalidSnapshot,
@@ -114,6 +118,7 @@ impl fmt::Display for Error {
         match self {
             Self::Conflict { key } => write!(f, "condition failed for key {key:?}"),
             Self::Storage(e) => write!(f, "storage error: {e}"),
+            Self::WriteLockBusy(e) => write!(f, "writer lock unavailable before transaction: {e}"),
             Self::LockPoisoned => write!(f, "store lock poisoned"),
             Self::VersionExhausted => write!(f, "store version exhausted"),
             Self::InvalidSnapshot => write!(
@@ -127,7 +132,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Storage(e) => Some(e),
+            Self::Storage(e) | Self::WriteLockBusy(e) => Some(e),
             _ => None,
         }
     }
@@ -1340,7 +1345,19 @@ impl Store {
         prefix_fence: Option<(&[&[u8]], u64)>,
     ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| match &error {
+                rusqlite::Error::SqliteFailure(code, _)
+                    if matches!(
+                        code.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    Error::WriteLockBusy(error)
+                }
+                _ => Error::Storage(error),
+            })?;
         if let Some((prefixes, boundary)) = prefix_fence {
             let current: u64 = tx.query_row(
                 "SELECT version FROM durable_store_meta WHERE id=1",

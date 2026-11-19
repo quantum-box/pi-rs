@@ -1915,3 +1915,123 @@ async fn signal_revision_fences_memo_and_retries_fresh() {
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
 }
+
+// The hook marks the exact registry-wake commit, so an unrelated write cannot
+// satisfy these contention tests. The writer is released on a separate thread.
+#[cfg(feature = "test-hooks")]
+async fn registry_wake_writer_race(lock_past_busy_timeout: bool) {
+    use pi_rs_durable::task_scheduler::registry_wake_test_hook;
+    use pi_rs_durable::task_store::{SignalResult, SignalState};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let deadline = now_ms()
+        + if lock_past_busy_timeout {
+            30_000
+        } else {
+            3_000
+        };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(vec![]));
+    let (options, registry, extensions) =
+        setup_signal(Some(deadline), events.clone(), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let task = wait_signal_sleep(&path, "first").await;
+    let (at_tx, at_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    if lock_past_busy_timeout {
+        registry_wake_test_hook::install_busy(task.id(), move || {
+            busy_tx.send(()).unwrap();
+        });
+    }
+    registry_wake_test_hook::install(task.id(), move || {
+        at_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    publish_unselected(&scheduler, "deadline-race");
+    at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let writer_path = path.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(writer_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        if lock_past_busy_timeout {
+            std::thread::sleep(Duration::from_millis(7000));
+        } else {
+            while now_ms() <= deadline + 50 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        connection.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    if lock_past_busy_timeout {
+        busy_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target wake did not reach the SQLite busy timeout");
+    }
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    if lock_past_busy_timeout {
+        // The first transaction could not start. Its retry must remain live and
+        // preserve the still-valid signal rather than poisoning the driver.
+        assert_eq!(
+            driver
+                .deliver_signal(task.id(), &token, "first", json!("one"))
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        wait_signal_sleep(&path, "second").await;
+        assert_eq!(
+            driver
+                .deliver_signal(task.id(), &token, "second", json!("two"))
+                .unwrap(),
+            SignalResult::Delivered
+        );
+    }
+    wait_result(&scheduler, id).await;
+    let store = durable_store::Store::open(&path).unwrap();
+    if !lock_past_busy_timeout {
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| *event == "before-b2")
+                .count(),
+            2,
+            "expired registry wake must not rerun the hook before expiration is recorded"
+        );
+        assert_eq!(
+            pi_rs_durable::task_store::TaskStore::new(&store)
+                .read_typed_signal_state(task.id(), &token, "first")
+                .unwrap(),
+            Some(SignalState::Expired)
+        );
+        assert_eq!(
+            driver
+                .deliver_signal(task.id(), &token, "first", json!("one"))
+                .unwrap(),
+            SignalResult::Closed
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn registry_wake_waiting_for_writer_cannot_cross_deadline() {
+    registry_wake_writer_race(false).await;
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn registry_wake_retries_writer_lock_timeout() {
+    registry_wake_writer_race(true).await;
+}
