@@ -523,6 +523,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         let _ = driver.shutdown_with_pending().unwrap();
         return;
     }
+    let is_owner = case == "owner";
     let is_reentrant = case == "reentrant";
     let is_late_receipt = case == "late_receipt";
     let reentrant_handle = identity_handle.clone();
@@ -647,7 +648,33 @@ async fn exercise_conversation_park_claim(case: &str) {
         assert!(receipts.iter().any(|receipt| matches!(&receipt.outcome, Outcome::Pending { reference } if reference == "remote-job")));
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let _ = driver.shutdown_with_pending().unwrap();
+    // Bound shutdown separately: it is synchronous and must not block the
+    // current-thread runtime, which also drives the timeout.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = shutdown_tx.send(driver.shutdown_with_pending());
+    });
+    let report = tokio::time::timeout(Duration::from_secs(10), shutdown_rx)
+        .await
+        .expect("driver shutdown timed out")
+        .expect("driver shutdown thread exited")
+        .unwrap();
+    if is_owner {
+        assert!(
+            report.failure().is_some(),
+            "stale ownership must be rejected"
+        );
+        assert!(
+            report
+                .pending()
+                .iter()
+                .any(|pending| pending.task_id() == root_id)
+        );
+        assert_eq!(
+            tasks.load(root_id).unwrap().unwrap().task.state(),
+            &TaskState::Running
+        );
+    }
 }
 
 #[tokio::test]
