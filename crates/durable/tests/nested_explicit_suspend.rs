@@ -6158,3 +6158,512 @@ async fn hooks_transform_mixed_any_results_across_repark_and_reopen() {
     drop(calls);
     scheduler.shutdown().await.unwrap();
 }
+
+struct ManualReceiptHook(std::path::PathBuf);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for ManualReceiptHook {
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        value: &Value,
+        context: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        use std::io::Write;
+        let name = call.arguments["job"].as_str().unwrap();
+        let candidate = if self.0.join("changed-candidate").exists() {
+            "later"
+        } else {
+            "original"
+        };
+        let memo = context
+            .memo
+            .get_or_insert("receipt-memo", json!(candidate))
+            .await?;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join(format!("hook-{name}")))
+                .unwrap(),
+            "{}:{}",
+            memo.as_str().unwrap(),
+            value.as_str().unwrap()
+        )
+        .unwrap();
+        if name == "b" && !self.0.join("release-multi-hook").exists() {
+            std::fs::write(self.0.join("b-hook-entered"), b"yes").unwrap();
+            std::future::pending::<()>().await;
+        }
+        Ok(Some(json!(format!(
+            "hook:{name}:{}:{}",
+            memo.as_str().unwrap(),
+            value.as_str().unwrap()
+        ))))
+    }
+}
+
+struct HookReceiptMiddle;
+#[async_trait]
+impl KeyedTool for HookReceiptMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let wake = host.pending_wake();
+        let a = host
+            .call_keyed_unpolled_with_id("a", "child", json!({"job":"a"}))
+            .await
+            .unwrap();
+        let b = host
+            .call_keyed_unpolled_with_id("b", "child", json!({"job":"b"}))
+            .await
+            .unwrap();
+        if let Some(wake) = wake {
+            assert_eq!(
+                wake.checkpoint,
+                json!({"a":a.operation_id,"b":b.operation_id})
+            );
+            assert_eq!(wake.ended, vec![a.operation_id, b.operation_id]);
+            assert_eq!(
+                a.outcome,
+                Outcome::Succeeded("hook:a:original:raw-a".into())
+            );
+            assert_eq!(
+                b.outcome,
+                Outcome::Succeeded("hook:b:original:raw-b".into())
+            );
+            Outcome::Succeeded("both hooked".into()).into()
+        } else {
+            assert!(matches!(a.outcome, Outcome::Pending { .. }));
+            assert!(matches!(b.outcome, Outcome::Pending { .. }));
+            host.suspend_pending_with_checkpoint(json!({"a":a.operation_id,"b":b.operation_id}))
+                .unwrap();
+            Outcome::Succeeded("park".into()).into()
+        }
+    }
+}
+
+fn manual_receipt_options(root: &std::path::Path) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(HookReceiptMiddle)).register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkFileLeaf(root.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+fn manual_receipt_scheduler(root: &std::path::Path) -> Scheduler {
+    Scheduler::open_with_extensions(
+        root.join("db"),
+        manual_receipt_options(root),
+        hook_registry(Arc::new(ManualReceiptHook(root.into()))),
+    )
+    .unwrap()
+}
+async fn start_manual_receipts(
+    root: &std::path::Path,
+) -> (
+    Scheduler,
+    uuid::Uuid,
+    uuid::Uuid,
+    Vec<pi_rs_durable::nested::PendingJob>,
+) {
+    let mut scheduler = manual_receipt_scheduler(root);
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    let root_op = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root_op).unwrap();
+    assert_eq!(jobs.len(), 2);
+    (scheduler, id, root_op, jobs)
+}
+
+#[tokio::test]
+async fn manual_receipt_hook_rewrite_is_replayable_and_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (mut scheduler, id, root_op, jobs) = start_manual_receipts(root).await;
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    let raw = Outcome::Succeeded("raw-a".into());
+    scheduler
+        .reconcile_nested_pending(id, root_op, a.operation_id, &a.reference, raw.clone())
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-a")).unwrap(),
+        "original:raw-a\n"
+    );
+    scheduler
+        .reconcile_nested_pending(id, root_op, a.operation_id, &a.reference, raw)
+        .unwrap();
+    assert!(
+        scheduler
+            .reconcile_nested_pending(
+                id,
+                root_op,
+                a.operation_id,
+                &a.reference,
+                Outcome::Succeeded("different".into())
+            )
+            .is_err()
+    );
+    std::fs::write(root.join("release-multi-hook"), b"yes").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root_op,
+            b.operation_id,
+            &b.reference,
+            Outcome::Succeeded("raw-b".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content,..} if content == "both hooked"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-a")).unwrap(),
+        "original:raw-a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-b")).unwrap(),
+        "original:raw-b\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches")).unwrap(),
+        "a\nb\n"
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn multiple_manual_receipt_hooks_crash_worker() {
+    let Some(path) = std::env::var_os("PI_MULTI_RECEIPT_HOOK_CRASH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let (mut scheduler, id, root_op, jobs) = start_manual_receipts(&path).await;
+    std::fs::write(path.join("conversation"), id.to_string()).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root_op,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("raw-a".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    assert_eq!(
+        std::fs::read_to_string(path.join("hook-a")).unwrap(),
+        "original:raw-a\n"
+    );
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root_op,
+            b.operation_id,
+            &b.reference,
+            Outcome::Succeeded("raw-b".into()),
+        )
+        .unwrap();
+    until(|| path.join("b-hook-entered").exists()).await;
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn multiple_manual_receipt_hooks_resume_after_crash_without_repeating_committed_hook() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "multiple_manual_receipt_hooks_crash_worker"])
+            .env("PI_MULTI_RECEIPT_HOOK_CRASH", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("b-hook-entered").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("changed-candidate"), b"yes").unwrap();
+    std::fs::write(root.join("release-multi-hook"), b"yes").unwrap();
+    let mut scheduler = manual_receipt_scheduler(root);
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content,..} if content == "both hooked"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-a")).unwrap(),
+        "original:raw-a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-b")).unwrap(),
+        "original:raw-b\noriginal:raw-b\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches")).unwrap(),
+        "a\nb\n"
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct MixedAnyReceiptMiddle(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for MixedAnyReceiptMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        use std::io::Write;
+        let wake = host.pending_wake();
+        let done = host
+            .call_keyed_unpolled("done", "immediate", json!({}))
+            .await;
+        let a = host
+            .call_keyed_unpolled_with_id("a", "child", json!({"job":"a"}))
+            .await
+            .unwrap();
+        let b = host
+            .call_keyed_unpolled_with_id("b", "child", json!({"job":"b"}))
+            .await
+            .unwrap();
+        assert_eq!(done, Outcome::Succeeded("already done".into()));
+        if let Some(wake) = wake {
+            assert_eq!(wake.checkpoint, json!("mixed-receipt"));
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("mixed-receipt-wakes"))
+                    .unwrap(),
+                "{}",
+                serde_json::to_string(&wake.ended).unwrap()
+            )
+            .unwrap();
+        }
+        if matches!(a.outcome, Outcome::Pending { .. })
+            || matches!(b.outcome, Outcome::Pending { .. })
+        {
+            host.suspend_pending_any_with_checkpoint(json!("mixed-receipt"))
+                .unwrap();
+            Outcome::Succeeded("park".into()).into()
+        } else {
+            assert_eq!(
+                a.outcome,
+                Outcome::Succeeded("hook:a:original:raw-a".into())
+            );
+            assert_eq!(
+                b.outcome,
+                Outcome::Succeeded("hook:b:original:raw-b".into())
+            );
+            Outcome::Succeeded("mixed receipts complete".into()).into()
+        }
+    }
+}
+fn mixed_any_receipt_scheduler(root: &std::path::Path) -> Scheduler {
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(MixedAnyReceiptMiddle(root.into())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(FileImmediateMixedLeaf(root.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+            RegisteredTool {
+                tool: Arc::new(MultiParkFileLeaf(root.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    Scheduler::open_with_extensions(
+        root.join("db"),
+        options,
+        hook_registry(Arc::new(ManualReceiptHook(root.into()))),
+    )
+    .unwrap()
+}
+#[tokio::test]
+async fn mixed_any_receipt_hook_crash_worker() {
+    let Some(root) = std::env::var_os("PI_MIXED_ANY_RECEIPT_CRASH") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mut scheduler = mixed_any_receipt_scheduler(&root);
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root_op = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root_op).unwrap();
+    assert_eq!(jobs.len(), 2);
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    std::fs::write(
+        root.join("job-ids"),
+        serde_json::to_vec(&vec![a.operation_id, b.operation_id]).unwrap(),
+    )
+    .unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root_op,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("raw-a".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    assert_eq!(
+        scheduler.nested_pending_jobs(id, root_op).unwrap(),
+        vec![b.clone()]
+    );
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root_op,
+            b.operation_id,
+            &b.reference,
+            Outcome::Succeeded("raw-b".into()),
+        )
+        .unwrap();
+    until(|| root.join("b-hook-entered").exists()).await;
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn mixed_any_reconciled_hook_recovers_after_process_loss() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mixed_any_receipt_hook_crash_worker"])
+            .env("PI_MIXED_ANY_RECEIPT_CRASH", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("b-hook-entered").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let ids: Vec<uuid::Uuid> =
+        serde_json::from_slice(&std::fs::read(root.join("job-ids")).unwrap()).unwrap();
+    std::fs::write(root.join("changed-candidate"), b"yes").unwrap();
+    std::fs::write(root.join("release-multi-hook"), b"yes").unwrap();
+    let mut scheduler = mixed_any_receipt_scheduler(root);
+    wait(&mut scheduler, id).await;
+    assert!(
+        scheduler.blocked(id).unwrap().is_none(),
+        "{:?}",
+        scheduler.conversation(id).unwrap()
+    );
+    assert!(scheduler.conversation(id).unwrap().messages.iter().any(
+        |m| matches!(m, Message::Tool { content, .. } if content == "mixed receipts complete")
+    ));
+    let wakes: Vec<Vec<uuid::Uuid>> = std::fs::read_to_string(root.join("mixed-receipt-wakes"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(wakes, vec![vec![ids[0]], vec![ids[1]]]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-a")).unwrap(),
+        "original:raw-a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-b")).unwrap(),
+        "original:raw-b\noriginal:raw-b\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("immediate-dispatches")).unwrap(),
+        "done\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches")).unwrap(),
+        "a\nb\n"
+    );
+    scheduler.shutdown().await.unwrap();
+}

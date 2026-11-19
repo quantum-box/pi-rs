@@ -399,6 +399,12 @@ repeat hooks; durable per-operation memos preserve decisions but cannot make
 external side effects exactly once. Hosts must keep extension and tool
 registrations compatible across reopen. Memo operations and result publication
 are fenced by the root attempt and, where applicable, the intermediate claim.
+This also applies to authoritative host reconciliation of pending descendants.
+Regression tests cover a rewritten manual receipt, idempotent reconciliation,
+and process loss in one child's hook after another child's result is committed;
+only the interrupted hook is rerun and its memo is retained. An early-any
+park with an already-completed unsafe sibling is also tested across process loss
+during the remaining descendant's result hook and then through final wake.
 This subset excludes nested before-tool gates at this checkpoint,
 deeper intermediate parks, new descendants after a child wake, and independently
 scheduled or parallel child handles. Unsupported and legacy unbound cases fail
