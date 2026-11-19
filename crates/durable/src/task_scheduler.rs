@@ -5969,75 +5969,109 @@ mod tests {
     #[test]
     fn ancestor_result_publication_fences_live_descendant_admission() {
         use std::{sync::mpsc, time::Duration};
-        let dir = tempfile::tempdir().unwrap();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        let parent_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
-            entered_tx.send(()).unwrap();
-            release_rx.lock().unwrap().recv().unwrap();
-            Ok(Step::Fail("parent failure".into()))
-        });
-        let child_handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
-        let child = crate::task_tool::TaskTool::new(
-            pi_rs_core::ToolSpec {
-                name: "child".into(),
-                description: "".into(),
-                parameters: json!({"type":"object"}),
-            },
-            "child",
-            true,
-            1,
-            child_handler.clone(),
-        );
-        let mut registry = Registry::default();
-        registry.register_shared("parent", true, parent_handler);
-        registry.register_shared("child", true, child_handler);
-        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
-        let parent = task(
-            1,
-            TaskOwner::Conversation(Uuid::from_u128(9)),
-            "parent",
-            true,
-            4,
-        )
-        .into_task_tool();
-        scheduler.submit(&parent).unwrap();
-        let parent_invocation = async_admission_reserve(&mut scheduler);
-        let child_id = parent_invocation
-            .admit_task_tool_child(&child, "child", json!({}))
-            .unwrap();
-        let child_invocation = async_admission_reserve(&mut scheduler);
-        assert_eq!(child_invocation.task_id(), child_id);
-        let worker = std::thread::spawn(move || parent_invocation.execute().unwrap());
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let before = child_invocation
-            .admit_task_tool_child(&child, "before", json!({}))
-            .unwrap();
-        let barrier = std::sync::Barrier::new(2);
-        let racing = std::thread::scope(|scope| {
-            let admission = scope.spawn(|| {
-                barrier.wait();
-                child_invocation.admit_task_tool_child(&child, "racing", json!({}))
+        for admission_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (returning_tx, returning_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            let parent_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                returning_tx.send(()).unwrap();
+                Ok(Step::Fail("parent failure".into()))
             });
-            barrier.wait();
-            release_tx.send(()).unwrap();
-            admission.join().unwrap()
-        });
-        let completed = worker.join().unwrap();
-        assert!(
-            child_invocation
-                .admit_task_tool_child(&child, "after", json!({}))
-                .is_err()
-        );
-        assert!(scheduler.ts().load(before).unwrap().is_some());
-        if let Ok(id) = racing {
-            assert!(scheduler.ts().load(id).unwrap().is_some());
-            assert_eq!(scheduler.ts().list().unwrap().len(), 4);
-        } else {
-            assert_eq!(scheduler.ts().list().unwrap().len(), 3);
+            let child_handler: Arc<dyn Handler> =
+                Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+            let child = crate::task_tool::TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "child".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                "child",
+                true,
+                1,
+                child_handler.clone(),
+            );
+            let mut registry = Registry::default();
+            registry.register_shared("parent", true, parent_handler);
+            registry.register_shared("child", true, child_handler);
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                4,
+            )
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            let parent_invocation = async_admission_reserve(&mut scheduler);
+            let child_id = parent_invocation
+                .admit_task_tool_child(&child, "child", json!({}))
+                .unwrap();
+            let child_invocation = async_admission_reserve(&mut scheduler);
+            assert_eq!(child_invocation.task_id(), child_id);
+            let worker = std::thread::spawn(move || parent_invocation.execute().unwrap());
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let owner = scheduler.owner();
+            let (completed, admitted) = if admission_first {
+                // Hold the publisher at its fence while the real handler returns;
+                // admission must commit before publication can acquire the fence.
+                let publication_gate = scheduler.failure_fence.lock().unwrap();
+                release_tx.send(()).unwrap();
+                returning_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let id = child_invocation
+                    .admit_task_tool_child(&child, "racing", json!({}))
+                    .expect("admission before publication must succeed");
+                assert!(scheduler.ts().load(id).unwrap().is_some());
+                drop(publication_gate);
+                (worker.join().unwrap(), Some(id))
+            } else {
+                // Hold admission at the task gate until the handler's result has
+                // actually been published, while its durable task is still Running.
+                let task_gate = owner.task_gate().lock().unwrap();
+                std::thread::scope(|scope| {
+                    let (started_tx, started_rx) = mpsc::channel();
+                    let child_invocation = &child_invocation;
+                    let child = &child;
+                    let admission = scope.spawn(move || {
+                        started_tx.send(()).unwrap();
+                        child_invocation.admit_task_tool_child(child, "racing", json!({}))
+                    });
+                    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    release_tx.send(()).unwrap();
+                    returning_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let completed = worker.join().unwrap();
+                    assert_eq!(
+                        scheduler
+                            .ts()
+                            .load(parent.id())
+                            .unwrap()
+                            .unwrap()
+                            .task
+                            .state(),
+                        &TaskState::Running
+                    );
+                    drop(task_gate);
+                    assert!(
+                        matches!(admission.join().unwrap(), Err(Error::Ownership)),
+                        "admission after publication must be rejected"
+                    );
+                    (completed, None)
+                })
+            };
+            assert!(matches!(
+                child_invocation.admit_task_tool_child(&child, "after", json!({})),
+                Err(Error::Ownership)
+            ));
+            assert_eq!(
+                scheduler.ts().list().unwrap().len(),
+                if admitted.is_some() { 3 } else { 2 }
+            );
+            drop(completed);
         }
-        drop(completed);
     }
 
     #[test]
