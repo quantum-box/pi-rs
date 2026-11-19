@@ -4616,7 +4616,8 @@ impl Scheduler {
             return Err("standalone scheduler required".into());
         }
         let mut registry = self.registry.clone();
-        if !registry.register_shared_versioned(kind.clone(), version, replay_safe, handler.clone()) {
+        if !registry.register_shared_versioned(kind.clone(), version, replay_safe, handler.clone())
+        {
             return Err("task kind already registered or invalid".into());
         }
         registry

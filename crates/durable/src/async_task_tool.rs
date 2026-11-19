@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 mod replay_safe;
 pub(crate) mod unsafe_park_proof;
-pub use replay_safe::{AbortAfterAuthorization, ReplaySafeAuthorization, UnsafeDurableAuthorization};
+pub use replay_safe::{
+    AbortAfterAuthorization, ReplaySafeAuthorization, UnsafeDurableAuthorization,
+};
 pub use unsafe_park_proof::{UnsafeDurableParkEvidence, UnsafeDurableReceipt};
 
 /// Read joined unsafe outcomes retained even if abort won settlement. These

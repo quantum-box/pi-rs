@@ -149,7 +149,13 @@ fn register_with_policy(
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
     let encoded = serde_json::to_vec(&(
-        if abort_after { 5u32 } else if block_results { 4u32 } else { 1u32 },
+        if abort_after {
+            5u32
+        } else if block_results {
+            4u32
+        } else {
+            1u32
+        },
         &identity,
         &child_identities,
     ))
