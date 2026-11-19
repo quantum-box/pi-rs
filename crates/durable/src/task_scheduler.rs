@@ -2725,6 +2725,24 @@ impl AdmissionHandle<'_> {
             &current.task,
             boundary,
         )?);
+        let TaskOwner::Conversation(conversation) = current.task.owner() else {
+            return Err("conversation cancel root owner changed".into());
+        };
+        // Signal delivery may bypass the Harness gate. Fence both revisions in
+        // the claim transaction itself; this alone does not authorize callback
+        // dispatch after the claim commit.
+        for key in [
+            crate::conversation_signal::revision(*conversation),
+            task_store::signal_revision_key(current.task.id()),
+        ] {
+            let entry = owner.store().get(&key).map_err(|e| e.to_string())?;
+            checks.push(durable_store::Check {
+                key,
+                expected: entry.map_or(durable_store::Expected::Missing, |entry| {
+                    durable_store::Expected::Version(entry.version)
+                }),
+            });
+        }
         let key = conversation_cancel_claim_key(current.task.id());
         checks.push(durable_store::Check {
             key: key.clone(),

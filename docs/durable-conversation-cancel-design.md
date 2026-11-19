@@ -93,6 +93,13 @@ started; it has no automatic retry owner yet. Generic task signals and wake,
 direct abort, and their graph and revision checks remain unconnected. Callback
 dispatch remains disabled until every boundary and retry path is complete.
 
+The pre-dispatch conversation cancel claim transaction also checks the root
+task signal revision and conversation signal revision. A public Inbox or task
+signal write racing that claim makes it fail closed. The evidence does not
+fence a signal committed after the claim and before a future callback first
+poll; a separate callback-start transaction and retry protocol are still
+required.
+
 The `Scheduler::schedule` worker also fences its ModelReady-to-ModelRunning
 save before model dispatch. Busy leaves the durable state unchanged and retries
 through the scheduled worker. This does not yet fence the general Harness save

@@ -591,6 +591,39 @@ async fn exercise_conversation_park_claim(case: &str) {
             reached_hook.store(true, Ordering::SeqCst);
             return;
         }
+        if case == "conversation_signal" {
+            let signal = crate::conversation_signal::Signal::new(
+                uuid::Uuid::new_v4(),
+                conversation,
+                "claim-race".into(),
+                json!(1),
+            );
+            let result = crate::conversation_signal::Inbox::new(&writer).send(&signal);
+            assert!(
+                result.is_ok() || matches!(result, Err(crate::conversation_signal::Error::Closed))
+            );
+            assert!(
+                writer
+                    .get(&crate::conversation_signal::revision(conversation))
+                    .unwrap()
+                    .is_some()
+            );
+            reached_hook.store(true, Ordering::SeqCst);
+            return;
+        }
+        if case == "task_signal" {
+            let signal = crate::task_store::Signal::new(
+                uuid::Uuid::new_v4(),
+                root_id,
+                "claim-race".into(),
+                json!(1),
+            );
+            crate::task_store::TaskStore::new(&writer)
+                .send_signal(&signal)
+                .unwrap();
+            reached_hook.store(true, Ordering::SeqCst);
+            return;
+        }
         let key = if case == "owner" {
             crate::task_store::key(root_id)
         } else {
@@ -682,6 +715,8 @@ async fn conversation_claim_rejects_owner_identity_and_abort_races() {
         "reentrant",
         "mismatch",
         "late_receipt",
+        "conversation_signal",
+        "task_signal",
     ] {
         exercise_conversation_park_claim(case).await;
     }

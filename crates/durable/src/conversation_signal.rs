@@ -62,7 +62,7 @@ fn prefix(id: Uuid) -> Vec<u8> {
 fn key(conversation: Uuid, id: Uuid) -> Vec<u8> {
     format!("runtime/conversation-signal/{conversation}/{id}").into_bytes()
 }
-fn revision(id: Uuid) -> Vec<u8> {
+pub(crate) fn revision(id: Uuid) -> Vec<u8> {
     format!("runtime/conversation-signal-revision/{id}").into_bytes()
 }
 
