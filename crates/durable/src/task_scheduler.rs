@@ -61,6 +61,12 @@ pub trait Handler: Send + Sync {
     fn requires_park_cancel_claim(&self) -> bool {
         false
     }
+    /// Lease the conversation cancellation definition during receipt recovery.
+    fn conversation_cleanup_identity_lease(
+        &self,
+    ) -> Result<crate::nested_identity::IdentityLease, crate::nested_identity::LeaseFailure> {
+        Err(crate::nested_identity::LeaseFailure::Mismatch)
+    }
     /// Lease the host definition across an interrupted-wake recovery commit.
     /// Handlers without the explicit host identity contract fail closed.
     fn woken_cleanup_identity_lease(
@@ -269,6 +275,19 @@ pub(crate) fn validate_conversation_cancel_receipt(
         return Err("conversation cancel receipt evidence mismatch".into());
     }
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConversationCancelTerminalMarker {
+    pub version: u32,
+    pub claim_id: Uuid,
+    pub attempt: Uuid,
+    pub running_task_version: u64,
+    pub terminal_task: Task,
+}
+pub(crate) fn conversation_cancel_terminal_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/conversation-park-cancel-terminal").into_bytes()
 }
 
 fn conversation_cancel_claim_key(task: Uuid) -> Vec<u8> {
@@ -809,6 +828,21 @@ impl Registry {
         }
         entry.abort = Some(entry.handler.clone());
         Ok(())
+    }
+    pub(crate) fn conversation_receipt_handler(&self, task: &Task) -> Option<Arc<dyn Handler>> {
+        let reg = self.entries.get(task.kind()?)?;
+        if reg.version != task.definition_version()
+            || reg.replay_safe
+            || task.replay_safe()
+            || reg.conversation_checkpointable.is_none()
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return None;
+        }
+        Some(reg.handler.clone())
     }
     pub(crate) fn conversation_checkpointable(
         &self,
@@ -6118,7 +6152,62 @@ impl Scheduler {
                             .map_err(task_store::Error::from)?;
                     }
                     None => self.ts().update(&running, |task| task.cancel())?,
-                    Some(reason) => self.ts().update(&running, |task| task.fail(reason))?,
+                    Some(reason) => {
+                        let task_store = self.ts();
+                        let store = task_store.store();
+                        let claim_key = conversation_cancel_claim_key(running.task.id());
+                        if let Some(entry) =
+                            store.get(&claim_key).map_err(task_store::Error::from)?
+                        {
+                            let claim: ConversationCancelClaim =
+                                serde_json::from_slice(&entry.value)
+                                    .map_err(|e| Error::Handler(e.to_string()))?;
+                            if claim.version != 2
+                                || claim.task != running.task.id()
+                                || Some(claim.attempt) != running.task.attempt_id()
+                                || claim.claim_id.is_nil()
+                                || claim.lease.is_nil()
+                                || Some(claim.kind.as_str()) != running.task.kind()
+                                || claim.definition_version != running.task.definition_version()
+                                || claim.checkpoint != *running.task.checkpoint()
+                            {
+                                return Err(Error::Handler(
+                                    "conversation terminal claim mismatch".into(),
+                                ));
+                            }
+                            let mut next = running.clone();
+                            next.task.fail(reason).map_err(Error::Transition)?;
+                            let marker = ConversationCancelTerminalMarker {
+                                version: 1,
+                                claim_id: claim.claim_id,
+                                attempt: claim.attempt,
+                                running_task_version: running.version,
+                                terminal_task: next.task.clone(),
+                            };
+                            let key = conversation_cancel_terminal_key(running.task.id());
+                            let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            batch.checks.extend([
+                                durable_store::Check {
+                                    key: claim_key,
+                                    expected: durable_store::Expected::Version(entry.version),
+                                },
+                                durable_store::Check {
+                                    key: key.clone(),
+                                    expected: durable_store::Expected::Missing,
+                                },
+                            ]);
+                            batch.mutations.push(durable_store::Mutation::Put {
+                                key,
+                                value: serde_json::to_vec(&marker)
+                                    .map_err(|e| Error::Handler(e.to_string()))?,
+                            });
+                            store
+                                .commit(&batch.checks, &batch.mutations)
+                                .map_err(task_store::Error::from)?;
+                        } else {
+                            self.ts().update(&running, |task| task.fail(reason))?;
+                        }
+                    }
                 }
                 #[cfg(test)]
                 if self.inject_abort_commit_error == 2 {

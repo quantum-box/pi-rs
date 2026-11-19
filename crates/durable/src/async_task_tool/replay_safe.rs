@@ -1625,6 +1625,26 @@ impl Executor {
 }
 
 impl Handler for Executor {
+    fn conversation_cleanup_identity_lease(
+        &self,
+    ) -> Result<crate::nested_identity::IdentityLease, crate::nested_identity::LeaseFailure> {
+        let expected = self
+            .conversation_identity
+            .as_deref()
+            .ok_or(crate::nested_identity::LeaseFailure::Mismatch)?;
+        if self._conversation_cancel.is_none() {
+            return Err(crate::nested_identity::LeaseFailure::Mismatch);
+        }
+        let tool: Arc<dyn Tool> = self.tool.clone();
+        let lease = crate::nested_identity::checked_lease(&tool, expected)?;
+        if !self
+            .identity
+            .matches(self.tool.as_ref(), &self.implementation, self.version)
+        {
+            return Err(crate::nested_identity::LeaseFailure::Mismatch);
+        }
+        Ok(lease)
+    }
     fn requires_park_cancel_claim(&self) -> bool {
         self.park_cancel.is_some()
     }

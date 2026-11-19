@@ -41,8 +41,13 @@ and callback retry policy are not included in this initial registration API.
 A preliminary receipt write transaction checks the live claim, lease,
 conversation binding, owner graph and park evidence atomically. It is exercised
 only by a test-only synthetic receipt; no callback is invoked and this record
-is not proof that external cleanup occurred. Receipt recovery after a process
-restart is not connected and remains fail-closed.
+is not proof that external cleanup occurred. Stopped-root test receipt recovery checks a terminal marker written in the
+same commit as the task failure, the claim and receipt, conversation binding,
+park provenance and late-result fence. The marker carries the original claim,
+attempt and running task version; the task and marker commit identities must
+match. Recovery remains limited to a failed, abort-marked unhooked root while
+the conversation retains its pending binding. It does not authorize callback
+dispatch or establish that a callback ran.
 
 A safe implementation needs all of the following before dispatch is enabled:
 

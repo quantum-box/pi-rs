@@ -3216,6 +3216,25 @@ pub struct Harness {
 thread_local! {
     static TASK_RESULT_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
+#[cfg(test)]
+fn stopped_receipt_read_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_stopped_receipt_read_before_commit(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    stopped_receipt_read_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
 #[derive(serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct CheckpointableRootBinding {
@@ -11583,7 +11602,7 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<Vec<Check>, Error> {
-        self.checkpointable_conversation_checks_inner(task, registry, false)
+        self.checkpointable_conversation_checks_inner(task, registry, false, false)
     }
 
     // Provisional evidence only: callers must include it in the same checked
@@ -11602,7 +11621,28 @@ impl Harness {
                 "checkpointable cleanup attempt unavailable".into(),
             ));
         }
-        self.checkpointable_conversation_checks_inner(task, registry, true)
+        self.checkpointable_conversation_checks_inner(task, registry, true, false)
+    }
+
+    /// Provisional conversation and root checks for a stopped cleanup. These
+    /// checks do not authenticate a receipt: callers must also validate the
+    /// original claim, park proof, identity lease and late-result fence in the
+    /// same transaction.
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_cancel_receipt_recovery_checks(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<Vec<Check>, Error> {
+        if !task.abort_requested()
+            || !matches!(task.state(), crate::task::TaskState::Failed(_))
+            || !matches!(task.owner(), crate::task::TaskOwner::Conversation(_))
+        {
+            return Err(Error::Invalid(
+                "checkpointable recovery task unavailable".into(),
+            ));
+        }
+        self.checkpointable_conversation_checks_inner(task, registry, true, true)
     }
 
     fn checkpointable_conversation_checks_inner(
@@ -11610,6 +11650,7 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
         cleanup: bool,
+        allow_failed_root: bool,
     ) -> Result<Vec<Check>, Error> {
         let store = self.owner.store();
         let tasks = crate::task_store::TaskStore::new(store);
@@ -11628,7 +11669,10 @@ impl Harness {
                 || (!stored.task.replay_safe()
                     && !registry.is_conversation_checkpointable_task(&stored.task))
                 || (!cleanup && stored.task.abort_requested())
-                || stored.task.is_terminal()
+                || (stored.task.is_terminal()
+                    && !(allow_failed_root
+                        && next == task.id()
+                        && matches!(stored.task.state(), crate::task::TaskState::Failed(_))))
                 || (stored.task.is_completing()
                     && !(stored.task.retains_task_children_on_success()
                         && matches!(stored.task.state(), crate::task::TaskState::Completing(_))))
@@ -11762,6 +11806,115 @@ impl Harness {
             }
         }
     }
+    /// Read provisional test receipt evidence for a stopped root. The
+    /// identity lease and all durable evidence remain fenced through commit.
+    /// This does not authorize external callback execution.
+    #[allow(dead_code)]
+    pub(crate) fn read_stopped_conversation_cancel_receipt(
+        &self,
+        task_id: Uuid,
+        attempt: Uuid,
+        claim_id: Uuid,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<Option<crate::task_scheduler::ConversationCancelReceipt>, Error> {
+        let store = self.owner.store();
+        let boundary = store.put_version()?;
+        let tasks = crate::task_store::TaskStore::new(store);
+        let task = tasks
+            .load(task_id)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .ok_or_else(|| Error::Invalid("missing recovery task".into()))?;
+        let handler = registry
+            .conversation_receipt_handler(&task.task)
+            .ok_or_else(|| Error::Invalid("missing recovery registration".into()))?;
+        let _identity = handler
+            .conversation_cleanup_identity_lease()
+            .map_err(|_| Error::Invalid("recovery identity unavailable".into()))?;
+        let (claim, claim_check) = crate::task_scheduler::read_conversation_cancel_claim(
+            store, task_id, attempt, claim_id,
+        )
+        .map_err(Error::Invalid)?
+        .ok_or_else(|| Error::Invalid("missing claim".into()))?;
+        if task.task.kind() != Some(claim.kind.as_str())
+            || task.task.definition_version() != claim.definition_version
+            || task.task.checkpoint() != &claim.checkpoint
+        {
+            return Err(Error::Invalid("recovery claim task mismatch".into()));
+        }
+        let marker_key = crate::task_scheduler::conversation_cancel_terminal_key(task_id);
+        let marker_entry = store
+            .get(&marker_key)?
+            .ok_or_else(|| Error::Invalid("missing terminal marker".into()))?;
+        let marker: crate::task_scheduler::ConversationCancelTerminalMarker =
+            serde_json::from_slice(&marker_entry.value)?;
+        if marker.version != 1
+            || marker.claim_id != claim.claim_id
+            || marker.attempt != claim.attempt
+            || marker.running_task_version == 0
+            || marker.terminal_task != task.task
+        {
+            return Err(Error::Invalid("terminal marker mismatch".into()));
+        }
+        let task_commit =
+            store.commit_for_version(&crate::task_store::key(task_id), task.version)?;
+        let marker_commit = store.commit_for_version(&marker_key, marker_entry.version)?;
+        if task_commit.is_none() || task_commit != marker_commit {
+            return Err(Error::Invalid(
+                "terminal marker is not atomic with task settlement".into(),
+            ));
+        }
+        let mut checks =
+            self.checkpointable_cancel_receipt_recovery_checks(&task.task, registry)?;
+        checks.push(Check {
+            key: marker_key,
+            expected: Expected::Version(marker_entry.version),
+        });
+        checks.push(claim_check);
+        checks.extend(
+            crate::async_task_tool::unsafe_park_proof::cancel_checks(store, &task.task, boundary)
+                .map_err(Error::Invalid)?,
+        );
+        let key = format!("durable/replay-safe-async/{task_id}/conversation-park-cancel-receipt")
+            .into_bytes();
+        let entry = store.get(&key)?;
+        let receipt = if let Some(entry) = entry {
+            let receipt: crate::task_scheduler::ConversationCancelReceipt =
+                serde_json::from_slice(&entry.value)?;
+            crate::task_scheduler::validate_conversation_cancel_receipt(&receipt, &claim)
+                .map_err(Error::Invalid)?;
+            checks.push(Check {
+                key,
+                expected: Expected::Version(entry.version),
+            });
+            Some(receipt)
+        } else {
+            checks.push(Check {
+                key,
+                expected: Expected::Missing,
+            });
+            None
+        };
+        #[cfg(test)]
+        if let Some(hook) = stopped_receipt_read_hooks()
+            .lock()
+            .unwrap()
+            .remove(&task_id)
+        {
+            hook();
+        }
+        store.commit_with_prefix_put_fence(
+            &checks,
+            &[],
+            &[
+                crate::task_store::PREFIX,
+                crate::ownership_edge::PREFIX,
+                b"runtime/conversation/",
+            ],
+            boundary,
+        )?;
+        Ok(receipt)
+    }
+
     pub fn start_tasks(
         &self,
         registry: crate::task_scheduler::Registry,
@@ -32238,6 +32391,156 @@ mod scheduler_tests {
                 if !abort {
                     assert!(
                         h.checkpointable_cancel_conversation_checks(&running.task, &registry)
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stopped_cancel_recovery_checks_fence_conversation_changes() {
+        use crate::task::Task;
+        use crate::task_scheduler::{Handler, Registry, Step};
+        use crate::task_tool::TaskTool;
+        for stage in ["intent", "park"] {
+            for abort in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let model = Arc::new(GatedModel {
+                    started: Arc::new(Semaphore::new(0)),
+                    release: Arc::new(Semaphore::new(0)),
+                    active: AtomicUsize::new(0),
+                    maximum: AtomicUsize::new(0),
+                });
+                let handler: Arc<dyn Handler> =
+                    Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!(null))));
+                let adapter = Arc::new(
+                    TaskTool::new(
+                        pi_rs_core::ToolSpec {
+                            name: "job".into(),
+                            description: "".into(),
+                            parameters: serde_json::json!({"type":"object"}),
+                        },
+                        "checkpointable-test",
+                        true,
+                        1,
+                        handler,
+                    )
+                    .with_deferred_arguments(),
+                );
+                let mut registry = Registry::default();
+                registry
+                    .register_conversation_checkpointable(&adapter, Arc::new(|| true), None)
+                    .unwrap();
+                let mut opts = options(model);
+                opts.tools = vec![adapter.register()];
+                let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+                let id = h.create_conversation(config()).unwrap();
+                let (mut c, version) = h.load(id).unwrap();
+                let op = Uuid::new_v4();
+                let attempt = ToolAttempt {
+                    operation_id: op,
+                    attempt_id: Uuid::new_v4(),
+                };
+                let args = serde_json::json!({});
+                let task = adapter.task(id, op, args.clone(), 5).unwrap();
+                let identity = adapter.identity().unwrap();
+                let binding = CheckpointableRootBinding {
+                    version: 1,
+                    conversation: id,
+                    tool_attempt: attempt,
+                    task: op,
+                    identity: identity.clone(),
+                    arguments: args.clone(),
+                };
+                let key = checkpointable_root_binding_key(op);
+                let evidence = crate::task_store::OwnedBatch {
+                    checks: vec![Check {
+                        key: key.clone(),
+                        expected: Expected::Missing,
+                    }],
+                    mutations: vec![Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&binding).unwrap(),
+                    }],
+                };
+                c.tool_attempt = Some(attempt);
+                c.phase = Phase::TaskPending {
+                    turns: 0,
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "job".into(),
+                        arguments: "{}".into(),
+                    }],
+                    index: 0,
+                    operation_id: op,
+                    arguments: args,
+                    task: op,
+                    identity: Some(identity),
+                };
+                h.save_composed_locked(
+                    &c,
+                    Expected::Version(version),
+                    None,
+                    &[task],
+                    &[],
+                    Some(&evidence),
+                )
+                .unwrap();
+                let tasks = crate::task_store::TaskStore::new(h.owner.store());
+                let mut running = tasks.load(op).unwrap().unwrap();
+                running.task.start_attempt(Uuid::new_v4()).unwrap();
+                running.task.request_abort().unwrap();
+                running.task.fail("reconciliation required".into()).unwrap();
+                tasks
+                    .save(&[crate::task_store::Save::Update(&running)])
+                    .unwrap();
+                let running = tasks.load(op).unwrap().unwrap();
+                assert!(
+                    h.checkpointable_conversation_checks(&running.task, &registry)
+                        .is_err()
+                );
+                let checks = h
+                    .checkpointable_cancel_receipt_recovery_checks(&running.task, &registry)
+                    .unwrap();
+                // The competing writer runs after all evidence reads and before
+                // the dependent intent or park batch reaches its commit.
+                let conversation_key = Harness::key(id);
+                let entry = h.owner.store().get(&conversation_key).unwrap().unwrap();
+                let mut changed: Conversation = serde_json::from_slice(&entry.value).unwrap();
+                if abort {
+                    changed.abort_requested = true;
+                } else {
+                    changed.tool_attempt.as_mut().unwrap().attempt_id = Uuid::new_v4();
+                }
+                h.owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: conversation_key.clone(),
+                            expected: Expected::Version(entry.version),
+                        }],
+                        &[Mutation::Put {
+                            key: conversation_key,
+                            value: serde_json::to_vec(&changed).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                let output = format!("test/{stage}/{op}").into_bytes();
+                assert!(matches!(
+                    h.owner.store().commit(
+                        &checks,
+                        &[Mutation::Put {
+                            key: output.clone(),
+                            value: vec![1]
+                        }]
+                    ),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(h.owner.store().get(&output).unwrap().is_none());
+                if !abort {
+                    assert!(
+                        h.checkpointable_cancel_receipt_recovery_checks(&running.task, &registry)
                             .is_err()
                     );
                 }
