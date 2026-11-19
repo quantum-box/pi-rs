@@ -9,7 +9,7 @@ not the ordinary asynchronous `Tool` invocation or its nested tool-hook pipeline
 It is separate from `KeyedHost` multi-level nested calls and does not establish
 parity with upstream `executeTool(..., { wait: false })` or its tool API.
 
-Conversation-owned checkpointable asynchronous tool execution and its extension hooks remain unsupported. A replay-safe, unhooked candidate can be registered explicitly and is checked against the conversation tool list when attaching the driver; invocation remains disabled. The existing TaskPending boundary now checks the admitted input and task definition on attachment and outcome reading; see the [integration design](durable-conversation-async-integration.md) for the additional authorization, fencing and recovery work required before enabling dispatch.
+Conversation-owned checkpointable asynchronous tools support explicitly registered replay-safe, unhooked task trees, with checked intent, ownership and park settlement. Extension hooks, unsafe tools and external-job cancellation are not supported on this path. The existing TaskPending boundary now checks the admitted input and task definition on attachment and outcome reading; see the [integration design](durable-conversation-async-integration.md) for the additional authorization, fencing and recovery work required before enabling dispatch.
 
 The scheduler integration tests kill the OS process with an unsafe root parked
 and a leaf result already committed, reopen, reconnect the root's key on wake,

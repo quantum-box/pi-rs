@@ -321,6 +321,11 @@ pub(crate) struct Identity {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     deferred_arguments: bool,
 }
+impl Identity {
+    pub(crate) fn is_checkpointable(&self) -> bool {
+        self.deferred_arguments
+    }
+}
 #[async_trait::async_trait]
 impl Tool for TaskTool {
     fn spec(&self) -> ToolSpec {

@@ -122,6 +122,10 @@ pub(crate) type IntentCommitHook =
 #[cfg(test)]
 pub(crate) static INTENT_COMMIT_HOOK: std::sync::Mutex<Option<(Uuid, IntentCommitHook)>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) static CONVERSATION_INTENT_COMMIT_HOOK: std::sync::Mutex<
+    Option<(Uuid, IntentCommitHook)>,
+> = std::sync::Mutex::new(None);
 
 pub type Migration =
     dyn Fn(&Value, &Checkpoint, u32) -> Result<(Value, Checkpoint), String> + Send + Sync;
@@ -617,6 +621,7 @@ impl Registry {
         }
         let entry = self.entries.get_mut(&identity.kind).expect("inserted");
         entry.cancellable_durable_async = true;
+        entry.abort = Some(Arc::new(|_: &Task| Ok(Step::Succeed(Value::Null))));
         entry.conversation_checkpointable = Some((identity, validate));
         Ok(())
     }
@@ -1839,6 +1844,7 @@ pub struct AdmissionHandle<'a> {
     definitions: &'a std::sync::RwLock<WakeDefinitions>,
     activity: &'a crate::worker_activity::WorkerActivity,
     standalone: bool,
+    validator: Option<&'a crate::runtime::Harness>,
 }
 
 impl DetachedInvocation {
@@ -1866,6 +1872,7 @@ impl DetachedInvocation {
             definitions: &self.definitions,
             activity: &self.activity,
             standalone: self.validator.is_none(),
+            validator: self.validator.as_ref(),
         }
         .admit_task_tool_child(tool, key, input)
     }
@@ -2923,7 +2930,8 @@ impl AdmissionHandle<'_> {
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<Vec<u8>, String> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
-        if !self.standalone
+        if (!self.standalone
+            && (test_namespace || !expected_replay_safe || self.validator.is_none()))
             || self.abort
             || self.lease.retired
             || self.running.task.replay_safe() != expected_replay_safe
@@ -3037,6 +3045,42 @@ impl AdmissionHandle<'_> {
                         .task
                 }
                 TaskOwner::Conversation(id) => {
+                    if let Some(harness) = self.validator {
+                        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+                        let registration = current
+                            .task
+                            .kind()
+                            .and_then(|kind| definitions.registry.entries.get(kind))
+                            .ok_or("missing checkpointable registration")?;
+                        if registration.conversation_checkpointable.is_none() {
+                            return Err("conversation checkpointable registration required".into());
+                        }
+                        for check in harness
+                            .checkpointable_conversation_checks(
+                                &current.task,
+                                &definitions.registry,
+                            )
+                            .map_err(|e| e.to_string())?
+                        {
+                            if let Some(existing) =
+                                checks.iter_mut().find(|existing| existing.key == check.key)
+                            {
+                                if matches!(existing.expected, durable_store::Expected::Missing)
+                                    && matches!(
+                                        check.expected,
+                                        durable_store::Expected::MissingUnchangedSince(_)
+                                    )
+                                {
+                                    existing.expected = check.expected;
+                                } else if existing.expected != check.expected {
+                                    return Err(HOOK_FENCE_CONFLICT.into());
+                                }
+                            } else {
+                                checks.push(check);
+                            }
+                        }
+                        break;
+                    }
                     let conversation = format!("runtime/conversation/{id}").into_bytes();
                     if owner
                         .store()
@@ -3071,6 +3115,14 @@ impl AdmissionHandle<'_> {
         #[cfg(test)]
         {
             let hook = INTENT_COMMIT_HOOK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|(id, hook)| (*id == current.task.id()).then(|| hook.clone()));
+            if let Some(hook) = hook {
+                hook(owner.store(), write_intent);
+            }
+            let hook = CONVERSATION_INTENT_COMMIT_HOOK
                 .lock()
                 .unwrap()
                 .as_ref()
@@ -3926,6 +3978,7 @@ impl DetachedInvocation {
                     definitions: &definitions,
                     activity: &activity,
                     standalone: validator.is_none(),
+                    validator: validator.as_ref(),
                 };
                 handler.run_abort_with_admission(
                     &running.task,
@@ -3969,6 +4022,7 @@ impl DetachedInvocation {
                                 definitions: &definitions,
                                 activity: &activity,
                                 standalone: validator.is_none(),
+                                validator: validator.as_ref(),
                             };
                             if let Some(cancellation) = cancellation {
                                 handler.run_with_admission_and_cancellation(
@@ -8404,7 +8458,8 @@ impl Scheduler {
                 let registration = self.registered(&running.task)?;
                 if !registration.cancellable_durable_async
                     || !staged.is_empty()
-                    || self.validator.is_some()
+                    || (self.validator.is_some()
+                        && registration.conversation_checkpointable.is_none())
                 {
                     return Err(Error::Registration);
                 }
@@ -8760,6 +8815,36 @@ impl Scheduler {
         // Both use the captured version, so aborts and competing graph writers
         // fence the whole transaction, without a self-conflict.
         let mut graph = self.ts().prepare_save(&batch)?;
+        if let Some(harness) = &self.validator
+            && self
+                .registered(&running.task)?
+                .conversation_checkpointable
+                .is_some()
+        {
+            let checks = harness
+                .checkpointable_conversation_checks(&running.task, &self.registry)
+                .map_err(|_| Error::Ownership)?;
+            for check in checks {
+                if let Some(existing) = graph
+                    .checks
+                    .iter_mut()
+                    .find(|existing| existing.key == check.key)
+                {
+                    if matches!(existing.expected, durable_store::Expected::Missing)
+                        && matches!(
+                            check.expected,
+                            durable_store::Expected::MissingUnchangedSince(_)
+                        )
+                    {
+                        existing.expected = check.expected;
+                    } else if existing.expected != check.expected {
+                        return Err(Error::Ownership);
+                    }
+                } else {
+                    graph.checks.push(check);
+                }
+            }
+        }
         if let Some(check) = undispatched_check {
             graph.checks.push(check);
         }
@@ -8771,7 +8856,17 @@ impl Scheduler {
                 }
                 document_keys.insert(check.key.clone());
                 if !graph.checks.contains(&check) {
-                    graph.checks.push(check);
+                    let weaker_missing = matches!(check.expected, durable_store::Expected::Missing)
+                        && graph.checks.iter().any(|existing| {
+                            existing.key == check.key
+                                && matches!(
+                                    existing.expected,
+                                    durable_store::Expected::MissingUnchangedSince(_)
+                                )
+                        });
+                    if !weaker_missing {
+                        graph.checks.push(check);
+                    }
                 }
             }
             for mutation in prepared.mutations {
@@ -8810,6 +8905,16 @@ impl Scheduler {
                 .checks
                 .iter()
                 .any(|check| check.key == b"runtime/conversation/");
+        document_batch.checks.retain(|check| {
+            !(matches!(check.expected, durable_store::Expected::Missing)
+                && graph.checks.iter().any(|existing| {
+                    existing.key == check.key
+                        && matches!(
+                            existing.expected,
+                            durable_store::Expected::MissingUnchangedSince(_)
+                        )
+                }))
+        });
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;

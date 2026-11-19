@@ -1,6 +1,7 @@
 //! Standalone task-backed async tools with explicit hook policy. Checkpointable
 //! tools have separate replay-safe and unsafe registrations. Conversation-
-//! attached checkpointable execution remains unsupported.
+//! attached checkpointable execution supports explicitly registered replay-safe,
+//! unhooked task trees; unsafe tools and selected extensions are rejected.
 
 use crate::task::Task;
 use pi_rs_core::{Outcome, Tool, ToolSpec};
@@ -18,7 +19,8 @@ pub use unsafe_park_proof::{UnsafeDurableParkEvidence, UnsafeDurableReceipt};
 /// Prepare matching conversation and driver registrations for an explicitly
 /// replay-safe checkpointable Tool with no hooks. Add the returned adapter's
 /// `register()` result to the Harness tool list and pass `registry` to the
-/// task driver. Conversation execution is not yet enabled and fails closed.
+/// task driver. The conversation must select no extensions. Unsafe tools,
+/// hooks, task-owned conversations and external-job cancellation are unsupported.
 pub fn register_conversation_replay_safe_durable_tool(
     registry: &mut crate::task_scheduler::Registry,
     tool: Arc<dyn DurableAsyncTool>,
