@@ -691,6 +691,11 @@ single plain-text block, then its block hook (including the existing legacy
 text bridge). Each replacement is checked before another hook can observe it.
 The text-only result API is skipped when the current output is multiple blocks,
 an image, or a non-plain text block; block hooks still see the full result.
+Unchanged attachment arrays retain their original fields and explicit empty form.
+A text-result hook cannot change attachments when their original metadata cannot
+be represented by that API. An unchanged text-result return leaves the initial
+projection available to a later block hook, including when it exceeds the final
+size limit.
 This per-extension ordering adapts pi's single afterTool chain to two pi-rs
 hook APIs. The definition identity is versioned for this behavior; older
 in-flight registrations must be recovered with their matching implementation. Dynamic conversation

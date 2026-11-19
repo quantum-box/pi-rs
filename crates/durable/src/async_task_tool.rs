@@ -4476,6 +4476,146 @@ mod tests {
         assert_eq!(driver.get(id).unwrap().unwrap().state(), task.state());
         let _ = driver.shutdown_with_pending().unwrap();
     }
+    struct AddAttachmentMetadata(serde_json::Value);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for AddAttachmentMetadata {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let mut out = input.clone();
+            out.extra.insert("attachments".into(), self.0.clone());
+            Ok(Some(out))
+        }
+    }
+    struct RewriteTextWithAttachments(bool);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for RewriteTextWithAttachments {
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolResult,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            let mut out = input.clone();
+            out.output = "rewritten".into();
+            if self.0 {
+                out.attachments.clear();
+            }
+            Ok(Some(out))
+        }
+    }
+    #[test]
+    fn durable_combined_text_bridge_preserves_attachment_representation() {
+        for (attachments, change) in [
+            (json!([]), false),
+            (
+                json!([{"id":"asset", "media_type":"image/png", "extra":{"origin":"original"}}]),
+                false,
+            ),
+            (
+                json!([{"id":"asset", "media_type":"image/png", "extra":{"origin":"original"}}]),
+                true,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (host, tool) = combined_content_host(
+                &path,
+                Arc::new(AddAttachmentMetadata(attachments.clone())),
+                Arc::new(RewriteTextWithAttachments(change)),
+            );
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, id);
+            if change {
+                assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+            } else {
+                let crate::task::TaskState::Succeeded(value) = task.state() else {
+                    panic!("unexpected {:?}", task.state())
+                };
+                let DurableTaskResult::Rich {
+                    task_content_v1: result,
+                } = serde_json::from_value(value.clone()).unwrap()
+                else {
+                    panic!("expected rich result")
+                };
+                assert_eq!(result.output[0]["text"], "rewritten");
+                assert_eq!(result.extra.get("attachments"), Some(&attachments));
+            }
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+
+    struct UnchangedThenShrink(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for UnchangedThenShrink {
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolResult,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            assert_eq!(
+                input.structured_output.as_ref().unwrap()["payload"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                60_000
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(input.clone()))
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut out = input.clone();
+            out.output = vec![json!({"type":"text", "text":"trimmed"})];
+            Ok(Some(out))
+        }
+    }
+    #[test]
+    fn durable_combined_oversized_initial_unchanged_result_reaches_shrinking_block_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("structured"), b"yes").unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let (host, tool) = single_content_host(
+            &dir.path().join("db"),
+            Arc::new(CountFileTool(dir.path().into())),
+            Arc::new(UnchangedThenShrink(count.clone())),
+        );
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected {:?}", task.state())
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: result,
+        } = serde_json::from_value(value.clone()).unwrap()
+        else {
+            panic!("expected rich result")
+        };
+        assert_eq!(result.output[0]["text"], "trimmed");
+        assert_eq!(
+            result.extra["structuredOutput"]["payload"]
+                .as_str()
+                .unwrap()
+                .len(),
+            60_000
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
     struct InvalidRichGate;
     #[async_trait::async_trait]
     impl crate::extension::Hook for InvalidRichGate {

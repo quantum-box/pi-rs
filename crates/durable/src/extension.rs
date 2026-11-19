@@ -1502,7 +1502,11 @@ impl Resolved {
             diagnostics: blocks.diagnostics.clone(),
         }))
     }
-    fn durable_result_blocks(value: ToolResult) -> Result<ToolBlockResult, String> {
+    fn durable_result_blocks(
+        value: ToolResult,
+        input: &ToolResult,
+        original: &ToolBlockResult,
+    ) -> Result<ToolBlockResult, String> {
         let mut extra = std::collections::BTreeMap::new();
         extra.insert("isError".into(), Value::Bool(value.is_error));
         if let Some(details) = value.details {
@@ -1511,11 +1515,23 @@ impl Resolved {
         if let Some(data) = value.structured_output {
             extra.insert("structuredOutput".into(), data);
         }
-        if !value.attachments.is_empty() {
-            extra.insert(
-                "attachments".into(),
-                serde_json::to_value(value.attachments).map_err(|e| e.to_string())?,
-            );
+        if value.attachments == input.attachments {
+            if let Some(attachments) = original.extra.get("attachments") {
+                extra.insert("attachments".into(), attachments.clone());
+            }
+        } else {
+            if let Some(attachments) = original.extra.get("attachments")
+                && serde_json::to_value(&input.attachments).map_err(|e| e.to_string())?
+                    != *attachments
+            {
+                return Err("attachment metadata cannot be preserved by text result hook".into());
+            }
+            if !value.attachments.is_empty() {
+                extra.insert(
+                    "attachments".into(),
+                    serde_json::to_value(value.attachments).map_err(|e| e.to_string())?,
+                );
+            }
         }
         Ok(ToolBlockResult {
             output: vec![serde_json::json!({"type":"text", "text":value.output})],
@@ -1547,11 +1563,12 @@ impl Resolved {
                     })
                     .await
                     {
-                        Ok(Some((value, _))) => {
-                            let candidate = Self::durable_result_blocks(value)?;
+                        Ok(Some((value, _))) if value != input => {
+                            let candidate = Self::durable_result_blocks(value, &input, &result)?;
                             validate(&candidate)?;
                             result = candidate;
                         }
+                        Ok(Some(_)) => (),
                         Ok(None) => (),
                         Err(error) => return Err(error),
                     }
