@@ -210,6 +210,31 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
+    if case == "save_receipt" {
+        crate::task_scheduler::enable_test_conversation_receipt(root_id);
+        scheduler.abort_task(root_id).unwrap();
+        let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        let entry = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(entry) = store.get(key.as_bytes()).unwrap() {
+                    break entry;
+                }
+                if tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                    panic!("receipt not stored");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let receipt: crate::task_scheduler::ConversationCancelReceipt =
+            serde_json::from_slice(&entry.value).unwrap();
+        assert_eq!(receipt.claim.task, root_id);
+        assert_eq!(receipt.result, "test evidence only");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+        return;
+    }
     if case == "mismatch" {
         identity_handle
             .update(Some("backend-v2".into()), || {})
@@ -357,6 +382,11 @@ async fn exercise_conversation_park_claim(case: &str) {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let _ = driver.shutdown_with_pending().unwrap();
+}
+
+#[tokio::test]
+async fn conversation_cancel_test_receipt_is_stored_by_driver() {
+    exercise_conversation_park_claim("save_receipt").await;
 }
 
 #[tokio::test]

@@ -1680,7 +1680,26 @@ impl Handler for Executor {
                 ._conversation_cancel
                 .as_ref()
                 .ok_or("missing cancel registration")?;
-            admission.record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
+            let _claim = admission
+                .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
+            #[cfg(test)]
+            if crate::task_scheduler::take_test_conversation_receipt(task.id()) {
+                let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                    version: 1,
+                    claim: _claim.clone(),
+                    result: "test evidence only".into(),
+                };
+                admission.store_conversation_cancel_receipt(self, &receipt)?;
+                admission.store_conversation_cancel_receipt(self, &receipt)?;
+                let mut foreign = receipt.clone();
+                foreign.claim.attempt = uuid::Uuid::new_v4();
+                if admission
+                    .store_conversation_cancel_receipt(self, &foreign)
+                    .is_ok()
+                {
+                    return Err("foreign attempt accepted".into());
+                }
+            }
             return Err(
                 "conversation cancel callback is not enabled; reconciliation required".into(),
             );

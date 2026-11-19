@@ -236,6 +236,41 @@ pub(crate) struct ConversationCancelClaim {
     pub policy: crate::async_task_tool::ConversationCancelPolicy,
 }
 
+/// A receipt binds a reported cancellation result to the complete claim. It
+/// does not itself establish that the callback was dispatched or completed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConversationCancelReceipt {
+    pub version: u32,
+    pub claim: ConversationCancelClaim,
+    pub result: String,
+}
+
+/// Check the immutable claim before treating the receipt as evidence. The
+/// caller must additionally validate the owner graph and commit all returned
+/// store checks atomically; this comparison alone is not authorization.
+#[allow(dead_code)]
+pub(crate) fn validate_conversation_cancel_receipt(
+    receipt: &ConversationCancelReceipt,
+    claim: &ConversationCancelClaim,
+) -> Result<(), String> {
+    if receipt.version != 1
+        || receipt.claim != *claim
+        || claim.version != 2
+        || claim.claim_id.is_nil()
+        || claim.task.is_nil()
+        || claim.attempt.is_nil()
+        || claim.lease.is_nil()
+        || claim.kind.is_empty()
+        || claim.definition_version == 0
+        || claim.checkpoint.phase != "replay-safe-async-wait"
+        || receipt.result.len() > 65536
+    {
+        return Err("conversation cancel receipt evidence mismatch".into());
+    }
+    Ok(())
+}
+
 fn conversation_cancel_claim_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-claim").into_bytes()
 }
@@ -1290,6 +1325,19 @@ impl PendingMaintenance {
 }
 
 #[cfg(test)]
+fn test_receipt_tasks() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn enable_test_conversation_receipt(id: Uuid) {
+    test_receipt_tasks().lock().unwrap().insert(id);
+}
+#[cfg(test)]
+pub(crate) fn take_test_conversation_receipt(id: Uuid) -> bool {
+    test_receipt_tasks().lock().unwrap().remove(&id)
+}
+#[cfg(test)]
 type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
 #[cfg(test)]
 fn conversation_claim_hooks() -> &'static BoundaryHooks {
@@ -2177,7 +2225,7 @@ impl AdmissionHandle<'_> {
         &self,
         handler: &dyn Handler,
         policy: crate::async_task_tool::ConversationCancelPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<ConversationCancelClaim, String> {
         if !self.abort || self.standalone || self.lease.retired {
             return Err("invalid conversation cleanup lease".into());
         }
@@ -2289,6 +2337,134 @@ impl AdmissionHandle<'_> {
             hook();
         }
         commit?;
+        Ok(record)
+    }
+
+    /// Persist test evidence while the original cleanup attempt and all of
+    /// its conversation and park fences are still live. This does not dispatch
+    /// a callback or establish that any external effect occurred.
+    #[allow(dead_code)]
+    pub(crate) fn store_conversation_cancel_receipt(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+    ) -> Result<(), String> {
+        if !self.abort || self.standalone || self.lease.retired {
+            return Err("invalid conversation cleanup lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cleanup attempt or live child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation cancel registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
+            owner.store(),
+            &current.task,
+            boundary,
+        )?);
+        if receipt.claim.attempt != attempt || receipt.claim.lease != self.lease.token {
+            return Err("receipt attempt or lease mismatch".into());
+        }
+        let (claim, claim_check) = read_conversation_cancel_claim(
+            owner.store(),
+            current.task.id(),
+            attempt,
+            receipt.claim.claim_id,
+        )?
+        .ok_or("missing claim")?;
+        validate_conversation_cancel_receipt(receipt, &claim)?;
+        checks.push(claim_check);
+        let key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+            current.task.id()
+        )
+        .into_bytes();
+        let existing = owner.store().get(&key).map_err(|e| e.to_string())?;
+        let expected = if let Some(ref entry) = existing {
+            let saved: ConversationCancelReceipt =
+                serde_json::from_slice(&entry.value).map_err(|_| "invalid receipt")?;
+            validate_conversation_cancel_receipt(&saved, &claim)?;
+            if saved != *receipt {
+                return Err("conflicting receipt".into());
+            }
+            durable_store::Expected::Version(entry.version)
+        } else {
+            durable_store::Expected::Missing
+        };
+        checks.push(durable_store::Check {
+            key: key.clone(),
+            expected,
+        });
+        let mutations = if existing.is_none() {
+            vec![durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(receipt).map_err(|e| e.to_string())?,
+            }]
+        } else {
+            vec![]
+        };
+        owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &mutations,
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -25833,6 +26009,47 @@ mod conversation_cancel_claim_schema_tests {
     use crate::async_task_tool::ConversationCancelPolicy;
     use crate::task::Checkpoint;
     use serde_json::json;
+
+    #[test]
+    fn receipt_requires_exact_claim_and_supported_schema() {
+        let claim = ConversationCancelClaim {
+            version: 2,
+            claim_id: Uuid::new_v4(),
+            task: Uuid::new_v4(),
+            kind: "registered-kind".into(),
+            definition_version: 1,
+            attempt: Uuid::new_v4(),
+            lease: Uuid::new_v4(),
+            checkpoint: Checkpoint {
+                phase: "replay-safe-async-wait".into(),
+                data: json!({}),
+            },
+            policy: ConversationCancelPolicy::AtMostOnce,
+        };
+        let receipt = ConversationCancelReceipt {
+            version: 1,
+            claim: claim.clone(),
+            result: "test".into(),
+        };
+        assert!(validate_conversation_cancel_receipt(&receipt, &claim).is_ok());
+        for index in 0..5 {
+            let mut changed = claim.clone();
+            match index {
+                0 => changed.claim_id = Uuid::new_v4(),
+                1 => changed.attempt = Uuid::new_v4(),
+                2 => changed.lease = Uuid::new_v4(),
+                3 => changed.task = Uuid::new_v4(),
+                _ => changed.checkpoint.data = json!({"changed":true}),
+            }
+            assert!(validate_conversation_cancel_receipt(&receipt, &changed).is_err());
+        }
+        let mut invalid = receipt.clone();
+        invalid.version = 2;
+        assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
+        invalid.version = 1;
+        invalid.result = "x".repeat(65537);
+        assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
+    }
 
     #[test]
     fn claim_identity_policy_and_attempt_survive_reopen() {

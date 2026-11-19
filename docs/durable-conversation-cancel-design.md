@@ -38,6 +38,12 @@ call with a different identity is rejected. This registration retains the
 handler but does not dispatch it or enable external cancellation. Hooked registrations
 and callback retry policy are not included in this initial registration API.
 
+A preliminary receipt write transaction checks the live claim, lease,
+conversation binding, owner graph and park evidence atomically. It is exercised
+only by a test-only synthetic receipt; no callback is invoked and this record
+is not proof that external cleanup occurred. Receipt recovery after a process
+restart is not connected and remains fail-closed.
+
 A safe implementation needs all of the following before dispatch is enabled:
 
 * Bind the callback identity, retry policy, Tool identity and selected hook
