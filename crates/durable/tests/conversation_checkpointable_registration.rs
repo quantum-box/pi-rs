@@ -259,7 +259,7 @@ async fn selected_hook_candidate_requires_identified_order_and_stays_closed() {
 }
 
 #[test]
-fn conversation_hook_registration_rejects_multiple_hooks() {
+fn conversation_hook_registration_accepts_multiple_hooks() {
     use pi_rs_durable::async_task_tool::{
         ReplaySafeConversationHooksAuthorization,
         register_conversation_replay_safe_durable_tool_with_selected_hooks,
@@ -294,7 +294,7 @@ fn conversation_hook_registration_rejects_multiple_hooks() {
             ReplaySafeAuthorization::host_attests_replay_safe(),
             ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()
         )
-        .is_err()
+        .is_ok()
     );
 }
 

@@ -50,7 +50,7 @@ impl ReplaySafeConversationHooksAuthorization {
     }
 }
 
-/// Register one identified replay-safe hook for conversation checkpointable
+/// Register an ordered, nonempty selection of identified replay-safe hooks for conversation checkpointable
 /// execution. Every checkpointable child must use the same selected registration.
 /// Final bounded after results, including blocks, metadata and diagnostics, are
 /// committed to the conversation without running the ordinary after chain again.
@@ -70,8 +70,8 @@ pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
     let selection = snapshot
         .stable_selection(names)
         .ok_or("extension selection is missing, duplicated, or unidentified")?;
-    if names.len() != 1 || selection.hook_count() != 1 {
-        return Err("exactly one selected hook is supported".into());
+    if names.is_empty() || selection.hook_count() == 0 {
+        return Err("at least one selected hook is required".into());
     }
     let resolved = snapshot
         .resolve_stable(names, &selection)
