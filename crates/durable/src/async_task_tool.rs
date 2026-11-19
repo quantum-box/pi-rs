@@ -9,7 +9,8 @@ use std::sync::Arc;
 mod replay_safe;
 pub(crate) mod unsafe_park_proof;
 pub use replay_safe::{
-    AbortAfterAuthorization, ReplaySafeAuthorization, RestartAfterAuthorization, UnsafeDurableAuthorization,
+    AbortAfterAuthorization, ReplaySafeAuthorization, RestartAfterAuthorization,
+    UnsafeDurableAuthorization,
 };
 pub use unsafe_park_proof::{UnsafeDurableParkEvidence, UnsafeDurableReceipt};
 
@@ -7567,6 +7568,188 @@ mod tests {
             1
         );
     }
+    struct MutableRestartTool(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Tool for MutableRestartTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "mutable-restart".into(),
+                description: if self.0.load(Ordering::SeqCst) {
+                    "changed"
+                } else {
+                    "original"
+                }
+                .into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for MutableRestartTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            Err("must not execute".into())
+        }
+    }
+    struct PausedRestartHook {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for PausedRestartHook {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(()).map_err(|e| e.to_string())?;
+            self.release
+                .lock()
+                .map_err(|e| e.to_string())?
+                .recv()
+                .map_err(|e| e.to_string())?;
+            let mut out = input.clone();
+            out.output = vec![json!({"type":"text", "text":"restart cleaned"})];
+            Ok(Some(out))
+        }
+    }
+    #[test]
+    fn restart_cleanup_respects_identity_and_abort_precedence() {
+        use crate::task_store::TaskStore;
+        for case in [
+            "control",
+            "mutation",
+            "abort-before",
+            "abort-after-drain-mark",
+            "abort-during",
+            "abort-after-receipt",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let mut extensions = crate::extension::Registry::default();
+            extensions
+                .install_identified(
+                    crate::extension::Extension {
+                        name: "restart-race".into(),
+                        hooks: vec![Arc::new(PausedRestartHook {
+                            entered,
+                            release: std::sync::Mutex::new(release_rx),
+                            calls: calls.clone(),
+                        })],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(
+                        1,
+                        "restart-race-v1".into(),
+                        vec!["hook".into()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut host =
+                StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+            let tool = host
+                .register_replay_safe_durable_tool_with_restart_after(
+                    Arc::new(MutableRestartTool(changed.clone())),
+                    "mutable-restart-v1",
+                    1,
+                    vec![],
+                    &extensions.snapshot(),
+                    &["restart-race".into()],
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                    RestartAfterAuthorization::host_attests_cleanup_safe(),
+                )
+                .unwrap();
+            let id = host.start_replay_safe_root(&tool, json!({}), 3).unwrap();
+            let mut scheduler = host.into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let tasks = TaskStore::new(owner.store());
+            let snapshot = tasks.load(id).unwrap().unwrap();
+            tasks
+                .update(&snapshot, |task| {
+                    task.start_attempt(Uuid::new_v4())?;
+                    task.hold_restart_failure()
+                })
+                .unwrap();
+            if case == "abort-after-drain-mark" {
+                let snapshot = tasks.load(id).unwrap().unwrap();
+                tasks
+                    .update(&snapshot, |task| task.request_restart_internal_abort())
+                    .unwrap();
+            }
+            if matches!(case, "abort-before" | "abort-after-drain-mark") {
+                scheduler.request_abort(id).unwrap();
+            }
+            let (receipt_entered, receipt_entered_rx) = std::sync::mpsc::channel();
+            let (receipt_release, receipt_release_rx) = std::sync::mpsc::channel();
+            if case == "abort-after-receipt" {
+                replay_safe::after_restart_receipt(id, move || {
+                    receipt_entered.send(()).unwrap();
+                    receipt_release_rx.recv().unwrap();
+                });
+            }
+            let driver = crate::task_driver::Driver::start(scheduler);
+            if !matches!(case, "abort-before" | "abort-after-drain-mark") {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("restart hook did not enter");
+                if case == "mutation" {
+                    changed.store(true, Ordering::SeqCst);
+                }
+                if case == "abort-during" {
+                    driver.request_abort(id).unwrap();
+                }
+                release.send(()).unwrap();
+                if case == "abort-after-receipt" {
+                    receipt_entered_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("receipt was not committed");
+                    driver.request_abort(id).unwrap();
+                    receipt_release.send(()).unwrap();
+                }
+            }
+            let task = wait_terminal(&driver, id);
+            assert!(
+                matches!(task.state(), crate::task::TaskState::Failed(reason) if reason == "restart limit"),
+                "{case}: {:?}",
+                task.state()
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!matches!(case, "abort-before" | "abort-after-drain-mark")),
+                "{case}"
+            );
+            driver.shutdown().unwrap();
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let result = read_restart_after_result(&store, id).unwrap();
+            assert_eq!(result.is_some(), case == "control", "{case}");
+            if case != "control" {
+                assert!(
+                    store
+                        .get(format!("durable/replay-safe-async/{id}/restart-after").as_bytes())
+                        .unwrap()
+                        .is_none(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
     struct RestartCleanupHook(std::path::PathBuf);
     #[async_trait::async_trait]
     impl crate::extension::Hook for RestartCleanupHook {

@@ -150,6 +150,9 @@ macro_rules! declare_task_schema {
             /// A restart-limit failure awaiting its independent, one-attempt hook.
             #[serde(default, skip_serializing_if = "task_tool_is_false")]
             restart_cleanup: bool,
+            /// The abort mark was issued by restart-failure child drainage.
+            #[serde(default, skip_serializing_if = "task_tool_is_false")]
+            restart_internal_abort: bool,
         }
     };
 }

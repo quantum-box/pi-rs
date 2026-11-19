@@ -53,6 +53,7 @@ impl Task {
             task_tool: false,
             retain_task_children_on_success: false,
             restart_cleanup: false,
+            restart_internal_abort: false,
         })
     }
 
@@ -156,6 +157,7 @@ impl Task {
         if self.is_terminal() {
             return Err(TransitionError::InvalidState);
         }
+        self.restart_internal_abort = false;
         if !self.abort_requested {
             self.abort_requested = true;
             self.retired_attempt_id = None;
@@ -392,6 +394,20 @@ impl Task {
     pub(crate) fn holds_restart_cleanup(&self) -> bool {
         self.restart_cleanup
     }
+    pub(crate) fn restart_internal_abort(&self) -> bool {
+        self.restart_cleanup && self.restart_internal_abort
+    }
+    pub(crate) fn restart_externally_aborted(&self) -> bool {
+        self.abort_requested && !self.restart_internal_abort
+    }
+    pub(crate) fn request_restart_internal_abort(&mut self) -> Result<(), TransitionError> {
+        if self.abort_requested {
+            return Ok(());
+        }
+        self.request_abort()?;
+        self.restart_internal_abort = true;
+        Ok(())
+    }
     pub(crate) fn hold_restart_failure(&mut self) -> Result<(), TransitionError> {
         self.hold_failure("restart limit".into())?;
         self.restart_cleanup = true;
@@ -400,6 +416,7 @@ impl Task {
     }
     pub(crate) fn start_restart_cleanup(&mut self, attempt: Uuid) -> Result<(), TransitionError> {
         if !self.restart_cleanup
+            || self.restart_externally_aborted()
             || !matches!(&self.state, TaskState::CompletingFailed(reason) if reason == "restart limit")
         {
             return Err(TransitionError::InvalidState);

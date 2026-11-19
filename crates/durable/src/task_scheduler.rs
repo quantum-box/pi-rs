@@ -1761,6 +1761,7 @@ impl AdmissionHandle<'_> {
             || current != *self.running
             || !matches!(current.task.state(), TaskState::CompletingFailed(reason) if reason == "restart limit")
             || !current.task.holds_restart_cleanup()
+            || current.task.restart_externally_aborted()
             || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
             || !state.attempts.contains(&self.lease.id)
             || has_live_owned(
@@ -3673,6 +3674,19 @@ impl Scheduler {
                 if self.inject_abort_commit_error == 1 {
                     return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
                 }
+                let (running, outcome) = if running.task.holds_restart_cleanup() {
+                    let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+                    if current.task.restart_externally_aborted()
+                        && current.task.holds_restart_cleanup()
+                        && current.task.attempt_id() == running.task.attempt_id()
+                    {
+                        (current, Some("restart cleanup aborted".to_string()))
+                    } else {
+                        (running, outcome)
+                    }
+                } else {
+                    (running, outcome)
+                };
                 match outcome {
                     None if running.task.holds_restart_cleanup() => {
                         let reg = self.registered(&running.task)?;
@@ -6070,6 +6084,8 @@ impl Scheduler {
                         .conversation_controls()
                         .fence(|| harness.abort_owned_graph(None, Some(snapshot.task.id())))
                         .map_err(|e| Error::Handler(format!("failure abort: {e:?}")))?;
+                } else if snapshot.task.holds_restart_cleanup() {
+                    request_restart_failure_subtree(&self.ts(), snapshot.task.id())?;
                 } else {
                     request_abort_subtree(&self.ts(), snapshot.task.id())?;
                 }
@@ -6085,7 +6101,9 @@ impl Scheduler {
                 if active {
                     continue;
                 }
-                if snapshot.task.attempt_id().is_some() {
+                if snapshot.task.attempt_id().is_some()
+                    || snapshot.task.restart_externally_aborted()
+                {
                     let key = restart_receipt_key(snapshot.task.id());
                     let receipt = self
                         .ts()
@@ -6098,7 +6116,9 @@ impl Scheduler {
                                 && reg.restart_after
                                 && reg.version == snapshot.task.definition_version()
                         });
-                    let evidence = if valid_registration {
+                    let evidence = if valid_registration
+                        && !snapshot.task.restart_externally_aborted()
+                    {
                         receipt.as_ref().and_then(|entry| {
                             restart_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
                         })
@@ -8341,17 +8361,22 @@ fn request_abort_subtree_with(
     id: Uuid,
     before_commit: impl FnMut(),
 ) -> Result<(), Error> {
-    request_abort_roots_with(ts, id, false, before_commit)
+    request_abort_roots_with(ts, id, false, false, before_commit)
 }
 
 fn request_abort_nested_tools(ts: &TaskStore<'_>, parent: Uuid) -> Result<(), Error> {
-    request_abort_roots_with(ts, parent, true, || {})
+    request_abort_roots_with(ts, parent, true, false, || {})
+}
+
+fn request_restart_failure_subtree(ts: &TaskStore<'_>, id: Uuid) -> Result<(), Error> {
+    request_abort_roots_with(ts, id, false, true, || {})
 }
 
 fn request_abort_roots_with(
     ts: &TaskStore<'_>,
     id: Uuid,
     nested: bool,
+    internal_restart: bool,
     mut before_commit: impl FnMut(),
 ) -> Result<(), Error> {
     loop {
@@ -8405,10 +8430,17 @@ fn request_abort_roots_with(
         for record in &records {
             if ids.contains(&record.task.id())
                 && !record.task.is_terminal()
-                && !record.task.abort_requested()
+                && (!record.task.abort_requested()
+                    || (!internal_restart && record.task.restart_internal_abort()))
             {
                 let mut next = record.clone();
-                next.task.request_abort().map_err(Error::Transition)?;
+                if internal_restart && record.task.id() == id {
+                    next.task
+                        .request_restart_internal_abort()
+                        .map_err(Error::Transition)?;
+                } else {
+                    next.task.request_abort().map_err(Error::Transition)?;
+                }
                 updates.push(next);
             }
         }
@@ -8416,6 +8448,9 @@ fn request_abort_roots_with(
         for record in &records {
             if ids.contains(&record.task.id())
                 && (record.task.is_terminal() || record.task.abort_requested())
+                && !updates
+                    .iter()
+                    .any(|updated| updated.task.id() == record.task.id())
             {
                 batch.checks.push(durable_store::Check {
                     key: task_store::key(record.task.id()),

@@ -24,6 +24,19 @@ pub(super) fn after_unsafe_park_evidence(id: uuid::Uuid, hook: impl FnOnce() + S
 }
 
 #[cfg(test)]
+fn restart_receipt_hooks() -> &'static ParkHooks {
+    static HOOKS: std::sync::OnceLock<ParkHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(super) fn after_restart_receipt(id: uuid::Uuid, hook: impl FnOnce() + Send + 'static) {
+    restart_receipt_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
+#[cfg(test)]
 fn crash_test_boundary(tool: &str, task: uuid::Uuid, stage: &str) {
     if tool != "root" || std::env::var("PI_TEST_REPLAY_SAFE_CUT").ok().as_deref() != Some(stage) {
         return;
@@ -1009,7 +1022,20 @@ impl Executor {
             )
             .map_err(|e| e.to_string())?;
         }
+        if !self
+            .identity
+            .matches(self.tool.as_ref(), &self.implementation, self.version)
+        {
+            return Err("restart hook identity changed during execution".into());
+        }
         admission.restart_hook_receipt(self, Some(&value))?;
+        #[cfg(test)]
+        {
+            let hook = restart_receipt_hooks().lock().unwrap().remove(&task.id());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         #[cfg(test)]
         if let Some(dir) = std::env::var_os("PI_TEST_RESTART_AFTER_RECEIPT") {
             std::fs::write(
