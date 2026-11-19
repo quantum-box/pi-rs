@@ -1174,6 +1174,31 @@ fn merge_task_expected(a: &Expected, b: &Expected) -> Expected {
     }
 }
 
+/// Preserve every independently observed graph fence in a single check.
+/// Incompatible snapshots must become a normal CAS conflict, not InvalidBatch.
+pub(crate) fn normalize_graph_checks(batch: &mut OwnedBatch) {
+    let mut seen = HashMap::<Vec<u8>, usize>::new();
+    let mut checks: Vec<Check> = Vec::with_capacity(batch.checks.len());
+    for check in std::mem::take(&mut batch.checks) {
+        let graph = check.key.starts_with(crate::task_store::PREFIX)
+            || check.key.starts_with(b"durable/signal-revision/")
+            || check.key.starts_with(crate::ownership_edge::PREFIX)
+            || check.key.starts_with(b"durable/ownership-abort-fence/v1/")
+            || check.key.starts_with(b"runtime/conversation/")
+            || check.key.starts_with(b"runtime/owned-cleanup-attempt/");
+        if graph && let Some(index) = seen.get(&check.key) {
+            let previous = &mut checks[*index].expected;
+            *previous = merge_task_expected(previous, &check.expected);
+        } else {
+            if graph {
+                seen.insert(check.key.clone(), checks.len());
+            }
+            checks.push(check);
+        }
+    }
+    batch.checks = checks;
+}
+
 pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut OwnedBatch) {
     for other in &mut graph.checks {
         if !other.key.starts_with(crate::task_store::PREFIX)
@@ -3847,6 +3872,42 @@ mod nested_entry_tests {
             ),
             Expected::MissingUnchangedSince(4)
         );
+    }
+
+    #[test]
+    fn conflicting_graph_checks_remain_a_commit_conflict() {
+        let db = Store::memory().unwrap();
+        let key = crate::task_store::key(Uuid::new_v4());
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: b"value".to_vec(),
+            }],
+        )
+        .unwrap();
+        let current = db.get(&key).unwrap().unwrap().version;
+        let mut batch = OwnedBatch {
+            checks: vec![
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Version(current),
+                },
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Version(current + 1),
+                },
+            ],
+            mutations: vec![],
+        };
+        normalize_graph_checks(&mut batch);
+        assert_eq!(batch.checks.len(), 1);
+        let mut transaction = Transaction::new();
+        transaction.append(batch).unwrap();
+        assert!(matches!(
+            transaction.commit(&db),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
     }
 
     #[test]

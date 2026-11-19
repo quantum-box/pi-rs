@@ -9187,6 +9187,7 @@ impl Scheduler {
                         )
                 }))
         });
+        crate::document::normalize_graph_checks(&mut graph);
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;

@@ -9354,7 +9354,7 @@ mod tests {
             .unwrap();
         (host, tool, calls)
     }
-    struct AbortParkedChild;
+    struct AbortParkedChild(Option<std::path::PathBuf>);
     #[async_trait::async_trait]
     impl Tool for AbortParkedChild {
         fn spec(&self) -> ToolSpec {
@@ -9373,13 +9373,32 @@ mod tests {
         async fn execute_durable(
             &self,
             _: serde_json::Value,
-            _: ToolContext,
+            context: ToolContext,
             _: DurableToolResume,
             host: &dyn DurableTaskHost,
         ) -> Result<DurableToolStep, String> {
+            if let Some(root) = &self.0 {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(root.join("slow-attempts"))
+                    .map_err(|e| e.to_string())?;
+                writeln!(file, "attempt").map_err(|e| e.to_string())?;
+                file.sync_all().map_err(|e| e.to_string())?;
+            }
             let child = host
                 .start_child("grand", "abort-result-tool", json!({}))
                 .await?;
+            if let Some(root) = &self.0 {
+                std::fs::write(root.join("slow-staged"), b"yes").map_err(|e| e.to_string())?;
+                while !root.join("parent-woken").exists() {
+                    tokio::select! {
+                        _ = context.cancellation.cancelled() => return Err("cancelled".into()),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => (),
+                    }
+                }
+            }
             Ok(DurableToolStep::Park {
                 checkpoint: json!({}),
                 wait: DurableWait::All(vec![child]),
@@ -9405,7 +9424,7 @@ mod tests {
         async fn execute_durable(
             &self,
             _: serde_json::Value,
-            _: ToolContext,
+            context: ToolContext,
             resume: DurableToolResume,
             host: &dyn DurableTaskHost,
         ) -> Result<DurableToolStep, String> {
@@ -9418,6 +9437,10 @@ mod tests {
                 })
             } else {
                 std::fs::write(self.0.join("parent-woken"), b"yes").map_err(|e| e.to_string())?;
+                if self.0.join("force-early-wake").exists() {
+                    context.cancellation.cancelled().await;
+                    return Err("cancelled".into());
+                }
                 std::future::pending().await
             }
         }
@@ -9447,7 +9470,12 @@ mod tests {
             _: DurableToolResume,
             _: &dyn DurableTaskHost,
         ) -> Result<DurableToolStep, String> {
-            while !self.0.join("tool-start").exists() {
+            let gate = if self.0.join("force-early-wake").exists() {
+                "slow-staged"
+            } else {
+                "tool-start"
+            };
+            while !self.0.join(gate).exists() {
                 tokio::select! {
                     _ = context.cancellation.cancelled() => return Err("cancelled".into()),
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => (),
@@ -9485,9 +9513,25 @@ mod tests {
                 ReplaySafeAuthorization::host_attests_replay_safe(),
             )
             .unwrap();
-        let child = host
-            .register_replay_safe_durable_tool_with_abort_after(
-                Arc::new(AbortParkedChild),
+        let child_tool: Arc<dyn DurableAsyncTool> = Arc::new(AbortParkedChild(
+            root.join("force-early-wake")
+                .exists()
+                .then(|| root.to_owned()),
+        ));
+        let child = if root.join("force-unsafe-child").exists() {
+            host.register_unsafe_durable_tool_with_hook(
+                child_tool,
+                "child-v1",
+                1,
+                vec![grand],
+                "unsafe-child-hook",
+                Arc::new(NoopDurableHook),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+        } else {
+            host.register_replay_safe_durable_tool_with_abort_after(
+                child_tool,
                 "child-v1",
                 1,
                 vec![grand],
@@ -9496,7 +9540,8 @@ mod tests {
                 ReplaySafeAuthorization::host_attests_replay_safe(),
                 AbortAfterAuthorization::host_attests_cleanup_safe(),
             )
-            .unwrap();
+        }
+        .unwrap();
         let fast = host
             .register_replay_safe_durable_tool_with_hook(
                 Arc::new(RestartGatedFast(root.to_owned())),
@@ -9521,6 +9566,98 @@ mod tests {
             )
             .unwrap();
         (host, parent)
+    }
+    #[test]
+    fn any_wake_during_child_admission_keeps_descendant_progressing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("force-early-wake"), b"yes").unwrap();
+        let (host, tool) = restart_child_host(root);
+        let id = host.start_replay_safe_root(&tool, json!({}), 3).unwrap();
+        let scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        wait_file(&root.join("slow-staged"));
+        wait_file(&root.join("parent-woken"));
+        wait_file(&root.join("tool-start"));
+        assert!(
+            std::fs::read_to_string(root.join("slow-attempts"))
+                .unwrap()
+                .lines()
+                .count()
+                >= 2,
+            "conflicting child transition must be retried"
+        );
+        let tasks = crate::task_store::TaskStore::new(owner.store())
+            .list()
+            .unwrap();
+        assert_eq!(tasks.len(), 4, "the stale child admission must not commit");
+        driver.request_abort(id).unwrap();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        driver.shutdown().unwrap();
+    }
+    #[test]
+    fn any_wake_with_unsafe_child_conflict_requires_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("force-early-wake"), b"yes").unwrap();
+        std::fs::write(root.join("force-unsafe-child"), b"yes").unwrap();
+        let (host, tool) = restart_child_host(root);
+        let id = host.start_replay_safe_root(&tool, json!({}), 3).unwrap();
+        let scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        wait_file(&root.join("slow-staged"));
+        wait_file(&root.join("parent-woken"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let child = loop {
+            let tasks = crate::task_store::TaskStore::new(owner.store())
+                .list()
+                .unwrap();
+            if let Some(child) = tasks.iter().find(|item| {
+                item.task.owner() == &TaskOwner::Task(id)
+                    && !item.task.replay_safe()
+                    && item.task.is_terminal()
+            }) {
+                assert_eq!(
+                    tasks.len(),
+                    3,
+                    "stale unsafe child admission must not commit"
+                );
+                break child.task.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unsafe child did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            matches!(child.state(), crate::task::TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("slow-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(!root.join("tool-start").exists());
+        assert_eq!(
+            read_unsafe_durable_park_evidence(owner.store(), child.id())
+                .unwrap()
+                .len(),
+            1
+        );
+        driver.request_abort(id).unwrap();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        driver.shutdown().unwrap();
     }
     #[test]
     fn restart_after_waits_for_owned_child_abort_cleanup() {
