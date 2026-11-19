@@ -14221,11 +14221,14 @@ impl Harness {
         }
     }
     /// Withdraw an input or write only while queued. Request IDs remain reserved.
+    /// A callback-start fence returns `TaskPublicationBusy` before any write.
     pub fn withdraw_submission(
         &mut self,
         id: Uuid,
         submission: Uuid,
     ) -> Result<WithdrawResult, Error> {
+        let gate = self.owner.conversation_controls().get(id).callback_start;
+        let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
         loop {
             let (mut c, version) = self.load(id)?;
             if let Some(item) = c.submissions.iter_mut().find(|item| item.id == submission) {
@@ -25106,6 +25109,56 @@ mod scheduler_tests {
         writer.join().unwrap();
         let id = harness.create_conversation(config()).unwrap();
         assert_eq!(harness.conversation(id).unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn direct_withdraw_is_retryable_while_callback_start_gate_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let (mut state, version) = scheduler.harness.load(id).unwrap();
+        let submission = Uuid::new_v4();
+        state.admit_initial_input(submission, "queued input".into());
+        state.submissions[0].status = Status::Queued;
+        state.active = None;
+        state.messages.clear();
+        state.phase = Phase::Idle;
+        scheduler
+            .harness
+            .save(&state, Expected::Version(version))
+            .unwrap();
+        let (before, version) = scheduler.harness.load(id).unwrap();
+        let gate = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .callback_start;
+        let lease = gate.try_enter().unwrap();
+        assert!(matches!(
+            scheduler.withdraw_submission(id, submission),
+            Err(Error::TaskPublicationBusy)
+        ));
+        let (during, during_version) = scheduler.harness.load(id).unwrap();
+        assert_eq!(during_version, version);
+        assert_eq!(
+            serde_json::to_value(&during).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        drop(lease);
+        assert!(matches!(
+            scheduler.withdraw_submission(id, submission).unwrap(),
+            WithdrawResult::Aborted
+        ));
+        let after = scheduler.conversation(id).unwrap();
+        assert!(
+            after
+                .submissions
+                .iter()
+                .any(|s| s.id == submission && matches!(s.status, Status::Unanswered { .. }))
+        );
+        scheduler.shutdown().await.unwrap();
     }
 
     #[tokio::test]

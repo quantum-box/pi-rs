@@ -54,10 +54,10 @@ callback-start gate without blocking. If it is busy, the uncommitted placement
 is discarded and the worker retries from durable state. Other save and direct
 Harness paths do not yet take this gate, so it does not authorize dispatch.
 
-The direct `Harness::reset` path also tries the gate before constructing or
+The direct `Harness::reset` and `Harness::withdraw_submission` paths also try the gate before constructing or
 saving a reset, returning `TaskPublicationBusy` for the caller to retry. This
 is not an automatic retry. Other direct mutation APIs (input and write
-admission, session transactions, withdrawal, reset-with-blocks, abort and
+admission, session transactions, reset-with-blocks, abort and
 extension selection) and the general Harness save/commit paths have not been
 connected. Some of those compose task and document writes or use the blocking
 conversation fence; their lock ordering and retry owners still need separate
