@@ -1391,6 +1391,45 @@ fn conversation_claim_finished_hooks() -> &'static BoundaryHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn conversation_claim_recovery_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_claim_recovery_before_commit(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    conversation_claim_recovery_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn conversation_claim_recovery_busy_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+fn conversation_claim_recovery_uncertain() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn inject_conversation_claim_recovery_uncertain(id: Uuid) {
+    conversation_claim_recovery_uncertain()
+        .lock()
+        .unwrap()
+        .insert(id);
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_claim_recovery_busy(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_claim_recovery_busy_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 pub(crate) fn on_conversation_claim_after_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
     conversation_claim_finished_hooks()
         .lock()
@@ -8280,10 +8319,42 @@ impl Scheduler {
                             value: serde_json::to_vec(&marker)
                                 .map_err(|e| Error::Handler(e.to_string()))?,
                         });
-                        match store.commit(&batch.checks, &batch.mutations) {
+                        #[cfg(test)]
+                        if let Some(hook) = conversation_claim_recovery_hooks()
+                            .lock()
+                            .unwrap()
+                            .remove(&item.task.id())
+                        {
+                            hook();
+                        }
+                        #[allow(unused_mut)]
+                        let mut commit = store.commit(&batch.checks, &batch.mutations);
+                        #[cfg(test)]
+                        if commit.is_ok()
+                            && conversation_claim_recovery_uncertain()
+                                .lock()
+                                .unwrap()
+                                .remove(&item.task.id())
+                        {
+                            commit = Err(durable_store::Error::LockPoisoned);
+                        }
+                        match commit {
                             Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
                                 self.deferred_recovery.extend(deferred);
                                 continue 'scan;
+                            }
+                            Err(durable_store::Error::WriteLockBusy(_)) => {
+                                #[cfg(test)]
+                                if let Some(hook) = conversation_claim_recovery_busy_hooks()
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&item.task.id())
+                                {
+                                    hook();
+                                }
+                                self.deferred_recovery.extend(deferred);
+                                self.deferred_recovery.insert(item.task.id());
+                                return Err(Error::Busy);
                             }
                             Err(error) => return Err(task_store::Error::from(error).into()),
                         }
@@ -10111,7 +10182,7 @@ impl Scheduler {
             running.task.id(),
             self.validator.is_none(),
         ) {
-            Err(Error::Busy) if nonblocking_abort => {
+            Err(Error::Busy) => {
                 *deferred = Some(DeferredSettlement::Unprepared(
                     original_running,
                     result,
@@ -25124,6 +25195,211 @@ mod standalone_foreground_cleanup_tests {
     #[tokio::test]
     async fn in_flight_result_waits_for_uncertain_failed_graph_without_stopping_driver() {
         exercise_in_flight_uncertain_graph(false).await;
+    }
+
+    async fn exercise_serial_graph_busy(transfer_to_driver: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let parent = task(1, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.wait(WaitFor::Signal("hold".into()))
+            })
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(
+                parent.id(),
+                parent.owner().clone(),
+                "child",
+                cfg.clone(),
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let damaged = h
+            .ensure_task_owned_subagent(
+                parent.id(),
+                parent.owner().clone(),
+                "damaged",
+                cfg.clone(),
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let other = h.create_conversation(cfg).unwrap();
+        let descendant = task(2, TaskOwner::Conversation(child), "blocked");
+        let independent = task(3, TaskOwner::Conversation(other), "work");
+        tasks
+            .save(&[Save::Create(&descendant), Save::Create(&independent)])
+            .unwrap();
+        let key = crate::ownership_edge::edge_key(damaged);
+        let original = db.get(&key).unwrap().unwrap().value;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mutation_path = path.clone();
+        let mutation_key = key.clone();
+        let parent_id = parent.id();
+        let mut registry = Registry::default();
+        registry.register("parent", true, |_: &Task| panic!("waiting parent ran"));
+        registry.register("blocked", true, move |_: &Task| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let writer = Store::open(&mutation_path).unwrap();
+            let tasks = TaskStore::new(&writer);
+            tasks
+                .update(&tasks.load(parent_id).unwrap().unwrap(), |task| {
+                    task.wake()?;
+                    task.start()?;
+                    task.hold_failure("failed".into())
+                })
+                .unwrap();
+            let entry = writer.get(&mutation_key).unwrap().unwrap();
+            let mut edge: Value = serde_json::from_slice(&entry.value).unwrap();
+            edge["mode"] = json!("corrupt");
+            writer
+                .commit(
+                    &[durable_store::Check {
+                        key: mutation_key.clone(),
+                        expected: Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: mutation_key.clone(),
+                        value: serde_json::to_vec(&edge).unwrap(),
+                    }],
+                )
+                .unwrap();
+            Ok(Step::Succeed(json!("must be discarded")))
+        });
+        registry.register("work", true, |_: &Task| {
+            Ok(Step::Succeed(json!("independent")))
+        });
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        assert!(matches!(scheduler.tick(0), Err(Error::Busy)));
+        assert!(matches!(scheduler.tick(0), Err(Error::Busy)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduler.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        assert_eq!(
+            scheduler.get(independent.id()).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        if transfer_to_driver {
+            let driver = crate::task_driver::Driver::start(scheduler);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if driver.get(independent.id()).unwrap().unwrap().is_terminal() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("independent graph must progress while the result is retained");
+            assert_eq!(
+                driver.get(independent.id()).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("independent"))
+            );
+            assert!(driver.has_pending_task(descendant.id()));
+            let entry = db.get(&key).unwrap().unwrap();
+            db.commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: original,
+                }],
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while driver.has_pending_task(descendant.id()) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("repaired graph must release the result");
+            assert!(
+                driver
+                    .get(descendant.id())
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
+            assert_ne!(
+                driver.get(descendant.id()).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("must be discarded"))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            driver.shutdown().unwrap();
+            return;
+        }
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: original,
+            }],
+        )
+        .unwrap();
+        for _ in 0..40 {
+            match scheduler.tick(0) {
+                Ok(_) | Err(Error::Busy) => (),
+                Err(error) => panic!("serial recovery failed: {error}"),
+            }
+            if scheduler
+                .get(independent.id())
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+            {
+                break;
+            }
+        }
+        assert!(
+            scheduler
+                .get(descendant.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        assert_ne!(
+            scheduler.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("must be discarded"))
+        );
+        assert_eq!(
+            scheduler.get(independent.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("independent"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serial_graph_busy_retains_outcome_until_abort_graph_is_repaired() {
+        exercise_serial_graph_busy(false).await;
+    }
+
+    #[tokio::test]
+    async fn serial_graph_busy_transfer_allows_independent_driver_work() {
+        exercise_serial_graph_busy(true).await;
     }
 
     #[tokio::test]

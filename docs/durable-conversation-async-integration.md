@@ -43,7 +43,9 @@ The test `restart_after_waits_for_owned_child_abort_cleanup` gates its fast sibl
 A synchronous `Scheduler::tick` retains the completed invocation, its exclusive
 lease and any prepared candidate when a checked settlement cannot start because
 another SQLite writer holds the lock. It returns `Error::Busy`; the host must
-call `tick` again after contention or a relevant ownership change. Each retry
+call `tick` again after contention or a relevant ownership change. An uncertain
+abort graph likewise retains the completed result and its lease until the graph
+can be revalidated. Each retry
 rechecks the task, attempt, abort and ownership/evidence fences before committing.
 Other synchronous ticks cannot reserve independent work while that lease remains
 pending; the concurrent driver is available when independent progress is needed.
@@ -59,6 +61,9 @@ require reconciliation, including when an unsafe Tool may have external effects.
 A pending synchronous outcome is transferred to the concurrent driver when the
 scheduler is handed to it. An indeterminate retained outcome stops that driver
 and remains available for reconciliation instead of being retried.
+Interrupted conversation cancel claims also retain their deferred recovery root
+when the terminal-marker transaction cannot acquire the writer lock; recovery
+rechecks the original claim and task after contention clears.
 
 ## Owned conversation cleanup concurrency
 

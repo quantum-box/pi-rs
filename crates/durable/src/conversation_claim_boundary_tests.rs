@@ -820,7 +820,12 @@ async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph
             Ok(())
         }
     }
-    for late in [false, true] {
+    for (late, busy, uncertain) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -959,7 +964,84 @@ async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph
             uncertain_policy: UncertainPolicy::RequireReconciliation,
         };
         let mut scheduler = Scheduler::open(&path, options).unwrap();
+        let busy_writer = if busy {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+            let writer_path = path.clone();
+            let busy_signal = Arc::new(tokio::sync::Semaphore::new(0));
+            let notify = busy_signal.clone();
+            crate::task_scheduler::on_conversation_claim_recovery_busy(claim.task, move || {
+                notify.add_permits(1)
+            });
+            crate::task_scheduler::on_conversation_claim_recovery_before_commit(
+                claim.task,
+                move || {
+                    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+                    let writer = std::thread::spawn(move || {
+                        let conn = rusqlite::Connection::open(writer_path).unwrap();
+                        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                        locked_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                        conn.execute_batch("COMMIT").unwrap();
+                    });
+                    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    writer_tx.send(writer).unwrap();
+                },
+            );
+            Some((release_tx, writer_rx, busy_signal))
+        } else {
+            None
+        };
+        if uncertain {
+            crate::task_scheduler::inject_conversation_claim_recovery_uncertain(claim.task);
+        }
         let driver = scheduler.start_tasks(registry).unwrap();
+        if uncertain {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while driver.get(claim.task).is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("indeterminate recovery must stop the driver");
+            let report = driver.shutdown_with_pending().unwrap();
+            assert!(report.failure().is_some());
+            let store = durable_store::Store::open(&path).unwrap();
+            let terminal = pi_rs_durable::task_store::TaskStore::new(&store)
+                .load(claim.task)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(terminal.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation required"))
+            );
+            let entry = store
+                .get(&crate::task_scheduler::conversation_cancel_terminal_key(
+                    claim.task,
+                ))
+                .unwrap()
+                .unwrap();
+            let marker: crate::task_scheduler::ConversationCancelTerminalMarker =
+                serde_json::from_slice(&entry.value).unwrap();
+            assert_eq!(marker.attempt, claim.attempt);
+            assert_eq!(marker.claim_id, claim.claim_id);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let _ = scheduler.shutdown().await;
+            continue;
+        }
+        if let Some((release, writer, signal)) = busy_writer {
+            tokio::time::timeout(Duration::from_secs(12), signal.acquire())
+                .await
+                .expect("recovery must reach the locked commit")
+                .unwrap()
+                .forget();
+            assert!(driver.get(claim.task).unwrap().unwrap().state() == &TaskState::Running);
+            release.send(()).unwrap();
+            writer
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .join()
+                .unwrap();
+        }
         let other = scheduler
             .create_conversation(Config {
                 model: "test".into(),
