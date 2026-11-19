@@ -1136,3 +1136,216 @@ async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph
         let _ = scheduler.shutdown().await;
     }
 }
+
+#[test]
+fn claim_recovery_progresses_during_independent_maintenance() {
+    use crate::async_task_tool::{
+        DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
+    };
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_scheduler::Step;
+    use crate::task_store::{Save, TaskStore};
+    use std::time::Instant;
+    struct Cancel;
+    #[async_trait]
+    impl DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            panic!("callback is disabled")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::conversation_cancel_claim_kill_worker",
+        ])
+        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    while !dir.path().join("ready").exists() {
+        assert!(worker.try_wait().unwrap().is_none(), "claim worker exited");
+        assert!(Instant::now() < until, "claim worker timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let claim_bytes = std::fs::read(dir.path().join("ready")).unwrap();
+    let claim: crate::task_scheduler::ConversationCancelClaim =
+        serde_json::from_slice(&claim_bytes).unwrap();
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    let path = dir.path().join("db");
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = TaskStore::new(&store);
+    let original = tasks.load(claim.task).unwrap().unwrap();
+    let mut parent = Task::new(
+        uuid::Uuid::new_v4(),
+        TaskOwner::Conversation(uuid::Uuid::new_v4()),
+        Checkpoint {
+            phase: "initial".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("independent".into(), true);
+    parent.start().unwrap();
+    let child = Task::new(
+        uuid::Uuid::new_v4(),
+        TaskOwner::Task(parent.id()),
+        Checkpoint {
+            phase: "initial".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("independent".into(), true);
+    drop(store);
+    let mut registry = Registry::default();
+    registry.register("independent", true, |_: &Task| {
+        Ok(Step::Succeed(json!("ok")))
+    });
+    let leaf = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(AsyncTool {
+            name: "leaf",
+            child: None,
+            gate: None,
+            early: false,
+        }),
+        "leaf",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let tool = Arc::new(AsyncTool {
+        name: "root",
+        child: Some("leaf"),
+        gate: None,
+        early: false,
+    });
+    let identity: Arc<dyn Tool> = tool.clone();
+    let _identity = crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
+    let root = register_conversation_unsafe_durable_tool_with_park_cancel(
+        &mut registry,
+        tool,
+        "root",
+        1,
+        vec![leaf.clone()],
+        "cancel-v1",
+        Arc::new(Cancel),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let harness = crate::runtime::Harness::open_paused(
+        &path,
+        Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: vec![root.register(), leaf.register()],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+    )
+    .unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let writer_path = path.clone();
+    crate::task_scheduler::on_conversation_claim_recovery_before_commit(claim.task, move || {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let db = rusqlite::Connection::open(writer_path).unwrap();
+            db.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            db.execute_batch("COMMIT").unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer_tx.send(writer).unwrap();
+    });
+    crate::task_scheduler::on_conversation_claim_recovery_busy(claim.task, move || {
+        busy_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    });
+    let task_scheduler = harness.attach_tasks(registry).unwrap();
+    let owner = task_scheduler.owner();
+    let control = owner.conversation_controls().get(uuid::Uuid::new_v4());
+    let poll = control.gate.lock().unwrap();
+    let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+    crate::task_driver::on_maintenance_reserved_for_test(parent.id(), move || {
+        reserved_tx.send(()).unwrap()
+    });
+    let driver = crate::task_driver::Driver::start_with_harness(task_scheduler, harness.worker());
+    busy_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("claim recovery did not encounter writer lock");
+    release_tx.send(()).unwrap();
+    writer_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .join()
+        .unwrap();
+    {
+        // The driver is paused in its test-only busy hook while holding the
+        // task gate. Insert the independent graph through the store seam.
+        let tasks = TaskStore::new(owner.store());
+        tasks
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.hold_failure("maintenance".into())
+            })
+            .unwrap();
+    }
+    resume_tx.send(()).unwrap();
+    reserved_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("maintenance was not retained");
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = driver.get(claim.task).unwrap().unwrap();
+        if current.is_terminal() {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "claim remained blocked behind unrelated maintenance"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        driver.get(parent.id()).unwrap().unwrap().state(),
+        TaskState::CompletingFailed(_)
+    ));
+    let marker_key = crate::task_scheduler::conversation_cancel_terminal_key(claim.task);
+    let marker_entry = owner.store().get(&marker_key).unwrap().unwrap();
+    let marker: crate::task_scheduler::ConversationCancelTerminalMarker =
+        serde_json::from_slice(&marker_entry.value).unwrap();
+    assert_eq!(marker.claim_id, claim.claim_id);
+    assert_eq!(marker.attempt, claim.attempt);
+    assert_eq!(marker.running_task_version, original.version);
+    let terminal = TaskStore::new(owner.store())
+        .load(claim.task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        owner
+            .store()
+            .commit_for_version(&crate::task_store::key(claim.task), terminal.version)
+            .unwrap(),
+        owner
+            .store()
+            .commit_for_version(&marker_key, marker_entry.version)
+            .unwrap()
+    );
+    drop(poll);
+    assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+}

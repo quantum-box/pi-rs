@@ -2289,11 +2289,22 @@ mod tests {
             .registered("work".into(), true);
             related.start().unwrap();
             related.wait(WaitFor::Signal("related".into())).unwrap();
+            let mut related_held = Task::new(
+                Uuid::from_u128(4),
+                TaskOwner::Task(parent_id),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), true);
+            related_held.start().unwrap();
+            related_held.hold_success(json!("related held")).unwrap();
             tasks
                 .save(&[
                     Save::Create(&parent),
                     Save::Create(&child),
                     Save::Create(&related),
+                    Save::Create(&related_held),
                 ])
                 .unwrap();
             tasks
@@ -2391,6 +2402,17 @@ mod tests {
             .wait(WaitFor::TasksAny(vec![Uuid::from_u128(3), ended.id()]))
             .unwrap();
         tasks.save(&[Save::Create(&ready_dependent)]).unwrap();
+        let mut held = Task::new(
+            Uuid::from_u128(offset + 6),
+            TaskOwner::Conversation(Uuid::from_u128(offset + 106)),
+            signal_task.checkpoint().clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        held.start().unwrap();
+        held.hold_success(json!("independent held")).unwrap();
+        tasks.save(&[Save::Create(&held)]).unwrap();
         tasks
             .poll_wait(
                 &tasks.load(ready_dependent.id()).unwrap().unwrap(),
@@ -2480,11 +2502,16 @@ mod tests {
                 .unwrap();
         }
         let until = Instant::now() + Duration::from_secs(10);
-        for id in [signal_task.id(), timer.id()] {
+        for id in [signal_task.id(), timer.id(), held.id()] {
             loop {
                 let task = driver.get(id).unwrap().unwrap();
                 if task.is_terminal() {
-                    assert_eq!(task.state(), &TaskState::Succeeded(json!("ok")));
+                    let expected = if id == held.id() {
+                        json!("independent held")
+                    } else {
+                        json!("ok")
+                    };
+                    assert_eq!(task.state(), &TaskState::Succeeded(expected));
                     break;
                 }
                 assert!(
@@ -2526,6 +2553,15 @@ mod tests {
         assert!(matches!(
             tasks.load(parent_id).unwrap().unwrap().task.state(),
             TaskState::CompletingFailed(_)
+        ));
+        assert!(matches!(
+            tasks
+                .load(Uuid::from_u128(4))
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            TaskState::Completing(_)
         ));
         assert!(
             !tasks

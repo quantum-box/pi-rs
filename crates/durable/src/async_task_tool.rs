@@ -12286,6 +12286,26 @@ mod tests {
         assert!(registry.register("independent-wake", true, |_: &Task| {
             Ok(crate::task_scheduler::Step::Succeed(json!("woken")))
         }));
+        let abort_path = root.join("independent-abort-order");
+        assert!(registry.register_with_abort(
+            "independent-abort",
+            true,
+            |_: &Task| Ok(crate::task_scheduler::Step::Succeed(json!("unexpected"))),
+            move |task: &Task| {
+                use std::io::Write;
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&abort_path)
+                        .map_err(|e| e.to_string())?,
+                    "{}",
+                    task.id()
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(crate::task_scheduler::Step::Succeed(json!("aborted")))
+            }
+        ));
         let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
         let adapter = host
             .register_tool_with_interrupted_after(
@@ -12653,10 +12673,17 @@ mod tests {
     #[test]
     fn interrupted_cleanup_waits_for_independent_uncertain_graph() {
         use crate::task_store::{Save, TaskStore};
-        for case in ["repair", "late-raw", "shutdown", "waits", "waits-busy"] {
+        for case in [
+            "repair",
+            "late-raw",
+            "shutdown",
+            "waits",
+            "waits-busy",
+            "waits-abort-conflict",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            let (_, child) = interrupted_kill_tool(root);
+            let (pending_parent, child) = interrupted_kill_tool(root);
             std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
             let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
             let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
@@ -12798,6 +12825,94 @@ mod tests {
                 maintenance.start().unwrap();
                 maintenance.hold_success(json!("maintenance")).unwrap();
                 tasks.save(&[Save::Create(&maintenance)]).unwrap();
+                let mut abort_parent = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Conversation(Uuid::new_v4()),
+                    Checkpoint {
+                        phase: "initial".into(),
+                        data: json!(null),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("independent-abort".into(), true);
+                abort_parent.start().unwrap();
+                let mut abort_child = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Task(abort_parent.id()),
+                    Checkpoint {
+                        phase: "initial".into(),
+                        data: json!(null),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("independent-abort".into(), true);
+                abort_child.start().unwrap();
+                abort_child
+                    .wait(crate::task::WaitFor::Signal("never".into()))
+                    .unwrap();
+                tasks
+                    .save(&[Save::Create(&abort_parent), Save::Create(&abort_child)])
+                    .unwrap();
+                tasks
+                    .update(&tasks.load(abort_parent.id()).unwrap().unwrap(), |task| {
+                        task.wait(crate::task::WaitFor::Signal("never".into()))
+                    })
+                    .unwrap();
+                let mut related_abort = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Task(pending_parent),
+                    Checkpoint {
+                        phase: "initial".into(),
+                        data: json!(null),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("independent-abort".into(), true);
+                related_abort.start().unwrap();
+                related_abort
+                    .wait(crate::task::WaitFor::Signal("never".into()))
+                    .unwrap();
+                tasks.save(&[Save::Create(&related_abort)]).unwrap();
+                let (abort_conflict_tx, abort_conflict_rx) = std::sync::mpsc::channel();
+                let abort_edge = crate::ownership_edge::edge_key(Uuid::new_v4());
+                if case == "waits-abort-conflict" {
+                    let conversation =
+                        Uuid::from_slice(&abort_edge[crate::ownership_edge::PREFIX.len()..])
+                            .unwrap();
+                    let proposal = crate::ownership_edge::Edge {
+                        task: abort_child.id(),
+                        task_owner: TaskOwner::Task(abort_parent.id()),
+                        child: conversation,
+                        mode: crate::ownership_edge::Mode::Foreground,
+                    };
+                    let path = root.join("db");
+                    let key = abort_edge.clone();
+                    crate::task_scheduler::before_independent_abort_reservation_for_test(
+                        abort_child.id(),
+                        move || {
+                            let store = durable_store::Store::open(path).unwrap();
+                            store
+                                .commit(
+                                    &[durable_store::Check {
+                                        key: key.clone(),
+                                        expected: durable_store::Expected::Missing,
+                                    }],
+                                    &[durable_store::Mutation::Put {
+                                        key,
+                                        value: serde_json::to_vec(&proposal).unwrap(),
+                                    }],
+                                )
+                                .unwrap();
+                        },
+                    );
+                    crate::task_scheduler::on_independent_abort_conflict_for_test(
+                        abort_child.id(),
+                        move || abort_conflict_tx.send(()).unwrap(),
+                    );
+                }
                 let (busy_tx, busy_rx) = std::sync::mpsc::channel();
                 let (writer_tx, writer_rx) = std::sync::mpsc::channel();
                 if case == "waits-busy" {
@@ -12839,6 +12954,26 @@ mod tests {
                     ))
                     .unwrap();
                 drop(gate);
+                driver.request_abort(abort_parent.id()).unwrap();
+                driver.request_abort(related_abort.id()).unwrap();
+                if case == "waits-abort-conflict" {
+                    abort_conflict_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("abort reservation did not conflict");
+                    assert!(!root.join("independent-abort-order").exists());
+                    let _gate = owner.task_gate().lock().unwrap();
+                    let entry = owner.store().get(&abort_edge).unwrap().unwrap();
+                    owner
+                        .store()
+                        .commit(
+                            &[durable_store::Check {
+                                key: abort_edge.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Delete { key: abort_edge }],
+                        )
+                        .unwrap();
+                }
                 if case == "waits-busy" {
                     busy_rx
                         .recv_timeout(std::time::Duration::from_secs(10))
@@ -12859,6 +12994,22 @@ mod tests {
                     wait_terminal(&driver, maintenance.id()).state(),
                     &crate::task::TaskState::Succeeded(json!("maintenance"))
                 );
+                assert!(matches!(
+                    wait_terminal(&driver, abort_child.id()).state(),
+                    crate::task::TaskState::Cancelled
+                ));
+                assert!(matches!(
+                    wait_terminal(&driver, abort_parent.id()).state(),
+                    crate::task::TaskState::Cancelled
+                ));
+                let order = std::fs::read_to_string(root.join("independent-abort-order")).unwrap();
+                assert_eq!(
+                    order.lines().collect::<Vec<_>>(),
+                    vec![abort_child.id().to_string(), abort_parent.id().to_string()]
+                );
+                let related = driver.get(related_abort.id()).unwrap().unwrap();
+                assert!(related.abort_requested());
+                assert_eq!(related.state(), &crate::task::TaskState::Ready);
                 assert!(
                     driver
                         .get(child)

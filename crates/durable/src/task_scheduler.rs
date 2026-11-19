@@ -1489,6 +1489,36 @@ fn independent_wake_conflict_hooks() -> &'static BoundaryHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn independent_abort_reservation_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn before_independent_abort_reservation_for_test(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    independent_abort_reservation_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn independent_abort_conflict_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_independent_abort_conflict_for_test(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    independent_abort_conflict_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 pub(crate) fn on_independent_wake_conflict_for_test(
     id: Uuid,
     hook: impl FnOnce() + Send + 'static,
@@ -5667,6 +5697,15 @@ fn task_ancestors_available(
     store: &durable_store::Store,
     task: &Task,
     tasks: &[task_store::StoredTask],
+    blocked: impl FnMut(&Task) -> bool,
+) -> bool {
+    task_ancestors_available_mode(store, task, tasks, false, blocked)
+}
+fn task_ancestors_available_mode(
+    store: &durable_store::Store,
+    task: &Task,
+    tasks: &[task_store::StoredTask],
+    allow_aborted_conversation: bool,
     mut blocked: impl FnMut(&Task) -> bool,
 ) -> bool {
     let edges = crate::ownership_edge::EdgeStore::new(store);
@@ -5698,7 +5737,9 @@ fn task_ancestors_available(
                         else {
                             return false;
                         };
-                        if conversation.id != *id || conversation.abort_requested {
+                        if conversation.id != *id
+                            || (conversation.abort_requested && !allow_aborted_conversation)
+                        {
                             return false;
                         }
                     }
@@ -6026,7 +6067,8 @@ impl Scheduler {
             }
         };
         if (matches!(&completed.result, InvocationResult::Abort(_))
-            && self.has_global_prior(completed.task_id()))
+            && self.has_global_prior(completed.task_id())
+            && !self.independent_abort_result(&owner, &completed))
             || self.has_prior_outcome(&owner, &completed.running.task)
         {
             return Err(if nonblocking_abort {
@@ -6069,6 +6111,7 @@ impl Scheduler {
         }
         // Preserve the exact handler input until all preparation and commit
         // paths have either succeeded or returned a more precise owned candidate.
+        let independent_abort = self.independent_abort_result(&owner, &completed);
         let woken_abort = matches!(completed.result, InvocationResult::Abort(_))
             && completed
                 .running
@@ -6103,6 +6146,25 @@ impl Scheduler {
                 #[cfg(feature = "test-hooks")]
                 hook_fence_test_hook::run(running.task.id(), "abort-settlement");
                 let _gate = task_gate;
+                let commit_abort = |batch: &task_store::OwnedBatch| -> Result<(), Error> {
+                    let tasks = self.ts();
+                    let store = tasks.store();
+                    let commit = if independent_abort {
+                        store.commit_with_prefix_put_fence(
+                            &batch.checks,
+                            &batch.mutations,
+                            &[
+                                task_store::PREFIX,
+                                crate::ownership_edge::PREFIX,
+                                b"runtime/conversation/",
+                            ],
+                            ordering_graph_version,
+                        )
+                    } else {
+                        store.commit(&batch.checks, &batch.mutations)
+                    };
+                    commit.map_err(task_store::Error::from).map_err(Error::from)
+                };
                 #[cfg(test)]
                 if self.inject_abort_commit_error == 1 {
                     return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
@@ -6347,10 +6409,7 @@ impl Scheduler {
                             .map_err(Error::Transition)?;
                         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
                         batch.checks.extend(checks);
-                        self.ts()
-                            .store()
-                            .commit(&batch.checks, &batch.mutations)
-                            .map_err(task_store::Error::from)?;
+                        commit_abort(&batch)?;
                     }
                     Some(_) if running.task.holds_restart_cleanup() => {
                         let key = restart_receipt_key(running.task.id());
@@ -6378,10 +6437,7 @@ impl Scheduler {
                                 expected: durable_store::Expected::Missing,
                             });
                         }
-                        self.ts()
-                            .store()
-                            .commit(&batch.checks, &batch.mutations)
-                            .map_err(task_store::Error::from)?;
+                        commit_abort(&batch)?;
                     }
                     None if abort_definition.is_some() => {
                         let reg = self.registered(&running.task)?;
@@ -6416,9 +6472,24 @@ impl Scheduler {
                         }
                         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
                         batch.checks.extend(checks);
+                        commit_abort(&batch)?;
+                    }
+                    None if independent_abort => {
+                        let mut next = running.clone();
+                        next.task.cancel().map_err(Error::Transition)?;
+                        let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
                         self.ts()
                             .store()
-                            .commit(&batch.checks, &batch.mutations)
+                            .commit_with_prefix_put_fence(
+                                &batch.checks,
+                                &batch.mutations,
+                                &[
+                                    task_store::PREFIX,
+                                    crate::ownership_edge::PREFIX,
+                                    b"runtime/conversation/",
+                                ],
+                                ordering_graph_version,
+                            )
                             .map_err(task_store::Error::from)?;
                     }
                     None => self.ts().update(&running, |task| task.cancel())?,
@@ -6471,9 +6542,12 @@ impl Scheduler {
                                 value: serde_json::to_vec(&marker)
                                     .map_err(|e| Error::Handler(e.to_string()))?,
                             });
-                            store
-                                .commit(&batch.checks, &batch.mutations)
-                                .map_err(task_store::Error::from)?;
+                            commit_abort(&batch)?;
+                        } else if independent_abort {
+                            let mut next = running.clone();
+                            next.task.fail(reason).map_err(Error::Transition)?;
+                            let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            commit_abort(&batch)?;
                         } else {
                             self.ts().update(&running, |task| task.fail(reason))?;
                         }
@@ -6601,10 +6675,9 @@ impl Scheduler {
                 | Error::Store(task_store::Error::Store(
                     durable_store::Error::Conflict { .. }
                 )))
-        ) && backup
-            .as_ref()
-            .is_some_and(|(running, _)| running.task.holds_interrupted_cleanup() || woken_abort)
-        {
+        ) && backup.as_ref().is_some_and(|(running, _)| {
+            running.task.holds_interrupted_cleanup() || woken_abort || independent_abort
+        }) {
             let (running, result) = backup.take().expect("checked above");
             drop(guard);
             return Err(SettlementError::Pending {
@@ -6749,7 +6822,8 @@ impl Scheduler {
             }
         };
         if (matches!(&completed.result, InvocationResult::Abort(_))
-            && self.has_global_prior(completed.task_id()))
+            && self.has_global_prior(completed.task_id())
+            && !self.independent_abort_result(&owner, &completed))
             || self.has_prior_outcome(&owner, &completed.running.task)
         {
             return Err(SettlementError::Pending {
@@ -7439,6 +7513,41 @@ impl Scheduler {
             .published
             .is_empty())
     }
+    // Abort outcomes may pass a published result only with complete ownership
+    // proofs for both graphs; their settlement is graph-fenced and revalidated.
+    fn independent_abort_result(
+        &self,
+        owner: &OwnedStore,
+        completed: &CompletedInvocation,
+    ) -> bool {
+        if !matches!(&completed.result, InvocationResult::Abort(_)) {
+            return false;
+        }
+        let ts = self.ts();
+        if !complete_foreground_chain_mode(&ts, &completed.running.task, true).unwrap_or(false) {
+            return false;
+        }
+        let Some(root) = Self::foreground_root(owner, &completed.running.task) else {
+            return false;
+        };
+        let published = self
+            .live_invocations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .published
+            .clone();
+        published
+            .iter()
+            .filter(|(id, _)| *id != completed.task_id())
+            .all(|(id, _)| {
+                ts.load(*id).ok().flatten().is_some_and(|record| {
+                    complete_foreground_chain_mode(&ts, &record.task, true).unwrap_or(false)
+                        && Self::foreground_root(owner, &record.task)
+                            .is_some_and(|other| other != root)
+                })
+            })
+    }
+
     fn has_global_prior(&self, id: Uuid) -> bool {
         let state = self
             .live_invocations
@@ -7573,6 +7682,56 @@ impl Scheduler {
             crate::nested_identity::checked_lease(capture.executor.tool(), &capture.implementation),
             Err(crate::nested_identity::LeaseFailure::Busy)
         )
+    }
+
+    fn commit_independent_abort_batch(
+        &self,
+        batch: &task_store::OwnedBatch,
+        graph_version: u64,
+    ) -> Result<bool, Error> {
+        match self.ts().store().commit_with_prefix_put_fence(
+            &batch.checks,
+            &batch.mutations,
+            &[
+                task_store::PREFIX,
+                crate::ownership_edge::PREFIX,
+                b"runtime/conversation/",
+            ],
+            graph_version,
+        ) {
+            Ok(()) | Err(durable_store::Error::Conflict { .. }) => Ok(true),
+            Err(durable_store::Error::WriteLockBusy(_)) => Ok(false),
+            Err(error) => Err(task_store::Error::from(error).into()),
+        }
+    }
+
+    fn independent_abort_update(
+        &self,
+        snapshot: &task_store::StoredTask,
+        graph_version: u64,
+        update: impl FnOnce(&mut Task) -> Result<(), TransitionError>,
+    ) -> Result<bool, Error> {
+        let mut next = snapshot.clone();
+        update(&mut next.task).map_err(Error::Transition)?;
+        let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+        self.commit_independent_abort_batch(&batch, graph_version)
+    }
+
+    fn independent_recovery_failure(
+        &self,
+        item: &task_store::StoredTask,
+        graph_version: u64,
+        reason: String,
+    ) -> Result<bool, Error> {
+        let records = self.ts().list()?;
+        let live = has_owned_work(self.ts().store(), item.task.id(), &records, true)?;
+        self.independent_abort_update(item, graph_version, |task| {
+            if live {
+                task.hold_failure(reason)
+            } else {
+                task.fail(reason)
+            }
+        })
     }
 
     // Require a complete foreground ownership chain and keep related published
@@ -8412,10 +8571,14 @@ impl Scheduler {
         Ok(true)
     }
     fn reconcile(&mut self) -> Result<(), Error> {
-        self.reconcile_inner(false)
+        self.reconcile_inner(false, None)
     }
 
-    fn reconcile_inner(&mut self, independent_only: bool) -> Result<(), Error> {
+    fn reconcile_inner(
+        &mut self,
+        independent_only: bool,
+        excluded: Option<MaintenanceIntent>,
+    ) -> Result<(), Error> {
         let live = self
             .live_invocations
             .lock()
@@ -8423,6 +8586,11 @@ impl Scheduler {
             .attempts
             .clone();
         'scan: loop {
+            let recovery_graph_version = self
+                .ts()
+                .store()
+                .put_version()
+                .map_err(task_store::Error::from)?;
             let records = self.ts().list()?;
             // The harness is bound only after attach. Defer interrupted work in
             // pending fail-fast ownership graphs, including conversation descendants,
@@ -8568,9 +8736,98 @@ impl Scheduler {
                 if item.task.state() != &TaskState::Running {
                     continue;
                 }
-                if independent_only && !self.independent_root_safe(&self.owner(), &item.task)? {
+                let abort_root = if independent_only && item.task.abort_requested() {
+                    if let TaskOwner::Conversation(conversation) = item.task.owner() {
+                        self.ts()
+                            .store()
+                            .get(&crate::ownership_edge::edge_key(*conversation))
+                            .map_err(task_store::Error::from)?
+                            .is_none()
+                            && !self.has_related_published(&self.owner(), &item.task)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let claim_root = abort_root
+                    && self
+                        .ts()
+                        .store()
+                        .get(&conversation_cancel_claim_key(item.task.id()))
+                        .map_err(task_store::Error::from)?
+                        .is_some();
+                if independent_only
+                    && (!(abort_root || self.independent_root_safe(&self.owner(), &item.task)?)
+                        || excluded.is_some_and(|intent| {
+                            !self.separate_from_maintenance(&self.owner(), &item.task, intent)
+                        }))
+                {
                     self.deferred_recovery.insert(item.task.id());
                     continue;
+                }
+                if excluded.is_some() {
+                    // Preserve blocked definitions and evidence for a later
+                    // pass even when a different graph still needs maintenance.
+                    self.deferred_recovery.insert(item.task.id());
+                }
+                if excluded.is_some() && !claim_root {
+                    let update = if item.task.holds_restart_cleanup() || item.task.abort_requested()
+                    {
+                        Some(false)
+                    } else if item.task.replay_safe()
+                        && self.registered(&item.task).is_ok_and(|reg| reg.replay_safe)
+                    {
+                        let exhausted =
+                            item.task.restarts().saturating_add(1) >= item.task.restart_limit();
+                        if !exhausted {
+                            Some(false)
+                        } else if self
+                            .registered(&item.task)
+                            .is_ok_and(|reg| reg.restart_after)
+                            && item.task.checkpoint().phase != "replay-safe-async-after"
+                        {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(restart_failure) = update {
+                        let progress =
+                            self.independent_abort_update(&item, recovery_graph_version, |task| {
+                                if restart_failure {
+                                    task.hold_restart_failure()
+                                } else {
+                                    task.recover()
+                                }
+                            })?;
+                        self.deferred_recovery.extend(deferred);
+                        if progress {
+                            continue 'scan;
+                        }
+                        self.deferred_recovery.insert(item.task.id());
+                        return Ok(());
+                    }
+                }
+                macro_rules! recovery_failure {
+                    ($reason:expr) => {{
+                        if excluded.is_some() {
+                            let progress = self.independent_recovery_failure(
+                                &item,
+                                recovery_graph_version,
+                                $reason,
+                            )?;
+                            if !progress {
+                                self.deferred_recovery.extend(deferred);
+                                self.deferred_recovery.insert(item.task.id());
+                                return Ok(());
+                            }
+                        } else {
+                            self.finish_failed(&item, $reason)?;
+                        }
+                    }};
                 }
                 if item.task.holds_restart_cleanup() {
                     self.ts().update(&item, |task| task.recover())?;
@@ -8646,7 +8903,20 @@ impl Scheduler {
                             hook();
                         }
                         #[allow(unused_mut)]
-                        let mut commit = store.commit(&batch.checks, &batch.mutations);
+                        let mut commit = if independent_only {
+                            store.commit_with_prefix_put_fence(
+                                &batch.checks,
+                                &batch.mutations,
+                                &[
+                                    task_store::PREFIX,
+                                    crate::ownership_edge::PREFIX,
+                                    b"runtime/conversation/",
+                                ],
+                                recovery_graph_version,
+                            )
+                        } else {
+                            store.commit(&batch.checks, &batch.mutations)
+                        };
                         #[cfg(test)]
                         if commit.is_ok()
                             && conversation_claim_recovery_uncertain()
@@ -8743,7 +9013,7 @@ impl Scheduler {
                                 vec![]
                             };
                         if item.task.restarts().saturating_add(1) >= item.task.restart_limit() {
-                            self.finish_failed(&item, "hook restart limit".into())?;
+                            recovery_failure!("hook restart limit".into());
                             self.deferred_recovery.extend(deferred);
                             continue 'scan;
                         }
@@ -8764,7 +9034,20 @@ impl Scheduler {
                         {
                             hook();
                         }
-                        match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                        match if independent_only {
+                            self.ts().store().commit_with_prefix_put_fence(
+                                &batch.checks,
+                                &batch.mutations,
+                                &[
+                                    task_store::PREFIX,
+                                    crate::ownership_edge::PREFIX,
+                                    b"runtime/conversation/",
+                                ],
+                                recovery_graph_version,
+                            )
+                        } else {
+                            self.ts().store().commit(&batch.checks, &batch.mutations)
+                        } {
                             Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
                                 self.deferred_recovery.extend(deferred);
                                 continue 'scan;
@@ -8810,7 +9093,7 @@ impl Scheduler {
                 };
                 if let Some(proof) = after_recovery {
                     if item.task.restarts().saturating_add(1) >= item.task.restart_limit() {
-                        self.finish_failed(&item, "after hook restart limit".into())?;
+                        recovery_failure!("after hook restart limit".into());
                         self.deferred_recovery.extend(deferred);
                         continue 'scan;
                     }
@@ -8826,7 +9109,20 @@ impl Scheduler {
                     {
                         hook();
                     }
-                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                    match if independent_only {
+                        self.ts().store().commit_with_prefix_put_fence(
+                            &batch.checks,
+                            &batch.mutations,
+                            &[
+                                task_store::PREFIX,
+                                crate::ownership_edge::PREFIX,
+                                b"runtime/conversation/",
+                            ],
+                            recovery_graph_version,
+                        )
+                    } else {
+                        self.ts().store().commit(&batch.checks, &batch.mutations)
+                    } {
                         Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
                             self.deferred_recovery.extend(deferred);
                             continue 'scan;
@@ -9027,10 +9323,30 @@ impl Scheduler {
                                     .map_err(Error::Transition)?;
                                 let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
                                 batch.checks.extend(checks);
-                                match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                                match if independent_only {
+                                    self.ts().store().commit_with_prefix_put_fence(
+                                        &batch.checks,
+                                        &batch.mutations,
+                                        &[
+                                            task_store::PREFIX,
+                                            crate::ownership_edge::PREFIX,
+                                            b"runtime/conversation/",
+                                        ],
+                                        recovery_graph_version,
+                                    )
+                                } else {
+                                    self.ts().store().commit(&batch.checks, &batch.mutations)
+                                } {
                                     Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
                                         self.deferred_recovery.extend(deferred);
                                         continue 'scan;
+                                    }
+                                    Err(durable_store::Error::WriteLockBusy(_))
+                                        if independent_only =>
+                                    {
+                                        self.deferred_recovery.extend(deferred);
+                                        self.deferred_recovery.insert(item.task.id());
+                                        return Ok(());
                                     }
                                     Err(error) => return Err(task_store::Error::from(error).into()),
                                 }
@@ -9051,10 +9367,30 @@ impl Scheduler {
                                     .map_err(Error::Transition)?;
                                 let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
                                 batch.checks.extend(checks);
-                                match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                                match if independent_only {
+                                    self.ts().store().commit_with_prefix_put_fence(
+                                        &batch.checks,
+                                        &batch.mutations,
+                                        &[
+                                            task_store::PREFIX,
+                                            crate::ownership_edge::PREFIX,
+                                            b"runtime/conversation/",
+                                        ],
+                                        recovery_graph_version,
+                                    )
+                                } else {
+                                    self.ts().store().commit(&batch.checks, &batch.mutations)
+                                } {
                                     Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
                                         self.deferred_recovery.extend(deferred);
                                         continue 'scan;
+                                    }
+                                    Err(durable_store::Error::WriteLockBusy(_))
+                                        if independent_only =>
+                                    {
+                                        self.deferred_recovery.extend(deferred);
+                                        self.deferred_recovery.insert(item.task.id());
+                                        return Ok(());
                                     }
                                     Err(error) => return Err(task_store::Error::from(error).into()),
                                 }
@@ -9062,10 +9398,9 @@ impl Scheduler {
                             Err(_) => continue,
                         }
                     }
-                    self.finish_failed(
-                        &item,
-                        "interrupted: execution outcome requires reconciliation".into(),
-                    )?;
+                    recovery_failure!(
+                        "interrupted: execution outcome requires reconciliation".into()
+                    );
                     self.deferred_recovery.extend(deferred);
                     continue 'scan;
                 }
@@ -9083,7 +9418,7 @@ impl Scheduler {
                             self.ts()
                                 .update(&item, |task| task.hold_restart_failure())?;
                         } else {
-                            self.finish_failed(&item, "restart limit".into())?;
+                            recovery_failure!("restart limit".into());
                         }
                         self.deferred_recovery.extend(deferred);
                         continue 'scan;
@@ -9091,10 +9426,9 @@ impl Scheduler {
                         self.ts().update(&item, |task| task.recover())?;
                     }
                 } else {
-                    self.finish_failed(
-                        &item,
-                        "interrupted: execution outcome requires reconciliation".into(),
-                    )?;
+                    recovery_failure!(
+                        "interrupted: execution outcome requires reconciliation".into()
+                    );
                     self.deferred_recovery.extend(deferred);
                     continue 'scan;
                 }
@@ -9596,10 +9930,12 @@ impl Scheduler {
         let unbound_owned =
             unbound_cancel_owned_tasks(owner.store(), &self.unbound_cancel_roots, &held_tasks)?;
         for snapshot in &held_tasks {
-            if independent_only && !allow_maintenance {
-                continue;
-            }
-            if independent_only && !self.independent_root_safe(&owner, &snapshot.task)? {
+            if independent_only
+                && (!self.independent_root_safe(&owner, &snapshot.task)?
+                    || excluded.is_some_and(|intent| {
+                        !self.separate_from_maintenance(&owner, &snapshot.task, intent)
+                    }))
+            {
                 continue;
             }
             if unbound_owned.contains(&snapshot.task.id()) || !snapshot.task.is_completing() {
@@ -9623,6 +9959,9 @@ impl Scheduler {
                 && cancels_nested_on_completion(&snapshot.task)
                 && has_unmarked_nested(snapshot.task.id(), &held_tasks)
             {
+                if independent_only && !allow_maintenance {
+                    continue;
+                }
                 if nonblocking && self.validator.is_some() {
                     return Ok(self.deferred_maintenance(
                         MaintenanceIntent::Nested(snapshot.task.id()),
@@ -9643,6 +9982,9 @@ impl Scheduler {
             if needs_cascade {
                 // A held failure is cancellation intent. Persist the mark and
                 // cascade before letting any descendant execute again.
+                if independent_only && !allow_maintenance {
+                    continue;
+                }
                 if nonblocking && self.validator.is_some() {
                     return Ok(self.deferred_maintenance(
                         MaintenanceIntent::Failed(snapshot.task.id()),
@@ -10117,9 +10459,9 @@ impl Scheduler {
                 return Ok(TickReservation::Progress(true));
             }
         }
-        if excluded.is_none() && !self.deferred_recovery.is_empty() {
+        if !self.deferred_recovery.is_empty() {
             let before = self.deferred_recovery.clone();
-            self.reconcile_inner(independent_only)?;
+            self.reconcile_inner(independent_only, excluded)?;
             // A graph that remains uncertain must not starve independent work.
             if self.deferred_recovery != before {
                 return Ok(TickReservation::Progress(true));
@@ -10297,9 +10639,6 @@ impl Scheduler {
                 }
             }
         }
-        if independent_only {
-            return Ok(TickReservation::Progress(progress));
-        }
         let tasks = self.ts().list()?;
         // Use one snapshot of the active ownership graph. Admission is fenced
         // by the task gate held above.
@@ -10332,11 +10671,36 @@ impl Scheduler {
                         && live_task_tool_parent(&entry.task, &live_invocations)
                 })
         };
+        // A pending result or maintenance may coexist only with an abort
+        // reservation whose complete foreground graph is demonstrably separate.
+        let mut independent_abortable = HashSet::new();
+        if independent_only {
+            for record in &tasks {
+                let task = &record.task;
+                if task.state() != &TaskState::Ready
+                    || !task.abort_requested()
+                    || !complete_foreground_chain_mode(&self.ts(), task, true)?
+                    || self.has_related_published(&owner, task)
+                    || excluded
+                        .is_some_and(|intent| !self.separate_from_maintenance(&owner, task, intent))
+                {
+                    continue;
+                }
+                match pending_abort_root_mode(&self.ts(), task.id(), false, false, true) {
+                    Ok(None) => {
+                        independent_abortable.insert(task.id());
+                    }
+                    Ok(Some(_)) | Err(Error::Busy) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         // Children settle before their owner, including work below terminal task
         // anchors. Ignore only graph edges explicitly identified as cyclic.
         let mut abortable = None;
         for snapshot in &tasks {
-            if !eligible(&snapshot.task)
+            if (independent_only && !independent_abortable.contains(&snapshot.task.id()))
+                || !eligible(&snapshot.task)
                 || (!snapshot.task.abort_requested() && !snapshot.task.holds_restart_cleanup())
                 || snapshot.task.state() != &TaskState::Ready
             {
@@ -10479,13 +10843,17 @@ impl Scheduler {
                         expected: durable_store::Expected::Missing,
                     });
                 }
-                match self.ts().store().commit(&batch.checks, &batch.mutations) {
-                    Ok(()) | Err(durable_store::Error::Conflict { .. }) => (),
-                    Err(error) => return Err(task_store::Error::from(error).into()),
-                }
+                let committed = if independent_only {
+                    self.commit_independent_abort_batch(&batch, graph_version)?
+                } else {
+                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => true,
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
+                };
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(TickReservation::Progress(true));
+                return Ok(TickReservation::Progress(committed));
             }
             if snapshot.task.restarts() > 0
                 && snapshot.task.restarts() >= snapshot.task.restart_limit()
@@ -10539,6 +10907,13 @@ impl Scheduler {
                     if let Some(hook) = &self.reservation_commit_hook {
                         hook(0, self.ts().store());
                     }
+                    if independent_only {
+                        let progress =
+                            self.commit_independent_abort_batch(&batch, graph_version)?;
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(progress));
+                    }
                     match self.ts().store().commit(&batch.checks, &batch.mutations) {
                         Ok(()) => (),
                         Err(durable_store::Error::Conflict { .. }) => {
@@ -10549,6 +10924,15 @@ impl Scheduler {
                         Err(error) => return Err(task_store::Error::from(error).into()),
                     }
                 } else {
+                    if independent_only {
+                        let progress =
+                            self.independent_abort_update(snapshot, graph_version, |task| {
+                                task.fail_abort_restart()
+                            })?;
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(progress));
+                    }
                     self.ts()
                         .update(snapshot, |task| task.fail_abort_restart())?;
                 }
@@ -10564,6 +10948,16 @@ impl Scheduler {
                 } else {
                     orphan_diagnostic(&reason)
                 };
+                if independent_only {
+                    let progress =
+                        self.independent_abort_update(snapshot, graph_version, |task| {
+                            task.start()?;
+                            task.fail(diagnostic)
+                        })?;
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(TickReservation::Progress(progress));
+                }
                 self.ts().update(snapshot, |t| {
                     t.start()?;
                     t.fail(diagnostic)
@@ -10577,7 +10971,28 @@ impl Scheduler {
                 .ok()
                 .and_then(|r| r.abort.clone());
             if let Some(abort) = abort {
-                if !self.reserve_resolved(snapshot, None)? {
+                #[cfg(test)]
+                if independent_only {
+                    let hook = independent_abort_reservation_hooks()
+                        .lock()
+                        .unwrap()
+                        .remove(&snapshot.task.id());
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                if !self.reserve_resolved(snapshot, independent_only.then_some(graph_version))? {
+                    if independent_only {
+                        #[cfg(test)]
+                        if let Some(hook) = independent_abort_conflict_hooks()
+                            .lock()
+                            .unwrap()
+                            .remove(&snapshot.task.id())
+                        {
+                            hook();
+                        }
+                        return Ok(TickReservation::Progress(false));
+                    }
                     let reason = self
                         .blocked_reason(&snapshot.task)
                         .ok_or(Error::Registration)?;
@@ -10609,6 +11024,16 @@ impl Scheduler {
                 drop(gate);
                 return Ok(TickReservation::Invocation(Box::new(invocation)));
             } else {
+                if independent_only {
+                    let progress =
+                        self.independent_abort_update(snapshot, graph_version, |task| {
+                            task.start()?;
+                            task.fail("orphaned: missing abort handler or task definition".into())
+                        })?;
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(TickReservation::Progress(progress));
+                }
                 self.ts().update(snapshot, |t| {
                     t.start()?;
                     t.fail("orphaned: missing abort handler or task definition".into())
@@ -10617,6 +11042,9 @@ impl Scheduler {
             self.poisoned
                 .store(false, std::sync::atomic::Ordering::Release);
             return Ok(TickReservation::Progress(true));
+        }
+        if independent_only {
+            return Ok(TickReservation::Progress(progress));
         }
         let Some(snapshot) = tasks
             .iter()
@@ -12149,6 +12577,13 @@ pub(crate) fn pending_abort_root_for_running(
 // Foreground traversal is also a full ownership traversal only if no task or
 // conversation edge along the chain crosses a background boundary.
 fn complete_foreground_chain(ts: &TaskStore<'_>, task: &Task) -> Result<bool, Error> {
+    complete_foreground_chain_mode(ts, task, false)
+}
+fn complete_foreground_chain_mode(
+    ts: &TaskStore<'_>,
+    task: &Task,
+    allow_aborted_conversation: bool,
+) -> Result<bool, Error> {
     let edges = crate::ownership_edge::EdgeStore::new(ts.store());
     let mut current = task.clone();
     let mut tasks = HashSet::new();
@@ -12194,7 +12629,9 @@ fn complete_foreground_chain(ts: &TaskStore<'_>, task: &Task) -> Result<bool, Er
                 else {
                     return Ok(false);
                 };
-                if conversation.id != *id || conversation.abort_requested {
+                if conversation.id != *id
+                    || (conversation.abort_requested && !allow_aborted_conversation)
+                {
                     return Ok(false);
                 }
                 let Some(parent) = ts.load(edge.edge.task)? else {
@@ -12214,6 +12651,15 @@ pub(crate) fn pending_abort_root_excluding_self(
     running: Uuid,
     include_background: bool,
     exclude_self: bool,
+) -> Result<Option<Uuid>, Error> {
+    pending_abort_root_mode(ts, running, include_background, exclude_self, false)
+}
+fn pending_abort_root_mode(
+    ts: &TaskStore<'_>,
+    running: Uuid,
+    include_background: bool,
+    exclude_self: bool,
+    allow_aborted_conversation: bool,
 ) -> Result<Option<Uuid>, Error> {
     let records = ts.list()?;
     let mut roots = Vec::new();
@@ -12264,9 +12710,13 @@ pub(crate) fn pending_abort_root_excluding_self(
             // A valid foreground owner chain proves this invocation is outside
             // the uncertain root. Otherwise retain the outcome for revalidation.
             if include_background
-                || !task_ancestors_available(ts.store(), &running_task.task, &records, |parent| {
-                    parent.id() == root
-                })
+                || !task_ancestors_available_mode(
+                    ts.store(),
+                    &running_task.task,
+                    &records,
+                    allow_aborted_conversation,
+                    |parent| parent.id() == root,
+                )
             {
                 return Err(Error::Busy);
             }
