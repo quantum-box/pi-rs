@@ -2616,6 +2616,180 @@ mod tests {
                 .is_empty()
         );
     }
+    #[test]
+    fn intent_commit_conflict_defers_safe_and_unsafe_child() {
+        use crate::task_scheduler::{INTENT_COMMIT_HOOK, Step, TickReservation};
+        use crate::task_store::{Save, TaskStore};
+        for (safe, abort, conflict_limit, existing) in [
+            (true, false, 0, false),
+            (false, false, 0, false),
+            (true, true, 0, false),
+            (false, true, 0, false),
+            (true, false, 2, false),
+            (false, false, 2, false),
+            (true, false, 9, false),
+            (false, false, 9, false),
+            (true, false, 0, true),
+            (false, false, 0, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::default();
+            assert!(
+                registry.register("unsafe-parent-test", false, |_: &Task| Ok(Step::Succeed(
+                    json!(null)
+                )))
+            );
+            let mut host = StandaloneNoHooksHost::open(
+                dir.path().join("db"),
+                registry,
+                UnhookedAuthorization::standalone_only(),
+            )
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tool: Arc<dyn DurableAsyncTool> = Arc::new(PureParkTool {
+                calls: calls.clone(),
+                barrier: None,
+                fail: false,
+            });
+            let child_tool = if safe {
+                host.register_replay_safe_durable_tool(
+                    tool,
+                    "intent-race",
+                    1,
+                    vec![],
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap()
+            } else {
+                host.register_unsafe_durable_tool(
+                    tool,
+                    "intent-race",
+                    1,
+                    vec![],
+                    UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                )
+                .unwrap()
+            };
+            let mut scheduler = host.into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let parent = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("unsafe-parent-test".into(), false)
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            let tasks = TaskStore::new(owner.store());
+            let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+            tasks
+                .update(&snapshot, |task| {
+                    task.start_attempt(Uuid::new_v4())?;
+                    task.wait(crate::task::WaitFor::Signal("hold".into()))
+                })
+                .unwrap();
+            let waiting = tasks.load(parent.id()).unwrap().unwrap().task;
+            let (_, child) = child_tool.child_candidate(&waiting, json!({})).unwrap();
+            tasks.save(&[Save::Create(&child)]).unwrap();
+            let TickReservation::Invocation(job) = scheduler.reserve_tick(0).unwrap() else {
+                panic!("child not reserved")
+            };
+            let parent_id = parent.id();
+            let attempt = scheduler
+                .get(child.id())
+                .unwrap()
+                .unwrap()
+                .attempt_id()
+                .unwrap();
+            let namespace = if safe {
+                "durable/replay-safe-async"
+            } else {
+                "durable/unsafe-park-async"
+            };
+            let intent_key = format!("{namespace}/{}/{attempt}/intent", child.id()).into_bytes();
+            let conflicts = Arc::new(AtomicUsize::new(0));
+            let hook_conflicts = conflicts.clone();
+            *INTENT_COMMIT_HOOK.lock().unwrap() = Some((
+                child.id(),
+                Arc::new(move |store, write_intent| {
+                    if existing {
+                        if write_intent {
+                            store
+                                .commit(
+                                    &[],
+                                    &[durable_store::Mutation::Put {
+                                        key: intent_key.clone(),
+                                        value: b"prior intent".to_vec(),
+                                    }],
+                                )
+                                .unwrap();
+                        }
+                        return;
+                    }
+                    if conflict_limit > 0
+                        && hook_conflicts.fetch_add(1, Ordering::SeqCst) >= conflict_limit
+                    {
+                        return;
+                    }
+                    let tasks = TaskStore::new(store);
+                    let snapshot = tasks.load(parent_id).unwrap().unwrap();
+                    tasks
+                        .update(&snapshot, |task| {
+                            if conflict_limit > 0 {
+                                Ok(())
+                            } else if abort {
+                                task.request_abort()
+                            } else {
+                                task.wake()?;
+                                task.start_attempt(Uuid::new_v4())
+                            }
+                        })
+                        .unwrap();
+                }),
+            ));
+            let completed = job.execute().unwrap();
+            *INTENT_COMMIT_HOOK.lock().unwrap() = None;
+            if abort || existing {
+                assert!(
+                    matches!(completed.handler_result(), Some(Err(_))),
+                    "abort or existing intent must not defer"
+                );
+                scheduler.settle_invocation(completed).unwrap();
+            } else {
+                assert!(
+                    matches!(
+                        completed.handler_result(),
+                        Some(Ok(Step::DeferUndispatched))
+                    ),
+                    "safe={safe}"
+                );
+                scheduler.settle_invocation(completed).unwrap();
+                assert!(matches!(
+                    scheduler.get(child.id()).unwrap().unwrap().state(),
+                    crate::task::TaskState::Ready
+                ));
+            }
+            if conflict_limit > 0 {
+                assert!(conflicts.load(Ordering::SeqCst) >= conflict_limit);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let namespace = if safe {
+                "durable/replay-safe-async"
+            } else {
+                "durable/unsafe-park-async"
+            };
+            let evidence = owner
+                .store()
+                .list(format!("{namespace}/{}/", child.id()).as_bytes())
+                .unwrap();
+            assert_eq!(evidence.is_empty(), !existing);
+        }
+    }
     #[async_trait::async_trait]
     impl Tool for PureParkTool {
         fn spec(&self) -> ToolSpec {
@@ -3106,6 +3280,190 @@ mod tests {
             )
         });
         (root.task_id(), middle.task_id(), leaf.task_id())
+    }
+    struct HookRace {
+        phase: &'static str,
+        fired: Arc<std::sync::atomic::AtomicBool>,
+        change_parent: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for HookRace {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            if self.phase == "before" {
+                self.race(ctx).await;
+            }
+            Ok(crate::extension::BeforeTool::Pass)
+        }
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if self.phase == "after" {
+                self.race(ctx).await;
+            }
+            Ok(None)
+        }
+    }
+    impl HookRace {
+        async fn race(&self, ctx: &crate::extension::Context<'_>) {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                ctx.memo
+                    .get_or_insert("race", json!("saved"))
+                    .await
+                    .unwrap();
+                self.change_parent.get().unwrap()();
+                // Hooks may ignore a memo error; the executor must still defer.
+                let _ = ctx.memo.get("race").await;
+            } else {
+                assert_eq!(ctx.memo.get("race").await.unwrap(), Some(json!("saved")));
+            }
+        }
+    }
+    struct HookRaceTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for HookRaceTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "hook-race".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for HookRaceTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableToolStep::Complete(Outcome::Succeeded("done".into())))
+        }
+    }
+    #[test]
+    fn hooked_child_defers_memo_races_with_running_unsafe_parent() {
+        use crate::task_scheduler::{Step, TickReservation};
+        use crate::task_store::{Save, TaskStore};
+        for phase in ["before", "after"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::default();
+            assert!(
+                registry.register("unsafe-parent-test", false, |_: &Task| Ok(Step::Succeed(
+                    json!(null)
+                )))
+            );
+            let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let change_parent: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>> =
+                Arc::new(std::sync::OnceLock::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let child_tool = host
+                .register_replay_safe_durable_tool_with_hook(
+                    Arc::new(HookRaceTool(calls.clone())),
+                    "hook-race-v1",
+                    1,
+                    vec![],
+                    "hook-v1",
+                    Arc::new(HookRace {
+                        phase,
+                        fired: fired.clone(),
+                        change_parent: change_parent.clone(),
+                    }),
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let mut scheduler = host.into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let parent = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!(null),
+                },
+                10,
+            )
+            .unwrap()
+            .registered("unsafe-parent-test".into(), false)
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            let tasks = TaskStore::new(owner.store());
+            let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+            tasks
+                .update(&snapshot, |task| {
+                    task.start_attempt(Uuid::new_v4())?;
+                    task.wait(crate::task::WaitFor::Signal("hold".into()))
+                })
+                .unwrap();
+            let waiting = tasks.load(parent.id()).unwrap().unwrap().task;
+            let (_, child) = child_tool.child_candidate(&waiting, json!({})).unwrap();
+            tasks.save(&[Save::Create(&child)]).unwrap();
+            let parent_id = parent.id();
+            let race_owner = owner.clone();
+            assert!(
+                change_parent
+                    .set(Arc::new(move || {
+                        let tasks = TaskStore::new(race_owner.store());
+                        let snapshot = tasks.load(parent_id).unwrap().unwrap();
+                        tasks
+                            .update(&snapshot, |task| {
+                                task.wake()?;
+                                task.start_attempt(Uuid::new_v4())
+                            })
+                            .unwrap();
+                    }))
+                    .is_ok()
+            );
+            let mut deferred = false;
+            for _ in 0..8 {
+                let TickReservation::Invocation(job) = scheduler.reserve_tick(0).unwrap() else {
+                    panic!("child not reserved in {phase}")
+                };
+                assert_eq!(job.task_id(), child.id());
+                let completed = job.execute().unwrap();
+                let is_defer = matches!(
+                    completed.handler_result(),
+                    Some(Ok(Step::DeferUndispatched))
+                );
+                scheduler.settle_invocation(completed).unwrap();
+                if is_defer {
+                    deferred = true;
+                    let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+                    tasks
+                        .update(&snapshot, |task| {
+                            task.wait(crate::task::WaitFor::Signal("hold".into()))
+                        })
+                        .unwrap();
+                }
+                if matches!(
+                    scheduler.get(child.id()).unwrap().unwrap().state(),
+                    crate::task::TaskState::Succeeded(_)
+                ) {
+                    break;
+                }
+            }
+            assert!(fired.load(Ordering::SeqCst) && deferred, "{phase}");
+            assert!(
+                matches!(
+                    scheduler.get(child.id()).unwrap().unwrap().state(),
+                    crate::task::TaskState::Succeeded(_)
+                ),
+                "{phase}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{phase}");
+        }
     }
     struct DurableHooks {
         before: Arc<AtomicUsize>,

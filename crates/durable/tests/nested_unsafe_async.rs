@@ -173,19 +173,13 @@ impl DurableAsyncTool for Parent {
                 }
                 match (self.expected.as_str(), host.child_result(&child).await?) {
                     ("success", Some(AsyncTaskResult::Outcome(Outcome::Succeeded(value))))
-                        if value == "child" =>
-                    {
-                        ()
-                    }
+                        if value == "child" => {}
                     (
                         "pending",
                         Some(AsyncTaskResult::Uncertain(Outcome::Pending { reference })),
                     ) if reference == "remote-17" => (),
                     ("interrupt", Some(AsyncTaskResult::Uncertain(Outcome::Unknown(reason))))
-                        if reason.contains("reconciliation") =>
-                    {
-                        ()
-                    }
+                        if reason.contains("reconciliation") => {}
                     (_, other) => return Err(format!("unexpected child result: {other:?}")),
                 }
                 if !matches!(

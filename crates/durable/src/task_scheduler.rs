@@ -110,6 +110,13 @@ pub enum Step {
 }
 
 pub(crate) const UNSAFE_ANCESTOR_BUSY: &str = "checkpointable unsafe ancestor is not parked";
+const HOOK_FENCE_CONFLICT: &str = "checkpointable hook fence conflict";
+#[cfg(test)]
+pub(crate) type IntentCommitHook =
+    std::sync::Arc<dyn Fn(&durable_store::Store, bool) + Send + Sync>;
+#[cfg(test)]
+pub(crate) static INTENT_COMMIT_HOOK: std::sync::Mutex<Option<(Uuid, IntentCommitHook)>> =
+    std::sync::Mutex::new(None);
 
 pub type Migration =
     dyn Fn(&Value, &Checkpoint, u32) -> Result<(Value, Checkpoint), String> + Send + Sync;
@@ -1250,6 +1257,32 @@ impl PreparedSettlement {
                 .hold_prepared_success()
                 .map_err(Error::Transition)?;
         }
+        if matches!(candidate.state(), TaskState::Succeeded(_))
+            && candidate.retains_task_children_on_success()
+        {
+            let (uncertain, checks) = unsafe_descendant_reconciliation(
+                owner.store(),
+                candidate.id(),
+                &scheduler.ts().list()?,
+                self.graph_version,
+            )?;
+            // A newly discovered descendant was not part of the original
+            // transaction. Never refresh away the original evidence fences;
+            // discard this candidate and use the ordinary replay policy.
+            if uncertain.is_some()
+                || checks.iter().any(|check| {
+                    !self.transaction.checks().iter().any(|old| {
+                        old.key == check.key
+                            && matches!(
+                                old.expected,
+                                durable_store::Expected::PrefixUnchangedSince(_)
+                            )
+                    })
+                })
+            {
+                return Ok(PreparedRevalidation::Stale);
+            }
+        }
         if latest.version != self.running.version || candidate != self.candidate.task {
             self.transaction.rebase_task_candidate(
                 self.running.task.id(),
@@ -1687,13 +1720,68 @@ impl AdmissionHandle<'_> {
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
     ) -> Result<Vec<u8>, String> {
-        self.replay_safe_durable_fence(
+        match self.replay_safe_durable_fence(
             test_namespace,
             expected_replay_safe,
             cancellation,
             true,
             (&[], &[]),
-        )
+        ) {
+            Err(error) if error == HOOK_FENCE_CONFLICT => {
+                // The intent did not commit. Recheck the lease, abort and
+                // intent absence before returning an undispatched defer.
+                for _ in 0..8 {
+                    match self.replay_safe_durable_fence(
+                        test_namespace,
+                        expected_replay_safe,
+                        cancellation,
+                        false,
+                        (&[], &[]),
+                    ) {
+                        Ok(_) => return Err(UNSAFE_ANCESTOR_BUSY.into()),
+                        Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                // Under sustained contention the defer transaction itself
+                // checks missing intent and the live attempt/abort fence.
+                // Detect already recorded intent and cancellation explicitly;
+                // concurrent changes after these reads are fenced at settlement.
+                let store = self.lease.attachment.owner.store();
+                let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+                let prefix = if test_namespace {
+                    "test/durable-async"
+                } else if expected_replay_safe {
+                    "durable/replay-safe-async"
+                } else {
+                    "durable/unsafe-park-async"
+                };
+                let key = format!("{prefix}/{}/{attempt}/intent", self.running.task.id());
+                if store
+                    .get(key.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+                {
+                    return Err("attempt intent already exists".into());
+                }
+                let tasks = TaskStore::new(store);
+                let current = tasks
+                    .load(self.running.task.id())
+                    .map_err(|e| e.to_string())?
+                    .ok_or("missing task")?;
+                if cancellation.is_some_and(pi_rs_core::CancellationToken::is_cancelled)
+                    || current.task != self.running.task
+                    || current.task.abort_requested()
+                    || pending_abort_root_for_running(&tasks, current.task.id(), true)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                {
+                    return Err("stale or aborted test attempt".into());
+                }
+                Err(UNSAFE_ANCESTOR_BUSY.into())
+            }
+            result => result,
+        }
     }
     pub(crate) fn replay_safe_durable_check(
         &self,
@@ -1701,6 +1789,13 @@ impl AdmissionHandle<'_> {
     ) -> Result<(), String> {
         self.replay_safe_durable_fence(false, true, Some(cancellation), false, (&[], &[]))
             .map(|_| ())
+            .map_err(|error| {
+                if error == HOOK_FENCE_CONFLICT {
+                    UNSAFE_ANCESTOR_BUSY.into()
+                } else {
+                    error
+                }
+            })
     }
     fn replay_safe_durable_fence(
         &self,
@@ -1845,10 +1940,24 @@ impl AdmissionHandle<'_> {
             vec![]
         };
         mutations.extend_from_slice(extra.1);
+        #[cfg(test)]
+        {
+            let hook = INTENT_COMMIT_HOOK
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|(id, hook)| (*id == current.task.id()).then(|| hook.clone()));
+            if let Some(hook) = hook {
+                hook(owner.store(), write_intent);
+            }
+        }
         owner
             .store()
             .commit(&checks, &mutations)
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| match error {
+                durable_store::Error::Conflict { .. } => HOOK_FENCE_CONFLICT.to_owned(),
+                other => other.to_string(),
+            })?;
         Ok(key)
     }
     pub(crate) fn replay_safe_hook_memo(
@@ -1860,6 +1969,20 @@ impl AdmissionHandle<'_> {
         if key.is_empty() || key.len() > 4096 {
             return Err("invalid memo key".into());
         }
+        for _ in 0..8 {
+            match self.replay_safe_hook_memo_once(key, value.clone(), cancel) {
+                Err(error) if error == HOOK_FENCE_CONFLICT => continue,
+                result => return result,
+            }
+        }
+        Err(UNSAFE_ANCESTOR_BUSY.into())
+    }
+    fn replay_safe_hook_memo_once(
+        &self,
+        key: &str,
+        value: Option<serde_json::Value>,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<Option<serde_json::Value>, String> {
         let store = self.lease.attachment.owner.store();
         let storage_key =
             format!("runtime/extension-memo/{}/{}", self.running.task.id(), key).into_bytes();
@@ -6137,6 +6260,7 @@ impl Scheduler {
         let mut children = Vec::new();
         let mut wait_graph_fence = false;
         let mut undispatched_check = None;
+        let mut unsafe_evidence_checks = Vec::new();
         match step {
             Step::Continue(checkpoint) => {
                 next.task.advance(checkpoint).map_err(Error::Transition)?;
@@ -6264,7 +6388,7 @@ impl Scheduler {
                     next.task.hold_success(value).map_err(Error::Transition)?;
                 } else {
                     if next.task.retains_task_children_on_success() {
-                        let (uncertain, _) = unsafe_descendant_reconciliation(
+                        let (uncertain, checks) = unsafe_descendant_reconciliation(
                             owner.store(),
                             next.task.id(),
                             &records,
@@ -6273,6 +6397,7 @@ impl Scheduler {
                         if let Some(child) = uncertain {
                             return self.finish_running_failure(&running, format!("unsafe descendant {child} requires reconciliation; success was not published"), &owner, _gate, nonblocking_abort, deferred);
                         }
+                        unsafe_evidence_checks = checks;
                     }
                     next.task.succeed(value).map_err(Error::Transition)?;
                 }
@@ -6455,6 +6580,26 @@ impl Scheduler {
         let has_task_submission = prepared_documents.task_input.is_some();
         let mut transaction = prepared_documents.transaction;
         let mut document_batch = prepared_documents.document_batch;
+        // Child-result reads may already fence the same evidence prefix at a
+        // different revision. Keep the stricter (earlier) boundary so both
+        // observations survive transaction assembly and every graph retry.
+        for check in unsafe_evidence_checks {
+            if let Some(existing) = document_batch
+                .checks
+                .iter_mut()
+                .find(|other| other.key == check.key)
+            {
+                match (&mut existing.expected, check.expected) {
+                    (
+                        durable_store::Expected::PrefixUnchangedSince(old),
+                        durable_store::Expected::PrefixUnchangedSince(new),
+                    ) => *old = (*old).min(new),
+                    _ => return Err(crate::document::Error::InvalidBatch.into()),
+                }
+            } else {
+                document_batch.checks.push(check);
+            }
+        }
         // Checks observed at reservation are equivalent to the reloaded task.
         // Preserve independently observed versions and any deadline.
         for check in &mut document_batch.checks {
@@ -10276,6 +10421,139 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn immediate_success_fences_late_unsafe_descendant_evidence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, |_: &Task| Ok(Step::Succeed(json!("done")))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            3,
+        )
+        .into_task_tool()
+        .retain_task_children_on_success();
+        let mut child = task(
+            2,
+            TaskOwner::Task(parent.id()),
+            "pi-rs.unsafe-park-async.v1.test",
+            false,
+            3,
+        );
+        child.start().unwrap();
+        child.fail("interrupted".into()).unwrap();
+        scheduler
+            .ts()
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        let inserted = Arc::new(AtomicBool::new(false));
+        let once = inserted.clone();
+        scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                store
+                    .commit(
+                        &[],
+                        &[durable_store::Mutation::Put {
+                            key: format!(
+                                "durable/unsafe-park-async/{}/1/intent",
+                                Uuid::from_u128(2)
+                            )
+                            .into_bytes(),
+                            value: b"evidence".to_vec(),
+                        }],
+                    )
+                    .unwrap();
+            }
+        }));
+        let TickReservation::Invocation(job) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("parent not reserved")
+        };
+        let completed = job.execute().unwrap();
+        scheduler.settle_invocation(completed).unwrap();
+        scheduler.result_commit_hook = None;
+        assert!(inserted.load(Ordering::SeqCst));
+        let first = scheduler.get(parent.id()).unwrap().unwrap();
+        assert!(
+            !matches!(first.state(), TaskState::Succeeded(_)),
+            "success escaped evidence fence"
+        );
+        if matches!(first.state(), TaskState::Ready) {
+            scheduler.tick(0).unwrap();
+        }
+        let final_task = scheduler.get(parent.id()).unwrap().unwrap();
+        assert!(
+            matches!(final_task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+            "{:?}",
+            final_task.state()
+        );
+    }
+
+    #[test]
+    fn graph_retry_discards_success_when_unsafe_descendant_appears() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, |_: &Task| Ok(Step::Succeed(json!("done")))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            3,
+        )
+        .into_task_tool()
+        .retain_task_children_on_success();
+        scheduler.submit(&parent).unwrap();
+        let inserted = Arc::new(AtomicBool::new(false));
+        let once = inserted.clone();
+        scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                let mut child = task(
+                    2,
+                    TaskOwner::Task(Uuid::from_u128(1)),
+                    "pi-rs.unsafe-park-async.v1.test",
+                    false,
+                    3,
+                );
+                child.start().unwrap();
+                child.fail("interrupted".into()).unwrap();
+                TaskStore::new(store).save(&[Save::Create(&child)]).unwrap();
+                store
+                    .commit(
+                        &[],
+                        &[durable_store::Mutation::Put {
+                            key: format!("durable/unsafe-park-async/{}/1/intent", child.id())
+                                .into_bytes(),
+                            value: b"evidence".to_vec(),
+                        }],
+                    )
+                    .unwrap();
+            }
+        }));
+        let TickReservation::Invocation(job) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("parent not reserved")
+        };
+        scheduler.settle_invocation(job.execute().unwrap()).unwrap();
+        scheduler.result_commit_hook = None;
+        assert!(inserted.load(Ordering::SeqCst));
+        assert!(matches!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::Ready
+        ));
+        scheduler.tick(0).unwrap();
+        let task = scheduler.get(parent.id()).unwrap().unwrap();
+        assert!(
+            matches!(task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+            "{:?}",
+            task.state()
+        );
+    }
+
     fn task(id: u128, owner: TaskOwner, kind: &str, safe: bool, limit: u32) -> Task {
         Task::new(Uuid::from_u128(id), owner, cp("start"), limit)
             .unwrap()

@@ -216,7 +216,7 @@ struct HookCheckpoint {
 struct HookMemo<'a, 'b> {
     admission: &'a AdmissionHandle<'b>,
     cancellation: &'a pi_rs_core::CancellationToken,
-    failed: Mutex<bool>,
+    failed: Mutex<Option<String>>,
 }
 impl HookMemo<'_, '_> {
     fn access(
@@ -227,7 +227,7 @@ impl HookMemo<'_, '_> {
         // Serialize access with failure publication: a concurrent operation
         // cannot commit after another operation has failed.
         let mut failed = self.failed.lock().map_err(|_| "hook memo unavailable")?;
-        if *failed {
+        if failed.is_some() {
             return Err("hook memo unavailable after failure".into());
         }
         let inserting = value.is_some();
@@ -241,13 +241,16 @@ impl HookMemo<'_, '_> {
                     Ok(value)
                 }
             });
-        if result.is_err() {
-            *failed = true;
+        if let Err(error) = &result {
+            *failed = Some(error.clone());
         }
         result
     }
-    fn failed(&self) -> bool {
-        self.failed.lock().map_or(true, |failed| *failed)
+    fn failure(&self) -> Option<String> {
+        self.failed.lock().map_or_else(
+            |_| Some("hook memo unavailable".into()),
+            |failed| failed.clone(),
+        )
     }
 }
 #[async_trait::async_trait]
@@ -565,7 +568,7 @@ impl Executor {
         let memo = HookMemo {
             admission,
             cancellation: cancel,
-            failed: Mutex::new(false),
+            failed: Mutex::new(None),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -592,10 +595,18 @@ impl Executor {
                 Ok::<_, String>(BeforeResult::Decision(call, decision))
             };
             tokio::select! { biased; _ = cancel.cancelled() => Err("before hook cancelled".into()), result = operation => result }
-        })?;
-        if memo.failed() {
-            return Err("task-fenced hook memo failed".into());
+        });
+        if cancel.is_cancelled() {
+            return Err("before hook cancelled".into());
         }
+        if let Some(error) = memo.failure() {
+            return Err(if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY {
+                error
+            } else {
+                "task-fenced hook memo failed".into()
+            });
+        }
+        let before = before?;
         admission.replay_safe_durable_check(cancel)?;
         let (call, decision) = match before {
             BeforeResult::Invalid(args, reason) => {
@@ -791,7 +802,7 @@ impl Executor {
         let memo = HookMemo {
             admission,
             cancellation: cancel,
-            failed: Mutex::new(false),
+            failed: Mutex::new(None),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -814,10 +825,18 @@ impl Executor {
                 Ok(serde_json::Value::String(result.output))
             };
             tokio::select! { biased; _ = cancel.cancelled() => Err("after hook cancelled".to_string()), result = operation => result }
-        })?;
-        if memo.failed() {
-            return Err("task-fenced hook memo failed".into());
+        });
+        if cancel.is_cancelled() {
+            return Err("after hook cancelled".into());
         }
+        if let Some(error) = memo.failure() {
+            return Err(if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY {
+                error
+            } else {
+                "task-fenced hook memo failed".into()
+            });
+        }
+        let value = value?;
         admission.replay_safe_durable_check(cancel)?;
         let result = match value.as_str() {
             Some(output) if output != text => match outcome {
@@ -971,10 +990,20 @@ impl Handler for Executor {
             return Err("tool identity changed".into());
         }
         if self.hook.is_some() && task.checkpoint().phase == "initial" {
-            return self.before(task, admission, cancellation);
+            return match self.before(task, admission, cancellation) {
+                Err(error) if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY => {
+                    Ok(Step::DeferUndispatched)
+                }
+                result => result,
+            };
         }
         if self.hook.is_some() && task.checkpoint().phase == "replay-safe-async-after" {
-            return self.after(task, admission, cancellation);
+            return match self.after(task, admission, cancellation) {
+                Err(error) if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY => {
+                    Ok(Step::DeferUndispatched)
+                }
+                result => result,
+            };
         }
         let intent = match admission.checkpointable_durable_intent(
             false,
