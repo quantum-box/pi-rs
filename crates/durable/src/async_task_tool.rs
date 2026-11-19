@@ -2126,7 +2126,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(received.try_recv().is_err());
         let _ = driver.shutdown_with_pending().unwrap();
-}
+    }
 
     struct DurableStub(Arc<AtomicUsize>);
 
@@ -2382,8 +2382,7 @@ mod tests {
                     }
                     match host.child_result(&call).await? {
                         Some(AsyncTaskResult::Outcome(Outcome::Succeeded(value)))
-                            if value == self.child =>
-                        {}
+                            if value == self.child => {}
                         other => return Err(format!("wrong child result: {other:?}")),
                     }
                     Ok(DurableToolStep::Complete(Outcome::Succeeded(
