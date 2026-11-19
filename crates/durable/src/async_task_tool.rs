@@ -12961,6 +12961,95 @@ mod tests {
         assert_ne!(retry_tool.identity().unwrap().kind, current_kind);
         drop(host);
     }
+    #[test]
+    fn actual_cross_version_park_cancel_stores_preserve_evidence() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/park-cancel-cross-version");
+        for generation in ["a587", "7f5"] {
+            for boundary in ["parked", "claimed", "receipted"] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let name = format!("{generation}-{boundary}");
+                std::fs::copy(fixtures.join(format!("{name}.sqlite3")), root.join("db")).unwrap();
+                let id: Uuid = std::fs::read_to_string(fixtures.join(format!("{name}.task-id")))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let store = durable_store::Store::open(root.join("db")).unwrap();
+                let before = crate::task_store::TaskStore::new(&store)
+                    .load(id)
+                    .unwrap()
+                    .unwrap()
+                    .task;
+                assert_eq!(before.checkpoint().phase, "replay-safe-async-wait");
+                assert_eq!(
+                    before.checkpoint().data["version"],
+                    if generation == "a587" {
+                        json!(1)
+                    } else {
+                        json!(2)
+                    }
+                );
+                assert_eq!(
+                    before.checkpoint().data.get("park_attempt").is_some(),
+                    generation == "7f5"
+                );
+                assert_eq!(before.abort_requested(), boundary != "parked");
+                let prefix = format!("durable/replay-safe-async/{id}/");
+                let records = store.list(prefix.as_bytes()).unwrap();
+                assert!(
+                    records
+                        .iter()
+                        .any(|(key, _)| key.ends_with(b"/intent/result"))
+                );
+                assert_eq!(
+                    records
+                        .iter()
+                        .any(|(key, _)| key.ends_with(b"/park-cancel-claim")),
+                    boundary != "parked"
+                );
+                assert_eq!(
+                    records
+                        .iter()
+                        .any(|(key, _)| key.ends_with(b"/abort-after")),
+                    boundary == "receipted"
+                );
+                drop(store);
+                let (host, tool) = park_cancel_host(root);
+                assert_ne!(before.kind().unwrap(), tool.identity().unwrap().kind);
+                let driver = host.into_driver();
+                if boundary == "parked" {
+                    driver.request_abort(id).unwrap();
+                }
+                let ended = wait_terminal(&driver, id);
+                assert!(
+                    matches!(ended.state(),crate::task::TaskState::Failed(reason) if reason.contains("reconciliation")),
+                    "{name}: {:?}",
+                    ended.state()
+                );
+                assert_eq!(ended.checkpoint(), before.checkpoint());
+                assert!(!root.join("cancel-count").exists(), "{name}");
+                assert!(!root.join("abort-hook-count").exists(), "{name}");
+                let _ = driver.shutdown_with_pending().unwrap();
+                let store = durable_store::Store::open(root.join("db")).unwrap();
+                for (key, old) in records {
+                    assert_eq!(store.get(&key).unwrap().unwrap().value, old.value, "{name}");
+                }
+                let evidence = read_park_cancel_evidence(&store, id).unwrap();
+                assert_eq!(
+                    evidence,
+                    match boundary {
+                        "parked" => None,
+                        "claimed" => Some(ParkCancelEvidence::AttemptedUnknown),
+                        _ => Some(ParkCancelEvidence::CallbackReturned),
+                    },
+                    "{name}"
+                );
+                assert!(read_aborted_after_result(&store, id).unwrap().is_none());
+            }
+        }
+    }
     struct SuppressGate;
     #[async_trait::async_trait]
     impl crate::extension::Hook for SuppressGate {
