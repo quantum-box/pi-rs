@@ -15200,9 +15200,18 @@ impl Harness {
                         task,
                     )
                     .map_err(|e| Error::Invalid(format!("unsafe task receipt: {e}")))?;
-                    if receipts.len() != 1
-                        || Some(receipts[0].attempt_id) != child.task.retired_attempt_id()
-                        || receipts[0].outcome != outcome
+                    let no_dispatch =
+                        crate::async_task_tool::unsafe_park_proof::no_dispatch_result(
+                            self.owner.store(),
+                            &child.task,
+                            &outcome,
+                        )
+                        .map_err(|e| Error::Invalid(format!("unsafe no-dispatch proof: {e}")))?;
+                    if (!no_dispatch
+                        && (receipts.len() != 1
+                            || Some(receipts[0].attempt_id) != child.task.retired_attempt_id()
+                            || receipts[0].outcome != outcome))
+                        || (no_dispatch && !receipts.is_empty())
                     {
                         return Err(Error::Invalid("unsafe task result receipt mismatch".into()));
                     }

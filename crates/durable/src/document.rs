@@ -2425,6 +2425,14 @@ impl<'a> TaskDocuments<'a> {
         }
         Ok((receipts, has_intent))
     }
+    /// The caller must already have fenced this child's unsafe evidence prefix.
+    pub(crate) fn unsafe_child_no_dispatch(
+        &self,
+        task: &crate::task::Task,
+        outcome: &pi_rs_core::Outcome,
+    ) -> Result<bool, String> {
+        crate::async_task_tool::unsafe_park_proof::no_dispatch_result(self.store, task, outcome)
+    }
     pub(crate) fn stage_unsafe_hook_phase(
         &mut self,
         step: &crate::task_scheduler::Step,
@@ -2468,7 +2476,12 @@ impl<'a> TaskDocuments<'a> {
         intent_key: &[u8],
     ) -> Result<bool, String> {
         let boundary = self.store.put_version().map_err(|e| e.to_string())?;
-        let prefix = format!("durable/replay-safe-async/{}/", self.task.id()).into_bytes();
+        let namespace = if self.task.replay_safe() {
+            "replay-safe-async"
+        } else {
+            "unsafe-park-async"
+        };
+        let prefix = format!("durable/{namespace}/{}/", self.task.id()).into_bytes();
         let entries = self.store.list(&prefix).map_err(|e| e.to_string())?;
         if entries.len() != 1 || entries[0].0 != intent_key {
             return Ok(false);
@@ -2487,6 +2500,18 @@ impl<'a> TaskDocuments<'a> {
             expected: Expected::PrefixUnchangedSince(boundary),
         });
         Ok(true)
+    }
+    pub(crate) fn stage_unsafe_no_dispatch(
+        &mut self,
+        intent: &[u8],
+        outcome: &pi_rs_core::Outcome,
+    ) -> Result<(), String> {
+        let (checks, mutations) = crate::async_task_tool::unsafe_park_proof::prepare_no_dispatch(
+            self.store, &self.task, intent, outcome,
+        )?;
+        self.signals.batch.checks.extend(checks);
+        self.signals.batch.mutations.extend(mutations);
+        Ok(())
     }
     pub(crate) fn stage_hook_signal_check(&mut self, check: Check) -> Result<(), String> {
         if let Some(existing) = self
@@ -4140,7 +4165,8 @@ mod nested_entry_tests {
     #[test]
     fn first_checkpointable_intent_proof_fences_late_and_deleted_prior_intents() {
         let db = Store::memory().unwrap();
-        let task = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        let task =
+            task(1, TaskOwner::Conversation(Uuid::from_u128(9))).registered("test".into(), true);
         let current = format!(
             "durable/replay-safe-async/{}/{}/intent",
             task.id(),
@@ -4184,6 +4210,60 @@ mod nested_entry_tests {
             Uuid::new_v4()
         )
         .into_bytes();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: prior,
+                value: serde_json::to_vec(&task).unwrap(),
+            }],
+        )
+        .unwrap();
+        let mut docs = TaskDocuments::new(&db, &task).unwrap();
+        assert!(!docs.prove_first_checkpointable_intent(&current).unwrap());
+    }
+
+    #[test]
+    fn first_unsafe_intent_proof_fences_prior_and_replaced_intents() {
+        let db = Store::memory().unwrap();
+        let task = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        let current = format!(
+            "durable/unsafe-park-async/{}/{}/intent",
+            task.id(),
+            Uuid::new_v4()
+        )
+        .into_bytes();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: current.clone(),
+                value: serde_json::to_vec(&task).unwrap(),
+            }],
+        )
+        .unwrap();
+        let mut docs = TaskDocuments::new(&db, &task).unwrap();
+        assert!(docs.prove_first_checkpointable_intent(&current).unwrap());
+        let prior = format!(
+            "durable/unsafe-park-async/{}/{}/intent",
+            task.id(),
+            Uuid::new_v4()
+        )
+        .into_bytes();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: prior.clone(),
+                value: serde_json::to_vec(&task).unwrap(),
+            }],
+        )
+        .unwrap();
+        db.commit(&[], &[Mutation::Delete { key: prior.clone() }])
+            .unwrap();
+        let mut tx = Transaction::new();
+        tx.append(docs.into_batch().unwrap()).unwrap();
+        assert!(matches!(
+            tx.commit(&db),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
         db.commit(
             &[],
             &[Mutation::Put {

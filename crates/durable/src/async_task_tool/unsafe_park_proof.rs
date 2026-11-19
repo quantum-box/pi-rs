@@ -44,6 +44,87 @@ pub(crate) fn prepare_receipt(
     )
 }
 
+pub(crate) fn prepare_no_dispatch(
+    store: &Store,
+    task: &Task,
+    intent: &[u8],
+    outcome: &pi_rs_core::Outcome,
+) -> Result<(Vec<Check>, Vec<Mutation>), String> {
+    if !matches!(outcome, pi_rs_core::Outcome::Failed(_)) {
+        return Err("invalid no-dispatch result".into());
+    }
+    prepare_evidence(
+        store,
+        task,
+        intent,
+        b"/no-dispatch",
+        serde_json::to_vec(outcome).map_err(|e| e.to_string())?,
+    )
+}
+
+/// Validate an atomically settled, first-attempt no-dispatch failure.
+pub(crate) fn no_dispatch_result(
+    store: &Store,
+    task: &Task,
+    outcome: &pi_rs_core::Outcome,
+) -> Result<bool, String> {
+    let Some(attempt) = task.retired_attempt_id() else {
+        return Ok(false);
+    };
+    let intent = intent_key(task.id(), attempt);
+    let mut marker = intent.clone();
+    marker.extend_from_slice(b"/no-dispatch");
+    let Some(entry) = store.get(&marker).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let recorded_outcome: pi_rs_core::Outcome =
+        serde_json::from_slice(&entry.value).map_err(|_| "invalid no-dispatch outcome")?;
+    if !matches!(recorded_outcome, pi_rs_core::Outcome::Failed(_)) || &recorded_outcome != outcome {
+        return Err("no-dispatch result mismatch".into());
+    }
+    let prefix = format!("durable/unsafe-park-async/{}/", task.id());
+    let entries = store.list(prefix.as_bytes()).map_err(|e| e.to_string())?;
+    let mut result_key = intent.clone();
+    result_key.extend_from_slice(b"/result");
+    if entries.len() != 3
+        || entries
+            .iter()
+            .any(|(key, _)| key != &intent && key != &marker && key != &result_key)
+    {
+        return Err("ambiguous no-dispatch evidence".into());
+    }
+    let saved = store
+        .get(&intent)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing no-dispatch intent")?;
+    let running: Task =
+        serde_json::from_slice(&saved.value).map_err(|_| "invalid no-dispatch intent")?;
+    if running.id() != task.id()
+        || running.attempt_id() != Some(attempt)
+        || running.owner() != task.owner()
+        || running.kind() != task.kind()
+        || running.definition_version() != task.definition_version()
+        || running.input() != task.input()
+        || running.replay_safe()
+        || running.abort_requested()
+        || running.restarts() != 0
+        || running.checkpoint().phase != "initial"
+        || running.state() != &TaskState::Running
+    {
+        return Err("no-dispatch intent mismatch".into());
+    }
+    let saved_result = store
+        .get(&result_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing no-dispatch result")?;
+    let step: DurableToolStep =
+        serde_json::from_slice(&saved_result.value).map_err(|_| "invalid no-dispatch result")?;
+    if step != DurableToolStep::Complete(outcome.clone()) {
+        return Err("no-dispatch result evidence mismatch".into());
+    }
+    Ok(true)
+}
+
 pub(crate) fn prepare_park_evidence(
     store: &Store,
     task: &Task,

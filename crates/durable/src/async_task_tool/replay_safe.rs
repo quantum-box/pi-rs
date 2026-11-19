@@ -879,6 +879,9 @@ impl DurableTaskHost for Host<'_, '_> {
                 }
                 TaskState::Succeeded(value) => {
                     let result: Outcome = serde_json::from_value(value.clone()).map_err(|_| "invalid unsafe child result")?;
+                    if outcome.is_none() && docs.unsafe_child_no_dispatch(&task, &result)? {
+                        return Ok(Some(AsyncTaskResult::Outcome(result)));
+                    }
                     let raw = outcome.as_ref().ok_or("unsafe child result lacks receipt")?;
                     let expected = if task.checkpoint().phase == "replay-safe-async-after" { docs.read_unsafe_hook_final(&task, raw)? } else { raw.clone() };
                     if expected != result { return Err("unsafe child result lacks matching final evidence".into()); }
@@ -1916,6 +1919,11 @@ impl Handler for Executor {
         } else {
             false
         };
+        let unsafe_first = admission.is_conversation_checkpointable()
+            && saved_args.is_none()
+            && task.restarts() == 0
+            && !self.replay_safe
+            && self.hook.is_none();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1926,7 +1934,7 @@ impl Handler for Executor {
             children: &self.children,
             started: Mutex::new(HashSet::new()),
         };
-        let (result, args) = runtime.block_on(async {
+        let (result, args, no_dispatch) = runtime.block_on(async {
             let args = match saved_args {
                 Some(args) => args,
                 None => tokio::select! {
@@ -1934,7 +1942,7 @@ impl Handler for Executor {
                     _ = cancellation.cancelled() => return Err("argument preparation cancelled".into()),
                     prepared = self.tool.prepare_arguments(task.input().clone()) => match prepared {
                         Ok(args) => args,
-                        Err(_) if fresh_unhooked && !cancellation.is_cancelled() => return Ok((DurableToolStep::Complete(Outcome::Failed("argument preparation failed".into())), serde_json::Value::Null)),
+                        Err(_) if !cancellation.is_cancelled() && (fresh_unhooked || (unsafe_first && host.docs.lock().map_err(|e| e.to_string())?.prove_first_checkpointable_intent(&intent)?)) => return Ok((DurableToolStep::Complete(Outcome::Failed("argument preparation failed".into())), serde_json::Value::Null, unsafe_first)),
                         Err(error) => return Err(error.to_string()),
                     },
                 },
@@ -1945,8 +1953,8 @@ impl Handler for Executor {
                 || !jsonschema::validator_for(&self.tool.spec().parameters)
                     .is_ok_and(|v| v.is_valid(&args))
             {
-                if fresh_unhooked {
-                    return Ok((DurableToolStep::Complete(Outcome::Failed("normalized arguments do not match schema".into())), serde_json::Value::Null));
+                if fresh_unhooked || (unsafe_first && host.docs.lock().map_err(|e| e.to_string())?.prove_first_checkpointable_intent(&intent)?) {
+                    return Ok((DurableToolStep::Complete(Outcome::Failed("normalized arguments do not match schema".into())), serde_json::Value::Null, unsafe_first));
                 }
                 return Err("normalized arguments do not match schema".into());
             }
@@ -1962,9 +1970,9 @@ impl Handler for Executor {
                     &host,
                 )
                 .await?;
-            Ok::<_, String>((result, args))
+            Ok::<_, String>((result, args, false))
         })?;
-        if !self.replay_safe {
+        if !self.replay_safe && !no_dispatch {
             admission.capture_unsafe_durable_outcome(&intent, &result, &args)?;
             #[cfg(test)]
             {
@@ -2047,6 +2055,12 @@ impl Handler for Executor {
             }
         };
         let docs = host.docs.into_inner().map_err(|e| e.to_string())?;
+        if no_dispatch {
+            let DurableToolStep::Complete(outcome) = &result else {
+                return Err("invalid no-dispatch result".into());
+            };
+            docs.stage_unsafe_no_dispatch(&intent, outcome)?;
+        }
         docs.stage_checkpointable_durable_result(intent, &result)?;
         if !self.replay_safe
             && let Step::Wait {
@@ -2098,5 +2112,208 @@ mod evidence_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod conversation_receipt_kill_tests {
+    use super::*;
+    use futures_util::{StreamExt, stream};
+    use pi_rs_core::{
+        Error, Message, Model, ModelEvent, ModelRequest, ModelStream, ToolCall, ToolSpec,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct ModelStub;
+    #[async_trait::async_trait]
+    impl Model for ModelStub {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            let done = request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool { .. }));
+            Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                calls: if done {
+                    vec![]
+                } else {
+                    vec![ToolCall {
+                        id: "call".into(),
+                        name: "root".into(),
+                        arguments: "{}".into(),
+                    }]
+                },
+                usage: None,
+            })])
+            .boxed())
+        }
+    }
+    struct Root(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Root {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "root".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for Root {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "external-result".into(),
+            )))
+        }
+    }
+    fn setup(
+        calls: Arc<AtomicUsize>,
+    ) -> (crate::runtime::Options, crate::task_scheduler::Registry) {
+        let mut registry = crate::task_scheduler::Registry::default();
+        let adapter = crate::async_task_tool::register_conversation_unsafe_durable_tool(&mut registry, Arc::new(Root(calls)), "receipt-boundary", 1, vec![], crate::async_task_tool::UnsafeDurableAuthorization::interruption_requires_reconciliation()).unwrap();
+        (
+            crate::runtime::Options {
+                model: Arc::new(ModelStub),
+                tools: vec![adapter.register()],
+                restart_limit: 4,
+                max_turns: 4,
+                uncertain_policy: crate::recovery::UncertainPolicy::RequireReconciliation,
+            },
+            registry,
+        )
+    }
+    #[tokio::test]
+    async fn worker() {
+        let Some(dir) = std::env::var_os("PI_TEST_UNSAFE_CONV_RECEIPT_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let (options, registry) = setup(Arc::new(AtomicUsize::new(0)));
+        let mut scheduler = crate::runtime::Scheduler::open(dir.join("db"), options).unwrap();
+        let _driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(crate::runtime::Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        std::fs::write(dir.join("conversation"), id.to_string()).unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        std::future::pending::<()>().await;
+    }
+    #[tokio::test]
+    async fn kill_after_unsafe_receipt_preserves_evidence_without_replay() {
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut child = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "async_task_tool::replay_safe::conversation_receipt_kill_tests::worker",
+                ])
+                .env("PI_TEST_UNSAFE_CONV_RECEIPT_DIR", dir.path())
+                .env("PI_TEST_REPLAY_SAFE_DIR", dir.path())
+                .env("PI_TEST_REPLAY_SAFE_CUT", "result")
+                .spawn()
+                .unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !dir.path().join("cut").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let task_id: uuid::Uuid = std::fs::read_to_string(dir.path().join("cut"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let id: uuid::Uuid = std::fs::read_to_string(dir.path().join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let receipts =
+            crate::async_task_tool::read_unsafe_durable_receipts(&store, task_id).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].outcome,
+            Outcome::Succeeded("external-result".into())
+        );
+        let task = crate::task_store::TaskStore::new(&store)
+            .load(task_id)
+            .unwrap()
+            .unwrap()
+            .task;
+        assert!(matches!(task.state(), crate::task::TaskState::Running));
+        drop(store);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (options, registry) = setup(calls.clone());
+        let mut scheduler = crate::runtime::Scheduler::open(&path, options).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let store = durable_store::Store::open(&path).unwrap();
+                let task = crate::task_store::TaskStore::new(&store)
+                    .load(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .task;
+                if task.is_terminal() {
+                    assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+                    assert_eq!(
+                        crate::async_task_tool::read_unsafe_durable_receipts(&store, task_id)
+                            .unwrap(),
+                        receipts
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            scheduler
+                .blocked(id)
+                .unwrap()
+                .is_some_and(|(_, reason)| reason.contains("reconciliation"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !scheduler
+                .conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool { .. }))
+        );
+        let _ = driver.shutdown_with_pending();
+        let _ = scheduler.shutdown().await;
     }
 }
