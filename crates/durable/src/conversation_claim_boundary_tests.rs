@@ -233,6 +233,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         return;
     }
     let is_reentrant = case == "reentrant";
+    let is_late_receipt = case == "late_receipt";
     let reentrant_handle = identity_handle.clone();
     let mutation_path = path.clone();
     let reached = Arc::new(AtomicBool::new(false));
@@ -260,6 +261,45 @@ async fn exercise_conversation_park_claim(case: &str) {
             return;
         }
         let writer = durable_store::Store::open(&mutation_path).unwrap();
+        if case == "late_receipt" {
+            let prefix = format!("durable/unsafe-park-async/{root_id}/");
+            let (intent_key, intent_entry) = writer
+                .list(prefix.as_bytes())
+                .unwrap()
+                .into_iter()
+                .find(|(key, _)| key.ends_with(b"/intent"))
+                .expect("park intent");
+            let intent: pi_rs_durable::task::Task =
+                serde_json::from_slice(&intent_entry.value).unwrap();
+            let attempt = serde_json::to_value(&intent).unwrap()["attempt_id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap();
+            let mut key = intent_key;
+            key.extend_from_slice(b"/receipt");
+            let receipt = pi_rs_durable::async_task_tool::UnsafeDurableReceipt {
+                task_id: root_id,
+                attempt_id: attempt,
+                outcome: Outcome::Pending {
+                    reference: "remote-job".into(),
+                },
+            };
+            writer
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&receipt).unwrap(),
+                    }],
+                )
+                .unwrap();
+            reached_hook.store(true, Ordering::SeqCst);
+            return;
+        }
         let key = if case == "owner" {
             crate::task_store::key(root_id)
         } else {
@@ -310,13 +350,25 @@ async fn exercise_conversation_park_claim(case: &str) {
     .await
     .unwrap();
     assert_eq!(store.get(key.as_bytes()).unwrap().is_some(), is_reentrant);
+    if is_late_receipt {
+        let receipts =
+            pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, root_id).unwrap();
+        assert!(receipts.iter().any(|receipt| matches!(&receipt.outcome, Outcome::Pending { reference } if reference == "remote-job")));
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let _ = driver.shutdown_with_pending().unwrap();
 }
 
 #[tokio::test]
 async fn conversation_claim_rejects_owner_identity_and_abort_races() {
-    for case in ["owner", "identity", "abort", "reentrant", "mismatch"] {
+    for case in [
+        "owner",
+        "identity",
+        "abort",
+        "reentrant",
+        "mismatch",
+        "late_receipt",
+    ] {
         exercise_conversation_park_claim(case).await;
     }
 }
