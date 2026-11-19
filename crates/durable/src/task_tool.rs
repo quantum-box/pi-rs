@@ -98,6 +98,9 @@ impl TaskTool {
     pub(crate) fn is_direct(&self) -> bool {
         self.direct_binding.is_some()
     }
+    pub(crate) fn is_checkpointable(&self) -> bool {
+        self.deferred_arguments
+    }
     /// Register this exact adapter. The same handler must be registered with the task driver.
     pub fn register(self: &Arc<Self>) -> crate::runtime::RegisteredTool {
         let tool: Arc<dyn Tool> = self.clone();
@@ -324,6 +327,11 @@ impl Tool for TaskTool {
         self.spec.clone()
     }
     async fn invoke(&self, _: Value, context: ToolContext) -> Outcome {
+        if self.deferred_arguments {
+            return Outcome::Skipped(
+                "conversation checkpointable tool execution is not enabled".into(),
+            );
+        }
         if self.is_direct() {
             return Outcome::Skipped("foreground task requires direct durable admission".into());
         }

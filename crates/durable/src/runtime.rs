@@ -3152,6 +3152,11 @@ pub struct Harness {
 thread_local! {
     static TASK_RESULT_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
+struct TaskResultFence {
+    task: crate::task::Task,
+    check: Check,
+}
+
 /// A snapshot of all store changes for one or more conversation saves.
 /// Prepared checks can become stale; a conflict requires preparing the entire batch again.
 pub(crate) struct PreparedConversationSave {
@@ -5601,19 +5606,63 @@ impl Harness {
         &mut self,
         state: &Conversation,
         expected: Expected,
-        check: Check,
+        mut fence: TaskResultFence,
     ) -> Result<(), Error> {
-        #[cfg(test)]
-        TASK_RESULT_BEFORE_COMMIT.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
-                hook();
+        for _ in 0..8 {
+            #[cfg(test)]
+            TASK_RESULT_BEFORE_COMMIT.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            let batch = crate::task_store::OwnedBatch {
+                checks: vec![fence.check.clone()],
+                mutations: vec![],
+            };
+            match self.save_composed_locked(state, expected.clone(), None, &[], &[], Some(&batch)) {
+                Err(Error::Storage(durable_store::Error::Conflict { key }))
+                    if key == fence.check.key =>
+                {
+                    // Do not reuse an outcome if any task field changed. Recheck
+                    // the persisted conversation and selected adapter as well.
+                    let (conversation, version) = self.load(state.id)?;
+                    if expected != Expected::Version(version) {
+                        return Err(Error::Invalid(
+                            "conversation changed during task result retry".into(),
+                        ));
+                    }
+                    let Phase::TaskPending {
+                        ref calls,
+                        index,
+                        operation_id,
+                        ref arguments,
+                        task,
+                        ref identity,
+                        ..
+                    } = conversation.phase
+                    else {
+                        return Err(Error::Invalid("task result binding changed".into()));
+                    };
+                    self.validate_pending_task_identity(&conversation, calls, index, identity)?;
+                    let identity = identity
+                        .as_ref()
+                        .ok_or_else(|| Error::Invalid("task adapter identity missing".into()))?;
+                    let (_, current) = self
+                        .task_tool_result(conversation.id, operation_id, task, arguments, identity)?
+                        .ok_or_else(|| Error::Invalid("task result no longer terminal".into()))?;
+                    if current.task != fence.task {
+                        return Err(Error::Invalid(
+                            "task changed during result settlement".into(),
+                        ));
+                    }
+                    fence = current;
+                }
+                result => return result,
             }
-        });
-        let batch = crate::task_store::OwnedBatch {
-            checks: vec![check],
-            mutations: vec![],
-        };
-        self.save_composed_locked(state, expected, None, &[], &[], Some(&batch))
+        }
+        Err(Error::Invalid(
+            "task result changed repeatedly during settlement".into(),
+        ))
     }
     fn save_with_wake(
         &mut self,
@@ -11075,6 +11124,38 @@ impl Harness {
         &self,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<(), Error> {
+        // A checkpointable registration is one definition shared by the
+        // conversation tool list and the driver, not merely a matching name.
+        for (identity, handler, valid) in registry.conversation_checkpointable() {
+            let matches = self
+                .tools
+                .values()
+                .filter_map(|registered| crate::task_tool::lookup(&registered.tool))
+                .any(|adapter| {
+                    adapter.identity().as_ref() == Some(identity)
+                        && registry.matches_task_tool(identity, &adapter.handler())
+                        && Arc::ptr_eq(&adapter.handler(), handler)
+                });
+            if !valid || !matches {
+                return Err(Error::Invalid(
+                    "conversation checkpointable tool registration mismatch".into(),
+                ));
+            }
+        }
+        for registered in self.tools.values() {
+            if let Some(adapter) = crate::task_tool::lookup(&registered.tool)
+                && adapter.is_checkpointable()
+            {
+                let identity = adapter
+                    .identity()
+                    .ok_or_else(|| Error::Invalid("checkpointable identity missing".into()))?;
+                if !registry.matches_conversation_checkpointable(&identity, &adapter.handler()) {
+                    return Err(Error::Invalid(
+                        "checkpointable driver registration missing or changed".into(),
+                    ));
+                }
+            }
+        }
         for id in self.conversations()? {
             let (c, _) = self.load(id)?;
             if let Phase::TaskPending {
@@ -14488,7 +14569,7 @@ impl Harness {
         task: Uuid,
         arguments: &serde_json::Value,
         identity: &crate::task_tool::Identity,
-    ) -> Result<Option<(Outcome, Check)>, Error> {
+    ) -> Result<Option<(Outcome, TaskResultFence)>, Error> {
         let child = crate::task_store::TaskStore::new(self.owner.store())
             .load(task)
             .map_err(|e| Error::Invalid(format!("task load: {e}")))?
@@ -14531,9 +14612,12 @@ impl Harness {
         Ok(outcome.map(|outcome| {
             (
                 outcome,
-                Check {
-                    key: crate::task_store::key(task),
-                    expected: Expected::Version(child.version),
+                TaskResultFence {
+                    task: child.task.clone(),
+                    check: Check {
+                        key: crate::task_store::key(task),
+                        expected: Expected::Version(child.version),
+                    },
                 },
             )
         }))
@@ -16912,6 +16996,17 @@ impl Harness {
                     calls,
                     index,
                 } => {
+                    // Until the conversation attempt fences are installed, do
+                    // not run before/after hooks or prepare this candidate.
+                    if let Some(call) = calls.get(index)
+                        && let Some(registered) = self.resolved_tools(&c)?.get(&call.name)
+                        && crate::task_tool::lookup(&registered.tool)
+                            .is_some_and(|adapter| adapter.is_checkpointable())
+                    {
+                        return Err(Error::Invalid(
+                            "conversation checkpointable tool execution is not enabled".into(),
+                        ));
+                    }
                     if index >= calls.len() {
                         c.phase = Phase::AfterTools {
                             turns,
@@ -17155,6 +17250,13 @@ impl Harness {
                         self.save(&c, Expected::Version(version))?;
                         continue;
                     };
+                    if crate::task_tool::lookup(&reg.tool)
+                        .is_some_and(|adapter| adapter.is_checkpointable())
+                    {
+                        return Err(Error::Invalid(
+                            "conversation checkpointable tool execution is not enabled".into(),
+                        ));
+                    }
                     if reg.replay == ReplayPolicy::Unsafe {
                         match crate::nested_identity::execution_lease(&reg.tool) {
                             Err(()) => {
@@ -30050,6 +30152,232 @@ mod scheduler_tests {
             "must not commit"
         );
         writer.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conversation_task_result_retries_version_only_conflict_in_normal_and_abort() {
+        use crate::task::Task;
+        use crate::task_scheduler::{Handler, Step};
+        use crate::task_tool::TaskTool;
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(GatedModel {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                active: AtomicUsize::new(0),
+                maximum: AtomicUsize::new(0),
+            });
+            let handler: Arc<dyn Handler> =
+                Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!("done"))));
+            let adapter = Arc::new(TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "job".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                "task",
+                true,
+                1,
+                handler,
+            ));
+            let mut opts = options(model);
+            opts.tools = vec![adapter.register()];
+            let mut h = Harness::open_paused(&path, opts).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            let op = Uuid::new_v4();
+            let task = adapter.task(id, op, serde_json::json!({}), 5).unwrap();
+            c.abort_requested = abort;
+            c.phase = Phase::TaskPending {
+                turns: 0,
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "job".into(),
+                    arguments: "{}".into(),
+                }],
+                index: 0,
+                operation_id: op,
+                arguments: serde_json::json!({}),
+                task: op,
+                identity: adapter.identity(),
+            };
+            h.save_composed(&c, Expected::Version(version), None, &[task])
+                .unwrap();
+            let tasks = crate::task_store::TaskStore::new(h.owner.store());
+            let mut stored = tasks.load(op).unwrap().unwrap();
+            stored.task.start().unwrap();
+            stored.task.succeed(serde_json::json!("done")).unwrap();
+            tasks
+                .save(&[crate::task_store::Save::Update(&stored)])
+                .unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let writer_barrier = barrier.clone();
+            let writer = std::thread::spawn(move || {
+                let store = durable_store::Store::open(path).unwrap();
+                let tasks = crate::task_store::TaskStore::new(&store);
+                writer_barrier.wait();
+                let current = tasks.load(op).unwrap().unwrap();
+                tasks
+                    .save(&[crate::task_store::Save::Update(&current)])
+                    .unwrap();
+                writer_barrier.wait();
+            });
+            TASK_RESULT_BEFORE_COMMIT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    barrier.wait();
+                    barrier.wait();
+                }))
+            });
+            let cancel = CancellationToken::new();
+            if abort {
+                let (c, version) = h.load(id).unwrap();
+                assert!(h.settle_abort(c, version, &cancel, None).await.unwrap());
+            } else {
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(100), h.drive(id, &cancel)).await;
+            }
+            writer.join().unwrap();
+            let state = h.conversation(id).unwrap();
+            assert!(
+                !matches!(state.phase, Phase::TaskPending { .. }),
+                "abort={abort}"
+            );
+            assert!(!h.failed, "abort={abort}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unconnected_checkpointable_call_stops_before_preparation_or_admission() {
+        use crate::task::Task;
+        use crate::task_scheduler::{Handler, Step};
+        use crate::task_tool::TaskTool;
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let invoked = calls.clone();
+        let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+            invoked.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(serde_json::json!(null)))
+        });
+        let adapter = Arc::new(
+            TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "job".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                "task",
+                true,
+                1,
+                handler,
+            )
+            .with_deferred_arguments(),
+        );
+        let mut opts = options(model);
+        opts.tools = vec![adapter.register()];
+        let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        c.phase = Phase::Tools {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+        };
+        h.save(&c, Expected::Version(version)).unwrap();
+        assert!(h.drive(id, &CancellationToken::new()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::task_store::TaskStore::new(h.owner.store())
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn checkpointable_pending_registration_is_checked_after_reopen() {
+        use crate::task::Task;
+        use crate::task_scheduler::{Handler, Registry, Step};
+        use crate::task_tool::TaskTool;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let build = |version, description: &str| {
+            let handler: Arc<dyn Handler> =
+                Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!("done"))));
+            Arc::new(
+                TaskTool::new(
+                    pi_rs_core::ToolSpec {
+                        name: "job".into(),
+                        description: description.into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                    "checkpointable-test",
+                    true,
+                    version,
+                    handler,
+                )
+                .with_deferred_arguments(),
+            )
+        };
+        let original = build(1, "original");
+        let mut opts = options(model.clone());
+        opts.tools = vec![original.register()];
+        let mut h = Harness::open_paused(&path, opts).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let op = Uuid::new_v4();
+        let task = original.task(id, op, serde_json::json!({}), 5).unwrap();
+        c.phase = Phase::TaskPending {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id: op,
+            arguments: serde_json::json!({}),
+            task: op,
+            identity: original.identity(),
+        };
+        h.save_composed(&c, Expected::Version(version), None, &[task])
+            .unwrap();
+        drop(h);
+        for (version, description, accepted) in [
+            (1, "original", true),
+            (2, "original", false),
+            (1, "changed", false),
+        ] {
+            let adapter = build(version, description);
+            let mut registry = Registry::default();
+            registry
+                .register_conversation_checkpointable(&adapter, Arc::new(|| true))
+                .unwrap();
+            let mut opts = options(model.clone());
+            opts.tools = vec![adapter.register()];
+            let h = Harness::open_paused(&path, opts).unwrap();
+            assert_eq!(
+                h.validate_task_tool_registry(&registry).is_ok(),
+                accepted,
+                "{version} {description}"
+            );
+        }
     }
 
     #[test]

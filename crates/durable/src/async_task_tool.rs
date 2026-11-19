@@ -15,6 +15,21 @@ pub use replay_safe::{
 };
 pub use unsafe_park_proof::{UnsafeDurableParkEvidence, UnsafeDurableReceipt};
 
+/// Prepare matching conversation and driver registrations for an explicitly
+/// replay-safe checkpointable Tool with no hooks. Add the returned adapter's
+/// `register()` result to the Harness tool list and pass `registry` to the
+/// task driver. Conversation execution is not yet enabled and fails closed.
+pub fn register_conversation_replay_safe_durable_tool(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    _authorization: ReplaySafeAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    replay_safe::register_conversation_candidate(registry, tool, implementation, version, children)
+}
+
 /// Read joined unsafe outcomes retained even if abort won settlement. These
 /// records are reconciliation evidence and do not authorize re-execution.
 pub fn read_unsafe_durable_receipts(

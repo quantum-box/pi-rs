@@ -292,6 +292,68 @@ fn register_with_policy(
     ))
 }
 
+/// Build an unhooked replay-safe definition before opening a conversation
+/// harness. This only creates matching registrations; conversation execution
+/// remains disabled until its attempt and ownership fences are connected.
+pub(super) fn register_conversation_candidate(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<TaskTool>>,
+) -> Result<Arc<TaskTool>, String> {
+    let identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
+    jsonschema::validator_for(&tool.spec().parameters).map_err(|_| "invalid tool schema")?;
+    let mut names = HashMap::new();
+    let mut child_identities = Vec::new();
+    for child in children {
+        let id = child.identity().ok_or("invalid child identity")?;
+        if child.is_direct()
+            || !id.replay_safe
+            || !registry.matches_task_tool(&id, &child.handler())
+        {
+            return Err("child must be a registered replay-safe task tool".into());
+        }
+        let name = child.spec().name;
+        if name.is_empty() || names.insert(name.clone(), child).is_some() {
+            return Err("duplicate or empty child name".into());
+        }
+        child_identities.push((name, id));
+    }
+    child_identities.sort_by(|a, b| a.0.cmp(&b.0));
+    let encoded =
+        serde_json::to_vec(&(1u32, &identity, &child_identities)).map_err(|e| e.to_string())?;
+    if encoded.len() > 65536 {
+        return Err("definition identity too large".into());
+    }
+    let kind = format!("pi-rs.replay-safe-async.v1.{:x}", Sha256::digest(encoded));
+    let spec = tool.spec();
+    if spec != identity.spec {
+        return Err("tool specification changed during registration".into());
+    }
+    let validate_tool = tool.clone();
+    let validate_identity = identity.clone();
+    let validate_implementation = implementation.to_owned();
+    let validate = Arc::new(move || {
+        validate_identity.matches(validate_tool.as_ref(), &validate_implementation, version)
+    });
+    let handler: Arc<dyn Handler> = Arc::new(Executor {
+        tool,
+        identity,
+        implementation: implementation.into(),
+        version,
+        children: names,
+        hook: None,
+        replay_safe: true,
+        block_results: false,
+        unavailable: false,
+    });
+    let adapter =
+        Arc::new(TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments());
+    registry.register_conversation_checkpointable(&adapter, validate)?;
+    Ok(adapter)
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ParkCheckpoint {

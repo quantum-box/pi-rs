@@ -573,6 +573,10 @@ struct Registration {
     abort: Option<Arc<dyn Handler>>,
     receipt_capture: Option<Arc<ReceiptCapture>>,
     cancellable_durable_async: bool,
+    conversation_checkpointable: Option<(
+        crate::task_tool::Identity,
+        Arc<dyn Fn() -> bool + Send + Sync>,
+    )>,
     restart_after: bool,
     checkpointable_hooks: bool,
 }
@@ -591,6 +595,52 @@ impl Registry {
             r.version == identity.definition_version
                 && r.replay_safe == identity.replay_safe
                 && Arc::ptr_eq(&r.handler, handler)
+        })
+    }
+    pub(crate) fn register_conversation_checkpointable(
+        &mut self,
+        adapter: &Arc<crate::task_tool::TaskTool>,
+        validate: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String> {
+        let identity = adapter
+            .identity()
+            .ok_or("invalid checkpointable identity")?;
+        if !identity.replay_safe
+            || !self.register_shared_versioned(
+                identity.kind.clone(),
+                identity.definition_version,
+                true,
+                adapter.handler(),
+            )
+        {
+            return Err("checkpointable kind already registered or invalid".into());
+        }
+        let entry = self.entries.get_mut(&identity.kind).expect("inserted");
+        entry.cancellable_durable_async = true;
+        entry.conversation_checkpointable = Some((identity, validate));
+        Ok(())
+    }
+    pub(crate) fn conversation_checkpointable(
+        &self,
+    ) -> impl Iterator<Item = (&crate::task_tool::Identity, &Arc<dyn Handler>, bool)> {
+        self.entries.values().filter_map(|entry| {
+            entry
+                .conversation_checkpointable
+                .as_ref()
+                .map(|(identity, validate)| (identity, &entry.handler, validate()))
+        })
+    }
+    pub(crate) fn matches_conversation_checkpointable(
+        &self,
+        identity: &crate::task_tool::Identity,
+        handler: &Arc<dyn Handler>,
+    ) -> bool {
+        self.entries.get(&identity.kind).is_some_and(|entry| {
+            entry
+                .conversation_checkpointable
+                .as_ref()
+                .is_some_and(|(saved, validate)| saved == identity && validate())
+                && self.matches_task_tool(identity, handler)
         })
     }
     pub fn register_shared(
@@ -624,6 +674,7 @@ impl Registry {
                     abort: None,
                     receipt_capture: None,
                     cancellable_durable_async: false,
+                    conversation_checkpointable: None,
                     restart_after: false,
                     checkpointable_hooks: false,
                 });
@@ -650,6 +701,7 @@ impl Registry {
                     abort: None,
                     receipt_capture: None,
                     cancellable_durable_async: false,
+                    conversation_checkpointable: None,
                     restart_after: false,
                     checkpointable_hooks: false,
                 });
