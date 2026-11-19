@@ -65,8 +65,11 @@ pub trait Handler: Send + Sync {
     /// Handlers without the explicit host identity contract fail closed.
     fn woken_cleanup_identity_lease(
         &self,
-    ) -> Result<tokio::sync::OwnedRwLockReadGuard<Option<String>>, String> {
-        Err("woken cleanup identity lease unavailable".into())
+    ) -> Result<
+        tokio::sync::OwnedRwLockReadGuard<Option<String>>,
+        crate::nested_identity::LeaseFailure,
+    > {
+        Err(crate::nested_identity::LeaseFailure::Mismatch)
     }
     /// Abort-only reservation. The default never grants ordinary admission or memo access.
     fn run_abort_with_admission(
@@ -1168,6 +1171,40 @@ fn woken_recovery_hooks() -> &'static BoundaryHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn woken_busy_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_woken_identity_busy_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    woken_busy_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn report_woken_identity_busy(id: Uuid) {
+    let hook = woken_busy_hooks().lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+#[cfg(test)]
+fn woken_reserved_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_woken_abort_reservation_for_test(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    woken_reserved_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 pub(crate) fn before_woken_recovery_commit_for_test(
     id: Uuid,
     hook: impl FnOnce() + Send + 'static,
@@ -1196,6 +1233,8 @@ pub struct DetachedInvocation {
     unhooked_cancellation: Option<pi_rs_core::CancellationToken>,
     sealed_registration: bool,
     abort_definition: Option<Arc<()>>,
+    // Acquired before a woken abort reservation, held until its callback joins.
+    woken_cleanup_lease: Option<crate::nested_identity::IdentityLease>,
 }
 
 #[derive(Clone)]
@@ -4149,6 +4188,7 @@ impl DetachedInvocation {
             unhooked_cancellation,
             sealed_registration: _,
             abort_definition,
+            woken_cleanup_lease: _woken_cleanup_lease,
         } = self;
         let capture_enabled =
             receipt_capture.is_some() && intent.is_some() && (!after_enabled || after_success);
@@ -4659,6 +4699,7 @@ impl Scheduler {
             abort,
             sealed_registration,
             abort_definition,
+            woken_cleanup_lease: None,
             validator: self.validator.as_ref().map(|harness| harness.worker()),
             definitions: self.wake_reader.definitions.clone(),
             activity: self.activity.clone(),
@@ -7243,8 +7284,15 @@ impl Scheduler {
                     {
                         continue;
                     }
-                    let Ok(_definition_lease) = reg.handler.woken_cleanup_identity_lease() else {
-                        continue;
+                    let _definition_lease = match reg.handler.woken_cleanup_identity_lease() {
+                        Ok(lease) => lease,
+                        Err(crate::nested_identity::LeaseFailure::Busy) => {
+                            #[cfg(test)]
+                            report_woken_identity_busy(item.task.id());
+                            self.deferred_recovery.insert(item.task.id());
+                            continue;
+                        }
+                        Err(crate::nested_identity::LeaseFailure::Mismatch) => continue,
                     };
                     let owner = self.owner();
                     let boundary = owner
@@ -8434,11 +8482,34 @@ impl Scheduler {
                 }
             }
             if !pending {
-                abortable = Some(snapshot);
+                // Do not reserve a worker or start a new attempt while a host
+                // update holds the woken cleanup identity. Retain the lease
+                // across reservation and invocation so there is no check/use gap.
+                let lease =
+                    if snapshot.task.kind().is_some_and(|kind| {
+                        kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
+                    }) {
+                        match self
+                            .registered(&snapshot.task)
+                            .ok()
+                            .map(|reg| reg.handler.woken_cleanup_identity_lease())
+                        {
+                            Some(Ok(lease)) => Some(lease),
+                            Some(Err(crate::nested_identity::LeaseFailure::Busy)) => {
+                                #[cfg(test)]
+                                report_woken_identity_busy(snapshot.task.id());
+                                continue;
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                abortable = Some((snapshot, lease));
                 break;
             }
         }
-        if let Some(snapshot) = abortable {
+        if let Some((snapshot, woken_cleanup_lease)) = abortable {
             self.poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
             if snapshot.task.holds_restart_cleanup() {
@@ -8597,7 +8668,16 @@ impl Scheduler {
                     .ts()
                     .load(snapshot.task.id())?
                     .ok_or(Error::Ownership)?;
-                let invocation = self.make_invocation(running, abort, true)?;
+                let mut invocation = self.make_invocation(running, abort, true)?;
+                invocation.woken_cleanup_lease = woken_cleanup_lease;
+                #[cfg(test)]
+                if let Some(hook) = woken_reserved_hooks()
+                    .lock()
+                    .unwrap()
+                    .remove(&snapshot.task.id())
+                {
+                    hook();
+                }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
                 drop(gate);

@@ -86,7 +86,7 @@ pub(crate) fn lease(
     (guard.as_deref() == Some(expected)).then_some(guard)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LeaseFailure {
+pub enum LeaseFailure {
     Busy,
     Mismatch,
 }

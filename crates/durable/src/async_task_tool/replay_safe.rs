@@ -1396,19 +1396,21 @@ impl Handler for Executor {
     }
     fn woken_cleanup_identity_lease(
         &self,
-    ) -> Result<tokio::sync::OwnedRwLockReadGuard<Option<String>>, String> {
+    ) -> Result<
+        tokio::sync::OwnedRwLockReadGuard<Option<String>>,
+        crate::nested_identity::LeaseFailure,
+    > {
         let expected = self
             .woken_identity
             .as_deref()
-            .ok_or("woken identity unavailable")?;
+            .ok_or(crate::nested_identity::LeaseFailure::Mismatch)?;
         let tool: Arc<dyn Tool> = self.tool.clone();
-        let lease = crate::nested_identity::checked_lease(&tool, expected)
-            .map_err(|_| "woken cancel identity unavailable; reconciliation required")?;
+        let lease = crate::nested_identity::checked_lease(&tool, expected)?;
         if !self
             .identity
             .matches(self.tool.as_ref(), &self.implementation, self.version)
         {
-            return Err("woken cancel tool identity changed".into());
+            return Err(crate::nested_identity::LeaseFailure::Mismatch);
         }
         Ok(lease)
     }

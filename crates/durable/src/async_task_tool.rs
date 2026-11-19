@@ -1297,7 +1297,9 @@ impl StandaloneBeforeHookHost {
     /// implementation, configuration and tenant. All changes to either must
     /// go through the returned `IdentityHandle::update`; bypassing that host
     /// contract cannot be fenced. Updates are nonblocking and return busy while
-    /// cleanup holds the lease. The 30-second timeout cannot preempt blocking
+    /// cleanup holds the lease. Busy recovery and pre-dispatch cleanup are
+    /// deferred and retried; an identity mismatch remains fail-closed.
+    /// The 30-second timeout cannot preempt blocking
     /// callback code, so a noncooperative callback can retain it longer.
     /// This contract has a distinct definition identity from earlier versions;
     /// older in-flight tasks require reconciliation or their original host.
@@ -14757,6 +14759,19 @@ mod tests {
         let id = host
             .start_unsafe_durable_root(&tool, json!({"token":"prepared"}), 3)
             .unwrap();
+        let reservation_blocked = Arc::new(AtomicBool::new(false));
+        let observed_reservation = reservation_blocked.clone();
+        let reservation_handle = handle.clone();
+        crate::task_scheduler::after_woken_abort_reservation_for_test(id, move || {
+            use futures_util::FutureExt;
+            let result = reservation_handle
+                .update(Some("changed".into()), || {
+                    panic!("changed after reservation")
+                })
+                .now_or_never()
+                .expect("update must not wait");
+            observed_reservation.store(result.is_err(), Ordering::SeqCst);
+        });
         let dispatch_blocked = Arc::new(AtomicBool::new(false));
         let observed = dispatch_blocked.clone();
         let dispatch_handle = handle.clone();
@@ -14784,6 +14799,7 @@ mod tests {
         wait_file(&root.join("wake-running"));
         driver.request_abort(id).unwrap();
         wait_file(&root.join("cancel-ready"));
+        assert!(reservation_blocked.load(Ordering::SeqCst));
         assert!(dispatch_blocked.load(Ordering::SeqCst));
         assert_eq!(std::fs::read(root.join("reenter-result")).unwrap(), b"busy");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -15287,6 +15303,165 @@ mod tests {
             .lock()
             .unwrap()
             .remove(root);
+    }
+    // Hold the host's update in progress without changing its identity. The
+    // rendezvous ensures the driver observes an actual write-lease conflict.
+    fn hold_woken_identity_update(
+        handle: crate::nested_identity::IdentityHandle,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime
+                .block_on(handle.update(Some("test-woken-cancel-v1".into()), || {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                }))
+                .unwrap();
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        (release_tx, thread)
+    }
+    #[test]
+    fn woken_recovery_busy_is_retried_by_driver_after_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for marker in [
+            "woken-case",
+            "any-case",
+            "capture-identity-handle",
+            "require-child-aborted",
+        ] {
+            std::fs::write(root.join(marker), b"yes").unwrap();
+        }
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        std::fs::write(root.join("separate-identity-db"), b"yes").unwrap();
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let registry = host.into_scheduler_for_test().registry_for_test();
+        let handle = WOKEN_TEST_IDENTITIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap();
+        let (release, update) = hold_woken_identity_update(handle);
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        crate::task_scheduler::on_woken_identity_busy_for_test(id, move || {
+            busy_tx.send(()).unwrap();
+        });
+        let scheduler = crate::task_scheduler::Scheduler::open(root.join("db"), registry).unwrap();
+        busy_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert_eq!(
+            driver.get(id).unwrap().unwrap().state(),
+            &crate::task::TaskState::Running
+        );
+        assert!(!root.join("cancel-count").exists());
+        release.send(()).unwrap();
+        update.join().unwrap();
+        assert!(
+            matches!(wait_terminal(&driver, id).state(), crate::task::TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        assert!(root.join("child-aborted").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    #[test]
+    fn woken_abort_busy_after_child_cleanup_defers_without_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for marker in [
+            "woken-case",
+            "any-case",
+            "capture-identity-handle",
+            "require-child-aborted",
+        ] {
+            std::fs::write(root.join(marker), b"yes").unwrap();
+        }
+        let (host, tool) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let handle = WOKEN_TEST_IDENTITIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap();
+        let id = host
+            .start_unsafe_durable_root(&tool, json!({"token":"prepared"}), 3)
+            .unwrap();
+        let driver = host.into_driver();
+        wait_park_cancel(&driver, id);
+        let task = driver.get(id).unwrap().unwrap();
+        let child: AsyncTaskCall =
+            serde_json::from_value(task.checkpoint().data["checkpoint"]["call"].clone()).unwrap();
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                child.task_id(),
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        let (release, update) = hold_woken_identity_update(handle);
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        crate::task_scheduler::on_woken_identity_busy_for_test(id, move || {
+            busy_tx.send(()).unwrap();
+        });
+        driver.request_abort(id).unwrap();
+        busy_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(root.join("child-aborted").exists());
+        let task = driver.get(id).unwrap().unwrap();
+        assert!(task.abort_requested());
+        assert_eq!(task.state(), &crate::task::TaskState::Ready);
+        assert!(!root.join("cancel-count").exists());
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert_eq!(read_park_cancel_evidence(&store, id).unwrap(), None);
+        drop(store);
+        release.send(()).unwrap();
+        update.join().unwrap();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
     }
     struct SuppressGate;
     #[async_trait::async_trait]
