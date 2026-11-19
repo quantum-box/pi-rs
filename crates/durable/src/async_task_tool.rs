@@ -8459,6 +8459,211 @@ mod tests {
                 .is_none()
         );
     }
+    struct InterruptedUnsafeRestartChild(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for InterruptedUnsafeRestartChild {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "slow-parent".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for InterruptedUnsafeRestartChild {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("unsafe-effects"))
+                .map_err(|e| e.to_string())?;
+            writeln!(file, "effect").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            std::fs::write(self.0.join("tool-start"), b"ready").map_err(|e| e.to_string())?;
+            std::future::pending().await
+        }
+    }
+    fn restart_unsafe_child_host(
+        root: &std::path::Path,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        let mut registry = crate::extension::Registry::default();
+        registry
+            .install_identified(
+                crate::extension::Extension {
+                    name: "restart".into(),
+                    hooks: vec![Arc::new(RestartCleanupHook(root.to_owned()))],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(
+                    1,
+                    "restart-v1".into(),
+                    vec!["hook".into()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut host =
+            StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+        // Use the real unsafe registration on the same scheduler as the hook-enabled parent.
+        let child = replay_safe::register_unsafe(
+            &mut host.scheduler,
+            Arc::new(InterruptedUnsafeRestartChild(root.to_owned())),
+            "interrupted-unsafe-child-v1",
+            1,
+            vec![],
+        )
+        .unwrap();
+        let fast = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(Arc::new(AtomicUsize::new(0)))),
+                "fast-v1",
+                1,
+                vec![],
+                "fast-hook",
+                Arc::new(NoopDurableHook),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let parent = host
+            .register_replay_safe_durable_tool_with_restart_after(
+                Arc::new(RestartParentWithChild(root.to_owned())),
+                "parent-v1",
+                1,
+                vec![child, fast],
+                &registry.snapshot(),
+                &["restart".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                RestartAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        (host, parent)
+    }
+    #[test]
+    fn restart_cleanup_abort_after_receipt_preserves_unsafe_descendant_evidence() {
+        use crate::task_store::TaskStore;
+        const ENV: &str = "PI_RS_RESTART_UNSAFE_CHILD_FIXTURE";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, parent) = restart_unsafe_child_host(&root);
+            let id = host.start_replay_safe_root(&parent, json!({}), 1).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::restart_cleanup_abort_after_receipt_preserves_unsafe_descendant_evidence")
+            .env(ENV, root).spawn().unwrap();
+        wait_file(&root.join("tool-start"));
+        wait_file(&root.join("parent-woken"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = restart_unsafe_child_host(root);
+        let scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let tasks = TaskStore::new(owner.store());
+        let child = tasks
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.task.owner() == &crate::task::TaskOwner::Task(id) && !item.task.replay_safe()
+            })
+            .expect("unsafe child was not admitted")
+            .task
+            .id();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        replay_safe::after_restart_receipt(id, move || {
+            entered.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let driver = crate::task_driver::Driver::start(scheduler);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("restart receipt was not committed");
+        assert!(
+            owner
+                .store()
+                .get(format!("durable/replay-safe-async/{id}/restart-after").as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        let unsafe_task = tasks.load(child).unwrap().unwrap().task;
+        assert!(matches!(
+            unsafe_task.state(),
+            crate::task::TaskState::Failed(_) | crate::task::TaskState::Cancelled
+        ));
+        driver.request_abort(id).unwrap();
+        release.send(()).unwrap();
+        let task = wait_terminal(&driver, id);
+        assert!(
+            matches!(task.state(), crate::task::TaskState::Failed(reason) if reason == "restart limit")
+        );
+        driver.shutdown().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(read_restart_after_result(&store, id).unwrap().is_none());
+        let intents = store
+            .list(format!("durable/unsafe-park-async/{child}/").as_bytes())
+            .unwrap();
+        let intent_records: Vec<_> = intents
+            .iter()
+            .filter(|(key, _)| key.ends_with(b"/intent"))
+            .collect();
+        assert_eq!(intent_records.len(), 1);
+        let intent_task: crate::task::Task =
+            serde_json::from_slice(&intent_records[0].1.value).unwrap();
+        assert_eq!(intent_task.id(), child);
+        assert!(matches!(
+            intent_task.state(),
+            crate::task::TaskState::Running
+        ));
+        assert!(!intent_task.replay_safe());
+        assert!(
+            read_unsafe_durable_receipts(&store, child)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            read_unsafe_durable_park_evidence(&store, child)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("unsafe-effects"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("restart-hook-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
     fn known_restart_host(
         root: &std::path::Path,
     ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
