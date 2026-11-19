@@ -1573,6 +1573,165 @@ mod tests {
         assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
         drop(parent_job);
     }
+    fn released_attempt_boundary(mode: u8) {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let tool_release =
+            std::sync::Arc::new((std::sync::Mutex::new(mode == 0), std::sync::Condvar::new()));
+        let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(RealTool {
+            entered,
+            release: tool_release.clone(),
+        });
+        let identity =
+            crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let setup = Box::new(move |child| {
+            crate::task_driver::before_execute_for_test(child, move |_| {
+                reserved_tx.send(()).unwrap();
+                proceed_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            });
+            let pause = move || {
+                pause_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            };
+            if mode == 0 || mode == 3 || mode == 4 {
+                crate::task_scheduler::after_ready_for_test(child, pause);
+            } else {
+                crate::task_driver::after_execute_for_test(child, pause);
+            }
+        });
+        let (driver, parent_job, owner, parent, child) = actual_driver_fixture_with_setup(
+            &dir.path().join("db"),
+            tool,
+            None,
+            None,
+            Some(setup),
+            None,
+        );
+        reserved_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (updating_tx, updating_rx) = std::sync::mpsc::channel();
+        let (update_release_tx, update_release_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(identity.update(Some("real-backend".into()), move || {
+                    updating_tx.send(()).unwrap();
+                    update_release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }))
+                .unwrap();
+        });
+        updating_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        proceed_tx.send(()).unwrap();
+        pause_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        update_release_tx.send(()).unwrap();
+        updater.join().unwrap();
+        if mode == 0 || mode == 3 || mode == 4 {
+            assert!(owner.task_gate().try_lock().is_err());
+            assert!(observed.try_recv().is_err());
+            if mode == 3 {
+                driver.stop_worker_for_test();
+            }
+            if mode == 4 {
+                std::thread::scope(|scope| {
+                    let (started_tx, started_rx) = std::sync::mpsc::channel();
+                    let driver_ref = &driver;
+                    let abort = scope.spawn(move || {
+                        started_tx.send(()).unwrap();
+                        driver_ref.request_abort(parent)
+                    });
+                    started_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    release_tx.send(()).unwrap();
+                    {
+                        let (lock, wake) = &*tool_release;
+                        *lock.lock().unwrap() = true;
+                        wake.notify_all();
+                    }
+                    abort.join().unwrap().unwrap();
+                });
+                assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+                drop(parent_job);
+                return;
+            }
+            release_tx.send(()).unwrap();
+            if mode == 3 {
+                assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+                drop(parent_job);
+                return;
+            }
+            observed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(matches!(
+                await_receipt(owner.store(), child).1,
+                Outcome::Pending { .. }
+            ));
+        } else {
+            observed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(driver.active_unhooked_count_for_test(), 2);
+            release_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while driver.active_unhooked_count_for_test() != 1 {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            if mode == 1 {
+                driver.request_abort(parent).unwrap();
+            } else {
+                driver.stop_worker_for_test();
+            }
+            {
+                let (lock, wake) = &*tool_release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+            }
+            assert!(matches!(
+                await_receipt(owner.store(), child).1,
+                Outcome::Pending { .. }
+            ));
+        }
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        drop(parent_job);
+    }
+    #[test]
+    fn ready_publication_keeps_old_lease_fenced_until_retirement() {
+        released_attempt_boundary(0);
+    }
+    #[test]
+    fn abort_during_ready_publication_retires_old_lease() {
+        released_attempt_boundary(4);
+    }
+    #[test]
+    fn shutdown_during_ready_publication_retires_old_lease() {
+        released_attempt_boundary(3);
+    }
+    #[test]
+    fn old_cancellation_registration_cannot_block_new_attempt_or_abort() {
+        released_attempt_boundary(1);
+    }
+    #[test]
+    fn old_cancellation_registration_cannot_block_new_attempt_or_shutdown() {
+        released_attempt_boundary(2);
+    }
     #[test]
     fn busy_identity_for_four_children_does_not_starve_update_dependency() {
         use crate::task_scheduler::{Registry, Step};

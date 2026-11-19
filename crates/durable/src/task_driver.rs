@@ -49,7 +49,7 @@ pub(crate) struct Shared {
     wake: Condvar,
     harness: Option<Mutex<crate::runtime::Harness>>,
     cleanup_stop: pi_rs_core::CancellationToken,
-    unhooked_cancellations: Mutex<HashMap<Uuid, pi_rs_core::CancellationToken>>,
+    unhooked_cancellations: Mutex<HashMap<(Uuid, Uuid), pi_rs_core::CancellationToken>>,
     notifications: Mutex<Option<SyncSender<()>>>,
     subscription: Mutex<Option<Receiver<()>>>,
 }
@@ -509,7 +509,7 @@ impl Driver {
                 }
             };
             let mut load_error = None;
-            for (task_id, token) in active.iter() {
+            for ((task_id, _), token) in active.iter() {
                 match TaskStore::new(self.shared.owner.store()).load(*task_id) {
                     Ok(task) if task.as_ref().is_none_or(|task| task.task.abort_requested()) => {
                         token.cancel()
@@ -644,6 +644,11 @@ impl Driver {
         self.shared.cleanup_stop.cancel();
         self.stop_worker();
     }
+    #[cfg(test)]
+    pub(crate) fn active_unhooked_count_for_test(&self) -> usize {
+        self.shared.unhooked_cancellations.lock().unwrap().len()
+    }
+
     #[cfg(test)]
     pub(crate) fn stop_worker_for_test(&self) {
         self.stop_worker();
@@ -891,6 +896,21 @@ pub(crate) fn before_execute_for_test(
         .insert(id, Box::new(hook));
 }
 
+#[cfg(test)]
+type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn after_execute_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_execute_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    after_execute_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
 struct WorkerPool {
     jobs: Option<mpsc::Sender<Box<task_scheduler::DetachedInvocation>>>,
     done: mpsc::Receiver<WorkerEvent>,
@@ -952,7 +972,7 @@ impl Shared {
             .lock()
             .map_err(|e| e.to_string())?;
         let tasks = TaskStore::new(self.owner.store());
-        for (id, token) in active.iter() {
+        for ((id, _), token) in active.iter() {
             match tasks.load(*id) {
                 Ok(Some(task)) if !task.task.abort_requested() => {
                     match task_scheduler::pending_abort_root_for_running(&tasks, *id, true) {
@@ -1005,6 +1025,7 @@ impl Shared {
                         break;
                     };
                     let task_id = job.task_id();
+                    let registration_key = job.cancellation_registration_key();
                     if let Some(token) = job.unhooked_cancellation() {
                         let registration = (|| -> Result<(), String> {
                             let _gate =
@@ -1024,10 +1045,10 @@ impl Shared {
                             {
                                 token.cancel();
                             }
-                            if active.contains_key(&task_id) {
+                            if active.contains_key(&registration_key) {
                                 return Err("duplicate unhooked executor".into());
                             }
-                            active.insert(task_id, token);
+                            active.insert(registration_key, token);
                             Ok(())
                         })();
                         if let Err(error) = registration {
@@ -1070,8 +1091,15 @@ impl Shared {
                             WorkerEvent::Failed("task handler panicked".into())
                         }
                     };
+                    #[cfg(test)]
+                    if matches!(event, WorkerEvent::Released) {
+                        let hook = after_execute_hooks().lock().unwrap().remove(&task_id);
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
                     if let Ok(mut active) = shared.unhooked_cancellations.lock() {
-                        active.remove(&task_id);
+                        active.remove(&registration_key);
                     }
                     if let Err(mpsc::SendError(event)) = done.send(event) {
                         if let WorkerEvent::Completed(completed) = event {

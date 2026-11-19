@@ -575,6 +575,18 @@ impl PendingMaintenance {
     }
 }
 
+#[cfg(test)]
+type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn release_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_ready_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    release_hooks().lock().unwrap().insert(id, Box::new(hook));
+}
+
 /// An exclusive in-process reservation. Dropping it without settlement poisons
 /// the scheduler; its attachment remains held until the invocation is dropped.
 pub struct DetachedInvocation {
@@ -1266,6 +1278,9 @@ pub struct AdmissionHandle<'a> {
 }
 
 impl DetachedInvocation {
+    pub(crate) fn cancellation_registration_key(&self) -> (Uuid, Uuid) {
+        (self.running.task.id(), self.lease.token)
+    }
     pub(crate) fn unhooked_cancellation(&self) -> Option<pi_rs_core::CancellationToken> {
         self.unhooked_cancellation.clone()
     }
@@ -1499,10 +1514,30 @@ impl DetachedInvocation {
                 .push(crate::async_task_protocol::undispatched_intent_check(
                     current.task.id(),
                 ));
+            let mut live = self.lease.state.lock().map_err(|_| Error::Poisoned)?;
+            if !live
+                .leases
+                .get(&self.lease.id)
+                .is_some_and(|(token, attempt)| {
+                    *token == self.lease.token && *attempt == self.running.task.attempt_id()
+                })
+            {
+                return Err(Error::Ownership);
+            }
             owner
                 .store()
                 .commit(&batch.checks, &batch.mutations)
                 .map_err(task_store::Error::from)?;
+            #[cfg(test)]
+            {
+                let hook = release_hooks().lock().unwrap().remove(&self.lease.id);
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            live.leases.remove(&self.lease.id);
+            live.attempts.remove(&self.lease.id);
+            live.published.retain(|(id, _)| *id != self.lease.id);
             self.lease.retired = true;
         }
         Err(Error::Stopped)

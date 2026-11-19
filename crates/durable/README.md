@@ -503,7 +503,10 @@ While an identity update holds the identity lease, admission skips that task;
 a reservation racing the update is released before retry. A changed identity
 is rejected. Cancellation
 before an intent is committed releases the attempt back to Ready using an
-atomic missing-intent check; after restart it can be reserved again.
+atomic missing-intent check; after restart it can be reserved again. Ready
+publication and lease retirement share the scheduler fence. Cancellation entries
+are scoped to the individual reservation, so an older worker cannot remove a
+newer attempt's entry.
 
 A durable intent committed under the task gate is logical dispatch start. A prior
 abort rejects dispatch; a later abort requests cancellation and the driver joins
