@@ -489,6 +489,15 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
+`async_task_tool::AsyncTaskTool` is intentionally disabled. Its constructor
+always returns an error, including for explicitly authorized unhooked standalone
+use. No task handler or tool dispatch is registered. Safe support still requires
+task-owned hook authorization, an abort/dispatch ordering fence, retention and
+reconciliation of pending or unknown outcomes after abort, and persisted tool
+specification and implementation identity checks across reopen. A conversation
+attempt fence cannot establish task-attempt ownership. `AsyncTaskCall` is serializable for checkpoints, but this disabled bridge
+cannot create or execute calls. Existing scheduler and `TaskTool` APIs are unaffected.
+
 Within a task-backed tool handler, `TaskTool::stage_child` stages another
 registered TaskTool under a stable key. Return a task wait step to commit the
 child and checkpoint together; on wake, `ended_children` and `get_owned_child`
