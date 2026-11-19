@@ -3720,7 +3720,7 @@ impl Scheduler {
         let capture = Arc::make_mut(capture);
         capture.before_intent = before;
         capture.after_intent = after;
-        true
+        self.publish_wake_definitions().is_ok()
     }
 
     #[cfg(test)]
@@ -3738,7 +3738,7 @@ impl Scheduler {
             return false;
         };
         Arc::make_mut(capture).busy_hook = Some(hook);
-        true
+        self.publish_wake_definitions().is_ok()
     }
 
     /// Install only a sealed Tool executor on a standalone scheduler. No

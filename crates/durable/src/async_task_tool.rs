@@ -1031,6 +1031,18 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
+        {
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let parent_task = TaskStore::new(&store).load(parent).unwrap().unwrap().task;
+            let handle: AsyncTaskCall =
+                serde_json::from_value(parent_task.checkpoint().data.clone()).unwrap();
+            let key = format!("runtime/extension-memo/{}/kill-marker", handle.task_id());
+            let stored = store.get(key.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&stored.value).unwrap(),
+                json!("saved")
+            );
+        }
         let (sent, received) = std::sync::mpsc::channel();
         let tool: Arc<dyn Tool> = Arc::new(BeforeToolFixture(sent));
         let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
