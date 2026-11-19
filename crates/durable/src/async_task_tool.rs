@@ -3133,10 +3133,14 @@ mod tests {
                 .unwrap();
             let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
             let driver = host.into_driver();
-            assert!(matches!(
-                wait_terminal(&driver, id).state(),
-                crate::task::TaskState::Failed(_)
-            ));
+            let task = wait_terminal(&driver, id);
+            if decision == 3 {
+                assert!(
+                    matches!(task.state(), crate::task::TaskState::Succeeded(value) if matches!(serde_json::from_value::<Outcome>(value.clone()), Ok(Outcome::Failed(reason)) if reason.contains("Invalid tool arguments")))
+                );
+            } else {
+                assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+            }
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             let _ = driver.shutdown_with_pending().unwrap();
         }
@@ -3409,6 +3413,430 @@ mod tests {
         let _ = driver.shutdown_with_pending().unwrap();
     }
 
+    struct HostResultHook {
+        mode: u8,
+        before_calls: Arc<AtomicUsize>,
+        observed: std::sync::mpsc::Sender<(String, bool)>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for HostResultHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            self.before_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(match self.mode {
+                0 => crate::extension::BeforeTool::Block("denied".into()),
+                1 => crate::extension::BeforeTool::Rewrite(json!({"bad":true})),
+                _ => crate::extension::BeforeTool::Pass,
+            })
+        }
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            result: &crate::extension::ToolResult,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            let code = result
+                .diagnostics
+                .first()
+                .and_then(|d| d.code.clone())
+                .ok_or("missing diagnostic")?;
+            self.observed.send((code, result.is_error)).unwrap();
+            ctx.memo.get_or_insert("host-after", json!(42)).await?;
+            let mut result = result.clone();
+            result.output = "after observed host error".into();
+            Ok(Some(result))
+        }
+    }
+    #[test]
+    fn hooked_durable_blocked_and_invalid_run_after_without_tool_dispatch() {
+        for mode in [0, 1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let before_calls = Arc::new(AtomicUsize::new(0));
+            let (observed, received) = std::sync::mpsc::channel();
+            let hook = Arc::new(HostResultHook {
+                mode,
+                before_calls: before_calls.clone(),
+                observed,
+            });
+            let mut host =
+                StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+            let tool = host
+                .register_replay_safe_durable_tool_with_hook(
+                    Arc::new(StrictDurable(calls.clone())),
+                    "strict-v1",
+                    1,
+                    vec![],
+                    "host-result-v1",
+                    hook,
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let input = if mode == 2 {
+                json!({"bad":true})
+            } else {
+                json!({})
+            };
+            let id = host.start_replay_safe_root(&tool, input, 4).unwrap();
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, id);
+            assert!(
+                matches!(task.state(), crate::task::TaskState::Succeeded(value) if matches!(serde_json::from_value::<Outcome>(value.clone()), Ok(Outcome::Failed(reason)) if reason == "after observed host error"))
+            );
+            assert_eq!(
+                received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                (
+                    if mode == 0 {
+                        "blocked".into()
+                    } else {
+                        "invalid_arguments".into()
+                    },
+                    true
+                )
+            );
+            assert_eq!(
+                before_calls.load(Ordering::SeqCst),
+                if mode == 2 { 0 } else { 1 }
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let _ = driver.shutdown_with_pending().unwrap();
+        }
+    }
+
+    struct PrepareFailureTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for PrepareFailureTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "prepare-failure".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn prepare_arguments(
+            &self,
+            _: serde_json::Value,
+        ) -> pi_rs_core::ExtensionResult<serde_json::Value> {
+            Err("repair failed".into())
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for PrepareFailureTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "unexpected".into(),
+            )))
+        }
+    }
+    #[test]
+    fn host_invalid_preparation_runs_after_without_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let before_calls = Arc::new(AtomicUsize::new(0));
+        let (observed, received) = std::sync::mpsc::channel();
+        let hook = Arc::new(HostResultHook {
+            mode: 2,
+            before_calls: before_calls.clone(),
+            observed,
+        });
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(PrepareFailureTool(calls.clone())),
+                "prepare-failure-v1",
+                1,
+                vec![],
+                "host-result-v1",
+                hook,
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(
+            matches!(wait_terminal(&driver, id).state(), crate::task::TaskState::Succeeded(value) if matches!(serde_json::from_value::<Outcome>(value.clone()), Ok(Outcome::Failed(_))))
+        );
+        assert_eq!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            ("invalid_arguments".into(), true)
+        );
+        assert_eq!(before_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    struct BlockedAbortHook(AbortAfterHook);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for BlockedAbortHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            Ok(crate::extension::BeforeTool::Block("denied".into()))
+        }
+        async fn after_tool(
+            &self,
+            call: &crate::extension::ToolCall,
+            value: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            crate::extension::Hook::after_tool(&self.0, call, value, ctx).await
+        }
+    }
+    #[test]
+    fn host_blocked_after_abort_fences_memo_and_never_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (result, result_rx) = std::sync::mpsc::channel();
+        let hook = Arc::new(BlockedAbortHook(AbortAfterHook {
+            entered,
+            release: std::sync::Mutex::new(release_rx),
+            result,
+        }));
+        let mut host = StandaloneBeforeHookHost::open(&path, Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(calls.clone())),
+                "immediate-v1",
+                1,
+                vec![],
+                "blocked-abort-v1",
+                hook,
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        driver.request_abort(id).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "after hook must not restart in abort cleanup"
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        assert!(
+            store
+                .get(format!("runtime/extension-memo/{id}/late-after").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+    struct RecoverHostHook(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for RecoverHostHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            Ok(crate::extension::BeforeTool::Block("denied".into()))
+        }
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            result: &crate::extension::ToolResult,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            if !result.is_error
+                || result.diagnostics.first().and_then(|d| d.code.as_deref()) != Some("blocked")
+            {
+                return Err("missing blocked result".into());
+            }
+            let exists = self.0.join("hook-ready").exists();
+            let memo = ctx
+                .memo
+                .get_or_insert(
+                    "host-recovery",
+                    json!(if exists { "second" } else { "first" }),
+                )
+                .await?;
+            if memo != json!("first") {
+                return Err("memo changed after restart".into());
+            }
+            if !exists {
+                std::fs::write(self.0.join("hook-ready"), b"ready").map_err(|e| e.to_string())?;
+                std::future::pending().await
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    struct FileDurable(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for FileDurable {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "file-durable".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for FileDurable {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            std::fs::write(self.0.join("tool-dispatched"), b"incorrect")
+                .map_err(|e| e.to_string())?;
+            Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "unexpected".into(),
+            )))
+        }
+    }
+    fn recovery_host_result(
+        root: &std::path::Path,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        let mut host =
+            StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(FileDurable(root.to_owned())),
+                "file-v1",
+                1,
+                vec![],
+                "recover-host-v1",
+                Arc::new(RecoverHostHook(root.to_owned())),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        (host, tool)
+    }
+    #[test]
+    fn host_blocked_after_kill_reopens_without_dispatch() {
+        const ENV: &str = "PI_RS_HOST_BLOCK_AFTER_KILL_1120";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tool) = recovery_host_result(&root);
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let _driver = host.into_driver();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::host_blocked_after_kill_reopens_without_dispatch")
+            .env(ENV, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("hook-ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("host result hook did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(dir.path().join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = recovery_host_result(dir.path());
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        assert!(
+            matches!(task.state(), crate::task::TaskState::Succeeded(value) if matches!(serde_json::from_value::<Outcome>(value.clone()), Ok(Outcome::Failed(reason)) if reason.contains("blocked")))
+        );
+        assert!(!dir.path().join("tool-dispatched").exists());
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+    struct HostMetadataRewrite;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for HostMetadataRewrite {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            Ok(crate::extension::BeforeTool::Block("denied".into()))
+        }
+        async fn after_tool_result(
+            &self,
+            _: &crate::extension::ToolCall,
+            result: &crate::extension::ToolResult,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolResult>, String> {
+            let mut changed = result.clone();
+            changed.is_error = false;
+            Ok(Some(changed))
+        }
+    }
+    #[test]
+    fn host_blocked_after_cannot_suppress_error_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut host =
+            StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+        let tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(ImmediateDurable(calls.clone())),
+                "immediate-v1",
+                1,
+                vec![],
+                "block-policy-v1",
+                Arc::new(HostMetadataRewrite),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
     #[test]
     fn hooked_durable_before_block_never_dispatches_tool() {
         let dir = tempfile::tempdir().unwrap();
@@ -3435,7 +3863,7 @@ mod tests {
         let driver = host.into_driver();
         assert!(matches!(
             wait_terminal(&driver, id).state(),
-            crate::task::TaskState::Failed(_)
+            crate::task::TaskState::Succeeded(value) if matches!(serde_json::from_value::<Outcome>(value.clone()), Ok(Outcome::Failed(reason)) if reason.contains("blocked"))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let _ = driver.shutdown_with_pending().unwrap();

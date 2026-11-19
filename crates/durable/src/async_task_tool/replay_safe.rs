@@ -99,6 +99,8 @@ struct HookCheckpoint {
     version: u32,
     arguments: serde_json::Value,
     outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_error: Option<String>,
 }
 struct HookMemo<'a, 'b> {
     admission: &'a AdmissionHandle<'b>,
@@ -239,6 +241,45 @@ impl Executor {
         }
         Ok(())
     }
+    fn bounded_hook_arguments(&self, args: &serde_json::Value) -> Result<(), String> {
+        if !args.is_object()
+            || serde_json::to_vec(args).map_err(|e| e.to_string())?.len() > 60 * 1024
+        {
+            return Err("host result arguments exceed supported bounds".into());
+        }
+        Ok(())
+    }
+    fn host_result_checkpoint(
+        &self,
+        args: serde_json::Value,
+        code: &str,
+        reason: &str,
+    ) -> Result<Step, String> {
+        self.bounded_hook_arguments(&args)?;
+        if !matches!(code, "blocked" | "invalid_arguments") {
+            return Err("unsupported host result".into());
+        }
+        let reason: String = reason.chars().take(2048).collect();
+        let message = if code == "blocked" {
+            format!("Tool call blocked: {reason}")
+        } else {
+            format!("Invalid tool arguments: {reason}")
+        };
+        let data = serde_json::to_value(HookCheckpoint {
+            version: 1,
+            arguments: args,
+            outcome: Some(Outcome::Failed(message)),
+            host_error: Some(code.into()),
+        })
+        .map_err(|e| e.to_string())?;
+        if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
+            return Err("host result checkpoint too large".into());
+        }
+        Ok(Step::Continue(Checkpoint {
+            phase: "replay-safe-async-after".into(),
+            data,
+        }))
+    }
     fn hook_registry(&self) -> Result<crate::extension::Resolved, String> {
         let mut registry = crate::extension::Registry::default();
         registry
@@ -266,14 +307,25 @@ impl Executor {
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
-        let (call, decision) = runtime.block_on(async {
+        enum BeforeResult {
+            Decision(crate::extension::ToolCall, crate::extension::BeforeTool),
+            Invalid(serde_json::Value, String),
+        }
+        let before = runtime.block_on(async {
             let operation = async {
-                let args = self.tool.prepare_arguments(task.input().clone()).await.map_err(|e| e.to_string())?;
-                self.validate_hook_arguments(&args)?;
+                let args = match self.tool.prepare_arguments(task.input().clone()).await {
+                    Ok(args) => args,
+                    Err(error) => {
+                        self.bounded_hook_arguments(task.input())?;
+                        return Ok(BeforeResult::Invalid(task.input().clone(), error.to_string()));
+                    }
+                };
+                self.bounded_hook_arguments(&args)?;
+                if let Err(error) = self.validate_hook_arguments(&args) { return Ok(BeforeResult::Invalid(args, error)); }
                 let snapshot = serde_json::Value::Null;
                 let ctx = crate::extension::Context { snapshot: &snapshot, memo: &memo };
                 let (call, decision, _) = self.hook_registry()?.before_tool(crate::extension::ToolCall { name: self.identity.spec.name.clone(), arguments: args }, &ctx).await;
-                Ok::<_, String>((call, decision))
+                Ok::<_, String>(BeforeResult::Decision(call, decision))
             };
             tokio::select! { biased; _ = cancel.cancelled() => Err("before hook cancelled".into()), result = operation => result }
         })?;
@@ -281,18 +333,28 @@ impl Executor {
             return Err("task-fenced hook memo failed".into());
         }
         admission.replay_safe_durable_check(cancel)?;
+        let (call, decision) = match before {
+            BeforeResult::Invalid(args, reason) => {
+                return self.host_result_checkpoint(args, "invalid_arguments", &reason);
+            }
+            BeforeResult::Decision(call, decision) => (call, decision),
+        };
         match decision {
             crate::extension::BeforeTool::Pass => (),
             crate::extension::BeforeTool::Block(reason) => {
-                return Ok(Step::Fail(format!("tool call blocked: {reason}")));
+                return self.host_result_checkpoint(call.arguments, "blocked", &reason);
             }
             _ => return Err("hook sleep is unsupported".into()),
         }
-        self.validate_hook_arguments(&call.arguments)?;
+        self.bounded_hook_arguments(&call.arguments)?;
+        if let Err(reason) = self.validate_hook_arguments(&call.arguments) {
+            return self.host_result_checkpoint(call.arguments, "invalid_arguments", &reason);
+        }
         let data = serde_json::to_value(HookCheckpoint {
             version: 1,
             arguments: call.arguments,
             outcome: None,
+            host_error: None,
         })
         .map_err(|e| e.to_string())?;
         if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
@@ -315,8 +377,25 @@ impl Executor {
         if stored.version != 1 {
             return Err("invalid after checkpoint version".into());
         }
-        self.validate_hook_arguments(&stored.arguments)?;
+        self.bounded_hook_arguments(&stored.arguments)?;
+        if stored.host_error.is_none() {
+            self.validate_hook_arguments(&stored.arguments)?;
+        }
+        if stored
+            .host_error
+            .as_deref()
+            .is_some_and(|code| !matches!(code, "blocked" | "invalid_arguments"))
+        {
+            return Err("invalid host result code".into());
+        }
         let outcome = stored.outcome.ok_or("missing completed outcome")?;
+        if stored.host_error.is_some() && !matches!(outcome, Outcome::Failed(_)) {
+            return Err("invalid host result outcome".into());
+        }
+        let diagnostic_message = match &outcome {
+            Outcome::Failed(reason) => reason.clone(),
+            _ => String::new(),
+        };
         let text = outcome.tool_content();
         let memo = HookMemo {
             admission,
@@ -331,7 +410,19 @@ impl Executor {
             let call = crate::extension::ToolCall { name: self.identity.spec.name.clone(), arguments: stored.arguments };
             let snapshot = serde_json::Value::Null; let ctx = crate::extension::Context { snapshot: &snapshot, memo: &memo };
             let selected = self.hook_registry()?;
-            tokio::select! { biased; _ = cancel.cancelled() => Err("after hook cancelled".to_string()), value = selected.after_tool(&call, serde_json::Value::String(text.clone()), &ctx) => Ok(value.0) }
+            let operation = async {
+                let (value, _) = selected.after_tool(&call, serde_json::Value::String(text.clone()), &ctx).await;
+                let Some(code) = stored.host_error.as_deref() else { return Ok(value); };
+                let output = value.as_str().unwrap_or(&text).to_owned();
+                let diagnostic = crate::runtime::ToolDiagnostic { severity: crate::runtime::DiagnosticSeverity::Error, message: diagnostic_message.clone(), code: Some(code.into()) };
+                let original = crate::extension::ToolResult { output, is_error: true, details: None, structured_output: None, attachments: vec![], diagnostics: vec![diagnostic.clone()] };
+                let (result, _, _) = selected.after_tool_result(&call, original.clone(), &ctx).await;
+                if !result.is_error || result.details.is_some() || result.structured_output.is_some() || !result.attachments.is_empty() || result.diagnostics != original.diagnostics {
+                    return Err("unsupported host-result metadata replacement".to_string());
+                }
+                Ok(serde_json::Value::String(result.output))
+            };
+            tokio::select! { biased; _ = cancel.cancelled() => Err("after hook cancelled".to_string()), result = operation => result }
         })?;
         if memo.failed() {
             return Err("task-fenced hook memo failed".into());
@@ -344,6 +435,12 @@ impl Executor {
                     output: output.to_owned(),
                     details,
                 },
+                Outcome::Failed(_) if stored.host_error.is_some() => Outcome::Failed(
+                    output
+                        .strip_prefix("Tool failed: ")
+                        .unwrap_or(output)
+                        .to_owned(),
+                ),
                 _ => return Err("non-text after replacement unsupported".into()),
             },
             _ => outcome,
@@ -393,7 +490,7 @@ impl Handler for Executor {
             "replay-safe-async-prepared" if self.hook.is_some() => {
                 let stored: HookCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
                     .map_err(|_| "invalid hook checkpoint")?;
-                if stored.version != 1 || stored.outcome.is_some() {
+                if stored.version != 1 || stored.outcome.is_some() || stored.host_error.is_some() {
                     return Err("invalid prepared hook checkpoint".into());
                 }
                 (
@@ -483,6 +580,7 @@ impl Handler for Executor {
                     version: 1,
                     arguments: args.clone(),
                     outcome: Some(outcome.clone()),
+                    host_error: None,
                 })
                 .map_err(|e| e.to_string())?;
                 if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
