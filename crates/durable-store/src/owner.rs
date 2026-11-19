@@ -14,7 +14,9 @@
 //! path validation cannot defend against concurrent filesystem manipulation.
 //! Bind mounts, other filesystem aliases, network filesystems, noncooperating
 //! writers and live database copies are unsupported. Use a local filesystem
-//! with working OS locks. On process death the OS releases the lock.
+//! with working OS locks. On process death the OS releases the lock, except
+//! while a forked child still holds the same open file description. A forked
+//! child must not use inherited SQLite or scheduler state before exec.
 //!
 //! This implementation currently supports Unix only, where hard-link counts
 //! are available. Unsupported platforms fail closed.
@@ -73,10 +75,20 @@ impl From<crate::Error> for OwnerError {
 /// Owns the store and its scheduler lock. The store closes before the lock.
 pub struct OwnedStore {
     store: Store,
-    _lock: File,
+    _lock: OwnerLock,
     task_gate: std::sync::Mutex<()>,
     controls: crate::controls::ConversationControls,
     summary_fences: Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+// Dropped after `store`: explicitly unlock the shared open file description so
+// a child temporarily between fork and exec cannot retain an abandoned lock.
+struct OwnerLock(File);
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Exclusive execution of one summary operation, including usage settlement.
@@ -130,7 +142,7 @@ impl OwnedStore {
         validate_file(&db, false)?;
         Ok(Self {
             store,
-            _lock: lock,
+            _lock: OwnerLock(lock),
             task_gate: std::sync::Mutex::new(()),
             controls: crate::controls::ConversationControls::default(),
             summary_fences: Mutex::new(HashMap::new()),
@@ -204,5 +216,25 @@ fn validate_file(path: &PathBuf, may_be_missing: bool) -> Result<(), OwnerError>
         Ok(metadata) => validate_metadata(&metadata),
         Err(e) if may_be_missing && e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod inherited_lock_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_releases_lock_even_if_an_inherited_descriptor_remains_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = OwnedStore::open(&path).unwrap();
+        // A duplicated descriptor models the open file description inherited
+        // by a concurrent fork before close-on-exec takes effect.
+        let inherited = owner._lock.0.try_clone().unwrap();
+        assert!(matches!(OwnedStore::open(&path), Err(OwnerError::Busy)));
+        drop(owner);
+        let reopened = OwnedStore::open(&path).unwrap();
+        drop(reopened);
+        drop(inherited);
     }
 }
