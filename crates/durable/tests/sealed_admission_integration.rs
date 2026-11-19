@@ -287,6 +287,36 @@ fn marker_ids(path: &Path) -> (Uuid, Uuid) {
     )
 }
 #[test]
+fn schema_failure_and_raw_key_identity_ungated_through_both_admission_paths() {
+    for mode in [Mode::Staged, Mode::Immediate] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let id = seed(&dir.path().join("db"));
+        let driver = host(
+            &dir.path().join("db"),
+            mode,
+            false,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            None,
+            calls.clone(),
+        );
+        until(|| {
+            driver
+                .get(id)
+                .unwrap()
+                .is_some_and(|task| task.is_terminal())
+        });
+        assert_eq!(
+            driver.get(id).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!({"Succeeded":"invalid"}))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        driver.shutdown().unwrap();
+    }
+}
+
+#[test]
 fn schema_failure_and_raw_key_identity_through_both_admission_paths() {
     for mode in [Mode::Staged, Mode::Immediate] {
         let dir = tempfile::tempdir().unwrap();

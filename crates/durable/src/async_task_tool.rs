@@ -2195,6 +2195,104 @@ mod tests {
         }
     }
     #[test]
+    fn before_hook_defers_while_parent_park_is_published() {
+        use crate::task::WaitFor;
+        use crate::task_scheduler::{Step, TickReservation};
+        use std::sync::{OnceLock, mpsc};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let (sent, received) = mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(BeforeToolFixture(sent));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = Arc::new(BeforeFixture {
+            decision: 1,
+            entered: None,
+            calls: calls.clone(),
+        });
+        let child_id = Arc::new(OnceLock::new());
+        let handler_child = child_id.clone();
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, move |task: &Task| {
+            if task.checkpoint().phase == "initial" {
+                Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "waiting".into(),
+                        data: json!(null),
+                    },
+                    condition: WaitFor::Tasks(vec![*handler_child.get().unwrap()]),
+                    children: vec![],
+                })
+            } else {
+                Ok(Step::Succeed(json!("done")))
+            }
+        }));
+        let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
+        let adapter = host
+            .register_tool("leaf", tool, "backend", 1, "hook-v1", hook)
+            .unwrap();
+        let mut scheduler = host.into_scheduler_for_test();
+        let parent = before_parent();
+        scheduler.submit(&parent).unwrap();
+        let TickReservation::Invocation(parent_job) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("parent reservation")
+        };
+        let owner = scheduler.owner();
+        let parent_snapshot = TaskStore::new(owner.store())
+            .load(parent.id())
+            .unwrap()
+            .unwrap();
+        let (_, child) = adapter
+            .adapter
+            .sealed_child_candidate(&parent_snapshot.task, json!({}))
+            .unwrap();
+        let (child, batch) = crate::async_task_protocol::prepare_child(
+            owner.store(),
+            &parent_snapshot,
+            "child",
+            &child,
+            &adapter.identity,
+        )
+        .unwrap();
+        owner
+            .store()
+            .commit(&batch.checks, &batch.mutations)
+            .unwrap();
+        child_id.set(child).unwrap();
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        crate::task_driver::before_execute_for_test(child, move |_| {
+            reserved_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let driver = crate::task_driver::Driver::start(scheduler);
+        reserved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let parent_result = parent_job.execute().unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while driver.get(child).expect("healthy driver").unwrap().state()
+            != &crate::task::TaskState::Ready
+        {
+            assert!(Instant::now() < deadline, "hooked child was not deferred");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(received.try_recv().is_err());
+        assert!(driver.settle_for_test(parent_result).unwrap());
+        let args = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("tool did not resume");
+        assert_eq!(args, json!({"rewritten":true}));
+        assert_eq!(
+            wait_terminal(&driver, parent.id()).state(),
+            &crate::task::TaskState::Succeeded(json!("done"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(received.try_recv().is_err());
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
     fn before_driver_block_rewrite_and_reject_invalid() {
         for mode in [0, 1, 3, 4] {
             let dir = tempfile::tempdir().unwrap();

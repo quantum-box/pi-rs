@@ -121,6 +121,17 @@ pub struct Driver {
 }
 impl Driver {
     #[cfg(test)]
+    pub(crate) fn settle_for_test(
+        &self,
+        completed: task_scheduler::CompletedInvocation,
+    ) -> Result<bool, task_scheduler::SettlementError> {
+        self.shared
+            .scheduler
+            .lock()
+            .unwrap()
+            .settle_invocation(completed)
+    }
+    #[cfg(test)]
     pub(crate) fn has_pending_task(&self, id: Uuid) -> bool {
         self.shared
             .pending

@@ -1516,13 +1516,38 @@ mod tests {
         Uuid,
         Uuid,
     ) {
-        use crate::task_scheduler::{Registry, Step, TickReservation};
+        actual_driver_fixture_with_parent(
+            path,
+            tool,
+            before_intent,
+            after_intent,
+            setup,
+            busy_hook,
+            std::sync::Arc::new(|_: &Task| Ok(crate::task_scheduler::Step::Succeed(json!(null)))),
+        )
+    }
+    fn actual_driver_fixture_with_parent(
+        path: &std::path::Path,
+        tool: std::sync::Arc<dyn Tool>,
+        before_intent: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        after_intent: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        setup: Option<Box<dyn FnOnce(Uuid)>>,
+        busy_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        parent_handler: std::sync::Arc<dyn crate::task_scheduler::Handler>,
+    ) -> (
+        crate::task_driver::Driver,
+        Box<crate::task_scheduler::DetachedInvocation>,
+        std::sync::Arc<durable_store::owner::OwnedStore>,
+        Uuid,
+        Uuid,
+    ) {
+        use crate::task_scheduler::{Registry, TickReservation};
         let identity = ToolIdentity::new(tool.as_ref(), "real-backend", 1).unwrap();
         if crate::nested_identity::current(&tool).is_none() {
             crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
         }
         let mut registry = Registry::default();
-        assert!(registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null)))));
+        assert!(registry.register_shared("parent", false, parent_handler));
         let mut host = crate::async_task_tool::StandaloneNoHooksHost::open(
             path,
             registry,
@@ -1598,6 +1623,371 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+    fn exercise_published_parent_deferral(abort: bool) {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, observed) = mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(RealTool {
+            entered,
+            release: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let setup = Box::new(move |child| {
+            crate::task_driver::before_execute_for_test(child, move |_| {
+                reserved_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        });
+        let (driver, parent_job, owner, parent, child) = actual_driver_fixture_with_setup(
+            &dir.path().join("db"),
+            tool,
+            None,
+            None,
+            Some(setup),
+            None,
+        );
+        reserved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The parent publishes its result while the child already owns a
+        // reservation but has not committed its dispatch intent.
+        let parent_result = parent_job.execute().unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let task = driver
+                .get(child)
+                .expect("driver must remain healthy")
+                .unwrap();
+            if task.state() == &TaskState::Ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reserved child was not deferred");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        if abort {
+            driver.request_abort(parent).unwrap();
+        }
+        assert!(driver.settle_for_test(parent_result).unwrap());
+        while !driver.get(parent).unwrap().unwrap().is_terminal() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not settle after child deferral"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        if abort {
+            assert!(driver.get(parent).unwrap().unwrap().abort_requested());
+        }
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
+    fn published_parent_defers_reserved_sealed_child_without_dispatch() {
+        exercise_published_parent_deferral(false);
+    }
+
+    #[test]
+    fn published_parent_abort_preempts_deferred_sealed_child() {
+        exercise_published_parent_deferral(true);
+    }
+
+    fn exercise_deferred_sealed_child_busy(abort: bool) {
+        use crate::task::WaitFor;
+        use crate::task_scheduler::Step;
+        use std::sync::{Arc, Mutex, OnceLock, mpsc};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (entered, observed) = mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(RealTool {
+            entered,
+            release: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let (unlock_tx, unlock_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let child_id = Arc::new(OnceLock::new());
+        let handler_child = child_id.clone();
+        let parent_handler: Arc<dyn crate::task_scheduler::Handler> =
+            Arc::new(move |task: &Task| {
+                if task.checkpoint().phase == "parent" {
+                    Ok(Step::Wait {
+                        checkpoint: Checkpoint {
+                            phase: "waiting".into(),
+                            data: json!(null),
+                        },
+                        condition: WaitFor::Tasks(vec![*handler_child.get().unwrap()]),
+                        children: vec![],
+                    })
+                } else {
+                    Ok(Step::Succeed(json!("parent finished")))
+                }
+            });
+        let setup = Box::new(move |child| {
+            child_id.set(child).unwrap();
+            crate::task_driver::before_execute_for_test(child, move |_| {
+                reserved_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            crate::task_scheduler::before_undispatched_release_for_test(child, move || {
+                let (locked_tx, locked_rx) = mpsc::channel();
+                let writer = std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(writer_path).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    locked_tx.send(()).unwrap();
+                    unlock_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                    conn.execute_batch("COMMIT").unwrap();
+                });
+                locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                writer_tx.send(writer).unwrap();
+            });
+        });
+        let (driver, parent_job, owner, parent, child) = actual_driver_fixture_with_parent(
+            &path,
+            tool,
+            None,
+            None,
+            Some(setup),
+            None,
+            parent_handler,
+        );
+        reserved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let parent_result = parent_job.execute().unwrap();
+        release_tx.send(()).unwrap();
+        let writer = writer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !driver.has_pending_task(child) {
+            assert!(driver.get(child).is_ok(), "busy release stopped driver");
+            assert!(
+                Instant::now() < deadline,
+                "busy release did not retain its lease"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        unlock_tx.send(()).unwrap();
+        writer.join().unwrap();
+        if abort {
+            driver.request_abort(parent).unwrap();
+        }
+        assert!(driver.settle_for_test(parent_result).unwrap());
+        if !abort {
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("child did not retry after park");
+        }
+        while !driver.get(parent).unwrap().unwrap().is_terminal() {
+            assert!(Instant::now() < deadline, "parent did not finish abort");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if abort {
+            assert!(driver.get(parent).unwrap().unwrap().abort_requested());
+            assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        } else {
+            assert_eq!(
+                driver.get(parent).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("parent finished"))
+            );
+            assert!(owner.store().get(&intent_key(child)).unwrap().is_some());
+        }
+        assert!(observed.try_recv().is_err());
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
+    fn deferred_sealed_child_retains_lease_when_release_writer_is_busy() {
+        exercise_deferred_sealed_child_busy(false);
+    }
+
+    #[test]
+    fn abort_preempts_deferred_sealed_child_after_release_writer_busy() {
+        exercise_deferred_sealed_child_busy(true);
+    }
+
+    #[test]
+    fn published_parent_defers_child_during_uncertain_abort_graph() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, observed) = mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(RealTool {
+            entered,
+            release: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let setup = Box::new(move |child| {
+            crate::task_driver::before_execute_for_test(child, move |_| {
+                reserved_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        });
+        let (driver, parent_job, owner, parent, child) = actual_driver_fixture_with_setup(
+            &dir.path().join("db"),
+            tool,
+            None,
+            None,
+            Some(setup),
+            None,
+        );
+        reserved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let parent_result = parent_job.execute().unwrap();
+        let edge = crate::ownership_edge::edge_key(Uuid::new_v4());
+        {
+            let _gate = owner.task_gate().lock().unwrap();
+            let tasks = TaskStore::new(owner.store());
+            let root = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("parent".into(), false);
+            tasks.save(&[Save::Create(&root)]).unwrap();
+            tasks
+                .update(&tasks.load(root.id()).unwrap().unwrap(), |task| {
+                    task.start()?;
+                    task.hold_failure("pending abort".into())
+                })
+                .unwrap();
+            owner
+                .store()
+                .commit(
+                    &[Check {
+                        key: edge.clone(),
+                        expected: Expected::Missing,
+                    }],
+                    &[Mutation::Put {
+                        key: edge.clone(),
+                        value: b"invalid edge".to_vec(),
+                    }],
+                )
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let task = driver
+                .get(child)
+                .expect("uncertain graph must not poison driver")
+                .unwrap();
+            if task.state() == &TaskState::Ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child was not deferred");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        let entry = owner.store().get(&edge).unwrap().unwrap();
+        owner
+            .store()
+            .commit(
+                &[Check {
+                    key: edge.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Delete { key: edge }],
+            )
+            .unwrap();
+        assert!(driver.settle_for_test(parent_result).unwrap());
+        while !driver.get(parent).unwrap().unwrap().is_terminal() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not settle after repair"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
+    fn published_parent_park_then_retries_the_same_sealed_child() {
+        use crate::task::WaitFor;
+        use crate::task_scheduler::Step;
+        use std::sync::{Arc, Mutex, OnceLock, mpsc};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, observed) = mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(RealTool {
+            entered,
+            release: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let child_id = Arc::new(OnceLock::new());
+        let handler_child = child_id.clone();
+        let parent_handler: Arc<dyn crate::task_scheduler::Handler> =
+            Arc::new(move |task: &Task| {
+                if task.checkpoint().phase == "parent" {
+                    Ok(Step::Wait {
+                        checkpoint: Checkpoint {
+                            phase: "waiting".into(),
+                            data: json!(null),
+                        },
+                        condition: WaitFor::Tasks(vec![*handler_child.get().unwrap()]),
+                        children: vec![],
+                    })
+                } else {
+                    Ok(Step::Succeed(json!("parent finished")))
+                }
+            });
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let setup = Box::new(move |child| {
+            child_id.set(child).unwrap();
+            crate::task_driver::before_execute_for_test(child, move |_| {
+                reserved_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        });
+        let (driver, parent_job, owner, parent, child) = actual_driver_fixture_with_parent(
+            &dir.path().join("db"),
+            tool,
+            None,
+            None,
+            Some(setup),
+            None,
+            parent_handler,
+        );
+        reserved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let parent_result = parent_job.execute().unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while driver.get(child).expect("healthy driver").unwrap().state() != &TaskState::Ready {
+            assert!(Instant::now() < deadline, "child was not deferred");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        assert!(driver.settle_for_test(parent_result).unwrap());
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("child did not run after park");
+        while !driver.get(parent).unwrap().unwrap().is_terminal() {
+            assert!(Instant::now() < deadline, "parent did not resume");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            driver.get(parent).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("parent finished"))
+        );
+        assert!(observed.try_recv().is_err(), "child was dispatched twice");
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
     #[test]
     fn actual_driver_worker_captures_pending_after_abort() {
         let dir = tempfile::tempdir().unwrap();

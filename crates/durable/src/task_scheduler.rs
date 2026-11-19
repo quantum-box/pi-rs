@@ -1442,6 +1442,18 @@ fn release_hooks() -> &'static BoundaryHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn before_release_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn before_undispatched_release_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    before_release_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 fn woken_recovery_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
     HOOKS.get_or_init(Default::default)
@@ -4548,16 +4560,6 @@ impl DetachedInvocation {
         {
             return Err(ProtocolError::Invalid);
         }
-        if pending_abort_root_for_running(
-            &task_store::TaskStore::new(owner.store()),
-            self.running.task.id(),
-            true,
-        )
-        .map_err(|_| ProtocolError::Invalid)?
-        .is_some()
-        {
-            return Err(ProtocolError::Invalid);
-        }
         if !parent_live {
             // The parent has finished its handler but its wait/termination has
             // not yet settled. No child effect may start in this window; the
@@ -4566,10 +4568,24 @@ impl DetachedInvocation {
                 && parent.task.state() == &TaskState::Running
                 && parent.task.attempt_id().is_some()
                 && state.attempts.contains(parent_id)
+                && state
+                    .leases
+                    .get(parent_id)
+                    .is_some_and(|(_, attempt)| *attempt == parent.task.attempt_id())
                 && state.published.iter().any(|(id, _)| *id == *parent_id)
             {
                 return Err(ProtocolError::Deferred);
             }
+            return Err(ProtocolError::Invalid);
+        }
+        if pending_abort_root_for_running(
+            &task_store::TaskStore::new(owner.store()),
+            self.running.task.id(),
+            true,
+        )
+        .map_err(|_| ProtocolError::Invalid)?
+        .is_some()
+        {
             return Err(ProtocolError::Invalid);
         }
         let (intent, batch) = if after {
@@ -4680,10 +4696,27 @@ impl DetachedInvocation {
             {
                 return Err(Error::Ownership);
             }
-            owner
-                .store()
-                .commit(&batch.checks, &batch.mutations)
-                .map_err(task_store::Error::from)?;
+            #[cfg(test)]
+            if let Some(hook) = before_release_hooks()
+                .lock()
+                .unwrap()
+                .remove(&self.lease.id)
+            {
+                hook();
+            }
+            match owner.store().commit(&batch.checks, &batch.mutations) {
+                Ok(()) => (),
+                Err(durable_store::Error::WriteLockBusy(_)) => {
+                    // The transaction never started. Keep this reservation and
+                    // let the coordinator retry its checked release, including
+                    // the no-intent and abort fences, without stopping the driver.
+                    drop(live);
+                    drop(_gate);
+                    drop(_failure);
+                    return self.publish_undispatched_release();
+                }
+                Err(error) => return Err(task_store::Error::from(error).into()),
+            }
             #[cfg(test)]
             {
                 let hook = release_hooks().lock().unwrap().remove(&self.lease.id);
@@ -4697,6 +4730,40 @@ impl DetachedInvocation {
             self.lease.retired = true;
         }
         Err(Error::Stopped)
+    }
+
+    fn publish_undispatched_release(self) -> Result<CompletedInvocation, Error> {
+        let owner = self.lease.attachment.owner.clone();
+        let documents = crate::document::TaskDocuments::new(owner.store(), &self.running.task)?
+            .detach(owner.clone(), &self.running)?;
+        {
+            let _failure = self
+                .lease
+                .failure_fence
+                .lock()
+                .map_err(|_| Error::Poisoned)?;
+            let mut state = self.lease.state.lock().map_err(|_| Error::Poisoned)?;
+            if state.poisoned
+                || self
+                    .lease
+                    .scheduler_poison
+                    .load(std::sync::atomic::Ordering::Acquire)
+                || state.leases.get(&self.lease.id)
+                    != Some(&(self.lease.token, self.running.task.attempt_id()))
+                || !state.attempts.contains(&self.lease.id)
+            {
+                return Err(Error::Ownership);
+            }
+            state.published.push_back((self.running.task.id(), false));
+        }
+        Ok(CompletedInvocation {
+            running: self.running,
+            result: InvocationResult::Handler(Ok(Step::DeferUndispatched), Box::new(documents)),
+            lease: self.lease,
+            receipt_capture: false,
+            abort_definition: self.abort_definition,
+            _identity_lease: None,
+        })
     }
 
     fn abort_precedes_unhooked_dispatch(&self) -> Result<bool, Error> {
@@ -10308,7 +10375,8 @@ impl Scheduler {
             }
             Step::DeferUndispatched => {
                 let registration = self.registered(&running.task)?;
-                if !registration.cancellable_durable_async
+                let sealed = registration.receipt_capture.is_some() && self.validator.is_none();
+                if !(registration.cancellable_durable_async || sealed)
                     || !staged.is_empty()
                     || (self.validator.is_some()
                         && registration.conversation_checkpointable.is_none())
@@ -10321,9 +10389,14 @@ impl Scheduler {
                 } else {
                     "durable/unsafe-park-async"
                 };
-                undispatched_check = Some(durable_store::Check {
-                    key: format!("{prefix}/{}/{attempt}/intent", running.task.id()).into_bytes(),
-                    expected: durable_store::Expected::Missing,
+                undispatched_check = Some(if sealed {
+                    crate::async_task_protocol::undispatched_intent_check(running.task.id())
+                } else {
+                    durable_store::Check {
+                        key: format!("{prefix}/{}/{attempt}/intent", running.task.id())
+                            .into_bytes(),
+                        expected: durable_store::Expected::Missing,
+                    }
                 });
                 next.task.yield_ready().map_err(Error::Transition)?;
             }
