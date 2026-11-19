@@ -4023,7 +4023,26 @@ impl Scheduler {
                 };
                 match outcome {
                     outcome if running.task.holds_interrupted_cleanup() => {
-                        let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+                        let mut current =
+                            self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+                        // A failed ancestor is already cancellation authority even before
+                        // its cascade marks this child. Mark the owned graph under the
+                        // task gate before deciding whether any receipt can survive.
+                        if !current.task.abort_requested() {
+                            if let Some(root) = pending_abort_root_excluding_self(
+                                &self.ts(),
+                                current.task.id(),
+                                true,
+                                true,
+                            )? {
+                                request_abort_subtree(&self.ts(), root)?;
+                                current =
+                                    self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+                                if !current.task.abort_requested() {
+                                    return Err(Error::Ownership);
+                                }
+                            }
+                        }
                         let key = interrupted_receipt_key(current.task.id());
                         let mut next = current.clone();
                         let mut batch;

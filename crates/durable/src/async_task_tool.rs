@@ -10615,6 +10615,118 @@ mod tests {
         }
     }
     #[test]
+    fn interrupted_cleanup_parent_failure_cascades_before_settlement() {
+        use crate::task_store::TaskStore;
+        for after_receipt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (parent, child) = interrupted_kill_tool(root);
+            if !after_receipt {
+                std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
+            }
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let mut scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+            let invocation = loop {
+                match scheduler.reserve_tick(0).unwrap() {
+                    crate::task_scheduler::TickReservation::Invocation(invocation) => {
+                        break invocation;
+                    }
+                    crate::task_scheduler::TickReservation::Progress(true) => continue,
+                    _ => panic!("expected interrupted cleanup reservation"),
+                }
+            };
+            assert_eq!(invocation.task_id(), child);
+            let worker = std::thread::spawn(move || invocation.execute().unwrap());
+            let mut worker = Some(worker);
+            let mut completed = if after_receipt {
+                Some(worker.take().unwrap().join().unwrap())
+            } else {
+                wait_file(&root.join("interrupted-ready"));
+                None
+            };
+            let owner = scheduler.owner();
+            let tasks = TaskStore::new(owner.store());
+            if after_receipt {
+                assert!(
+                    owner
+                        .store()
+                        .get(format!("durable/async-task/interrupted-after/{child}").as_bytes())
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            let snapshot = tasks.load(parent).unwrap().unwrap();
+            tasks
+                .update(&snapshot, |task| {
+                    task.wake()?;
+                    task.start_attempt(Uuid::new_v4())?;
+                    task.hold_failure("parent failed while hook was running".into())
+                })
+                .unwrap();
+            assert!(!tasks.load(child).unwrap().unwrap().task.abort_requested());
+            if !after_receipt {
+                std::fs::write(root.join("interrupted-release"), b"yes").unwrap();
+                completed = Some(worker.take().unwrap().join().unwrap());
+            }
+            let mut completed = completed.unwrap();
+            let mut retries = 0;
+            loop {
+                retries += 1;
+                assert!(retries <= 10, "cleanup settlement did not converge");
+                match scheduler.settle_invocation(completed) {
+                    Ok(_) => break,
+                    Err(crate::task_scheduler::SettlementError::Pending { completed: pending }) => {
+                        completed = *pending
+                    }
+                    other => panic!("cleanup settlement failed: {other:?}"),
+                }
+            }
+            let child_task = tasks.load(child).unwrap().unwrap().task;
+            assert!(matches!(
+                child_task.state(),
+                crate::task::TaskState::Cancelled
+            ));
+            assert!(child_task.abort_requested());
+            assert!(
+                read_interrupted_after_result(owner.store(), child)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                owner
+                    .store()
+                    .get(format!("durable/async-task/interrupted-after/{child}").as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                read_sealed_outcome_evidence(owner.store(), child).unwrap(),
+                Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+            ));
+            let driver = crate::task_driver::Driver::start(scheduler);
+            assert!(
+                matches!(wait_terminal(&driver, parent).state(), crate::task::TaskState::Failed(reason) if reason == "parent failed while hook was running")
+            );
+            driver.shutdown().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("unsafe-invocations"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn interrupted_cleanup_defers_while_unsafe_ancestor_is_running() {
         use crate::task_store::TaskStore;
         for race_during_hook in [false, true] {
