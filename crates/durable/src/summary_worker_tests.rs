@@ -2408,7 +2408,8 @@ async fn killed_standalone_summary_cleanup_blocks_recovery_and_explicit_resume()
         State::Aborting { .. }
     ));
     std::fs::write(dir.path().join("conversation"), conversation.to_string()).unwrap();
-    drop(scheduler);
+    // Await worker shutdown so their owner clones release the scheduler lock.
+    scheduler.shutdown().await.unwrap();
     drop(owner);
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
