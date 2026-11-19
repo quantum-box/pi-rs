@@ -1588,7 +1588,14 @@ impl DetachedInvocation {
         version: u32,
         commit: bool,
     ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
-        self.checked_tool_transaction(identity, tool, implementation, version, (commit, false), (&[], &[]))
+        self.checked_tool_transaction(
+            identity,
+            tool,
+            implementation,
+            version,
+            (commit, false),
+            (&[], &[]),
+        )
     }
 
     fn checked_tool_transaction(
