@@ -23,6 +23,11 @@ pub struct CallbackStartGate(Arc<std::sync::atomic::AtomicBool>);
 #[must_use = "retain the lease until the callback has started or the mutation is complete"]
 pub struct CallbackStartLease(Arc<std::sync::atomic::AtomicBool>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackStartGateError {
+    Poisoned,
+}
+
 impl CallbackStartGate {
     pub fn try_enter(&self) -> Option<CallbackStartLease> {
         self.0
@@ -34,6 +39,18 @@ impl CallbackStartGate {
             )
             .ok()?;
         Some(CallbackStartLease(self.0.clone()))
+    }
+}
+impl CallbackStartLease {
+    /// Consume the lease around exactly one poll. No conversation registry,
+    /// poll or task mutex is acquired by this operation. The lease is dropped
+    /// before any later poll, so other conversation work can proceed.
+    pub fn poll_first<F: std::future::Future + ?Sized>(
+        self,
+        future: std::pin::Pin<&mut F>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        future.poll(context)
     }
 }
 impl Drop for CallbackStartLease {
@@ -103,6 +120,40 @@ impl ConversationControls {
                 cleanup_cancel: CancellationToken::new(),
             })
             .clone()
+    }
+
+    /// Obtain a target conversation's callback-start lease without waiting.
+    /// The registry lock is released before returning the lease, so a held
+    /// start does not prevent an unrelated conversation from acquiring one.
+    /// `None` means either the registry or the target is temporarily busy.
+    pub fn try_callback_start(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<CallbackStartLease>, CallbackStartGateError> {
+        use std::sync::TryLockError;
+        let gate = {
+            let mut entries = match self.entries.try_lock() {
+                Ok(entries) => entries,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => return Err(CallbackStartGateError::Poisoned),
+            };
+            entries
+                .entry(id)
+                .or_insert_with(|| Control {
+                    callback_start: CallbackStartGate::default(),
+                    gate: Arc::new(Mutex::new(())),
+                    worker: Arc::new(tokio::sync::Mutex::new(())),
+                    abort_execution: Arc::new(tokio::sync::Mutex::new(())),
+                    summary_execution: Arc::new(tokio::sync::RwLock::new(())),
+                    nested_poll: Arc::new(tokio::sync::Mutex::new(())),
+                    next_poll: Arc::new(Mutex::new(None)),
+                    cancel: self.root.child_token(),
+                    cleanup_cancel: CancellationToken::new(),
+                })
+                .callback_start
+                .clone()
+        };
+        Ok(gate.try_enter())
     }
 
     /// Fence all registered polls while `commit` discovers and persists its
@@ -198,6 +249,26 @@ mod tests {
         assert!(first.try_enter().is_none());
         drop(lease);
         assert!(controls.get(id).callback_start.try_enter().is_some());
+    }
+
+    #[test]
+    fn first_poll_holds_only_target_start_lease_and_releases_it() {
+        let controls = ConversationControls::default();
+        let id = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let lease = controls.try_callback_start(id).unwrap().unwrap();
+        assert!(controls.try_callback_start(id).unwrap().is_none());
+        assert!(controls.try_callback_start(other).unwrap().is_some());
+        let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+            // Reentrant acquisition returns immediately; a distinct graph is
+            // not blocked and no controls registry lock is held while polling.
+            assert!(controls.try_callback_start(id).unwrap().is_none());
+            assert!(controls.try_callback_start(other).unwrap().is_some());
+            std::task::Poll::<()>::Pending
+        }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(lease.poll_first(future.as_mut(), &mut context).is_pending());
+        assert!(controls.try_callback_start(id).unwrap().is_some());
     }
 
     #[test]

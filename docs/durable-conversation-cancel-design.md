@@ -63,6 +63,13 @@ connected. Some of those compose task and document writes or use the blocking
 conversation fence; their lock ordering and retry owners still need separate
 verification before dispatch can be enabled.
 
+A nonblocking target-specific start lease can bracket exactly the first poll
+of a future without holding registry, task or poll mutexes. It is a primitive
+only: callback dispatch and most mutation paths do not yet use it. Existing
+`try_fence` still acquires all registered start gates and can defer unrelated
+graphs; blocking abort and signal delivery are not protected by this primitive.
+The task wake and signal revision must be checked before dispatch is enabled.
+
 A safe implementation needs all of the following before dispatch is enabled:
 
 * Bind the callback identity, retry policy, Tool identity and selected hook
