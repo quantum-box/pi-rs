@@ -9329,6 +9329,40 @@ mod tests {
             }
         }
     }
+    // Ensure the Any wake happens only after the grandchild has started.
+    // This makes the intended child-first cleanup state independent of dispatch order.
+    struct RestartGatedFast(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for RestartGatedFast {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "immediate".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for RestartGatedFast {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            context: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            while !self.0.join("tool-start").exists() {
+                tokio::select! {
+                    _ = context.cancellation.cancelled() => return Err("cancelled".into()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => (),
+                }
+            }
+            Ok(DurableToolStep::Complete(Outcome::Succeeded("done".into())))
+        }
+    }
     fn restart_child_host(
         root: &std::path::Path,
     ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
@@ -9372,7 +9406,7 @@ mod tests {
             .unwrap();
         let fast = host
             .register_replay_safe_durable_tool_with_hook(
-                Arc::new(ImmediateDurable(Arc::new(AtomicUsize::new(0)))),
+                Arc::new(RestartGatedFast(root.to_owned())),
                 "fast-v1",
                 1,
                 vec![],
@@ -9410,16 +9444,25 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("async_task_tool::tests::restart_after_waits_for_owned_child_abort_cleanup")
-            .env(ENV, root)
-            .spawn()
-            .unwrap();
+        struct KillChild(std::process::Child);
+        impl Drop for KillChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut process = KillChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("async_task_tool::tests::restart_after_waits_for_owned_child_abort_cleanup")
+                .env(ENV, root)
+                .spawn()
+                .unwrap(),
+        );
         wait_file(&root.join("tool-start"));
         wait_file(&root.join("parent-woken"));
-        process.kill().unwrap();
-        process.wait().unwrap();
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
         let id: Uuid = std::fs::read_to_string(root.join("task-id"))
             .unwrap()
             .parse()
