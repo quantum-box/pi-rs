@@ -215,6 +215,285 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
+    if case.starts_with("start_") {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let case_name = case.to_owned();
+        let writer_path = path.clone();
+        let hook_reached = Arc::new(AtomicBool::new(false));
+        let reached = hook_reached.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_hook = finished.clone();
+        crate::task_scheduler::on_conversation_start_result(root_id, move || {
+            finished_hook.store(true, Ordering::SeqCst);
+        });
+        let identity = identity_handle.clone();
+        let other = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        crate::task_scheduler::enable_test_conversation_start(root_id);
+        if case == "start_legacy" {
+            let after_path = path.clone();
+            let legacy_reached = hook_reached.clone();
+            crate::task_scheduler::on_conversation_claim_after_commit(root_id, move || {
+                let writer = durable_store::Store::open(&after_path).unwrap();
+                let key = format!(
+                    "durable/replay-safe-async/{root_id}/conversation-park-cancel-signals-v1"
+                )
+                .into_bytes();
+                let entry = writer.get(&key).unwrap().unwrap();
+                writer
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        }],
+                        &[durable_store::Mutation::Delete { key }],
+                    )
+                    .unwrap();
+                legacy_reached.store(true, Ordering::SeqCst);
+            });
+        }
+        if case == "start_signal_after_claim" || case == "start_task_signal_after_claim" {
+            let after_path = path.clone();
+            let after_case = case.to_owned();
+            crate::task_scheduler::on_conversation_claim_after_commit(root_id, move || {
+                let writer = durable_store::Store::open(&after_path).unwrap();
+                if after_case == "start_signal_after_claim" {
+                    let signal = crate::conversation_signal::Signal::new(
+                        uuid::Uuid::new_v4(),
+                        conversation,
+                        "after-claim".into(),
+                        json!(1),
+                    );
+                    let result = crate::conversation_signal::Inbox::new(&writer).send(&signal);
+                    assert!(
+                        result.is_ok()
+                            || matches!(result, Err(crate::conversation_signal::Error::Closed))
+                    );
+                } else {
+                    let signal = crate::task_store::Signal::new(
+                        uuid::Uuid::new_v4(),
+                        root_id,
+                        "after-claim".into(),
+                        json!(1),
+                    );
+                    crate::task_store::TaskStore::new(&writer)
+                        .send_signal(&signal)
+                        .unwrap();
+                }
+            });
+        }
+        crate::task_scheduler::on_conversation_start_before_commit(root_id, move || {
+            let writer = durable_store::Store::open(&writer_path).unwrap();
+            match case_name.as_str() {
+                "start_signal_after_claim" | "start_task_signal_after_claim" => (),
+                "start_ok" => {
+                    use futures_util::FutureExt;
+                    let result = identity
+                        .update(Some("changed".into()), || {})
+                        .now_or_never()
+                        .expect("identity update must not wait");
+                    assert!(result.is_err());
+                }
+                "start_owner" => {
+                    let key = crate::task_store::key(root_id);
+                    let entry = writer.get(&key).unwrap().unwrap();
+                    let mut value: Value = serde_json::from_slice(&entry.value).unwrap();
+                    value["owner"] = json!({"Conversation": uuid::Uuid::new_v4()});
+                    writer
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: serde_json::to_vec(&value).unwrap(),
+                            }],
+                        )
+                        .unwrap();
+                }
+                "start_abort" => {
+                    let key = format!("runtime/conversation/{conversation}").into_bytes();
+                    let entry = writer.get(&key).unwrap().unwrap();
+                    let mut value: Value = serde_json::from_slice(&entry.value).unwrap();
+                    value["abort_requested"] = json!(true);
+                    writer
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: serde_json::to_vec(&value).unwrap(),
+                            }],
+                        )
+                        .unwrap();
+                }
+                "start_signal" => {
+                    let signal = crate::conversation_signal::Signal::new(
+                        uuid::Uuid::new_v4(),
+                        conversation,
+                        "start-race".into(),
+                        json!(1),
+                    );
+                    let result = crate::conversation_signal::Inbox::new(&writer).send(&signal);
+                    assert!(
+                        result.is_ok()
+                            || matches!(result, Err(crate::conversation_signal::Error::Closed))
+                    );
+                }
+                "start_task_signal" => {
+                    let signal = crate::task_store::Signal::new(
+                        uuid::Uuid::new_v4(),
+                        root_id,
+                        "start-race".into(),
+                        json!(1),
+                    );
+                    crate::task_store::TaskStore::new(&writer)
+                        .send_signal(&signal)
+                        .unwrap();
+                }
+                "start_child" => {
+                    let child = pi_rs_durable::task::Task::new(
+                        uuid::Uuid::new_v4(),
+                        pi_rs_durable::task::TaskOwner::Task(root_id),
+                        pi_rs_durable::task::Checkpoint {
+                            phase: "initial".into(),
+                            data: json!({}),
+                        },
+                        3,
+                    )
+                    .unwrap()
+                    .registered("foreign".into(), true);
+                    let key = crate::task_store::key(child.id());
+                    writer
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Missing,
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: serde_json::to_vec(&child).unwrap(),
+                            }],
+                        )
+                        .unwrap();
+                }
+                _ => panic!("unknown start case"),
+            }
+            reached.store(true, Ordering::SeqCst);
+        });
+        scheduler.abort_task(root_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !hook_reached.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let conversation_marker_key = format!("runtime/conversation-callback-start/{conversation}");
+        let task_marker_key = format!("durable/task-callback-start/{root_id}");
+        if case == "start_ok" {
+            let marker = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(entry) = store.get(conversation_marker_key.as_bytes()).unwrap() {
+                        break entry.value;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .get(task_marker_key.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                marker
+            );
+            if std::env::var_os("PI_TEST_START_MARKER_KILL").is_some() {
+                let directory = std::path::PathBuf::from(
+                    std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
+                );
+                let temporary = directory.join("start-ready.tmp");
+                std::fs::write(
+                    &temporary,
+                    serde_json::to_vec(&json!({"conversation": conversation, "task": root_id}))
+                        .unwrap(),
+                )
+                .unwrap();
+                std::fs::rename(temporary, directory.join("start-ready")).unwrap();
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
+            let signal = crate::conversation_signal::Signal::new(
+                uuid::Uuid::new_v4(),
+                conversation,
+                "blocked".into(),
+                json!(1),
+            );
+            assert!(matches!(
+                crate::conversation_signal::Inbox::new(&store).send(&signal),
+                Err(crate::conversation_signal::Error::CallbackStartBusy)
+            ));
+            let task_signal = crate::task_store::Signal::new(
+                uuid::Uuid::new_v4(),
+                root_id,
+                "blocked".into(),
+                json!(1),
+            );
+            assert!(matches!(
+                tasks.send_signal(&task_signal),
+                Err(crate::task_store::Error::CallbackStartBusy)
+            ));
+            let other_signal = crate::conversation_signal::Signal::new(
+                uuid::Uuid::new_v4(),
+                other,
+                "allowed".into(),
+                json!(1),
+            );
+            scheduler.send_signal(&other_signal).unwrap();
+            let conv_finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+                &store,
+                conversation,
+                &marker,
+            )
+            .unwrap();
+            let task_finish =
+                crate::task_store::prepare_callback_finish_task_fence(&store, root_id, &marker)
+                    .unwrap();
+            let mut checks = conv_finish.checks;
+            checks.extend(task_finish.checks);
+            let mut mutations = conv_finish.mutations;
+            mutations.extend(task_finish.mutations);
+            store.commit(&checks, &mutations).unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !finished.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .get(conversation_marker_key.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(store.get(task_marker_key.as_bytes()).unwrap().is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+        return;
+    }
     if case == "kill_after_claim" {
         let directory = std::path::PathBuf::from(
             std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
@@ -681,6 +960,98 @@ async fn exercise_conversation_park_claim(case: &str) {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let _ = driver.shutdown_with_pending().unwrap();
+}
+
+#[tokio::test]
+async fn conversation_start_marker_kill_worker() {
+    if std::env::var_os("PI_TEST_START_MARKER_KILL").is_some() {
+        exercise_conversation_park_claim("start_ok").await;
+    }
+}
+
+#[tokio::test]
+async fn conversation_start_markers_survive_process_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("conversation_claim_boundary_tests::conversation_start_marker_kill_worker")
+        .arg("--nocapture")
+        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+        .env("PI_TEST_START_MARKER_KILL", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = dir.path().join("start-ready");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("marker worker exited before ready: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "marker worker timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+    let conversation: uuid::Uuid = serde_json::from_value(value["conversation"].clone()).unwrap();
+    let task: uuid::Uuid = serde_json::from_value(value["task"].clone()).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let conv_marker = store
+        .get(format!("runtime/conversation-callback-start/{conversation}").as_bytes())
+        .unwrap()
+        .unwrap();
+    let task_marker = store
+        .get(format!("durable/task-callback-start/{task}").as_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(conv_marker.value, task_marker.value);
+    let marker: Value = serde_json::from_slice(&conv_marker.value).unwrap();
+    let evidence_key =
+        format!("durable/replay-safe-async/{task}/conversation-park-cancel-signals-v1");
+    let evidence: Value =
+        serde_json::from_slice(&store.get(evidence_key.as_bytes()).unwrap().unwrap().value)
+            .unwrap();
+    assert_eq!(evidence["version"], json!(1));
+    assert_eq!(evidence["claim_id"], marker["claim_id"]);
+    assert_eq!(evidence["task"], json!(task));
+    assert_eq!(evidence["conversation"], json!(conversation));
+    let signal = crate::conversation_signal::Signal::new(
+        uuid::Uuid::new_v4(),
+        conversation,
+        "after-kill".into(),
+        json!(1),
+    );
+    assert!(matches!(
+        crate::conversation_signal::Inbox::new(&store).send(&signal),
+        Err(crate::conversation_signal::Error::CallbackStartBusy)
+    ));
+    let task_signal =
+        crate::task_store::Signal::new(uuid::Uuid::new_v4(), task, "after-kill".into(), json!(1));
+    assert!(matches!(
+        crate::task_store::TaskStore::new(&store).send_signal(&task_signal),
+        Err(crate::task_store::Error::CallbackStartBusy)
+    ));
+}
+
+#[tokio::test]
+async fn conversation_start_marker_transaction_fences_real_driver_races() {
+    for case in [
+        "start_ok",
+        "start_owner",
+        "start_abort",
+        "start_signal",
+        "start_task_signal",
+        "start_signal_after_claim",
+        "start_task_signal_after_claim",
+        "start_child",
+        "start_legacy",
+    ] {
+        exercise_conversation_park_claim(case).await;
+    }
 }
 
 #[tokio::test]

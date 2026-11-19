@@ -1703,6 +1703,31 @@ impl Handler for Executor {
             let _claim = admission
                 .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
             #[cfg(test)]
+            if crate::task_scheduler::take_test_conversation_start(task.id()) {
+                let result = admission.record_conversation_start_markers(
+                    self,
+                    _claim.claim_id,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                );
+                crate::task_scheduler::report_conversation_start_result(task.id());
+                result?;
+                if admission
+                    .record_conversation_start_markers(
+                        self,
+                        _claim.claim_id,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )
+                    .is_ok()
+                {
+                    return Err("duplicate start markers accepted".into());
+                }
+                return Err("test start evidence only; callback remains disabled".into());
+            }
+            #[cfg(test)]
             if crate::task_scheduler::take_test_conversation_receipt(task.id()) {
                 // A successful claim is single-use even when the same live
                 // attempt tries to acquire it again before any callback runs.

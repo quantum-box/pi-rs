@@ -124,12 +124,25 @@ global poll fence; full graph marker coverage and the composed callback start
 transaction remain unconnected. Callback dispatch remains disabled until
 every boundary and retry path is complete.
 
-The pre-dispatch conversation cancel claim transaction also checks the root
-task signal revision and conversation signal revision. A public Inbox or task
-signal write racing that claim makes it fail closed. The evidence does not
-fence a signal committed after the claim and before a future callback first
-poll; a separate callback-start transaction and retry protocol are still
-required.
+The pre-dispatch conversation cancel claim transaction checks the root task
+signal revision and conversation signal revision and stores a versioned sidecar
+with those observations. The separate start-marker transaction rechecks that
+sidecar, the live claim, attempt and identity lease, conversation and selection,
+park proof, late outcome, and child graph; it commits the conversation and task
+markers together. A public Inbox or task signal write after the claim makes the
+start transaction fail closed. Claims created by an older version without the
+sidecar require reconciliation and cannot create start markers.
+
+A test-only driver route exercises marker creation without polling a callback.
+An actual process-kill test reopens the Store and verifies that both markers
+remain equal and continue to block the corresponding Inbox and task signal.
+It does not establish callback execution or recovery after dispatch.
+
+The start markers are evidence and gate cooperating writes; they are not an
+execution claim. Their creation and retirement must not be used to dispatch or
+re-dispatch a callback. Callback dispatch and the at-most-once first-poll
+protocol remain disabled, and direct raw Store modifications remain outside
+the cooperating host trust boundary.
 
 The `Scheduler::schedule` worker also fences its ModelReady-to-ModelRunning
 save before model dispatch. Busy leaves the durable state unchanged and retries

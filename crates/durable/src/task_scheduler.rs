@@ -245,6 +245,23 @@ pub(crate) struct ConversationCancelClaim {
     pub policy: crate::async_task_tool::ConversationCancelPolicy,
 }
 
+/// Signal revisions observed by the claim transaction. Missing legacy evidence
+/// cannot authorize a callback-start transaction and requires reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationCancelSignalEvidence {
+    version: u32,
+    claim_id: Uuid,
+    conversation: Uuid,
+    task: Uuid,
+    conversation_revision: Option<u64>,
+    task_revision: Option<u64>,
+}
+
+fn conversation_cancel_signal_evidence_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/conversation-park-cancel-signals-v1").into_bytes()
+}
+
 /// A receipt binds a reported cancellation result to the complete claim. It
 /// does not itself establish that the callback was dispatched or completed.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1617,6 +1634,49 @@ pub(crate) fn on_reservation_before_update(id: Uuid, hook: impl FnOnce() + Send 
         .insert(id, Box::new(hook));
 }
 #[cfg(test)]
+fn conversation_start_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_start_before_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_start_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn conversation_start_result_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_start_result(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_start_result_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+pub(crate) fn report_conversation_start_result(id: Uuid) {
+    conversation_start_hooks().lock().unwrap().remove(&id);
+    invoke_boundary(conversation_start_result_hooks(), id);
+}
+#[cfg(test)]
+fn test_start_tasks() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn enable_test_conversation_start(id: Uuid) {
+    test_start_tasks().lock().unwrap().insert(id);
+}
+#[cfg(test)]
+pub(crate) fn take_test_conversation_start(id: Uuid) -> bool {
+    test_start_tasks().lock().unwrap().remove(&id)
+}
+
+#[cfg(test)]
 fn conversation_claim_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
     HOOKS.get_or_init(Default::default)
@@ -2744,16 +2804,32 @@ impl AdmissionHandle<'_> {
         // Signal delivery may bypass the Harness gate. Fence both revisions in
         // the claim transaction itself; this alone does not authorize callback
         // dispatch after the claim commit.
-        for key in [
-            crate::conversation_signal::revision(*conversation),
-            task_store::signal_revision_key(current.task.id()),
+        let conversation_revision = owner
+            .store()
+            .get(&crate::conversation_signal::revision(*conversation))
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.version);
+        let task_revision = owner
+            .store()
+            .get(&task_store::signal_revision_key(current.task.id()))
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.version);
+        for (key, version) in [
+            (
+                crate::conversation_signal::revision(*conversation),
+                conversation_revision,
+            ),
+            (
+                task_store::signal_revision_key(current.task.id()),
+                task_revision,
+            ),
         ] {
-            let entry = owner.store().get(&key).map_err(|e| e.to_string())?;
             checks.push(durable_store::Check {
                 key,
-                expected: entry.map_or(durable_store::Expected::Missing, |entry| {
-                    durable_store::Expected::Version(entry.version)
-                }),
+                expected: version.map_or(
+                    durable_store::Expected::Missing,
+                    durable_store::Expected::Version,
+                ),
             });
         }
         let key = conversation_cancel_claim_key(current.task.id());
@@ -2772,6 +2848,19 @@ impl AdmissionHandle<'_> {
             checkpoint: current.task.checkpoint().clone(),
             policy,
         };
+        let signal_evidence_key = conversation_cancel_signal_evidence_key(current.task.id());
+        checks.push(durable_store::Check {
+            key: signal_evidence_key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        let signal_evidence = ConversationCancelSignalEvidence {
+            version: 1,
+            claim_id: record.claim_id,
+            conversation: *conversation,
+            task: current.task.id(),
+            conversation_revision,
+            task_revision,
+        };
         #[cfg(test)]
         if let Some(hook) = conversation_claim_hooks()
             .lock()
@@ -2784,10 +2873,16 @@ impl AdmissionHandle<'_> {
             .store()
             .commit_with_prefix_put_fence(
                 &checks,
-                &[durable_store::Mutation::Put {
-                    key,
-                    value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
-                }],
+                &[
+                    durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                    },
+                    durable_store::Mutation::Put {
+                        key: signal_evidence_key,
+                        value: serde_json::to_vec(&signal_evidence).map_err(|e| e.to_string())?,
+                    },
+                ],
                 &[
                     task_store::PREFIX,
                     crate::ownership_edge::PREFIX,
@@ -2806,6 +2901,178 @@ impl AdmissionHandle<'_> {
         }
         commit?;
         Ok(record)
+    }
+
+    /// Persist both signal-start markers against one live, identity-bound
+    /// conversation cancellation claim. This transaction is evidence only:
+    /// it does not grant callback execution or provide at-most-once dispatch.
+    #[allow(dead_code)]
+    pub(crate) fn record_conversation_start_markers(
+        &self,
+        handler: &dyn Handler,
+        claim_id: Uuid,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        policy: crate::async_task_tool::ConversationCancelPolicy,
+    ) -> Result<Vec<u8>, String> {
+        if identity_lease.as_deref() != Some(expected_identity)
+            || !self.abort
+            || self.standalone
+            || self.lease.retired
+        {
+            return Err("invalid conversation start lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale start attempt or live child".into());
+        }
+        let TaskOwner::Conversation(conversation) = current.task.owner() else {
+            return Err("start root owner changed".into());
+        };
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation start registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
+            owner.store(),
+            &current.task,
+            boundary,
+        )?);
+        let (claim, claim_check) =
+            read_conversation_cancel_claim(owner.store(), current.task.id(), attempt, claim_id)?
+                .ok_or("missing claim")?;
+        if claim.lease != self.lease.token
+            || claim.policy != policy
+            || claim.checkpoint != *current.task.checkpoint()
+        {
+            return Err("conversation start claim mismatch".into());
+        }
+        checks.push(claim_check);
+        let evidence_key = conversation_cancel_signal_evidence_key(current.task.id());
+        let evidence_entry = owner
+            .store()
+            .get(&evidence_key)
+            .map_err(|e| e.to_string())?
+            .ok_or("legacy claim lacks signal evidence")?;
+        let evidence: ConversationCancelSignalEvidence =
+            serde_json::from_slice(&evidence_entry.value).map_err(|_| "invalid signal evidence")?;
+        if evidence.version != 1
+            || evidence.claim_id != claim_id
+            || evidence.conversation != *conversation
+            || evidence.task != current.task.id()
+        {
+            return Err("conversation start signal evidence mismatch".into());
+        }
+        checks.push(durable_store::Check {
+            key: evidence_key,
+            expected: durable_store::Expected::Version(evidence_entry.version),
+        });
+        for (key, revision) in [
+            (
+                crate::conversation_signal::revision(*conversation),
+                evidence.conversation_revision,
+            ),
+            (
+                task_store::signal_revision_key(current.task.id()),
+                evidence.task_revision,
+            ),
+        ] {
+            checks.push(durable_store::Check {
+                key,
+                expected: revision.map_or(
+                    durable_store::Expected::Missing,
+                    durable_store::Expected::Version,
+                ),
+            });
+        }
+        let marker = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "claim_id": claim.claim_id,
+            "task": claim.task,
+            "attempt": claim.attempt,
+            "lease": claim.lease,
+            "policy": claim.policy,
+        }))
+        .map_err(|e| e.to_string())?;
+        let conversation_start = crate::conversation_signal::prepare_callback_start_signal_fence(
+            owner.store(),
+            *conversation,
+            &marker,
+        )
+        .map_err(|e| e.to_string())?;
+        let task_start = task_store::prepare_callback_start_task_fence(
+            owner.store(),
+            current.task.id(),
+            &marker,
+        )
+        .map_err(|e| e.to_string())?;
+        checks.extend(conversation_start.checks);
+        checks.extend(task_start.checks);
+        let mut mutations = conversation_start.mutations;
+        mutations.extend(task_start.mutations);
+        #[cfg(test)]
+        invoke_boundary(conversation_start_hooks(), current.task.id());
+        let result = owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &mutations,
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string());
+        result?;
+        Ok(marker)
     }
 
     /// Persist test evidence while the original cleanup attempt and all of
