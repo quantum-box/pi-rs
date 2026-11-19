@@ -3168,6 +3168,7 @@ fn checkpointable_root_binding_key(task: Uuid) -> Vec<u8> {
 }
 
 struct TaskResultFence {
+    rich: Option<crate::extension::ToolBlockResult>,
     task: crate::task::Task,
     check: Check,
     binding: Option<Check>,
@@ -5016,6 +5017,115 @@ impl Harness {
                 blocks: vec![serde_json::json!({"type":"text","text":content})],
             },
         );
+        Ok(())
+    }
+    // The task's final after result is already fenced and bounded. Publish its
+    // complete channels directly: the normal ToolFinished chain would rerun hooks.
+    fn append_checkpointable_hook_result(
+        &self,
+        c: &mut Conversation,
+        calls: &[ToolCall],
+        index: usize,
+        operation_id: Uuid,
+        mut result: crate::extension::ToolBlockResult,
+    ) -> Result<(), Error> {
+        let call = calls
+            .get(index)
+            .ok_or_else(|| Error::Invalid("invalid tool result index".into()))?;
+        if c.tool_results
+            .iter()
+            .any(|m| m.operation_id == operation_id)
+        {
+            return Err(Error::Invalid(
+                "duplicate checkpointable tool result".into(),
+            ));
+        }
+        let attachments = result
+            .extra
+            .get("attachments")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let mut metadata = ToolResultMetadata {
+            operation_id,
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            content_block_id: None,
+            is_error: result
+                .extra
+                .get("isError")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| Error::Invalid("missing checkpointable result status".into()))?,
+            redacted: false,
+            metadata_truncated: false,
+            schema_validated: false,
+            details: result.extra.get("details").cloned(),
+            structured_output: result.extra.get("structuredOutput").cloned(),
+            attachments,
+            diagnostics: result.diagnostics,
+        };
+        validate_tool_metadata(&c.tool_filters, &mut metadata);
+        // The saved result does not retain diagnostic provenance. Conservatively
+        // withhold derived failure reasons from model text: an after hook may
+        // have replaced the output to redact them. The host still retains them.
+        let withheld: Vec<_> = metadata
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code.as_deref(),
+                    Some(
+                        "blocked"
+                            | "invalid_arguments"
+                            | "tool_unavailable"
+                            | "tool_failed"
+                            | "tool_skipped"
+                    )
+                )
+            })
+            .cloned()
+            .collect();
+        if let Some(diagnostic) = render_metadata_diagnostics(&metadata, &withheld) {
+            if result.output.len() == 1
+                && result.output[0].as_object().is_some_and(|o| o.len() == 2)
+                && result.output[0]["type"] == "text"
+            {
+                let mut text = result.output[0]["text"]
+                    .as_str()
+                    .ok_or_else(|| Error::Invalid("invalid result text".into()))?
+                    .to_owned();
+                append_diagnostic_text(&mut text, &diagnostic);
+                result.output[0]["text"] = text.into();
+            } else {
+                result
+                    .output
+                    .push(serde_json::json!({"type":"text", "text":diagnostic}));
+            }
+        }
+        let simple = result.output.len() == 1
+            && result.output[0].as_object().is_some_and(|o| o.len() == 2)
+            && result.output[0]["type"] == "text";
+        if simple && !self.status_aware(c) {
+            let text = result.output[0]["text"]
+                .as_str()
+                .ok_or_else(|| Error::Invalid("invalid result text".into()))?
+                .to_owned();
+            append_tool(c, calls, index, text)?;
+        } else {
+            let position = c.messages.len();
+            append_tool(c, calls, index, String::new())?;
+            let message_id = Uuid::new_v4();
+            metadata.content_block_id = Some(message_id);
+            c.content_blocks.insert(
+                position,
+                crate::transcript::MessageContentBlocks {
+                    message_id,
+                    blocks: result.output,
+                },
+            );
+        }
+        c.tool_results.push(metadata);
+        c.pending_diagnostic_provenance = None;
         Ok(())
     }
     fn append_skipped_with_status(
@@ -14904,6 +15014,7 @@ impl Harness {
         } else {
             None
         };
+        let mut rich_result = None;
         let outcome = match child.task.state() {
             crate::task::TaskState::Succeeded(value)
                 if child.task.kind() == Some(crate::foreground_subagent::KIND)
@@ -14928,27 +15039,13 @@ impl Harness {
                         "missing checkpointable after-hook result".into(),
                     ));
                 };
-                if result.output.len() != 1
-                    || result.output[0].as_object().is_none_or(|o| o.len() != 2)
-                    || result.output[0]
-                        .get("type")
-                        .and_then(serde_json::Value::as_str)
-                        != Some("text")
-                    || result.extra.len() != 1
-                    || result.extra.get("isError") != Some(&serde_json::Value::Bool(false))
-                    || !result.diagnostics.is_empty()
-                {
-                    return Err(Error::Invalid(
-                        "unsupported checkpointable hook result channels".into(),
-                    ));
-                }
-                Some(Outcome::Succeeded(
-                    result.output[0]
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| Error::Invalid("invalid checkpointable hook text".into()))?
-                        .to_owned(),
-                ))
+                crate::async_task_tool::validate_content_hook_result(&result, None, false)
+                    .map_err(|e| {
+                        Error::Invalid(format!("invalid checkpointable hook result: {e}"))
+                    })?;
+                rich_result = Some(result);
+                // The final status and content are carried by the checked rich result.
+                Some(Outcome::Succeeded(String::new()))
             }
             crate::task::TaskState::Succeeded(value) if identity.is_checkpointable() => {
                 let outcome: Outcome = serde_json::from_value(value.clone())
@@ -14976,6 +15073,7 @@ impl Harness {
             (
                 outcome,
                 TaskResultFence {
+                    rich: rich_result,
                     task: child.task.clone(),
                     binding: binding_check,
                     check: Check {
@@ -15322,8 +15420,25 @@ impl Harness {
                         })?,
                     )?
                     .ok_or_else(|| Error::Invalid("task-backed tool cleanup incomplete".into()))?;
+                let rich = check.rich.clone();
                 task_result_check = Some(check);
-                if let Outcome::Unknown(reason) = outcome {
+                if let Some(result) = rich {
+                    self.append_checkpointable_hook_result(
+                        &mut c,
+                        &calls,
+                        index,
+                        operation_id,
+                        result,
+                    )?;
+                    for i in index + 1..calls.len() {
+                        self.append_skipped_with_status(
+                            &mut c,
+                            &calls,
+                            i,
+                            "aborted before dispatch",
+                        )?;
+                    }
+                } else if let Outcome::Unknown(reason) = outcome {
                     c.phase = Phase::Blocked {
                         tool_panicked: false,
                         turns,
@@ -19174,17 +19289,14 @@ impl Harness {
                     } else {
                         outcome
                     };
-                    if hooked && !matches!(outcome, Outcome::Unknown(_)) {
-                        record_tool_result(
+                    if let Some(result) = task_check.rich.clone() {
+                        self.append_checkpointable_hook_result(
                             &mut c,
                             &calls,
                             index,
                             operation_id,
-                            &outcome,
-                            Vec::new(),
+                            result,
                         )?;
-                        let content = model_tool_content(&c.tool_filters, &calls, index, &outcome);
-                        self.append_tool_with_status(&mut c, &calls, index, operation_id, content)?;
                         c.pending_diagnostic_provenance = None;
                         c.phase = Phase::Tools {
                             turns,

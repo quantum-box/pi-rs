@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 mod replay_safe;
 pub(crate) use replay_safe::invalid_raw_checkpoint;
+pub(crate) use replay_safe::validate_content_hook_result;
 pub(crate) mod unsafe_park_proof;
 pub(crate) use replay_safe::park_cancel_provenance_checks;
 pub use replay_safe::{
@@ -51,8 +52,8 @@ impl ReplaySafeConversationHooksAuthorization {
 
 /// Register one identified replay-safe hook for conversation checkpointable
 /// execution. Every checkpointable child must use the same selected registration.
-/// Conversation publication currently supports only a single plain-text successful
-/// after result without extra metadata or diagnostics; other results fail closed.
+/// Final bounded after results, including blocks, metadata and diagnostics, are
+/// committed to the conversation without running the ordinary after chain again.
 /// The supplied snapshot and Harness registry must share the exact registration.
 #[allow(clippy::too_many_arguments)]
 pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(

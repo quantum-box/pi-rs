@@ -673,7 +673,7 @@ fn bounded_diagnostic(message: &str) -> String {
     message[..end].to_owned()
 }
 
-pub(super) fn validate_content_hook_result(
+pub(crate) fn validate_content_hook_result(
     result: &crate::extension::ToolBlockResult,
     required: Option<&crate::runtime::ToolDiagnostic>,
     initial: bool,

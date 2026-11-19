@@ -828,7 +828,94 @@ async fn selection_change_during_hook_fences_memo_and_publication() {
     }
 }
 
-struct RichHook;
+struct RichAdapter;
+#[async_trait]
+impl pi_rs_durable::model::ProviderAdapter for RichAdapter {
+    fn id(&self) -> &str {
+        "rich-fixture/v1"
+    }
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+    ) -> Result<Value, Error> {
+        Ok(json!({"tool_blocks":{}}))
+    }
+    fn validate(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+        _: &Value,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        r: &pi_rs_durable::model::DurableToolRequest,
+    ) -> Result<Value, Error> {
+        r.validate_bindings()?;
+        Ok(json!({"tool_blocks":r.tool_blocks}))
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        r: &pi_rs_durable::model::DurableToolRequest,
+        body: &Value,
+    ) -> Result<(), Error> {
+        r.validate_bindings()?;
+        if body["tool_blocks"] != json!(r.tool_blocks) {
+            return Err(Error::Config("blocks changed".into()));
+        }
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+        body: Value,
+    ) -> Result<ModelStream, Error> {
+        let done = !body["tool_blocks"].as_object().unwrap().is_empty();
+        if done {
+            let binding = body["tool_blocks"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(binding["blocks"][0]["text"], "first");
+            assert_eq!(binding["blocks"][1]["text"], "second");
+            let encoded = binding.to_string();
+            assert!(encoded.contains("hook diagnostic"));
+            assert!(!encoded.contains("blocked by policy"));
+            assert!(!encoded.contains("tool failure"));
+        }
+        if done && let Some(path) = std::env::var_os("PI_RICH_AFTER_READY") {
+            std::fs::write(path, "ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+            calls: if done {
+                vec![]
+            } else {
+                vec![ToolCall {
+                    id: "call".into(),
+                    name: "root".into(),
+                    arguments: "{}".into(),
+                }]
+            },
+            usage: None,
+        })])
+        .boxed())
+    }
+}
+struct RichHook {
+    mode: &'static str,
+    after: Arc<AtomicUsize>,
+}
 #[async_trait]
 impl Hook for RichHook {
     async fn before_tool(
@@ -836,6 +923,9 @@ impl Hook for RichHook {
         call: &pi_rs_durable::extension::ToolCall,
         _: &Context<'_>,
     ) -> Result<BeforeTool, String> {
+        if self.mode == "block" {
+            return Ok(BeforeTool::Block("blocked by policy".into()));
+        }
         let mut args = call.arguments.clone();
         args["prepared_by_hook"] = json!(true);
         Ok(BeforeTool::Rewrite(args))
@@ -845,23 +935,93 @@ impl Hook for RichHook {
         _: &pi_rs_durable::extension::ToolCall,
         result: &pi_rs_durable::extension::ToolBlockResult,
         _: bool,
-        _: &Context<'_>,
+        ctx: &Context<'_>,
     ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        assert_eq!(
+            ctx.memo
+                .get_or_insert("rich-after", json!("stable"))
+                .await?,
+            json!("stable")
+        );
+        self.after.fetch_add(1, Ordering::SeqCst);
         let mut result = result.clone();
-        result.output.push(json!({"type":"text","text":"second"}));
+        result.output = vec![
+            json!({"type":"text","text":"first"}),
+            json!({"type":"text","text":"second"}),
+        ];
+        result.extra.insert("details".into(), json!({"kept":true}));
+        result
+            .extra
+            .insert("structuredOutput".into(), json!({"value":7}));
+        result.extra.insert(
+            "attachments".into(),
+            json!([{"id":"ref-1","media_type":"text/plain"}]),
+        );
+        result
+            .diagnostics
+            .push(pi_rs_durable::runtime::ToolDiagnostic {
+                severity: pi_rs_durable::runtime::DiagnosticSeverity::Warn,
+                message: "hook diagnostic".into(),
+                code: Some("hook_note".into()),
+            });
         Ok(Some(result))
     }
 }
-#[tokio::test]
-async fn unsupported_multi_block_result_is_not_published_as_success() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db");
+struct ErrorJob {
+    mode: &'static str,
+    executions: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Tool for ErrorJob {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "root".into(),
+            description: String::new(),
+            parameters: if self.mode == "schema" {
+                json!({"type":"object","required":["required"]})
+            } else {
+                json!({"type":"object"})
+            },
+        }
+    }
+    async fn prepare_arguments(&self, args: Value) -> pi_rs_core::ExtensionResult<Value> {
+        Ok(args)
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for ErrorJob {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(DurableToolStep::Complete(if self.mode == "failure" {
+            Outcome::Failed("tool failure".into())
+        } else {
+            Outcome::Succeeded("ok".into())
+        }))
+    }
+}
+fn setup_rich(
+    mode: &'static str,
+    after: Arc<AtomicUsize>,
+    executions: Arc<AtomicUsize>,
+) -> (Options, Registry, pi_rs_durable::extension::Registry) {
     let mut extensions = pi_rs_durable::extension::Registry::default();
     extensions
         .install_identified(
             Extension {
                 name: "policy".into(),
-                hooks: vec![Arc::new(RichHook)],
+                hooks: vec![Arc::new(RichHook {
+                    mode,
+                    after: after.clone(),
+                })],
                 ..Default::default()
             },
             ExtensionIdentity::new(1, "rich-v1".into(), vec!["hook-v1".into()]).unwrap(),
@@ -870,10 +1030,9 @@ async fn unsupported_multi_block_result_is_not_published_as_success() {
     let mut registry = Registry::default();
     let root = register_conversation_replay_safe_durable_tool_with_selected_hooks(
         &mut registry,
-        Arc::new(Job {
-            name: "root",
-            child: None,
-            executions: Arc::new(AtomicUsize::new(0)),
+        Arc::new(ErrorJob {
+            mode,
+            executions: executions.clone(),
         }),
         "root",
         1,
@@ -891,30 +1050,197 @@ async fn unsupported_multi_block_result_is_not_published_as_success() {
         max_turns: 4,
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
-    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
-    let driver = scheduler.start_tasks(registry).unwrap();
+    (options, registry, extensions)
+}
+#[tokio::test]
+async fn selected_after_rich_and_error_results_resume_conversation() {
+    for mode in ["success", "failure", "block", "schema"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let after = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (options, registry, extensions) = setup_rich(mode, after.clone(), executions.clone());
+        let mut scheduler = Scheduler::open_with_provider_adapter(
+            &path,
+            options,
+            extensions,
+            Arc::new(RichAdapter),
+        )
+        .unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.select_provider_adapter(id, true).unwrap();
+        scheduler
+            .select_extensions(id, vec!["policy".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let c = scheduler.conversation(id).unwrap();
+        let meta = &c.tool_results[0];
+        assert_eq!(meta.is_error, mode != "success", "{mode}");
+        assert_eq!(meta.details, Some(json!({"kept":true})), "{mode}");
+        assert_eq!(meta.structured_output, Some(json!({"value":7})), "{mode}");
+        assert_eq!(meta.attachments.len(), 1, "{mode}");
+        assert!(
+            meta.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("hook_note")),
+            "{mode}"
+        );
+        if mode == "block" || mode == "schema" {
+            assert!(
+                meta.diagnostics
+                    .iter()
+                    .any(|d| d.severity == pi_rs_durable::runtime::DiagnosticSeverity::Error),
+                "{mode}"
+            );
+        }
+        let blocks = c
+            .content_blocks
+            .values()
+            .find(|b| Some(b.message_id) == meta.content_block_id)
+            .unwrap();
+        assert_eq!(blocks.blocks[0]["text"], "first");
+        assert_eq!(blocks.blocks[1]["text"], "second");
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { .. }))
+        );
+        assert_eq!(after.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            usize::from(mode == "success" || mode == "failure"),
+            "{mode}"
+        );
+        let store = durable_store::Store::open(&path).unwrap();
+        let root = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()[0]
+            .task
+            .id();
+        assert!(
+            store
+                .get(format!("runtime/extension-memo/{root}/rich-after").as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rich_after_kill_worker() {
+    let Some(dir) = std::env::var_os("PI_RICH_AFTER_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let (options, registry, extensions) = setup_rich(
+        "failure",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mut scheduler = Scheduler::open_with_provider_adapter(
+        dir.join("db"),
+        options,
+        extensions,
+        Arc::new(RichAdapter),
+    )
+    .unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
     let id = scheduler
         .create_conversation(Config {
             model: "test".into(),
-            system_prompt: "".into(),
+            system_prompt: String::new(),
             max_output_tokens: 100,
         })
         .unwrap();
+    scheduler.select_provider_adapter(id, true).unwrap();
     scheduler
         .select_extensions(id, vec!["policy".into()])
         .unwrap();
+    std::fs::write(dir.join("id"), id.to_string()).unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
-        .await
-        .unwrap();
-    assert!(result.is_err());
-    assert!(
-        !scheduler
-            .conversation(id)
-            .unwrap()
-            .messages
-            .iter()
-            .any(|m| matches!(m, Message::Tool { .. }))
+    std::future::pending::<()>().await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn rich_after_published_result_survives_process_kill() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rich_after_kill_worker"])
+            .env("PI_RICH_AFTER_DIR", dir.path())
+            .env("PI_RICH_AFTER_READY", dir.path().join("ready"))
+            .spawn()
+            .unwrap(),
     );
-    let _ = driver.shutdown_with_pending();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id = std::fs::read_to_string(dir.path().join("id"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_rich("failure", after.clone(), executions.clone());
+    let (mut scheduler, driver) = Scheduler::open_with_pinned_provider_adapter_and_tasks(
+        dir.path().join("db"),
+        options,
+        extensions,
+        Arc::new(RichAdapter),
+        registry,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let c = scheduler.conversation(id).unwrap();
+    let meta = &c.tool_results[0];
+    assert!(meta.is_error);
+    assert_eq!(meta.details, Some(json!({"kept":true})));
+    assert_eq!(meta.structured_output, Some(json!({"value":7})));
+    assert_eq!(meta.attachments.len(), 1);
+    assert!(
+        meta.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("hook_note"))
+    );
+    let blocks = c
+        .content_blocks
+        .values()
+        .find(|b| Some(b.message_id) == meta.content_block_id)
+        .unwrap();
+    assert_eq!(blocks.blocks[0]["text"], "first");
+    assert_eq!(blocks.blocks[1]["text"], "second");
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
 }
