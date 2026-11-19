@@ -470,27 +470,27 @@ the task driver, including process kill, reopen, abort and registration mismatch
 This remains a task-handler interface: admission takes effect at the handler's
 settlement, and it is not asynchronous `KeyedHost` / upstream `wait: false`.
 
-The private `DetachedInvocation::admit_task_tool_child` adds a low-level separate commit
-for a live TaskTool parent. It checks the reserved executor lease and recorded
+`Handler::run_with_admission` receives a borrowed `AdmissionHandle` and can make
+a separate child-admission commit for a live TaskTool parent. Its default calls
+`run_with_documents`, preserving existing handlers. It checks the reserved executor lease and recorded
 attempt, parent abort, ownership and registered child definition, and atomically
 creates or reattaches the keyed child. A running generic parent is rejected: the
 current scheduler cannot run a child beneath it. TaskTool children can run while
 their TaskTool parent remains live when ordinary worker capacity is available;
 the reserved overflow worker is only for generic children. The borrowed API
 cannot outlive its reservation, and retired or replaced leases fail closed.
-It is not a public API and is not yet callable from `DetachedInvocation::execute(self)`,
-`Handler::run_with_documents`, or an ordinary async tool: no admission handle is
-passed to them. A lease-bound handle and driver integration remain required. It does not provide nested
+The handle is borrowed for the handler call, including driver execution, and
+cannot be retained after it returns; abort handlers receive no handle. It is
+not available to ordinary async tools and does not provide nested
 tool dispatch, hooks, result/wake delivery, async cancellation or upstream
 `wait: false`; wiring those requires the separate executor integration. A crash
 after admission leaves a durable child to reconnect after parent recovery, not
 an atomic parent park. An uncertain storage commit requires reopen and inspection.
-Tests exercise the real driver with parent and child handlers concurrently after
-a test-only pre-execution admission, both orders and a race with conversation-root
-abort, and a descendant admission racing its ancestor's failure publication.
-They do not exercise admission from within the running handler, or a same-parent
-admission racing its own result publication: `execute(self)` consumes the only
-reservation from which the private admission method can currently be called.
+Tests exercise admission from the real driver handler, concurrent keyed calls,
+parent abort, and the borrowed handle's lifetime. They also exercise both orders
+and a race with conversation-root abort, and descendant admission racing its
+ancestor's failure publication. The handle cannot survive its own handler's
+return to race that handler's result publication.
 The driver has four ordinary workers. A test occupies all four with TaskTool
 parents and verifies that an admitted TaskTool child stays ready until an
 ordinary worker becomes free; the overflow reservation cannot run that child.

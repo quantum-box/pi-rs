@@ -45,6 +45,18 @@ pub trait Handler: Send + Sync {
     ) -> Result<Step, String> {
         self.run(task)
     }
+    /// Run with an admission capability borrowed from this invocation's live
+    /// executor lease. Existing handlers continue through `run_with_documents`.
+    /// The capability cannot be retained after this call or used by an abort
+    /// handler. Newly admitted children are durable even if this step fails.
+    fn run_with_admission(
+        &self,
+        task: &Task,
+        documents: &mut crate::document::TaskDocuments<'_>,
+        _admission: &AdmissionHandle<'_>,
+    ) -> Result<Step, String> {
+        self.run_with_documents(task, documents)
+    }
 }
 impl<F> Handler for F
 where
@@ -1115,24 +1127,54 @@ impl CompletedInvocation {
     }
 }
 
+/// Authority to admit keyed TaskTool children during a single live invocation.
+///
+/// It borrows the executor reservation and cannot outlive the handler call.
+/// It does not park the parent or reserve worker capacity for a child.
+///
+/// ```compile_fail
+/// use pi_rs_durable::task_scheduler::AdmissionHandle;
+/// fn escape<'a>(handle: &'a AdmissionHandle<'a>) -> &'static AdmissionHandle<'static> {
+///     handle
+/// }
+/// ```
+pub struct AdmissionHandle<'a> {
+    running: &'a task_store::StoredTask,
+    lease: &'a InvocationLease,
+    abort: bool,
+    definitions: &'a std::sync::RwLock<WakeDefinitions>,
+    activity: &'a crate::worker_activity::WorkerActivity,
+}
+
 impl DetachedInvocation {
     pub fn task_id(&self) -> Uuid {
         self.running.task.id()
     }
 
-    /// Admit or reconnect a keyed task-tool child while this invocation is
-    /// still running. Only a TaskTool parent is supported. The caller must retain this reservation until all async
-    /// work using it has stopped. A successful admission is durable immediately,
-    /// independent of the eventual parent transition.
-    ///
-    /// A storage error may have an uncertain outcome: stop the executor and
-    /// reopen before retrying. This method does not start the child executor.
-    /// This low-level method is not available inside `execute(self)` or an
-    /// ordinary async tool: that executor integration has not been implemented.
-    /// Its borrowed receiver cannot outlive or be used after dropping the
-    /// reservation; a retired or replaced lease is rejected as well.
-    #[allow(dead_code)] // Awaiting a lease-bound handler/async executor integration.
+    #[cfg(test)]
     pub(crate) fn admit_task_tool_child(
+        &self,
+        tool: &crate::task_tool::TaskTool,
+        key: &str,
+        input: Value,
+    ) -> Result<Uuid, Error> {
+        AdmissionHandle {
+            running: &self.running,
+            lease: &self.lease,
+            abort: self.abort,
+            definitions: &self.definitions,
+            activity: &self.activity,
+        }
+        .admit_task_tool_child(tool, key, input)
+    }
+}
+
+impl AdmissionHandle<'_> {
+    /// Atomically admit or reconnect a keyed TaskTool child. The parent must be
+    /// a live, non-aborted TaskTool attempt with this exact executor lease.
+    /// A changed definition or input rejects reuse of an existing key.
+    /// A storage error can be uncertain; stop and reopen before retrying.
+    pub fn admit_task_tool_child(
         &self,
         tool: &crate::task_tool::TaskTool,
         key: &str,
@@ -1217,7 +1259,9 @@ impl DetachedInvocation {
         self.activity.notify();
         Ok(prepared.child)
     }
+}
 
+impl DetachedInvocation {
     /// Run without holding the scheduler mutex. A handler panic publishes a
     /// known failed attempt; other unretired exits poison the scheduler. Abort
     /// handler panics retain existing semantics.
@@ -1228,7 +1272,8 @@ impl DetachedInvocation {
             abort,
             validator,
             lease,
-            ..
+            definitions,
+            activity,
         } = self;
         let result = if abort {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1250,7 +1295,14 @@ impl DetachedInvocation {
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
             documents.set_input_validator(validator.as_ref());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handler.run_with_documents(&running.task, &mut documents)
+                let admission = AdmissionHandle {
+                    running: &running,
+                    lease: &lease,
+                    abort,
+                    definitions: &definitions,
+                    activity: &activity,
+                };
+                handler.run_with_admission(&running.task, &mut documents, &admission)
             }));
             let result = match result {
                 Ok(result) => result,
@@ -5858,6 +5910,103 @@ mod tests {
         Checkpoint {
             phase: phase.into(),
             data: json!(null),
+        }
+    }
+
+    #[test]
+    fn handler_admission_rejects_replaced_attempt_or_executor() {
+        use std::{sync::mpsc, time::Duration};
+        struct Parent {
+            child: Arc<crate::task_tool::TaskTool>,
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+            rejected: mpsc::Sender<bool>,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_admission(
+                &self,
+                _: &Task,
+                _: &mut crate::document::TaskDocuments<'_>,
+                admission: &AdmissionHandle<'_>,
+            ) -> Result<Step, String> {
+                self.entered.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+                self.rejected
+                    .send(matches!(
+                        admission.admit_task_tool_child(&self.child, "key", json!({})),
+                        Err(Error::Ownership)
+                    ))
+                    .unwrap();
+                Ok(Step::Succeed(json!(null)))
+            }
+        }
+        for replace_token in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let child_handler: Arc<dyn Handler> =
+                Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+            let child = Arc::new(crate::task_tool::TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "child".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                "child",
+                true,
+                1,
+                child_handler.clone(),
+            ));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (rejected_tx, rejected_rx) = mpsc::channel();
+            let parent_handler: Arc<dyn Handler> = Arc::new(Parent {
+                child,
+                entered: entered_tx,
+                resume: Mutex::new(resume_rx),
+                rejected: rejected_tx,
+            });
+            let mut registry = Registry::default();
+            registry.register_shared("parent", true, parent_handler);
+            registry.register_shared("child", true, child_handler);
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                4,
+            )
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            let invocation = async_admission_reserve(&mut scheduler);
+            let old_attempt = invocation.running.task.attempt_id();
+            let worker = std::thread::spawn(move || invocation.execute().unwrap());
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if replace_token {
+                scheduler
+                    .live_invocations
+                    .lock()
+                    .unwrap()
+                    .leases
+                    .insert(parent.id(), (Uuid::new_v4(), old_attempt));
+            } else {
+                let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
+                scheduler
+                    .ts()
+                    .update(&current, |task| task.recover())
+                    .unwrap();
+                let ready = scheduler.ts().load(parent.id()).unwrap().unwrap();
+                scheduler
+                    .ts()
+                    .update(&ready, |task| task.start_attempt(Uuid::new_v4()))
+                    .unwrap();
+            }
+            resume_tx.send(()).unwrap();
+            assert!(rejected_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert_eq!(scheduler.ts().list().unwrap().len(), 1);
+            drop(worker.join().unwrap());
         }
     }
 

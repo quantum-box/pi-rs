@@ -1883,17 +1883,17 @@ synchronous task-handler API for `TaskTool`, not general `executeTool` support;
 its child runs the registered task handler rather than the ordinary nested tool
 hook pipeline, and starting it does not dispatch until the handler commits.
 
-An internal, currently unconnected `DetachedInvocation::admit_task_tool_child`
-primitive supports a TaskTool parent during the running attempt. It durably creates or
+`Handler::run_with_admission` receives a borrowed `AdmissionHandle` for the
+running invocation; its default calls the existing `run_with_documents` method.
+For a TaskTool parent the handle durably creates or
 reattaches a keyed child immediately, without staging `TaskDocuments` or
 committing a parent step. The live reservation token and its recorded attempt,
 parent abort state, failure publication,
 ownership checks and exact registered child handler are checked at admission;
 reusing a key with changed input or definition fails. The executor must retain
 the invocation until its work has stopped and must reopen after an uncertain
-storage failure. This is a low-level admission primitive only: `execute(self)`
-consumes the reservation and does not pass an admission handle to its handler.
-The primitive is not a public API and there is no handle that survives dropping or retiring the reservation. Ordinary
+storage failure. The handle cannot outlive the handler call or be used by an
+abort handler. This is a task-handler admission API; ordinary
 async tools and their nested execution, hooks, wake and cancellation are not
 yet connected. A running generic parent is rejected because its child cannot
 currently execute while that parent runs. TaskTool children use ordinary worker

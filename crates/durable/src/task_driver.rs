@@ -1857,6 +1857,133 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn driver_passes_live_admission_to_handler_and_fences_abort() {
+        use crate::task_scheduler::{AdmissionHandle, Handler, Step};
+        use std::time::Duration;
+        struct Parent {
+            child: Arc<crate::task_tool::TaskTool>,
+            admitted: mpsc::Sender<Uuid>,
+            proceed: Mutex<mpsc::Receiver<()>>,
+            after: mpsc::Sender<bool>,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_admission(
+                &self,
+                _: &Task,
+                _: &mut crate::document::TaskDocuments<'_>,
+                admission: &AdmissionHandle<'_>,
+            ) -> Result<Step, String> {
+                let ids = std::thread::scope(|scope| {
+                    let a = scope.spawn(|| {
+                        admission
+                            .admit_task_tool_child(&self.child, "child", json!({}))
+                            .unwrap()
+                    });
+                    let b = scope.spawn(|| {
+                        admission
+                            .admit_task_tool_child(&self.child, "child", json!({}))
+                            .unwrap()
+                    });
+                    (a.join().unwrap(), b.join().unwrap())
+                });
+                assert_eq!(ids.0, ids.1);
+                self.admitted.send(ids.0).unwrap();
+                self.proceed.lock().unwrap().recv().unwrap();
+                let rejected = admission
+                    .admit_task_tool_child(&self.child, "child", json!({}))
+                    .is_err();
+                self.after.send(rejected).unwrap();
+                Ok(Step::Succeed(json!("parent")))
+            }
+        }
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (child_started_tx, child_started_rx) = mpsc::channel();
+            let (child_release_tx, child_release_rx) = mpsc::channel();
+            let child_release_rx = Mutex::new(child_release_rx);
+            let child_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+                child_started_tx.send(()).unwrap();
+                child_release_rx.lock().unwrap().recv().unwrap();
+                Ok(Step::Succeed(json!("child")))
+            });
+            let child = Arc::new(crate::task_tool::TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "child".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                "child",
+                true,
+                1,
+                child_handler.clone(),
+            ));
+            let (admitted_tx, admitted_rx) = mpsc::channel();
+            let (proceed_tx, proceed_rx) = mpsc::channel();
+            let (after_tx, after_rx) = mpsc::channel();
+            let parent_handler: Arc<dyn Handler> = Arc::new(Parent {
+                child,
+                admitted: admitted_tx,
+                proceed: Mutex::new(proceed_rx),
+                after: after_tx,
+            });
+            let mut registry = task_scheduler::Registry::default();
+            registry.register_shared("parent", true, parent_handler);
+            registry.register_shared("child", true, child_handler);
+            let scheduler =
+                task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let id = Uuid::new_v4();
+            let parent = Task::new(
+                id,
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("parent".into(), true)
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            let driver = Driver::start(scheduler);
+            let child_id = admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            child_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                driver.get(child_id).unwrap().unwrap().owner(),
+                &TaskOwner::Task(id)
+            );
+            if abort {
+                driver.request_abort(id).unwrap();
+            }
+            proceed_tx.send(()).unwrap();
+            assert_eq!(
+                after_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                abort
+            );
+            child_release_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let parent = driver.get(id).unwrap().unwrap();
+                if parent.is_terminal() {
+                    assert!(driver.get(child_id).unwrap().unwrap().is_terminal());
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent did not settle"
+                );
+                std::thread::yield_now();
+            }
+            driver.shutdown().unwrap();
+        }
+    }
+
+    #[test]
     fn driver_runs_admitted_task_tool_child_while_parent_handler_is_live() {
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
