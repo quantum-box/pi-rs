@@ -1605,6 +1605,18 @@ fn invoke_boundary(hooks: &BoundaryHooks, id: Uuid) {
     }
 }
 #[cfg(test)]
+fn reservation_update_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_reservation_before_update(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    reservation_update_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 fn conversation_claim_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
     HOOKS.get_or_init(Default::default)
@@ -10082,6 +10094,25 @@ impl Scheduler {
         self.reserve_tick_inner(now, true, task_tool_child_only, false, true, &[], anchor)
     }
 
+    // Called while reservation holds the failure and task fences. A checked
+    // conflict or marker busy proves this update did not commit, so it is safe
+    // to clear the provisional poison and rescan rather than stop the driver.
+    fn reservation_update_committed(
+        &self,
+        result: Result<(), task_store::Error>,
+    ) -> Result<bool, Error> {
+        match result {
+            Ok(()) => Ok(true),
+            Err(task_store::Error::CallbackStartBusy)
+            | Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => {
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn try_reserve_independent_maintenance(
         &mut self,
         allow_maintenance: bool,
@@ -10181,8 +10212,25 @@ impl Scheduler {
                 }
             }
         }
-        let unbound_owned =
+        let mut unbound_owned =
             unbound_cancel_owned_tasks(owner.store(), &self.unbound_cancel_roots, &held_tasks)?;
+        let mut callback_roots = HashSet::new();
+        for record in &held_tasks {
+            match task_store::clear_callback_start_check(owner.store(), record.task.id()) {
+                Ok(_) => (),
+                Err(task_store::Error::CallbackStartBusy) => {
+                    #[cfg(test)]
+                    task_store::report_callback_wake_blocked(record.task.id());
+                    callback_roots.insert(record.task.id());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unbound_owned.extend(unbound_cancel_owned_tasks(
+            owner.store(),
+            &callback_roots,
+            &held_tasks,
+        )?);
         for snapshot in &held_tasks {
             if independent_only
                 && (!self.independent_root_safe(&owner, &snapshot.task)?
@@ -11200,8 +11248,10 @@ impl Scheduler {
                             .store(false, std::sync::atomic::Ordering::Release);
                         return Ok(TickReservation::Progress(progress));
                     }
-                    self.ts()
-                        .update(snapshot, |task| task.fail_abort_restart())?;
+                    let update = self.ts().update(snapshot, |task| task.fail_abort_restart());
+                    if !self.reservation_update_committed(update)? {
+                        return Ok(TickReservation::Progress(true));
+                    }
                 }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
@@ -11225,10 +11275,15 @@ impl Scheduler {
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(progress));
                 }
-                self.ts().update(snapshot, |t| {
+                #[cfg(test)]
+                invoke_boundary(reservation_update_hooks(), snapshot.task.id());
+                let update = self.ts().update(snapshot, |t| {
                     t.start()?;
                     t.fail(diagnostic)
-                })?;
+                });
+                if !self.reservation_update_committed(update)? {
+                    return Ok(TickReservation::Progress(true));
+                }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
                 return Ok(TickReservation::Progress(true));
@@ -11264,10 +11319,13 @@ impl Scheduler {
                         .blocked_reason(&snapshot.task)
                         .ok_or(Error::Registration)?;
                     let diagnostic = orphan_diagnostic(&reason);
-                    self.ts().update(snapshot, |t| {
+                    let update = self.ts().update(snapshot, |t| {
                         t.start()?;
                         t.fail(diagnostic)
-                    })?;
+                    });
+                    if !self.reservation_update_committed(update)? {
+                        return Ok(TickReservation::Progress(true));
+                    }
                     self.poisoned
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(true));
@@ -11301,10 +11359,13 @@ impl Scheduler {
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(progress));
                 }
-                self.ts().update(snapshot, |t| {
+                let update = self.ts().update(snapshot, |t| {
                     t.start()?;
                     t.fail("orphaned: missing abort handler or task definition".into())
-                })?;
+                });
+                if !self.reservation_update_committed(update)? {
+                    return Ok(TickReservation::Progress(true));
+                }
             }
             self.poisoned
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -13413,7 +13474,12 @@ fn request_abort_roots_with(
                 updates.push(next);
             }
         }
-        let mut batch = ts.prepare_save(&updates.iter().map(Save::Update).collect::<Vec<_>>())?;
+        let mut batch = match ts.prepare_save(&updates.iter().map(Save::Update).collect::<Vec<_>>())
+        {
+            Ok(batch) => batch,
+            Err(task_store::Error::CallbackStartBusy) => return Err(Error::Busy),
+            Err(error) => return Err(error.into()),
+        };
         for record in &records {
             if ids.contains(&record.task.id())
                 && (record.task.is_terminal() || record.task.abort_requested())

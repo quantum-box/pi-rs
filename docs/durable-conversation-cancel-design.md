@@ -112,9 +112,11 @@ and conversations; an existing marker makes abort return busy without writes,
 and a concurrent marker insertion forces transaction conflict and rescan.
 Deferred task cleanup retries this busy condition. The synchronous abort and
 signal APIs still expose busy to the caller and have no automatic retry owner.
-Direct abort still takes the legacy global poll fence; full graph marker
-coverage, generic public task mutation fencing, and the composed callback
-start transaction remain unconnected. Callback dispatch remains disabled until
+Generic public task save and update batches now also check marker absence;
+known pre-transaction conflicts defer reservation instead of poisoning the
+driver. Direct abort still takes the legacy global poll fence; full graph
+marker coverage and the composed callback start transaction remain
+unconnected. Callback dispatch remains disabled until
 every boundary and retry path is complete.
 
 The pre-dispatch conversation cancel claim transaction also checks the root

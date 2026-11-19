@@ -1181,6 +1181,9 @@ pub(crate) fn normalize_graph_checks(batch: &mut OwnedBatch) {
     let mut checks: Vec<Check> = Vec::with_capacity(batch.checks.len());
     for check in std::mem::take(&mut batch.checks) {
         let graph = check.key.starts_with(crate::task_store::PREFIX)
+            || check
+                .key
+                .starts_with(crate::task_store::CALLBACK_START_PREFIX)
             || check.key.starts_with(b"durable/signal-revision/")
             || check.key.starts_with(crate::ownership_edge::PREFIX)
             || check.key.starts_with(b"durable/ownership-abort-fence/v1/")
@@ -1202,6 +1205,9 @@ pub(crate) fn normalize_graph_checks(batch: &mut OwnedBatch) {
 pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut OwnedBatch) {
     for other in &mut graph.checks {
         if !other.key.starts_with(crate::task_store::PREFIX)
+            && !other
+                .key
+                .starts_with(crate::task_store::CALLBACK_START_PREFIX)
             && !other.key.starts_with(b"durable/signal-revision/")
             && !other.key.starts_with(crate::ownership_edge::PREFIX)
             && !other.key.starts_with(b"durable/ownership-abort-fence/v1/")

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub(crate) const PREFIX: &[u8] = b"durable/task/";
+pub(crate) const CALLBACK_START_PREFIX: &[u8] = b"durable/task-callback-start/";
 const SIGNAL_PREFIX: &[u8] = b"durable/signal/";
 const SIGNAL_REVISION_PREFIX: &[u8] = b"durable/signal-revision/";
 const SUBMISSION_SETTLED_NAME: &str = "pi.submission-settled";
@@ -369,7 +370,7 @@ pub(crate) fn on_callback_wake_blocked(id: Uuid, hook: impl FnOnce() + Send + 's
         .insert(id, Box::new(hook));
 }
 #[cfg(test)]
-fn report_callback_wake_blocked(id: Uuid) {
+pub(crate) fn report_callback_wake_blocked(id: Uuid) {
     let hook = callback_wake_hooks().lock().unwrap().remove(&id);
     if let Some(hook) = hook {
         hook();
@@ -411,8 +412,22 @@ impl<'a> TaskStore<'a> {
     /// later writer, so it must not be used as proof of an exclusive reservation.
     pub fn save(&self, tasks: &[Save<'_>]) -> Result<(), Error> {
         let batch = self.prepare_save(tasks)?;
-        self.store.commit(&batch.checks, &batch.mutations)?;
-        Ok(())
+        match self.store.commit(&batch.checks, &batch.mutations) {
+            Ok(()) => Ok(()),
+            Err(error @ durable_store::Error::Conflict { .. }) => {
+                for save in tasks {
+                    let task = match save {
+                        Save::Create(task) => *task,
+                        Save::Update(stored) => &stored.task,
+                    };
+                    if self.store.get(&callback_start_key(task.id()))?.is_some() {
+                        return Err(Error::CallbackStartBusy);
+                    }
+                }
+                Err(error.into())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Prepare task writes for an atomic commit with other checked records.
@@ -464,6 +479,13 @@ impl<'a> TaskStore<'a> {
             if !seen.insert(key.clone()) {
                 return Err(Error::DuplicateTask);
             }
+            // An unconditional absence CAS keeps prepared task writes safe
+            // without introducing a pre-transaction error after a scheduler
+            // has marked an operation as indeterminate.
+            checks.push(Check {
+                key: callback_start_key(task.id()),
+                expected: Expected::Missing,
+            });
             checks.push(Check {
                 key: key.clone(),
                 expected,
@@ -1064,7 +1086,7 @@ impl<'a> TaskStore<'a> {
         now_millis: Option<i64>,
     ) -> Result<OwnedBatch, Error> {
         let snapshot = self.load(task_id)?.ok_or(Error::SignalTargetNotFound)?;
-        let callback_start = clear_callback_start_check(self.store, task_id)?;
+        clear_callback_start_check(self.store, task_id)?;
         if snapshot.task.abort_requested() || snapshot.task.is_terminal() {
             return Err(Error::SignalTargetClosed);
         }
@@ -1152,7 +1174,6 @@ impl<'a> TaskStore<'a> {
             });
         }
         let mut batch = self.prepare_save(&[Save::Update(&next)])?;
-        batch.checks.push(callback_start);
         batch.checks.push(Check {
             key: revision_key.clone(),
             expected: revision.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
@@ -1862,6 +1883,54 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn callback_start_fences_generic_task_save_and_update() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let target = task(1, 3);
+        let unrelated = task(2, 3);
+        ts.save(&[Save::Create(&target), Save::Create(&unrelated)])
+            .unwrap();
+        let mut candidate = ts.load(target.id()).unwrap().unwrap();
+        candidate.task.request_abort().unwrap();
+        let prepared = ts.prepare_save(&[Save::Update(&candidate)]).unwrap();
+        let start = prepare_callback_start_task_fence(&db, target.id(), b"claim").unwrap();
+        db.commit(&start.checks, &start.mutations).unwrap();
+        assert!(matches!(
+            db.commit(&prepared.checks, &prepared.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(matches!(
+            ts.update(&ts.load(target.id()).unwrap().unwrap(), |task| task
+                .request_abort()),
+            Err(Error::CallbackStartBusy)
+        ));
+        ts.update(&ts.load(unrelated.id()).unwrap().unwrap(), |task| {
+            task.request_abort()
+        })
+        .unwrap();
+        assert!(
+            !ts.load(target.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        let finish = prepare_callback_finish_task_fence(&db, target.id(), b"claim").unwrap();
+        db.commit(&finish.checks, &finish.mutations).unwrap();
+        ts.update(&ts.load(target.id()).unwrap().unwrap(), |task| {
+            task.request_abort()
+        })
+        .unwrap();
+        assert!(
+            ts.load(target.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
     }
 
     #[test]

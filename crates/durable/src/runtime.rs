@@ -14702,7 +14702,10 @@ impl Harness {
                         .map(crate::task_store::Save::Update)
                         .collect::<Vec<_>>(),
                 )
-                .map_err(|e| Error::Invalid(format!("task batch: {e}")))?;
+                .map_err(|error| match error {
+                    crate::task_store::Error::CallbackStartBusy => Error::TaskPublicationBusy,
+                    other => Error::Invalid(format!("task batch: {other}")),
+                })?;
             batch.checks.extend(task_batch.checks);
             // Check unchanged marked or terminal tasks too, so a child/edge
             // change committed since traversal forces a retry. Do not rewrite

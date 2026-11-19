@@ -5978,6 +5978,145 @@ mod tests {
     }
 
     #[test]
+    fn callback_marker_racing_abort_reservation_does_not_poison_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let (other_tx, other_rx) = mpsc::channel();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("other", true, move |_: &Task| {
+            other_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("other")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let mut blocked = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("missing".into(), true);
+        blocked.request_abort().unwrap();
+        let other = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&blocked), Save::Create(&other)])
+            .unwrap();
+        let writer = owner.clone();
+        let id = blocked.id();
+        let (inserted_tx, inserted_rx) = mpsc::channel();
+        task_scheduler::on_reservation_before_update(id, move || {
+            let start = task_store::prepare_callback_start_task_fence(writer.store(), id, b"claim")
+                .unwrap();
+            writer
+                .store()
+                .commit(&start.checks, &start.mutations)
+                .unwrap();
+            inserted_tx.send(()).unwrap();
+        });
+        let driver = Driver::start(scheduler);
+        inserted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        other_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(driver.get(id).unwrap().unwrap().state(), &TaskState::Ready);
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), id, b"claim").unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(id).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn task_start_marker_defers_ready_reservation_without_blocking_other_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", true, move |task: &Task| {
+            ran_tx.send(task.id()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let target = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        let other = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&target), Save::Create(&other)])
+            .unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), target.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        task_store::on_callback_wake_blocked(target.id(), move || {
+            blocked_tx.send(()).unwrap();
+        });
+        let driver = Driver::start(scheduler);
+        blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            other.id()
+        );
+        assert_eq!(
+            driver.get(target.id()).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), target.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            target.id()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(target.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
     fn task_start_marker_defers_signal_and_driver_wake_until_release() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = task_scheduler::Registry::default();
