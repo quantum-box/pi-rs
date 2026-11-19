@@ -1704,6 +1704,14 @@ impl Handler for Executor {
                 .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
             #[cfg(test)]
             if crate::task_scheduler::take_test_conversation_receipt(task.id()) {
+                // A successful claim is single-use even when the same live
+                // attempt tries to acquire it again before any callback runs.
+                if admission
+                    .record_conversation_park_claim(self, cancel.conversation_cancel_policy())
+                    .is_ok()
+                {
+                    return Err("duplicate conversation cancel claim accepted".into());
+                }
                 let receipt = crate::task_scheduler::ConversationCancelReceipt {
                     version: 1,
                     claim: _claim.clone(),
