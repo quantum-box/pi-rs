@@ -10617,7 +10617,7 @@ mod tests {
     #[test]
     fn interrupted_cleanup_waits_for_independent_uncertain_graph() {
         use crate::task_store::{Save, TaskStore};
-        for shutdown_before_repair in [false, true] {
+        for case in ["repair", "late-raw", "shutdown"] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let (_, child) = interrupted_kill_tool(root);
@@ -10677,13 +10677,26 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            if shutdown_before_repair {
+            if case == "shutdown" {
                 let report = driver.shutdown_with_pending().unwrap();
                 assert!(report.failure().is_none());
                 assert_eq!(report.pending().len(), 1);
                 assert_eq!(report.pending()[0].task_id(), child);
                 assert!(report.pending()[0].completed().is_some());
                 continue;
+            }
+            if case == "late-raw" {
+                let intent = crate::async_task_protocol::load_intent(owner.store(), child).unwrap();
+                let batch = crate::async_task_protocol::prepare_raw_result(
+                    owner.store(),
+                    &intent,
+                    &Outcome::Succeeded("late result".into()),
+                )
+                .unwrap();
+                owner
+                    .store()
+                    .commit(&batch.checks, &batch.mutations)
+                    .unwrap();
             }
             {
                 let _gate = owner.task_gate().lock().unwrap();
@@ -10700,14 +10713,23 @@ mod tests {
                     .unwrap();
             }
             let task = wait_terminal(&driver, child);
-            assert!(
-                matches!(task.state(), crate::task::TaskState::Failed(reason) if reason == "interrupted: execution outcome requires reconciliation")
-            );
             assert!(!task.abort_requested());
-            assert!(matches!(
-                read_sealed_outcome_evidence(owner.store(), child).unwrap(),
-                Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
-            ));
+            if case == "late-raw" {
+                assert!(
+                    matches!(task.state(), crate::task::TaskState::Failed(reason) if reason == "sealed outcome requires reconciliation")
+                );
+                assert!(
+                    matches!(read_sealed_outcome_evidence(owner.store(), child).unwrap(), Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Succeeded(value))) if value == "late result")
+                );
+            } else {
+                assert!(
+                    matches!(task.state(), crate::task::TaskState::Failed(reason) if reason == "interrupted: execution outcome requires reconciliation")
+                );
+                assert!(matches!(
+                    read_sealed_outcome_evidence(owner.store(), child).unwrap(),
+                    Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+                ));
+            }
             assert!(
                 read_interrupted_after_result(owner.store(), child)
                     .unwrap()
