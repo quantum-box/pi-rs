@@ -8,7 +8,7 @@ Compared with upstream pi durable at `9cd49d2c00ac446f774b878d25923bdb3739dadd`,
 
 Foundation `faf92f0c591bff77d5b520faf86e75b4aedc8086` has a separate conversation `TaskPending` admission and standalone checkpointable driver. It also has extension identity selection, attempt/owner fences and child admission machinery, but the standalone admission and installation guards explicitly reject conversation attachment. The private executor handoff binds an ordinary `ToolRunning` attempt, not a `TaskPending` task tree. Neither existing primitive grants permission to execute a conversation-owned async tree.
 
-This change strengthens the existing TaskPending boundary: scheduler attachment checks that the persisted conversation arguments equal the task's immutable input; result and abort cleanup additionally verify that input and the persisted task definition match the conversation's adapter identity. This detects substituted or mismatched records; it is not a new authorization token, a cross-record atomic settlement fence, or a substitute for trusted storage.
+This change strengthens the existing TaskPending boundary: scheduler attachment checks that the persisted conversation arguments equal the task's immutable input; result and abort cleanup additionally verify that input and the persisted task definition match the conversation's adapter identity. The normal-result and abort-cleanup conversation commits also check the exact task version that supplied the outcome. A competing task update conflicts and is not retried with the stale result. This is not an execution authorization token, an async park/child settlement fence, or a substitute for trusted storage.
 
 ## Proposed minimal implementation
 

@@ -3148,6 +3148,10 @@ pub struct Harness {
     activity: crate::worker_activity::WorkerActivity,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
+#[cfg(test)]
+thread_local! {
+    static TASK_RESULT_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
 /// A snapshot of all store changes for one or more conversation saves.
 /// Prepared checks can become stale; a conflict requires preparing the entire batch again.
 pub(crate) struct PreparedConversationSave {
@@ -5590,6 +5594,26 @@ impl Harness {
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
         self.save_composed(state, expected, None, &[])
+    }
+    // The task snapshot used to publish an outcome must still be current in
+    // the very same commit as the conversation transition.
+    fn save_with_task_result_check(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
+        check: Check,
+    ) -> Result<(), Error> {
+        #[cfg(test)]
+        TASK_RESULT_BEFORE_COMMIT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let batch = crate::task_store::OwnedBatch {
+            checks: vec![check],
+            mutations: vec![],
+        };
+        self.save_composed_locked(state, expected, None, &[], &[], Some(&batch))
     }
     fn save_with_wake(
         &mut self,
@@ -14464,7 +14488,7 @@ impl Harness {
         task: Uuid,
         arguments: &serde_json::Value,
         identity: &crate::task_tool::Identity,
-    ) -> Result<Option<Outcome>, Error> {
+    ) -> Result<Option<(Outcome, Check)>, Error> {
         let child = crate::task_store::TaskStore::new(self.owner.store())
             .load(task)
             .map_err(|e| Error::Invalid(format!("task load: {e}")))?
@@ -14480,7 +14504,7 @@ impl Harness {
                 "task-backed tool identity or input mismatch".into(),
             ));
         }
-        Ok(match child.task.state() {
+        let outcome = match child.task.state() {
             crate::task::TaskState::Succeeded(value)
                 if child.task.kind() == Some(crate::foreground_subagent::KIND)
                     && value
@@ -14503,7 +14527,16 @@ impl Harness {
             crate::task::TaskState::Failed(reason) => Some(Outcome::Unknown(reason.clone())),
             crate::task::TaskState::Cancelled => Some(Outcome::Failed("task cancelled".into())),
             _ => None,
-        })
+        };
+        Ok(outcome.map(|outcome| {
+            (
+                outcome,
+                Check {
+                    key: crate::task_store::key(task),
+                    expected: Expected::Version(child.version),
+                },
+            )
+        }))
     }
     fn validate_pending_task_identity(
         &self,
@@ -14781,6 +14814,7 @@ impl Harness {
                 }
             }
         }
+        let mut task_result_check = None;
         match c.phase.clone() {
             Phase::ToolRunning {
                 turns,
@@ -14811,7 +14845,7 @@ impl Harness {
                 identity,
             } => {
                 self.validate_pending_task_identity(&c, &calls, index, &identity)?;
-                let outcome = self
+                let (outcome, check) = self
                     .task_tool_result(
                         c.id,
                         operation_id,
@@ -14822,6 +14856,7 @@ impl Harness {
                         })?,
                     )?
                     .ok_or_else(|| Error::Invalid("task-backed tool cleanup incomplete".into()))?;
+                task_result_check = Some(check);
                 if let Outcome::Unknown(reason) = outcome {
                     c.phase = Phase::Blocked {
                         tool_panicked: false,
@@ -14963,7 +14998,11 @@ impl Harness {
             c.abort_requested = false;
             finish_abort(&mut c);
         }
-        self.save(&c, Expected::Version(version))?;
+        if let Some(check) = task_result_check {
+            self.save_with_task_result_check(&c, Expected::Version(version), check)?;
+        } else {
+            self.save(&c, Expected::Version(version))?;
+        }
         Ok(true)
     }
     async fn run_lifecycle_hook(
@@ -18529,7 +18568,7 @@ impl Harness {
                     identity,
                 } => {
                     self.validate_pending_task_identity(&c, &calls, index, &identity)?;
-                    let Some(outcome) = self.task_tool_result(
+                    let Some((outcome, task_check)) = self.task_tool_result(
                         c.id,
                         operation_id,
                         task,
@@ -18571,7 +18610,7 @@ impl Harness {
                             content,
                         }
                     };
-                    self.save(&c, Expected::Version(version))?;
+                    self.save_with_task_result_check(&c, Expected::Version(version), task_check)?;
                 }
                 Phase::Pending {
                     turns,
@@ -29956,6 +29995,61 @@ mod scheduler_tests {
         }
         h.save(&c, Expected::Version(version)).unwrap();
         assert!(h.validate_task_tool_registry(&registry).is_err());
+        // Simulate another writer replacing the observed task after outcome
+        // selection but before the conversation result commit.
+        let tasks = crate::task_store::TaskStore::new(h.owner.store());
+        let mut stored = tasks.load(operation_id).unwrap().unwrap();
+        stored.task.start().unwrap();
+        stored.task.succeed(serde_json::json!("done")).unwrap();
+        tasks
+            .save(&[crate::task_store::Save::Update(&stored)])
+            .unwrap();
+        let (_, check) = h
+            .task_tool_result(id, operation_id, operation_id, &original, &identity)
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = barrier.clone();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let store = durable_store::Store::open(writer_path).unwrap();
+            let tasks = crate::task_store::TaskStore::new(&store);
+            writer_barrier.wait();
+            let current = tasks.load(operation_id).unwrap().unwrap();
+            let mut replacement = serde_json::to_value(&current.task).unwrap();
+            replacement["state"]["Succeeded"] = serde_json::json!("substituted");
+            let key = crate::task_store::key(operation_id);
+            store
+                .commit(
+                    &[Check {
+                        key: key.clone(),
+                        expected: Expected::Version(current.version),
+                    }],
+                    &[Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&replacement).unwrap(),
+                    }],
+                )
+                .unwrap();
+            writer_barrier.wait();
+        });
+        TASK_RESULT_BEFORE_COMMIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                barrier.wait();
+                barrier.wait();
+            }));
+        });
+        let (mut c, version) = h.load(id).unwrap();
+        c.config.system_prompt = "must not commit".into();
+        assert!(
+            h.save_with_task_result_check(&c, Expected::Version(version), check)
+                .is_err()
+        );
+        assert_ne!(
+            h.conversation(id).unwrap().config.system_prompt,
+            "must not commit"
+        );
+        writer.join().unwrap();
     }
 
     #[test]
