@@ -103,6 +103,11 @@ pub struct SummaryGuard {
     _owner: Arc<OwnedStore>,
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static AFTER_OWNER_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce(&File, &Path)>>> = std::cell::RefCell::new(None);
+}
+
 impl OwnedStore {
     /// Try to acquire ownership without waiting, then open the SQLite store.
     #[cfg(unix)]
@@ -142,15 +147,22 @@ impl OwnedStore {
             Err(std::fs::TryLockError::WouldBlock) => return Err(OwnerError::Busy),
             Err(std::fs::TryLockError::Error(e)) => return Err(OwnerError::Io(e)),
         }
+        let lock = OwnerLock {
+            file: lock,
+            owner_pid: std::process::id(),
+        };
+        #[cfg(test)]
+        AFTER_OWNER_LOCK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook(&lock.file, &db);
+            }
+        });
         validate_file(&db, true)?;
         let store = Store::open(&db)?;
         validate_file(&db, false)?;
         Ok(Self {
             store,
-            _lock: OwnerLock {
-                file: lock,
-                owner_pid: std::process::id(),
-            },
+            _lock: lock,
             task_gate: std::sync::Mutex::new(()),
             controls: crate::controls::ConversationControls::default(),
             summary_fences: Mutex::new(HashMap::new()),
@@ -230,6 +242,38 @@ fn validate_file(path: &PathBuf, may_be_missing: bool) -> Result<(), OwnerError>
 #[cfg(all(test, unix))]
 mod inherited_lock_tests {
     use super::*;
+
+    #[test]
+    fn failed_open_releases_lock_while_inherited_descriptor_remains() {
+        use std::{cell::RefCell, os::unix::fs::symlink, rc::Rc};
+        for fail_validation in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let inherited = Rc::new(RefCell::new(None));
+            let retained = inherited.clone();
+            AFTER_OWNER_LOCK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |lock, db| {
+                    *retained.borrow_mut() = Some(lock.try_clone().unwrap());
+                    if fail_validation {
+                        symlink("/dev/null", db).unwrap();
+                    } else {
+                        std::fs::write(db, b"not a sqlite database").unwrap();
+                    }
+                }));
+            });
+            let result = OwnedStore::open(&path);
+            if fail_validation {
+                assert!(matches!(result, Err(OwnerError::InvalidPath(_))));
+            } else {
+                assert!(matches!(result, Err(OwnerError::Store(_))));
+            }
+            assert!(inherited.borrow().is_some());
+            std::fs::remove_file(&path).unwrap();
+            let reopened = OwnedStore::open(&path).unwrap();
+            drop(reopened);
+            drop(inherited);
+        }
+    }
 
     #[test]
     fn fork_child_drop_does_not_unlock_live_parent() {
