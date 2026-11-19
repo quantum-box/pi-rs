@@ -127,6 +127,7 @@ impl KeyedTool for BoundaryParent {
         if let Some(wake) = host.pending_wake() {
             append(&self.root, "wake-effects");
             if std::env::var("PI_UNSAFE_BOUNDARY_STAGE").ok().as_deref() == Some("handler-started")
+                || self.root.join("hold-woken-execution").exists()
             {
                 std::fs::write(self.root.join("boundary"), b"handler-started").unwrap();
                 std::future::pending::<()>().await;
@@ -1195,6 +1196,63 @@ async fn initial_busy_wait_reopen_requires_parent_registration() {
     assert_eq!(count(root, "initial-effects"), 0);
     scheduler.shutdown().await.unwrap();
 }
+struct WokenCancelSentinel(PathBuf);
+#[async_trait::async_trait]
+impl Tool for WokenCancelSentinel {
+    fn spec(&self) -> ToolSpec {
+        spec("sentinel")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        append(&self.0, "unexpected-task-invoke");
+        Outcome::Failed("unexpected".into())
+    }
+}
+#[async_trait::async_trait]
+impl crate::async_task_tool::DurableAsyncTool for WokenCancelSentinel {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: crate::async_task_tool::DurableToolResume,
+        _: &dyn crate::async_task_tool::DurableTaskHost,
+    ) -> Result<crate::async_task_tool::DurableToolStep, String> {
+        append(&self.0, "unexpected-task-execute");
+        Err("unexpected".into())
+    }
+}
+#[async_trait::async_trait]
+impl crate::async_task_tool::DurableParkCancel for WokenCancelSentinel {
+    async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+        append(&self.0, "unexpected-task-cancel");
+        Ok(())
+    }
+}
+fn woken_cancel_registry(root: &Path) -> crate::task_scheduler::Registry {
+    use crate::async_task_tool::{
+        AbortAfterAuthorization, ReplaySafeAuthorization, StandaloneBeforeHookHost,
+        UnsafeDurableAuthorization,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut host =
+        StandaloneBeforeHookHost::open(dir.path().join("db"), Default::default()).unwrap();
+    let sentinel = Arc::new(WokenCancelSentinel(root.into()));
+    host.register_unsafe_durable_tool_with_woken_cancel(
+        sentinel.clone(),
+        "sentinel-v1",
+        1,
+        vec![],
+        &crate::extension::Registry::default().snapshot(),
+        &[],
+        "sentinel-cancel-v1",
+        sentinel,
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        AbortAfterAuthorization::host_attests_cleanup_safe(),
+        None,
+    )
+    .unwrap();
+    host.into_scheduler_for_test().registry_for_test()
+}
 struct Kill(std::process::Child);
 impl Drop for Kill {
     fn drop(&mut self) {
@@ -1203,6 +1261,9 @@ impl Drop for Kill {
     }
 }
 async fn stop_process(root: &Path, stage: &str) -> Uuid {
+    stop_process_with_task_driver(root, stage, false).await
+}
+async fn stop_process_with_task_driver(root: &Path, stage: &str, driver: bool) -> Uuid {
     let mut process = Kill(
         std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -1211,6 +1272,10 @@ async fn stop_process(root: &Path, stage: &str) -> Uuid {
             ])
             .env("PI_UNSAFE_BOUNDARY_DIR", root)
             .env("PI_UNSAFE_BOUNDARY_STAGE", stage)
+            .env(
+                "PI_UNSAFE_BOUNDARY_TASK_DRIVER",
+                if driver { "yes" } else { "no" },
+            )
             .spawn()
             .unwrap(),
     );
@@ -1235,6 +1300,11 @@ async fn unsafe_boundary_worker() {
         options(&root, 1, false, ReplayPolicy::Unsafe),
     )
     .unwrap();
+    let _driver = if std::env::var("PI_UNSAFE_BOUNDARY_TASK_DRIVER").as_deref() == Ok("yes") {
+        Some(scheduler.start_tasks(woken_cancel_registry(&root)).unwrap())
+    } else {
+        None
+    };
     let id = scheduler
         .create_conversation(Config {
             model: "test".into(),
@@ -1358,4 +1428,127 @@ async fn killed_wake_and_claim_respect_abort_and_definition_fences() {
             scheduler.shutdown().await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn conversation_woken_interruption_does_not_enter_task_cancel_driver() {
+    for (stage, abort) in [
+        ("wake-saved", true),
+        ("attempt-claimed", false),
+        ("handler-started", false),
+        ("handler-started", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = stop_process_with_task_driver(root, stage, true).await;
+        if abort {
+            let mut harness = Harness::open_paused(
+                root.join("db"),
+                options(root, 1, false, ReplayPolicy::Unsafe),
+            )
+            .unwrap();
+            harness.request_abort(id).unwrap();
+        }
+        let mut scheduler = Scheduler::open(
+            root.join("db"),
+            options(root, 1, false, ReplayPolicy::Unsafe),
+        )
+        .unwrap();
+        let driver = scheduler.start_tasks(woken_cancel_registry(root)).unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_some(), "{stage}/{abort}");
+        assert_eq!(count(root, "initial-effects"), 1);
+        assert_eq!(count(root, "child-effects"), 1);
+        assert_eq!(
+            count(root, "wake-effects"),
+            usize::from(stage == "handler-started")
+        );
+        for name in [
+            "unexpected-task-invoke",
+            "unexpected-task-execute",
+            "unexpected-task-cancel",
+        ] {
+            assert_eq!(count(root, name), 0, "{stage}/{abort}: {name}");
+        }
+        let store = scheduler.harness.owner.store();
+        assert!(store.list(crate::task_store::PREFIX).unwrap().is_empty());
+        assert!(
+            store
+                .list(b"durable/replay-safe-async/")
+                .unwrap()
+                .is_empty()
+        );
+        let attempts = scheduler
+            .tool_attempts(
+                id,
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )
+            .unwrap()
+            .records;
+        assert_eq!(attempts.len(), if stage == "wake-saved" { 1 } else { 2 });
+        drop(driver);
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn conversation_running_abort_does_not_dispatch_woken_task_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("hold-woken-execution"), b"yes").unwrap();
+    let mut scheduler = Scheduler::open(
+        root.join("db"),
+        options(root, 1, false, ReplayPolicy::Unsafe),
+    )
+    .unwrap();
+    let driver = scheduler.start_tasks(woken_cancel_registry(root)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| root.join("poll-entered").exists()).await;
+    std::fs::write(root.join("release"), b"yes").unwrap();
+    until(|| root.join("boundary").exists()).await;
+    scheduler.abort(id).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(count(root, "initial-effects"), 1);
+    assert_eq!(count(root, "child-effects"), 1);
+    assert_eq!(count(root, "wake-effects"), 1);
+    assert_eq!(count(root, "unexpected-task-cancel"), 0);
+    assert!(
+        scheduler
+            .harness
+            .owner
+            .store()
+            .list(crate::task_store::PREFIX)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        scheduler
+            .harness
+            .owner
+            .store()
+            .list(b"durable/replay-safe-async/")
+            .unwrap()
+            .is_empty()
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(
+        root.join("db"),
+        options(root, 1, false, ReplayPolicy::Unsafe),
+    )
+    .unwrap();
+    let driver = scheduler.start_tasks(woken_cancel_registry(root)).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(count(root, "wake-effects"), 1);
+    assert_eq!(count(root, "unexpected-task-cancel"), 0);
+    drop(driver);
+    scheduler.shutdown().await.unwrap();
 }

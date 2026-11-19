@@ -6741,6 +6741,10 @@ impl Scheduler {
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         self.replace_registry_locked(registry)
     }
+    #[cfg(test)]
+    pub(crate) fn registry_for_test(&self) -> Registry {
+        self.registry.clone()
+    }
     pub(crate) fn bind_harness(&mut self, harness: crate::runtime::Harness) {
         self.activity = harness.worker_activity();
         self.validator = Some(harness);
