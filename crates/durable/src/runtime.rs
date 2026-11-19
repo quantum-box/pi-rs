@@ -3248,7 +3248,7 @@ pub struct Harness {
     /// Snapshots loaded by this worker, used to distinguish admission-only
     /// conflicts from changes to execution state.
     loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
-    execution_gate: Option<Arc<std::sync::Mutex<()>>>,
+    execution_gate: Option<Arc<durable_store::controls::PollGate>>,
     scheduled_placement_gate: Option<durable_store::controls::CallbackStartGate>,
     task_driver: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::task_driver::Shared>>>>,
     pub(crate) task_publication:
@@ -24199,7 +24199,7 @@ async fn poll_suspended_nested(
 // the commit wins, no subsequent poll can initiate or resume dispatch.
 async fn fenced_poll<F: std::future::Future>(
     future: F,
-    gate: Option<&Arc<std::sync::Mutex<()>>>,
+    gate: Option<&Arc<durable_store::controls::PollGate>>,
     cancel: &CancellationToken,
 ) -> Option<F::Output> {
     let mut future = std::pin::pin!(future);

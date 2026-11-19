@@ -90,12 +90,78 @@ impl Drop for MutationLease {
     }
 }
 
+/// A poll lock that detects same-thread reentry before attempting the lock.
+/// Ownership is cleared before the underlying guard is released, including
+/// during unwinding. A guard is not transferable between threads.
+#[derive(Default)]
+pub struct PollGate {
+    inner: Mutex<()>,
+    owner: Mutex<Option<std::thread::ThreadId>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollGateError {
+    Reentrant,
+    Busy,
+    Poisoned,
+}
+
+pub struct PollGateGuard<'a> {
+    gate: &'a PollGate,
+    _inner: std::sync::MutexGuard<'a, ()>,
+}
+
+impl PollGate {
+    fn check_owner(&self) -> Result<(), PollGateError> {
+        let owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        if *owner == Some(std::thread::current().id()) {
+            Err(PollGateError::Reentrant)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn guard<'a>(&'a self, inner: std::sync::MutexGuard<'a, ()>) -> PollGateGuard<'a> {
+        *self.owner.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(std::thread::current().id());
+        PollGateGuard {
+            gate: self,
+            _inner: inner,
+        }
+    }
+
+    pub fn lock(&self) -> Result<PollGateGuard<'_>, PollGateError> {
+        self.check_owner()?;
+        let inner = self.inner.lock().map_err(|_| PollGateError::Poisoned)?;
+        Ok(self.guard(inner))
+    }
+
+    pub fn try_lock(&self) -> Result<PollGateGuard<'_>, PollGateError> {
+        self.check_owner()?;
+        let inner = self.inner.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => PollGateError::Busy,
+            std::sync::TryLockError::Poisoned(_) => PollGateError::Poisoned,
+        })?;
+        Ok(self.guard(inner))
+    }
+}
+
+impl Drop for PollGateGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .gate
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
 #[derive(Clone)]
 pub struct Control {
     /// Shared start/mutation gate. Callers must opt in at both boundaries;
     /// creation alone does not fence a conversation write.
     pub callback_start: CallbackStartGate,
-    pub gate: Arc<Mutex<()>>,
+    pub gate: Arc<PollGate>,
     pub worker: Arc<tokio::sync::Mutex<()>>,
     /// Serializes abort cleanup across direct and scheduled workers.
     pub abort_execution: Arc<tokio::sync::Mutex<()>>,
@@ -124,6 +190,7 @@ pub enum TargetFenceBusy {
     Registry,
     CallbackStart,
     Poll,
+    Reentrant,
     MutationCapacity,
 }
 
@@ -150,7 +217,7 @@ impl ConversationControls {
             .entry(id)
             .or_insert_with(|| Control {
                 callback_start: CallbackStartGate::default(),
-                gate: Arc::new(Mutex::new(())),
+                gate: Arc::new(PollGate::default()),
                 worker: Arc::new(tokio::sync::Mutex::new(())),
                 abort_execution: Arc::new(tokio::sync::Mutex::new(())),
                 summary_execution: Arc::new(tokio::sync::RwLock::new(())),
@@ -257,8 +324,9 @@ impl ConversationControls {
         for gate in &gates {
             match gate.try_lock() {
                 Ok(guard) => guards.push(guard),
-                Err(TryLockError::WouldBlock) => return Ok(Err(TargetFenceBusy::Poll)),
-                Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
+                Err(PollGateError::Busy) => return Ok(Err(TargetFenceBusy::Poll)),
+                Err(PollGateError::Reentrant) => return Ok(Err(TargetFenceBusy::Reentrant)),
+                Err(PollGateError::Poisoned) => return Err(FenceError::Poisoned),
             }
         }
         let affected = commit().map_err(FenceError::Commit)?;
@@ -301,8 +369,8 @@ impl ConversationControls {
         for gate in &gates {
             match gate.try_lock() {
                 Ok(guard) => guards.push(guard),
-                Err(TryLockError::WouldBlock) => return Ok(None),
-                Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
+                Err(PollGateError::Busy | PollGateError::Reentrant) => return Ok(None),
+                Err(PollGateError::Poisoned) => return Err(FenceError::Poisoned),
             }
         }
         let affected = commit().map_err(FenceError::Commit)?;
@@ -422,6 +490,54 @@ mod tests {
     }
 
     #[test]
+    fn poll_gate_reentry_is_rejected_and_other_thread_waits() {
+        let gate = Arc::new(PollGate::default());
+        let held = gate.lock().unwrap();
+        assert!(matches!(gate.lock(), Err(PollGateError::Reentrant)));
+        assert!(matches!(gate.try_lock(), Err(PollGateError::Reentrant)));
+        let other = gate.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            assert!(matches!(other.try_lock(), Err(PollGateError::Busy)));
+            entered_tx.send(()).unwrap();
+            let _guard = other.lock().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        assert!(done_rx.try_recv().is_err());
+        drop(held);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        // Many new owners cannot inherit stale ownership from terminated threads.
+        for _ in 0..64 {
+            let gate = gate.clone();
+            std::thread::spawn(move || drop(gate.lock().unwrap()))
+                .join()
+                .unwrap();
+        }
+        drop(gate.lock().unwrap());
+    }
+
+    #[test]
+    fn poll_gate_panic_releases_owner_and_preserves_poison() {
+        let gate = Arc::new(PollGate::default());
+        let other = gate.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = other.lock().unwrap();
+            panic!("poll failed");
+        })
+        .join()
+        .is_err());
+        assert!(matches!(gate.lock(), Err(PollGateError::Poisoned)));
+        assert!(matches!(gate.try_lock(), Err(PollGateError::Poisoned)));
+        let owner = gate.owner.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(owner.is_none());
+    }
+
+    #[test]
     fn targeted_fence_classifies_callback_and_poll_contention_without_committing() {
         let controls = ConversationControls::default();
         let id = Uuid::from_u128(12);
@@ -444,7 +560,7 @@ mod tests {
                 Ok::<_, ()>(vec![id])
             })
             .unwrap();
-        assert_eq!(result, Err(TargetFenceBusy::Poll));
+        assert_eq!(result, Err(TargetFenceBusy::Reentrant));
         assert!(!called.get());
         assert!(!control.cancel.is_cancelled());
         drop(poll);
