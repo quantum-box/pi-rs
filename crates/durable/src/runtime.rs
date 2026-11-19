@@ -25170,6 +25170,47 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_mutations_do_not_block_each_other_at_callback_start_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let (mut state, version) = scheduler.harness.load(id).unwrap();
+        let submission = Uuid::new_v4();
+        state.admit_initial_input(submission, "queued input".into());
+        state.submissions[0].status = Status::Queued;
+        state.active = None;
+        state.messages.clear();
+        state.phase = Phase::Idle;
+        scheduler
+            .harness
+            .save(&state, Expected::Version(version))
+            .unwrap();
+        let gate = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .callback_start;
+        let _other_mutation = gate.try_enter().unwrap();
+        assert!(matches!(
+            scheduler.withdraw_submission(id, submission).unwrap(),
+            WithdrawResult::Aborted
+        ));
+        let reset = scheduler.reset(id, Some("handoff".into())).unwrap();
+        assert!(
+            scheduler
+                .conversation(id)
+                .unwrap()
+                .resets
+                .iter()
+                .any(|entry| entry.id == reset)
+        );
+        drop(_other_mutation);
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn direct_withdraw_is_retryable_while_callback_start_gate_is_held() {
         let dir = tempfile::tempdir().unwrap();
         let mut scheduler =
@@ -25193,7 +25234,7 @@ mod scheduler_tests {
             .conversation_controls()
             .get(id)
             .callback_start;
-        let lease = gate.try_enter().unwrap();
+        let lease = gate.try_start().unwrap();
         assert!(matches!(
             scheduler.withdraw_submission(id, submission),
             Err(Error::TaskPublicationBusy)
@@ -25232,7 +25273,7 @@ mod scheduler_tests {
             .conversation_controls()
             .get(id)
             .callback_start;
-        let lease = gate.try_enter().unwrap();
+        let lease = gate.try_start().unwrap();
         assert!(matches!(
             scheduler.reset(id, Some("handoff".into())),
             Err(Error::TaskPublicationBusy)
@@ -25262,7 +25303,7 @@ mod scheduler_tests {
             .conversation_controls()
             .get(id)
             .callback_start;
-        let lease = gate.try_enter().unwrap();
+        let lease = gate.try_start().unwrap();
         let busy = Arc::new(Semaphore::new(0));
         placement_start_busy_hooks()
             .lock()
@@ -25323,7 +25364,7 @@ mod scheduler_tests {
             .conversation_controls()
             .get(id)
             .callback_start;
-        let held = start_gate.try_enter().unwrap();
+        let held = start_gate.try_start().unwrap();
         let busy = Arc::new(Semaphore::new(0));
         placement_start_busy_hooks()
             .lock()

@@ -13,15 +13,18 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Nonblocking, process-local exclusion for a callback-start boundary and a
-/// competing conversation mutation. The caller must hold the lease only while
-/// checking durable evidence and initiating the callback, never while awaiting
-/// external work. A held lease makes reentrant acquisition return `None`.
+/// A callback's first poll excludes conversation mutations. Mutations may
+/// overlap each other and are serialized by their existing durable checks.
 #[derive(Clone, Default)]
-pub struct CallbackStartGate(Arc<std::sync::atomic::AtomicBool>);
+pub struct CallbackStartGate(Arc<std::sync::atomic::AtomicUsize>);
 
-#[must_use = "retain the lease until the callback has started or the mutation is complete"]
-pub struct CallbackStartLease(Arc<std::sync::atomic::AtomicBool>);
+const CALLBACK_ACTIVE: usize = 1 << (usize::BITS - 1);
+
+#[must_use = "retain the lease until the callback's first poll finishes"]
+pub struct CallbackStartLease(Arc<std::sync::atomic::AtomicUsize>);
+
+#[must_use = "retain the lease until the mutation finishes"]
+pub struct MutationLease(Arc<std::sync::atomic::AtomicUsize>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallbackStartGateError {
@@ -30,22 +33,37 @@ pub enum CallbackStartGateError {
 }
 
 impl CallbackStartGate {
-    pub fn try_enter(&self) -> Option<CallbackStartLease> {
+    /// Enter as a mutation; other mutations may enter concurrently.
+    pub fn try_enter(&self) -> Option<MutationLease> {
+        use std::sync::atomic::Ordering;
+        let mut state = self.0.load(Ordering::Relaxed);
+        loop {
+            if state >= CALLBACK_ACTIVE - 1 {
+                return None;
+            }
+            match self.0.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(MutationLease(self.0.clone())),
+                Err(observed) => state = observed,
+            }
+        }
+    }
+
+    /// Acquire exclusive permission for the callback's first poll.
+    pub fn try_start(&self) -> Option<CallbackStartLease> {
+        use std::sync::atomic::Ordering;
         self.0
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
-            )
+            .compare_exchange(0, CALLBACK_ACTIVE, Ordering::Acquire, Ordering::Relaxed)
             .ok()?;
         Some(CallbackStartLease(self.0.clone()))
     }
 }
 impl CallbackStartLease {
-    /// Consume the lease around exactly one poll. No conversation registry,
-    /// poll or task mutex is acquired by this operation. The lease is dropped
-    /// before any later poll, so other conversation work can proceed.
+    /// Consume the exclusive lease around exactly one poll.
     pub fn poll_first<F: std::future::Future + ?Sized>(
         self,
         future: std::pin::Pin<&mut F>,
@@ -56,7 +74,12 @@ impl CallbackStartLease {
 }
 impl Drop for CallbackStartLease {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+impl Drop for MutationLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -144,7 +167,7 @@ impl ConversationControls {
                 .callback_start
                 .clone()
         };
-        Ok(gate.try_enter())
+        Ok(gate.try_start())
     }
 
     /// Fence all registered polls while `commit` discovers and persists its
@@ -230,16 +253,18 @@ mod tests {
         let first = controls.get(id).callback_start;
         let same = controls.get(id).callback_start;
         let other = controls.get(Uuid::from_u128(2)).callback_start;
-        let lease = first.try_enter().unwrap();
+        let mutation = first.try_enter().unwrap();
+        let nested = same.try_enter().unwrap();
+        assert!(first.try_start().is_none());
+        assert!(other.try_start().is_some());
+        drop(mutation);
+        assert!(first.try_start().is_none());
+        drop(nested);
+        let callback = first.try_start().unwrap();
         assert!(same.try_enter().is_none());
-        assert!(other.try_enter().is_some());
-        let worker = std::thread::spawn(move || same.try_enter().is_none());
-        assert!(worker.join().unwrap());
-        drop(lease);
-        let lease = first.try_enter().unwrap();
-        assert!(first.try_enter().is_none());
-        drop(lease);
-        assert!(controls.get(id).callback_start.try_enter().is_some());
+        assert!(same.try_start().is_none());
+        drop(callback);
+        assert!(first.try_enter().is_some());
     }
 
     #[test]
@@ -256,6 +281,8 @@ mod tests {
             // Reentrant acquisition returns immediately; a distinct graph is
             // not blocked and no controls registry lock is held while polling.
             assert!(controls.try_callback_start(id).unwrap().is_none());
+            assert!(controls.get(id).callback_start.try_enter().is_none());
+            assert!(controls.get(other).callback_start.try_enter().is_some());
             assert!(controls.try_callback_start(other).unwrap().is_some());
             std::task::Poll::<()>::Pending
         }));
@@ -280,7 +307,7 @@ mod tests {
     fn callback_start_lease_releases_during_unwind() {
         let gate = CallbackStartGate::default();
         let result = std::panic::catch_unwind(|| {
-            let _lease = gate.try_enter().unwrap();
+            let _lease = gate.try_start().unwrap();
             panic!("test unwind");
         });
         assert!(result.is_err());
@@ -292,7 +319,7 @@ mod tests {
         let controls = ConversationControls::default();
         let id = Uuid::from_u128(9);
         let start = controls.get(id).callback_start;
-        let lease = start.try_enter().unwrap();
+        let lease = start.try_start().unwrap();
         let called = std::cell::Cell::new(false);
         assert!(controls
             .try_fence(|| {
@@ -306,7 +333,8 @@ mod tests {
         assert_eq!(
             controls
                 .try_fence(|| {
-                    assert!(start.try_enter().is_none());
+                    assert!(start.try_enter().is_some());
+                    assert!(start.try_start().is_none());
                     Ok::<_, ()>(vec![])
                 })
                 .unwrap(),

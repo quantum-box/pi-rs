@@ -63,6 +63,11 @@ connected. Some of those compose task and document writes or use the blocking
 conversation fence; their lock ordering and retry owners still need separate
 verification before dispatch can be enabled.
 
+Mutation leases may overlap one another; the callback first-poll lease is
+exclusive against all of them. Durable transaction checks remain responsible
+for conflicts between concurrent mutations. This removes gate-induced Busy
+between ordinary mutations without authorizing callback dispatch.
+
 A nonblocking target-specific start lease can bracket exactly the first poll
 of a future without holding registry, task or poll mutexes. It is a primitive
 only: callback dispatch and most mutation paths do not yet use it. Existing
