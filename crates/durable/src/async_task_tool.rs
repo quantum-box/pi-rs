@@ -1223,7 +1223,7 @@ mod tests {
     ) -> StandaloneBeforeHookHost {
         let cell = Arc::new(std::sync::OnceLock::new());
         let mut registry = Registry::default();
-        assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
         let mut host = StandaloneBeforeHookHost::open(path, registry).unwrap();
         let adapter = host
             .register_tool_with_after("leaf", tool, "backend", 1, identity, hook)
@@ -1343,7 +1343,7 @@ mod tests {
         }
         let cell = Arc::new(std::sync::OnceLock::new());
         let mut registry = Registry::default();
-        assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+        assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
         let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
         let adapter = host
             .register_selected_tool_with_after(

@@ -2006,10 +2006,8 @@ impl DetachedInvocation {
                         capture.executor.tool().as_ref(),
                         &capture.implementation,
                         capture.version,
-                        false,
-                        true,
-                        &[],
-                        &[],
+                        (false, true),
+                        (&[], &[]),
                     )
                     .map_err(|e| format!("after authorization rejected: {e}"))?;
                     // A previous attempt may have committed the final receipt
@@ -2035,10 +2033,8 @@ impl DetachedInvocation {
                             capture.executor.tool().as_ref(),
                             &capture.implementation,
                             capture.version,
-                            false,
-                            true,
-                            &[],
-                            &[],
+                            (false, true),
+                            (&[], &[]),
                         )
                         .map_err(|e| format!("after completion rejected: {e}"))?;
                         result
