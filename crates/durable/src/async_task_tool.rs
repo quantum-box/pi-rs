@@ -216,6 +216,7 @@ impl StandaloneBeforeHookHost {
             true,
         )
     }
+    #[allow(clippy::too_many_arguments)] // Keep registration parameters explicit at this private boundary.
     fn register_tool_inner(
         &mut self,
         kind: impl Into<String>,
@@ -288,6 +289,7 @@ impl StandaloneBeforeHookHost {
             true,
         )
     }
+    #[allow(clippy::too_many_arguments)] // Keep registration parameters explicit at this private boundary.
     fn register_selected_tool_inner(
         &mut self,
         kind: impl Into<String>,
