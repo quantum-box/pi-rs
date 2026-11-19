@@ -4915,12 +4915,21 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let store = durable_store::Store::open(dir.path().join("db")).unwrap();
         assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
-        assert!(
-            store
-                .list(format!("durable/unsafe-park-async/{id}/").as_bytes())
-                .unwrap()
-                .is_empty()
+        // A blocked before hook records proof of non-dispatch. It must not
+        // create an intent, park proposal, receipt, or final outcome.
+        let records = store
+            .list(format!("durable/unsafe-park-async/{id}/").as_bytes())
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].0,
+            format!("durable/unsafe-park-async/{id}/no-dispatch").as_bytes()
         );
+        let proof: serde_json::Value = serde_json::from_slice(&records[0].1.value).unwrap();
+        assert_eq!(proof["task"], id.to_string());
+        assert_eq!(proof["version"], 1);
+        assert!(proof["before_attempt"].as_str().is_some());
+        assert_eq!(proof["checkpoint"]["phase"], "replay-safe-async-after");
     }
     struct DurableHooks {
         before: Arc<AtomicUsize>,
