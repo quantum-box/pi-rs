@@ -114,7 +114,7 @@ pub(super) fn register(
         abort_after,
         restart_after,
         unavailable,
-        park_cancel,
+        park_cancel.map(|(id, callback, retry)| (id, callback, retry, false)),
     )
 }
 
@@ -151,6 +151,7 @@ pub(super) fn register_unsafe_park_cancel(
     children: Vec<Arc<TaskTool>>,
     hook: (String, Arc<dyn crate::extension::Hook>),
     park_cancel: (String, Arc<dyn DurableParkCancel>, bool),
+    woken: bool,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -164,7 +165,7 @@ pub(super) fn register_unsafe_park_cancel(
         true,
         false,
         false,
-        Some(park_cancel),
+        Some((park_cancel.0, park_cancel.1, park_cancel.2, woken)),
     )
 }
 
@@ -181,7 +182,7 @@ fn register_with_policy(
     abort_after: bool,
     restart_after: bool,
     unavailable: bool,
-    park_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
+    park_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool, bool)>,
 ) -> Result<Arc<TaskTool>, String> {
     if unavailable && (!block_results || abort_after || restart_after || !children.is_empty()) {
         return Err("invalid unavailable registration".into());
@@ -226,7 +227,7 @@ fn register_with_policy(
     } else {
         1u32
     };
-    let encoded = if let Some((cancel_id, _, retry)) = &park_cancel {
+    let encoded = if let Some((cancel_id, _, retry, woken)) = &park_cancel {
         // 8 names the legacy at-most-once contract without park provenance;
         // 9 and 10 bind the retryable and provenance-required contracts.
         #[cfg(test)]
@@ -234,7 +235,11 @@ fn register_with_policy(
         #[cfg(not(test))]
         let legacy_fixture = false;
         serde_json::to_vec(&(
-            if !replay_safe && *retry {
+            if *woken && *retry {
+                14u32
+            } else if *woken {
+                13u32
+            } else if !replay_safe && *retry {
                 12u32
             } else if !replay_safe {
                 11u32
@@ -260,7 +265,11 @@ fn register_with_policy(
     let kind = if replay_safe {
         format!("pi-rs.replay-safe-async.v1.{hash:x}")
     } else if hook.is_some() {
-        format!("pi-rs.unsafe-park-async.v1.hook.{hash:x}")
+        if park_cancel.as_ref().is_some_and(|(_, _, _, woken)| *woken) {
+            format!("pi-rs.unsafe-park-async.v1.hook.woken.{hash:x}")
+        } else {
+            format!("pi-rs.unsafe-park-async.v1.hook.{hash:x}")
+        }
     } else {
         format!("pi-rs.unsafe-park-async.v1.{hash:x}")
     };
@@ -276,7 +285,7 @@ fn register_with_policy(
         replay_safe,
         block_results,
         unavailable,
-        park_cancel: park_cancel.map(|(_, callback, retry)| (callback, retry)),
+        park_cancel: park_cancel.map(|(_, callback, retry, _)| (callback, retry)),
     });
     scheduler.install_checkpointable_async_handler(
         kind.clone(),

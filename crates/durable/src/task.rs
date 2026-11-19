@@ -55,6 +55,7 @@ impl Task {
             restart_cleanup: false,
             restart_internal_abort: false,
             interrupted_dispatch_attempt: None,
+            woken_interrupted_attempt: None,
         })
     }
 
@@ -146,6 +147,7 @@ impl Task {
             && !self.abort_requested
             && !self.restart_cleanup
             && self.interrupted_dispatch_attempt.is_none()
+            && self.woken_interrupted_attempt.is_none()
             && self.restarts == 0
             && self.attempt_id.is_none()
             && self.retired_attempt_id.is_none()
@@ -171,6 +173,18 @@ impl Task {
         if matches!(self.state, TaskState::Waiting(_)) {
             self.state = TaskState::Ready;
         }
+        Ok(())
+    }
+
+    pub(crate) fn woken_interrupted_attempt(&self) -> Option<Uuid> {
+        self.woken_interrupted_attempt
+    }
+    /// The caller must atomically fence the exact woken intent and park proof.
+    pub(crate) fn recover_interrupted_woken_for_cleanup(&mut self) -> Result<(), TransitionError> {
+        let attempt = self.attempt_id.ok_or(TransitionError::InvalidState)?;
+        self.recover()?;
+        self.request_abort()?;
+        self.woken_interrupted_attempt = Some(attempt);
         Ok(())
     }
 
@@ -572,6 +586,18 @@ impl Task {
         self.typed_wake = None;
         self.ended_children = None;
         self.wake_children = None;
+        Ok(())
+    }
+
+    pub(crate) fn fail_interrupted_woken_ready(&mut self) -> Result<(), TransitionError> {
+        if self.state != TaskState::Ready
+            || !self.abort_requested
+            || self.woken_interrupted_attempt.is_none()
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state =
+            TaskState::Failed("interrupted woken execution; reconciliation required".into());
         Ok(())
     }
 

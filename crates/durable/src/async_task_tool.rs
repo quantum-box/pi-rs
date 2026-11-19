@@ -1270,6 +1270,52 @@ impl StandaloneBeforeHookHost {
             children,
             (identity, Arc::new(SelectedBeforeHooks(resolved))),
             (cancel_identity.to_owned(), cancel, retry.is_some()),
+            false,
+        )
+    }
+    /// Opt in to cleanup for an interrupted woken unsafe execution. External
+    /// effects remain uncertain; retry requires explicit idempotency attestation.
+    /// This distinct registration does not cancel an unwoken park. The host must
+    /// change `cancel_identity` when the callback or its configuration changes.
+    /// Cleanup must be cooperative and must not spawn detached work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_unsafe_durable_tool_with_woken_cancel(
+        &mut self,
+        tool: Arc<dyn DurableAsyncTool>,
+        implementation: &str,
+        version: u32,
+        children: Vec<Arc<crate::task_tool::TaskTool>>,
+        snapshot: &crate::extension::Snapshot,
+        names: &[String],
+        cancel_identity: &str,
+        cancel: Arc<dyn DurableParkCancel>,
+        _unsafe: UnsafeDurableAuthorization,
+        _hooks: ReplaySafeAuthorization,
+        _cleanup: AbortAfterAuthorization,
+        retry: Option<ParkCancelRetryAuthorization>,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+            return Err("invalid cancel identity".into());
+        }
+        let selection = snapshot
+            .stable_selection(names)
+            .ok_or("invalid selection")?;
+        let resolved = snapshot
+            .resolve_stable(names, &selection)
+            .ok_or("selection changed")?;
+        let identity = format!(
+            "selection-v1:{}",
+            serde_json::to_string(&selection).map_err(|e| e.to_string())?
+        );
+        replay_safe::register_unsafe_park_cancel(
+            &mut self.scheduler,
+            tool,
+            implementation,
+            version,
+            children,
+            (identity, Arc::new(SelectedBeforeHooks(resolved))),
+            (cancel_identity.to_owned(), cancel, retry.is_some()),
+            true,
         )
     }
     pub fn start_replay_safe_root(
@@ -12728,9 +12774,14 @@ mod tests {
         ) -> Result<(), String> {
             if args != json!({"token":"prepared"})
                 || checkpoint.get("call").is_none()
-                || !self.0.join("child-aborted").exists()
+                || (!self.0.join("child-aborted").exists() && !self.0.join("woken-case").exists())
             {
                 return Err("bad cancel input or child ordering".into());
+            }
+            if self.0.join("require-child-aborted").exists()
+                && !self.0.join("child-aborted").exists()
+            {
+                return Err("owned child has not aborted".into());
             }
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -12842,7 +12893,7 @@ mod tests {
         root: &std::path::Path,
         retry: bool,
     ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
-        unsafe_park_cancel_host_inner(root, retry, None)
+        unsafe_park_cancel_host_inner(root, retry, None, false)
     }
     type UnsafeCancelOuterSlot = Arc<std::sync::OnceLock<Arc<crate::task_tool::TaskTool>>>;
     struct UnsafeCancelOuter(UnsafeCancelOuterSlot);
@@ -12871,10 +12922,47 @@ mod tests {
             })
         }
     }
+    struct WokenAnyTool(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for WokenAnyTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "root".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for WokenAnyTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            context: ToolContext,
+            resume: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            if resume.checkpoint.is_none() {
+                let first = host.start_child("first", "leaf", json!({})).await?;
+                let second = host.start_child("second", "leaf", json!({})).await?;
+                return Ok(DurableToolStep::Park {
+                    checkpoint: json!({"call":first,"other":second}),
+                    wait: DurableWait::Any(vec![first, second]),
+                });
+            }
+            std::fs::write(self.0.join("wake-running"), b"yes").map_err(|e| e.to_string())?;
+            context.cancellation.cancelled().await;
+            Err("woken execution cancelled".into())
+        }
+    }
     fn unsafe_park_cancel_host_inner(
         root: &std::path::Path,
         retry: bool,
         outer: Option<(UnsafeCancelOuterSlot, bool)>,
+        woken: bool,
     ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
         use crate::task_scheduler::Handler;
         let leaf: Arc<dyn Handler> = Arc::new(ChainLeaf);
@@ -12923,36 +13011,47 @@ mod tests {
             1,
             leaf,
         ));
-        let definition: Arc<dyn DurableAsyncTool> = Arc::new(ChainTool {
-            name: "root",
-            child: "leaf",
-            calls: Arc::new(AtomicUsize::new(0)),
-            any: false,
-        });
+        let definition: Arc<dyn DurableAsyncTool> = if root.join("any-case").exists() {
+            Arc::new(WokenAnyTool(root.to_owned()))
+        } else {
+            Arc::new(ChainTool {
+                name: "root",
+                child: "leaf",
+                calls: Arc::new(AtomicUsize::new(0)),
+                any: false,
+            })
+        };
         let callback: Arc<dyn DurableParkCancel> = Arc::new(ParkCancelFixture(root.to_owned()));
-        let tool = host
-            .register_unsafe_durable_tool_with_park_cancel(
-                definition,
-                "park-cancel-tool-v1",
-                1,
-                vec![child],
-                &extensions.snapshot(),
-                &["hook".into()],
-                "park-cancel-v1",
-                callback,
-                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
-                ReplaySafeAuthorization::host_attests_replay_safe(),
-                AbortAfterAuthorization::host_attests_cleanup_safe(),
-                retry.then(ParkCancelRetryAuthorization::host_attests_cancel_replay_safe),
-            )
-            .unwrap();
+        let register = if woken {
+            StandaloneBeforeHookHost::register_unsafe_durable_tool_with_woken_cancel
+        } else {
+            StandaloneBeforeHookHost::register_unsafe_durable_tool_with_park_cancel
+        };
+        let tool = register(
+            &mut host,
+            definition,
+            "park-cancel-tool-v1",
+            1,
+            vec![child],
+            &extensions.snapshot(),
+            &["hook".into()],
+            "park-cancel-v1",
+            callback,
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+            AbortAfterAuthorization::host_attests_cleanup_safe(),
+            retry.then(ParkCancelRetryAuthorization::host_attests_cancel_replay_safe),
+        )
+        .unwrap();
         (host, tool)
     }
     fn wait_park_cancel(driver: &crate::task_driver::Driver, id: Uuid) {
         let root = wait_state(driver, id, |s| {
             matches!(
                 s,
-                crate::task::TaskState::Waiting(crate::task::WaitFor::Tasks(_))
+                crate::task::TaskState::Waiting(
+                    crate::task::WaitFor::Tasks(_) | crate::task::WaitFor::TasksAny(_)
+                )
             )
         });
         let child: AsyncTaskCall =
@@ -13884,8 +13983,12 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let slot: UnsafeCancelOuterSlot = Arc::new(std::sync::OnceLock::new());
-            let (host, tool) =
-                unsafe_park_cancel_host_inner(root, false, Some((slot.clone(), parent_safe)));
+            let (host, tool) = unsafe_park_cancel_host_inner(
+                root,
+                false,
+                Some((slot.clone(), parent_safe)),
+                false,
+            );
             assert!(slot.set(tool).is_ok());
             let scheduler = host.into_scheduler_for_test();
             let parent = Task::new(
@@ -14311,6 +14414,456 @@ mod tests {
             Some(ParkCancelEvidence::CallbackReturned)
         );
         assert!(!root.join("abort-hook-count").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn unsafe_woken_cancel_process_fixture() {
+        let Ok(root) = std::env::var("PI_UNSAFE_WOKEN_CANCEL_FIXTURE") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let (host, tool) =
+            unsafe_park_cancel_host_inner(&root, root.join("retry").exists(), None, true);
+        let id = host
+            .start_unsafe_durable_root(&tool, json!({"token":"prepared"}), 3)
+            .unwrap();
+        std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+        let driver = host.into_driver();
+        wait_park_cancel(&driver, id);
+        let task = driver.get(id).unwrap().unwrap();
+        let child: AsyncTaskCall =
+            serde_json::from_value(task.checkpoint().data["checkpoint"]["call"].clone()).unwrap();
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                child.task_id(),
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        if root.join("abort-woken").exists() {
+            driver.request_abort(id).unwrap();
+            let task = wait_terminal(&driver, id);
+            std::fs::write(root.join("woken-terminal"), format!("{:?}", task.state())).unwrap();
+        }
+        loop {
+            std::hint::black_box(&driver);
+            std::thread::park();
+        }
+    }
+    #[test]
+    fn unsafe_woken_cancel_running_abort_and_crash_reopen() {
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("woken-case"), b"yes").unwrap();
+            if abort {
+                std::fs::write(root.join("abort-woken"), b"yes").unwrap();
+            }
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+                .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+                .env("PI_TEST_PARK_CANCEL_WAKE", root)
+                .spawn()
+                .unwrap();
+            wait_file(&root.join(if abort {
+                "woken-terminal"
+            } else {
+                "wake-running"
+            }));
+            process.kill().unwrap();
+            process.wait().unwrap();
+            let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, id);
+            if abort {
+                assert!(
+                    matches!(task.state(), crate::task::TaskState::Cancelled),
+                    "{:?}",
+                    task.state()
+                );
+            } else {
+                assert!(
+                    matches!(task.state(),crate::task::TaskState::Failed(reason) if reason.contains("reconciliation")),
+                    "{:?}",
+                    task.state()
+                );
+            }
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            assert_eq!(
+                read_park_cancel_evidence(&store, id).unwrap(),
+                Some(ParkCancelEvidence::CallbackReturned)
+            );
+            assert_eq!(
+                read_unsafe_durable_park_evidence(&store, id).unwrap().len(),
+                1
+            );
+            assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(root.join("cancel-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn unsafe_woken_cancel_late_receipt_before_callback_is_reconcilable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("woken-case"), b"yes").unwrap();
+        std::fs::write(root.join("abort-woken"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .env("PI_TEST_PARK_CANCEL_SPEC_BARRIER", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("spec-barrier"));
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let prefix = format!("durable/unsafe-park-async/{id}/");
+        let mut target = None;
+        for (key, entry) in store.list(prefix.as_bytes()).unwrap() {
+            if !key.ends_with(b"/intent") {
+                continue;
+            }
+            let task: Task = serde_json::from_slice(&entry.value).unwrap();
+            if task.ended_children().is_some() {
+                target = Some((key, task));
+            }
+        }
+        let (key, intent) = target.expect("woken intent");
+        let (checks, mutations) = unsafe_park_proof::prepare_receipt(
+            &store,
+            &intent,
+            &key,
+            &Outcome::Succeeded("external evidence".into()),
+        )
+        .unwrap();
+        store.commit(&checks, &mutations).unwrap();
+        let expected = read_unsafe_durable_receipts(&store, id).unwrap();
+        drop(store);
+        std::fs::write(root.join("spec-release"), b"yes").unwrap();
+        wait_file(&root.join("woken-terminal"));
+        assert!(
+            std::fs::read_to_string(root.join("woken-terminal"))
+                .unwrap()
+                .contains("Failed")
+        );
+        assert!(!root.join("cancel-count").exists());
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert_eq!(read_unsafe_durable_receipts(&store, id).unwrap(), expected);
+        assert_eq!(
+            read_park_cancel_evidence(&store, id).unwrap(),
+            Some(ParkCancelEvidence::AttemptedUnknown)
+        );
+    }
+    #[test]
+    fn unsafe_woken_cancel_late_receipt_after_callback_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("woken-case"), b"yes").unwrap();
+        std::fs::write(root.join("abort-woken"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .env("PI_TEST_PARK_CANCEL_AFTER_RETURN", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("cancel-returned"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let prefix = format!("durable/unsafe-park-async/{id}/");
+        let mut target = None;
+        for (key, entry) in store.list(prefix.as_bytes()).unwrap() {
+            if !key.ends_with(b"/intent") {
+                continue;
+            }
+            let task: Task = serde_json::from_slice(&entry.value).unwrap();
+            if task.ended_children().is_some() {
+                target = Some((key, task));
+            }
+        }
+        let (key, intent) = target.expect("woken intent");
+        let (checks, mutations) = unsafe_park_proof::prepare_receipt(
+            &store,
+            &intent,
+            &key,
+            &Outcome::Succeeded("external result".into()),
+        )
+        .unwrap();
+        store.commit(&checks, &mutations).unwrap();
+        let expected = read_unsafe_durable_receipts(&store, id).unwrap();
+        drop(store);
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert_eq!(read_unsafe_durable_receipts(&store, id).unwrap(), expected);
+        assert_eq!(
+            read_park_cancel_evidence(&store, id).unwrap(),
+            Some(ParkCancelEvidence::CallbackReturned)
+        );
+        assert!(!root.join("abort-hook-count").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn unsafe_woken_cancel_rejects_changed_attempt_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("woken-case"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let prefix = format!("durable/unsafe-park-async/{id}/");
+        for (key, entry) in store.list(prefix.as_bytes()).unwrap() {
+            if !key.ends_with(b"/intent") {
+                continue;
+            }
+            let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+            if value.get("ended_children").is_some() {
+                value["attempt_id"] = json!(Uuid::new_v4());
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&value).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                break;
+            }
+        }
+        drop(store);
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert!(!root.join("cancel-count").exists());
+    }
+    #[test]
+    fn unsafe_woken_cancel_resume_fixture() {
+        let Ok(root) = std::env::var("PI_UNSAFE_WOKEN_CANCEL_RESUME") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let (host, _) =
+            unsafe_park_cancel_host_inner(&root, root.join("retry").exists(), None, true);
+        let driver = host.into_driver();
+        loop {
+            std::hint::black_box(&driver);
+            std::thread::park();
+        }
+    }
+    #[test]
+    fn unsafe_woken_cancel_cleanup_kill_reopen_obeys_retry_policy() {
+        for retry in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("woken-case"), b"yes").unwrap();
+            if retry {
+                std::fs::write(root.join("retry"), b"yes").unwrap();
+            }
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+                .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+                .env("PI_TEST_PARK_CANCEL_WAKE", root)
+                .spawn()
+                .unwrap();
+            wait_file(&root.join("wake-running"));
+            process.kill().unwrap();
+            process.wait().unwrap();
+            std::fs::write(root.join("pause-cancel"), b"yes").unwrap();
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("async_task_tool::tests::unsafe_woken_cancel_resume_fixture")
+                .env("PI_UNSAFE_WOKEN_CANCEL_RESUME", root)
+                .spawn()
+                .unwrap();
+            wait_file(&root.join("cancel-ready"));
+            process.kill().unwrap();
+            process.wait().unwrap();
+            std::fs::remove_file(root.join("pause-cancel")).unwrap();
+            let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let (host, _) = unsafe_park_cancel_host_inner(root, retry, None, true);
+            let driver = host.into_driver();
+            assert!(matches!(
+                wait_terminal(&driver, id).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            assert_eq!(
+                read_park_cancel_evidence(&store, id).unwrap(),
+                Some(if retry {
+                    ParkCancelEvidence::CallbackReturned
+                } else {
+                    ParkCancelEvidence::AttemptedUnknown
+                })
+            );
+            assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(root.join("cancel-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                if retry { 2 } else { 1 }
+            );
+        }
+    }
+    #[test]
+    fn unsafe_woken_cancel_retry_budget_is_finite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("woken-case"), b"yes").unwrap();
+        std::fs::write(root.join("retry"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        std::fs::write(root.join("pause-cancel"), b"yes").unwrap();
+        for _ in 0..3 {
+            let _ = std::fs::remove_file(root.join("cancel-ready"));
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("async_task_tool::tests::unsafe_woken_cancel_resume_fixture")
+                .env("PI_UNSAFE_WOKEN_CANCEL_RESUME", root)
+                .spawn()
+                .unwrap();
+            wait_file(&root.join("cancel-ready"));
+            process.kill().unwrap();
+            process.wait().unwrap();
+        }
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = unsafe_park_cancel_host_inner(root, true, None, true);
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert_eq!(
+            read_park_cancel_evidence(&store, id).unwrap(),
+            Some(ParkCancelEvidence::AttemptedUnknown)
+        );
+        assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+    }
+    #[test]
+    fn unsafe_woken_crash_drains_live_any_child_before_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for marker in ["woken-case", "any-case", "require-child-aborted"] {
+            std::fs::write(root.join(marker), b"yes").unwrap();
+        }
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        assert!(
+            matches!(task.state(),crate::task::TaskState::Failed(reason) if reason.contains("reconciliation")),
+            "{:?}",
+            task.state()
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert!(root.join("child-aborted").exists());
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert_eq!(
+            read_park_cancel_evidence(&store, id).unwrap(),
+            Some(ParkCancelEvidence::CallbackReturned)
+        );
+        assert!(read_unsafe_durable_receipts(&store, id).unwrap().is_empty());
         assert_eq!(
             std::fs::read_to_string(root.join("cancel-count"))
                 .unwrap()

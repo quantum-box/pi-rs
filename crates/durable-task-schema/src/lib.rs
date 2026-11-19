@@ -155,6 +155,9 @@ macro_rules! declare_task_schema {
             restart_internal_abort: bool,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             interrupted_dispatch_attempt: Option<Uuid>,
+            /// A woken unsafe execution interrupted before its cleanup.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            woken_interrupted_attempt: Option<Uuid>,
         }
     };
 }

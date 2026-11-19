@@ -290,7 +290,41 @@ pub(crate) fn prepare_park(
 
 /// Bind the next dispatch to the exact committed park and prior attempt.
 pub(crate) fn dispatch_checks(store: &Store, task: &Task) -> Result<Vec<Check>, String> {
-    park_checks(store, task, true)
+    park_checks(store, task, true, false)
+}
+
+/// Validate the identity and original park of a woken attempt without
+/// asserting that its external outcome is absent.
+pub(crate) fn woken_evidence_checks(
+    store: &Store,
+    task: &Task,
+    attempt: Uuid,
+) -> Result<Vec<Check>, String> {
+    let key = intent_key(task.id(), attempt);
+    let entry = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing woken intent")?;
+    let intent: Task = serde_json::from_slice(&entry.value).map_err(|_| "invalid woken intent")?;
+    if intent.id() != task.id()
+        || intent.attempt_id() != Some(attempt)
+        || intent.checkpoint() != task.checkpoint()
+        || intent.owner() != task.owner()
+        || intent.kind() != task.kind()
+        || intent.input() != task.input()
+        || intent.definition_version() != task.definition_version()
+        || intent.replay_safe()
+        || intent.state() != &TaskState::Running
+        || intent.abort_requested()
+    {
+        return Err("woken intent identity mismatch".into());
+    }
+    let mut checks = park_checks(store, &intent, true, true)?;
+    checks.push(Check {
+        key,
+        expected: Expected::Version(entry.version),
+    });
+    Ok(checks)
 }
 
 /// Authenticate a committed unsafe park without authorizing a Tool wake.
@@ -299,10 +333,20 @@ pub(crate) fn cancel_checks(
     task: &Task,
     boundary: u64,
 ) -> Result<Vec<Check>, String> {
+    cancel_checks_with_attempt(store, task, boundary).map(|(checks, _)| checks)
+}
+pub(crate) fn cancel_checks_with_attempt(
+    store: &Store,
+    task: &Task,
+    boundary: u64,
+) -> Result<(Vec<Check>, Option<Uuid>), String> {
     if task.checkpoint().phase != "replay-safe-async-wait" || task.replay_safe() {
         return Err("unsafe cancel requires a committed park".into());
     }
-    let mut checks = park_checks(store, task, false)?;
+    let woken_enabled = task
+        .kind()
+        .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken."));
+    let mut checks = park_checks(store, task, false, woken_enabled)?;
     let park_entry = store
         .get(&key(task.id()))
         .map_err(|e| e.to_string())?
@@ -340,6 +384,7 @@ pub(crate) fn cancel_checks(
         return Err("joined park wait mismatch".into());
     }
     let prefix = format!("durable/unsafe-park-async/{}/", task.id()).into_bytes();
+    let mut woken = None;
     for (key, entry) in store.list(&prefix).map_err(|e| e.to_string())? {
         if key.ends_with(b"/intent/receipt") || key.ends_with(b"/hook-final") {
             return Err("unsafe Tool receipt exists; reconciliation required".into());
@@ -352,12 +397,64 @@ pub(crate) fn cancel_checks(
         if later.id() != task.id() {
             return Err("unsafe execution identity mismatch".into());
         }
+        if woken_enabled
+            && entry.version > park_entry.version
+            && (later.checkpoint() != task.checkpoint() || later.ended_children().is_none())
+        {
+            return Err("later unsafe execution is not this park epoch".into());
+        }
         if later.attempt_id() != Some(proof.attempt)
             && later.checkpoint() == task.checkpoint()
             && later.ended_children().is_some()
         {
-            return Err("unsafe park epoch has already woken".into());
+            if !woken_enabled
+                || entry.version <= park_entry.version
+                || woken.is_some()
+                || later.replay_safe()
+                || later.owner() != task.owner()
+                || later.kind() != task.kind()
+                || later.definition_version() != task.definition_version()
+                || later.input() != task.input()
+                || later.state() != &TaskState::Running
+                || later.abort_requested()
+            {
+                return Err("untrusted or ambiguous woken execution".into());
+            }
+            let attempt = later.attempt_id().ok_or("missing woken attempt")?;
+            let actual = intent_key(task.id(), attempt);
+            if key != actual {
+                return Err("woken intent key mismatch".into());
+            }
+            checks.extend(park_checks(store, &later, true, true)?);
+            for suffix in [
+                b"/receipt".as_slice(),
+                b"/result".as_slice(),
+                b"/park-evidence".as_slice(),
+            ] {
+                let mut outcome = actual.clone();
+                outcome.extend_from_slice(suffix);
+                if store.get(&outcome).map_err(|e| e.to_string())?.is_some() {
+                    return Err(
+                        "woken execution has an external outcome; reconciliation required".into(),
+                    );
+                }
+                checks.push(Check {
+                    key: outcome,
+                    expected: Expected::Missing,
+                });
+            }
+            checks.push(Check {
+                key: actual,
+                expected: Expected::Version(entry.version),
+            });
+            woken = Some(attempt);
         }
+    }
+    if task.woken_interrupted_attempt().is_some() && task.woken_interrupted_attempt() != woken {
+        return Err("interrupted woken attempt changed".into());
+    }
+    if woken.is_none() && (woken_enabled || task.ended_children().is_some()) {
+        return Err("unbound wake; reconciliation required".into());
     }
     checks.push(Check {
         key: joined_key,
@@ -367,10 +464,15 @@ pub(crate) fn cancel_checks(
         key: prefix,
         expected: Expected::PrefixUnchangedSince(boundary),
     });
-    Ok(checks)
+    Ok((checks, woken))
 }
 
-fn park_checks(store: &Store, task: &Task, require_wake: bool) -> Result<Vec<Check>, String> {
+fn park_checks(
+    store: &Store,
+    task: &Task,
+    require_wake: bool,
+    allow_ended: bool,
+) -> Result<Vec<Check>, String> {
     let park_key = key(task.id());
     let park_entry = store.get(&park_key).map_err(|e| e.to_string())?;
     if matches!(
@@ -409,7 +511,7 @@ fn park_checks(store: &Store, task: &Task, require_wake: bool) -> Result<Vec<Che
         {
             return Err("unsafe wake does not match committed wait".into());
         }
-    } else if task.ended_children().is_some() {
+    } else if !allow_ended && task.ended_children().is_some() {
         return Err("unsafe park epoch already woken".into());
     }
     let previous_key = intent_key(task.id(), proof.attempt);

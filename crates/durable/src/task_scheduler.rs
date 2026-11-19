@@ -214,6 +214,8 @@ pub(crate) struct ParkCancelClaim {
     retry_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started_at_restart: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    woken_attempt: Option<Uuid>,
 }
 pub(crate) fn park_cancel_key(id: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{id}/park-cancel-claim").into_bytes()
@@ -278,20 +280,41 @@ pub(crate) fn read_park_cancel_claim(
             return Err("invalid parked cancel evidence".into());
         }
         let original_intent = park_cancel_original_intent_check(store, &claim)?;
-        match store.commit(
-            &[
-                durable_store::Check {
-                    key: task_store::key(id),
-                    expected: durable_store::Expected::Version(task.version),
-                },
-                durable_store::Check {
-                    key,
-                    expected: durable_store::Expected::Version(entry.version),
-                },
-                original_intent,
-            ],
-            &[],
-        ) {
+        let mut evidence_checks = if claim
+            .kind
+            .starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
+        {
+            let target = claim
+                .woken_attempt
+                .ok_or("missing woken attempt evidence")?;
+            if task
+                .task
+                .woken_interrupted_attempt()
+                .is_some_and(|id| id != target)
+            {
+                return Err("woken attempt evidence changed".into());
+            }
+            crate::async_task_tool::unsafe_park_proof::woken_evidence_checks(
+                store, &task.task, target,
+            )?
+        } else {
+            if claim.woken_attempt.is_some() {
+                return Err("unexpected woken evidence".into());
+            }
+            vec![]
+        };
+        evidence_checks.extend([
+            durable_store::Check {
+                key: task_store::key(id),
+                expected: durable_store::Expected::Version(task.version),
+            },
+            durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(entry.version),
+            },
+            original_intent,
+        ]);
+        match store.commit(&evidence_checks, &[]) {
             Ok(()) => return Ok(Some(claim.finished)),
             Err(durable_store::Error::Conflict { .. }) => continue,
             Err(e) => return Err(e.to_string()),
@@ -373,6 +396,26 @@ pub(crate) fn abort_receipt_evidence(
             || claim.lease.is_nil()
         {
             return Err("parked cancel claim changed".into());
+        }
+        if task.woken_interrupted_attempt().is_some() {
+            checks.extend(interrupted_owner_checks(store, task)?);
+        }
+        if claim
+            .kind
+            .starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
+        {
+            let (proof, target) =
+                crate::async_task_tool::unsafe_park_proof::cancel_checks_with_attempt(
+                    store,
+                    task,
+                    graph_version,
+                )?;
+            if target.is_none() || target != claim.woken_attempt {
+                return Err("woken cleanup target changed".into());
+            }
+            checks.extend(proof);
+        } else if claim.woken_attempt.is_some() {
+            return Err("unexpected woken target".into());
         }
         checks.push(park_cancel_original_intent_check(store, claim)?);
         checks.push(durable_store::Check {
@@ -2045,6 +2088,23 @@ impl AdmissionHandle<'_> {
             &current.task,
             boundary,
         )?;
+        if current.task.woken_interrupted_attempt().is_some() {
+            checks.extend(interrupted_owner_checks(owner.store(), &current.task)?);
+        }
+        if kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.") {
+            let (proof, target) =
+                crate::async_task_tool::unsafe_park_proof::cancel_checks_with_attempt(
+                    owner.store(),
+                    &current.task,
+                    boundary,
+                )?;
+            if target.is_none() || target != claim.woken_attempt {
+                return Err("woken cleanup target changed".into());
+            }
+            checks.extend(proof);
+        } else if claim.woken_attempt.is_some() {
+            return Err("unexpected woken target".into());
+        }
         checks.push(park_cancel_original_intent_check(owner.store(), &claim)?);
         checks.push(durable_store::Check {
             key,
@@ -2088,11 +2148,31 @@ impl AdmissionHandle<'_> {
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
         let state = self.lease.state.lock().map_err(|e| e.to_string())?;
         let graph_version = owner.store().put_version().map_err(|e| e.to_string())?;
-        let provenance = crate::async_task_tool::park_cancel_provenance_checks(
+        let mut provenance = crate::async_task_tool::park_cancel_provenance_checks(
             owner.store(),
             &self.running.task,
             graph_version,
         )?;
+        if self.running.task.woken_interrupted_attempt().is_some() {
+            provenance.extend(interrupted_owner_checks(owner.store(), &self.running.task)?);
+        }
+        let woken_attempt = if self
+            .running
+            .task
+            .kind()
+            .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken."))
+        {
+            let (extra, target) =
+                crate::async_task_tool::unsafe_park_proof::cancel_checks_with_attempt(
+                    owner.store(),
+                    &self.running.task,
+                    graph_version,
+                )?;
+            provenance.extend(extra);
+            target
+        } else {
+            None
+        };
         let tasks = TaskStore::new(owner.store());
         let current = tasks
             .load(self.running.task.id())
@@ -2171,6 +2251,7 @@ impl AdmissionHandle<'_> {
             finished: false,
             retry_count: retryable.then_some(1),
             started_at_restart: retryable.then_some(current.task.restarts()),
+            woken_attempt,
         };
         let mut prior_evidence = None;
         let mut archive = None;
@@ -2185,6 +2266,7 @@ impl AdmissionHandle<'_> {
                         || prior.started_at_restart.is_none()))
                 || (!retryable
                     && (prior.retry_count.is_some() || prior.started_at_restart.is_some()))
+                || prior.woken_attempt != claim.woken_attempt
                 || prior.task != claim.task
                 || prior.kind != claim.kind
                 || prior.definition_version != claim.definition_version
@@ -2447,6 +2529,23 @@ impl AdmissionHandle<'_> {
                     || claim.lease.is_nil()
                 {
                     return Err("invalid parked cancel claim".into());
+                }
+                if current.task.woken_interrupted_attempt().is_some() {
+                    checks.extend(interrupted_owner_checks(owner.store(), &current.task)?);
+                }
+                if kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.") {
+                    let (proof, target) =
+                        crate::async_task_tool::unsafe_park_proof::cancel_checks_with_attempt(
+                            owner.store(),
+                            &current.task,
+                            graph_version,
+                        )?;
+                    if target.is_none() || target != claim.woken_attempt {
+                        return Err("woken cleanup target changed".into());
+                    }
+                    checks.extend(proof);
+                } else if claim.woken_attempt.is_some() {
+                    return Err("unexpected woken target".into());
                 }
                 checks.push(park_cancel_original_intent_check(owner.store(), &claim)?);
                 checks.push(durable_store::Check {
@@ -4664,7 +4763,15 @@ impl Scheduler {
         }
         // Preserve the exact handler input until all preparation and commit
         // paths have either succeeded or returned a more precise owned candidate.
-        let mut backup = if nonblocking_abort || completed.running.task.holds_interrupted_cleanup()
+        let woken_abort = matches!(completed.result, InvocationResult::Abort(_))
+            && completed
+                .running
+                .task
+                .kind()
+                .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken."));
+        let mut backup = if nonblocking_abort
+            || completed.running.task.holds_interrupted_cleanup()
+            || woken_abort
         {
             Some((completed.running.clone(), completed.result.clone()))
         } else {
@@ -4997,7 +5104,13 @@ impl Scheduler {
                         )
                         .map_err(Error::Handler)?;
                         let mut next = running.clone();
-                        next.task.cancel().map_err(Error::Transition)?;
+                        if running.task.woken_interrupted_attempt().is_some() {
+                            next.task
+                                .fail("interrupted woken execution; reconciliation required".into())
+                                .map_err(Error::Transition)?;
+                        } else {
+                            next.task.cancel().map_err(Error::Transition)?;
+                        }
                         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
                         batch.checks.extend(checks);
                         self.ts()
@@ -5114,7 +5227,7 @@ impl Scheduler {
                 )))
         ) && backup
             .as_ref()
-            .is_some_and(|(running, _)| running.task.holds_interrupted_cleanup())
+            .is_some_and(|(running, _)| running.task.holds_interrupted_cleanup() || woken_abort)
         {
             let (running, result) = backup.take().expect("checked above");
             drop(guard);
@@ -7044,6 +7157,132 @@ impl Scheduler {
                         .map_err(task_store::Error::from)?;
                     continue;
                 }
+                if !item.task.replay_safe()
+                    && item.task.kind().is_some_and(|kind| {
+                        kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
+                    })
+                    && item.task.checkpoint().phase == "replay-safe-async-wait"
+                {
+                    let Ok(reg) = self.registered(&item.task) else {
+                        continue;
+                    };
+                    if reg.version != item.task.definition_version()
+                        || reg.replay_safe
+                        || !reg.cancellable_durable_async
+                        || !reg.checkpointable_hooks
+                        || !reg.handler.requires_park_cancel_claim()
+                        || reg
+                            .abort
+                            .as_ref()
+                            .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+                    {
+                        continue;
+                    }
+                    let owner = self.owner();
+                    let boundary = owner
+                        .store()
+                        .put_version()
+                        .map_err(task_store::Error::from)?;
+                    let records = self.ts().list()?;
+                    if owned_graph_uncertain(owner.store(), item.task.id())? {
+                        continue;
+                    }
+                    let proof =
+                        crate::async_task_tool::unsafe_park_proof::cancel_checks_with_attempt(
+                            owner.store(),
+                            &item.task,
+                            boundary,
+                        );
+                    if let (Ok((mut checks, Some(target))), Ok(owner_checks)) =
+                        (proof, interrupted_owner_checks(owner.store(), &item.task))
+                        && item.task.attempt_id() == Some(target)
+                    {
+                        let mut ids = HashSet::from([item.task.id()]);
+                        loop {
+                            let before = ids.len();
+                            for record in &records {
+                                if let TaskOwner::Task(parent) = record.task.owner()
+                                    && ids.contains(parent)
+                                {
+                                    ids.insert(record.task.id());
+                                }
+                            }
+                            if ids.len() == before {
+                                break;
+                            }
+                        }
+                        if crate::ownership_edge::reject_foreground_children(
+                            owner.store(),
+                            records
+                                .iter()
+                                .filter(|r| ids.contains(&r.task.id()))
+                                .map(|r| r.task.id()),
+                        )
+                        .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+                        {
+                            continue;
+                        }
+                        checks.extend(owner_checks);
+                        let mut updates = Vec::new();
+                        for record in &records {
+                            if !ids.contains(&record.task.id()) || record.task.is_terminal() {
+                                continue;
+                            }
+                            let mut next = record.clone();
+                            if record.task.id() == item.task.id() {
+                                if record != &item {
+                                    continue 'scan;
+                                }
+                                next.task
+                                    .recover_interrupted_woken_for_cleanup()
+                                    .map_err(Error::Transition)?;
+                                updates.push(next);
+                            } else if !record.task.abort_requested() {
+                                next.task.request_abort().map_err(Error::Transition)?;
+                                updates.push(next);
+                            }
+                        }
+                        let mut batch = self
+                            .ts()
+                            .prepare_save(&updates.iter().map(Save::Update).collect::<Vec<_>>())?;
+                        batch.checks.extend(checks);
+                        for record in &records {
+                            if ids.contains(&record.task.id())
+                                && !updates.iter().any(|u| u.task.id() == record.task.id())
+                            {
+                                batch.checks.push(durable_store::Check {
+                                    key: task_store::key(record.task.id()),
+                                    expected: durable_store::Expected::Version(record.version),
+                                });
+                            }
+                        }
+                        for id in &ids {
+                            let (check, mutation) = crate::ownership_edge::prepare_abort_fence(
+                                owner.store(),
+                                &TaskOwner::Task(*id),
+                            )
+                            .map_err(task_store::Error::from)?;
+                            batch.checks.push(check);
+                            batch.mutations.push(mutation);
+                        }
+                        match owner.store().commit_with_prefix_put_fence(
+                            &batch.checks,
+                            &batch.mutations,
+                            &[
+                                task_store::PREFIX,
+                                crate::ownership_edge::PREFIX,
+                                b"runtime/conversation/",
+                            ],
+                            boundary,
+                        ) {
+                            Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                self.deferred_recovery.extend(deferred);
+                                continue 'scan;
+                            }
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    }
+                }
                 if !item.task.replay_safe() {
                     if item.task.checkpoint().phase == "sealed.execute.v1"
                         && let Some(identity) = crate::async_task_protocol::interrupted_identity(
@@ -8214,7 +8453,13 @@ impl Scheduler {
                 };
                 if let Some((_, checks)) = evidence {
                     let mut next = snapshot.clone();
-                    next.task.cancel().map_err(Error::Transition)?;
+                    if snapshot.task.woken_interrupted_attempt().is_some() {
+                        next.task
+                            .fail_interrupted_woken_ready()
+                            .map_err(Error::Transition)?;
+                    } else {
+                        next.task.cancel().map_err(Error::Transition)?;
+                    }
                     let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
                     batch.checks.extend(checks);
                     #[cfg(test)]
