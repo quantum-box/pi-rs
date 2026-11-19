@@ -715,7 +715,7 @@ impl Executor {
         let memo = HookMemo {
             admission,
             cancellation: cancel,
-            failed: Mutex::new(false),
+            failed: Mutex::new(None),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -741,10 +741,18 @@ impl Executor {
                     Ok(value)
                 }
             }
-        })?;
-        if memo.failed() {
-            return Err("task-fenced hook memo failed".into());
+        });
+        if cancel.is_cancelled() {
+            return Err("after hook cancelled".into());
         }
+        if let Some(error) = memo.failure() {
+            return Err(if error == crate::task_scheduler::UNSAFE_ANCESTOR_BUSY {
+                error
+            } else {
+                "task-fenced hook memo failed".into()
+            });
+        }
+        let result = result?;
         admission.replay_safe_durable_check(cancel)?;
         validate_content_hook_result(&result, required.as_ref(), false)?;
         let value = serde_json::to_value(DurableTaskResult::Rich {
