@@ -497,13 +497,16 @@ host-assigned implementation/backend identity and version. It is not yet bound
 to a task or enforced at dispatch, and its implementation identity is an assertion,
 not a cryptographic measurement.
 
-A private storage-only prototype composes a keyed child and its identity in one
-checked transaction. It also stores an attempt-specific intent and an independent
-`Pending`/`Unknown` receipt, including after an abort mark. These records are not
-wired to the scheduler, driver, or `TaskTool`: the intent is not a lease or
-authority to run effects, and the receipt writer does not authenticate an executor.
-An intent left without a receipt is uncertain, not permission to retry. Operators
-cannot yet use this private protocol for reconciliation.
+A private prototype composes a keyed child and its identity in one checked
+transaction. A detached scheduler invocation can record a provisional intent
+while its own and its direct parent's reservations are live and the task gate
+fences abort. A joined handler can persist its returned `Pending`/`Unknown` in a
+separate receipt after abort. These methods are not invoked by the task driver or
+`TaskTool`. The intent is not a lease or authority to run effects: abort can commit
+after its gate is released. The receipt proves only that this handler returned
+under the reserved task attempt; it does not prove the handler used the intended
+Tool or joined any spawned executor. An intent without a receipt is uncertain,
+not permission to retry. Operators cannot use this private protocol to reconcile.
 
 `async_task_tool::AsyncTaskTool` remains disabled even with this host capability:
 its constructor returns an error, and no async tool handler is registered. Safe

@@ -576,6 +576,53 @@ pub struct CompletedInvocation {
     lease: InvocationLease,
 }
 
+impl CompletedInvocation {
+    /// Persist an uncertain outcome taken from this joined handler's exact
+    /// return value while its invocation lease is still held. It does not prove
+    /// that a handler joined any executor it may have spawned.
+    #[allow(dead_code)] // The async tool driver is not wired yet.
+    pub(crate) fn persist_unhooked_receipt(
+        &self,
+        intent: &crate::async_task_protocol::Intent,
+    ) -> Result<(), crate::async_task_protocol::Error> {
+        use crate::async_task_protocol::Error as ProtocolError;
+        if !intent.matches_attempt(&self.running.task) || self.lease.retired {
+            return Err(ProtocolError::Invalid);
+        }
+        let InvocationResult::Handler(Ok(Step::Succeed(value)), _) = &self.result else {
+            return Err(ProtocolError::Invalid);
+        };
+        let outcome: pi_rs_core::Outcome = serde_json::from_value(value.clone())?;
+        if !matches!(
+            outcome,
+            pi_rs_core::Outcome::Pending { .. } | pi_rs_core::Outcome::Unknown(_)
+        ) {
+            return Err(ProtocolError::Invalid);
+        }
+        let _failure = self
+            .lease
+            .failure_fence
+            .lock()
+            .map_err(|_| ProtocolError::Invalid)?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner
+            .task_gate()
+            .lock()
+            .map_err(|_| ProtocolError::Invalid)?;
+        let state = self
+            .lease
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::Invalid)?;
+        if !state.attempts.contains(&self.running.task.id()) {
+            return Err(ProtocolError::Invalid);
+        }
+        let batch = crate::async_task_protocol::prepare_receipt(owner.store(), intent, &outcome)?;
+        owner.store().commit(&batch.checks, &batch.mutations)?;
+        Ok(())
+    }
+}
+
 // Own the exact checked transaction and the observations needed to revalidate
 // it after graph-only conflicts. The invocation lease remains with its caller.
 /// A checked transaction and its graph revalidation state.
@@ -1262,6 +1309,79 @@ impl AdmissionHandle<'_> {
 }
 
 impl DetachedInvocation {
+    /// Record a provisional standalone intent while both task reservations and
+    /// the graph gate are held. This is not dispatch authority: the gate is
+    /// released on return and abort may still win before an effect begins.
+    #[allow(dead_code)] // Unhooked dispatch remains disabled.
+    pub(crate) fn commit_unhooked_intent(
+        &self,
+        identity: &crate::async_task_tool::ToolIdentity,
+        tool: &dyn pi_rs_core::Tool,
+        implementation: &str,
+        version: u32,
+    ) -> Result<crate::async_task_protocol::Intent, crate::async_task_protocol::Error> {
+        use crate::async_task_protocol::Error as ProtocolError;
+        if self.abort
+            || self.validator.is_some()
+            || !self.running.task.is_task_tool()
+            || self.running.task.replay_safe()
+            || !identity.matches(tool, implementation, version)
+        {
+            return Err(ProtocolError::Invalid);
+        }
+        let TaskOwner::Task(parent_id) = self.running.task.owner() else {
+            return Err(ProtocolError::Invalid);
+        };
+        let _failure = self
+            .lease
+            .failure_fence
+            .lock()
+            .map_err(|_| ProtocolError::Invalid)?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner
+            .task_gate()
+            .lock()
+            .map_err(|_| ProtocolError::Invalid)?;
+        let state = self
+            .lease
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::Invalid)?;
+        let parent = task_store::TaskStore::new(owner.store())
+            .load(*parent_id)?
+            .ok_or(ProtocolError::Invalid)?;
+        if state.poisoned
+            || state.handler_failed
+            || self.lease.retired
+            || !state.attempts.contains(&self.running.task.id())
+            || !state.attempts.contains(parent_id)
+            || state
+                .published
+                .iter()
+                .any(|(id, _)| *id == self.running.task.id() || *id == *parent_id)
+            || !parent.task.is_task_tool()
+            || parent.task.state() != &TaskState::Running
+            || parent.task.attempt_id().is_none()
+            || parent.task.abort_requested()
+        {
+            return Err(ProtocolError::Invalid);
+        }
+        if pending_abort_root_for_running(
+            &task_store::TaskStore::new(owner.store()),
+            self.running.task.id(),
+            true,
+        )
+        .map_err(|_| ProtocolError::Invalid)?
+        .is_some()
+        {
+            return Err(ProtocolError::Invalid);
+        }
+        let (intent, batch) =
+            crate::async_task_protocol::prepare_intent(owner.store(), &self.running, identity)?;
+        owner.store().commit(&batch.checks, &batch.mutations)?;
+        Ok(intent)
+    }
+
     /// Run without holding the scheduler mutex. An unwinding TaskTool handler
     /// panic becomes a published failure so its owned graph can be cleaned up.
     /// Generic handler panics and abort handler panics retain their semantics.

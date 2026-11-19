@@ -79,6 +79,12 @@ pub(crate) struct Intent {
     identity: ToolIdentity,
 }
 
+impl Intent {
+    pub(crate) fn matches_attempt(&self, task: &Task) -> bool {
+        self.task == task.id() && task.attempt_id() == Some(self.attempt)
+    }
+}
+
 /// Stage an attempt-specific durable intent. It is deliberately NOT a lease:
 /// another abort can commit immediately after it. No external effect may use
 /// this as dispatch authority. Restricted to unlinked standalone ownership.
@@ -541,5 +547,224 @@ mod tests {
         assert_eq!(read_receipt(&store, &intent).unwrap(), None);
         let task = TaskStore::new(&store).load(id).unwrap().unwrap();
         assert!(prepare_intent(&store, &task, &intent.identity).is_err());
+    }
+    struct RealTool {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for RealTool {
+        fn spec(&self) -> ToolSpec {
+            Stub.spec()
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            self.entered.send(()).unwrap();
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Outcome::Pending {
+                reference: "real-tool-reference".into(),
+            }
+        }
+    }
+    struct RealToolHandler(std::sync::Arc<RealTool>);
+    impl crate::task_scheduler::Handler for RealToolHandler {
+        fn run(&self, task: &Task) -> Result<crate::task_scheduler::Step, String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let result = runtime.block_on(self.0.invoke(
+                json!({}),
+                ToolContext {
+                    operation_id: task.id(),
+                    cancellation: pi_rs_core::CancellationToken::new(),
+                },
+            ));
+            Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::to_value(result).map_err(|e| e.to_string())?,
+            ))
+        }
+    }
+    fn live_fixture(
+        path: &std::path::Path,
+        tool: std::sync::Arc<RealTool>,
+    ) -> (
+        crate::task_scheduler::Scheduler,
+        Box<crate::task_scheduler::DetachedInvocation>,
+        Box<crate::task_scheduler::DetachedInvocation>,
+        Uuid,
+        ToolIdentity,
+    ) {
+        use crate::task_scheduler::{Registry, Scheduler, Step, TickReservation};
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null)))));
+        assert!(registry.register("leaf", false, RealToolHandler(tool.clone())));
+        let mut scheduler = Scheduler::open(path, registry).unwrap();
+        let parent = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "parent".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false)
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let TickReservation::Invocation(parent_job) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("parent reservation");
+        };
+        let owner = scheduler.owner();
+        let tasks = TaskStore::new(owner.store());
+        let parent_snapshot = tasks.load(parent.id()).unwrap().unwrap();
+        let child = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Task(parent.id()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered_versioned("leaf".into(), false, 1, json!({}))
+        .unwrap()
+        .into_task_tool();
+        let identity = ToolIdentity::new(tool.as_ref(), "real-backend", 1).unwrap();
+        let (_, batch) =
+            prepare_child(owner.store(), &parent_snapshot, "child", &child, &identity).unwrap();
+        commit(owner.store(), batch);
+        let TickReservation::Invocation(child_job) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("child reservation");
+        };
+        (scheduler, parent_job, child_job, parent.id(), identity)
+    }
+    #[test]
+    fn driver_abort_before_intent_refuses_reserved_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, received) = std::sync::mpsc::channel();
+        let tool = std::sync::Arc::new(RealTool {
+            entered,
+            release: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        });
+        let (scheduler, parent_job, child_job, parent, identity) =
+            live_fixture(&dir.path().join("db"), tool.clone());
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert!(
+            child_job
+                .commit_unhooked_intent(&identity, tool.as_ref(), "wrong-backend", 1)
+                .is_err()
+        );
+        driver.request_abort(parent).unwrap();
+        assert!(
+            child_job
+                .commit_unhooked_intent(&identity, tool.as_ref(), "real-backend", 1)
+                .is_err()
+        );
+        assert!(received.try_recv().is_err());
+        let _ = driver.shutdown_with_pending();
+        drop(child_job);
+        drop(parent_job);
+    }
+    #[test]
+    fn joined_real_tool_result_can_be_receipted_after_driver_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, received) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let tool = std::sync::Arc::new(RealTool {
+            entered,
+            release: release.clone(),
+        });
+        let (scheduler, parent_job, child_job, parent, identity) =
+            live_fixture(&dir.path().join("db"), tool.clone());
+        let owner = scheduler.owner();
+        let intent = child_job
+            .commit_unhooked_intent(&identity, tool.as_ref(), "real-backend", 1)
+            .unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let running = std::thread::spawn(move || child_job.execute().unwrap());
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        driver.request_abort(parent).unwrap();
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        let completed = running.join().unwrap();
+        completed.persist_unhooked_receipt(&intent).unwrap();
+        assert_eq!(
+            read_receipt(owner.store(), &intent).unwrap(),
+            Some(Outcome::Pending {
+                reference: "real-tool-reference".into()
+            })
+        );
+        let _ = driver.shutdown_with_pending();
+        drop(completed);
+        drop(parent_job);
+    }
+    #[test]
+    fn killed_after_joined_real_tool_receipt_preserves_reference() {
+        const ENV: &str = "PI_RS_REAL_TOOL_RECEIPT_KILL";
+        if let Ok(directory) = std::env::var(ENV) {
+            let dir = std::path::Path::new(&directory);
+            let (entered, _received) = std::sync::mpsc::channel();
+            let tool = std::sync::Arc::new(RealTool {
+                entered,
+                release: std::sync::Arc::new((
+                    std::sync::Mutex::new(true),
+                    std::sync::Condvar::new(),
+                )),
+            });
+            let (scheduler, parent, child, _, identity) =
+                live_fixture(&dir.join("db"), tool.clone());
+            let id = child.task_id();
+            let intent = child
+                .commit_unhooked_intent(&identity, tool.as_ref(), "real-backend", 1)
+                .unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            let completed = child.execute().unwrap();
+            completed.persist_unhooked_receipt(&intent).unwrap();
+            std::fs::write(dir.join("ready"), id.to_string()).unwrap();
+            loop {
+                std::hint::black_box((&driver, &parent, &completed));
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("async_task_protocol::tests::killed_after_joined_real_tool_receipt_preserves_reference")
+            .env(ENV, dir.path()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("tool worker did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(dir.path().join("ready"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let intent: Intent =
+            serde_json::from_slice(&store.get(&intent_key(id)).unwrap().unwrap().value).unwrap();
+        assert_eq!(
+            read_receipt(&store, &intent).unwrap(),
+            Some(Outcome::Pending {
+                reference: "real-tool-reference".into()
+            })
+        );
     }
 }
