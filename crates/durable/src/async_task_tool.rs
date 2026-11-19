@@ -43,14 +43,18 @@ impl AsyncTaskCall {
         let Some(result) = self.0.result(parent, documents)? else {
             return Ok(None);
         };
-        let result = match result {
-            NestedTaskResult::Succeeded(value) => {
-                let outcome: Outcome = serde_json::from_value(value)
-                    .map_err(|_| "invalid stored async tool outcome")?;
+        if let Some(outcome) = documents.read_sealed_child_receipt(self.task_id())? {
+            return Ok(Some(
                 if matches!(outcome, Outcome::Unknown(_) | Outcome::Pending { .. }) {
-                    return Err("uncertain tool outcome was stored as success".into());
-                }
-                AsyncTaskResult::Outcome(outcome)
+                    AsyncTaskResult::Uncertain(outcome)
+                } else {
+                    AsyncTaskResult::Outcome(outcome)
+                },
+            ));
+        }
+        let result = match result {
+            NestedTaskResult::Succeeded(_) => {
+                return Err("sealed tool result lacks a receipt".into());
             }
             NestedTaskResult::Failed(reason) => match reason.strip_prefix(UNCERTAIN_PREFIX) {
                 Some(json) => {
@@ -89,7 +93,7 @@ impl UnhookedAuthorization {
 
 /// Owns a scheduler constructed without a conversation runtime. Its fields are
 /// private, so a conversation-attached scheduler cannot be substituted.
-/// This does not yet authorize dispatch of async task tools.
+/// Only explicitly registered sealed leaf tools can be dispatched.
 pub struct StandaloneNoHooksHost {
     scheduler: crate::task_scheduler::Scheduler,
 }
@@ -103,8 +107,35 @@ impl StandaloneNoHooksHost {
         Ok(Self { scheduler })
     }
 
+    /// Register a sealed leaf Tool in this standalone host. The exact Tool
+    /// allocation must have a matching `nested_identity` registration. The
+    /// returned adapter stages task-owned child calls atomically.
+    pub fn register_tool(
+        &mut self,
+        kind: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        implementation: &str,
+        version: u32,
+    ) -> Result<Arc<AsyncTaskTool>, String> {
+        let kind = kind.into();
+        let (executor, identity) =
+            self.scheduler
+                .install_sealed_tool(kind.clone(), tool, implementation, version)?;
+        let spec = identity.spec.clone();
+        let handler: Arc<dyn crate::task_scheduler::Handler> = executor;
+        let adapter = Arc::new(crate::task_tool::TaskTool::new(
+            spec, kind, false, version, handler,
+        ));
+        Ok(Arc::new(AsyncTaskTool { adapter, identity }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_scheduler_for_test(self) -> crate::task_scheduler::Scheduler {
+        self.scheduler
+    }
+
     /// Transfer this standalone scheduler to its real task driver. Async tool
-    /// dispatch remains disabled, including after this transfer.
+    /// Registered sealed tools execute only through this driver.
     pub fn into_driver(self) -> crate::task_driver::Driver {
         crate::task_driver::Driver::start(self.scheduler)
     }
@@ -158,19 +189,164 @@ impl ToolIdentity {
     }
 }
 
-/// Reserved API for the disabled task-backed async tool bridge.
+/// Executor construction is crate-private: no caller can substitute a Handler
+/// for the Tool whose identity is checked by the driver.
+pub(crate) struct SealedExecutor {
+    tool: Arc<dyn Tool>,
+    identity: ToolIdentity,
+    implementation: String,
+    version: u32,
+}
+impl SealedExecutor {
+    pub(crate) fn new(
+        tool: Arc<dyn Tool>,
+        identity: ToolIdentity,
+        implementation: String,
+        version: u32,
+    ) -> Self {
+        Self {
+            tool,
+            identity,
+            implementation,
+            version,
+        }
+    }
+    pub(crate) fn tool(&self) -> &Arc<dyn Tool> {
+        &self.tool
+    }
+
+    /// Called only after the driver has committed its task-owned intent and
+    /// acquired the registered identity lease. The worker directly polls and
+    /// joins the Tool future. Arbitrary effects spawned by a Tool are outside
+    /// that join and require destination-side idempotency or reconciliation.
+    pub(crate) fn run(
+        &self,
+        task: &Task,
+        intent: &crate::async_task_protocol::Intent,
+        store: &durable_store::Store,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> Result<crate::task_scheduler::Step, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tool runtime: {e}"))?;
+        let outcome = runtime.block_on(async {
+            if cancellation.is_cancelled() {
+                return Outcome::Unknown("cancelled after logical dispatch".into());
+            }
+            let args = match self.tool.prepare_arguments(task.input().clone()).await {
+                Ok(args) => args,
+                Err(error) => {
+                    return Outcome::Unknown(format!(
+                        "argument preparation failed after logical dispatch: {error}"
+                    ));
+                }
+            };
+            if !self
+                .identity
+                .matches(self.tool.as_ref(), &self.implementation, self.version)
+            {
+                return Outcome::Unknown("tool identity changed during preparation".into());
+            }
+            let spec = self.tool.spec();
+            if !args.is_object()
+                || !jsonschema::validator_for(&spec.parameters).is_ok_and(|v| v.is_valid(&args))
+            {
+                return Outcome::Unknown(
+                    "normalized arguments do not match the tool schema after dispatch".into(),
+                );
+            }
+            let batch =
+                match crate::async_task_protocol::prepare_arguments_record(store, intent, &args) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        return Outcome::Unknown(format!(
+                            "normalized argument persistence failed: {error}"
+                        ));
+                    }
+                };
+            if let Err(error) = store.commit(&batch.checks, &batch.mutations) {
+                return Outcome::Unknown(format!("normalized argument commit failed: {error}"));
+            }
+            if cancellation.is_cancelled() {
+                return Outcome::Unknown("cancelled after logical dispatch".into());
+            }
+            let host = Arc::new(SealedLeafHost(std::sync::atomic::AtomicBool::new(false)));
+            let reply = self
+                .tool
+                .invoke_transaction(
+                    args,
+                    pi_rs_core::ToolContext {
+                        operation_id: task.id(),
+                        cancellation: cancellation.clone(),
+                    },
+                    None,
+                    host.clone(),
+                )
+                .await;
+            if host.0.load(std::sync::atomic::Ordering::Acquire) || reply.state.is_some() {
+                return Outcome::Unknown(format!(
+                    "unsupported host operation or state update; returned reply: {}",
+                    serde_json::to_string(&reply).unwrap_or_else(|_| "unserializable".into())
+                ));
+            }
+            reply.outcome
+        });
+        Ok(crate::task_scheduler::Step::Succeed(
+            serde_json::to_value(outcome).map_err(|e| e.to_string())?,
+        ))
+    }
+}
+
+impl crate::task_scheduler::Handler for SealedExecutor {
+    fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
+        Err("sealed executor requires its driver-owned task reservation".into())
+    }
+}
+
+struct SealedLeafHost(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl pi_rs_core::ToolHost for SealedLeafHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        vec![]
+    }
+    async fn report_progress(&self, _: serde_json::Value) -> pi_rs_core::ExtensionResult<()> {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        Err("progress is unavailable".into())
+    }
+    async fn ui(
+        &self,
+        _: pi_rs_core::UiRequest,
+    ) -> pi_rs_core::ExtensionResult<pi_rs_core::UiResponse> {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        Err("UI is unavailable".into())
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        Outcome::Skipped("nested calls are unavailable".into())
+    }
+}
+
+/// Sealed task-backed Tool registered in a standalone no-hook host.
 pub struct AsyncTaskTool {
-    _private: (),
+    adapter: Arc<crate::task_tool::TaskTool>,
+    identity: ToolIdentity,
 }
 impl AsyncTaskTool {
-    /// The bridge is unavailable even with a standalone host capability.
-    pub fn new_unhooked(
-        _host: &StandaloneNoHooksHost,
-        _tool: Arc<dyn Tool>,
-        _kind: impl Into<String>,
-        _version: u32,
-    ) -> Result<Self, String> {
-        Err("async task tool dispatch is disabled: hooks, abort fencing, uncertain outcomes and tool identity are not yet integrated".into())
+    /// Stage a direct task-owned call. Its identity, admission and parent
+    /// transition commit together; it runs only while the parent is active or
+    /// durably waiting on this direct child.
+    pub fn start_child(
+        &self,
+        parent: &Task,
+        documents: &mut crate::document::TaskDocuments<'_>,
+        key: &str,
+        input: serde_json::Value,
+    ) -> Result<AsyncTaskCall, String> {
+        documents.require_standalone_for_sealed_child()?;
+        let handle = self.adapter.start_child(parent, documents, key, input)?;
+        documents.bind_sealed_child_identity(key, &self.identity)?;
+        Ok(AsyncTaskCall(handle))
     }
 }
 
@@ -178,7 +354,7 @@ impl AsyncTaskTool {
 mod tests {
     use super::*;
     use crate::task::{Checkpoint, TaskOwner};
-    use crate::task_scheduler::{Registry, Scheduler};
+    use crate::task_scheduler::Registry;
     use crate::task_store::{Save, TaskStore};
     use pi_rs_core::{ToolContext, ToolSpec};
     use serde_json::json;
@@ -223,7 +399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let calls = Arc::new(AtomicUsize::new(0));
-        let host = StandaloneNoHooksHost::open(
+        let mut host = StandaloneNoHooksHost::open(
             dir.path().join("host-db"),
             Registry::default(),
             UnhookedAuthorization::standalone_only(),
@@ -234,7 +410,10 @@ mod tests {
                 calls: calls.clone(),
                 spec,
             });
-            assert!(AsyncTaskTool::new_unhooked(&host, tool, "async.disabled", 1).is_err());
+            assert!(
+                host.register_tool("async.disabled", tool, "backend", 1)
+                    .is_err()
+            );
         }
         let id = Uuid::new_v4();
         let task = Task::new(
@@ -269,7 +448,7 @@ mod tests {
         assert!(!restored.is_terminal());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
-    struct CheckpointParent(Arc<crate::task_tool::TaskTool>);
+    struct CheckpointParent(Arc<std::sync::OnceLock<Arc<AsyncTaskTool>>>);
     impl crate::task_scheduler::Handler for CheckpointParent {
         fn run(&self, _: &Task) -> Result<crate::task_scheduler::Step, String> {
             unreachable!()
@@ -281,7 +460,12 @@ mod tests {
         ) -> Result<crate::task_scheduler::Step, String> {
             use crate::task_scheduler::Step;
             if parent.checkpoint().phase == "initial" {
-                let handle = AsyncTaskCall(self.0.start_child(parent, docs, "child", json!({}))?);
+                let handle = self.0.get().ok_or("missing tool")?.start_child(
+                    parent,
+                    docs,
+                    "child",
+                    json!({}),
+                )?;
                 let id = handle.task_id();
                 return Ok(Step::Wait {
                     checkpoint: Checkpoint {
@@ -303,39 +487,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn driver_restores_checkpoint_handle_and_reads_child_after_reopen() {
-        use crate::task_scheduler::{Handler, Step};
+    fn driver_checkpoint_reopen(mode: u8) {
         use std::time::{Duration, Instant};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        let handler: Arc<dyn Handler> = Arc::new(|_: &Task| {
-            Ok(Step::Succeed(
-                serde_json::to_value(Outcome::Structured {
+        struct ReplyTool {
+            changed: Arc<std::sync::atomic::AtomicBool>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for ReplyTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "fixture".into(),
+                    description: String::new(),
+                    parameters: if self.changed.load(Ordering::SeqCst) {
+                        json!({"type":"object", "required":["different"]})
+                    } else {
+                        json!({"type":"object"})
+                    },
+                }
+            }
+            async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Outcome::Structured {
                     data: json!({"answer":42}),
                     attachments: vec![],
-                })
-                .unwrap(),
-            ))
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn Tool> = Arc::new(ReplyTool {
+            changed: changed.clone(),
+            calls: calls.clone(),
         });
-        let adapter = Arc::new(crate::task_tool::TaskTool::new(
-            ToolSpec {
-                name: "fixture".into(),
-                description: String::new(),
-                parameters: json!({"type":"object"}),
-            },
-            "fixture",
-            true,
-            1,
-            handler.clone(),
-        ));
-        let registry = || {
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let make_host = || {
+            let cell = Arc::new(std::sync::OnceLock::new());
             let mut registry = Registry::default();
-            assert!(registry.register_shared("fixture", true, handler.clone()));
-            assert!(registry.register("parent", true, CheckpointParent(adapter.clone())));
-            registry
+            assert!(registry.register("parent", true, CheckpointParent(cell.clone())));
+            let mut host = StandaloneNoHooksHost::open(
+                &path,
+                registry,
+                UnhookedAuthorization::standalone_only(),
+            )
+            .unwrap();
+            let adapter = host
+                .register_tool("fixture", tool.clone(), "backend", 1)
+                .unwrap();
+            assert!(cell.set(adapter).is_ok());
+            host
         };
-        let mut scheduler = Scheduler::open(&path, registry()).unwrap();
+        let mut scheduler = make_host().into_scheduler_for_test();
         let id = Uuid::new_v4();
         let parent = Task::new(
             id,
@@ -347,7 +551,8 @@ mod tests {
             4,
         )
         .unwrap()
-        .registered("parent".into(), true);
+        .registered("parent".into(), true)
+        .into_task_tool();
         scheduler.submit(&parent).unwrap();
         assert!(scheduler.tick(0).unwrap());
         assert_eq!(
@@ -355,7 +560,47 @@ mod tests {
             "waiting"
         );
         drop(scheduler);
-        let driver = crate::task_driver::Driver::start(Scheduler::open(&path, registry()).unwrap());
+        if mode == 2 {
+            let cell = Arc::new(std::sync::OnceLock::new());
+            let mut registry = Registry::default();
+            assert!(registry.register("parent", true, CheckpointParent(cell)));
+            let forged_calls = Arc::new(AtomicUsize::new(0));
+            let observed = forged_calls.clone();
+            assert!(registry.register("fixture", false, move |_: &Task| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::task_scheduler::Step::Succeed(json!(null)))
+            }));
+            let driver = StandaloneNoHooksHost::open(
+                &path,
+                registry,
+                UnhookedAuthorization::standalone_only(),
+            )
+            .unwrap()
+            .into_driver();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while driver.get(id).is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "replacement handler was not rejected"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(forged_calls.load(Ordering::SeqCst), 0);
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_some());
+            return;
+        }
+        changed.store(mode == 1, Ordering::SeqCst);
+        let driver = make_host().into_driver();
+        if mode == 1 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while driver.get(id).is_ok() {
+                assert!(Instant::now() < deadline, "changed spec was not rejected");
+                std::thread::yield_now();
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_some());
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let task = driver.get(id).unwrap().unwrap();
@@ -370,6 +615,18 @@ mod tests {
             std::thread::yield_now();
         }
         driver.shutdown().unwrap();
+    }
+    #[test]
+    fn driver_restores_checkpoint_handle_and_reads_child_after_reopen() {
+        driver_checkpoint_reopen(0);
+    }
+    #[test]
+    fn driver_rejects_changed_tool_spec_after_reopen() {
+        driver_checkpoint_reopen(1);
+    }
+    #[test]
+    fn driver_rejects_replacement_handler_after_reopen() {
+        driver_checkpoint_reopen(2);
     }
     struct ChangedSchema;
     #[async_trait::async_trait]
@@ -427,7 +684,7 @@ mod tests {
     #[test]
     fn unhooked_host_drives_only_its_standalone_scheduler() {
         let dir = tempfile::tempdir().unwrap();
-        let host = StandaloneNoHooksHost::open(
+        let mut host = StandaloneNoHooksHost::open(
             dir.path().join("db"),
             Registry::default(),
             UnhookedAuthorization::standalone_only(),
@@ -437,7 +694,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             spec: "fixture",
         });
-        assert!(AsyncTaskTool::new_unhooked(&host, tool, "fixture", 1).is_err());
+        assert!(host.register_tool("fixture", tool, "backend", 1).is_err());
         host.into_driver().shutdown().unwrap();
     }
     #[test]
@@ -480,6 +737,35 @@ mod tests {
             UnhookedAuthorization::standalone_only(),
         )
         .unwrap();
+        host.into_driver().shutdown().unwrap();
+    }
+    #[test]
+    fn production_registration_requires_matching_host_tool_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            Registry::default(),
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn Tool> = Arc::new(TestTool {
+            calls: calls.clone(),
+            spec: "leaf",
+        });
+        assert!(
+            host.register_tool("leaf", tool.clone(), "backend", 1)
+                .is_err()
+        );
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        assert!(
+            host.register_tool("leaf", tool.clone(), "other", 1)
+                .is_err()
+        );
+        host.register_tool("leaf", tool.clone(), "backend", 1)
+            .unwrap();
+        assert!(host.register_tool("leaf", tool, "backend", 1).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         host.into_driver().shutdown().unwrap();
     }
 }

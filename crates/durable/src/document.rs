@@ -3083,6 +3083,100 @@ impl<'a> TaskDocuments<'a> {
         Ok(id)
     }
 
+    pub(crate) fn require_standalone_for_sealed_child(&self) -> Result<(), String> {
+        if self.input_validator.is_some() {
+            return Err("sealed tools require a standalone scheduler".into());
+        }
+        Ok(())
+    }
+
+    /// Add the sealed Tool identity to the already staged keyed child. The
+    /// scheduler commits these checks and writes with the parent transition.
+    pub(crate) fn bind_sealed_child_identity(
+        &mut self,
+        key: &str,
+        identity: &crate::async_task_tool::ToolIdentity,
+    ) -> Result<(), String> {
+        if self.input_validator.is_some() {
+            return Err("sealed tools require a standalone scheduler".into());
+        }
+        let (_, _, prepared) = self
+            .keyed_children
+            .iter_mut()
+            .find(|(existing, _, _)| existing == key)
+            .ok_or("sealed child not staged")?;
+        let batch = crate::async_task_protocol::prepare_child_identity(
+            self.store,
+            prepared.child,
+            identity,
+        )
+        .map_err(|e| e.to_string())?;
+        // Idempotent repeated calls within the same handler must not duplicate
+        // checks or write a second identity mutation.
+        for check in &batch.checks {
+            if let Some(existing) = prepared
+                .checks
+                .iter()
+                .find(|candidate| candidate.key == check.key)
+                && existing.expected != check.expected
+            {
+                return Err("sealed identity check changed".into());
+            }
+        }
+        for mutation in &batch.mutations {
+            if let durable_store::Mutation::Put { key, value } = mutation
+                && let Some(durable_store::Mutation::Put { value: existing, .. }) = prepared.mutations.iter().find(|candidate| matches!(candidate, durable_store::Mutation::Put { key: existing_key, .. } if existing_key == key))
+                && existing != value
+            {
+                return Err("sealed identity changed".into());
+            }
+        }
+        for check in batch.checks {
+            if !prepared
+                .checks
+                .iter()
+                .any(|existing| existing.key == check.key)
+            {
+                prepared.checks.push(check);
+            }
+        }
+        for mutation in batch.mutations {
+            let duplicate = match &mutation { durable_store::Mutation::Put { key, .. } => prepared.mutations.iter().any(|candidate| matches!(candidate, durable_store::Mutation::Put { key: existing, .. } if existing == key)), _ => false };
+            if !duplicate {
+                prepared.mutations.push(mutation);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_sealed_child_receipt(
+        &mut self,
+        id: uuid::Uuid,
+    ) -> Result<Option<pi_rs_core::Outcome>, String> {
+        if self.input_validator.is_some() {
+            return Err("sealed tools require a standalone scheduler".into());
+        }
+        self.get_owned_child(id)?;
+        let (outcome, checks) = crate::async_task_protocol::prepare_receipt_read(self.store, id)
+            .map_err(|e| e.to_string())?;
+        for check in checks {
+            if let Some(existing) = self
+                .signals
+                .batch
+                .checks
+                .iter()
+                .find(|existing| existing.key == check.key)
+            {
+                if existing.expected != check.expected {
+                    return Err("sealed receipt changed during invocation".into());
+                }
+            } else {
+                self.signals.batch.checks.push(check);
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Read a direct owned child and fence the handler's whole transition on
     /// that version. Repeated reads use the same snapshot. This does not read
     /// children staged for creation in the current uncommitted invocation.

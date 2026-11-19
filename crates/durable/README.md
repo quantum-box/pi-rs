@@ -489,37 +489,27 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
-`StandaloneNoHooksHost` constructs a standalone scheduler and transfers it to a
-task driver. Its explicit authorization is the host's assertion that no hook
-policy applies; the type cannot prove anything about policy outside this runtime.
-`ToolIdentity` can be persisted and compared across reopen using a full tool spec,
-host-assigned implementation/backend identity and version. It is not yet bound
-to a task or enforced at dispatch, and its implementation identity is an assertion,
-not a cryptographic measurement.
+`StandaloneNoHooksHost` constructs a standalone scheduler with an explicit
+host assertion that no hook policy applies. It cannot prove policy outside this
+runtime; do not use it when hooks are required. It cannot attach to a conversation
+runtime. Registering a sealed Tool requires its exact allocation to have a matching
+host identity binding. The full Tool spec, host-assigned implementation/backend
+identity and version are committed with child admission and checked again at
+dispatch. The identity is a host assertion, not a cryptographic measurement.
+The driver invokes the registered Tool itself; arbitrary handlers cannot stand in
+for it. The standalone leaf host rejects nested calls, progress and UI requests.
 
-A private prototype composes a keyed child and its identity in one checked
-transaction. Its test-only registration exercises a driver worker that commits a
-durable intent under the task gate while its own and its direct parent's task
-reservations are live. The intent commit is the logical dispatch start: an abort
-that commits first rejects dispatch; an abort after it requests cancellation and
-the worker joins its handler. The returned `Outcome` (including structured,
-`Pending`, or `Unknown`) is saved in an independent receipt before settlement,
-even after abort. It holds the existing host identity registration lease from
-before intent until receipt persistence; backend configuration changes must use
-that identity handle. Receipts are limited to 64 KiB; a failed or oversized capture
-retains the joined result and its lease for reconciliation. Shutdown requests
-cancellation and joins the worker, but a handler that ignores cancellation can
-block shutdown indefinitely.
-
-This is not a public dispatch capability. The only registration enabling this
-path is test-only; it does not prove that the registered handler invokes the
-recorded Tool or joins effects it spawns. The public `AsyncTaskTool` constructor
-continues to reject dispatch. A process death after intent but before receipt is
-uncertain and is not permission to retry. Ordinary Tool effects may occur after
-logical dispatch, including after abort, and require destination-side idempotency
-or authoritative reconciliation. A conversation attempt fence is not a task
-attempt lease. `AsyncTaskCall` is serializable for checkpoints, but this bridge
-cannot yet create or execute calls. Existing `TaskTool` APIs are unaffected.
+A durable intent committed under the task gate is logical dispatch start. A prior
+abort rejects dispatch; a later abort requests cancellation and the driver joins
+the Tool future. A Tool can ignore cancellation and block shutdown indefinitely.
+Structured, pending and unknown outcomes are captured in an independent receipt
+before settlement, including after abort; checkpointed `AsyncTaskCall` handles
+can read authenticated receipts after reopening. Receipts are limited to 64 KiB;
+a capture failure retains the joined result for reconciliation. Process death
+after intent and before receipt is uncertain and does not permit automatic retry.
+Tool effects may continue after logical dispatch or abort, especially if the Tool
+spawns its own work: destination-side idempotency or authoritative reconciliation
+is required. A conversation attempt fence is not a task attempt lease.
 
 Within a task-backed tool handler, `TaskTool::stage_child` stages another
 registered TaskTool under a stable key. Return a task wait step to commit the

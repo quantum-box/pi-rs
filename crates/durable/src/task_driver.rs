@@ -925,6 +925,37 @@ impl Shared {
         }
     }
 
+    // Abort marks can also be committed by scheduler cleanup and fail-fast,
+    // without passing through Driver::request_abort.
+    fn cancel_marked_unhooked(&self) -> Result<(), String> {
+        let _gate = self.owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let active = self
+            .unhooked_cancellations
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(self.owner.store());
+        for (id, token) in active.iter() {
+            match tasks.load(*id) {
+                Ok(Some(task)) if !task.task.abort_requested() => {
+                    match task_scheduler::pending_abort_root_for_running(&tasks, *id, true) {
+                        Ok(Some(_)) => token.cancel(),
+                        Ok(None) => (),
+                        Err(error) => {
+                            token.cancel();
+                            return Err(error.to_string());
+                        }
+                    }
+                }
+                Ok(_) => token.cancel(),
+                Err(error) => {
+                    token.cancel();
+                    return Err(error.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn stop_for_failure(&self, error: String) {
         self.reservation_stop
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1047,6 +1078,9 @@ impl Shared {
         let mut active = 0usize;
         let mut maintenance: Option<task_scheduler::PendingMaintenance> = None;
         loop {
+            if let Err(error) = self.cancel_marked_unhooked() {
+                self.stop_for_failure(format!("abort cancellation scan failed: {error}"));
+            }
             while let Ok(event) = pool.done.try_recv() {
                 pool.inbox.push_back(event);
             }

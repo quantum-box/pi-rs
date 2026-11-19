@@ -132,7 +132,7 @@ pub struct WakeSnapshot {
 #[derive(Clone)]
 struct ReceiptCapture {
     identity: crate::async_task_tool::ToolIdentity,
-    tool: Arc<dyn pi_rs_core::Tool>,
+    executor: Arc<crate::async_task_tool::SealedExecutor>,
     implementation: String,
     version: u32,
     #[cfg(test)]
@@ -254,31 +254,6 @@ impl Registry {
         entry.abort = Some(Arc::new(abort));
         true
     }
-    // Test-only opt-in exercises the worker path without enabling public tool dispatch.
-    #[cfg(test)]
-    pub(crate) fn enable_test_receipt_capture(
-        &mut self,
-        kind: &str,
-        tool: Arc<dyn pi_rs_core::Tool>,
-        identity: crate::async_task_tool::ToolIdentity,
-        before_intent: Option<Arc<dyn Fn() + Send + Sync>>,
-        after_intent: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) -> bool {
-        if let Some(entry) = self.entries.get_mut(kind) {
-            entry.receipt_capture = Some(Arc::new(ReceiptCapture {
-                tool,
-                identity,
-                implementation: "real-backend".into(),
-                version: 1,
-                before_intent,
-                after_intent,
-            }));
-            true
-        } else {
-            false
-        }
-    }
-
     /// Register a separate cleanup invocation. Abort handlers must be replay-safe:
     /// their external effects require idempotency across a crash before commit.
     pub fn register_with_abort(
@@ -610,6 +585,7 @@ pub struct DetachedInvocation {
     activity: crate::worker_activity::WorkerActivity,
     receipt_capture: Option<Arc<ReceiptCapture>>,
     unhooked_cancellation: Option<pi_rs_core::CancellationToken>,
+    sealed_registration: bool,
 }
 
 #[derive(Clone)]
@@ -646,7 +622,6 @@ impl CompletedInvocation {
     }
 
     /// Preserve a marked task's uncertain result before the driver settles it.
-    /// The marker is not enabled by any public registration.
     pub(crate) fn capture_marked_receipt(
         &mut self,
     ) -> Result<(), crate::async_task_protocol::Error> {
@@ -682,7 +657,6 @@ impl CompletedInvocation {
     /// Persist an outcome taken from this joined handler's exact
     /// return value while its invocation lease is still held. It does not prove
     /// that a handler joined any executor it may have spawned.
-    #[allow(dead_code)] // The async tool driver is not wired yet.
     pub(crate) fn persist_unhooked_receipt(
         &self,
         intent: &crate::async_task_protocol::Intent,
@@ -1412,7 +1386,6 @@ impl DetachedInvocation {
     /// gate are held. The commit can be a logical dispatch start only when the
     /// caller also owns, cancels, and joins the authenticated executor. Effects
     /// may physically begin after a later abort.
-    #[allow(dead_code)] // Unhooked dispatch remains disabled.
     pub(crate) fn commit_unhooked_intent(
         &self,
         identity: &crate::async_task_tool::ToolIdentity,
@@ -1457,18 +1430,27 @@ impl DetachedInvocation {
         let parent = task_store::TaskStore::new(owner.store())
             .load(*parent_id)?
             .ok_or(ProtocolError::Invalid)?;
+        let parent_live = match parent.task.state() {
+            TaskState::Running => {
+                state.attempts.contains(parent_id)
+                    && parent.task.attempt_id().is_some()
+                    && !state.published.iter().any(|(id, _)| *id == *parent_id)
+            }
+            TaskState::Waiting(
+                WaitFor::Tasks(ids) | WaitFor::TasksAny(ids) | WaitFor::TasksFailFast(ids),
+            ) => parent.task.attempt_id().is_none() && ids.contains(&self.running.task.id()),
+            _ => false,
+        };
         if state.poisoned
             || state.handler_failed
             || self.lease.retired
             || !state.attempts.contains(&self.running.task.id())
-            || !state.attempts.contains(parent_id)
             || state
                 .published
                 .iter()
-                .any(|(id, _)| *id == self.running.task.id() || *id == *parent_id)
+                .any(|(id, _)| *id == self.running.task.id())
             || !parent.task.is_task_tool()
-            || parent.task.state() != &TaskState::Running
-            || parent.task.attempt_id().is_none()
+            || !parent_live
             || parent.task.abort_requested()
         {
             return Err(ProtocolError::Invalid);
@@ -1489,37 +1471,75 @@ impl DetachedInvocation {
         Ok(intent)
     }
 
+    fn abort_precedes_unhooked_dispatch(&self) -> Result<bool, Error> {
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        let tasks = task_store::TaskStore::new(owner.store());
+        Ok(tasks
+            .load(self.running.task.id())?
+            .is_some_and(|task| task.task.abort_requested())
+            || pending_abort_root_for_running(&tasks, self.running.task.id(), true)?.is_some())
+    }
+
     /// Run without holding the scheduler mutex. An unwinding TaskTool handler
     /// panic becomes a published failure so its owned graph can be cleaned up.
     /// Generic handler panics and abort handler panics retain their semantics.
     pub fn execute(self) -> Result<CompletedInvocation, Error> {
+        if !self.sealed_registration
+            && crate::async_task_protocol::has_sealed_identity(
+                self.lease.attachment.owner.store(),
+                self.running.task.id(),
+            )
+            .map_err(|error| Error::Handler(format!("sealed identity lookup failed: {error}")))?
+        {
+            return Err(Error::Handler(
+                "sealed task requires its registered executor".into(),
+            ));
+        }
         let identity_lease = if let Some(capture) = &self.receipt_capture {
             Some(
-                crate::nested_identity::checked_lease(&capture.tool, &capture.implementation)
-                    .map_err(|_| {
-                        Error::Handler("unhooked tool identity unavailable or changed".into())
-                    })?,
+                crate::nested_identity::checked_lease(
+                    capture.executor.tool(),
+                    &capture.implementation,
+                )
+                .map_err(|_| {
+                    Error::Handler("unhooked tool identity unavailable or changed".into())
+                })?,
             )
         } else {
             None
         };
-        if let Some(capture) = &self.receipt_capture {
+        let intent = if let Some(capture) = &self.receipt_capture {
             #[cfg(test)]
             if let Some(before) = &capture.before_intent {
                 before();
             }
-            self.commit_unhooked_intent(
+            let intent = match self.commit_unhooked_intent(
                 &capture.identity,
-                capture.tool.as_ref(),
+                capture.executor.tool().as_ref(),
                 &capture.implementation,
                 capture.version,
-            )
-            .map_err(|e| Error::Handler(format!("unhooked intent rejected: {e}")))?;
+            ) {
+                Ok(intent) => Some(intent),
+                Err(crate::async_task_protocol::Error::Invalid)
+                    if self.abort_precedes_unhooked_dispatch()? =>
+                {
+                    None
+                }
+                Err(error) => {
+                    return Err(Error::Handler(format!("unhooked intent rejected: {error}")));
+                }
+            };
             #[cfg(test)]
-            if let Some(after) = &capture.after_intent {
+            if intent.is_some()
+                && let Some(after) = &capture.after_intent
+            {
                 after();
             }
-        }
+            intent
+        } else {
+            None
+        };
         let Self {
             running,
             handler,
@@ -1530,8 +1550,9 @@ impl DetachedInvocation {
             activity,
             receipt_capture,
             unhooked_cancellation,
+            sealed_registration: _,
         } = self;
-        let receipt_capture = receipt_capture.is_some();
+        let capture_enabled = receipt_capture.is_some() && intent.is_some();
         let result = if abort {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler.run(&running.task)
@@ -1552,18 +1573,24 @@ impl DetachedInvocation {
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
             documents.set_input_validator(validator.as_ref());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match &unhooked_cancellation {
-                    Some(cancel) => handler.run_with_cancellation(&running.task, &mut documents, cancel),
-                    None => {
-                let admission = AdmissionHandle {
-                    running: &running,
-                    lease: &lease,
-                    abort,
-                    definitions: &definitions,
-                    activity: &activity,
-                };
-                handler.run_with_admission(&running.task, &mut documents, &admission)
+                match (&receipt_capture, &intent, &unhooked_cancellation) {
+                    (Some(capture), Some(intent), Some(cancel)) => {
+                        capture
+                            .executor
+                            .run(&running.task, intent, owner.store(), cancel)
                     }
+                    (Some(_), None, Some(_)) => Ok(Step::Fail("aborted before dispatch".into())),
+                    (None, None, None) => {
+                        let admission = AdmissionHandle {
+                            running: &running,
+                            lease: &lease,
+                            abort,
+                            definitions: &definitions,
+                            activity: &activity,
+                        };
+                        handler.run_with_admission(&running.task, &mut documents, &admission)
+                    }
+                    _ => Err("invalid unhooked executor state".into()),
                 }
             }));
             let result = match result {
@@ -1640,7 +1667,7 @@ impl DetachedInvocation {
             running,
             result,
             lease,
-            receipt_capture,
+            receipt_capture: capture_enabled,
             _identity_lease: identity_lease,
         })
     }
@@ -1958,11 +1985,9 @@ impl Scheduler {
         abort: bool,
     ) -> Result<DetachedInvocation, Error> {
         let id = running.task.id();
-        let receipt_capture = if abort {
-            None
-        } else {
-            self.registered(&running.task)?.receipt_capture.clone()
-        };
+        let registered_capture = self.registered(&running.task)?.receipt_capture.clone();
+        let sealed_registration = registered_capture.is_some();
+        let receipt_capture = if abort { None } else { registered_capture };
         let mut state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
         if state.poisoned || !state.attempts.insert(id) {
             return Err(Error::Poisoned);
@@ -1977,6 +2002,7 @@ impl Scheduler {
             running,
             handler,
             abort,
+            sealed_registration,
             validator: self.validator.as_ref().map(|harness| harness.worker()),
             definitions: self.wake_reader.definitions.clone(),
             activity: self.activity.clone(),
@@ -3292,6 +3318,86 @@ impl Scheduler {
         harness
             .attach_tasks(registry)
             .map_err(|e| Error::Handler(format!("conversation runtime: {e}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sealed_test_hooks(
+        &mut self,
+        kind: &str,
+        before: Option<Arc<dyn Fn() + Send + Sync>>,
+        after: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> bool {
+        let Some(capture) = self
+            .registry
+            .entries
+            .get_mut(kind)
+            .and_then(|entry| entry.receipt_capture.as_mut())
+        else {
+            return false;
+        };
+        let capture = Arc::make_mut(capture);
+        capture.before_intent = before;
+        capture.after_intent = after;
+        true
+    }
+
+    /// Install only a sealed Tool executor on a standalone scheduler. No
+    /// arbitrary Handler can be supplied on this path. Child admission remains
+    /// unavailable until its identity can be staged with the parent transition.
+    pub(crate) fn install_sealed_tool(
+        &mut self,
+        kind: String,
+        tool: Arc<dyn pi_rs_core::Tool>,
+        implementation: &str,
+        version: u32,
+    ) -> Result<
+        (
+            Arc<crate::async_task_tool::SealedExecutor>,
+            crate::async_task_tool::ToolIdentity,
+        ),
+        String,
+    > {
+        if self.validator.is_some() || kind.is_empty() {
+            return Err("sealed tool requires a standalone scheduler and task kind".into());
+        }
+        let _identity_lease = crate::nested_identity::checked_lease(&tool, implementation)
+            .map_err(|_| "tool identity is missing, busy, or changed")?;
+        let identity =
+            crate::async_task_tool::ToolIdentity::new(tool.as_ref(), implementation, version)?;
+        if serde_json::to_vec(&identity)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 65_536
+        {
+            return Err("tool identity exceeds size limit".into());
+        }
+        let executor = Arc::new(crate::async_task_tool::SealedExecutor::new(
+            tool,
+            identity.clone(),
+            implementation.into(),
+            version,
+        ));
+        let handler: Arc<dyn Handler> = executor.clone();
+        let mut registry = self.registry.clone();
+        if !registry.register_shared_versioned(kind.clone(), version, false, handler) {
+            return Err("task kind is already registered or invalid".into());
+        }
+        registry
+            .entries
+            .get_mut(&kind)
+            .expect("inserted")
+            .receipt_capture = Some(Arc::new(ReceiptCapture {
+            identity: identity.clone(),
+            executor: executor.clone(),
+            implementation: implementation.into(),
+            version,
+            #[cfg(test)]
+            before_intent: None,
+            #[cfg(test)]
+            after_intent: None,
+        }));
+        self.replace_registry(registry).map_err(|e| e.to_string())?;
+        Ok((executor, identity))
     }
 
     pub(crate) fn conversation_harness(&self) -> Option<crate::runtime::Harness> {

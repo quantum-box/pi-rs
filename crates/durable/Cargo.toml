@@ -22,7 +22,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 pi-rs-core = { path = "../core" }
 pi-rs-workbench = { path = "../workbench", optional = true }
 futures-util = "0.3"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "net", "process"] }
 durable-store = { path = "../durable-store" }
 thiserror = "2"
 jsonschema = { version = "0.33", default-features = false }

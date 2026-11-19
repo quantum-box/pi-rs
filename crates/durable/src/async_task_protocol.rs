@@ -1,5 +1,5 @@
-//! Storage-only foundation for task-backed tool dispatch. These records do not
-//! grant an executor lease and are not wired to tool execution.
+//! Durable records for task-backed tool dispatch. Records alone do not grant
+//! an executor lease; the driver retains and joins the authenticated executor.
 use crate::async_task_tool::ToolIdentity;
 use crate::task::{Task, TaskOwner, TaskState};
 use crate::task_store::{OwnedBatch, StoredTask, TaskStore};
@@ -21,11 +21,18 @@ pub(crate) enum Error {
     Invalid,
 }
 
+pub(crate) fn has_sealed_identity(store: &Store, task: Uuid) -> Result<bool, Error> {
+    Ok(store.get(&identity_key(task))?.is_some())
+}
+
 fn identity_key(task: Uuid) -> Vec<u8> {
     format!("durable/async-task/identity/{task}").into_bytes()
 }
 fn intent_key(task: Uuid) -> Vec<u8> {
     format!("durable/async-task/intent/{task}").into_bytes()
+}
+fn prepared_key(task: Uuid) -> Vec<u8> {
+    format!("durable/async-task/prepared/{task}").into_bytes()
 }
 fn receipt_key(task: Uuid) -> Vec<u8> {
     format!("durable/async-task/receipt/{task}").into_bytes()
@@ -53,23 +60,48 @@ pub(crate) fn prepare_child(
         checks: prepared.checks,
         mutations: prepared.mutations,
     };
+    let identity_batch = prepare_child_identity(store, id, identity)?;
+    batch.checks.extend(identity_batch.checks);
+    batch.mutations.extend(identity_batch.mutations);
+    Ok((id, batch))
+}
+
+/// Prepare an identity record for composition into the same checked child
+/// admission and parent checkpoint transaction.
+pub(crate) fn prepare_child_identity(
+    store: &Store,
+    id: Uuid,
+    identity: &ToolIdentity,
+) -> Result<OwnedBatch, Error> {
+    if id.is_nil() || !identity.is_valid() {
+        return Err(Error::Invalid);
+    }
+    let encoded = serde_json::to_vec(identity)?;
+    if encoded.len() > 65_536 {
+        return Err(Error::Invalid);
+    }
     let key = identity_key(id);
     let existing = store.get(&key)?;
-    if let Some(ref entry) = existing {
-        if serde_json::from_slice::<ToolIdentity>(&entry.value)? != *identity {
-            return Err(Error::Invalid);
-        }
-    } else {
-        batch.mutations.push(Mutation::Put {
-            key: key.clone(),
-            value: encoded.into_bytes(),
-        });
+    if let Some(ref entry) = existing
+        && serde_json::from_slice::<ToolIdentity>(&entry.value)? != *identity
+    {
+        return Err(Error::Invalid);
     }
-    batch.checks.push(Check {
-        key,
-        expected: existing.map_or(Expected::Missing, |e| Expected::Version(e.version)),
-    });
-    Ok((id, batch))
+    let checks = vec![Check {
+        key: key.clone(),
+        expected: existing
+            .as_ref()
+            .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+    }];
+    let mutations = if existing.is_none() {
+        vec![Mutation::Put {
+            key,
+            value: encoded,
+        }]
+    } else {
+        vec![]
+    };
+    Ok(OwnedBatch { checks, mutations })
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -182,6 +214,62 @@ pub(crate) fn prepare_intent(
     Ok((intent, OwnedBatch { checks, mutations }))
 }
 
+/// Persist the exact normalized arguments before invoking the tool. This does
+/// not authorize dispatch; the worker must retain its identity and task leases.
+pub(crate) fn prepare_arguments_record(
+    store: &Store,
+    intent: &Intent,
+    arguments: &serde_json::Value,
+) -> Result<OwnedBatch, Error> {
+    let serialized = serde_json::to_vec(&(intent, arguments))?;
+    if serialized.len() > 16 * 1024 * 1024 {
+        return Err(Error::Invalid);
+    }
+    let intent_key = intent_key(intent.task);
+    let stored_intent = store.get(&intent_key)?.ok_or(Error::Invalid)?;
+    if serde_json::from_slice::<Intent>(&stored_intent.value)? != *intent {
+        return Err(Error::Invalid);
+    }
+    let definition_key = identity_key(intent.task);
+    let definition = store.get(&definition_key)?.ok_or(Error::Invalid)?;
+    if serde_json::from_slice::<ToolIdentity>(&definition.value)? != intent.identity {
+        return Err(Error::Invalid);
+    }
+    let key = prepared_key(intent.task);
+    let existing = store.get(&key)?;
+    if existing
+        .as_ref()
+        .is_some_and(|entry| entry.value != serialized)
+    {
+        return Err(Error::Invalid);
+    }
+    let checks = vec![
+        Check {
+            key: intent_key,
+            expected: Expected::Version(stored_intent.version),
+        },
+        Check {
+            key: definition_key,
+            expected: Expected::Version(definition.version),
+        },
+        Check {
+            key: key.clone(),
+            expected: existing
+                .as_ref()
+                .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+        },
+    ];
+    let mutations = if existing.is_none() {
+        vec![Mutation::Put {
+            key,
+            value: serialized,
+        }]
+    } else {
+        vec![]
+    };
+    Ok(OwnedBatch { checks, mutations })
+}
+
 /// Store a tool outcome independently of task settlement and abort.
 /// The caller must join and authenticate the executor; this checks persisted
 /// identity only and is not a lease. A lost commit requires readback.
@@ -231,6 +319,63 @@ pub(crate) fn prepare_receipt(
         vec![]
     };
     Ok(OwnedBatch { checks, mutations })
+}
+
+/// Read a receipt with checks suitable for a parent task transition. Every
+/// record read here is fenced by the parent's eventual atomic commit.
+pub(crate) fn prepare_receipt_read(
+    store: &Store,
+    task: Uuid,
+) -> Result<(Option<Outcome>, Vec<Check>), Error> {
+    let definition_key = identity_key(task);
+    let definition = store.get(&definition_key)?.ok_or(Error::Invalid)?;
+    let identity: ToolIdentity = serde_json::from_slice(&definition.value)?;
+    if !identity.is_valid() {
+        return Err(Error::Invalid);
+    }
+    let mut checks = vec![Check {
+        key: definition_key,
+        expected: Expected::Version(definition.version),
+    }];
+    let intent_key = intent_key(task);
+    let intent_entry = store.get(&intent_key)?;
+    checks.push(Check {
+        key: intent_key,
+        expected: intent_entry
+            .as_ref()
+            .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+    });
+    let receipt_key = receipt_key(task);
+    let receipt_entry = store.get(&receipt_key)?;
+    checks.push(Check {
+        key: receipt_key,
+        expected: receipt_entry
+            .as_ref()
+            .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+    });
+    match (intent_entry, receipt_entry) {
+        (None, None) => Ok((None, checks)),
+        (None, Some(_)) => Err(Error::Invalid),
+        (Some(intent), receipt) => {
+            let intent: Intent = serde_json::from_slice(&intent.value)?;
+            if intent.task != task || intent.identity != identity {
+                return Err(Error::Invalid);
+            }
+            let Some(receipt) = receipt else {
+                return Ok((
+                    Some(Outcome::Unknown(
+                        "dispatch intent has no durable receipt; reconcile external effects".into(),
+                    )),
+                    checks,
+                ));
+            };
+            let (stored, outcome): (Intent, Outcome) = serde_json::from_slice(&receipt.value)?;
+            if stored != intent {
+                return Err(Error::Invalid);
+            }
+            Ok((Some(outcome), checks))
+        }
+    }
 }
 
 pub(crate) fn read_receipt(store: &Store, intent: &Intent) -> Result<Option<Outcome>, Error> {
@@ -555,6 +700,10 @@ mod tests {
         let intent: Intent =
             serde_json::from_slice(&store.get(&intent_key(id)).unwrap().unwrap().value).unwrap();
         assert_eq!(read_receipt(&store, &intent).unwrap(), None);
+        assert!(matches!(
+            prepare_receipt_read(&store, id).unwrap().0,
+            Some(Outcome::Unknown(_))
+        ));
         let task = TaskStore::new(&store).load(id).unwrap().unwrap();
         assert!(prepare_intent(&store, &task, &intent.identity).is_err());
     }
@@ -699,6 +848,7 @@ mod tests {
         drop(parent_job);
     }
     #[test]
+    #[ignore = "superseded prototype used an arbitrary handler; sealed driver tests cover this boundary"]
     fn joined_real_tool_result_can_be_receipted_after_driver_abort() {
         let dir = tempfile::tempdir().unwrap();
         let (entered, received) = std::sync::mpsc::channel();
@@ -738,6 +888,7 @@ mod tests {
         drop(parent_job);
     }
     #[test]
+    #[ignore = "superseded prototype used an arbitrary handler; sealed driver tests cover this boundary"]
     fn killed_after_joined_real_tool_receipt_preserves_reference() {
         const ENV: &str = "PI_RS_REAL_TOOL_RECEIPT_KILL";
         if let Ok(directory) = std::env::var(ENV) {
@@ -799,6 +950,7 @@ mod tests {
     /// commit abort after logical start but before the physical first poll;
     /// public dispatch requires an executor-aware boundary and a joined result.
     #[test]
+    #[ignore = "superseded prototype used an arbitrary handler; sealed driver tests cover this boundary"]
     fn provisional_intent_can_precede_abort_and_physical_tool_poll() {
         let dir = tempfile::tempdir().unwrap();
         let (entered, received) = std::sync::mpsc::channel();
@@ -848,22 +1000,22 @@ mod tests {
         Uuid,
         Uuid,
     ) {
-        use crate::task_scheduler::{Registry, Scheduler, Step, TickReservation};
+        use crate::task_scheduler::{Registry, Step, TickReservation};
         let identity = ToolIdentity::new(tool.as_ref(), "real-backend", 1).unwrap();
         if crate::nested_identity::current(&tool).is_none() {
             crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
         }
         let mut registry = Registry::default();
         assert!(registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null)))));
-        assert!(registry.register("leaf", false, RealToolHandler(tool.clone())));
-        assert!(registry.enable_test_receipt_capture(
-            "leaf",
-            tool,
-            identity.clone(),
-            before_intent,
-            after_intent
-        ));
-        let mut scheduler = Scheduler::open(path, registry).unwrap();
+        let mut host = crate::async_task_tool::StandaloneNoHooksHost::open(
+            path,
+            registry,
+            crate::async_task_tool::UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        host.register_tool("leaf", tool, "real-backend", 1).unwrap();
+        let mut scheduler = host.into_scheduler_for_test();
+        assert!(scheduler.set_sealed_test_hooks("leaf", before_intent, after_intent));
         let owner = scheduler.owner();
         let parent = Task::new(
             Uuid::new_v4(),
@@ -939,6 +1091,7 @@ mod tests {
         received
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
+        assert!(owner.store().get(&prepared_key(child)).unwrap().is_some());
         driver.request_abort(parent).unwrap();
         {
             let (lock, wake) = &*release;
@@ -1143,18 +1296,36 @@ mod tests {
             *lock.lock().unwrap() = true;
             wake.notify_all();
         }
+        let unrelated = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "unrelated".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false);
+        TaskStore::new(owner.store())
+            .save(&[crate::task_store::Save::Create(&unrelated)])
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while driver.get(child).is_ok() {
+        loop {
+            let task = driver.get(unrelated.id()).unwrap().unwrap();
+            if task.is_terminal() {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "driver did not reject dispatch"
+                "unrelated task did not settle"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(tool_received.try_recv().is_err());
         assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
         let report = driver.shutdown_with_pending().unwrap();
-        assert!(report.failure().is_some());
+        assert!(report.failure().is_none());
         drop(parent_job);
     }
     struct CancellableTool(std::sync::mpsc::Sender<()>);
@@ -1190,6 +1361,150 @@ mod tests {
         drop(parent_job);
     }
     #[test]
+    fn actual_driver_observes_scheduler_internal_abort_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, received) = std::sync::mpsc::channel();
+        let tool = std::sync::Arc::new(CancellableTool(entered));
+        let (driver, parent_job, owner, parent, child) =
+            actual_driver_fixture(&dir.path().join("db"), tool);
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        {
+            let _gate = owner.task_gate().lock().unwrap();
+            crate::task_scheduler::request_abort_subtree(&TaskStore::new(owner.store()), parent)
+                .unwrap();
+        }
+        let (_, outcome) = await_receipt(owner.store(), child);
+        assert_eq!(
+            outcome,
+            Outcome::Unknown("cancelled after logical dispatch".into())
+        );
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_none());
+        drop(parent_job);
+    }
+    fn actual_driver_cancels_and_joins_sealed_tool(mode: u8) {
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, received) = std::sync::mpsc::channel();
+        let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(CancellableTool(entered));
+        let _binding =
+            crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
+        let identity = ToolIdentity::new(tool.as_ref(), "real-backend", 1).unwrap();
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null)))));
+        let mut host = crate::async_task_tool::StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            registry,
+            crate::async_task_tool::UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        host.register_tool("leaf", tool, "real-backend", 1).unwrap();
+        let scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let failed_id = Uuid::new_v4();
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: json!({}),
+        };
+        let mut parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(Uuid::new_v4()),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false)
+        .into_task_tool();
+        parent.start().unwrap();
+        parent
+            .wait(crate::task::WaitFor::TasksFailFast(vec![
+                child_id, failed_id,
+            ]))
+            .unwrap();
+        let child = Task::new(child_id, TaskOwner::Task(parent_id), checkpoint.clone(), 3)
+            .unwrap()
+            .registered_versioned("leaf".into(), false, 1, json!({}))
+            .unwrap()
+            .into_task_tool();
+        let failed = Task::new(failed_id, TaskOwner::Task(parent_id), checkpoint, 3)
+            .unwrap()
+            .registered("missing".into(), false);
+        TaskStore::new(owner.store())
+            .save(&[
+                crate::task_store::Save::Create(&parent),
+                crate::task_store::Save::Create(&child),
+                crate::task_store::Save::Create(&failed),
+            ])
+            .unwrap();
+        commit(
+            owner.store(),
+            prepare_child_identity(owner.store(), child_id, &identity).unwrap(),
+        );
+        let driver = crate::task_driver::Driver::start(scheduler);
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        if mode == 1 {
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                let tasks = TaskStore::new(owner.store());
+                let failed = tasks.load(failed_id).unwrap().unwrap();
+                tasks
+                    .update(&failed, |task| {
+                        task.start()?;
+                        task.fail("failure".into())
+                    })
+                    .unwrap();
+            }
+        } else if mode == 2 {
+            let _gate = owner.task_gate().lock().unwrap();
+            let tasks = TaskStore::new(owner.store());
+            let parent = tasks.load(parent_id).unwrap().unwrap();
+            tasks
+                .update(&parent, |task| {
+                    task.wake()?;
+                    task.start()?;
+                    task.hold_failure("parent failure".into())
+                })
+                .unwrap();
+        } else {
+            driver.request_abort(parent_id).unwrap();
+        }
+        let (_, outcome) = await_receipt(owner.store(), child_id);
+        assert_eq!(
+            outcome,
+            Outcome::Unknown("cancelled after logical dispatch".into())
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if driver.get(child_id).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abort cleanup did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+    #[test]
+    fn actual_driver_fail_fast_cancels_and_joins_sealed_tool() {
+        actual_driver_cancels_and_joins_sealed_tool(1);
+    }
+    #[test]
+    fn actual_driver_explicit_abort_cancels_joins_and_cleans_up_sealed_tool() {
+        actual_driver_cancels_and_joins_sealed_tool(0);
+    }
+    #[test]
+    fn actual_driver_parent_failure_cancels_joins_and_cleans_up_sealed_tool() {
+        actual_driver_cancels_and_joins_sealed_tool(2);
+    }
+    #[test]
     fn actual_driver_abort_after_intent_cancels_inflight_executor_and_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let (tool_entered, tool_received) = std::sync::mpsc::channel();
@@ -1218,13 +1533,11 @@ mod tests {
             *lock.lock().unwrap() = true;
             wake.notify_all();
         }
-        tool_received
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
         assert_eq!(
             await_receipt(owner.store(), child).1,
             Outcome::Unknown("cancelled after logical dispatch".into())
         );
+        assert!(tool_received.try_recv().is_err());
         let report = driver.shutdown_with_pending().unwrap();
         assert!(report.failure().is_none());
         drop(parent_job);
@@ -1511,5 +1824,88 @@ mod tests {
         assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
         assert!(driver.shutdown_with_pending().unwrap().failure().is_some());
         drop(parent_job);
+    }
+    struct NormalizingTool(std::sync::mpsc::Sender<serde_json::Value>);
+    #[async_trait::async_trait]
+    impl Tool for NormalizingTool {
+        fn spec(&self) -> ToolSpec {
+            Stub.spec()
+        }
+        async fn prepare_arguments(
+            &self,
+            mut value: serde_json::Value,
+        ) -> pi_rs_core::ExtensionResult<serde_json::Value> {
+            value["normalized"] = json!(true);
+            Ok(value)
+        }
+        async fn invoke(&self, value: serde_json::Value, _: ToolContext) -> Outcome {
+            self.0.send(value.clone()).unwrap();
+            Outcome::Structured {
+                data: value,
+                attachments: vec![],
+            }
+        }
+    }
+    #[test]
+    fn sealed_driver_persists_normalized_arguments_before_tool_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let tool = std::sync::Arc::new(NormalizingTool(sent));
+        let (driver, parent, owner, _, child) = actual_driver_fixture(&dir.path().join("db"), tool);
+        let arguments = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let prepared = owner.store().get(&prepared_key(child)).unwrap().unwrap();
+        let (intent, persisted): (Intent, serde_json::Value) =
+            serde_json::from_slice(&prepared.value).unwrap();
+        assert_eq!(persisted, arguments);
+        assert_eq!(persisted, json!({"normalized":true}));
+        assert_eq!(
+            read_receipt(owner.store(), &intent)
+                .unwrap()
+                .or_else(|| Some(await_receipt(owner.store(), child).1)),
+            Some(Outcome::Structured {
+                data: arguments,
+                attachments: vec![]
+            })
+        );
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_none());
+        drop(parent);
+    }
+    struct UnsupportedNestedTool;
+    #[async_trait::async_trait]
+    impl Tool for UnsupportedNestedTool {
+        fn spec(&self) -> ToolSpec {
+            Stub.spec()
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: std::sync::Arc<dyn pi_rs_core::ToolHost>,
+        ) -> Outcome {
+            let _ = host.call("ignored", json!({})).await;
+            Outcome::Succeeded("not-authorized".into())
+        }
+    }
+    #[test]
+    fn sealed_driver_rejects_ignored_nested_host_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, parent, owner, _, child) = actual_driver_fixture(
+            &dir.path().join("db"),
+            std::sync::Arc::new(UnsupportedNestedTool),
+        );
+        let (_, outcome) = await_receipt(owner.store(), child);
+        assert!(
+            matches!(outcome, Outcome::Unknown(text) if text.contains("unsupported host operation"))
+        );
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_none());
+        drop(parent);
     }
 }
