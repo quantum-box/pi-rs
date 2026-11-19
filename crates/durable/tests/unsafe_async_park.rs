@@ -717,3 +717,141 @@ fn unsafe_pending_reference_is_retained_as_uncertain_evidence() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].outcome, outcome);
 }
+
+struct CoexistingHook;
+#[async_trait]
+impl pi_rs_durable::extension::Hook for CoexistingHook {
+    async fn before_tool(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        if ctx.memo.get_or_insert("phase", json!("before")).await? != json!("before") {
+            return Err("unexpected hook memo".into());
+        }
+        Ok(pi_rs_durable::extension::BeforeTool::Rewrite(
+            json!({"value":"rewritten"}),
+        ))
+    }
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.arguments != json!({"value":"rewritten"})
+            || result != &json!("rewritten")
+            || ctx.memo.get("phase").await? != Some(json!("before"))
+        {
+            return Err("hook arguments, result, or memo changed".into());
+        }
+        Ok(Some(json!("after rewrite")))
+    }
+}
+
+struct CoexistingSafeTool;
+#[async_trait]
+impl Tool for CoexistingSafeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "coexisting-safe".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for CoexistingSafeTool {
+    async fn execute_durable(
+        &self,
+        args: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        let value = args["value"].as_str().ok_or("missing rewritten value")?;
+        Ok(DurableToolStep::Complete(Outcome::Succeeded(value.into())))
+    }
+}
+
+#[test]
+fn unsafe_park_and_hooked_replay_safe_drivers_coexist() {
+    use pi_rs_durable::async_task_tool::{ReplaySafeAuthorization, StandaloneBeforeHookHost};
+    let dir = tempfile::tempdir().unwrap();
+    let unsafe_dir = dir.path().join("unsafe");
+    std::fs::create_dir(&unsafe_dir).unwrap();
+    let (unsafe_host, unsafe_tool) = host(&unsafe_dir, None);
+    let unsafe_id = unsafe_host
+        .start_unsafe_durable_root(&unsafe_tool, json!({}), 3)
+        .unwrap();
+    let unsafe_driver = unsafe_host.into_driver();
+    let child = parked(&unsafe_driver, unsafe_id);
+
+    let mut hook_host =
+        StandaloneBeforeHookHost::open(dir.path().join("hooks-db"), Registry::default()).unwrap();
+    let hooked = hook_host
+        .register_replay_safe_durable_tool_with_hook(
+            Arc::new(CoexistingSafeTool),
+            "coexisting-safe-v1",
+            1,
+            vec![],
+            "coexisting-hook-v1",
+            Arc::new(CoexistingHook),
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap();
+    assert!(
+        hook_host
+            .start_replay_safe_root(&unsafe_tool, json!({}), 3)
+            .is_err()
+    );
+    let hooked_id = hook_host
+        .start_replay_safe_root(&hooked, json!({"value":"original"}), 3)
+        .unwrap();
+    let hook_driver = hook_host.into_driver();
+    let hooked_task = until(&hook_driver, hooked_id, |s| {
+        matches!(
+            s,
+            TaskState::Succeeded(_) | TaskState::Failed(_) | TaskState::Cancelled
+        )
+    });
+    assert_eq!(
+        hooked_task.state(),
+        &TaskState::Succeeded(
+            serde_json::to_value(Outcome::Succeeded("after rewrite".into())).unwrap()
+        )
+    );
+    assert!(matches!(
+        unsafe_driver.get(unsafe_id).unwrap().unwrap().state(),
+        TaskState::Waiting(_)
+    ));
+    signal(&unsafe_driver, child);
+    let unsafe_task = until(&unsafe_driver, unsafe_id, |s| {
+        matches!(
+            s,
+            TaskState::Succeeded(_) | TaskState::Failed(_) | TaskState::Cancelled
+        )
+    });
+    assert_eq!(
+        unsafe_task.state(),
+        &TaskState::Succeeded(serde_json::to_value(Outcome::Succeeded("done".into())).unwrap())
+    );
+    assert_eq!(
+        std::fs::read_to_string(unsafe_dir.join("effects")).unwrap(),
+        "initial\nresumed\n"
+    );
+    hook_driver.shutdown().unwrap();
+    unsafe_driver.shutdown().unwrap();
+    let store = durable_store::Store::open(unsafe_dir.join("db")).unwrap();
+    let proposals =
+        pi_rs_durable::async_task_tool::read_unsafe_durable_park_evidence(&store, unsafe_id)
+            .unwrap();
+    let receipts =
+        pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, unsafe_id).unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].outcome, Outcome::Succeeded("done".into()));
+}
