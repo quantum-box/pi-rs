@@ -1,7 +1,9 @@
 # Conversation-owned external cancellation: integration notes
 
-Status: design only. Conversation-owned checkpointable Tool cancellation is not
-implemented or enabled by this document. Standalone cancel registrations must
+Status: cancellation is not enabled. The scheduler defers conversation-owned
+interrupted wake or parked-abort recovery and its owned task graph until a
+Harness is bound; unrelated tasks continue. Binding triggers re-evaluation,
+which still uses the existing refusal for unsupported cancellation. Standalone cancel registrations must
 not be attached to a conversation as a substitute.
 
 Upstream `packages/durable/src/harness/tool.ts` invokes Tool cancellation for a
@@ -27,11 +29,12 @@ A safe implementation needs all of the following before dispatch is enabled:
   before dispatch, callback receipt and final conversation settlement. Define
   separate checks for explicit conversation abort and interrupted-wake
   recovery; an abort-marked graph cannot use ordinary admission checks.
-* `Scheduler::attach` currently calls reconciliation before `bind_harness`.
-  Conversation-owned interrupted wake recovery must remain deferred until the
-  Harness is attached and the conversation proof can be included in the same
-  transaction as descendant abort marks. Busy proof acquisition needs a bounded
-  automatic retry without starving unrelated tasks.
+* `Scheduler::attach` calls reconciliation before `bind_harness`. The unbound
+  scheduler now defers eligible cancellation roots and their owned tasks from
+  recovery, wait polling and reservation. Binding requests re-evaluation; this
+  does not yet authorize conversation cancellation or supply conversation proof
+  to the descendant-abort transaction. Busy proof acquisition still needs a
+  bounded automatic retry without starving unrelated tasks.
 * Preserve the original park proof and prepared arguments, woken intent, joined
   result and late receipt independently. A callback claim is not proof of its
   completion; non-idempotent claims cannot be replayed after interruption.

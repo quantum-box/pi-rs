@@ -24830,6 +24830,177 @@ mod scheduler_tests {
         }
     }
 
+    #[tokio::test]
+    async fn unbound_conversation_cancel_recovery_holds_owned_work_but_not_unrelated() {
+        check_unbound_cancel_holds_owned_work(false).await;
+    }
+
+    #[tokio::test]
+    async fn unbound_conversation_parked_abort_holds_owned_work_but_not_unrelated() {
+        check_unbound_cancel_holds_owned_work(true).await;
+    }
+
+    async fn check_unbound_cancel_holds_owned_work(parked_abort: bool) {
+        use crate::task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor};
+        use crate::task_scheduler::{Registry, Scheduler as TaskScheduler, Step};
+        use crate::task_store::{Save, TaskStore};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let root_id = Uuid::new_v4();
+        let ready_id = Uuid::new_v4();
+        let waiting_id = Uuid::new_v4();
+        let independent_id = Uuid::new_v4();
+        let mut root = Task::new(
+            root_id,
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "replay-safe-async-wait".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered_versioned(
+            "pi-rs.unsafe-park-async.v1.hook.woken.fixture".into(),
+            false,
+            1,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_task_tool();
+        root.start_attempt(Uuid::new_v4()).unwrap();
+        if parked_abort {
+            root.wait(WaitFor::DeadlineMillis(0)).unwrap();
+        }
+        let ready = Task::new(
+            ready_id,
+            TaskOwner::Task(root_id),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        let mut waiting = Task::new(
+            waiting_id,
+            TaskOwner::Task(root_id),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        waiting.start().unwrap();
+        waiting.wait(WaitFor::DeadlineMillis(0)).unwrap();
+        let independent = Task::new(
+            independent_id,
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("independent".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[
+                Save::Create(&root),
+                Save::Create(&ready),
+                Save::Create(&waiting),
+                Save::Create(&independent),
+            ])
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let child_calls = calls.clone();
+        let mut registry = Registry::default();
+        assert!(registry.register("child", true, move |_: &Task| {
+            child_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(serde_json::json!("child")))
+        }));
+        assert!(
+            registry.register("independent", true, |_: &Task| Ok(Step::Succeed(
+                serde_json::json!("done")
+            )))
+        );
+        let scheduler = TaskScheduler::attach(h.owner.clone(), registry.clone()).unwrap();
+        if parked_abort {
+            // Request abort after attach, before the first reservation scan.
+            let store = TaskStore::new(h.owner.store());
+            let mut item = store.load(root_id).unwrap().unwrap();
+            item.task.request_abort().unwrap();
+            store.save(&[Save::Update(&item)]).unwrap();
+        } else {
+            assert!(scheduler.recovery_is_deferred_for_test(root_id));
+        }
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert!(matches!(
+            TaskScheduler::attach(h.owner.clone(), registry.clone()),
+            Err(crate::task_scheduler::Error::AlreadyAttached)
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    driver.get(independent_id).unwrap().unwrap().state(),
+                    TaskState::Succeeded(_)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            driver.get(ready_id).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        assert!(matches!(
+            driver.get(waiting_id).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ));
+        assert_eq!(
+            driver.get(root_id).unwrap().unwrap().state(),
+            if parked_abort {
+                &TaskState::Ready
+            } else {
+                &TaskState::Running
+            }
+        );
+        let _ = driver.shutdown_with_pending().unwrap();
+        // Reopening before binding must reconstruct the same deferral.
+        drop(h);
+        let h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let mut scheduler = TaskScheduler::attach(h.owner.clone(), registry.clone()).unwrap();
+        assert!(scheduler.recovery_is_deferred_for_test(root_id));
+        scheduler.bind_harness(h.worker());
+        let _ = scheduler.reserve_tick(0).unwrap();
+        assert!(!scheduler.recovery_is_deferred_for_test(root_id));
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert!(matches!(
+            TaskScheduler::attach(h.owner.clone(), registry),
+            Err(crate::task_scheduler::Error::AlreadyAttached)
+        ));
+        // There is no conversation cancellation registration yet: retry keeps
+        // the existing refusal and does not call either owned handler.
+        if !parked_abort {
+            assert_eq!(
+                driver.get(root_id).unwrap().unwrap().state(),
+                &TaskState::Running
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
     #[test]
     fn submission_notify_withdrawal_commits_and_reopens() {
         use crate::task::{Checkpoint, Task, TaskOwner};

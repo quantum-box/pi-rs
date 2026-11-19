@@ -4613,6 +4613,82 @@ impl WakeReader {
         Ok(result)
     }
 }
+// Before a Harness is attached, a conversation-owned interrupted woken
+// cancellation cannot be reconciled. Missing/cyclic ancestry is conservative.
+fn needs_harness_for_cancel_recovery(
+    store: &durable_store::Store,
+    task: &Task,
+    records: &[task_store::StoredTask],
+) -> Result<bool, Error> {
+    let mut current = task;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.id()) {
+            return Ok(true);
+        }
+        match current.owner() {
+            TaskOwner::Task(id) => match records.iter().find(|r| r.task.id() == *id) {
+                Some(parent) => current = &parent.task,
+                None => return Ok(true),
+            },
+            TaskOwner::Conversation(id) => {
+                let key = format!("runtime/conversation/{id}");
+                return Ok(store
+                    .get(key.as_bytes())
+                    .map_err(task_store::Error::from)?
+                    .is_some());
+            }
+        }
+    }
+}
+
+fn unbound_cancel_owned_tasks(
+    store: &durable_store::Store,
+    roots: &HashSet<Uuid>,
+    records: &[task_store::StoredTask],
+) -> Result<HashSet<Uuid>, Error> {
+    if roots.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let graph = crate::ownership_edge::CleanupGraph::load(store)
+        .map_err(|e| Error::Handler(format!("ownership graph: {e}")))?;
+    let mut result = HashSet::new();
+    let mut conversations = HashSet::new();
+    let mut pending: Vec<_> = roots.iter().copied().collect();
+    while let Some(id) = pending.pop() {
+        if !result.insert(id) {
+            continue;
+        }
+        for record in records {
+            if record.task.owner() == &TaskOwner::Task(id) {
+                pending.push(record.task.id());
+            }
+        }
+        for edge in graph.task_edges(id) {
+            if edge.mode == crate::ownership_edge::Mode::Foreground
+                && conversations.insert(edge.child)
+            {
+                for record in records {
+                    if record.task.owner() == &TaskOwner::Conversation(edge.child) {
+                        pending.push(record.task.id());
+                    }
+                }
+            }
+        }
+    }
+    // An invalid edge cannot authorize an otherwise ambiguous task to run.
+    for root in roots {
+        if graph.uncertain_task(*root) {
+            for record in records {
+                if !task_ancestors_available(store, &record.task, records, |p| p.id() == *root) {
+                    result.insert(record.task.id());
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
 // Follow task ownership through foreground conversation edges as well. A root
 // conversation may be absent in standalone task stores; an owned conversation
 // must have a valid record and a consistent edge. Invalid graphs fail closed.
@@ -4755,6 +4831,7 @@ pub struct Scheduler {
     failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
     // Interrupted invocations held until pending fail-fast marks have landed.
     deferred_recovery: HashSet<Uuid>,
+    unbound_cancel_roots: HashSet<Uuid>,
     #[cfg(test)]
     result_commit_hook: Option<CommitHook>,
     #[cfg(test)]
@@ -6797,6 +6874,7 @@ impl Scheduler {
             reservation_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_migrations: HashMap::new(),
             deferred_recovery: HashSet::new(),
+            unbound_cancel_roots: HashSet::new(),
             #[cfg(test)]
             result_commit_hook: None,
             #[cfg(test)]
@@ -6982,6 +7060,10 @@ impl Scheduler {
     pub(crate) fn registry_for_test(&self) -> Registry {
         self.registry.clone()
     }
+    #[cfg(test)]
+    pub(crate) fn recovery_is_deferred_for_test(&self, id: Uuid) -> bool {
+        self.deferred_recovery.contains(&id)
+    }
     pub(crate) fn bind_harness(&mut self, harness: crate::runtime::Harness) {
         self.activity = harness.worker_activity();
         *self
@@ -6990,6 +7072,7 @@ impl Scheduler {
             .write()
             .expect("wake generation lock") = Some(harness.checkpointable_extension_generation());
         self.validator = Some(harness);
+        self.activity.notify();
     }
     pub(crate) fn replace_registry_locked(&mut self, registry: Registry) -> Result<(), Error> {
         self.check()?;
@@ -7173,6 +7256,34 @@ impl Scheduler {
             // pending fail-fast ownership graphs, including conversation descendants,
             // until the normal graph-abort path has persisted the complete mark.
             let mut pending_roots = Vec::new();
+            self.unbound_cancel_roots.clear();
+            if self.validator.is_none() {
+                for record in &records {
+                    if !live.contains(&record.task.id())
+                        && !record.task.replay_safe()
+                        && record.task.is_task_tool()
+                        && !record.task.is_terminal()
+                        && record.task.checkpoint().phase == "replay-safe-async-wait"
+                        && ((record.task.state() == &TaskState::Running
+                            && record.task.kind().is_some_and(|kind| {
+                                kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
+                            }))
+                            || (record.task.abort_requested()
+                                && record.task.kind().is_some_and(|kind| {
+                                    kind.starts_with("pi-rs.unsafe-park-async.v1.")
+                                })))
+                        && needs_harness_for_cancel_recovery(
+                            self.owner().store(),
+                            &record.task,
+                            &records,
+                        )?
+                    {
+                        self.unbound_cancel_roots.insert(record.task.id());
+                        self.deferred_recovery.insert(record.task.id());
+                        pending_roots.push(record.task.id());
+                    }
+                }
+            }
             for parent in &records {
                 if !parent.task.abort_requested()
                     && let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = parent.task.state()
@@ -8010,8 +8121,41 @@ impl Scheduler {
             .put_version()
             .map_err(task_store::Error::from)?;
         let held_tasks = self.ts().list()?;
+        // An abort can be requested after attach while the Harness is still
+        // absent. Discover it before polling waits or reserving owned work.
+        if self.validator.is_none() {
+            let live = self
+                .live_invocations
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .attempts
+                .clone();
+            for record in &held_tasks {
+                let task = &record.task;
+                let unsafe_kind = task
+                    .kind()
+                    .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."));
+                let interrupted_wake = task.state() == &TaskState::Running
+                    && task.kind().is_some_and(|kind| {
+                        kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
+                    });
+                if !live.contains(&task.id())
+                    && !task.replay_safe()
+                    && task.is_task_tool()
+                    && !task.is_terminal()
+                    && task.checkpoint().phase == "replay-safe-async-wait"
+                    && (interrupted_wake || (task.abort_requested() && unsafe_kind))
+                    && needs_harness_for_cancel_recovery(owner.store(), task, &held_tasks)?
+                {
+                    self.unbound_cancel_roots.insert(task.id());
+                    self.deferred_recovery.insert(task.id());
+                }
+            }
+        }
+        let unbound_owned =
+            unbound_cancel_owned_tasks(owner.store(), &self.unbound_cancel_roots, &held_tasks)?;
         for snapshot in &held_tasks {
-            if !snapshot.task.is_completing() {
+            if unbound_owned.contains(&snapshot.task.id()) || !snapshot.task.is_completing() {
                 continue;
             }
             if matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
@@ -8471,7 +8615,8 @@ impl Scheduler {
             }
         }
         for snapshot in self.ts().list()? {
-            if !snapshot.task.abort_requested()
+            if !unbound_owned.contains(&snapshot.task.id())
+                && !snapshot.task.abort_requested()
                 && let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state()
                 && let Some(id) = failed_sibling_to_abort(&self.ts(), &snapshot, ids)?
             {
@@ -8508,7 +8653,8 @@ impl Scheduler {
             }
         }
         for snapshot in self.ts().list()? {
-            if !snapshot.task.abort_requested()
+            if !unbound_owned.contains(&snapshot.task.id())
+                && !snapshot.task.abort_requested()
                 && matches!(snapshot.task.state(), TaskState::Waiting(_))
             {
                 match self.ts().poll_wait(&snapshot, now_millis) {
@@ -8553,6 +8699,9 @@ impl Scheduler {
         };
         let live_invocations = self.live_invocations.clone();
         let eligible = |task: &Task| {
+            if unbound_owned.contains(&task.id()) {
+                return false;
+            }
             if !task_tool_child_only {
                 return true;
             }
