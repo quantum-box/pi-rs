@@ -347,6 +347,7 @@ pub(super) fn register_conversation_candidate(
         replay_safe: true,
         block_results: false,
         unavailable: false,
+        park_cancel: None,
     });
     let adapter =
         Arc::new(TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments());
