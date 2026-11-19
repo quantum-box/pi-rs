@@ -127,8 +127,8 @@ pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
 /// separately proved before/after phases and committed parks may resume.
 /// The host must restore the same Tool and hook registrations after restart.
 /// External-job cancellation is not supported. Host-generated pre-dispatch
-/// errors, including before Block and invalid arguments, remain fail-closed
-/// pending a separate proof that no Tool intent was ever dispatched.
+/// errors run after hooks only when an atomic no-dispatch proof establishes
+/// that the task has no earlier unsafe intent or result evidence.
 #[allow(clippy::too_many_arguments)]
 pub fn register_conversation_unsafe_durable_tool_with_selected_hooks(
     registry: &mut crate::task_scheduler::Registry,

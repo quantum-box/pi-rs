@@ -17737,7 +17737,7 @@ impl Harness {
                             arguments: arguments.clone(),
                         };
                         let binding_key = checkpointable_root_binding_key(task.id());
-                        let evidence = crate::task_store::OwnedBatch {
+                        let mut evidence = crate::task_store::OwnedBatch {
                             checks: vec![Check {
                                 key: binding_key.clone(),
                                 expected: Expected::Missing,
@@ -17747,6 +17747,13 @@ impl Harness {
                                 value: serde_json::to_vec(&binding)?,
                             }],
                         };
+                        if invalid_raw && !identity.replay_safe {
+                            let (checks, mutations) = crate::async_task_tool::unsafe_park_proof::prepare_no_dispatch_proof(
+                                self.owner.store(), &task, task.checkpoint(), true,
+                            ).map_err(Error::Invalid)?;
+                            evidence.checks.extend(checks);
+                            evidence.mutations.extend(mutations);
+                        }
                         c.tool_attempt = Some(tool_attempt);
                         c.phase = Phase::TaskPending {
                             turns,

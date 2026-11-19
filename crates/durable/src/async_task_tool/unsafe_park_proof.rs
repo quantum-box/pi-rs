@@ -482,10 +482,24 @@ fn park_checks(
         if park_entry.is_some() {
             return Err("unexpected unsafe park proof".into());
         }
-        return Ok(vec![Check {
-            key: park_key,
-            expected: Expected::Missing,
-        }]);
+        // Initial/prepared may dispatch only once. A prior attempt's intent
+        // means that an external effect may already have occurred, even if
+        // the current checkpoint was restored or rewritten to an earlier phase.
+        let boundary = store.put_version().map_err(|e| e.to_string())?;
+        let prefix = format!("durable/unsafe-park-async/{}/", task.id()).into_bytes();
+        if !store.list(&prefix).map_err(|e| e.to_string())?.is_empty() {
+            return Err("prior unsafe execution evidence requires reconciliation".into());
+        }
+        return Ok(vec![
+            Check {
+                key: park_key,
+                expected: Expected::Missing,
+            },
+            Check {
+                key: prefix,
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+        ]);
     }
     let entry = park_entry.ok_or("unsafe wake lacks committed park proof")?;
     let proof: ParkProof =
@@ -618,12 +632,158 @@ fn park_checks(
     Ok(checks)
 }
 
+// An admission or before-phase settlement creates this only with an empty
+// task evidence prefix and the task/checkpoint in the same checked commit.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoDispatchProof {
+    version: u32,
+    task: Uuid,
+    owner: crate::task::TaskOwner,
+    kind: String,
+    definition_version: u32,
+    input_digest: Vec<u8>,
+    checkpoint: Checkpoint,
+    before_attempt: Option<Uuid>,
+}
+fn no_dispatch_key(task: Uuid) -> Vec<u8> {
+    format!("durable/unsafe-park-async/{task}/no-dispatch").into_bytes()
+}
+fn task_evidence_prefix(task: Uuid) -> Vec<u8> {
+    format!("durable/unsafe-park-async/{task}/").into_bytes()
+}
+fn host_error_outcome(checkpoint: &Checkpoint) -> Result<pi_rs_core::Outcome, String> {
+    if checkpoint.phase != "replay-safe-async-after" {
+        return Err("not a host error checkpoint".into());
+    }
+    match super::after_checkpoint_evidence(&checkpoint.data)? {
+        super::ReplaySafeAfterEvidence::HostError { outcome, .. } => Ok(outcome),
+        _ => Err("not a host error checkpoint".into()),
+    }
+}
+pub(crate) fn prepare_no_dispatch_proof(
+    store: &Store,
+    task: &Task,
+    checkpoint: &Checkpoint,
+    admission: bool,
+) -> Result<(Vec<Check>, Vec<Mutation>), String> {
+    if task.replay_safe()
+        || !task.is_task_tool()
+        || !task
+            .kind()
+            .is_some_and(|k| k.starts_with("pi-rs.unsafe-park-async.v1.hook."))
+        || if admission {
+            task.state() != &TaskState::Ready
+                || task.checkpoint() != checkpoint
+                || task.attempt_id().is_some()
+        } else {
+            task.state() != &TaskState::Running
+                || task.checkpoint().phase != "initial"
+                || task.attempt_id().is_none()
+        }
+    {
+        return Err("invalid no-dispatch proof origin".into());
+    }
+    host_error_outcome(checkpoint)?;
+    let boundary = store.put_version().map_err(|e| e.to_string())?;
+    let prefix = task_evidence_prefix(task.id());
+    if !store.list(&prefix).map_err(|e| e.to_string())?.is_empty() {
+        return Err("prior unsafe execution evidence requires reconciliation".into());
+    }
+    let proof = NoDispatchProof {
+        version: 1,
+        task: task.id(),
+        owner: task.owner().clone(),
+        kind: task.kind().ok_or("missing kind")?.into(),
+        definition_version: task.definition_version(),
+        input_digest: Sha256::digest(serde_json::to_vec(task.input()).map_err(|e| e.to_string())?)
+            .to_vec(),
+        checkpoint: checkpoint.clone(),
+        before_attempt: if admission { None } else { task.attempt_id() },
+    };
+    let key = no_dispatch_key(task.id());
+    Ok((
+        vec![
+            Check {
+                key: prefix,
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+            Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            },
+        ],
+        vec![Mutation::Put {
+            key,
+            value: serde_json::to_vec(&proof).map_err(|e| e.to_string())?,
+        }],
+    ))
+}
+fn no_dispatch_checks(store: &Store, task: &Task) -> Result<(NoDispatchProof, Vec<Check>), String> {
+    let boundary = store.put_version().map_err(|e| e.to_string())?;
+    let prefix = task_evidence_prefix(task.id());
+    let records = store.list(&prefix).map_err(|e| e.to_string())?;
+    let key = no_dispatch_key(task.id());
+    let entry = records
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+        .ok_or("no-dispatch proof missing")?;
+    let proof: NoDispatchProof =
+        serde_json::from_slice(&entry.value).map_err(|_| "invalid no-dispatch proof")?;
+    if proof.version != 1
+        || proof.task != task.id()
+        || &proof.owner != task.owner()
+        || Some(proof.kind.as_str()) != task.kind()
+        || proof.definition_version != task.definition_version()
+        || proof.before_attempt.is_some_and(|attempt| attempt.is_nil())
+        || proof.input_digest
+            != Sha256::digest(serde_json::to_vec(task.input()).map_err(|e| e.to_string())?)
+                .as_slice()
+        || &proof.checkpoint != task.checkpoint()
+        || task.replay_safe()
+        || !task.is_task_tool()
+        || records
+            .iter()
+            .any(|(k, _)| *k != key && *k != hook_final_key(task.id()))
+    {
+        return Err("no-dispatch evidence mismatch or prior intent".into());
+    }
+    host_error_outcome(task.checkpoint())?;
+    if proof.before_attempt.is_none()
+        && (!matches!(task.owner(), crate::task::TaskOwner::Conversation(_))
+            || task.checkpoint() != &super::invalid_raw_checkpoint()?
+            || task.input() != &serde_json::json!({}))
+    {
+        return Err("invalid no-dispatch admission origin".into());
+    }
+    if !task.is_terminal() && records.iter().any(|(k, _)| *k == hook_final_key(task.id())) {
+        return Err("unsafe hook final exists before terminal settlement".into());
+    }
+    Ok((
+        proof,
+        vec![
+            Check {
+                key: prefix,
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+            Check {
+                key,
+                expected: Expected::Version(entry.version),
+            },
+        ],
+    ))
+}
+
 /// Bind a replayable after phase to the exact committed unsafe Complete and its joined receipt.
 pub(crate) fn after_checks(store: &Store, task: &Task) -> Result<Vec<Check>, String> {
     if task.replay_safe() || task.checkpoint().phase != "replay-safe-async-after" {
         return Err("invalid unsafe after phase".into());
     }
     let checkpoint = &task.checkpoint().data;
+    if checkpoint.get("host_error").is_some_and(|v| !v.is_null()) {
+        return no_dispatch_checks(store, task).map(|(_, checks)| checks);
+    }
     if checkpoint
         .get("version")
         .and_then(serde_json::Value::as_u64)
@@ -751,16 +911,41 @@ pub(crate) fn prepare_hook_phase(
     match (task.checkpoint().phase.as_str(), step) {
         ("initial", crate::task_scheduler::Step::Continue(next))
             if next.phase == "replay-safe-async-prepared" => {}
+        ("initial", crate::task_scheduler::Step::Continue(next))
+            if next.phase == "replay-safe-async-after" =>
+        {
+            let (extra_checks, extra_mutations) =
+                prepare_no_dispatch_proof(store, task, next, false)?;
+            checks.extend(extra_checks);
+            mutations.extend(extra_mutations);
+        }
         ("replay-safe-async-after", crate::task_scheduler::Step::Succeed(value)) => {
             checks.extend(after_checks(store, task)?);
-            let receipt = read_receipts(store, task.id())?
-                .into_iter()
-                .next()
-                .ok_or("missing unsafe receipt")?;
+            let no_dispatch = task
+                .checkpoint()
+                .data
+                .get("host_error")
+                .is_some_and(|v| !v.is_null());
+            let (raw_attempt, raw) = if no_dispatch {
+                let (proof, _) = no_dispatch_checks(store, task)?;
+                (
+                    proof.before_attempt.unwrap_or(Uuid::nil()),
+                    host_error_outcome(task.checkpoint())?,
+                )
+            } else {
+                let receipt = read_receipts(store, task.id())?
+                    .into_iter()
+                    .next()
+                    .ok_or("missing unsafe receipt")?;
+                (receipt.attempt_id, receipt.outcome)
+            };
             let rich = matches!(
                 serde_json::from_value::<super::DurableTaskResult>(value.clone()),
                 Ok(super::DurableTaskResult::Rich { .. })
             );
+            if no_dispatch && !rich {
+                return Err("no-dispatch outcome requires rich hooks".into());
+            }
             let final_outcome = if rich {
                 None
             } else {
@@ -770,10 +955,16 @@ pub(crate) fn prepare_hook_phase(
                 )
             };
             let record = HookFinal {
-                version: if rich { 2 } else { 1 },
+                version: if no_dispatch {
+                    3
+                } else if rich {
+                    2
+                } else {
+                    1
+                },
                 task: task.id(),
-                raw_attempt: receipt.attempt_id,
-                raw: receipt.outcome,
+                raw_attempt,
+                raw,
                 final_outcome,
                 final_rich: rich.then(|| value.clone()),
                 final_attempt: rich.then_some(attempt),
@@ -892,16 +1083,25 @@ pub(crate) fn rich_hook_final_checks(
     let record: HookFinal =
         serde_json::from_slice(&entry.value).map_err(|_| "invalid unsafe hook final")?;
     let receipts = read_receipts(store, task.id())?;
-    if record.version != 2
+    let no_dispatch = record.version == 3;
+    let valid_origin = if no_dispatch {
+        let (proof, _) = no_dispatch_checks(store, task)?;
+        receipts.is_empty()
+            && record.raw_attempt == proof.before_attempt.unwrap_or(Uuid::nil())
+            && record.raw == host_error_outcome(task.checkpoint())?
+    } else {
+        record.version == 2
+            && receipts.len() == 1
+            && receipts[0].attempt_id == record.raw_attempt
+            && receipts[0].outcome == record.raw
+    };
+    if !valid_origin
         || record.task != task.id()
         || record.final_outcome.is_some()
         || record.final_rich.as_ref() != Some(value)
         || (matches!(task.state(), TaskState::Succeeded(_))
             && record.final_attempt != task.retired_attempt_id())
         || record.final_attempt.is_none()
-        || receipts.len() != 1
-        || receipts[0].attempt_id != record.raw_attempt
-        || receipts[0].outcome != record.raw
     {
         return Err("unsafe rich hook final mismatch".into());
     }
@@ -921,4 +1121,50 @@ pub(crate) fn rich_hook_final_checks(
         expected: Expected::Missing,
     });
     Ok(checks)
+}
+
+#[cfg(test)]
+mod no_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn prior_intent_racing_no_dispatch_commit_rejects_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let id = Uuid::new_v4();
+        let mut task = Task::new(
+            id,
+            crate::task::TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("pi-rs.unsafe-park-async.v1.hook.test".into(), false)
+        .into_task_tool();
+        task.start_attempt(Uuid::new_v4()).unwrap();
+        let checkpoint = super::super::invalid_raw_checkpoint().unwrap();
+        let (checks, mutations) =
+            prepare_no_dispatch_proof(&store, &task, &checkpoint, false).unwrap();
+        let prior = intent_key(id, Uuid::new_v4());
+        store
+            .commit(
+                &[Check {
+                    key: prior.clone(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: prior,
+                    value: b"prior".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(store.get(&no_dispatch_key(id)).unwrap().is_none());
+    }
 }
