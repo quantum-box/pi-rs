@@ -360,7 +360,15 @@ impl AsyncTaskTool {
         input: serde_json::Value,
     ) -> Result<AsyncTaskCall, String> {
         documents.require_standalone_for_sealed_child()?;
-        let handle = self.adapter.start_child(parent, documents, key, input)?;
+        let (identity, child) = self.adapter.sealed_child_candidate(parent, input)?;
+        let id = documents.stage_task_tool_child(
+            key,
+            &identity,
+            child.input(),
+            child.clone(),
+            self.adapter.handler(),
+        )?;
+        let handle = crate::task_tool::NestedTaskCall::new(parent.id(), id);
         documents.bind_sealed_child_identity(key, &self.identity)?;
         Ok(AsyncTaskCall(handle))
     }
@@ -549,6 +557,7 @@ mod tests {
         struct ReplyTool {
             changed: Arc<std::sync::atomic::AtomicBool>,
             calls: Arc<AtomicUsize>,
+            normalize: bool,
         }
         #[async_trait::async_trait]
         impl Tool for ReplyTool {
@@ -558,12 +567,26 @@ mod tests {
                     description: String::new(),
                     parameters: if self.changed.load(Ordering::SeqCst) {
                         json!({"type":"object", "required":["different"]})
+                    } else if self.normalize {
+                        json!({"type":"object", "required":["normalized"]})
                     } else {
                         json!({"type":"object"})
                     },
                 }
             }
-            async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            async fn prepare_arguments(
+                &self,
+                mut args: serde_json::Value,
+            ) -> pi_rs_core::ExtensionResult<serde_json::Value> {
+                if self.normalize {
+                    args["normalized"] = json!(true);
+                }
+                Ok(args)
+            }
+            async fn invoke(&self, args: serde_json::Value, _: ToolContext) -> Outcome {
+                if self.normalize {
+                    assert_eq!(args["normalized"], json!(true));
+                }
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Outcome::Structured {
                     data: json!({"answer":42}),
@@ -578,12 +601,17 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(ReplyTool {
             changed: changed.clone(),
             calls: calls.clone(),
+            normalize: mode >= 4,
         });
         let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
         let make_host = || {
             let cell = Arc::new(std::sync::OnceLock::new());
             let mut registry = Registry::default();
-            assert!(registry.register("parent", true, CheckpointParent(cell.clone(), mode == 3)));
+            assert!(registry.register(
+                "parent",
+                true,
+                CheckpointParent(cell.clone(), mode == 3 || mode == 5)
+            ));
             let mut host = StandaloneNoHooksHost::open(
                 &path,
                 registry,
@@ -688,6 +716,14 @@ mod tests {
     #[test]
     fn immediate_sealed_child_handle_survives_checkpoint_and_reopen() {
         driver_checkpoint_reopen(3);
+    }
+    #[test]
+    fn staged_sealed_child_normalizes_before_schema_validation_after_reopen() {
+        driver_checkpoint_reopen(4);
+    }
+    #[test]
+    fn immediate_sealed_child_normalizes_before_schema_validation_after_reopen() {
+        driver_checkpoint_reopen(5);
     }
     struct ChangedSchema;
     #[async_trait::async_trait]

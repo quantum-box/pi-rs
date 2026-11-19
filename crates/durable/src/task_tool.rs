@@ -152,13 +152,38 @@ impl TaskTool {
         parent: &crate::task::Task,
         input: Value,
     ) -> Result<(String, crate::task::Task), String> {
+        self.child_candidate_inner(parent, input, true)
+    }
+
+    /// Sealed async tools normalize arguments inside their durable executor.
+    /// Validate the raw object and schema here; validate the normalized value
+    /// against that schema before invoking the tool.
+    pub(crate) fn sealed_child_candidate(
+        &self,
+        parent: &crate::task::Task,
+        input: Value,
+    ) -> Result<(String, crate::task::Task), String> {
+        self.child_candidate_inner(parent, input, false)
+    }
+
+    fn child_candidate_inner(
+        &self,
+        parent: &crate::task::Task,
+        input: Value,
+        validate_input: bool,
+    ) -> Result<(String, crate::task::Task), String> {
         let identity = self.identity().ok_or("invalid task tool identity")?;
         let identity = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
+        let validator = jsonschema::validator_for(&self.spec.parameters)
+            .map_err(|_| "invalid task tool schema")?;
         if identity.len() > 65_536
             || self.spec.name.is_empty()
             || serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024
-            || !jsonschema::validator_for(&self.spec.parameters)
-                .is_ok_and(|validator| validator.is_valid(&input))
+            || if validate_input {
+                !validator.is_valid(&input)
+            } else {
+                !input.is_object()
+            }
         {
             return Err("invalid task tool identity, schema, or input".into());
         }

@@ -1350,9 +1350,12 @@ impl AdmissionHandle<'_> {
         if self.abort || self.lease.retired || !self.running.task.is_task_tool() {
             return Err(Error::Ownership);
         }
-        let (identity, child) = tool
-            .child_candidate(&self.running.task, input)
-            .map_err(Error::Handler)?;
+        let (identity, child) = if sealed.is_some() {
+            tool.sealed_child_candidate(&self.running.task, input)
+        } else {
+            tool.child_candidate(&self.running.task, input)
+        }
+        .map_err(Error::Handler)?;
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         let state = self.lease.state.lock().map_err(|_| Error::Poisoned)?;
