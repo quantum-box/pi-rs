@@ -131,6 +131,23 @@ fn placement_start_busy_hooks()
 }
 
 #[cfg(test)]
+fn scoped_abort_busy_hooks() -> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>
+{
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn scoped_abort_discovery_hooks()
+-> &'static std::sync::Mutex<HashMap<Uuid, Box<dyn FnOnce() + Send>>> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, Box<dyn FnOnce() + Send>>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
 pub(crate) fn cleanup_marker_hooks()
 -> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>> {
     static HOOKS: std::sync::OnceLock<
@@ -14441,6 +14458,39 @@ impl Harness {
         .map(|result| result.map(|(conversations, _, _)| conversations))
     }
 
+    // Discovery is read-only; commit repeats the graph scan under the task
+    // gate and refuses any conversation outside the acquired scope.
+    fn scoped_direct_abort(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+        background: bool,
+        targets: Option<&[Uuid]>,
+    ) -> Result<Option<OwnedGraphAbort>, Error> {
+        let owner = self.owner.clone();
+        let gate = match owner.task_gate().try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(Error::TaskPublicationBusy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Failed),
+        };
+        let mode = match targets {
+            Some(targets) => (false, targets),
+            None => (true, &[][..]),
+        };
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            conversation,
+            task,
+            None,
+            background,
+            None,
+            None,
+            None,
+            Some(mode),
+            || {},
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn abort_owned_graph_impl_roots_locked(
         &mut self,
@@ -22196,6 +22246,71 @@ impl Scheduler {
         }
         Ok((affected, result))
     }
+    // The existing synchronous abort API preserves its legacy behavior. This
+    // asynchronous path can yield and safely retry a nonblocking graph fence.
+    async fn scoped_abort_with_retry(
+        &mut self,
+        id: Uuid,
+        background: bool,
+    ) -> Result<OwnedGraphAbort, Error> {
+        loop {
+            let result = (|| {
+                let (targets, _, _) = self
+                    .harness
+                    .scoped_direct_abort(Some(id), None, background, None)?
+                    .ok_or_else(|| Error::Invalid("abort graph disappeared".into()))?;
+                #[cfg(test)]
+                {
+                    let hook = scoped_abort_discovery_hooks().lock().unwrap().remove(&id);
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                let owner = self.harness.owner.clone();
+                let mut committed = None;
+                let fenced = owner
+                    .conversation_controls()
+                    .try_fence_targets(&targets, || {
+                        let value = self
+                            .harness
+                            .scoped_direct_abort(Some(id), None, background, Some(&targets))?
+                            .ok_or_else(|| Error::Invalid("abort graph disappeared".into()))?;
+                        let affected = value.0.clone();
+                        committed = Some(value);
+                        Ok::<_, Error>(affected)
+                    });
+                match fenced {
+                    Ok(Some(_)) => {
+                        committed.ok_or_else(|| Error::Invalid("abort result missing".into()))
+                    }
+                    Ok(None) => Err(Error::TaskPublicationBusy),
+                    Err(durable_store::controls::FenceError::Poisoned) => Err(Error::Failed),
+                    Err(durable_store::controls::FenceError::Commit(Error::TaskScheduler(
+                        crate::task_scheduler::Error::Busy,
+                    ))) => Err(Error::TaskPublicationBusy),
+                    Err(durable_store::controls::FenceError::Commit(error)) => Err(error),
+                }
+            })();
+            match result {
+                Ok(value) => {
+                    for conversation in &value.0 {
+                        self.schedule(*conversation);
+                    }
+                    return Ok(value);
+                }
+                Err(Error::TaskPublicationBusy)
+                | Err(Error::Storage(durable_store::Error::WriteLockBusy(_))) => {
+                    #[cfg(test)]
+                    if let Some(signal) = scoped_abort_busy_hooks().lock().unwrap().remove(&id) {
+                        signal.add_permits(1);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Request abort and join workers for every affected foreground conversation.
     pub async fn abort_and_wait(&mut self, id: Uuid) -> Result<(), Error> {
         self.abort_and_wait_withdrawn(id).await.map(|_| ())
@@ -22205,7 +22320,7 @@ impl Scheduler {
         &mut self,
         id: Uuid,
     ) -> Result<ConversationAbortResult, Error> {
-        let (affected, result) = self.abort_graph_with_result(Some(id), None)?;
+        let (affected, _, result) = self.scoped_abort_with_retry(id, false).await?;
         let mut first_error = None;
         for child in &affected {
             if let Err(error) = self.wait(*child).await {
@@ -22236,7 +22351,7 @@ impl Scheduler {
         &mut self,
         id: Uuid,
     ) -> Result<ConversationAbortResult, Error> {
-        let (conversations, tasks, result) = self.abort_background_graph(id)?;
+        let (conversations, tasks, result) = self.scoped_abort_with_retry(id, true).await?;
         let mut first_error = None;
         for conversation in &conversations {
             loop {
@@ -25443,6 +25558,130 @@ mod scheduler_tests {
         store.commit(&finish.checks, &finish.mutations).unwrap();
         harness.request_abort(conversation).unwrap();
         assert!(harness.conversation(conversation).unwrap().abort_requested);
+    }
+
+    #[tokio::test]
+    async fn scoped_async_abort_rechecks_graph_added_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let added = scheduler.create_conversation(config()).unwrap();
+        let unrelated = scheduler.create_conversation(config()).unwrap();
+        let worker = scheduler.harness.worker();
+        let owner = scheduler.harness.owner.clone();
+        let task = crate::task::Task::new(
+            Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(target),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("missing".into(), true);
+        crate::task_store::TaskStore::new(owner.store())
+            .save(&[crate::task_store::Save::Create(&task)])
+            .unwrap();
+        let added_owner = owner.clone();
+        scoped_abort_discovery_hooks().lock().unwrap().insert(
+            target,
+            Box::new(move || {
+                let edge = crate::ownership_edge::Edge {
+                    task: task.id(),
+                    task_owner: task.owner().clone(),
+                    child: added,
+                    mode: crate::ownership_edge::Mode::Foreground,
+                };
+                let batch = crate::ownership_edge::EdgeStore::new(added_owner.store())
+                    .prepare_create(&edge)
+                    .unwrap();
+                added_owner
+                    .store()
+                    .commit(&batch.checks, &batch.mutations)
+                    .unwrap();
+            }),
+        );
+        let busy = Arc::new(tokio::sync::Semaphore::new(0));
+        scoped_abort_busy_hooks()
+            .lock()
+            .unwrap()
+            .insert(target, busy.clone());
+        let unrelated_control = owner.conversation_controls().get(unrelated);
+        let unrelated_callback = unrelated_control.callback_start.try_start().unwrap();
+        let unrelated_poll = unrelated_control.gate.lock().unwrap();
+        let mut abort = Box::pin(scheduler.scoped_abort_with_retry(target, false));
+        tokio::select! {
+            result = &mut abort => panic!("graph change was not retried: {result:?}"),
+            permit = busy.acquire() => permit.unwrap().forget(),
+        }
+        assert!(!worker.conversation(target).unwrap().abort_requested);
+        assert!(!worker.conversation(added).unwrap().abort_requested);
+        let (affected, _, _) = tokio::time::timeout(Duration::from_secs(5), &mut abort)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(affected.contains(&target));
+        assert!(affected.contains(&added));
+        assert!(!affected.contains(&unrelated));
+        drop(abort);
+        drop(unrelated_poll);
+        drop(unrelated_callback);
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_abort_retries_target_marker_and_preserves_other_graph_progress() {
+        for background in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+            let target = scheduler.create_conversation(config()).unwrap();
+            let other = scheduler.create_conversation(config()).unwrap();
+            let worker = scheduler.harness.worker();
+            let store = durable_store::Store::open(&path).unwrap();
+            let start = crate::conversation_signal::prepare_callback_start_signal_fence(
+                &store, target, b"claim",
+            )
+            .unwrap();
+            store.commit(&start.checks, &start.mutations).unwrap();
+            let busy = Arc::new(tokio::sync::Semaphore::new(0));
+            scoped_abort_busy_hooks()
+                .lock()
+                .unwrap()
+                .insert(target, busy.clone());
+            let mut abort = Box::pin(async {
+                if background {
+                    scheduler.abort_and_wait_with_background(target).await
+                } else {
+                    scheduler.abort_and_wait(target).await
+                }
+            });
+            tokio::select! {
+                result = &mut abort => panic!("abort completed before marker retirement: {result:?}"),
+                permit = busy.acquire() => permit.unwrap().forget(),
+            }
+            assert!(!worker.conversation(target).unwrap().abort_requested);
+            let signal = crate::conversation_signal::Signal::new(
+                Uuid::new_v4(),
+                other,
+                "wake".into(),
+                serde_json::json!(1),
+            );
+            worker.send_signal(&signal).unwrap();
+            let finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+                &store, target, b"claim",
+            )
+            .unwrap();
+            store.commit(&finish.checks, &finish.mutations).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), &mut abort)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(abort);
+            scheduler.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
