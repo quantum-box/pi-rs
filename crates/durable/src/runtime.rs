@@ -14359,6 +14359,7 @@ impl Harness {
             None,
             None,
             None,
+            None,
             before_commit,
         )
         .map(|result| result.expect("unconditional abort always has a result"))
@@ -14385,20 +14386,33 @@ impl Harness {
             Some(running),
             None,
             None,
+            None,
             || {},
         )
         .map(|result| result.map(|(conversations, _, _)| conversations))
     }
 
-    /// Recheck a deferred scheduling intent under the task gate on every
-    /// graph retry. The caller has already acquired the poll and failure fences.
-    pub(crate) fn abort_maintenance_checked(
+    /// Discover or commit an abort graph; the commit must remain within the
+    /// selected controls. Re-discovery runs on every graph-conflict retry.
+    pub(crate) fn scoped_abort_graph(
         &mut self,
-        intent: crate::task_scheduler::MaintenanceIntent,
-        verify: impl Fn() -> Result<(), crate::task_scheduler::Error>,
+        running: Option<Uuid>,
+        maintenance: Option<crate::task_scheduler::MaintenanceIntent>,
+        targets: Option<&[Uuid]>,
+        verify: Option<&dyn Fn() -> Result<(), crate::task_scheduler::Error>>,
     ) -> Result<Option<Vec<Uuid>>, Error> {
         let owner = self.owner.clone();
-        let gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
+        let gate = match owner.task_gate().try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Failed),
+        };
+        let mode = match targets {
+            Some(targets) => (false, targets),
+            None => (true, &[][..]),
+        };
         self.abort_owned_graph_impl_roots_locked(
             &gate,
             None,
@@ -14406,9 +14420,10 @@ impl Harness {
             None,
             false,
             None,
-            None,
-            Some(intent),
-            Some(&verify),
+            running,
+            maintenance,
+            Some(mode),
+            verify,
             || {},
         )
         .map(|result| result.map(|(conversations, _, _)| conversations))
@@ -14425,6 +14440,7 @@ impl Harness {
         nested_parent: Option<Uuid>,
         pending_running: Option<Uuid>,
         maintenance: Option<crate::task_scheduler::MaintenanceIntent>,
+        graph_scope: Option<(bool, &[Uuid])>,
         verify: Option<&dyn Fn() -> Result<(), crate::task_scheduler::Error>>,
         mut before_commit: impl FnMut(),
     ) -> Result<Option<OwnedGraphAbort>, Error> {
@@ -14551,6 +14567,18 @@ impl Harness {
                             cq.push_back(edge.edge.child);
                         }
                     }
+                }
+            }
+            if let Some((discover, targets)) = graph_scope {
+                if discover {
+                    return Ok(Some((
+                        conversations.into_iter().collect(),
+                        tasks.into_iter().collect(),
+                        ConversationAbortResult::default(),
+                    )));
+                }
+                if conversations.iter().any(|id| !targets.contains(id)) {
+                    return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
                 }
             }
             let mut updates = Vec::new();

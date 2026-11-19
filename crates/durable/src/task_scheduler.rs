@@ -1350,27 +1350,43 @@ impl PendingMaintenance {
         if !Arc::ptr_eq(owner, &harness.owner) {
             return Err(Error::Ownership);
         }
-        match owner.conversation_controls().try_fence(|| {
-            let _guard = match self.fence.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
-            };
+        let targets = match harness.scoped_abort_graph(None, Some(self.intent), None, None) {
+            Ok(Some(targets)) => targets,
+            Ok(None) => Vec::new(),
+            Err(error)
+                if runtime_pre_transaction_busy(&error)
+                    || matches!(error, crate::runtime::Error::TaskScheduler(Error::Busy)) =>
             {
-                let state = self.state.lock().map_err(|_| Error::Poisoned)?;
-                if state.poisoned
-                    || self
-                        .scheduler_poison
-                        .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    return Err(Error::Poisoned);
-                }
-                if state.handler_failed {
-                    return Err(Error::Busy);
-                }
+                return Ok(false);
             }
-            let guard =
-                || {
+            Err(error) => {
+                return Err(Error::Handler(format!(
+                    "maintenance graph discovery: {error}"
+                )));
+            }
+        };
+        match owner
+            .conversation_controls()
+            .try_fence_targets(&targets, || {
+                let _guard = match self.fence.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+                };
+                {
+                    let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+                    if state.poisoned
+                        || self
+                            .scheduler_poison
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return Err(Error::Poisoned);
+                    }
+                    if state.handler_failed {
+                        return Err(Error::Busy);
+                    }
+                }
+                let guard = || {
                     if !self.independent && earlier.is_empty() {
                         return Ok(());
                     }
@@ -1453,13 +1469,17 @@ impl PendingMaintenance {
                     }
                     Ok(())
                 };
-            match harness.abort_maintenance_checked(self.intent, guard) {
-                Ok(affected) => Ok(affected.unwrap_or_default()),
-                Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                Err(error) if runtime_pre_transaction_busy(&error) => {
-                    #[cfg(test)]
-                    if let Some(hook) =
-                        maintenance_write_busy_test_hooks()
+                match harness.scoped_abort_graph(
+                    None,
+                    Some(self.intent),
+                    Some(&targets),
+                    Some(&guard),
+                ) {
+                    Ok(affected) => Ok(affected.unwrap_or_default()),
+                    Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                    Err(error) if runtime_pre_transaction_busy(&error) => {
+                        #[cfg(test)]
+                        if let Some(hook) = maintenance_write_busy_test_hooks()
                             .lock()
                             .unwrap()
                             .remove(&match self.intent {
@@ -1467,17 +1487,17 @@ impl PendingMaintenance {
                                 | MaintenanceIntent::Failed(id)
                                 | MaintenanceIntent::FailFast(id) => id,
                             })
-                    {
-                        hook();
+                        {
+                            hook();
+                        }
+                        Err(Error::Busy)
                     }
-                    Err(Error::Busy)
+                    Err(error) => {
+                        self.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                        Err(Error::Handler(format!("maintenance abort: {error}")))
+                    }
                 }
-                Err(error) => {
-                    self.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
-                    Err(Error::Handler(format!("maintenance abort: {error}")))
-                }
-            }
-        }) {
+            }) {
             Ok(Some(_)) => Ok(true),
             Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => Ok(false),
             Err(durable_store::controls::FenceError::Poisoned) => Err(Error::Poisoned),
@@ -1552,6 +1572,37 @@ pub(crate) fn take_test_conversation_receipt(id: Uuid) -> bool {
 }
 #[cfg(test)]
 type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn graph_discovery_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_pending_graph_discovered(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    graph_discovery_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn graph_scope_retry_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_pending_graph_scope_retry(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    graph_scope_retry_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn invoke_boundary(hooks: &BoundaryHooks, id: Uuid) {
+    let hook = hooks.lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 #[cfg(test)]
 fn conversation_claim_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
@@ -2261,35 +2312,61 @@ impl PendingSettlement {
         if !Arc::ptr_eq(owner, &harness.owner) {
             return Err(Error::Ownership);
         }
-        let result = owner.conversation_controls().try_fence(|| {
-            let _failure = match lease.failure_fence.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
-            };
+        let targets = match harness.scoped_abort_graph(Some(lease.id), None, None, None) {
+            Ok(Some(targets)) => targets,
+            Ok(None) => Vec::new(),
+            Err(error)
+                if runtime_pre_transaction_busy(&error)
+                    || matches!(error, crate::runtime::Error::TaskScheduler(Error::Busy)) =>
             {
-                let state = lease.state.lock().map_err(|_| Error::Poisoned)?;
-                if state.poisoned
-                    || lease
-                        .scheduler_poison
-                        .load(std::sync::atomic::Ordering::Acquire)
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(Error::Handler(format!(
+                    "pending abort graph discovery: {error}"
+                )));
+            }
+        };
+        #[cfg(test)]
+        invoke_boundary(graph_discovery_hooks(), lease.id);
+        let result = owner
+            .conversation_controls()
+            .try_fence_targets(&targets, || {
+                let _failure = match lease.failure_fence.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+                };
                 {
-                    return Err(Error::Poisoned);
+                    let state = lease.state.lock().map_err(|_| Error::Poisoned)?;
+                    if state.poisoned
+                        || lease
+                            .scheduler_poison
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return Err(Error::Poisoned);
+                    }
+                    if state.handler_failed && !state.failed_handlers.contains(&lease.id) {
+                        return Err(Error::Busy);
+                    }
                 }
-                if state.handler_failed && !state.failed_handlers.contains(&lease.id) {
-                    return Err(Error::Busy);
+                match harness.scoped_abort_graph(Some(lease.id), None, Some(&targets), None) {
+                    Ok(affected) => Ok(affected.unwrap_or_default()),
+                    Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                    Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
+                    Err(error) => {
+                        lease.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                        Err(Error::Handler(format!("checked pending abort: {error}")))
+                    }
                 }
-            }
-            match harness.abort_pending_task_graph(lease.id) {
-                Ok(affected) => Ok(affected.unwrap_or_default()),
-                Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
-                Err(error) => {
-                    lease.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
-                    Err(Error::Handler(format!("checked pending abort: {error}")))
-                }
-            }
-        });
+            });
+        #[cfg(test)]
+        if matches!(
+            &result,
+            Err(durable_store::controls::FenceError::Commit(Error::Busy))
+        ) {
+            invoke_boundary(graph_scope_retry_hooks(), lease.id);
+        }
         match result {
             Ok(Some(_)) => Ok(true),
             Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => Ok(false),
@@ -7022,32 +7099,53 @@ impl Scheduler {
             let state = self.live_invocations.clone();
             let scheduler_poison = self.poisoned.clone();
             let running = completed.task_id();
-            let result = owner.conversation_controls().try_fence(|| {
-                let _failure = match fence.try_lock() {
-                    Ok(guard) => guard,
-                    Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
-                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
-                };
+            let targets = match worker.scoped_abort_graph(Some(running), None, None, None) {
+                Ok(Some(targets)) => targets,
+                Ok(None) => Vec::new(),
+                Err(error)
+                    if runtime_pre_transaction_busy(&error)
+                        || matches!(error, crate::runtime::Error::TaskScheduler(Error::Busy)) =>
                 {
-                    let state = state.lock().map_err(|_| Error::Poisoned)?;
-                    if state.poisoned || scheduler_poison.load(std::sync::atomic::Ordering::Acquire)
+                    return Err(SettlementError::Pending {
+                        completed: Box::new(completed),
+                    });
+                }
+                Err(error) => {
+                    return Err(SettlementError::Rejected {
+                        error: Error::Handler(format!("pending abort graph discovery: {error}")),
+                        completed: Box::new(completed),
+                    });
+                }
+            };
+            let result = owner
+                .conversation_controls()
+                .try_fence_targets(&targets, || {
+                    let _failure = match fence.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                        Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+                    };
                     {
-                        return Err(Error::Poisoned);
+                        let state = state.lock().map_err(|_| Error::Poisoned)?;
+                        if state.poisoned
+                            || scheduler_poison.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            return Err(Error::Poisoned);
+                        }
+                        if state.handler_failed && !state.failed_handlers.contains(&running) {
+                            return Err(Error::Busy);
+                        }
                     }
-                    if state.handler_failed && !state.failed_handlers.contains(&running) {
-                        return Err(Error::Busy);
+                    match worker.scoped_abort_graph(Some(running), None, Some(&targets), None) {
+                        Ok(affected) => Ok(affected.unwrap_or_default()),
+                        Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                        Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
+                        Err(error) => {
+                            state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                            Err(Error::Handler(format!("checked pending abort: {error}")))
+                        }
                     }
-                }
-                match worker.abort_pending_task_graph(running) {
-                    Ok(affected) => Ok(affected.unwrap_or_default()),
-                    Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                    Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
-                    Err(error) => {
-                        state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
-                        Err(Error::Handler(format!("checked pending abort: {error}")))
-                    }
-                }
-            });
+                });
             match result {
                 Ok(Some(_)) => (),
                 Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => {
@@ -14804,6 +14902,161 @@ mod tests {
     }
 
     #[test]
+    fn scoped_abort_rediscovers_new_graph_before_commit() {
+        use crate::runtime::{Config, Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = Harness::open_paused(
+            dir.path().join("db"),
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let config = || Config {
+            model: "stub".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 20,
+        };
+        let first = harness.create_conversation(config()).unwrap();
+        let second = harness.create_conversation(config()).unwrap();
+        let scheduler = harness.attach_tasks(Registry::default()).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut running = task(2, TaskOwner::Task(parent.id()), "running", false, 3);
+        running.start().unwrap();
+        let mut failed = task(3, TaskOwner::Task(parent.id()), "failed", false, 3);
+        failed.start().unwrap();
+        failed.fail("failure".into()).unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&running),
+                Save::Create(&failed),
+            ])
+            .unwrap();
+        let owner = scheduler.owner();
+        let add_edge = |child| {
+            let edge = crate::ownership_edge::Edge {
+                task: running.id(),
+                task_owner: running.owner().clone(),
+                child,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let prepared = crate::ownership_edge::EdgeStore::new(owner.store())
+                .prepare_create(&edge)
+                .unwrap();
+            owner
+                .store()
+                .commit(&prepared.checks, &prepared.mutations)
+                .unwrap();
+        };
+        add_edge(first);
+        let initial = harness
+            .scoped_abort_graph(Some(running.id()), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(initial.contains(&first));
+        assert!(!initial.contains(&second));
+        add_edge(second);
+        let result = owner
+            .conversation_controls()
+            .try_fence_targets(&initial, || {
+                harness
+                    .scoped_abort_graph(Some(running.id()), None, Some(&initial), None)
+                    .map(|value| value.unwrap_or_default())
+            });
+        assert!(matches!(
+            result,
+            Err(durable_store::controls::FenceError::Commit(
+                crate::runtime::Error::TaskScheduler(Error::Busy)
+            ))
+        ));
+        assert!(
+            !scheduler
+                .ts()
+                .load(running.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(!harness.conversation(first).unwrap().abort_requested);
+        assert!(!harness.conversation(second).unwrap().abort_requested);
+        let targets = harness
+            .scoped_abort_graph(Some(running.id()), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(targets.contains(&first) && targets.contains(&second));
+        // A deleted edge may leave a conservative extra fence; the checked
+        // commit must not abort the detached conversation.
+        let key = crate::ownership_edge::edge_key(first);
+        let existing = owner.store().get(&key).unwrap().unwrap();
+        owner
+            .store()
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(existing.version),
+                }],
+                &[durable_store::Mutation::Delete { key }],
+            )
+            .unwrap();
+        let unrelated = harness.create_conversation(config()).unwrap();
+        let unrelated_control = owner.conversation_controls().get(unrelated);
+        let callback = unrelated_control.callback_start.try_start().unwrap();
+        let poll = unrelated_control.gate.lock().unwrap();
+        let result = owner
+            .conversation_controls()
+            .try_fence_targets(&targets, || {
+                harness
+                    .scoped_abort_graph(Some(running.id()), None, Some(&targets), None)
+                    .map(|v| v.unwrap_or_default())
+            })
+            .unwrap();
+        assert!(result.is_some());
+        assert!(
+            scheduler
+                .ts()
+                .load(running.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(!harness.conversation(first).unwrap().abort_requested);
+        assert!(harness.conversation(second).unwrap().abort_requested);
+        assert!(!harness.conversation(unrelated).unwrap().abort_requested);
+        drop(poll);
+        drop(callback);
+    }
+
+    #[test]
     fn checked_abort_rechecks_intent_under_task_gate() {
         use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
@@ -14951,7 +15204,7 @@ mod tests {
     #[test]
     fn deferred_nested_cleanup_marks_two_live_handlers_before_their_results() {
         use crate::document::{Address, Documents, TaskDocuments};
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         use std::sync::{Condvar, mpsc};
@@ -15000,7 +15253,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let harness = Harness::open_paused(
+        let mut harness = Harness::open_paused(
             dir.path().join("db"),
             Options {
                 model: Arc::new(Stub),
@@ -15011,6 +15264,13 @@ mod tests {
             },
         )
         .unwrap();
+        let nested = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 20,
+            })
+            .unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let mut registry = Registry::default();
@@ -15039,6 +15299,17 @@ mod tests {
             .ts()
             .save(&[Save::Create(&parent), Save::Create(&a), Save::Create(&b)])
             .unwrap();
+        let owner = scheduler.owner();
+        let edge = crate::ownership_edge::Edge {
+            task: a.id(),
+            task_owner: a.owner().clone(),
+            child: nested,
+            mode: crate::ownership_edge::Mode::Foreground,
+        };
+        let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+            .prepare_create(&edge)
+            .unwrap();
+        owner.store().commit(&edge.checks, &edge.mutations).unwrap();
         let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
         scheduler
             .ts()
@@ -15069,8 +15340,7 @@ mod tests {
                 task.hold_success(json!("parent"))
             })
             .unwrap();
-        let owner = scheduler.owner();
-        let control = owner.conversation_controls().get(Uuid::from_u128(99));
+        let control = owner.conversation_controls().get(nested);
         let poll = control.gate.lock().unwrap();
         let TickReservation::Maintenance(pending) = scheduler.try_reserve_tick(0).unwrap() else {
             panic!("maintenance")
@@ -15129,7 +15399,7 @@ mod tests {
 
     #[test]
     fn deferred_maintenance_rechecks_graph_and_allows_independent_progress() {
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         struct Stub;
@@ -15142,7 +15412,7 @@ mod tests {
         for kind in ["nested", "failed", "failfast"] {
             for stale in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
-                let harness = Harness::open_paused(
+                let mut harness = Harness::open_paused(
                     dir.path().join("db"),
                     Options {
                         model: Arc::new(Stub),
@@ -15153,6 +15423,13 @@ mod tests {
                     },
                 )
                 .unwrap();
+                let config = || Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                };
+                let nested_a = harness.create_conversation(config()).unwrap();
+                let nested_b = harness.create_conversation(config()).unwrap();
                 let mut registry = Registry::default();
                 registry.register("independent", false, |_: &Task| {
                     Ok(Step::Succeed(json!("independent")))
@@ -15199,6 +15476,19 @@ mod tests {
                         Save::Create(&generic),
                     ])
                     .unwrap();
+                let owner = scheduler.owner();
+                for (task, conversation) in [(&a, nested_a), (&b, nested_b)] {
+                    let edge = crate::ownership_edge::Edge {
+                        task: task.id(),
+                        task_owner: task.owner().clone(),
+                        child: conversation,
+                        mode: crate::ownership_edge::Mode::Foreground,
+                    };
+                    let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                        .prepare_create(&edge)
+                        .unwrap();
+                    owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+                }
                 let parent_record = scheduler.ts().load(parent.id()).unwrap().unwrap();
                 scheduler
                     .ts()
@@ -15212,9 +15502,10 @@ mod tests {
                         ])),
                     })
                     .unwrap();
-                let owner = scheduler.owner();
-                let control = owner.conversation_controls().get(Uuid::from_u128(99));
-                let poll = control.gate.lock().unwrap();
+                let control_a = owner.conversation_controls().get(nested_a);
+                let control_b = owner.conversation_controls().get(nested_b);
+                let poll_a = control_a.gate.lock().unwrap();
+                let poll_b = control_b.gate.lock().unwrap();
                 let TickReservation::Maintenance(mut pending) =
                     scheduler.try_reserve_tick(0).unwrap()
                 else {
@@ -15270,7 +15561,8 @@ mod tests {
                         })
                         .unwrap();
                 }
-                drop(poll);
+                drop(poll_a);
+                drop(poll_b);
                 if !stale {
                     pending.independent = true;
                     assert!(
@@ -15310,6 +15602,7 @@ mod tests {
                     );
                     publication.test_set_published(a.id(), false);
                 }
+
                 assert!(pending.try_cleanup(&mut cleanup).unwrap());
                 let a_marked = scheduler
                     .ts()
@@ -15360,7 +15653,7 @@ mod tests {
     #[test]
     fn pre_prepare_busy_returns_lease_and_independent_root_can_run() {
         use crate::document::{Address, Documents, TaskDocuments, Transaction};
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use crate::task_store::{SignalResult, SignalToken};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
@@ -15426,7 +15719,7 @@ mod tests {
             "poison_prepared",
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let harness = Harness::open_paused(
+            let mut harness = Harness::open_paused(
                 dir.path().join("db"),
                 Options {
                     model: Arc::new(Stub),
@@ -15437,6 +15730,13 @@ mod tests {
                 },
             )
             .unwrap();
+            let nested = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
             let address = Address {
                 scope: "pending".into(),
                 name: "result".into(),
@@ -15495,14 +15795,24 @@ mod tests {
                     Save::Create(&receiver),
                 ])
                 .unwrap();
+            let owner = scheduler.owner();
+            let edge = crate::ownership_edge::Edge {
+                task: child.id(),
+                task_owner: child.owner().clone(),
+                child: nested,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                .prepare_create(&edge)
+                .unwrap();
+            owner.store().commit(&edge.checks, &edge.mutations).unwrap();
             let TickReservation::Invocation(child_invocation) = scheduler.reserve_tick(0).unwrap()
             else {
                 panic!("child")
             };
             assert_eq!(child_invocation.task_id(), child.id());
             let completed = child_invocation.execute().unwrap();
-            let owner = scheduler.owner();
-            let control = owner.conversation_controls().get(Uuid::from_u128(99));
+            let control = owner.conversation_controls().get(nested);
             let poll = control.gate.lock().unwrap();
             if timing.starts_with("prepare_conflict") || timing.starts_with("failure") {
                 let hook: CommitHook = Arc::new(move |attempt, store| {
@@ -15685,10 +15995,14 @@ mod tests {
                 assert_eq!(rewritten.task, current.task);
             }
             if timing.ends_with("_direct_abort") {
-                request_abort_subtree(&scheduler.ts(), child.id()).unwrap();
+                cleanup_worker
+                    .abort_owned_graph(None, Some(child.id()))
+                    .unwrap();
             }
             if timing.ends_with("_ancestor_abort") {
-                request_abort_subtree(&scheduler.ts(), parent.id()).unwrap();
+                cleanup_worker
+                    .abort_owned_graph(None, Some(parent.id()))
+                    .unwrap();
             }
             if timing.ends_with("_changed") {
                 let current = scheduler.ts().load(child.id()).unwrap().unwrap();

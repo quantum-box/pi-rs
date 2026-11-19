@@ -195,6 +195,57 @@ impl ConversationControls {
         Ok(affected)
     }
 
+    /// Fence only controls in a previously discovered graph. The commit must
+    /// re-discover its graph under its own durable fence and reject any target
+    /// outside `targets` before writing; a changed graph must be retried.
+    /// The registry remains locked through commit, so controls cannot appear
+    /// between selection and the durable check.
+    pub fn try_fence_targets<E>(
+        &self,
+        targets: &[Uuid],
+        commit: impl FnOnce() -> Result<Vec<Uuid>, E>,
+    ) -> Result<Option<Vec<Uuid>>, FenceError<E>> {
+        use std::sync::TryLockError;
+        let mut entries = match self.entries.try_lock() {
+            Ok(entries) => entries,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
+        };
+        let mut ids = targets.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let selected: Vec<_> = ids.iter().filter_map(|id| entries.get(id)).collect();
+        let mut starts = Vec::with_capacity(selected.len());
+        for control in &selected {
+            let Some(lease) = control.callback_start.try_enter() else {
+                return Ok(None);
+            };
+            starts.push(lease);
+        }
+        let gates: Vec<_> = selected
+            .iter()
+            .map(|control| control.gate.clone())
+            .collect();
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in &gates {
+            match gate.try_lock() {
+                Ok(guard) => guards.push(guard),
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
+            }
+        }
+        let affected = commit().map_err(FenceError::Commit)?;
+        for id in &affected {
+            if let Some(control) = entries.get_mut(id) {
+                control.cancel.cancel();
+                control.cleanup_cancel.cancel();
+                control.cancel = self.root.child_token();
+                control.cleanup_cancel = CancellationToken::new();
+            }
+        }
+        Ok(Some(affected))
+    }
+
     /// Try all current poll gates. Busy performs no commit and cancels no epochs.
     pub fn try_fence<E>(
         &self,
@@ -341,6 +392,40 @@ mod tests {
             Some(vec![])
         );
         assert!(start.try_enter().is_some());
+    }
+
+    #[test]
+    fn targeted_fence_ignores_unrelated_callback_and_poll_gate() {
+        let controls = ConversationControls::default();
+        let target = Uuid::from_u128(10);
+        let unrelated = Uuid::from_u128(11);
+        let target_control = controls.get(target);
+        let unrelated_control = controls.get(unrelated);
+        let callback = unrelated_control.callback_start.try_start().unwrap();
+        let poll = unrelated_control.gate.lock().unwrap();
+        assert_eq!(
+            controls
+                .try_fence_targets(&[target], || Ok::<_, ()>(vec![target]))
+                .unwrap(),
+            Some(vec![target])
+        );
+        assert!(target_control.cancel.is_cancelled());
+        assert!(!unrelated_control.cancel.is_cancelled());
+        drop(poll);
+        drop(callback);
+        let held = controls.get(target).callback_start.try_start().unwrap();
+        let called = std::cell::Cell::new(false);
+        assert_eq!(
+            controls
+                .try_fence_targets(&[target], || {
+                    called.set(true);
+                    Ok::<_, ()>(vec![target])
+                })
+                .unwrap(),
+            None
+        );
+        assert!(!called.get());
+        drop(held);
     }
 
     #[test]

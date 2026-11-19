@@ -4025,7 +4025,7 @@ mod tests {
     #[test]
     fn bounded_workers_progress_independent_root_during_busy_graph_cleanup() {
         use crate::document::{Address, Documents, TaskDocuments};
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         struct Stub;
@@ -4068,9 +4068,9 @@ mod tests {
                 Ok(task_scheduler::Step::Succeed(json!("discard")))
             }
         }
-        for mode in ["failfast", "tasktool"] {
+        for mode in ["failfast", "failfast-delete", "tasktool"] {
             let dir = tempfile::tempdir().unwrap();
-            let harness = Harness::open_paused(
+            let mut harness = Harness::open_paused(
                 dir.path().join("db"),
                 Options {
                     model: Arc::new(Stub),
@@ -4081,6 +4081,27 @@ mod tests {
                 },
             )
             .unwrap();
+            let nested_conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
+            let unrelated_conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
+            let added_conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
             let (entered_tx, entered_rx) = mpsc::channel();
             let (other_tx, other_rx) = mpsc::channel();
             let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -4123,7 +4144,7 @@ mod tests {
                 parent = parent.into_task_tool();
             }
             parent.start().unwrap();
-            if mode == "failfast" {
+            if mode != "tasktool" {
                 parent
                     .wait(WaitFor::TasksFailFast(vec![
                         Uuid::from_u128(2),
@@ -4165,14 +4186,36 @@ mod tests {
             tasks
                 .save(&[Save::Create(&parent), Save::Create(&a), Save::Create(&b)])
                 .unwrap();
+            let edge = crate::ownership_edge::Edge {
+                task: a.id(),
+                task_owner: a.owner().clone(),
+                child: nested_conversation,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                .prepare_create(&edge)
+                .unwrap();
+            owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+            if mode == "failfast-delete" {
+                let edge = crate::ownership_edge::Edge {
+                    task: a.id(),
+                    task_owner: a.owner().clone(),
+                    child: added_conversation,
+                    mode: crate::ownership_edge::Mode::Foreground,
+                };
+                let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                    .prepare_create(&edge)
+                    .unwrap();
+                owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+            }
             let driver = Arc::new(Driver::start_with_harness(scheduler, harness.worker()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             if mode == "tasktool" {
                 entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             }
-            let control = owner.conversation_controls().get(Uuid::from_u128(99));
-            let poll = control.gate.lock().unwrap();
-            if mode == "failfast" {
+            let control = owner.conversation_controls().get(nested_conversation);
+            let mut poll = Some(control.gate.lock().unwrap());
+            if mode != "tasktool" {
                 let current = tasks.load(b.id()).unwrap().unwrap();
                 tasks
                     .update(&current, |task| {
@@ -4308,6 +4351,75 @@ mod tests {
                     .state(),
                 TaskState::CompletingFailed(_)
             ));
+            let added_control = owner.conversation_controls().get(added_conversation);
+            let mut added_callback = None;
+            let mut added_poll = None;
+            if mode == "failfast" {
+                let (discovered_tx, discovered_rx) = mpsc::channel();
+                let (continue_tx, continue_rx) = mpsc::channel();
+                let (retry_tx, retry_rx) = mpsc::channel();
+                task_scheduler::on_pending_graph_discovered(a.id(), move || {
+                    discovered_tx.send(()).unwrap();
+                    continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                task_scheduler::on_pending_graph_scope_retry(a.id(), move || {
+                    retry_tx.send(()).unwrap();
+                });
+                driver.shared.notify_work();
+                discovered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("pending graph was not discovered");
+                let edge = crate::ownership_edge::Edge {
+                    task: a.id(),
+                    task_owner: a.owner().clone(),
+                    child: added_conversation,
+                    mode: crate::ownership_edge::Mode::Foreground,
+                };
+                let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                    .prepare_create(&edge)
+                    .unwrap();
+                owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+                added_callback = Some(added_control.callback_start.try_start().unwrap());
+                added_poll = Some(added_control.gate.lock().unwrap());
+                drop(poll.take());
+                continue_tx.send(()).unwrap();
+                retry_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("new graph did not defer commit");
+                assert!(!tasks.load(a.id()).unwrap().unwrap().task.abort_requested());
+                assert!(
+                    !harness
+                        .conversation(added_conversation)
+                        .unwrap()
+                        .abort_requested
+                );
+            }
+            if mode == "failfast-delete" {
+                let (discovered_tx, discovered_rx) = mpsc::channel();
+                let (continue_tx, continue_rx) = mpsc::channel();
+                task_scheduler::on_pending_graph_discovered(a.id(), move || {
+                    discovered_tx.send(()).unwrap();
+                    continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                driver.shared.notify_work();
+                discovered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("pending graph was not discovered");
+                let key = crate::ownership_edge::edge_key(added_conversation);
+                let existing = owner.store().get(&key).unwrap().unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(existing.version),
+                        }],
+                        &[durable_store::Mutation::Delete { key }],
+                    )
+                    .unwrap();
+                continue_tx.send(()).unwrap();
+            }
+
             let replacing = driver.clone();
             let (replaced_tx, replaced_rx) = mpsc::channel();
             let replacement = thread::spawn(move || {
@@ -4369,12 +4481,55 @@ mod tests {
                 replaced_rx.recv_timeout(Duration::from_millis(100)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ));
+            let unrelated = owner.conversation_controls().get(unrelated_conversation);
+            let callback = unrelated.callback_start.try_start().unwrap();
+            let unrelated_poll = unrelated.gate.lock().unwrap();
+            let (callback_started, callback_entered) = mpsc::channel();
+            let callback_release = Arc::new((Mutex::new(false), Condvar::new()));
+            let callback_wait = callback_release.clone();
+            let callback_thread = thread::spawn(move || {
+                let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+                    callback_started.send(()).unwrap();
+                    let (lock, wake) = &*callback_wait;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    std::task::Poll::<()>::Pending
+                }));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    callback
+                        .poll_first(future.as_mut(), &mut context)
+                        .is_pending()
+                );
+            });
+            callback_entered
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
             drop(poll);
+            drop(added_poll);
+            drop(added_callback);
             replaced_rx
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .unwrap();
             replacement.join().unwrap();
+            drop(unrelated_poll);
+            {
+                let (lock, wake) = &*callback_release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+            }
+            callback_thread.join().unwrap();
+            if mode == "failfast-delete" {
+                assert!(
+                    !harness
+                        .conversation(added_conversation)
+                        .unwrap()
+                        .abort_requested
+                );
+            }
             let report = Arc::try_unwrap(driver)
                 .ok()
                 .unwrap()
@@ -4970,7 +5125,7 @@ mod tests {
 
     #[test]
     fn shutdown_waits_for_known_pending_abort_cleanup() {
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         struct Stub;
@@ -4981,7 +5136,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let harness = Harness::open_paused(
+        let mut harness = Harness::open_paused(
             dir.path().join("db"),
             Options {
                 model: Arc::new(Stub),
@@ -4992,6 +5147,13 @@ mod tests {
             },
         )
         .unwrap();
+        let nested_conversation = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 20,
+            })
+            .unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Mutex::new(release_rx);
@@ -5048,7 +5210,17 @@ mod tests {
                 Save::Create(&sibling),
             ])
             .unwrap();
-        let control = owner.conversation_controls().get(Uuid::from_u128(99));
+        let edge = crate::ownership_edge::Edge {
+            task: child.id(),
+            task_owner: child.owner().clone(),
+            child: nested_conversation,
+            mode: crate::ownership_edge::Mode::Foreground,
+        };
+        let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+            .prepare_create(&edge)
+            .unwrap();
+        owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+        let control = owner.conversation_controls().get(nested_conversation);
         let poll = control.gate.lock().unwrap();
         let driver = Driver::start_with_harness(scheduler, harness.worker());
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();

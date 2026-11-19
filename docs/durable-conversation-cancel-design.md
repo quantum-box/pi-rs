@@ -75,6 +75,15 @@ only: callback dispatch and most mutation paths do not yet use it. Existing
 graphs; blocking abort and signal delivery are not protected by this primitive.
 The task wake and signal revision must be checked before dispatch is enabled.
 
+Deferred task cleanup now discovers its foreground conversations, takes only
+those poll and start gates, and repeats graph discovery under the task gate
+before committing. A newly reached conversation causes a non-mutating retry;
+a removed edge permits a conservative extra fence. This applies only to the
+nonblocking task cleanup and settlement paths. Direct abort, signal delivery,
+and other blocking graph fences remain outside this change. The controls
+registry is still held through commit. These remaining boundaries must be
+addressed before the callback can be dispatched.
+
 The `Scheduler::schedule` worker also fences its ModelReady-to-ModelRunning
 save before model dispatch. Busy leaves the durable state unchanged and retries
 through the scheduled worker. This does not yet fence the general Harness save
