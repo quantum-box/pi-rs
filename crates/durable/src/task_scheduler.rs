@@ -4544,7 +4544,6 @@ impl DetachedInvocation {
                 .iter()
                 .any(|(id, _)| *id == self.running.task.id())
             || !parent.task.is_task_tool()
-            || !parent_live
             || parent.task.abort_requested()
         {
             return Err(ProtocolError::Invalid);
@@ -4557,6 +4556,20 @@ impl DetachedInvocation {
         .map_err(|_| ProtocolError::Invalid)?
         .is_some()
         {
+            return Err(ProtocolError::Invalid);
+        }
+        if !parent_live {
+            // The parent has finished its handler but its wait/termination has
+            // not yet settled. No child effect may start in this window; the
+            // reserved child can safely yield until settlement resolves it.
+            if !after
+                && parent.task.state() == &TaskState::Running
+                && parent.task.attempt_id().is_some()
+                && state.attempts.contains(parent_id)
+                && state.published.iter().any(|(id, _)| *id == *parent_id)
+            {
+                return Err(ProtocolError::Deferred);
+            }
             return Err(ProtocolError::Invalid);
         }
         let (intent, batch) = if after {
@@ -4746,16 +4759,20 @@ impl DetachedInvocation {
         });
         if preflight {
             let capture = self.receipt_capture.as_ref().expect("preflight capture");
-            if self
-                .check_or_commit_unhooked_intent(
-                    &capture.identity,
-                    capture.executor.tool().as_ref(),
-                    &capture.implementation,
-                    capture.version,
-                    false,
-                )
-                .is_err()
-            {
+            let authorization = self.check_or_commit_unhooked_intent(
+                &capture.identity,
+                capture.executor.tool().as_ref(),
+                &capture.implementation,
+                capture.version,
+                false,
+            );
+            if matches!(
+                authorization,
+                Err(crate::async_task_protocol::Error::Deferred)
+            ) {
+                return self.release_undispatched();
+            }
+            if authorization.is_err() {
                 if self
                     .unhooked_cancellation
                     .as_ref()
@@ -4807,6 +4824,9 @@ impl DetachedInvocation {
                 capture.version,
             ) {
                 Ok(intent) => Some(intent),
+                Err(crate::async_task_protocol::Error::Deferred) => {
+                    return self.release_undispatched();
+                }
                 Err(crate::async_task_protocol::Error::Invalid)
                     if self
                         .unhooked_cancellation

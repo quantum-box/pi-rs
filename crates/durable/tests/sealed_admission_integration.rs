@@ -105,11 +105,15 @@ impl Handler for Parent {
             let input = json!({"raw":"first"});
             let call = match self.mode {
                 Mode::Staged => leaf.start_child(task, docs, "leaf", input.clone())?,
-                _ => leaf.start_child_now(admission, "leaf", input.clone())?,
+                _ => leaf
+                    .start_child_now(admission, "leaf", input.clone())
+                    .map_err(|e| format!("first immediate: {e}"))?,
             };
             let repeated = match self.mode {
                 Mode::Staged => leaf.start_child(task, docs, "leaf", input)?,
-                _ => leaf.start_child_now(admission, "leaf", input)?,
+                _ => leaf
+                    .start_child_now(admission, "leaf", input)
+                    .map_err(|e| format!("repeat immediate: {e}"))?,
             };
             if call != repeated {
                 return Err("identical raw input did not reconnect".into());
@@ -190,6 +194,28 @@ fn host(
     calls: Arc<AtomicUsize>,
 ) -> Driver {
     let preparation_gate = matches!(mode, Mode::Abort).then(|| release.clone());
+    host_with_preparation_gate(
+        path,
+        mode,
+        valid,
+        marker,
+        release,
+        log,
+        calls,
+        preparation_gate,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn host_with_preparation_gate(
+    path: &Path,
+    mode: Mode,
+    valid: bool,
+    marker: Option<PathBuf>,
+    release: Arc<AtomicBool>,
+    log: Option<PathBuf>,
+    calls: Arc<AtomicUsize>,
+    preparation_gate: Option<Arc<AtomicBool>>,
+) -> Driver {
     let leaf: Arc<dyn Tool> = Arc::new(Leaf {
         calls,
         valid,
@@ -266,17 +292,79 @@ fn schema_failure_and_raw_key_identity_through_both_admission_paths() {
         let dir = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let id = seed(&dir.path().join("db"));
-        let driver = host(
+        let marker = dir.path().join("parent-ready");
+        let preparation_gate = Arc::new(AtomicBool::new(false));
+        let driver = host_with_preparation_gate(
             &dir.path().join("db"),
             mode,
             false,
-            None,
+            Some(marker.clone()),
             Arc::new(AtomicBool::new(true)),
             None,
             calls.clone(),
+            Some(preparation_gate.clone()),
         );
-        until(|| driver.get(id).unwrap().is_some_and(|t| t.is_terminal()));
-        let root = driver.get(id).unwrap().unwrap();
+        until(|| {
+            std::fs::read_to_string(&marker).ok().is_some_and(|text| {
+                let mut parts = text.split_whitespace();
+                matches!(
+                    (
+                        parts.next().and_then(|id| id.parse::<Uuid>().ok()),
+                        parts.next().and_then(|id| id.parse::<Uuid>().ok())
+                    ),
+                    (Some(_), Some(_))
+                )
+            })
+        });
+        let (parent, _) = marker_ids(&marker);
+        until(|| {
+            driver
+                .get(parent)
+                .unwrap()
+                .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
+        });
+        preparation_gate.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let root = loop {
+            match driver.get(id) {
+                Ok(Some(task)) if task.is_terminal() => break task,
+                Ok(_) => assert!(Instant::now() < deadline, "timed out waiting for root"),
+                Err(error) => {
+                    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+                    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+                        .list()
+                        .unwrap();
+                    let report = driver.shutdown_with_pending().unwrap();
+                    let handler_results: Vec<_> = report
+                        .pending()
+                        .iter()
+                        .filter_map(|pending| {
+                            if let pi_rs_durable::task_scheduler::PendingSettlement::Unprepared(
+                                completed,
+                            ) = pending
+                            {
+                                Some((
+                                    completed.task_id(),
+                                    completed.handler_result().map(|r| match r {
+                                        Ok(_) => "ok".to_owned(),
+                                        Err(error) => error.clone(),
+                                    }),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    eprintln!("pending handler results: {handler_results:?}");
+                    panic!(
+                        "driver failed: {error}; cause: {:?}; pending: {:?}; tasks: {tasks:?}",
+                        report.failure(),
+                        report.pending()
+                    );
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(
             root.state(),
             &TaskState::Succeeded(json!({"Succeeded":"invalid"}))

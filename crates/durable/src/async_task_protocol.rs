@@ -17,6 +17,8 @@ pub(crate) enum Error {
     Child(#[from] crate::keyed_child::Error),
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("parent settlement pending")]
+    Deferred,
     #[error("stale or invalid task, identity, intent, or receipt")]
     Invalid,
 }
@@ -1402,6 +1404,64 @@ mod tests {
         let _ = driver.shutdown_with_pending();
         drop(child_job);
         drop(parent_job);
+    }
+    #[test]
+    fn driver_defers_child_while_parent_result_is_unsettled() {
+        use std::sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (entered, calls) = std::sync::mpsc::channel();
+        let tool = Arc::new(RealTool {
+            entered,
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+        });
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = release.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let hook_count = count.clone();
+        let hook = Arc::new(move || {
+            let n = hook_count.fetch_add(1, Ordering::SeqCst);
+            let _ = arrived.send(n);
+            if n == 0 {
+                let (lock, wake) = &*gate;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = wake.wait(ready).unwrap();
+                }
+            }
+        });
+        let (driver, parent, owner, parent_id, child) =
+            actual_driver_fixture_with_hook(&dir.path().join("db"), tool, Some(hook), None);
+        assert_eq!(arrival.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        let completed = parent.execute().unwrap();
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if driver
+                .get(child)
+                .unwrap()
+                .is_some_and(|t| t.state() == &TaskState::Ready)
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "child did not yield");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(driver.get(parent_id).is_ok());
+        assert!(load_intent(owner.store(), child).is_err());
+        assert!(calls.try_recv().is_err());
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_none());
+        drop(completed);
     }
     #[test]
     fn joined_real_tool_result_can_be_receipted_after_driver_abort() {
