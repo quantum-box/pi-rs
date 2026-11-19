@@ -134,6 +134,21 @@ impl TaskTool {
         key: &str,
         input: Value,
     ) -> Result<uuid::Uuid, String> {
+        let (identity, child) = self.child_candidate(parent, input)?;
+        documents.stage_task_tool_child(
+            key,
+            &identity,
+            child.input(),
+            child.clone(),
+            self.handler.clone(),
+        )
+    }
+
+    pub(crate) fn child_candidate(
+        &self,
+        parent: &crate::task::Task,
+        input: Value,
+    ) -> Result<(String, crate::task::Task), String> {
         let identity = self.identity().ok_or("invalid task tool identity")?;
         let identity = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
         if identity.len() > 65_536
@@ -163,7 +178,7 @@ impl TaskTool {
         })
         .map_err(|error| format!("task creation: {error:?}"))?
         .into_task_tool();
-        documents.stage_task_tool_child(key, &identity, &input, child, self.handler.clone())
+        Ok((identity, child))
     }
 }
 tokio::task_local! { static DISPATCH: (Arc<TaskTool>, uuid::Uuid); }

@@ -306,6 +306,9 @@ impl Drop for Attachment {
 #[derive(Default)]
 struct InvocationState {
     attempts: HashSet<Uuid>,
+    // A task ID alone can be reused by a later reservation. Bind each live
+    // executor to the durable attempt that was reserved for it.
+    leases: HashMap<Uuid, (Uuid, Option<Uuid>)>,
     poisoned: bool,
     handler_failed: bool,
     failed_handlers: HashSet<Uuid>,
@@ -443,6 +446,7 @@ pub struct InvocationLease {
     failure_fence: Arc<Mutex<()>>,
     scheduler_poison: Arc<std::sync::atomic::AtomicBool>,
     id: Uuid,
+    token: Uuid,
     retired: bool,
     _activity: crate::worker_activity::Guard,
 }
@@ -450,8 +454,15 @@ impl Drop for InvocationLease {
     fn drop(&mut self) {
         let _fence = self.failure_fence.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.attempts.remove(&self.id);
-        state.published.retain(|(id, _)| *id != self.id);
+        if state
+            .leases
+            .get(&self.id)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            state.leases.remove(&self.id);
+            state.attempts.remove(&self.id);
+            state.published.retain(|(id, _)| *id != self.id);
+        }
         if !self.retired {
             state.poisoned = true;
         }
@@ -533,6 +544,8 @@ pub struct DetachedInvocation {
     abort: bool,
     validator: Option<crate::runtime::Harness>,
     lease: InvocationLease,
+    definitions: Arc<std::sync::RwLock<WakeDefinitions>>,
+    activity: crate::worker_activity::WorkerActivity,
 }
 
 #[derive(Clone)]
@@ -1107,6 +1120,104 @@ impl DetachedInvocation {
         self.running.task.id()
     }
 
+    /// Admit or reconnect a keyed task-tool child while this invocation is
+    /// still running. Only a TaskTool parent is supported. The caller must retain this reservation until all async
+    /// work using it has stopped. A successful admission is durable immediately,
+    /// independent of the eventual parent transition.
+    ///
+    /// A storage error may have an uncertain outcome: stop the executor and
+    /// reopen before retrying. This method does not start the child executor.
+    /// This low-level method is not available inside `execute(self)` or an
+    /// ordinary async tool: that executor integration has not been implemented.
+    /// Its borrowed receiver cannot outlive or be used after dropping the
+    /// reservation; a retired or replaced lease is rejected as well.
+    #[allow(dead_code)] // Awaiting a lease-bound handler/async executor integration.
+    pub(crate) fn admit_task_tool_child(
+        &self,
+        tool: &crate::task_tool::TaskTool,
+        key: &str,
+        input: Value,
+    ) -> Result<Uuid, Error> {
+        let Some(attempt) = self.running.task.attempt_id() else {
+            return Err(Error::Ownership);
+        };
+        if self.abort || self.lease.retired || !self.running.task.is_task_tool() {
+            return Err(Error::Ownership);
+        }
+        let (identity, child) = tool
+            .child_candidate(&self.running.task, input)
+            .map_err(Error::Handler)?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        let state = self.lease.state.lock().map_err(|_| Error::Poisoned)?;
+        if state.poisoned
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || !state.attempts.contains(&self.lease.id)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || state.failed_handlers.contains(&self.lease.id)
+            || state.published.iter().any(|(id, _)| *id == self.lease.id)
+        {
+            return Err(Error::Ownership);
+        }
+        let publication = AdmissionPublication { state };
+        let tasks = TaskStore::new(owner.store());
+        let parent = tasks.load(self.lease.id)?.ok_or(Error::Ownership)?;
+        if parent.task != self.running.task
+            || parent.task.attempt_id() != Some(attempt)
+            || parent.task.abort_requested()
+            || parent.task.state() != &TaskState::Running
+            || !publication.permits_admission(owner, Uuid::nil(), Some(&parent.task))
+        {
+            return Err(Error::Ownership);
+        }
+        let definitions = self.definitions.read().map_err(|_| Error::Poisoned)?;
+        let tool_identity = tool.identity().ok_or(Error::Registration)?;
+        if !definitions
+            .registry
+            .matches_task_tool(&tool_identity, &tool.handler())
+        {
+            return Err(Error::Registration);
+        }
+        if pending_abort_root_for_running(&tasks, parent.task.id(), false)?.is_some() {
+            return Err(Error::Ownership);
+        }
+        let prepared = crate::keyed_child::prepare(
+            owner.store(),
+            &parent,
+            key,
+            &identity,
+            child.input(),
+            &child,
+        )
+        .map_err(|e| Error::Handler(e.to_string()))?;
+        let mut transaction = crate::document::Transaction::new();
+        transaction.append(crate::task_store::OwnedBatch {
+            checks: prepared.checks,
+            mutations: prepared.mutations,
+        })?;
+        let checks = crate::ownership_edge::owner_chain_admission_checks(
+            owner.store(),
+            parent.task.id(),
+            child.id(),
+        )
+        .map_err(|_| Error::Ownership)?;
+        transaction.append(crate::task_store::OwnedBatch {
+            checks,
+            mutations: vec![],
+        })?;
+        if let Err(error) = transaction.commit(owner.store()) {
+            self.lease
+                .scheduler_poison
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(error.into());
+        }
+        self.activity.notify();
+        Ok(prepared.child)
+    }
+
     /// Run without holding the scheduler mutex. A handler panic publishes a
     /// known failed attempt; other unretired exits poison the scheduler. Abort
     /// handler panics retain existing semantics.
@@ -1117,6 +1228,7 @@ impl DetachedInvocation {
             abort,
             validator,
             lease,
+            ..
         } = self;
         let result = if abort {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1524,18 +1636,23 @@ impl Scheduler {
         if state.poisoned || !state.attempts.insert(id) {
             return Err(Error::Poisoned);
         }
+        let token = Uuid::new_v4();
+        state.leases.insert(id, (token, running.task.attempt_id()));
         drop(state);
         Ok(DetachedInvocation {
             running,
             handler,
             abort,
             validator: self.validator.as_ref().map(|harness| harness.worker()),
+            definitions: self.wake_reader.definitions.clone(),
+            activity: self.activity.clone(),
             lease: InvocationLease {
                 attachment: self.attachment.clone(),
                 state: self.live_invocations.clone(),
                 failure_fence: self.failure_fence.clone(),
                 scheduler_poison: self.poisoned.clone(),
                 id,
+                token,
                 retired: false,
                 _activity: self
                     .activity
@@ -5742,6 +5859,410 @@ mod tests {
             phase: phase.into(),
             data: json!(null),
         }
+    }
+
+    fn async_admission_setup(
+        path: &std::path::Path,
+    ) -> (Scheduler, Arc<crate::task_tool::TaskTool>) {
+        let handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            pi_rs_core::ToolSpec {
+                name: "child".into(),
+                description: "".into(),
+                parameters: json!({"type":"object"}),
+            },
+            "child",
+            true,
+            1,
+            handler.clone(),
+        ));
+        let mut registry = Registry::default();
+        assert!(registry.register_shared("parent", true, handler.clone()));
+        assert!(registry.register_shared("child", true, handler));
+        (Scheduler::open(path, registry).unwrap(), child)
+    }
+
+    fn async_admission_reserve(scheduler: &mut Scheduler) -> Box<DetachedInvocation> {
+        let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("expected invocation")
+        };
+        invocation
+    }
+
+    #[test]
+    fn async_admission_rejects_running_generic_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        );
+        scheduler.submit(&parent).unwrap();
+        let invocation = async_admission_reserve(&mut scheduler);
+        assert!(matches!(
+            invocation.admit_task_tool_child(&child, "key", json!({})),
+            Err(Error::Ownership)
+        ));
+        assert_eq!(scheduler.ts().list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn async_admission_child_runs_while_task_tool_parent_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let invocation = async_admission_reserve(&mut scheduler);
+        let child_id = invocation
+            .admit_task_tool_child(&child, "key", json!({}))
+            .unwrap();
+        let child_invocation = async_admission_reserve(&mut scheduler);
+        assert_eq!(child_invocation.task_id(), child_id);
+        assert!(
+            scheduler
+                .settle_invocation(child_invocation.execute().unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            scheduler.get(child_id).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!(null))
+        );
+        assert_eq!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        drop(invocation);
+    }
+
+    #[test]
+    fn async_admission_rejects_retired_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let mut invocation = async_admission_reserve(&mut scheduler);
+        invocation.lease.retired = true;
+        assert!(matches!(
+            invocation.admit_task_tool_child(&child, "key", json!({})),
+            Err(Error::Ownership)
+        ));
+        assert_eq!(scheduler.ts().list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn async_admission_reconnect_concurrent_and_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let invocation = async_admission_reserve(&mut scheduler);
+        let ids = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                invocation
+                    .admit_task_tool_child(&child, "key", json!({"x":1}))
+                    .unwrap()
+            });
+            let b = scope.spawn(|| {
+                invocation
+                    .admit_task_tool_child(&child, "key", json!({"x":1}))
+                    .unwrap()
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(ids.0, ids.1);
+        // A graph-only rewrite advances the stored version without replacing
+        // the attempt or executor; reconnect and another admission remain valid.
+        let snapshot = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        let parent_key = task_store::key(parent.id());
+        scheduler
+            .owner()
+            .store()
+            .commit(
+                &[durable_store::Check {
+                    key: parent_key.clone(),
+                    expected: durable_store::Expected::Version(snapshot.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: parent_key,
+                    value: serde_json::to_vec(&snapshot.task).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            invocation
+                .admit_task_tool_child(&child, "key", json!({"x":1}))
+                .unwrap(),
+            ids.0
+        );
+        assert!(
+            invocation
+                .admit_task_tool_child(&child, "key", json!({"x":2}))
+                .is_err()
+        );
+        assert_eq!(scheduler.ts().list().unwrap().len(), 2);
+        let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        scheduler
+            .ts()
+            .update(&current, |t| t.request_abort())
+            .unwrap();
+        assert!(
+            invocation
+                .admit_task_tool_child(&child, "another", json!({}))
+                .is_err()
+        );
+        assert_eq!(scheduler.ts().list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn async_admission_rejects_old_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let invocation = async_admission_reserve(&mut scheduler);
+        let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        scheduler.ts().update(&current, |t| t.recover()).unwrap();
+        let ready = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        scheduler
+            .ts()
+            .update(&ready, |t| t.start_attempt(Uuid::new_v4()))
+            .unwrap();
+        assert!(
+            invocation
+                .admit_task_tool_child(&child, "key", json!({}))
+                .is_err()
+        );
+        assert_eq!(scheduler.ts().list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn async_admission_rejects_retired_executor_even_with_same_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let invocation = async_admission_reserve(&mut scheduler);
+        let attempt = invocation.running.task.attempt_id();
+        // Model an old worker retaining its snapshot after ownership moved to
+        // another executor, including the ABA case where the durable attempt
+        // record was not changed. Its lease token must not authorize writes.
+        invocation
+            .lease
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .insert(parent.id(), (Uuid::new_v4(), attempt));
+        assert!(
+            invocation
+                .admit_task_tool_child(&child, "key", json!({}))
+                .is_err()
+        );
+        assert_eq!(scheduler.ts().list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn async_admission_races_subtree_abort() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+            let parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                4,
+            )
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            let invocation = async_admission_reserve(&mut scheduler);
+            let owner = scheduler.owner();
+            let barrier = std::sync::Barrier::new(2);
+            let result = std::thread::scope(|scope| {
+                let admission = scope.spawn(|| {
+                    barrier.wait();
+                    invocation.admit_task_tool_child(&child, "key", json!({}))
+                });
+                barrier.wait();
+                let _gate = owner.task_gate().lock().unwrap();
+                request_abort_subtree(&TaskStore::new(owner.store()), parent.id()).unwrap();
+                drop(_gate);
+                admission.join().unwrap()
+            });
+            let records = scheduler.ts().list().unwrap();
+            assert!(
+                records
+                    .iter()
+                    .find(|r| r.task.id() == parent.id())
+                    .unwrap()
+                    .task
+                    .abort_requested()
+            );
+            if let Ok(id) = result {
+                assert!(
+                    records
+                        .iter()
+                        .find(|r| r.task.id() == id)
+                        .unwrap()
+                        .task
+                        .abort_requested()
+                );
+            } else {
+                assert_eq!(records.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn async_admission_parent_completion_cleans_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let invocation = async_admission_reserve(&mut scheduler);
+        let child_id = invocation
+            .admit_task_tool_child(&child, "key", json!({}))
+            .unwrap();
+        assert!(
+            scheduler
+                .settle_invocation(invocation.execute().unwrap())
+                .unwrap()
+        );
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            scheduler
+                .ts()
+                .load(child_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+    }
+
+    #[test]
+    fn async_admission_crash_worker() {
+        let Some(path) = std::env::var_os("PI_ASYNC_ADMISSION_CRASH_DB") else {
+            return;
+        };
+        let (mut scheduler, child) = async_admission_setup(std::path::Path::new(&path));
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let invocation = async_admission_reserve(&mut scheduler);
+        if std::env::var_os("PI_ASYNC_ADMISSION_BEFORE").is_some() {
+            std::process::exit(78);
+        }
+        let id = invocation
+            .admit_task_tool_child(&child, "key", json!({"x":1}))
+            .unwrap();
+        std::fs::write(
+            std::path::Path::new(&path).with_extension("child"),
+            id.to_string(),
+        )
+        .unwrap();
+        std::process::exit(79);
+    }
+
+    #[test]
+    fn async_admission_reconnects_after_process_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_scheduler::tests::async_admission_crash_worker",
+            ])
+            .env("PI_ASYNC_ADMISSION_CRASH_DB", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(79));
+        let original =
+            Uuid::parse_str(&std::fs::read_to_string(path.with_extension("child")).unwrap())
+                .unwrap();
+        let (mut scheduler, child) = async_admission_setup(&path);
+        let invocation = async_admission_reserve(&mut scheduler);
+        assert_eq!(
+            invocation
+                .admit_task_tool_child(&child, "key", json!({"x":1}))
+                .unwrap(),
+            original
+        );
+        assert_eq!(scheduler.ts().list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn async_admission_recovers_crash_before_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_scheduler::tests::async_admission_crash_worker",
+            ])
+            .env("PI_ASYNC_ADMISSION_CRASH_DB", &path)
+            .env("PI_ASYNC_ADMISSION_BEFORE", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(78));
+        let (mut scheduler, child) = async_admission_setup(&path);
+        assert_eq!(scheduler.ts().list().unwrap().len(), 1);
+        let invocation = async_admission_reserve(&mut scheduler);
+        invocation
+            .admit_task_tool_child(&child, "key", json!({"x":1}))
+            .unwrap();
+        assert_eq!(scheduler.ts().list().unwrap().len(), 2);
     }
 
     #[test]
