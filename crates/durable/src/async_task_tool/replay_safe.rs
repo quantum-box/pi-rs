@@ -58,6 +58,16 @@ impl UnsafeDurableAuthorization {
     }
 }
 
+/// Host attestation that abort hooks finish cooperatively, have no detached work,
+/// and tolerate replay across process loss. The runtime cannot verify this.
+pub struct AbortAfterAuthorization(());
+impl AbortAfterAuthorization {
+    pub fn host_attests_cleanup_safe() -> Self {
+        Self(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Registration and both explicit hook policies are bound into identity.
 pub(super) fn register(
     scheduler: &mut Scheduler,
     tool: Arc<dyn DurableAsyncTool>,
@@ -66,6 +76,7 @@ pub(super) fn register(
     children: Vec<Arc<TaskTool>>,
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
     block_results: bool,
+    abort_after: bool,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -76,6 +87,7 @@ pub(super) fn register(
         true,
         hook,
         block_results,
+        abort_after,
     )
 }
 
@@ -95,6 +107,7 @@ pub(super) fn register_unsafe(
         false,
         None,
         false,
+        false,
     )
 }
 
@@ -108,7 +121,11 @@ fn register_with_policy(
     replay_safe: bool,
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
     block_results: bool,
+    abort_after: bool,
 ) -> Result<Arc<TaskTool>, String> {
+    if abort_after && !block_results {
+        return Err("abort hooks require content hooks".into());
+    }
     if block_results && hook.is_none() {
         return Err("content hooks require a registration".into());
     }
@@ -132,7 +149,7 @@ fn register_with_policy(
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
     let encoded = serde_json::to_vec(&(
-        if block_results { 4u32 } else { 1u32 },
+        if abort_after { 5u32 } else if block_results { 4u32 } else { 1u32 },
         &identity,
         &child_identities,
     ))
@@ -162,6 +179,7 @@ fn register_with_policy(
         version,
         replay_safe,
         handler.clone(),
+        abort_after,
     )?;
     Ok(Arc::new(
         TaskTool::new(spec, kind, replay_safe, version, handler).with_deferred_arguments(),
@@ -325,11 +343,31 @@ pub(super) fn validate_content_hook_result(
     }
     if let Some(gate) = required
         && (result.extra.get("isError") != Some(&serde_json::Value::Bool(true))
-            || !result.diagnostics.contains(gate))
+            || !result.diagnostics.contains(gate)
+            || (gate.code.as_deref() == Some("aborted")
+                && (result.extra.contains_key("structuredOutput")
+                    || result.extra.contains_key("attachments"))))
     {
         return Err("host error metadata cannot be suppressed".into());
     }
     Ok(())
+}
+
+struct AbortMemo(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl crate::extension::Memo for AbortMemo {
+    async fn get(&self, _: &str) -> Result<Option<serde_json::Value>, String> {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        Err("memo unavailable during abort cleanup".into())
+    }
+    async fn get_or_insert(
+        &self,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        Err("memo unavailable during abort cleanup".into())
+    }
 }
 
 struct Executor {
@@ -772,6 +810,109 @@ impl Executor {
 impl Handler for Executor {
     fn run(&self, _: &Task) -> Result<Step, String> {
         Err("driver reservation required".into())
+    }
+    fn run_abort_with_admission(
+        &self,
+        task: &Task,
+        admission: &AdmissionHandle<'_>,
+    ) -> Result<Step, String> {
+        if !self.block_results
+            || !self
+                .identity
+                .matches(self.tool.as_ref(), &self.implementation, self.version)
+        {
+            return Err("abort hook identity changed".into());
+        }
+        if let Some(value) = admission.abort_hook_receipt(self, None)? {
+            super::validate_aborted_after_result(&value)?;
+            return Ok(Step::Succeed(serde_json::Value::Null));
+        }
+        let args = match task.checkpoint().phase.as_str() {
+            "initial" => task.input().clone(),
+            "replay-safe-async-prepared" | "replay-safe-async-after" => {
+                serde_json::from_value::<HookCheckpoint>(task.checkpoint().data.clone())
+                    .map_err(|_| "invalid hook checkpoint")?
+                    .arguments
+            }
+            "replay-safe-async-wait" => {
+                serde_json::from_value::<ParkCheckpoint>(task.checkpoint().data.clone())
+                    .map_err(|_| "invalid park checkpoint")?
+                    .arguments
+            }
+            _ => return Err("unsupported abort checkpoint".into()),
+        };
+        self.bounded_hook_arguments(&args)?;
+        let gate = crate::runtime::ToolDiagnostic {
+            severity: crate::runtime::DiagnosticSeverity::Error,
+            code: Some("aborted".into()),
+            message: "Tool was aborted".into(),
+        };
+        let initial = crate::extension::ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text","text":"Tool was aborted"})],
+            diagnostics: vec![gate.clone()],
+            extra: [("isError".into(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        };
+        let memo = AbortMemo(std::sync::atomic::AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let result = rt.block_on(async {
+            let call = crate::extension::ToolCall {
+                name: self.identity.spec.name.clone(),
+                arguments: args,
+            };
+            let snapshot = serde_json::Value::Null;
+            let ctx = crate::extension::Context {
+                snapshot: &snapshot,
+                memo: &memo,
+            };
+            let (value, reports) = self
+                .hook_registry()?
+                .after_tool_blocks(
+                    &call,
+                    initial,
+                    matches!(task.owner(), crate::task::TaskOwner::Task(_)),
+                    &ctx,
+                )
+                .await?;
+            if !reports.is_empty() {
+                return Err("abort hook failed".to_string());
+            }
+            Ok(value)
+        })?;
+        if memo.0.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("abort hook used unavailable memo".into());
+        }
+        validate_content_hook_result(&result, Some(&gate), false)?;
+        let value = serde_json::to_value(DurableTaskResult::Rich {
+            task_content_v1: result,
+        })
+        .map_err(|e| e.to_string())?;
+        super::validate_aborted_after_result(&value)?;
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os("PI_TEST_ABORT_STALE_LEASE") {
+            if !admission.test_abort_stale_lease(self, &value) {
+                return Err("stale lease accepted".into());
+            }
+            std::fs::write(std::path::PathBuf::from(dir).join("stale-rejected"), b"yes")
+                .map_err(|e| e.to_string())?;
+        }
+        admission.abort_hook_receipt(self, Some(&value))?;
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os("PI_TEST_ABORT_AFTER_RECEIPT") {
+            std::fs::write(
+                std::path::PathBuf::from(dir).join("abort-receipt"),
+                b"ready",
+            )
+            .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        Ok(Step::Succeed(serde_json::Value::Null))
     }
     fn run_with_admission_and_cancellation(
         &self,

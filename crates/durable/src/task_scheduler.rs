@@ -57,6 +57,14 @@ pub trait Handler: Send + Sync {
     ) -> Result<Step, String> {
         self.run_with_documents(task, documents)
     }
+    /// Abort-only reservation. The default never grants ordinary admission or memo access.
+    fn run_abort_with_admission(
+        &self,
+        task: &Task,
+        _admission: &AdmissionHandle<'_>,
+    ) -> Result<Step, String> {
+        self.run(task)
+    }
     /// The default preserves existing handlers. A cancellation-aware adapter
     /// must join its own executor before returning.
     fn run_with_cancellation(
@@ -136,6 +144,71 @@ pub struct WakeSnapshot {
     pub at: Option<i64>,
     /// Live tasks whose definitions cannot currently execute.
     pub blocked: Vec<BlockedTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AbortHookIntent {
+    version: u32,
+    task: Uuid,
+    kind: String,
+    definition_version: u32,
+    attempt: Uuid,
+    lease: Uuid,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AbortHookReceipt {
+    intent: AbortHookIntent,
+    pub(crate) result: Value,
+}
+fn abort_receipt_key(id: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{id}/abort-after").into_bytes()
+}
+fn abort_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{id}/abort-intent/{attempt}").into_bytes()
+}
+pub(crate) fn abort_receipt_evidence(
+    store: &durable_store::Store,
+    task: &Task,
+    entry: &durable_store::Entry,
+) -> Result<(Value, Vec<durable_store::Check>), String> {
+    let receipt: AbortHookReceipt =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    let intent = &receipt.intent;
+    if intent.version != 1
+        || intent.task != task.id()
+        || Some(intent.kind.as_str()) != task.kind()
+        || intent.definition_version != task.definition_version()
+        || intent.attempt.is_nil()
+        || intent.lease.is_nil()
+    {
+        return Err("abort receipt identity mismatch".into());
+    }
+    crate::async_task_tool::validate_aborted_after_result(&receipt.result)?;
+    let intent_key = abort_intent_key(task.id(), intent.attempt);
+    let stored = store
+        .get(&intent_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing abort intent")?;
+    let persisted: AbortHookIntent =
+        serde_json::from_slice(&stored.value).map_err(|e| e.to_string())?;
+    if persisted != *intent {
+        return Err("abort intent mismatch".into());
+    }
+    Ok((
+        receipt.result,
+        vec![
+            durable_store::Check {
+                key: abort_receipt_key(task.id()),
+                expected: durable_store::Expected::Version(entry.version),
+            },
+            durable_store::Check {
+                key: intent_key,
+                expected: durable_store::Expected::Version(stored.version),
+            },
+        ],
+    ))
 }
 
 #[derive(Clone)]
@@ -612,6 +685,7 @@ pub struct DetachedInvocation {
     receipt_capture: Option<Arc<ReceiptCapture>>,
     unhooked_cancellation: Option<pi_rs_core::CancellationToken>,
     sealed_registration: bool,
+    abort_definition: Option<Arc<()>>,
 }
 
 #[derive(Clone)]
@@ -629,6 +703,7 @@ pub struct CompletedInvocation {
     result: InvocationResult,
     lease: InvocationLease,
     receipt_capture: bool,
+    abort_definition: Option<Arc<()>>,
     // Pin the exact host registration until receipt persistence or abandonment.
     _identity_lease: Option<crate::nested_identity::IdentityLease>,
 }
@@ -1414,6 +1489,175 @@ impl AdmissionHandle<'_> {
             .commit(&checks, &mutations)
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+    /// Abort cleanup has its own reservation and never grants ordinary task memo.
+    /// A result is stored once only while the exact attempt and definition are live.
+    pub(crate) fn abort_hook_receipt(
+        &self,
+        handler: &dyn Handler,
+        result: Option<&Value>,
+    ) -> Result<Option<Value>, String> {
+        if !self.abort || !self.standalone || self.lease.retired {
+            return Err("invalid cleanup lease".into());
+        }
+        let attempt = self
+            .running
+            .task
+            .attempt_id()
+            .ok_or("missing cleanup attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.running.task.id())
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cleanup lease or live owned child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing cleanup definition")?;
+        let registration = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing cleanup definition")?;
+        if registration.version != current.task.definition_version()
+            || !registration.replay_safe
+            || !std::ptr::eq(registration.handler.as_ref(), handler)
+            || registration
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &registration.handler))
+        {
+            return Err("cleanup definition changed".into());
+        }
+        let key = abort_receipt_key(current.task.id());
+        if let Some(existing) = owner.store().get(&key).map_err(|e| e.to_string())? {
+            return abort_receipt_evidence(owner.store(), &current.task, &existing)
+                .map(|(value, _)| Some(value));
+        }
+        let intent = AbortHookIntent {
+            version: 1,
+            task: current.task.id(),
+            kind: kind.to_owned(),
+            definition_version: current.task.definition_version(),
+            attempt,
+            lease: self.lease.token,
+        };
+        let intent_key = abort_intent_key(current.task.id(), attempt);
+        let task_check = durable_store::Check {
+            key: task_store::key(current.task.id()),
+            expected: durable_store::Expected::Version(current.version),
+        };
+        let missing_receipt = durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        };
+        if let Some(result) = result {
+            crate::async_task_tool::validate_aborted_after_result(result)?;
+            let entry = owner
+                .store()
+                .get(&intent_key)
+                .map_err(|e| e.to_string())?
+                .ok_or("missing cleanup intent")?;
+            let stored: AbortHookIntent =
+                serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if stored != intent {
+                return Err("stale cleanup intent".into());
+            }
+            let bytes = serde_json::to_vec(&AbortHookReceipt {
+                intent,
+                result: result.clone(),
+            })
+            .map_err(|e| e.to_string())?;
+            owner
+                .store()
+                .commit(
+                    &[
+                        task_check,
+                        missing_receipt,
+                        durable_store::Check {
+                            key: intent_key,
+                            expected: durable_store::Expected::Version(entry.version),
+                        },
+                    ],
+                    &[durable_store::Mutation::Put { key, value: bytes }],
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(Some(result.clone()));
+        }
+        owner
+            .store()
+            .commit(
+                &[
+                    task_check,
+                    missing_receipt,
+                    durable_store::Check {
+                        key: intent_key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    },
+                ],
+                &[durable_store::Mutation::Put {
+                    key: intent_key,
+                    value: serde_json::to_vec(&intent).map_err(|e| e.to_string())?,
+                }],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(None)
+    }
+    #[cfg(test)]
+    pub(crate) fn test_abort_stale_lease(&self, handler: &dyn Handler, result: &Value) -> bool {
+        let original = {
+            let mut state = self.lease.state.lock().unwrap();
+            state
+                .leases
+                .insert(
+                    self.lease.id,
+                    (Uuid::new_v4(), self.running.task.attempt_id()),
+                )
+                .unwrap()
+        };
+        let denied = self
+            .abort_hook_receipt(handler, Some(result))
+            .is_err_and(|error| error.contains("stale cleanup lease"));
+        let key = format!(
+            "durable/replay-safe-async/{}/abort-after",
+            self.running.task.id()
+        );
+        let missing = self
+            .lease
+            .attachment
+            .owner
+            .store()
+            .get(key.as_bytes())
+            .unwrap()
+            .is_none();
+        self.lease
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .insert(self.lease.id, original);
+        denied && missing
     }
     pub(crate) fn checkpointable_durable_intent(
         &self,
@@ -2371,12 +2615,21 @@ impl DetachedInvocation {
             receipt_capture,
             unhooked_cancellation,
             sealed_registration: _,
+            abort_definition,
         } = self;
         let capture_enabled =
             receipt_capture.is_some() && intent.is_some() && (!after_enabled || after_success);
         let result = if abort {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handler.run(&running.task)
+                let admission = AdmissionHandle {
+                    running: &running,
+                    lease: &lease,
+                    abort: true,
+                    definitions: &definitions,
+                    activity: &activity,
+                    standalone: validator.is_none(),
+                };
+                handler.run_abort_with_admission(&running.task, &admission)
             }));
             let outcome = match result {
                 Ok(Ok(Step::Succeed(_))) => None,
@@ -2511,6 +2764,7 @@ impl DetachedInvocation {
             result,
             lease,
             receipt_capture: capture_enabled,
+            abort_definition,
             _identity_lease: identity_lease,
         })
     }
@@ -2830,6 +3084,12 @@ impl Scheduler {
     ) -> Result<DetachedInvocation, Error> {
         let id = running.task.id();
         let registration = self.registered(&running.task)?;
+        let abort_definition = (abort
+            && registration
+                .abort
+                .as_ref()
+                .is_some_and(|handler| Arc::ptr_eq(handler, &registration.handler)))
+        .then(|| registration.identity.clone());
         let cancellable_durable_async = registration.cancellable_durable_async;
         let registered_capture = registration.receipt_capture.clone();
         let sealed_registration = registered_capture.is_some();
@@ -2849,6 +3109,7 @@ impl Scheduler {
             handler,
             abort,
             sealed_registration,
+            abort_definition,
             validator: self.validator.as_ref().map(|harness| harness.worker()),
             definitions: self.wake_reader.definitions.clone(),
             activity: self.activity.clone(),
@@ -3024,6 +3285,7 @@ impl Scheduler {
             result,
             mut lease,
             receipt_capture,
+            abort_definition,
             _identity_lease: _,
         } = completed;
         let mut reported_handler_failure = false;
@@ -3046,6 +3308,34 @@ impl Scheduler {
                     return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
                 }
                 match outcome {
+                    None if abort_definition.is_some() => {
+                        let reg = self.registered(&running.task)?;
+                        if !Arc::ptr_eq(abort_definition.as_ref().unwrap(), &reg.identity)
+                            || reg
+                                .abort
+                                .as_ref()
+                                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+                        {
+                            return Err(Error::Registration);
+                        }
+                        let entry = self
+                            .ts()
+                            .store()
+                            .get(&abort_receipt_key(running.task.id()))
+                            .map_err(task_store::Error::from)?
+                            .ok_or(Error::Ownership)?;
+                        let (_, checks) =
+                            abort_receipt_evidence(self.ts().store(), &running.task, &entry)
+                                .map_err(Error::Handler)?;
+                        let mut next = running.clone();
+                        next.task.cancel().map_err(Error::Transition)?;
+                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        batch.checks.extend(checks);
+                        self.ts()
+                            .store()
+                            .commit(&batch.checks, &batch.mutations)
+                            .map_err(task_store::Error::from)?;
+                    }
                     None => self.ts().update(&running, |task| task.cancel())?,
                     Some(reason) => self.ts().update(&running, |task| task.fail(reason))?,
                 }
@@ -3073,6 +3363,7 @@ impl Scheduler {
                             result,
                             lease,
                             receipt_capture,
+                            abort_definition,
                             _identity_lease: None,
                         })),
                     });
@@ -3102,6 +3393,7 @@ impl Scheduler {
                             result: InvocationResult::Handler(result, Box::new(documents)),
                             lease,
                             receipt_capture,
+                            abort_definition,
                             _identity_lease: None,
                         }),
                     }
@@ -3159,6 +3451,7 @@ impl Scheduler {
                     result: result_backup,
                     lease,
                     receipt_capture,
+                    abort_definition,
                     _identity_lease: None,
                 })),
             });
@@ -4317,12 +4610,13 @@ impl Scheduler {
         version: u32,
         replay_safe: bool,
         handler: Arc<dyn Handler>,
+        abort_hook: bool,
     ) -> Result<(), String> {
         if self.validator.is_some() {
             return Err("standalone scheduler required".into());
         }
         let mut registry = self.registry.clone();
-        if !registry.register_shared_versioned(kind.clone(), version, replay_safe, handler) {
+        if !registry.register_shared_versioned(kind.clone(), version, replay_safe, handler.clone()) {
             return Err("task kind already registered or invalid".into());
         }
         registry
@@ -4330,7 +4624,9 @@ impl Scheduler {
             .get_mut(&kind)
             .expect("registered")
             .cancellable_durable_async = true;
-        if !registry.set_abort(&kind, |_: &Task| Ok(Step::Succeed(Value::Null))) {
+        if abort_hook {
+            registry.entries.get_mut(&kind).expect("registered").abort = Some(handler);
+        } else if !registry.set_abort(&kind, |_: &Task| Ok(Step::Succeed(Value::Null))) {
             return Err("failed to install abort handler".into());
         }
         self.replace_registry(registry).map_err(|e| e.to_string())
@@ -5505,8 +5801,48 @@ impl Scheduler {
             if snapshot.task.restarts() > 0
                 && snapshot.task.restarts() >= snapshot.task.restart_limit()
             {
-                self.ts()
-                    .update(snapshot, |task| task.fail_abort_restart())?;
+                let key = abort_receipt_key(snapshot.task.id());
+                let receipt = self
+                    .ts()
+                    .store()
+                    .get(&key)
+                    .map_err(task_store::Error::from)?;
+                let valid_registration = self.registered(&snapshot.task).ok().is_some_and(|reg| {
+                    reg.replay_safe
+                        && reg
+                            .abort
+                            .as_ref()
+                            .is_some_and(|abort| Arc::ptr_eq(abort, &reg.handler))
+                });
+                let evidence = if valid_registration {
+                    receipt.as_ref().and_then(|entry| {
+                        abort_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
+                    })
+                } else {
+                    None
+                };
+                if let Some((_, checks)) = evidence {
+                    let mut next = snapshot.clone();
+                    next.task.cancel().map_err(Error::Transition)?;
+                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                    batch.checks.extend(checks);
+                    #[cfg(test)]
+                    if let Some(hook) = &self.reservation_commit_hook {
+                        hook(0, self.ts().store());
+                    }
+                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                        Ok(()) => (),
+                        Err(durable_store::Error::Conflict { .. }) => {
+                            self.poisoned
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            return Ok(TickReservation::Progress(true));
+                        }
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
+                } else {
+                    self.ts()
+                        .update(snapshot, |task| task.fail_abort_restart())?;
+                }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
                 return Ok(TickReservation::Progress(true));

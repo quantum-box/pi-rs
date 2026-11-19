@@ -698,9 +698,26 @@ projection available to a later block hook, including when it exceeds the final
 size limit.
 This per-extension ordering adapts pi's single afterTool chain to two pi-rs
 hook APIs. The definition identity is versioned for this behavior; older
-in-flight registrations must be recovered with their matching implementation. Dynamic conversation
-selection, hook parking, and after hooks for host interrupted, unavailable,
-restart-limit and aborted results remain unsupported.
+in-flight registrations must be recovered with their matching implementation.
+
+`register_replay_safe_durable_tool_with_abort_after` separately opts into an
+aborted-result hook, with a distinct definition identity and explicit
+`AbortAfterAuthorization`: the host attests that hooks finish cooperatively,
+are replay-safe, and start no detached work. The scheduler drains owned children
+before reserving this cleanup attempt. It binds an intent and receipt to the
+exact task, definition, attempt, and lease; the receipt and task transition are
+checked together. The mandatory `aborted` error diagnostic and `isError` cannot
+be suppressed, and abort hooks cannot attach structured output or attachments.
+Normal task memo is unavailable during cleanup: any read or write, even if its
+error is ignored, rejects the hook result. `read_aborted_after_result` reads the
+validated receipt only after cancellation; parent `child_result` continues to
+report `Cancelled`. A crash before receipt may rerun the hook within the task's
+restart limit; a committed receipt is reused without rerunning it, including at
+the limit. Hook failures fail the cleanup; a non-cooperative hook can still
+block shutdown, so the host's completion attestation is required. The normal
+content registration keeps its existing abort behavior. Dynamic conversation
+selection, hook parking, and after hooks for host interrupted, unavailable and
+restart-limit results remain unsupported.
 
 An attempt may stage keyed direct children and return `Park` with an `All` or
 `Any` wait. Child admissions, checkpoint, wait and the attempt result commit
