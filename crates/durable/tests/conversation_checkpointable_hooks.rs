@@ -25,6 +25,26 @@ use std::{
     time::Duration,
 };
 struct ModelStub;
+struct InvalidModel(&'static str);
+#[async_trait]
+impl Model for InvalidModel {
+    async fn stream(&self, r: ModelRequest) -> Result<ModelStream, Error> {
+        let done = r.messages.iter().any(|m| matches!(m, Message::Tool { .. }));
+        Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+            calls: if done {
+                vec![]
+            } else {
+                vec![ToolCall {
+                    id: "call".into(),
+                    name: "root".into(),
+                    arguments: self.0.into(),
+                }]
+            },
+            usage: None,
+        })])
+        .boxed())
+    }
+}
 #[async_trait]
 impl Model for ModelStub {
     async fn stream(&self, r: ModelRequest) -> Result<ModelStream, Error> {
@@ -279,6 +299,156 @@ async fn until_result(scheduler: &Scheduler, id: uuid::Uuid) {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn invalid_raw_runs_only_after_hook_and_survives_reopen() {
+    for raw in ["{invalid", "[1,2]"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (mut options, registry, extensions) =
+            setup(1, before.clone(), after.clone(), executions.clone(), "v1");
+        options.model = Arc::new(InvalidModel(raw));
+        let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler
+            .select_extensions(id, vec!["policy".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        let task = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let store = durable_store::Store::open(&path).unwrap();
+                if let Some(task) = pi_rs_durable::task_store::TaskStore::new(&store)
+                    .list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|task| task.task.is_terminal())
+                {
+                    break task.task;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(before.load(Ordering::SeqCst), 0);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(task.checkpoint().phase, "replay-safe-async-after");
+        let pi_rs_durable::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("expected after result: {:?}", task.state());
+        };
+        assert_eq!(value["task_content_v1"]["isError"], true);
+        assert!(
+            value["task_content_v1"]["output"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("-after")
+        );
+        let store = durable_store::Store::open(&path).unwrap();
+        let memo_key = format!("runtime/extension-memo/{}/after", task.id());
+        assert!(store.get(memo_key.as_bytes()).unwrap().is_some());
+        drop(store);
+        let _ = driver.shutdown_with_pending();
+        let _ = scheduler.shutdown().await;
+
+        let (mut options, registry, extensions) =
+            setup(1, before.clone(), after.clone(), executions.clone(), "v1");
+        options.model = Arc::new(InvalidModel(raw));
+        let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let recovered = pi_rs_durable::task_store::TaskStore::new(&store)
+            .load(task.id())
+            .unwrap()
+            .unwrap()
+            .task;
+        assert_eq!(recovered.state(), task.state());
+        assert!(store.get(memo_key.as_bytes()).unwrap().is_some());
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending();
+        let _ = scheduler.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn invalid_raw_selection_change_fences_after_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let gate = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (mut options, registry, extensions) = setup_gated(
+        1,
+        before.clone(),
+        after.clone(),
+        executions.clone(),
+        "v1",
+        Some(("after", gate.clone())),
+    );
+    options.model = Arc::new(InvalidModel("[1,2]"));
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while gate.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    scheduler.uninstall_extension("policy").unwrap();
+    gate.store(2, Ordering::SeqCst);
+    let task = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let store = durable_store::Store::open(&path).unwrap();
+            if let Some(task) = pi_rs_durable::task_store::TaskStore::new(&store)
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|t| t.task.is_terminal())
+            {
+                break task.task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!matches!(
+        task.state(),
+        pi_rs_durable::task::TaskState::Succeeded(_)
+    ));
+    let store = durable_store::Store::open(&path).unwrap();
+    let late = format!("runtime/extension-memo/{}/late", task.id());
+    assert!(store.get(late.as_bytes()).unwrap().is_none());
+    assert_eq!(before.load(Ordering::SeqCst), 0);
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let _ = driver.shutdown_with_pending();
+    let _ = scheduler.shutdown().await;
+}
 #[tokio::test]
 async fn selected_hook_runs_once_per_phase_and_publishes_result() {
     let dir = tempfile::tempdir().unwrap();
@@ -343,13 +513,16 @@ async fn selected_hook_kill_worker() {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
-    let (options, registry, extensions) = setup(
+    let (mut options, registry, extensions) = setup(
         1,
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
         "v1",
     );
+    if std::env::var_os("PI_SELECTED_HOOK_INVALID_RAW").is_some() {
+        options.model = Arc::new(InvalidModel("{invalid"));
+    }
     let mut scheduler =
         Scheduler::open_with_extensions(dir.join("db"), options, extensions).unwrap();
     let _driver = scheduler.start_tasks(registry).unwrap();
@@ -366,6 +539,80 @@ async fn selected_hook_kill_worker() {
     std::fs::write(dir.join("conversation"), id.to_string()).unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
     std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_raw_after_recovers_after_process_kill() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "selected_hook_kill_worker"])
+            .env("PI_SELECTED_HOOK_DIR", dir.path())
+            .env("PI_SELECTED_HOOK_INVALID_RAW", "1")
+            .env("PI_SELECTED_HOOK_CUT", "after")
+            .env("PI_SELECTED_HOOK_READY", dir.path().join("ready"))
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let path = dir.path().join("db");
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0].task;
+    assert_eq!(task.checkpoint().phase, "replay-safe-async-after");
+    let memo_key = format!("runtime/extension-memo/{}/after", task.id());
+    let memo = store.get(memo_key.as_bytes()).unwrap().unwrap().value;
+    let task_id = task.id();
+    drop(store);
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (mut options, registry, extensions) =
+        setup(1, before.clone(), after.clone(), executions.clone(), "v1");
+    options.model = Arc::new(InvalidModel("{invalid"));
+    let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let store = durable_store::Store::open(&path).unwrap();
+            let task = pi_rs_durable::task_store::TaskStore::new(&store)
+                .load(task_id)
+                .unwrap()
+                .unwrap()
+                .task;
+            if matches!(task.state(), pi_rs_durable::task::TaskState::Succeeded(_)) {
+                assert_eq!(store.get(memo_key.as_bytes()).unwrap().unwrap().value, memo);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(before.load(Ordering::SeqCst), 0);
+    assert_eq!(after.load(Ordering::SeqCst), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let _ = driver.shutdown_with_pending();
+    let _ = scheduler.shutdown().await;
 }
 #[cfg(unix)]
 #[tokio::test]

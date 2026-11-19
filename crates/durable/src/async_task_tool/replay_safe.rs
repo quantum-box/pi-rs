@@ -501,6 +501,21 @@ struct HookCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_error: Option<String>,
 }
+pub(crate) fn invalid_raw_checkpoint() -> Result<Checkpoint, String> {
+    let data = serde_json::to_value(HookCheckpoint {
+        version: 1,
+        arguments: serde_json::json!({}),
+        outcome: Some(Outcome::Failed(
+            "Invalid tool arguments: invalid checkpointable arguments".into(),
+        )),
+        host_error: Some("invalid_arguments".into()),
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(Checkpoint {
+        phase: "replay-safe-async-after".into(),
+        data,
+    })
+}
 pub(super) fn after_checkpoint_evidence(
     data: &serde_json::Value,
 ) -> Result<super::ReplaySafeAfterEvidence, String> {

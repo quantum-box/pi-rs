@@ -17392,12 +17392,7 @@ impl Harness {
                                     && serde_json::to_vec(arguments)
                                         .is_ok_and(|bytes| bytes.len() <= 16 * 1024 * 1024)
                             });
-                        let Some(arguments) = arguments else {
-                            if adapter.conversation_selection().is_some() {
-                                return Err(Error::Invalid(
-                                    "checkpointable after hooks are not supported".into(),
-                                ));
-                            }
+                        if arguments.is_none() && adapter.conversation_selection().is_none() {
                             let operation_id = Uuid::new_v4();
                             let outcome =
                                 Outcome::Failed("invalid checkpointable arguments".into());
@@ -17421,14 +17416,24 @@ impl Harness {
                             };
                             self.save(&c, Expected::Version(version))?;
                             continue;
-                        };
+                        }
+                        let invalid_raw = arguments.is_none();
+                        let arguments = arguments.unwrap_or_else(|| serde_json::json!({}));
                         let operation_id = Uuid::new_v4();
                         let task = adapter
-                            .task(
+                            .task_with_checkpoint(
                                 c.id,
                                 operation_id,
                                 arguments.clone(),
                                 self.options.restart_limit,
+                                if invalid_raw {
+                                    Some(
+                                        crate::async_task_tool::invalid_raw_checkpoint()
+                                            .map_err(Error::Invalid)?,
+                                    )
+                                } else {
+                                    None
+                                },
                             )
                             .map_err(Error::Invalid)?;
                         let tool_attempt = ToolAttempt {

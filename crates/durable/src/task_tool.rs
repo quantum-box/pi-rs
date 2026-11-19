@@ -304,13 +304,23 @@ impl TaskTool {
         input: Value,
         limit: u32,
     ) -> Result<crate::task::Task, String> {
+        self.task_with_checkpoint(conversation, operation, input, limit, None)
+    }
+    pub(crate) fn task_with_checkpoint(
+        &self,
+        conversation: uuid::Uuid,
+        operation: uuid::Uuid,
+        input: Value,
+        limit: u32,
+        checkpoint: Option<crate::task::Checkpoint>,
+    ) -> Result<crate::task::Task, String> {
         crate::task::Task::new(
             operation,
             crate::task::TaskOwner::Conversation(conversation),
-            crate::task::Checkpoint {
+            checkpoint.unwrap_or_else(|| crate::task::Checkpoint {
                 phase: "initial".into(),
                 data: input.clone(),
-            },
+            }),
             limit,
         )
         .and_then(|task| {
