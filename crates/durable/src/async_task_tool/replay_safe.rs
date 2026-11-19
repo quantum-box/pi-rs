@@ -1711,6 +1711,37 @@ impl Handler for Executor {
                     expected,
                     cancel.conversation_cancel_policy(),
                 );
+                if crate::task_scheduler::take_test_conversation_finish(task.id()) {
+                    let marker = result?;
+                    let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                        version: 1,
+                        claim: _claim.clone(),
+                        result: "test evidence only".into(),
+                    };
+                    // A substituted marker must not write a receipt or remove either marker.
+                    if admission
+                        .store_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            b"substituted",
+                        )
+                        .is_ok()
+                    {
+                        return Err("substituted marker accepted".into());
+                    }
+                    let finish = admission.store_conversation_cancel_receipt_and_retire(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    );
+                    crate::task_scheduler::report_conversation_start_result(task.id());
+                    finish?;
+                    return Err("test receipt evidence only; callback remains disabled".into());
+                }
                 crate::task_scheduler::report_conversation_start_result(task.id());
                 result?;
                 if admission

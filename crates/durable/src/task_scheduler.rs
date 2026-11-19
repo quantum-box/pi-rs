@@ -1679,6 +1679,20 @@ pub(crate) fn take_test_conversation_start(id: Uuid) -> bool {
 }
 
 #[cfg(test)]
+fn test_finish_tasks() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn enable_test_conversation_finish(id: Uuid) {
+    test_finish_tasks().lock().unwrap().insert(id);
+}
+#[cfg(test)]
+pub(crate) fn take_test_conversation_finish(id: Uuid) -> bool {
+    test_finish_tasks().lock().unwrap().remove(&id)
+}
+
+#[cfg(test)]
 fn conversation_claim_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
     HOOKS.get_or_init(Default::default)
@@ -3088,6 +3102,43 @@ impl AdmissionHandle<'_> {
         identity_lease: &crate::nested_identity::IdentityLease,
         expected_identity: &str,
     ) -> Result<(), String> {
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            None,
+        )
+    }
+
+    /// Save the successful callback receipt and retire both exact start markers
+    /// in the same transaction; failed validation leaves every record intact.
+    #[allow(dead_code)]
+    pub(crate) fn store_conversation_cancel_receipt_and_retire(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+    ) -> Result<(), String> {
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            Some(marker),
+        )
+    }
+
+    fn store_conversation_cancel_receipt_inner(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: Option<&[u8]>,
+    ) -> Result<(), String> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
         }
@@ -3186,7 +3237,7 @@ impl AdmissionHandle<'_> {
             key: key.clone(),
             expected,
         });
-        let mutations = if existing.is_none() {
+        let mut mutations = if existing.is_none() {
             vec![durable_store::Mutation::Put {
                 key,
                 value: serde_json::to_vec(receipt).map_err(|e| e.to_string())?,
@@ -3194,6 +3245,40 @@ impl AdmissionHandle<'_> {
         } else {
             vec![]
         };
+        if let Some(marker) = marker {
+            let TaskOwner::Conversation(conversation) = current.task.owner() else {
+                return Err("receipt root owner changed".into());
+            };
+            let expected_marker = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "claim_id": claim.claim_id,
+                "task": claim.task,
+                "attempt": claim.attempt,
+                "lease": claim.lease,
+                "policy": claim.policy,
+            }))
+            .map_err(|e| e.to_string())?;
+            if marker != expected_marker {
+                return Err("receipt marker claim mismatch".into());
+            }
+            let conversation_finish =
+                crate::conversation_signal::prepare_callback_finish_signal_fence(
+                    owner.store(),
+                    *conversation,
+                    marker,
+                )
+                .map_err(|e| e.to_string())?;
+            let task_finish = task_store::prepare_callback_finish_task_fence(
+                owner.store(),
+                current.task.id(),
+                marker,
+            )
+            .map_err(|e| e.to_string())?;
+            checks.extend(conversation_finish.checks);
+            checks.extend(task_finish.checks);
+            mutations.extend(conversation_finish.mutations);
+            mutations.extend(task_finish.mutations);
+        }
         owner
             .store()
             .commit_with_prefix_put_fence(

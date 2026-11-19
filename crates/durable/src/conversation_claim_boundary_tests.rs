@@ -235,6 +235,9 @@ async fn exercise_conversation_park_claim(case: &str) {
             })
             .unwrap();
         crate::task_scheduler::enable_test_conversation_start(root_id);
+        if case == "start_retire" {
+            crate::task_scheduler::enable_test_conversation_finish(root_id);
+        }
         if case == "start_legacy" {
             let after_path = path.clone();
             let legacy_reached = hook_reached.clone();
@@ -291,7 +294,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             let writer = durable_store::Store::open(&writer_path).unwrap();
             match case_name.as_str() {
                 "start_signal_after_claim" | "start_task_signal_after_claim" => (),
-                "start_ok" => {
+                "start_ok" | "start_retire" => {
                     use futures_util::FutureExt;
                     let result = identity
                         .update(Some("changed".into()), || {})
@@ -489,6 +492,11 @@ async fn exercise_conversation_park_claim(case: &str) {
                     .is_none()
             );
             assert!(store.get(task_marker_key.as_bytes()).unwrap().is_none());
+        }
+        if case == "start_retire" {
+            let key =
+                format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+            assert!(store.get(key.as_bytes()).unwrap().is_some());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let _ = driver.shutdown_with_pending().unwrap();
@@ -1041,6 +1049,7 @@ async fn conversation_start_markers_survive_process_kill() {
 async fn conversation_start_marker_transaction_fences_real_driver_races() {
     for case in [
         "start_ok",
+        "start_retire",
         "start_owner",
         "start_abort",
         "start_signal",
