@@ -49,6 +49,11 @@ match. Recovery remains limited to a failed, abort-marked unhooked root while
 the conversation retains its pending binding. It does not authorize callback
 dispatch or establish that a callback ran.
 
+The scheduled worker's Idle-to-ModelReady input placement now takes the
+callback-start gate without blocking. If it is busy, the uncommitted placement
+is discarded and the worker retries from durable state. Other save and direct
+Harness paths do not yet take this gate, so it does not authorize dispatch.
+
 A safe implementation needs all of the following before dispatch is enabled:
 
 * Bind the callback identity, retry policy, Tool identity and selected hook
