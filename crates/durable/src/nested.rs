@@ -1409,10 +1409,8 @@ impl NestedHost {
                 if all.contains(&leaf.operation_id) {
                     return Err("duplicate nested park descendant".into());
                 }
-                if !pending.contains(&leaf.operation_id) {
-                    if !resolved_terminal(&leaf) {
-                        return Err("nested park descendant is not terminal".into());
-                    }
+                if !pending.contains(&leaf.operation_id) && !resolved_terminal(&leaf) {
+                    return Err("nested park descendant is not terminal".into());
                 }
                 all.push(leaf.operation_id);
             }
