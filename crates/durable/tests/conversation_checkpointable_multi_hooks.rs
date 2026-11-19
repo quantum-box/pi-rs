@@ -471,6 +471,12 @@ impl Hook for SleepHook {
         call: &pi_rs_durable::extension::ToolCall,
         ctx: &Context<'_>,
     ) -> Result<BeforeTool, String> {
+        if self.id == "b1"
+            && let Some(path) = std::env::var_os("PI_REVIEW_KILL_BEFORE_SLEEP")
+        {
+            std::fs::write(path, b"running").unwrap();
+            std::future::pending::<()>().await;
+        }
         self.events
             .lock()
             .unwrap()
@@ -550,7 +556,7 @@ async fn invalid_sleep_runs_after_without_tool_dispatch() {
         loop {
             let c = scheduler.conversation(id).unwrap();
             if let Some(index) = c.messages.iter().position(
-                |m| matches!(m, Message::Tool { content, .. } if content.starts_with("redacted/b2/a") && !content.contains("cannot wait")),
+                |m| matches!(m, Message::Tool { content, .. } if content == "redacted/b2/a\n[tool error]"),
             ) && c.messages[index + 1..]
                 .iter()
                 .any(|m| matches!(m, Message::Assistant { .. }))
@@ -1596,6 +1602,239 @@ async fn task_registry_publication_wakes_sleeping_hook() {
         .unwrap();
     wait_result(&scheduler, id).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_sleep_clears_interrupted_attempt_count() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let deadline = now_ms() + 30_000;
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sleep_worker"])
+            .env("PI_MULTI_SLEEP_DIR", root)
+            .env("PI_MULTI_SLEEP_DEADLINE", deadline.to_string())
+            .env("PI_REVIEW_KILL_BEFORE_SLEEP", root.join("running"))
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !root.join("running").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let (options, registry, extensions) = setup_sleep(
+        deadline,
+        Arc::new(Mutex::new(vec![])),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let scheduler = Scheduler::open_with_extensions(root.join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let task = wait_sleep(&root.join("db")).await;
+    assert_eq!(
+        task.restarts(),
+        0,
+        "committed sleep must reset interrupted attempt count"
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review_sleep_resume_worker() {
+    let Some(root) = std::env::var_os("PI_REVIEW_SLEEP_RESUME") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let deadline = std::env::var("PI_MULTI_SLEEP_DEADLINE")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (options, registry, extensions) = setup_sleep(
+        deadline,
+        Arc::new(Mutex::new(vec![])),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let scheduler = Scheduler::open_with_extensions(root.join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    std::hint::black_box((&scheduler, &driver));
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prior_interruptions_do_not_exhaust_budget_after_committed_sleep() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let deadline = now_ms() + 12_000;
+    for index in 0..4 {
+        let _ = std::fs::remove_file(root.join("running"));
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                if index == 0 {
+                    "sleep_worker"
+                } else {
+                    "review_sleep_resume_worker"
+                },
+            ])
+            .env("PI_MULTI_SLEEP_DIR", root)
+            .env("PI_REVIEW_SLEEP_RESUME", root)
+            .env("PI_MULTI_SLEEP_DEADLINE", deadline.to_string())
+            .env("PI_REVIEW_KILL_BEFORE_SLEEP", root.join("running"));
+        let mut process = Kill(command.spawn().unwrap());
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !root.join("running").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+    }
+    let (options, registry, extensions) = setup_sleep(
+        deadline,
+        Arc::new(Mutex::new(vec![])),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let scheduler = Scheduler::open_with_extensions(root.join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let waiting = wait_sleep(&root.join("db")).await;
+    assert_eq!(waiting.restarts(), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+    let _ = std::fs::remove_file(root.join("running"));
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "review_sleep_resume_worker"])
+            .env("PI_REVIEW_SLEEP_RESUME", root)
+            .env("PI_MULTI_SLEEP_DEADLINE", deadline.to_string())
+            .env("PI_REVIEW_KILL_BEFORE_SLEEP", root.join("running"))
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !root.join("running").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_sleep(deadline, events.clone(), calls.clone());
+    let scheduler = Scheduler::open_with_extensions(root.join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let task = wait_task(&root.join("db")).await;
+    assert!(
+        matches!(task.state(), pi_rs_durable::task::TaskState::Succeeded(_)),
+        "{:?}",
+        task.state()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "after-a")
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_sleep_wake_rejects_removed_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let events = Arc::new(Mutex::new(vec![]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let deadline = now_ms() + 1800;
+    let (options, registry, extensions) = setup_sleep(deadline, events.clone(), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    let _ = wait_sleep(&path).await;
+    scheduler.uninstall_extension("a").unwrap();
+    while now_ms() < deadline + 400 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(*events.lock().unwrap(), ["before-b1", "before-b2"]);
+    assert!(scheduler.conversation(id).unwrap().tool_results.is_empty());
+    let _ = driver.shutdown_with_pending();
+    let _ = scheduler.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_abort_sleep_result_is_not_duplicated_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let deadline = now_ms() + 60_000;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) =
+        setup_sleep(deadline, Arc::new(Mutex::new(vec![])), calls.clone());
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = start(&mut scheduler).await;
+    wait_sleep(&path).await;
+    tokio::time::timeout(Duration::from_secs(10), scheduler.abort_and_wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let before = scheduler.conversation(id).unwrap();
+    let results = before.tool_results.len();
+    let messages = before
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::Tool { .. }))
+        .count();
+    assert_eq!(results, 1);
+    assert_eq!(messages, 1);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+    let (options, registry, extensions) =
+        setup_sleep(deadline, Arc::new(Mutex::new(vec![])), calls.clone());
+    let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = scheduler.conversation(id).unwrap();
+    assert_eq!(after.tool_results.len(), results);
+    assert_eq!(
+        after
+            .messages
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { .. }))
+            .count(),
+        messages
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
 }

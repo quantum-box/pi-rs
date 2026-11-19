@@ -322,6 +322,8 @@ impl Task {
         Ok(())
     }
 
+    /// A non-abort transition from running to waiting is durable progress once
+    /// committed; retries begin a fresh budget after that commit.
     pub fn wait(&mut self, condition: WaitFor) -> Result<(), TransitionError> {
         self.require_running()?;
         if let WaitFor::Sleep {
@@ -351,6 +353,9 @@ impl Task {
         self.typed_wake = None;
         self.ended_children = None;
         self.wake_children = None;
+        if !self.abort_requested {
+            self.restarts = 0;
+        }
         self.state = TaskState::Waiting(condition);
         self.attempt_id = None;
         Ok(())
@@ -729,6 +734,7 @@ mod tests {
         let before = t.clone();
         assert_eq!(t.start(), Err(TransitionError::RestartLimit));
         assert_eq!(t, before);
+
         t.cancel().unwrap();
     }
 
@@ -767,6 +773,96 @@ mod tests {
         assert_eq!(t.wake(), Err(TransitionError::InvalidState));
         assert_eq!(t.cancel(), Err(TransitionError::InvalidState));
         assert_eq!(t, before);
+    }
+
+    #[test]
+    fn valid_wait_resets_restarts_but_rejected_wait_does_not() {
+        let waits = [
+            WaitFor::Signal("approval".into()),
+            WaitFor::Sleep {
+                until_millis: Some(1),
+                signals: vec![],
+            },
+            WaitFor::TypedSleep {
+                until_millis: Some(1),
+                signals: vec![],
+            },
+            WaitFor::Tasks(vec![Uuid::new_v4()]),
+            WaitFor::TasksAny(vec![Uuid::new_v4()]),
+            WaitFor::TasksFailFast(vec![Uuid::new_v4()]),
+        ];
+        for wait in waits {
+            let mut t = task(3);
+            t.start().unwrap();
+            t.recover().unwrap();
+            t.start().unwrap();
+            assert_eq!(t.restarts(), 1);
+            t.wait(wait).unwrap();
+            assert_eq!(t.restarts(), 0);
+            t.wake().unwrap();
+            t.start().unwrap();
+            t.recover().unwrap();
+            assert_eq!(t.restarts(), 1);
+        }
+        let mut t = task(3);
+        t.start().unwrap();
+        t.recover().unwrap();
+        t.start().unwrap();
+        let before = t.clone();
+        assert_eq!(
+            t.wait(WaitFor::Sleep {
+                until_millis: None,
+                signals: vec![]
+            }),
+            Err(TransitionError::InvalidWait)
+        );
+        assert_eq!(t, before);
+        let mut aborting = task(3);
+        aborting.start().unwrap();
+        aborting.request_abort().unwrap();
+        aborting.recover().unwrap();
+        aborting.start().unwrap();
+        aborting.wait(WaitFor::Signal("go".into())).unwrap();
+        assert_eq!(aborting.restarts(), 1, "cleanup budget must not be reset");
+    }
+
+    #[test]
+    fn wait_restart_reset_is_atomic_with_store_commit() {
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = TaskStore::new(&store);
+        let t = task(3);
+        tasks.save(&[Save::Create(&t)]).unwrap();
+        let current = tasks.load(t.id()).unwrap().unwrap();
+        tasks.update(&current, |task| task.start()).unwrap();
+        let current = tasks.load(t.id()).unwrap().unwrap();
+        tasks.update(&current, |task| task.recover()).unwrap();
+        let current = tasks.load(t.id()).unwrap().unwrap();
+        tasks.update(&current, |task| task.start()).unwrap();
+        let current = tasks.load(t.id()).unwrap().unwrap();
+        assert_eq!(current.task.restarts(), 1);
+        let mut next = current.clone();
+        next.task.wait(WaitFor::Signal("go".into())).unwrap();
+        let batch = tasks.prepare_save(&[Save::Update(&next)]).unwrap();
+        tasks.update(&current, |_| Ok(())).unwrap();
+        assert!(matches!(
+            store.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        let current = tasks.load(t.id()).unwrap().unwrap();
+        assert_eq!(current.task.restarts(), 1);
+        assert_eq!(current.task.state(), &TaskState::Running);
+        let mut next = current.clone();
+        next.task.wait(WaitFor::Signal("go".into())).unwrap();
+        let batch = tasks.prepare_save(&[Save::Update(&next)]).unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        let committed = tasks.load(t.id()).unwrap().unwrap().task;
+        assert_eq!(committed.restarts(), 0);
+        assert_eq!(
+            committed.state(),
+            &TaskState::Waiting(WaitFor::Signal("go".into()))
+        );
     }
 
     #[test]
