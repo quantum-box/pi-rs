@@ -38,6 +38,11 @@ pub(crate) fn undispatched_intent_check(task: Uuid) -> Check {
 fn intent_key(task: Uuid) -> Vec<u8> {
     format!("durable/async-task/intent/{task}").into_bytes()
 }
+// An immutable dispatch record for each execution generation. The existing
+// task-level record remains the dispatch fence for the leaf-only executor.
+fn attempt_intent_key(task: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("durable/async-task/attempt/{task}/{attempt}/intent").into_bytes()
+}
 fn prepared_key(task: Uuid) -> Vec<u8> {
     format!("durable/async-task/prepared/{task}").into_bytes()
 }
@@ -267,10 +272,13 @@ fn prepare_authorized_phase(
             key: key.clone(),
             expected: Expected::Missing,
         });
-        let mutations = vec![Mutation::Put {
-            key,
-            value: serde_json::to_vec(&expected)?,
-        }];
+        let attempt_key = attempt_intent_key(expected.task, expected.attempt);
+        checks.push(Check { key: attempt_key.clone(), expected: Expected::Missing });
+        let value = serde_json::to_vec(&expected)?;
+        let mutations = vec![
+            Mutation::Put { key, value: value.clone() },
+            Mutation::Put { key: attempt_key, value },
+        ];
         Ok((expected, OwnedBatch { checks, mutations }))
     }
 }
@@ -643,7 +651,45 @@ mod tests {
             Err(durable_store::Error::Conflict { .. })
         ));
         assert!(store.get(&intent_key(child)).unwrap().is_none());
+        assert!(
+            store
+                .get(&attempt_intent_key(
+                    child,
+                    snapshot.task.attempt_id().unwrap()
+                ))
+                .unwrap()
+                .is_none()
+        );
         assert!(prepare_intent(&store, &snapshot, &identity).is_err());
+    }
+
+    #[test]
+    fn dispatch_records_attempt_atomically_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let (_, child, identity) = fixture(&store);
+        let (intent, batch) = prepare_intent(
+            &store,
+            &TaskStore::new(&store).load(child).unwrap().unwrap(),
+            &identity,
+        )
+        .unwrap();
+        let attempt_key = attempt_intent_key(child, intent.attempt);
+        assert!(store.get(&attempt_key).unwrap().is_none());
+        commit(&store, batch);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let attempt: Intent =
+            serde_json::from_slice(&store.get(&attempt_key).unwrap().unwrap().value).unwrap();
+        assert_eq!(attempt, load_intent(&store, child).unwrap());
+        assert_eq!(attempt, intent);
+        assert!(
+            store
+                .get(&attempt_intent_key(child, Uuid::new_v4()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
