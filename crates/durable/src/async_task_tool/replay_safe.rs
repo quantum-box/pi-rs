@@ -66,7 +66,15 @@ pub(super) fn register(
     children: Vec<Arc<TaskTool>>,
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
 ) -> Result<Arc<TaskTool>, String> {
-    register_with_policy(scheduler, tool, implementation, version, children, true, hook)
+    register_with_policy(
+        scheduler,
+        tool,
+        implementation,
+        version,
+        children,
+        true,
+        hook,
+    )
 }
 
 pub(super) fn register_unsafe(
@@ -76,7 +84,15 @@ pub(super) fn register_unsafe(
     version: u32,
     children: Vec<Arc<TaskTool>>,
 ) -> Result<Arc<TaskTool>, String> {
-    register_with_policy(scheduler, tool, implementation, version, children, false, None)
+    register_with_policy(
+        scheduler,
+        tool,
+        implementation,
+        version,
+        children,
+        false,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // Explicit policy and hook identity are part of registration.
@@ -538,7 +554,8 @@ impl Handler for Executor {
         if self.hook.is_some() && task.checkpoint().phase == "replay-safe-async-after" {
             return self.after(task, admission, cancellation);
         }
-        let intent = admission.checkpointable_durable_intent(false, self.replay_safe, Some(cancellation))?;
+        let intent =
+            admission.checkpointable_durable_intent(false, self.replay_safe, Some(cancellation))?;
         #[cfg(test)]
         crash_test_boundary(&self.tool.spec().name, task.id(), "intent");
         let (resume, saved_args) = match task.checkpoint().phase.as_str() {

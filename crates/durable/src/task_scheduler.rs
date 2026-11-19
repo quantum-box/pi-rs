@@ -1421,7 +1421,13 @@ impl AdmissionHandle<'_> {
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
     ) -> Result<Vec<u8>, String> {
-        self.replay_safe_durable_fence(test_namespace, expected_replay_safe, cancellation, true, (&[], &[]))
+        self.replay_safe_durable_fence(
+            test_namespace,
+            expected_replay_safe,
+            cancellation,
+            true,
+            (&[], &[]),
+        )
     }
     pub(crate) fn replay_safe_durable_check(
         &self,
