@@ -170,6 +170,271 @@ fn task_tool_panic_withdraws_failed_idle_owned_conversation_inputs() {
 
 #[cfg(unix)]
 #[test]
+fn failed_idle_panic_and_explicit_abort_serialize_at_failure_commit() {
+    use crate::ownership_edge::{Edge, EdgeStore, Mode};
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState};
+    use crate::task_driver::Driver;
+    use crate::task_scheduler::{Registry, Step, TickReservation};
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    for abort_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let config = Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        };
+        let root = harness.create_conversation(config.clone()).unwrap();
+        let child = harness.create_conversation(config).unwrap();
+        let withdraw = Uuid::new_v4();
+        let keep = Uuid::new_v4();
+        let (mut state, version) = harness.load(child).unwrap();
+        state.phase = Phase::FailedIdle;
+        for (id, on_abort) in [(withdraw, OnAbort::Withdraw), (keep, OnAbort::Keep)] {
+            state.submissions.push(Submission {
+                kind: SubmissionKind::Input,
+                id,
+                request_id: None,
+                content: "queued".into(),
+                image_notes: vec![],
+                input_blocks: None,
+                on_abort,
+                status: Status::Queued,
+            });
+        }
+        harness.save(&state, Expected::Version(version)).unwrap();
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| -> Result<Step, String> {
+            panic!("parent panic")
+        });
+        registry.set_abort("parent", |_: &Task| {
+            Ok(Step::Succeed(serde_json::Value::Null))
+        });
+        let mut scheduler = harness.attach_tasks(registry).unwrap();
+        let parent_id = Uuid::new_v4();
+        let parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(root),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false)
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let owner = scheduler.owner();
+        let edge = EdgeStore::new(owner.store())
+            .prepare_create(&Edge {
+                task: parent_id,
+                task_owner: TaskOwner::Conversation(root),
+                child,
+                mode: Mode::Foreground,
+            })
+            .unwrap();
+        owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+        let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("missing invocation")
+        };
+        let completed = invocation.execute().unwrap();
+        if abort_first {
+            harness.request_abort_task(parent_id).unwrap();
+            scheduler.settle_invocation(completed).unwrap();
+        } else {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            scheduler.set_failure_boundary_hook(
+                false,
+                Arc::new(move |_, _| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }),
+            );
+            let mut abort_worker = harness.worker();
+            std::thread::scope(|scope| {
+                let settlement = scope.spawn(|| scheduler.settle_invocation(completed));
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (started_tx, started_rx) = mpsc::channel();
+                let abort = scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    abort_worker.request_abort_task(parent_id)
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                release_tx.send(()).unwrap();
+                settlement.join().unwrap().unwrap();
+                abort.join().unwrap().unwrap();
+            });
+        }
+        // A repeated abort is idempotent and must preserve the already withdrawn input.
+        harness.request_abort_task(parent_id).unwrap();
+        let driver = Driver::start(scheduler);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let parent = driver.get(parent_id).unwrap().unwrap();
+            if parent.is_terminal() {
+                if abort_first {
+                    assert_eq!(parent.state(), &TaskState::Cancelled);
+                } else {
+                    assert!(
+                        matches!(parent.state(), TaskState::Failed(reason) if reason.contains("panicked"))
+                    );
+                }
+                break;
+            }
+            assert!(Instant::now() < deadline, "parent did not settle");
+            std::thread::yield_now();
+        }
+        let state = harness.conversation(child).unwrap();
+        assert!(
+            matches!(state.submissions.iter().find(|s| s.id == withdraw).unwrap().status, Status::Unanswered { ref reason } if reason == "aborted")
+        );
+        assert_eq!(
+            state
+                .submissions
+                .iter()
+                .find(|s| s.id == keep)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+        driver.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn panic_failure_drains_failed_idle_input_through_multiple_foreground_owners() {
+    use crate::ownership_edge::{Edge, EdgeStore, Mode};
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState};
+    use crate::task_driver::Driver;
+    use crate::task_scheduler::{Registry, Step, TickReservation};
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 10,
+    };
+    let root = harness.create_conversation(config.clone()).unwrap();
+    let middle = harness.create_conversation(config.clone()).unwrap();
+    let leaf = harness.create_conversation(config.clone()).unwrap();
+    let background = harness.create_conversation(config).unwrap();
+    for id in [leaf, background] {
+        let (mut state, version) = harness.load(id).unwrap();
+        state.phase = Phase::FailedIdle;
+        state.submissions.push(Submission {
+            kind: SubmissionKind::Input,
+            id: Uuid::new_v4(),
+            request_id: None,
+            content: "queued".into(),
+            image_notes: vec![],
+            input_blocks: None,
+            on_abort: OnAbort::Withdraw,
+            status: Status::Queued,
+        });
+        harness.save(&state, Expected::Version(version)).unwrap();
+    }
+    let mut registry = Registry::default();
+    registry.register("parent", false, |_: &Task| -> Result<Step, String> {
+        panic!("parent panic")
+    });
+    registry.register("middle", true, |_: &Task| -> Result<Step, String> {
+        panic!("owned task must be aborted before running")
+    });
+    registry.set_abort("middle", |_: &Task| {
+        Ok(Step::Succeed(serde_json::Value::Null))
+    });
+    let mut scheduler = harness.attach_tasks(registry).unwrap();
+    let checkpoint = Checkpoint {
+        phase: "start".into(),
+        data: serde_json::Value::Null,
+    };
+    let parent = Task::new(
+        Uuid::from_u128(1),
+        TaskOwner::Conversation(root),
+        checkpoint.clone(),
+        3,
+    )
+    .unwrap()
+    .registered("parent".into(), false)
+    .into_task_tool();
+    let inner = Task::new(
+        Uuid::from_u128(2),
+        TaskOwner::Conversation(middle),
+        checkpoint,
+        3,
+    )
+    .unwrap()
+    .registered("middle".into(), true);
+    scheduler.submit(&parent).unwrap();
+    scheduler.submit(&inner).unwrap();
+    let owner = scheduler.owner();
+    for edge in [
+        Edge {
+            task: parent.id(),
+            task_owner: TaskOwner::Conversation(root),
+            child: middle,
+            mode: Mode::Foreground,
+        },
+        Edge {
+            task: inner.id(),
+            task_owner: TaskOwner::Conversation(middle),
+            child: leaf,
+            mode: Mode::Foreground,
+        },
+        Edge {
+            task: inner.id(),
+            task_owner: TaskOwner::Conversation(middle),
+            child: background,
+            mode: Mode::Background,
+        },
+    ] {
+        let batch = EdgeStore::new(owner.store()).prepare_create(&edge).unwrap();
+        owner
+            .store()
+            .commit(&batch.checks, &batch.mutations)
+            .unwrap();
+    }
+    let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+        panic!("missing parent invocation")
+    };
+    assert_eq!(invocation.task_id(), parent.id());
+    scheduler
+        .settle_invocation(invocation.execute().unwrap())
+        .unwrap();
+    let driver = Driver::start(scheduler);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = driver.get(parent.id()).unwrap().unwrap();
+        if state.is_terminal() {
+            assert!(matches!(state.state(), TaskState::Failed(_)));
+            break;
+        }
+        assert!(Instant::now() < deadline, "ancestor cleanup did not settle");
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        driver.get(inner.id()).unwrap().unwrap().state(),
+        &TaskState::Cancelled
+    );
+    assert!(
+        matches!(harness.conversation(leaf).unwrap().submissions[0].status, Status::Unanswered { ref reason } if reason == "aborted")
+    );
+    assert_eq!(
+        harness.conversation(background).unwrap().submissions[0].status,
+        Status::Queued
+    );
+    driver.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn failed_idle_panic_kill_worker() {
     use crate::ownership_edge::{Edge, EdgeStore, Mode};
     use crate::task::{Checkpoint, Task, TaskOwner};
@@ -180,6 +445,7 @@ fn failed_idle_panic_kill_worker() {
     };
     let path = std::path::PathBuf::from(path);
     let after = std::env::var_os("PI_FAILED_IDLE_PANIC_AFTER").is_some();
+    let safe = std::env::var_os("PI_FAILED_IDLE_PARENT_SAFE").is_some();
     let mut harness = Harness::open_paused(&path, options()).unwrap();
     let config = Config {
         model: "test".into(),
@@ -212,7 +478,7 @@ fn failed_idle_panic_kill_worker() {
     }
     harness.save(&state, Expected::Version(version)).unwrap();
     let mut registry = Registry::default();
-    registry.register("parent", false, |_: &Task| -> Result<Step, String> {
+    registry.register("parent", safe, |_: &Task| -> Result<Step, String> {
         panic!("test panic")
     });
     let mut scheduler = harness.attach_tasks(registry).unwrap();
@@ -226,7 +492,7 @@ fn failed_idle_panic_kill_worker() {
         3,
     )
     .unwrap()
-    .registered("parent".into(), false)
+    .registered("parent".into(), safe)
     .into_task_tool();
     scheduler.submit(&parent).unwrap();
     let owner = scheduler.owner();
@@ -272,7 +538,7 @@ fn failed_idle_panic_survives_kill_at_failure_commit_boundaries() {
             let _ = self.0.wait();
         }
     }
-    for after in [false, true] {
+    for (safe, after) in [(false, false), (false, true), (true, false)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -287,6 +553,9 @@ fn failed_idle_panic_survives_kill_at_failure_commit_boundaries() {
             .stderr(std::process::Stdio::null());
         if after {
             command.env("PI_FAILED_IDLE_PANIC_AFTER", "1");
+        }
+        if safe {
+            command.env("PI_FAILED_IDLE_PARENT_SAFE", "1");
         }
         let mut worker = KillOnDrop(command.spawn().unwrap());
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -324,9 +593,9 @@ fn failed_idle_panic_survives_kill_at_failure_commit_boundaries() {
         let replays = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = replays.clone();
         let mut registry = Registry::default();
-        registry.register("parent", false, move |_: &Task| -> Result<Step, String> {
+        registry.register("parent", safe, move |_: &Task| -> Result<Step, String> {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Step::Succeed(serde_json::Value::Null))
+            Ok(Step::Fail("replayed failure".into()))
         });
         let scheduler = harness.attach_tasks(registry).unwrap();
         let driver = Driver::start(scheduler);
@@ -356,7 +625,10 @@ fn failed_idle_panic_survives_kill_at_failure_commit_boundaries() {
                 .status,
             Status::Queued
         );
-        assert_eq!(replays.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            replays.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(safe && !after)
+        );
         driver.shutdown().unwrap();
     }
 }
