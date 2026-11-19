@@ -498,25 +498,28 @@ to a task or enforced at dispatch, and its implementation identity is an asserti
 not a cryptographic measurement.
 
 A private prototype composes a keyed child and its identity in one checked
-transaction. A detached scheduler invocation can record a provisional intent
-while its own and its direct parent's reservations are live and the task gate
-fences abort. A joined handler can persist its returned `Pending`/`Unknown` in a
-separate receipt after abort. These methods are not invoked by the task driver or
-`TaskTool`. The intent is not a lease or authority to run effects: abort can commit
-after its gate is released. The receipt proves only that this handler returned
-under the reserved task attempt; it does not prove the handler used the intended
-Tool or joined any spawned executor. An intent without a receipt is uncertain,
-not permission to retry. Operators cannot use this private protocol to reconcile.
+transaction. Its test-only registration exercises a driver worker that commits a
+durable intent under the task gate while its own and its direct parent's task
+reservations are live. The intent commit is the logical dispatch start: an abort
+that commits first rejects dispatch; an abort after it requests cancellation and
+the worker joins its handler. The returned `Outcome` (including structured,
+`Pending`, or `Unknown`) is saved in an independent receipt before settlement,
+even after abort. It holds the existing host identity registration lease from
+before intent until receipt persistence; backend configuration changes must use
+that identity handle. Receipts are limited to 64 KiB; a failed or oversized capture
+retains the joined result and its lease for reconciliation. Shutdown requests
+cancellation and joins the worker, but a handler that ignores cancellation can
+block shutdown indefinitely.
 
-`async_task_tool::AsyncTaskTool` remains disabled even with this host capability:
-its constructor returns an error, and no async tool handler is registered. Safe
-dispatch still requires task-owned hook authorization, a linearized abort/dispatch
-boundary, retention and reconciliation of pending or unknown outcomes after abort,
-and atomic persistence and enforcement of identity with each task. A conversation
-attempt fence cannot establish task-attempt ownership. A pre-dispatch check alone
-cannot close the race with a subsequent abort. `AsyncTaskCall` is serializable for
-checkpoints, but this bridge cannot create or execute calls. Existing scheduler and
-`TaskTool` APIs are unaffected.
+This is not a public dispatch capability. The only registration enabling this
+path is test-only; it does not prove that the registered handler invokes the
+recorded Tool or joins effects it spawns. The public `AsyncTaskTool` constructor
+continues to reject dispatch. A process death after intent but before receipt is
+uncertain and is not permission to retry. Ordinary Tool effects may occur after
+logical dispatch, including after abort, and require destination-side idempotency
+or authoritative reconciliation. A conversation attempt fence is not a task
+attempt lease. `AsyncTaskCall` is serializable for checkpoints, but this bridge
+cannot yet create or execute calls. Existing `TaskTool` APIs are unaffected.
 
 Within a task-backed tool handler, `TaskTool::stage_child` stages another
 registered TaskTool under a stable key. Return a task wait step to commit the

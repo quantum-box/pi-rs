@@ -57,6 +57,16 @@ pub trait Handler: Send + Sync {
     ) -> Result<Step, String> {
         self.run_with_documents(task, documents)
     }
+    /// The default preserves existing handlers. A cancellation-aware adapter
+    /// must join its own executor before returning.
+    fn run_with_cancellation(
+        &self,
+        task: &Task,
+        documents: &mut crate::document::TaskDocuments<'_>,
+        _cancellation: &pi_rs_core::CancellationToken,
+    ) -> Result<Step, String> {
+        self.run_with_documents(task, documents)
+    }
 }
 impl<F> Handler for F
 where
@@ -120,6 +130,18 @@ pub struct WakeSnapshot {
 }
 
 #[derive(Clone)]
+struct ReceiptCapture {
+    identity: crate::async_task_tool::ToolIdentity,
+    tool: Arc<dyn pi_rs_core::Tool>,
+    implementation: String,
+    version: u32,
+    #[cfg(test)]
+    before_intent: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_intent: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone)]
 struct Registration {
     identity: Arc<()>,
     version: u32,
@@ -127,6 +149,7 @@ struct Registration {
     replay_safe: bool,
     handler: Arc<dyn Handler>,
     abort: Option<Arc<dyn Handler>>,
+    receipt_capture: Option<Arc<ReceiptCapture>>,
 }
 /// Clones preserve definition identity for migration retry decisions.
 #[derive(Clone, Default)]
@@ -174,6 +197,7 @@ impl Registry {
                     replay_safe,
                     handler,
                     abort: None,
+                    receipt_capture: None,
                 });
                 true
             }
@@ -196,6 +220,7 @@ impl Registry {
                     replay_safe,
                     handler: Arc::new(handler),
                     abort: None,
+                    receipt_capture: None,
                 });
                 true
             }
@@ -229,6 +254,31 @@ impl Registry {
         entry.abort = Some(Arc::new(abort));
         true
     }
+    // Test-only opt-in exercises the worker path without enabling public tool dispatch.
+    #[cfg(test)]
+    pub(crate) fn enable_test_receipt_capture(
+        &mut self,
+        kind: &str,
+        tool: Arc<dyn pi_rs_core::Tool>,
+        identity: crate::async_task_tool::ToolIdentity,
+        before_intent: Option<Arc<dyn Fn() + Send + Sync>>,
+        after_intent: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> bool {
+        if let Some(entry) = self.entries.get_mut(kind) {
+            entry.receipt_capture = Some(Arc::new(ReceiptCapture {
+                tool,
+                identity,
+                implementation: "real-backend".into(),
+                version: 1,
+                before_intent,
+                after_intent,
+            }));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Register a separate cleanup invocation. Abort handlers must be replay-safe:
     /// their external effects require idempotency across a crash before commit.
     pub fn register_with_abort(
@@ -558,6 +608,8 @@ pub struct DetachedInvocation {
     lease: InvocationLease,
     definitions: Arc<std::sync::RwLock<WakeDefinitions>>,
     activity: crate::worker_activity::WorkerActivity,
+    receipt_capture: Option<Arc<ReceiptCapture>>,
+    unhooked_cancellation: Option<pi_rs_core::CancellationToken>,
 }
 
 #[derive(Clone)]
@@ -574,10 +626,60 @@ pub struct CompletedInvocation {
     running: task_store::StoredTask,
     result: InvocationResult,
     lease: InvocationLease,
+    receipt_capture: bool,
+    // Pin the exact host registration until receipt persistence or abandonment.
+    _identity_lease: Option<crate::nested_identity::IdentityLease>,
 }
 
 impl CompletedInvocation {
-    /// Persist an uncertain outcome taken from this joined handler's exact
+    /// Read a marked handler's retained outcome when receipt capture failed.
+    /// This is evidence for reconciliation, not a retry authorization.
+    pub fn retained_tool_outcome(&self) -> Option<pi_rs_core::Outcome> {
+        if !self.receipt_capture {
+            return None;
+        }
+        let InvocationResult::Handler(Ok(Step::Succeed(value)), _) = &self.result else {
+            return None;
+        };
+        let outcome: pi_rs_core::Outcome = serde_json::from_value(value.clone()).ok()?;
+        Some(outcome)
+    }
+
+    /// Preserve a marked task's uncertain result before the driver settles it.
+    /// The marker is not enabled by any public registration.
+    pub(crate) fn capture_marked_receipt(
+        &mut self,
+    ) -> Result<(), crate::async_task_protocol::Error> {
+        use crate::async_task_protocol::Error as ProtocolError;
+        if !self.receipt_capture {
+            return Ok(());
+        }
+        let intent = crate::async_task_protocol::load_intent(
+            self.lease.attachment.owner.store(),
+            self.running.task.id(),
+        )?;
+        if !intent.matches_attempt(&self.running.task) {
+            return Err(ProtocolError::Invalid);
+        }
+        let InvocationResult::Handler(Ok(Step::Succeed(value)), _) = &self.result else {
+            return Err(ProtocolError::Invalid);
+        };
+        let outcome: pi_rs_core::Outcome = serde_json::from_value(value.clone())?;
+        self.persist_unhooked_receipt(&intent)?;
+        self.receipt_capture = false;
+        if matches!(
+            outcome,
+            pi_rs_core::Outcome::Pending { .. } | pi_rs_core::Outcome::Unknown(_)
+        ) && let InvocationResult::Handler(result, _) = &mut self.result
+        {
+            *result = Ok(Step::Fail(
+                "uncertain tool outcome retained for reconciliation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persist an outcome taken from this joined handler's exact
     /// return value while its invocation lease is still held. It does not prove
     /// that a handler joined any executor it may have spawned.
     #[allow(dead_code)] // The async tool driver is not wired yet.
@@ -593,12 +695,6 @@ impl CompletedInvocation {
             return Err(ProtocolError::Invalid);
         };
         let outcome: pi_rs_core::Outcome = serde_json::from_value(value.clone())?;
-        if !matches!(
-            outcome,
-            pi_rs_core::Outcome::Pending { .. } | pi_rs_core::Outcome::Unknown(_)
-        ) {
-            return Err(ProtocolError::Invalid);
-        }
         let _failure = self
             .lease
             .failure_fence
@@ -1194,6 +1290,9 @@ pub struct AdmissionHandle<'a> {
 }
 
 impl DetachedInvocation {
+    pub(crate) fn unhooked_cancellation(&self) -> Option<pi_rs_core::CancellationToken> {
+        self.unhooked_cancellation.clone()
+    }
     pub fn task_id(&self) -> Uuid {
         self.running.task.id()
     }
@@ -1309,9 +1408,10 @@ impl AdmissionHandle<'_> {
 }
 
 impl DetachedInvocation {
-    /// Record a provisional standalone intent while both task reservations and
-    /// the graph gate are held. This is not dispatch authority: the gate is
-    /// released on return and abort may still win before an effect begins.
+    /// Record a standalone intent while both task reservations and the graph
+    /// gate are held. The commit can be a logical dispatch start only when the
+    /// caller also owns, cancels, and joins the authenticated executor. Effects
+    /// may physically begin after a later abort.
     #[allow(dead_code)] // Unhooked dispatch remains disabled.
     pub(crate) fn commit_unhooked_intent(
         &self,
@@ -1347,6 +1447,13 @@ impl DetachedInvocation {
             .state
             .lock()
             .map_err(|_| ProtocolError::Invalid)?;
+        if self
+            .unhooked_cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(ProtocolError::Invalid);
+        }
         let parent = task_store::TaskStore::new(owner.store())
             .load(*parent_id)?
             .ok_or(ProtocolError::Invalid)?;
@@ -1386,6 +1493,33 @@ impl DetachedInvocation {
     /// panic becomes a published failure so its owned graph can be cleaned up.
     /// Generic handler panics and abort handler panics retain their semantics.
     pub fn execute(self) -> Result<CompletedInvocation, Error> {
+        let identity_lease = if let Some(capture) = &self.receipt_capture {
+            Some(
+                crate::nested_identity::checked_lease(&capture.tool, &capture.implementation)
+                    .map_err(|_| {
+                        Error::Handler("unhooked tool identity unavailable or changed".into())
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let Some(capture) = &self.receipt_capture {
+            #[cfg(test)]
+            if let Some(before) = &capture.before_intent {
+                before();
+            }
+            self.commit_unhooked_intent(
+                &capture.identity,
+                capture.tool.as_ref(),
+                &capture.implementation,
+                capture.version,
+            )
+            .map_err(|e| Error::Handler(format!("unhooked intent rejected: {e}")))?;
+            #[cfg(test)]
+            if let Some(after) = &capture.after_intent {
+                after();
+            }
+        }
         let Self {
             running,
             handler,
@@ -1394,7 +1528,10 @@ impl DetachedInvocation {
             lease,
             definitions,
             activity,
+            receipt_capture,
+            unhooked_cancellation,
         } = self;
+        let receipt_capture = receipt_capture.is_some();
         let result = if abort {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler.run(&running.task)
@@ -1415,6 +1552,9 @@ impl DetachedInvocation {
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
             documents.set_input_validator(validator.as_ref());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match &unhooked_cancellation {
+                    Some(cancel) => handler.run_with_cancellation(&running.task, &mut documents, cancel),
+                    None => {
                 let admission = AdmissionHandle {
                     running: &running,
                     lease: &lease,
@@ -1423,6 +1563,8 @@ impl DetachedInvocation {
                     activity: &activity,
                 };
                 handler.run_with_admission(&running.task, &mut documents, &admission)
+                    }
+                }
             }));
             let result = match result {
                 Ok(result) => result,
@@ -1498,6 +1640,8 @@ impl DetachedInvocation {
             running,
             result,
             lease,
+            receipt_capture,
+            _identity_lease: identity_lease,
         })
     }
 }
@@ -1814,6 +1958,11 @@ impl Scheduler {
         abort: bool,
     ) -> Result<DetachedInvocation, Error> {
         let id = running.task.id();
+        let receipt_capture = if abort {
+            None
+        } else {
+            self.registered(&running.task)?.receipt_capture.clone()
+        };
         let mut state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
         if state.poisoned || !state.attempts.insert(id) {
             return Err(Error::Poisoned);
@@ -1821,6 +1970,9 @@ impl Scheduler {
         let token = Uuid::new_v4();
         state.leases.insert(id, (token, running.task.attempt_id()));
         drop(state);
+        let unhooked_cancellation = receipt_capture
+            .as_ref()
+            .map(|_| pi_rs_core::CancellationToken::new());
         Ok(DetachedInvocation {
             running,
             handler,
@@ -1828,6 +1980,8 @@ impl Scheduler {
             validator: self.validator.as_ref().map(|harness| harness.worker()),
             definitions: self.wake_reader.definitions.clone(),
             activity: self.activity.clone(),
+            receipt_capture,
+            unhooked_cancellation,
             lease: InvocationLease {
                 attachment: self.attachment.clone(),
                 state: self.live_invocations.clone(),
@@ -1869,6 +2023,12 @@ impl Scheduler {
         completed: CompletedInvocation,
         nonblocking_abort: bool,
     ) -> Result<bool, SettlementError> {
+        if completed.receipt_capture {
+            return Err(SettlementError::Rejected {
+                error: Error::Handler("tool receipt capture is required before settlement".into()),
+                completed: Box::new(completed),
+            });
+        }
         let fence = self.failure_fence.clone();
         let guard = if nonblocking_abort {
             match fence.try_lock() {
@@ -1991,6 +2151,8 @@ impl Scheduler {
             running,
             result,
             mut lease,
+            receipt_capture,
+            _identity_lease: _,
         } = completed;
         let mut reported_handler_failure = false;
         let mut deferred = None;
@@ -2038,6 +2200,8 @@ impl Scheduler {
                             running,
                             result,
                             lease,
+                            receipt_capture,
+                            _identity_lease: None,
                         })),
                     });
                 }
@@ -2065,6 +2229,8 @@ impl Scheduler {
                             running,
                             result: InvocationResult::Handler(result, Box::new(documents)),
                             lease,
+                            receipt_capture,
+                            _identity_lease: None,
                         }),
                     }
                 }
@@ -2120,6 +2286,8 @@ impl Scheduler {
                     running,
                     result: result_backup,
                     lease,
+                    receipt_capture,
+                    _identity_lease: None,
                 })),
             });
         }

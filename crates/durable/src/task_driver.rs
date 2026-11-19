@@ -49,6 +49,7 @@ pub(crate) struct Shared {
     wake: Condvar,
     harness: Option<Mutex<crate::runtime::Harness>>,
     cleanup_stop: pi_rs_core::CancellationToken,
+    unhooked_cancellations: Mutex<HashMap<Uuid, pi_rs_core::CancellationToken>>,
     notifications: Mutex<Option<SyncSender<()>>>,
     subscription: Mutex<Option<Receiver<()>>>,
 }
@@ -178,6 +179,7 @@ impl Driver {
             wake: Condvar::new(),
             harness: harness.map(Mutex::new),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            unhooked_cancellations: Mutex::new(HashMap::new()),
             notifications: Mutex::new(Some(notify_tx)),
             subscription: Mutex::new(Some(notify_rx)),
         });
@@ -207,6 +209,9 @@ impl Driver {
                                 state.failure = Some("task worker panicked".into());
                             }
                         });
+                    }
+                    if std::thread::panicking() {
+                        self.0.cancel_unhooked();
                     }
                     self.0.activity.notify();
                     self.0.close_notifications();
@@ -491,6 +496,36 @@ impl Driver {
                 .lock()
                 .map_err(|_| Error::Poisoned)?;
             task_scheduler::request_abort_subtree(&TaskStore::new(self.shared.owner.store()), id)?;
+            let active = match self.shared.unhooked_cancellations.lock() {
+                Ok(active) => active,
+                Err(poisoned) => {
+                    let active = poisoned.into_inner();
+                    for token in active.values() {
+                        token.cancel();
+                    }
+                    drop(active);
+                    self.shared.notify_work();
+                    return Err(Error::Poisoned);
+                }
+            };
+            let mut load_error = None;
+            for (task_id, token) in active.iter() {
+                match TaskStore::new(self.shared.owner.store()).load(*task_id) {
+                    Ok(task) if task.as_ref().is_none_or(|task| task.task.abort_requested()) => {
+                        token.cancel()
+                    }
+                    Ok(_) => (),
+                    Err(error) => {
+                        token.cancel();
+                        load_error.get_or_insert(error);
+                    }
+                }
+            }
+            drop(active);
+            if let Some(error) = load_error {
+                self.shared.notify_work();
+                return Err(task_scheduler::Error::from(error).into());
+            }
         }
         self.shared.notify_work();
         Ok(())
@@ -613,6 +648,7 @@ impl Driver {
         self.shared
             .reservation_stop
             .store(true, std::sync::atomic::Ordering::Release);
+        self.shared.cancel_unhooked();
         self.shared.close_notifications();
         if let Ok(mut state) = self.shared.state.lock() {
             state.stop = true;
@@ -818,6 +854,7 @@ fn fail_cleanup(shared: &Shared, error: String) {
             shared.wake.notify_all();
         }
     });
+    shared.cancel_unhooked();
     shared.activity.notify();
     shared.cleanup_stop.cancel();
     shared.close_notifications();
@@ -875,6 +912,19 @@ impl Drop for WorkerPool {
 }
 
 impl Shared {
+    fn cancel_unhooked(&self) {
+        let tokens: Vec<_> = self
+            .unhooked_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
     fn stop_for_failure(&self, error: String) {
         self.reservation_stop
             .store(true, std::sync::atomic::Ordering::Release);
@@ -883,6 +933,7 @@ impl Shared {
             state.stop = true;
             self.wake.notify_all();
         }
+        self.cancel_unhooked();
         self.activity.notify();
         self.close_notifications();
     }
@@ -904,6 +955,37 @@ impl Shared {
                     let Ok(job) = job else {
                         break;
                     };
+                    let task_id = job.task_id();
+                    if let Some(token) = job.unhooked_cancellation() {
+                        let registration = (|| -> Result<(), String> {
+                            let _gate =
+                                shared.owner.task_gate().lock().map_err(|e| e.to_string())?;
+                            let task = TaskStore::new(shared.owner.store())
+                                .load(task_id)
+                                .map_err(|e| e.to_string())?
+                                .ok_or("reserved task missing")?;
+                            let mut active = shared
+                                .unhooked_cancellations
+                                .lock()
+                                .map_err(|e| e.to_string())?;
+                            if task.task.abort_requested()
+                                || shared
+                                    .reservation_stop
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                token.cancel();
+                            }
+                            if active.contains_key(&task_id) {
+                                return Err("duplicate unhooked executor".into());
+                            }
+                            active.insert(task_id, token);
+                            Ok(())
+                        })();
+                        if let Err(error) = registration {
+                            let _ = done.send(WorkerEvent::Failed(error));
+                            break;
+                        }
+                    }
                     let event = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         #[cfg(test)]
                         {
@@ -917,13 +999,30 @@ impl Shared {
                         }
                         job.execute()
                     })) {
-                        Ok(Ok(completed)) => WorkerEvent::Completed(Box::new(completed)),
+                        Ok(Ok(mut completed)) => match completed.capture_marked_receipt() {
+                            Ok(()) => WorkerEvent::Completed(Box::new(completed)),
+                            Err(error) => {
+                                let message = format!("uncertain receipt capture: {error}");
+                                // Publish the failure before exposing the unsaved result;
+                                // the coordinator must never settle it ahead of the receipt.
+                                shared.stop_for_failure(message.clone());
+                                shared
+                                    .pending
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(task_scheduler::PendingSettlement::Unprepared(completed));
+                                WorkerEvent::Failed(message)
+                            }
+                        },
                         Ok(Err(error)) => WorkerEvent::Failed(error.to_string()),
                         Err(payload) => {
                             crate::extension::discard_panic_payload(payload);
                             WorkerEvent::Failed("task handler panicked".into())
                         }
                     };
+                    if let Ok(mut active) = shared.unhooked_cancellations.lock() {
+                        active.remove(&task_id);
+                    }
                     if let Err(mpsc::SendError(event)) = done.send(event) {
                         if let WorkerEvent::Completed(completed) = event {
                             shared
@@ -987,7 +1086,9 @@ impl Shared {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty();
-            if has_pending {
+            // Once a worker reports an indeterminate failure, retain every
+            // pending lease for shutdown/reconciliation instead of settling it.
+            if has_pending && !failed {
                 let before = self.pending.lock().unwrap_or_else(|e| e.into_inner()).len();
                 match self.retry_pending() {
                     Ok(true) => {
@@ -1097,10 +1198,19 @@ impl Shared {
                         {
                             active -= 1;
                             self.stop_for_failure("task worker pool disconnected".into());
+                            if job.unhooked_cancellation().is_some() {
+                                drop(job);
+                                continue;
+                            }
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 job.execute()
                             })) {
-                                Ok(Ok(completed)) => {
+                                Ok(Ok(mut completed)) => {
+                                    if let Err(error) = completed.capture_marked_receipt() {
+                                        self.stop_for_failure(format!(
+                                            "uncertain receipt capture: {error}"
+                                        ));
+                                    }
                                     self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(
                                         task_scheduler::PendingSettlement::Unprepared(completed),
                                     )
@@ -1275,6 +1385,15 @@ impl Shared {
 
     fn retry_pending(&self) -> Result<bool, String> {
         let pending = {
+            // The worker publishes receipt failure under state before adding
+            // its result. Hold state through removal to close that race.
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| "task driver state poisoned".to_string())?;
+            if state.failure.is_some() {
+                return Ok(false);
+            }
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             if pending.is_empty() {
                 return Ok(false);
@@ -2751,6 +2870,7 @@ mod tests {
                 wake: Condvar::new(),
                 harness: None,
                 cleanup_stop: pi_rs_core::CancellationToken::new(),
+                unhooked_cancellations: Mutex::new(HashMap::new()),
                 notifications: Mutex::new(None),
                 subscription: Mutex::new(None),
             });
@@ -4146,6 +4266,7 @@ mod tests {
                 wake: Condvar::new(),
                 harness: None,
                 cleanup_stop: pi_rs_core::CancellationToken::new(),
+                unhooked_cancellations: Mutex::new(HashMap::new()),
                 notifications: Mutex::new(None),
                 subscription: Mutex::new(None),
             });
@@ -4314,6 +4435,7 @@ mod tests {
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            unhooked_cancellations: Mutex::new(HashMap::new()),
             notifications: Mutex::new(None),
             subscription: Mutex::new(None),
         });
@@ -4537,6 +4659,7 @@ mod tests {
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            unhooked_cancellations: Mutex::new(HashMap::new()),
             notifications: Mutex::new(None),
             subscription: Mutex::new(None),
         };
@@ -4639,6 +4762,7 @@ mod tests {
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            unhooked_cancellations: Mutex::new(HashMap::new()),
             notifications: Mutex::new(None),
             subscription: Mutex::new(None),
         });
@@ -4717,6 +4841,7 @@ mod tests {
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            unhooked_cancellations: Mutex::new(HashMap::new()),
             notifications: Mutex::new(None),
             subscription: Mutex::new(None),
         });
@@ -5003,6 +5128,7 @@ mod tests {
             wake: Condvar::new(),
             harness: Some(Mutex::new(harness.worker())),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            unhooked_cancellations: Mutex::new(HashMap::new()),
             notifications: Mutex::new(None),
             subscription: Mutex::new(None),
         });
