@@ -645,8 +645,32 @@ pub(crate) fn freeze_any_wake(
             .get(leaf_key)?
             .ok_or_else(|| Error::Invalid("nested park leaf missing".into()))?;
         let leaf: Record = serde_json::from_slice(&entry.value)?;
-        if !seen.insert(leaf.operation_id) || leaf.staged_outcome.is_some() {
+        if !seen.insert(leaf.operation_id) {
             return Err(Error::Invalid("invalid nested park leaf".into()));
+        }
+        if let Some(staged) = &leaf.staged_outcome {
+            // Reconciliation or a poll can stage a result after the caller's
+            // earlier staged scan. Only an exact, terminal raw receipt for this
+            // suspension is a retry; malformed or ambiguous records fail closed.
+            let valid = leaf.hooks_required
+                && !leaf.before_pending
+                && leaf.before_gate.is_none()
+                && leaf.child_park.is_none()
+                && leaf.outcome.is_none()
+                && !matches!(staged, Outcome::Pending { .. } | Outcome::Unknown(_))
+                && leaf.resolution.as_ref().is_some_and(|receipt| {
+                    receipt.finalized_outcome.is_none()
+                        && receipt.outcome == *staged
+                        && suspension.jobs().iter().any(|job| {
+                            job.operation_id == leaf.operation_id
+                                && job.reference == receipt.reference
+                        })
+                });
+            return if valid {
+                Ok(AnyWake::Retry)
+            } else {
+                Err(Error::Invalid("invalid nested park leaf".into()))
+            };
         }
         let reference = match &leaf.outcome {
             Some(Outcome::Pending { reference }) => reference,
@@ -3377,6 +3401,112 @@ mod tests {
     use pi_rs_core::{Tool, ToolContext};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn reconciliation_between_staged_scan_and_any_freeze_retries() {
+        use crate::runtime::{Harness, ToolAttempt};
+        let store = durable_store::Store::memory().unwrap();
+        let conversation = Uuid::new_v4();
+        let root = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let leaf_id = Uuid::new_v4();
+        let suspension_id = Uuid::new_v4();
+        let attempt = ToolAttempt {
+            operation_id: root,
+            attempt_id: Uuid::new_v4(),
+        };
+        let binding = crate::nested_fence::Binding {
+            conversation,
+            attempt,
+            suspended: true,
+        };
+        let leaf_key = format!("nested/{root}/{middle}/k61").into_bytes();
+        let middle_key = format!("nested/{root}/{root}/k6d").into_bytes();
+        let conversation_key = Harness::key(conversation);
+        let leaf: Record = serde_json::from_value(json!({
+            "name":"child", "arguments":{}, "prepared":{}, "policy":ReplayPolicy::Safe,
+            "operation_id":leaf_id, "outcome":Outcome::Pending { reference:"job".into() },
+            "hooks_required":true
+        }))
+        .unwrap();
+        let middle_record: Record = serde_json::from_value(json!({
+            "name":"middle", "arguments":{}, "prepared":{}, "policy":ReplayPolicy::Safe,
+            "operation_id":middle,
+            "outcome":Outcome::Pending { reference:format!("nested-child-park:{suspension_id}") },
+            "child_park":ChildPark { suspension:suspension_id, root_attempt:attempt.attempt_id, leaf_key:leaf_key.clone(), additional_leaf_keys:vec![], any:true }
+        })).unwrap();
+        let batch = crate::nested_suspension::prepare_retired(
+            conversation,
+            middle,
+            suspension_id,
+            attempt.attempt_id,
+            json!({}),
+            vec![crate::nested_suspension::PendingJob {
+                operation_id: leaf_id,
+                reference: "job".into(),
+            }],
+        )
+        .unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: conversation_key.clone(),
+                        value: b"{}".to_vec(),
+                    },
+                    Mutation::Put {
+                        key: middle_key,
+                        value: serde_json::to_vec(&middle_record).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: leaf_key.clone(),
+                        value: serde_json::to_vec(&leaf).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        // Interleave the real staged scan and reconciliation deterministically:
+        // the result is staged only after the scan, before freeze reads the leaf.
+        assert!(!has_staged_results(&store, root).unwrap());
+        let version = store.get(&conversation_key).unwrap().unwrap().version;
+        resolve_pending(
+            &store,
+            (conversation_key, version),
+            root,
+            leaf_id,
+            "job",
+            Outcome::Succeeded("raw".into()),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            freeze_any_wake(&store, &binding).unwrap(),
+            AnyWake::Retry
+        ));
+
+        // A forged or inconsistent staged receipt is still rejected.
+        let entry = store.get(&leaf_key).unwrap().unwrap();
+        let mut broken: Record = serde_json::from_slice(&entry.value).unwrap();
+        broken.resolution.as_mut().unwrap().reference = "other".into();
+        store
+            .commit(
+                &[Check {
+                    key: leaf_key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key: leaf_key,
+                    value: serde_json::to_vec(&broken).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            freeze_any_wake(&store, &binding),
+            Err(crate::runtime::Error::Invalid(_))
+        ));
+    }
 
     #[test]
     fn legacy_and_hook_finalized_receipts_require_matching_evidence() {
