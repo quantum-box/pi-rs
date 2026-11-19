@@ -1963,6 +1963,219 @@ mod tests {
     }
 
     #[test]
+    fn killed_unpublished_parent_with_uncertain_graph_never_dispatches_child() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+        const ENV: &str = "PI_TEST_UNPUBLISHED_GRAPH_KILL_1120";
+        if let Some(path) = std::env::var_os(ENV) {
+            let path = std::path::PathBuf::from(path);
+            let (entered, _) = mpsc::channel();
+            let tool: Arc<dyn Tool> = Arc::new(RealTool {
+                entered,
+                release: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+            });
+            let (reserved_tx, reserved_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let setup = Box::new(move |id| {
+                crate::task_driver::before_execute_for_test(id, move |_| {
+                    reserved_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                })
+            });
+            let (driver, _parent_job, owner, parent, child) = actual_driver_fixture_with_setup(
+                &path.join("db"),
+                tool,
+                None,
+                None,
+                Some(setup),
+                None,
+            );
+            reserved_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let (busy_tx, busy_rx) = mpsc::channel();
+            crate::task_driver::on_abort_scan_busy_for_test(child, move || {
+                busy_tx.send(()).unwrap()
+            });
+            let edge = crate::ownership_edge::edge_key(Uuid::new_v4());
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                let tasks = TaskStore::new(owner.store());
+                let root = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Conversation(Uuid::new_v4()),
+                    Checkpoint {
+                        phase: "initial".into(),
+                        data: json!(null),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("parent".into(), false);
+                tasks.save(&[Save::Create(&root)]).unwrap();
+                tasks
+                    .update(&tasks.load(root.id()).unwrap().unwrap(), |task| {
+                        task.start()?;
+                        task.hold_failure("pending abort".into())
+                    })
+                    .unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: edge.clone(),
+                            expected: Expected::Missing,
+                        }],
+                        &[Mutation::Put {
+                            key: edge.clone(),
+                            value: b"invalid edge".to_vec(),
+                        }],
+                    )
+                    .unwrap();
+            }
+            busy_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("abort scan did not see uncertain graph");
+            driver
+                .get(child)
+                .expect("uncertain graph must not stop driver");
+            release_tx.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                let gate = owner.task_gate().lock().unwrap();
+                if TaskStore::new(owner.store())
+                    .load(child)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state()
+                    == &TaskState::Ready
+                {
+                    assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
+                    std::fs::write(
+                        path.join("ids"),
+                        serde_json::to_vec(&(parent, child, edge)).unwrap(),
+                    )
+                    .unwrap();
+                    let _gate = gate;
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                drop(gate);
+                assert!(Instant::now() < until, "child did not defer");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "async_task_protocol::tests::killed_unpublished_parent_with_uncertain_graph_never_dispatches_child"])
+            .env(ENV, dir.path()).spawn().unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        while !dir.path().join("ids").exists() {
+            assert!(worker.try_wait().unwrap().is_none(), "worker exited");
+            assert!(
+                Instant::now() < until,
+                "worker did not reach deferred boundary"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        let (parent, child, edge): (Uuid, Uuid, Vec<u8>) =
+            serde_json::from_slice(&std::fs::read(dir.path().join("ids")).unwrap()).unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            TaskStore::new(&store)
+                .load(parent)
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Running
+        );
+        assert_eq!(
+            TaskStore::new(&store)
+                .load(child)
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Ready
+        );
+        assert!(store.get(&intent_key(child)).unwrap().is_none());
+        let other = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false);
+        TaskStore::new(&store)
+            .save(&[Save::Create(&other)])
+            .unwrap();
+        drop(store);
+        let (entered, observed) = mpsc::channel();
+        let tool: Arc<dyn Tool> = Arc::new(RealTool {
+            entered,
+            release: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+        });
+        let _binding =
+            crate::nested_identity::register(&tool, Some("real-backend".into())).unwrap();
+        let mut registry = crate::task_scheduler::Registry::default();
+        assert!(registry.register("parent", false, |_: &Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!(null))
+        )));
+        let mut host = crate::async_task_tool::StandaloneNoHooksHost::open(
+            &path,
+            registry,
+            crate::async_task_tool::UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        host.register_tool("leaf", tool, "real-backend", 1).unwrap();
+        let driver = host.into_driver();
+        let store = Store::open(&path).unwrap();
+        assert!(store.get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        let existing = store.get(&edge).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: edge.clone(),
+                    expected: Expected::Version(existing.version),
+                }],
+                &[Mutation::Delete { key: edge }],
+            )
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let parent = driver.get(parent).unwrap().unwrap();
+            let child_task = driver.get(child).unwrap().unwrap();
+            if parent.is_terminal() && child_task.is_terminal() {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "recovery did not finish: {:?} {:?}",
+                parent.state(),
+                child_task.state()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(store.get(&intent_key(child)).unwrap().is_none());
+        assert!(observed.try_recv().is_err());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !driver.get(other.id()).unwrap().unwrap().is_terminal() {
+            assert!(Instant::now() < until, "independent graph did not progress");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
+
+    #[test]
     fn published_parent_defers_child_during_uncertain_abort_graph() {
         use std::sync::{Arc, Mutex, mpsc};
         use std::time::{Duration, Instant};

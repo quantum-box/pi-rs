@@ -470,6 +470,8 @@ A reserved sealed child defers before Tool intent or before-hook execution while
 
 After restart, unsafe hook and sealed raw-result after-hook recovery retain their deferred roots if the recovery transaction cannot acquire the writer lock. A later retry re-reads the task and its evidence before recovery; an error after transaction start remains a reconciliation failure.
 
+When a running invocation's cancellation scan encounters an uncertain ownership graph, the driver retries the scan instead of stopping. Interrupted cleanup is cancelled until ownership is proven; other invocations retain their existing cancellation token and remain subject to checked settlement.
+
 A sealed after phase that already has a raw Tool result uses its original intent and receipt evidence when identity acquisition is temporarily busy; it does not claim the Tool was undispatched or invoke it again. The release and retry retain checks for the recorded Tool identity, original dispatch attempt, raw result and any final receipt.
 
 Before a sealed Tool dispatch, an uncertain pending abort graph also defers an already-reserved child while its parent is still running. The retry checks the absent Tool intent and re-evaluates the graph and parent before dispatch.

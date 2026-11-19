@@ -939,6 +939,18 @@ pub(crate) fn before_execute_for_test(
 #[cfg(test)]
 type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
 #[cfg(test)]
+fn abort_scan_busy_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_abort_scan_busy_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    abort_scan_busy_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 fn after_execute_hooks() -> &'static BoundaryHooks {
     static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
@@ -1065,12 +1077,18 @@ impl Shared {
                     ) {
                         Ok(Some(_)) => token.cancel(),
                         Ok(None) => (),
-                        Err(task_scheduler::Error::Busy)
-                            if task.task.holds_interrupted_cleanup() =>
-                        {
-                            // Stop the hook until ownership can be proven, but keep its
-                            // completed invocation available for checked settlement.
-                            token.cancel();
+                        Err(task_scheduler::Error::Busy) => {
+                            #[cfg(test)]
+                            if let Some(hook) = abort_scan_busy_hooks().lock().unwrap().remove(id) {
+                                hook();
+                            }
+                            // Retry an uncertain graph on a later scan. Interrupted
+                            // cleanup must stop until ownership is proven; ordinary
+                            // invocations retain their cancellation token and checked
+                            // settlement while the graph remains unresolved.
+                            if task.task.holds_interrupted_cleanup() {
+                                token.cancel();
+                            }
                         }
                         Err(error) => {
                             token.cancel();
