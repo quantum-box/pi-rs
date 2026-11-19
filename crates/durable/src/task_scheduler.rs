@@ -1665,6 +1665,8 @@ pub struct Scheduler {
     #[cfg(test)]
     failure_commit_hook: Option<CommitHook>,
     #[cfg(test)]
+    failure_committed_hook: Option<CommitHook>,
+    #[cfg(test)]
     inject_batch_prepare_conflict: bool,
     #[cfg(test)]
     inject_post_commit_error: bool,
@@ -2866,6 +2868,15 @@ impl Scheduler {
         self.result_commit_hook = Some(hook);
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_failure_boundary_hook(&mut self, after_commit: bool, hook: CommitHook) {
+        if after_commit {
+            self.failure_committed_hook = Some(hook);
+        } else {
+            self.failure_commit_hook = Some(hook);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_failure_commit_error_for_test(&mut self, boundary: u8) {
         self.inject_failure_commit_error = boundary;
@@ -3048,6 +3059,8 @@ impl Scheduler {
             preparation_conflict_hook: None,
             #[cfg(test)]
             failure_commit_hook: None,
+            #[cfg(test)]
+            failure_committed_hook: None,
             #[cfg(test)]
             inject_batch_prepare_conflict: false,
             #[cfg(test)]
@@ -5337,12 +5350,7 @@ impl Scheduler {
                 return Err(Error::PendingAbort(root));
             }
             let records = store.list()?;
-            let live = has_owned_work(
-                store.store(),
-                settlement.running.task.id(),
-                &records,
-                !settlement.running.task.is_task_tool(),
-            )?;
+            let live = has_owned_work(store.store(), settlement.running.task.id(), &records, true)?;
             let mut next = settlement.running.clone();
             if live {
                 next.task
@@ -5393,7 +5401,13 @@ impl Scheduler {
                 return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
             }
             match commit {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(test)]
+                    if let Some(hook) = &self.failure_committed_hook {
+                        hook(settlement.attempt, store.store());
+                    }
+                    return Ok(());
+                }
                 Err(durable_store::Error::Conflict { ref key })
                     if settlement.attempt < 31
                         && (key == task_store::PREFIX

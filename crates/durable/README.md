@@ -1925,6 +1925,11 @@ the corresponding pending outcome for reconciliation. External effects already
 started are not rolled back or confirmed cancelled; hosts must reconcile them.
 A process crash before the panic failure is durably recorded still follows
 interrupted-attempt recovery and does not prove external cancellation.
+Failure settlement also treats withdrawable queued inputs in a foreground
+owned conversation as cleanup work, even when that conversation is in
+`FailedIdle`. The parent cannot become terminal until the abort cascade
+withdraws those inputs; inputs explicitly marked Keep remain queued. Process-kill
+tests cover the failure commit's pre- and post-commit boundaries.
 Records written before the adapter type was added lack it and retain generic
 semantics; existing keyed children cannot be silently upgraded. Drain or
 reconcile such work before upgrading. A commit recorded by the new runtime must

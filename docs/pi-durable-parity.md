@@ -501,6 +501,11 @@ unsafe parents, and an unsafe child with an already-started external effect.
 Neither that effect nor its cancellation is proved by the task states. A crash
 before the failure is durably recorded still uses interrupted-attempt recovery;
 process-aborting panics are not caught.
+The failure candidate includes withdrawable queued inputs in foreground owned
+conversations even when those conversations are `FailedIdle`. This keeps the
+parent in failure cleanup until the abort cascade withdraws those inputs, while
+leaving Keep inputs queued. A live-driver regression and OS-kill tests before
+and after the panic failure commit verify cleanup and non-replay on reopen.
 The driver has four ordinary workers. A test occupies all four with TaskTool
 parents and verifies that an admitted TaskTool child stays ready until an
 ordinary worker becomes free; the overflow reservation cannot run that child.

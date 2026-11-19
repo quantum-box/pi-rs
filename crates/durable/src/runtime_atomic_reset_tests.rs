@@ -72,6 +72,294 @@ fn options() -> Options {
         uncertain_policy: UncertainPolicy::InterruptedResult,
     }
 }
+
+#[test]
+fn task_tool_panic_withdraws_failed_idle_owned_conversation_inputs() {
+    use crate::ownership_edge::{Edge, EdgeStore, Mode};
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState};
+    use crate::task_driver::Driver;
+    use crate::task_scheduler::{Registry, Step};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 10,
+    };
+    let root = harness.create_conversation(config.clone()).unwrap();
+    let child = harness.create_conversation(config).unwrap();
+    let withdraw = Uuid::new_v4();
+    let keep = Uuid::new_v4();
+    let (mut state, version) = harness.load(child).unwrap();
+    state.phase = Phase::FailedIdle;
+    for (id, on_abort) in [(withdraw, OnAbort::Withdraw), (keep, OnAbort::Keep)] {
+        state.submissions.push(Submission {
+            kind: SubmissionKind::Input,
+            id,
+            request_id: None,
+            content: "queued".into(),
+            image_notes: vec![],
+            input_blocks: None,
+            on_abort,
+            status: Status::Queued,
+        });
+    }
+    harness.save(&state, Expected::Version(version)).unwrap();
+    let mut registry = Registry::default();
+    registry.register("parent", false, |_: &Task| -> Result<Step, String> {
+        panic!("parent panic")
+    });
+    let scheduler = harness.attach_tasks(registry).unwrap();
+    let parent_id = Uuid::new_v4();
+    let parent = Task::new(
+        parent_id,
+        TaskOwner::Conversation(root),
+        Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap()
+    .registered("parent".into(), false)
+    .into_task_tool();
+    scheduler.submit(&parent).unwrap();
+    let owner = scheduler.owner();
+    let edge = Edge {
+        task: parent_id,
+        task_owner: TaskOwner::Conversation(root),
+        child,
+        mode: Mode::Foreground,
+    };
+    let batch = EdgeStore::new(owner.store()).prepare_create(&edge).unwrap();
+    owner
+        .store()
+        .commit(&batch.checks, &batch.mutations)
+        .unwrap();
+    let driver = Driver::start(scheduler);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let task = driver.get(parent_id).unwrap().unwrap();
+        if task.is_terminal() {
+            assert!(
+                matches!(task.state(), TaskState::Failed(reason) if reason.contains("panicked"))
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "failed parent did not settle");
+        std::thread::yield_now();
+    }
+    let state = harness.conversation(child).unwrap();
+    assert!(
+        matches!(state.submissions.iter().find(|s| s.id == withdraw).unwrap().status, Status::Unanswered { ref reason } if reason == "aborted")
+    );
+    assert_eq!(
+        state
+            .submissions
+            .iter()
+            .find(|s| s.id == keep)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    driver.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_idle_panic_kill_worker() {
+    use crate::ownership_edge::{Edge, EdgeStore, Mode};
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_driver::Driver;
+    use crate::task_scheduler::{Registry, Step};
+    let Some(path) = std::env::var_os("PI_FAILED_IDLE_PANIC_DB") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let after = std::env::var_os("PI_FAILED_IDLE_PANIC_AFTER").is_some();
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 10,
+    };
+    let root = Uuid::from_u128(11);
+    let child = Uuid::from_u128(12);
+    let parent_id = Uuid::from_u128(13);
+    harness
+        .create_conversation_with_id(root, config.clone())
+        .unwrap();
+    harness.create_conversation_with_id(child, config).unwrap();
+    let (mut state, version) = harness.load(child).unwrap();
+    state.phase = Phase::FailedIdle;
+    for (id, on_abort) in [
+        (Uuid::from_u128(14), OnAbort::Withdraw),
+        (Uuid::from_u128(15), OnAbort::Keep),
+    ] {
+        state.submissions.push(Submission {
+            kind: SubmissionKind::Input,
+            id,
+            request_id: None,
+            content: "queued".into(),
+            image_notes: vec![],
+            input_blocks: None,
+            on_abort,
+            status: Status::Queued,
+        });
+    }
+    harness.save(&state, Expected::Version(version)).unwrap();
+    let mut registry = Registry::default();
+    registry.register("parent", false, |_: &Task| -> Result<Step, String> {
+        panic!("test panic")
+    });
+    let mut scheduler = harness.attach_tasks(registry).unwrap();
+    let parent = Task::new(
+        parent_id,
+        TaskOwner::Conversation(root),
+        Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap()
+    .registered("parent".into(), false)
+    .into_task_tool();
+    scheduler.submit(&parent).unwrap();
+    let owner = scheduler.owner();
+    let batch = EdgeStore::new(owner.store())
+        .prepare_create(&Edge {
+            task: parent_id,
+            task_owner: TaskOwner::Conversation(root),
+            child,
+            mode: Mode::Foreground,
+        })
+        .unwrap();
+    owner
+        .store()
+        .commit(&batch.checks, &batch.mutations)
+        .unwrap();
+    let marker = path.with_extension("ready");
+    scheduler.set_failure_boundary_hook(
+        after,
+        Arc::new(move |_, _| {
+            std::fs::write(&marker, b"ready").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }),
+    );
+    let _driver = Driver::start(scheduler);
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_idle_panic_survives_kill_at_failure_commit_boundaries() {
+    use crate::task::{Task, TaskState};
+    use crate::task_driver::Driver;
+    use crate::task_scheduler::{Registry, Step};
+    use std::time::{Duration, Instant};
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for after in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runtime::runtime_atomic_reset_tests::failed_idle_panic_kill_worker",
+                "--nocapture",
+            ])
+            .env("PI_FAILED_IDLE_PANIC_DB", &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if after {
+            command.env("PI_FAILED_IDLE_PANIC_AFTER", "1");
+        }
+        let mut worker = KillOnDrop(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.with_extension("ready").exists() {
+            assert!(
+                worker.0.try_wait().unwrap().is_none(),
+                "worker exited before boundary"
+            );
+            assert!(Instant::now() < deadline, "failure boundary not reached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        worker.0.kill().unwrap();
+        worker.0.wait().unwrap();
+        let harness = Harness::open_paused(&path, options()).unwrap();
+        let before_recovery = harness.conversation(Uuid::from_u128(12)).unwrap();
+        assert_eq!(
+            before_recovery
+                .submissions
+                .iter()
+                .find(|s| s.id == Uuid::from_u128(14))
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+        let original = crate::task_store::TaskStore::new(harness.owner.store())
+            .load(Uuid::from_u128(13))
+            .unwrap()
+            .unwrap()
+            .task;
+        assert_eq!(
+            matches!(original.state(), TaskState::CompletingFailed(_)),
+            after
+        );
+        assert_eq!(matches!(original.state(), TaskState::Running), !after);
+        let replays = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = replays.clone();
+        let mut registry = Registry::default();
+        registry.register("parent", false, move |_: &Task| -> Result<Step, String> {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Step::Succeed(serde_json::Value::Null))
+        });
+        let scheduler = harness.attach_tasks(registry).unwrap();
+        let driver = Driver::start(scheduler);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let task = driver.get(Uuid::from_u128(13)).unwrap().unwrap();
+            if task.is_terminal() {
+                assert!(matches!(task.state(), TaskState::Failed(_)));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed parent did not settle after reopening"
+            );
+            std::thread::yield_now();
+        }
+        let state = harness.conversation(Uuid::from_u128(12)).unwrap();
+        assert!(
+            matches!(state.submissions.iter().find(|s| s.id == Uuid::from_u128(14)).unwrap().status, Status::Unanswered { ref reason } if reason == "aborted")
+        );
+        assert_eq!(
+            state
+                .submissions
+                .iter()
+                .find(|s| s.id == Uuid::from_u128(15))
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+        assert_eq!(replays.load(std::sync::atomic::Ordering::SeqCst), 0);
+        driver.shutdown().unwrap();
+    }
+}
 fn stage_limit_evidence(
     h: &mut Harness,
     id: Uuid,
