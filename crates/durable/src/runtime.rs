@@ -30248,6 +30248,120 @@ mod scheduler_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn conversation_task_result_rejects_changed_value_in_normal_and_abort() {
+        use crate::task::Task;
+        use crate::task_scheduler::{Handler, Step};
+        use crate::task_tool::TaskTool;
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(GatedModel {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                active: AtomicUsize::new(0),
+                maximum: AtomicUsize::new(0),
+            });
+            let handler: Arc<dyn Handler> =
+                Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!("done"))));
+            let adapter = Arc::new(TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "job".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                "task",
+                true,
+                1,
+                handler,
+            ));
+            let mut opts = options(model);
+            opts.tools = vec![adapter.register()];
+            let mut h = Harness::open_paused(&path, opts).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            let op = Uuid::new_v4();
+            let task = adapter.task(id, op, serde_json::json!({}), 5).unwrap();
+            c.abort_requested = abort;
+            c.phase = Phase::TaskPending {
+                turns: 0,
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "job".into(),
+                    arguments: "{}".into(),
+                }],
+                index: 0,
+                operation_id: op,
+                arguments: serde_json::json!({}),
+                task: op,
+                identity: adapter.identity(),
+            };
+            h.save_composed(&c, Expected::Version(version), None, &[task])
+                .unwrap();
+            let tasks = crate::task_store::TaskStore::new(h.owner.store());
+            let mut stored = tasks.load(op).unwrap().unwrap();
+            stored.task.start().unwrap();
+            stored.task.succeed(serde_json::json!("done")).unwrap();
+            tasks
+                .save(&[crate::task_store::Save::Update(&stored)])
+                .unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let writer_barrier = barrier.clone();
+            let writer = std::thread::spawn(move || {
+                let store = durable_store::Store::open(path).unwrap();
+                let tasks = crate::task_store::TaskStore::new(&store);
+                writer_barrier.wait();
+                let current = tasks.load(op).unwrap().unwrap();
+                let mut replacement = serde_json::to_value(&current.task).unwrap();
+                replacement["state"]["Succeeded"] = serde_json::json!("replacement");
+                let key = crate::task_store::key(op);
+                store
+                    .commit(
+                        &[Check {
+                            key: key.clone(),
+                            expected: Expected::Version(current.version),
+                        }],
+                        &[Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&replacement).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                writer_barrier.wait();
+            });
+            TASK_RESULT_BEFORE_COMMIT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    barrier.wait();
+                    barrier.wait();
+                }))
+            });
+            let before = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+            let cancel = CancellationToken::new();
+            let result = if abort {
+                let (c, version) = h.load(id).unwrap();
+                h.settle_abort(c, version, &cancel, None).await.map(|_| ())
+            } else {
+                h.drive(id, &cancel).await.map(|_| ())
+            };
+            writer.join().unwrap();
+            assert!(
+                matches!(result, Err(Error::Invalid(ref reason)) if reason == "task changed during result settlement"),
+                "abort={abort}: {result:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(h.conversation(id).unwrap()).unwrap(),
+                before,
+                "stale result must not alter conversation, abort={abort}"
+            );
+            let tasks = crate::task_store::TaskStore::new(h.owner.store());
+            let task = tasks.load(op).unwrap().unwrap();
+            assert_eq!(
+                task.task.state(),
+                &crate::task::TaskState::Succeeded(serde_json::json!("replacement"))
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn unconnected_checkpointable_call_stops_before_preparation_or_admission() {
         use crate::task::Task;
         use crate::task_scheduler::{Handler, Step};
