@@ -35,11 +35,18 @@ pub enum CallbackStartGateError {
 impl CallbackStartGate {
     /// Enter as a mutation; other mutations may enter concurrently.
     pub fn try_enter(&self) -> Option<MutationLease> {
+        self.try_enter_classified().ok()
+    }
+
+    fn try_enter_classified(&self) -> Result<MutationLease, TargetFenceBusy> {
         use std::sync::atomic::Ordering;
         let mut state = self.0.load(Ordering::Relaxed);
         loop {
-            if state >= CALLBACK_ACTIVE - 1 {
-                return None;
+            if state & CALLBACK_ACTIVE != 0 {
+                return Err(TargetFenceBusy::CallbackStart);
+            }
+            if state == CALLBACK_ACTIVE - 1 {
+                return Err(TargetFenceBusy::MutationCapacity);
             }
             match self.0.compare_exchange_weak(
                 state,
@@ -47,7 +54,7 @@ impl CallbackStartGate {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(MutationLease(self.0.clone())),
+                Ok(_) => return Ok(MutationLease(self.0.clone())),
                 Err(observed) => state = observed,
             }
         }
@@ -109,6 +116,15 @@ pub struct Control {
 pub enum FenceError<E> {
     Poisoned,
     Commit(E),
+}
+
+/// The process-local boundary that prevented a target graph fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetFenceBusy {
+    Registry,
+    CallbackStart,
+    Poll,
+    MutationCapacity,
 }
 
 #[derive(Default)]
@@ -205,10 +221,21 @@ impl ConversationControls {
         targets: &[Uuid],
         commit: impl FnOnce() -> Result<Vec<Uuid>, E>,
     ) -> Result<Option<Vec<Uuid>>, FenceError<E>> {
+        self.try_fence_targets_classified(targets, commit)
+            .map(|result| result.ok())
+    }
+
+    /// Like `try_fence_targets`, retaining the source of contention.
+    /// No durable commit or cancellation occurs when a boundary is busy.
+    pub fn try_fence_targets_classified<E>(
+        &self,
+        targets: &[Uuid],
+        commit: impl FnOnce() -> Result<Vec<Uuid>, E>,
+    ) -> Result<Result<Vec<Uuid>, TargetFenceBusy>, FenceError<E>> {
         use std::sync::TryLockError;
         let mut entries = match self.entries.try_lock() {
             Ok(entries) => entries,
-            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::WouldBlock) => return Ok(Err(TargetFenceBusy::Registry)),
             Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
         };
         let mut ids = targets.to_vec();
@@ -217,10 +244,10 @@ impl ConversationControls {
         let selected: Vec<_> = ids.iter().filter_map(|id| entries.get(id)).collect();
         let mut starts = Vec::with_capacity(selected.len());
         for control in &selected {
-            let Some(lease) = control.callback_start.try_enter() else {
-                return Ok(None);
-            };
-            starts.push(lease);
+            match control.callback_start.try_enter_classified() {
+                Ok(lease) => starts.push(lease),
+                Err(reason) => return Ok(Err(reason)),
+            }
         }
         let gates: Vec<_> = selected
             .iter()
@@ -230,7 +257,7 @@ impl ConversationControls {
         for gate in &gates {
             match gate.try_lock() {
                 Ok(guard) => guards.push(guard),
-                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::WouldBlock) => return Ok(Err(TargetFenceBusy::Poll)),
                 Err(TryLockError::Poisoned(_)) => return Err(FenceError::Poisoned),
             }
         }
@@ -243,7 +270,7 @@ impl ConversationControls {
                 control.cleanup_cancel = CancellationToken::new();
             }
         }
-        Ok(Some(affected))
+        Ok(Ok(affected))
     }
 
     /// Try all current poll gates. Busy performs no commit and cancels no epochs.
@@ -392,6 +419,42 @@ mod tests {
             Some(vec![])
         );
         assert!(start.try_enter().is_some());
+    }
+
+    #[test]
+    fn targeted_fence_classifies_callback_and_poll_contention_without_committing() {
+        let controls = ConversationControls::default();
+        let id = Uuid::from_u128(12);
+        let control = controls.get(id);
+        let called = std::cell::Cell::new(false);
+        let callback = control.callback_start.try_start().unwrap();
+        let result = controls
+            .try_fence_targets_classified(&[id], || {
+                called.set(true);
+                Ok::<_, ()>(vec![id])
+            })
+            .unwrap();
+        assert_eq!(result, Err(TargetFenceBusy::CallbackStart));
+        assert!(!called.get());
+        drop(callback);
+        let poll = control.gate.lock().unwrap();
+        let result = controls
+            .try_fence_targets_classified(&[id], || {
+                called.set(true);
+                Ok::<_, ()>(vec![id])
+            })
+            .unwrap();
+        assert_eq!(result, Err(TargetFenceBusy::Poll));
+        assert!(!called.get());
+        assert!(!control.cancel.is_cancelled());
+        drop(poll);
+        assert_eq!(
+            controls
+                .try_fence_targets_classified(&[id], || Ok::<_, ()>(vec![id]))
+                .unwrap(),
+            Ok(vec![id])
+        );
+        assert!(control.cancel.is_cancelled());
     }
 
     #[test]
