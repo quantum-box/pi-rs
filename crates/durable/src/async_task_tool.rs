@@ -1,7 +1,7 @@
 //! Standalone task-backed async tools with explicit hook policy. Checkpointable
 //! tools have separate replay-safe and unsafe registrations. Conversation-
-//! attached checkpointable execution supports explicitly registered replay-safe,
-//! unhooked task trees; unsafe tools and selected extensions are rejected.
+//! attached checkpointable execution supports explicitly registered replay-safe
+//! task trees and one explicitly selected hook. Unsafe tools are rejected.
 
 use crate::task::Task;
 use pi_rs_core::{Outcome, Tool, ToolSpec};
@@ -48,9 +48,11 @@ impl ReplaySafeConversationHooksAuthorization {
     }
 }
 
-/// Register an identified ordered hook selection for future conversation
-/// checkpointable execution. Dispatch with selected extensions remains
-/// fail-closed until conversation hook and memo fences are connected.
+/// Register one identified replay-safe hook for conversation checkpointable
+/// execution. Every checkpointable child must use the same selected registration.
+/// Conversation publication currently supports only a single plain-text successful
+/// after result without extra metadata or diagnostics; other results fail closed.
+/// The supplied snapshot and Harness registry must share the exact registration.
 #[allow(clippy::too_many_arguments)]
 pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
     registry: &mut crate::task_scheduler::Registry,
@@ -66,16 +68,26 @@ pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
     let selection = snapshot
         .stable_selection(names)
         .ok_or("extension selection is missing, duplicated, or unidentified")?;
+    if names.len() != 1 || selection.hook_count() != 1 {
+        return Err("exactly one selected hook is supported".into());
+    }
     let resolved = snapshot
         .resolve_stable(names, &selection)
         .ok_or("extension selection changed")?;
+    let registration = resolved
+        .registration_evidence()
+        .ok_or("invalid hook registration evidence")?;
     replay_safe::register_conversation_candidate(
         registry,
         tool,
         implementation,
         version,
         children,
-        Some((selection, Arc::new(SelectedBeforeHooks(resolved)))),
+        Some((
+            selection,
+            registration,
+            Arc::new(SelectedBeforeHooks(resolved)),
+        )),
     )
 }
 

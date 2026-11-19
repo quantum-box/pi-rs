@@ -705,6 +705,17 @@ impl Registry {
             .2
             .as_ref()
     }
+    pub(crate) fn checkpointable_selection_for_kind(
+        &self,
+        kind: &str,
+    ) -> Option<&crate::extension::StableExtensionSelection> {
+        self.entries
+            .get(kind)?
+            .conversation_checkpointable
+            .as_ref()?
+            .2
+            .as_ref()
+    }
     pub fn register_shared(
         &mut self,
         kind: impl Into<String>,
@@ -3015,6 +3026,34 @@ impl AdmissionHandle<'_> {
             result => result,
         }
     }
+    pub(crate) fn checkpointable_hook_snapshot(&self) -> Result<serde_json::Value, String> {
+        let Some(harness) = self.validator else {
+            return Ok(serde_json::Value::Null);
+        };
+        let mut current = self.running.task.clone();
+        let tasks = TaskStore::new(self.lease.attachment.owner.store());
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.id()) {
+                return Err("ownership cycle".into());
+            }
+            match current.owner() {
+                TaskOwner::Task(id) => {
+                    current = tasks
+                        .load(*id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("missing owner")?
+                        .task
+                }
+                TaskOwner::Conversation(id) => {
+                    return serde_json::to_value(
+                        harness.conversation(*id).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string());
+                }
+            }
+        }
+    }
     pub(crate) fn replay_safe_durable_check(
         &self,
         cancellation: &pi_rs_core::CancellationToken,
@@ -3057,6 +3096,12 @@ impl AdmissionHandle<'_> {
         }
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let state = self.lease.state.lock().map_err(|e| e.to_string())?;
         let current = TaskStore::new(owner.store())
             .load(self.running.task.id())
@@ -3168,14 +3213,8 @@ impl AdmissionHandle<'_> {
                             .kind()
                             .and_then(|kind| definitions.registry.entries.get(kind))
                             .ok_or("missing checkpointable registration")?;
-                        if registration
-                            .conversation_checkpointable
-                            .as_ref()
-                            .is_none_or(|(_, _, selection)| selection.is_some())
-                        {
-                            return Err(
-                                "conversation checkpointable hooks are not supported".into()
-                            );
+                        if registration.conversation_checkpointable.is_none() {
+                            return Err("conversation checkpointable registration required".into());
                         }
                         for check in harness
                             .checkpointable_conversation_checks(
@@ -9087,6 +9126,22 @@ impl Scheduler {
         // Both use the captured version, so aborts and competing graph writers
         // fence the whole transaction, without a self-conflict.
         let mut graph = self.ts().prepare_save(&batch)?;
+        let selection_gate = if self
+            .registered(&running.task)?
+            .conversation_checkpointable
+            .is_some()
+        {
+            self.validator
+                .as_ref()
+                .map(|h| h.checkpointable_extension_gate())
+        } else {
+            None
+        };
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|_| Error::Poisoned)?;
         if let Some(harness) = &self.validator
             && self
                 .registered(&running.task)?

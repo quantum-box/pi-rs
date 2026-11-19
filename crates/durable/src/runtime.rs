@@ -3133,6 +3133,7 @@ pub struct Harness {
     provider_adapter_pin: Arc<std::sync::Mutex<Option<Arc<dyn crate::model::ProviderAdapter>>>>,
     summary_provider: Option<SummaryProviderIdentity>,
     extensions: Arc<std::sync::RwLock<crate::extension::Registry>>,
+    extension_selection_gate: Arc<std::sync::Mutex<()>>,
     failed: bool,
     dirty: Arc<AtomicBool>,
     merge_admissions: bool,
@@ -4668,6 +4669,7 @@ impl Harness {
             provider_adapter_pin: Arc::new(std::sync::Mutex::new(None)),
             summary_provider: None,
             extensions: Arc::new(std::sync::RwLock::new(crate::extension::Registry::default())),
+            extension_selection_gate: Arc::new(std::sync::Mutex::new(())),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: false,
@@ -4693,6 +4695,7 @@ impl Harness {
             provider_adapter_pin: self.provider_adapter_pin.clone(),
             summary_provider: self.summary_provider.clone(),
             extensions: self.extensions.clone(),
+            extension_selection_gate: self.extension_selection_gate.clone(),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: true,
@@ -4809,6 +4812,10 @@ impl Harness {
     }
     /// Atomically publish a new registry snapshot to subsequent execution phases.
     pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
+        let _selection = self
+            .extension_selection_gate
+            .lock()
+            .map_err(|_| Error::Failed)?;
         self.extensions
             .write()
             .map_err(|_| Error::Failed)?
@@ -4822,6 +4829,10 @@ impl Harness {
         extension: crate::extension::Extension,
         identity: crate::extension::ExtensionIdentity,
     ) -> Result<(), Error> {
+        let _selection = self
+            .extension_selection_gate
+            .lock()
+            .map_err(|_| Error::Failed)?;
         self.extensions
             .write()
             .map_err(|_| Error::Failed)?
@@ -4829,11 +4840,46 @@ impl Harness {
             .map_err(|e| Error::Invalid(format!("extension registry: {e}")))
     }
     pub fn uninstall_extension(&self, name: &str) -> Result<(), Error> {
+        let _selection = self
+            .extension_selection_gate
+            .lock()
+            .map_err(|_| Error::Failed)?;
         self.extensions
             .write()
             .map_err(|_| Error::Failed)?
             .uninstall(name);
         Ok(())
+    }
+    pub(crate) fn checkpointable_extension_gate(&self) -> Arc<std::sync::Mutex<()>> {
+        self.extension_selection_gate.clone()
+    }
+    fn validate_checkpointable_selection(
+        &self,
+        c: &Conversation,
+        adapter: &crate::task_tool::TaskTool,
+    ) -> Result<(), Error> {
+        match (
+            adapter.conversation_selection(),
+            adapter.conversation_registration(),
+        ) {
+            (None, None) if c.extensions.is_empty() => Ok(()),
+            (Some(saved), Some(registration))
+                if self
+                    .extensions
+                    .read()
+                    .map_err(|_| Error::Failed)?
+                    .snapshot()
+                    .resolve_stable(&c.extensions, saved)
+                    .and_then(|resolved| resolved.registration_evidence())
+                    .as_ref()
+                    == Some(registration) =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Invalid(
+                "checkpointable extension selection missing or changed".into(),
+            )),
+        }
     }
     fn selected_extensions(&self, c: &Conversation) -> Result<crate::extension::Resolved, Error> {
         if c.extensions.iter().any(|name| {
@@ -5754,6 +5800,40 @@ impl Harness {
             let result = fenced_poll(
                 async {
                     driver.with_hook_children(children, handlers, state.id, || {
+                        let selection_gate =
+                            evidence.map(|_| self.extension_selection_gate.clone());
+                        let _selection = selection_gate
+                            .as_ref()
+                            .map(|gate| gate.lock())
+                            .transpose()
+                            .map_err(|_| Error::Failed)?;
+                        if let Phase::TaskPending {
+                            ref calls,
+                            index,
+                            ref identity,
+                            ..
+                        } = state.phase
+                            && identity
+                                .as_ref()
+                                .is_some_and(crate::task_tool::Identity::is_checkpointable)
+                        {
+                            let call = calls.get(index).ok_or_else(|| {
+                                Error::Invalid("checkpointable call missing".into())
+                            })?;
+                            let adapter = self
+                                .resolved_tools(state)?
+                                .get(&call.name)
+                                .and_then(|registered| crate::task_tool::lookup(&registered.tool))
+                                .ok_or_else(|| {
+                                    Error::Invalid("checkpointable adapter missing".into())
+                                })?;
+                            if adapter.identity().as_ref() != identity.as_ref() {
+                                return Err(Error::Invalid(
+                                    "checkpointable adapter changed".into(),
+                                ));
+                            }
+                            self.validate_checkpointable_selection(state, &adapter)?;
+                        }
                         self.save_composed_locked(
                             state,
                             expected.clone(),
@@ -11223,7 +11303,12 @@ impl Harness {
                         .read()
                         .map_err(|_| Error::Failed)?
                         .snapshot();
-                    if snapshot.resolve_stable(&c.extensions, saved).is_none() {
+                    if snapshot
+                        .resolve_stable(&c.extensions, saved)
+                        .and_then(|selected| selected.registration_evidence())
+                        .as_ref()
+                        != adapter.conversation_registration()
+                    {
                         return Err(Error::Invalid(
                             "checkpointable extension selection changed or missing".into(),
                         ));
@@ -11306,10 +11391,7 @@ impl Harness {
                         Error::Invalid("checkpointable conversation missing".into())
                     })?;
                     let conversation: Conversation = serde_json::from_slice(&entry.value)?;
-                    if conversation.id != *id
-                        || conversation.abort_requested
-                        || !conversation.extensions.is_empty()
-                    {
+                    if conversation.id != *id || conversation.abort_requested {
                         return Err(Error::Invalid(
                             "checkpointable conversation unavailable or hooks selected".into(),
                         ));
@@ -11343,6 +11425,14 @@ impl Harness {
                     let identity = identity
                         .as_ref()
                         .ok_or_else(|| Error::Invalid("checkpointable identity missing".into()))?;
+                    let current_selection = task
+                        .kind()
+                        .and_then(|kind| registry.checkpointable_selection_for_kind(kind));
+                    if current_selection != identity.conversation_selection() {
+                        return Err(Error::Invalid(
+                            "checkpointable child hook selection mismatch".into(),
+                        ));
+                    }
                     let binding_key = checkpointable_root_binding_key(root);
                     let binding_entry = store.get(&binding_key)?.ok_or_else(|| {
                         Error::Invalid("checkpointable root binding missing".into())
@@ -14826,6 +14916,40 @@ impl Harness {
                     value["foreground_error"].as_str().unwrap().into(),
                 ))
             }
+            crate::task::TaskState::Succeeded(value) if identity.has_conversation_hooks() => {
+                let rich: crate::async_task_tool::DurableTaskResult =
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| Error::Invalid("invalid checkpointable hook result".into()))?;
+                let crate::async_task_tool::DurableTaskResult::Rich {
+                    task_content_v1: result,
+                } = rich
+                else {
+                    return Err(Error::Invalid(
+                        "missing checkpointable after-hook result".into(),
+                    ));
+                };
+                if result.output.len() != 1
+                    || result.output[0].as_object().is_none_or(|o| o.len() != 2)
+                    || result.output[0]
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("text")
+                    || result.extra.len() != 1
+                    || result.extra.get("isError") != Some(&serde_json::Value::Bool(false))
+                    || !result.diagnostics.is_empty()
+                {
+                    return Err(Error::Invalid(
+                        "unsupported checkpointable hook result channels".into(),
+                    ));
+                }
+                Some(Outcome::Succeeded(
+                    result.output[0]
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| Error::Invalid("invalid checkpointable hook text".into()))?
+                        .to_owned(),
+                ))
+            }
             crate::task::TaskState::Succeeded(value) if identity.is_checkpointable() => {
                 let outcome: Outcome = serde_json::from_value(value.clone())
                     .map_err(|_| Error::Invalid("invalid checkpointable tool outcome".into()))?;
@@ -14869,24 +14993,21 @@ impl Harness {
         index: usize,
         identity: &Option<crate::task_tool::Identity>,
     ) -> Result<(), Error> {
-        if identity
-            .as_ref()
-            .is_some_and(crate::task_tool::Identity::is_checkpointable)
-            && !c.extensions.is_empty()
-        {
-            return Err(Error::Invalid(
-                "conversation checkpointable hooks are not supported".into(),
-            ));
-        }
         let current = calls
             .get(index)
             .and_then(|call| self.resolved_tools(c).ok()?.get(&call.name).cloned())
-            .and_then(|reg| crate::task_tool::lookup(&reg.tool))
-            .and_then(|adapter| adapter.identity());
-        if identity.is_none() || current != *identity {
+            .and_then(|reg| crate::task_tool::lookup(&reg.tool));
+        let adapter = current.ok_or_else(|| Error::Invalid("task adapter missing".into()))?;
+        if identity.is_none() || adapter.identity() != *identity {
             return Err(Error::Invalid(
                 "task adapter identity missing or changed".into(),
             ));
+        }
+        if identity
+            .as_ref()
+            .is_some_and(crate::task_tool::Identity::is_checkpointable)
+        {
+            self.validate_checkpointable_selection(c, &adapter)?;
         }
         Ok(())
     }
@@ -15148,6 +15269,18 @@ impl Harness {
             }
         }
         let mut task_result_check = None;
+        let selection_gate = match &c.phase {
+            Phase::TaskPending {
+                identity: Some(identity),
+                ..
+            } if identity.has_conversation_hooks() => Some(self.extension_selection_gate.clone()),
+            _ => None,
+        };
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|_| Error::Failed)?;
         match c.phase.clone() {
             Phase::ToolRunning {
                 turns,
@@ -17251,11 +17384,7 @@ impl Harness {
                         && let Some(adapter) = crate::task_tool::lookup(&registered.tool)
                             .filter(|adapter| adapter.is_checkpointable())
                     {
-                        if adapter.has_conversation_hooks() || !c.extensions.is_empty() {
-                            return Err(Error::Invalid(
-                                "conversation checkpointable tools do not support hooks".into(),
-                            ));
-                        }
+                        self.validate_checkpointable_selection(&c, &adapter)?;
                         let arguments = pi_rs_core::parse_tool_arguments(&call.arguments)
                             .ok()
                             .filter(|arguments| {
@@ -17264,6 +17393,11 @@ impl Harness {
                                         .is_ok_and(|bytes| bytes.len() <= 16 * 1024 * 1024)
                             });
                         let Some(arguments) = arguments else {
+                            if adapter.conversation_selection().is_some() {
+                                return Err(Error::Invalid(
+                                    "checkpointable after hooks are not supported".into(),
+                                ));
+                            }
                             let operation_id = Uuid::new_v4();
                             let outcome =
                                 Outcome::Failed("invalid checkpointable arguments".into());
@@ -19006,6 +19140,15 @@ impl Harness {
                     task,
                     identity,
                 } => {
+                    let hooked = identity
+                        .as_ref()
+                        .is_some_and(crate::task_tool::Identity::has_conversation_hooks);
+                    let selection_gate = hooked.then(|| self.extension_selection_gate.clone());
+                    let _selection = selection_gate
+                        .as_ref()
+                        .map(|gate| gate.lock())
+                        .transpose()
+                        .map_err(|_| Error::Failed)?;
                     self.validate_pending_task_identity(&c, &calls, index, &identity)?;
                     let Some((outcome, task_check)) = self.task_tool_result(
                         c.id,
@@ -19019,6 +19162,37 @@ impl Harness {
                     else {
                         return Ok(());
                     };
+                    let outcome = if hooked && matches!(outcome, Outcome::Failed(_)) {
+                        Outcome::Unknown(
+                            "checkpointable hook cancellation requires reconciliation".into(),
+                        )
+                    } else {
+                        outcome
+                    };
+                    if hooked && !matches!(outcome, Outcome::Unknown(_)) {
+                        record_tool_result(
+                            &mut c,
+                            &calls,
+                            index,
+                            operation_id,
+                            &outcome,
+                            Vec::new(),
+                        )?;
+                        let content = model_tool_content(&c.tool_filters, &calls, index, &outcome);
+                        self.append_tool_with_status(&mut c, &calls, index, operation_id, content)?;
+                        c.pending_diagnostic_provenance = None;
+                        c.phase = Phase::Tools {
+                            turns,
+                            calls,
+                            index: index + 1,
+                        };
+                        self.save_with_task_result_check(
+                            &c,
+                            Expected::Version(version),
+                            task_check,
+                        )?;
+                        continue;
+                    }
                     c.phase = if let Outcome::Unknown(reason) = outcome {
                         Phase::Blocked {
                             tool_panicked: false,
@@ -30728,8 +30902,7 @@ mod scheduler_tests {
                 1,
                 handler,
             )
-            .with_deferred_arguments()
-            .with_conversation_hooks(),
+            .with_deferred_arguments(),
         );
         let mut opts = options(model);
         opts.tools = vec![adapter.register()];
@@ -30747,7 +30920,7 @@ mod scheduler_tests {
         };
         h.save(&c, Expected::Version(version)).unwrap();
         let error = h.drive(id, &CancellationToken::new()).await.unwrap_err();
-        assert!(error.to_string().contains("do not support hooks"));
+        assert!(error.to_string().contains("task driver is not running"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(
             crate::task_store::TaskStore::new(h.owner.store())
@@ -31361,7 +31534,7 @@ mod scheduler_tests {
         let mut opts = options(model.clone());
         opts.tools = vec![adapter.register()];
         let mut h = Harness::open_paused(&path, opts).unwrap();
-        h.install_identified_extension(ext(), ext_id("v1")).unwrap();
+        *h.extensions.write().unwrap() = extensions.clone();
         let id = h.create_conversation(config()).unwrap();
         h.select_extensions(id, vec!["policy".into()]).unwrap();
         let (mut c, version) = h.load(id).unwrap();
@@ -31383,13 +31556,20 @@ mod scheduler_tests {
         h.save_composed(&c, Expected::Version(version), None, &[task])
             .unwrap();
         drop(h);
-        for (fingerprint, accepted) in [("v1", true), ("v2", false)] {
+        for (fingerprint, replace, accepted) in [
+            ("v1", false, true),
+            ("v1", true, false),
+            ("v2", true, false),
+        ] {
             let (registry, adapter) = make();
             let mut opts = options(model.clone());
             opts.tools = vec![adapter.register()];
             let h = Harness::open_paused(&path, opts).unwrap();
-            h.install_identified_extension(ext(), ext_id(fingerprint))
-                .unwrap();
+            *h.extensions.write().unwrap() = extensions.clone();
+            if replace {
+                h.install_identified_extension(ext(), ext_id(fingerprint))
+                    .unwrap();
+            }
             assert_eq!(
                 h.validate_task_tool_registry(&registry).is_ok(),
                 accepted,

@@ -1050,6 +1050,14 @@ pub(crate) struct RegistrationEvidence {
 pub struct StableExtensionSelection {
     selected: Vec<(String, ExtensionIdentity)>,
 }
+impl StableExtensionSelection {
+    pub(crate) fn hook_count(&self) -> usize {
+        self.selected
+            .iter()
+            .map(|(_, identity)| identity.hooks.len())
+            .sum()
+    }
+}
 impl Snapshot {
     pub fn names(&self) -> Vec<&str> {
         self.extensions.iter().map(|x| x.name.as_str()).collect()

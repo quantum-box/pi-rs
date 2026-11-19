@@ -16,6 +16,8 @@ pub struct TaskTool {
     direct_binding: Option<Value>,
     deferred_arguments: bool,
     conversation_hooks: bool,
+    conversation_selection: Option<crate::extension::StableExtensionSelection>,
+    conversation_registration: Option<crate::extension::RegistrationEvidence>,
 }
 /// Handle for a keyed task-backed nested tool. It can be stored in a checkpoint
 /// and resolved after a child wake. The child is admitted only when the parent
@@ -87,6 +89,8 @@ impl TaskTool {
             direct_binding: None,
             deferred_arguments: false,
             conversation_hooks: false,
+            conversation_selection: None,
+            conversation_registration: None,
         }
     }
     pub(crate) fn with_direct_binding(mut self, binding: Value) -> Self {
@@ -103,12 +107,25 @@ impl TaskTool {
     pub(crate) fn is_checkpointable(&self) -> bool {
         self.deferred_arguments
     }
-    pub(crate) fn with_conversation_hooks(mut self) -> Self {
+    pub(crate) fn with_conversation_hooks(
+        mut self,
+        selection: crate::extension::StableExtensionSelection,
+        registration: crate::extension::RegistrationEvidence,
+    ) -> Self {
         self.conversation_hooks = true;
+        self.conversation_selection = Some(selection);
+        self.conversation_registration = Some(registration);
         self
     }
-    pub(crate) fn has_conversation_hooks(&self) -> bool {
-        self.conversation_hooks
+    pub(crate) fn conversation_selection(
+        &self,
+    ) -> Option<&crate::extension::StableExtensionSelection> {
+        self.conversation_selection.as_ref()
+    }
+    pub(crate) fn conversation_registration(
+        &self,
+    ) -> Option<&crate::extension::RegistrationEvidence> {
+        self.conversation_registration.as_ref()
     }
     /// Register this exact adapter. The same handler must be registered with the task driver.
     pub fn register(self: &Arc<Self>) -> crate::runtime::RegisteredTool {
@@ -277,6 +294,7 @@ impl TaskTool {
             direct_binding: self.direct_binding.clone(),
             deferred_arguments: self.deferred_arguments,
             conversation_hooks: self.conversation_hooks,
+            conversation_selection: self.conversation_selection.clone(),
         })
     }
     pub(crate) fn task(
@@ -332,10 +350,20 @@ pub(crate) struct Identity {
     deferred_arguments: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     conversation_hooks: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_selection: Option<crate::extension::StableExtensionSelection>,
 }
 impl Identity {
+    pub(crate) fn has_conversation_hooks(&self) -> bool {
+        self.conversation_hooks
+    }
     pub(crate) fn is_checkpointable(&self) -> bool {
         self.deferred_arguments
+    }
+    pub(crate) fn conversation_selection(
+        &self,
+    ) -> Option<&crate::extension::StableExtensionSelection> {
+        self.conversation_selection.as_ref()
     }
 }
 #[async_trait::async_trait]

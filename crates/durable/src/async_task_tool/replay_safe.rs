@@ -302,8 +302,7 @@ fn register_with_policy(
 }
 
 /// Build a replay-safe definition before opening a conversation harness.
-/// Selected-hook registrations remain unavailable for conversation dispatch
-/// until their hook-phase and memo fences are connected.
+/// Selected children must share the same stable and live hook registration.
 pub(super) fn register_conversation_candidate(
     registry: &mut crate::task_scheduler::Registry,
     tool: Arc<dyn DurableAsyncTool>,
@@ -312,11 +311,12 @@ pub(super) fn register_conversation_candidate(
     children: Vec<Arc<TaskTool>>,
     selected: Option<(
         crate::extension::StableExtensionSelection,
+        crate::extension::RegistrationEvidence,
         Arc<dyn crate::extension::Hook>,
     )>,
 ) -> Result<Arc<TaskTool>, String> {
     let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
-    if let Some((selection, _)) = &selected {
+    if let Some((selection, _, _)) = &selected {
         let hook_id = format!(
             "selection-v1:{}",
             serde_json::to_string(selection).map_err(|e| e.to_string())?
@@ -333,6 +333,13 @@ pub(super) fn register_conversation_candidate(
             || !registry.matches_task_tool(&id, &child.handler())
         {
             return Err("child must be a registered replay-safe task tool".into());
+        }
+        let expected_selection = selected.as_ref().map(|(selection, _, _)| selection);
+        let expected_registration = selected.as_ref().map(|(_, registration, _)| registration);
+        if registry.conversation_hook_selection(&id) != expected_selection
+            || child.conversation_registration() != expected_registration
+        {
+            return Err("child hook selection must match parent".into());
         }
         let name = child.spec().name;
         if name.is_empty() || names.insert(name.clone(), child).is_some() {
@@ -361,9 +368,9 @@ pub(super) fn register_conversation_candidate(
     let validate = Arc::new(move || {
         validate_identity.matches(validate_tool.as_ref(), &validate_implementation, version)
     });
-    let (selection, hook) = match selected {
-        Some((selection, hook)) => (Some(selection), Some(hook)),
-        None => (None, None),
+    let (selection, registration, hook) = match selected {
+        Some((selection, registration, hook)) => (Some(selection), Some(registration), Some(hook)),
+        None => (None, None, None),
     };
     let has_hook = hook.is_some();
     let handler: Arc<dyn Handler> = Arc::new(Executor {
@@ -380,7 +387,10 @@ pub(super) fn register_conversation_candidate(
     });
     let mut adapter = TaskTool::new(spec, kind, true, version, handler).with_deferred_arguments();
     if has_hook {
-        adapter = adapter.with_conversation_hooks();
+        adapter = adapter.with_conversation_hooks(
+            selection.clone().ok_or("missing selection")?,
+            registration.ok_or("missing registration")?,
+        );
     }
     let adapter = Arc::new(adapter);
     registry.register_conversation_checkpointable(&adapter, validate, selection)?;
@@ -904,6 +914,7 @@ impl Executor {
             cancellation: cancel,
             failed: Mutex::new(None),
         };
+        let snapshot = admission.checkpointable_hook_snapshot()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -923,7 +934,6 @@ impl Executor {
                 };
                 self.bounded_hook_arguments(&args)?;
                 if let Err(error) = self.validate_hook_arguments(&args) { return Ok(BeforeResult::Invalid(args, error)); }
-                let snapshot = serde_json::Value::Null;
                 let ctx = crate::extension::Context { snapshot: &snapshot, memo: &memo };
                 let (call, decision, _) = self.hook_registry()?.before_tool(crate::extension::ToolCall { name: self.identity.spec.name.clone(), arguments: args }, &ctx).await;
                 Ok::<_, String>(BeforeResult::Decision(call, decision))
@@ -1051,6 +1061,7 @@ impl Executor {
             cancellation: cancel,
             failed: Mutex::new(None),
         };
+        let snapshot = admission.checkpointable_hook_snapshot()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1060,7 +1071,6 @@ impl Executor {
                 name: self.identity.spec.name.clone(),
                 arguments: args,
             };
-            let snapshot = serde_json::Value::Null;
             let ctx = crate::extension::Context {
                 snapshot: &snapshot,
                 memo: &memo,
