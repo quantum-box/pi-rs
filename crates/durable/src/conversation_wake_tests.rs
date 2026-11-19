@@ -629,40 +629,38 @@ async fn runtime_wake_retries_overlapping_conversation_commits() {
     second.retry_state.deadline_ms = Some(200);
     let b = write(&first, &second);
     store_owner.store().commit(&[], &a).unwrap();
-    let running = Arc::new(AtomicBool::new(true));
-    let writer_running = running.clone();
-    let (started, wait_for_writer) = std::sync::mpsc::sync_channel(0);
+    let (trigger, wait_for_trigger) = std::sync::mpsc::sync_channel::<()>(1);
+    let (committed, wait_for_commit) = std::sync::mpsc::sync_channel::<()>(1);
+    let timeout = std::time::Duration::from_secs(5);
     let writer = std::thread::spawn(move || {
-        // Begin with a committed alternate state, then contend with snapshots.
-        // A finite writer guarantees the reader eventually gets a quiet window
-        // even when the store mutex and snapshot retries are unfair.
+        wait_for_trigger.recv_timeout(timeout).unwrap();
         store_owner.store().commit(&[], &b).unwrap();
-        if started.send(()).is_err() {
-            return;
-        }
-        for _ in 0..512 {
-            if !writer_running.load(Ordering::Acquire) {
-                break;
-            }
-            store_owner.store().commit(&[], &a).unwrap();
-            store_owner.store().commit(&[], &b).unwrap();
-        }
+        committed.send(()).unwrap();
     });
-    wait_for_writer.recv().unwrap();
-    let mut inconsistent = false;
-    for _ in 0..100 {
-        if let Ok(snapshot) = owner.wake_snapshot(0) {
-            inconsistent |= !matches!(snapshot.at, Some(100 | 200))
-                || snapshot.active
-                || !snapshot.unknown_conversations.is_empty();
-        }
-    }
-    running.store(false, Ordering::Release);
+    let driver = owner.driver.weak().upgrade().unwrap();
+    let mut reads = 0;
+    let snapshot = runtime_wake_snapshot_with_observer(
+        &owner.scheduler.harness.owner,
+        &owner.scheduler.worker_activity(),
+        &driver,
+        0,
+        |candidate| {
+            reads += 1;
+            if reads == 1 {
+                // The first read observed A. Publish B before its sequence
+                // check so the result can only be accepted after a retry.
+                assert_eq!(candidate.as_ref().unwrap().at, Some(100));
+                trigger.send(()).unwrap();
+                wait_for_commit.recv_timeout(timeout).unwrap();
+            }
+        },
+    )
+    .unwrap();
     writer.join().unwrap();
-    assert!(!inconsistent);
-    assert!(matches!(
-        owner.wake_snapshot(0).unwrap().at,
-        Some(100 | 200)
-    ));
+    assert!(reads >= 2, "overlapping commit must cause a retry");
+    assert_eq!(snapshot.at, Some(200));
+    assert!(!snapshot.active);
+    assert!(snapshot.unknown_conversations.is_empty());
+    assert_eq!(owner.wake_snapshot(0).unwrap(), snapshot);
     owner.shutdown().await.unwrap();
 }

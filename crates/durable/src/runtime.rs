@@ -21820,6 +21820,18 @@ fn runtime_wake_snapshot(
     driver: &crate::task_driver::Shared,
     now_millis: i64,
 ) -> Result<RuntimeWakeSnapshot, Error> {
+    runtime_wake_snapshot_with_observer(owner, activity, driver, now_millis, |_| {})
+}
+
+// The observer is a no-op in production; tests use it to force a commit
+// between the snapshot reads and their validating sequence check.
+fn runtime_wake_snapshot_with_observer(
+    owner: &durable_store::owner::OwnedStore,
+    activity: &crate::worker_activity::WorkerActivity,
+    driver: &crate::task_driver::Shared,
+    now_millis: i64,
+    mut after_read: impl FnMut(&Result<RuntimeWakeSnapshot, Error>),
+) -> Result<RuntimeWakeSnapshot, Error> {
     let store = owner.store();
     for _ in 0..16 {
         let (revision, workers) = activity.snapshot_with_revision();
@@ -21855,6 +21867,7 @@ fn runtime_wake_snapshot(
             result.unknown_conversations.sort_unstable();
             Ok(result)
         })();
+        after_read(&snapshot);
         let end_sequence = store.commit_sequence()?;
         let (end_revision, _) = activity.snapshot_with_revision();
         if sequence == end_sequence && revision == end_revision {
