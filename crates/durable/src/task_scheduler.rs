@@ -9519,6 +9519,7 @@ impl Scheduler {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reserve_tick_inner(
         &mut self,
         now_millis: i64,
