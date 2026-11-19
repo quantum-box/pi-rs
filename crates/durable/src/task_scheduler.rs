@@ -57,6 +57,10 @@ pub trait Handler: Send + Sync {
     ) -> Result<Step, String> {
         self.run_with_documents(task, documents)
     }
+    /// Whether abort for a parked checkpoint requires a durable cancel claim.
+    fn requires_park_cancel_claim(&self) -> bool {
+        false
+    }
     /// Abort-only reservation. The default never grants ordinary admission or memo access.
     fn run_abort_with_admission(
         &self,
@@ -174,6 +178,8 @@ pub(crate) struct AbortHookIntent {
 pub(crate) struct AbortHookReceipt {
     intent: AbortHookIntent,
     pub(crate) result: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    park_cancel_claim: Option<ParkCancelClaim>,
 }
 fn abort_receipt_key(id: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{id}/abort-after").into_bytes()
@@ -181,13 +187,112 @@ fn abort_receipt_key(id: Uuid) -> Vec<u8> {
 fn abort_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{id}/abort-intent/{attempt}").into_bytes()
 }
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParkCancelClaim {
+    version: u32,
+    task: Uuid,
+    kind: String,
+    definition_version: u32,
+    attempt: Uuid,
+    lease: Uuid,
+    checkpoint: crate::task::Checkpoint,
+    finished: bool,
+}
+pub(crate) fn park_cancel_key(id: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{id}/park-cancel-claim").into_bytes()
+}
+fn park_cancel_original_intent_check(
+    store: &durable_store::Store,
+    claim: &ParkCancelClaim,
+) -> Result<durable_store::Check, String> {
+    let key = abort_intent_key(claim.task, claim.attempt);
+    let entry = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing original cancel intent")?;
+    let intent: AbortHookIntent =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    if intent.version != 1
+        || intent.task != claim.task
+        || intent.kind != claim.kind
+        || intent.definition_version != claim.definition_version
+        || intent.attempt != claim.attempt
+        || intent.lease != claim.lease
+    {
+        return Err("original cancel intent changed".into());
+    }
+    Ok(durable_store::Check {
+        key,
+        expected: durable_store::Expected::Version(entry.version),
+    })
+}
+pub(crate) fn read_park_cancel_claim(
+    store: &durable_store::Store,
+    id: Uuid,
+) -> Result<Option<bool>, String> {
+    let tasks = TaskStore::new(store);
+    for _ in 0..8 {
+        let Some(task) = tasks.load(id).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        if !task.task.is_terminal() {
+            return Ok(None);
+        }
+        let key = park_cancel_key(id);
+        let Some(entry) = store.get(&key).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let claim: ParkCancelClaim =
+            serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+        if claim.version != 1
+            || claim.task != id
+            || Some(claim.kind.as_str()) != task.task.kind()
+            || claim.definition_version != task.task.definition_version()
+            || claim.checkpoint != *task.task.checkpoint()
+            || claim.attempt.is_nil()
+            || claim.lease.is_nil()
+            || !task.task.abort_requested()
+        {
+            return Err("invalid parked cancel evidence".into());
+        }
+        let original_intent = park_cancel_original_intent_check(store, &claim)?;
+        match store.commit(
+            &[
+                durable_store::Check {
+                    key: task_store::key(id),
+                    expected: durable_store::Expected::Version(task.version),
+                },
+                durable_store::Check {
+                    key,
+                    expected: durable_store::Expected::Version(entry.version),
+                },
+                original_intent,
+            ],
+            &[],
+        ) {
+            Ok(()) => return Ok(Some(claim.finished)),
+            Err(durable_store::Error::Conflict { .. }) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("parked cancel evidence changed repeatedly".into())
+}
 pub(crate) fn abort_receipt_evidence(
     store: &durable_store::Store,
     task: &Task,
     entry: &durable_store::Entry,
+    require_park_cancel: bool,
 ) -> Result<(Value, Vec<durable_store::Check>), String> {
     let receipt: AbortHookReceipt =
         serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    if require_park_cancel
+        && task.checkpoint().phase == "replay-safe-async-wait"
+        && receipt.park_cancel_claim.is_none()
+    {
+        return Err("abort receipt missing parked cancel evidence".into());
+    }
     let intent = &receipt.intent;
     if intent.version != 1
         || intent.task != task.id()
@@ -209,19 +314,42 @@ pub(crate) fn abort_receipt_evidence(
     if persisted != *intent {
         return Err("abort intent mismatch".into());
     }
-    Ok((
-        receipt.result,
-        vec![
-            durable_store::Check {
-                key: abort_receipt_key(task.id()),
-                expected: durable_store::Expected::Version(entry.version),
-            },
-            durable_store::Check {
-                key: intent_key,
-                expected: durable_store::Expected::Version(stored.version),
-            },
-        ],
-    ))
+    let mut checks = vec![
+        durable_store::Check {
+            key: abort_receipt_key(task.id()),
+            expected: durable_store::Expected::Version(entry.version),
+        },
+        durable_store::Check {
+            key: intent_key,
+            expected: durable_store::Expected::Version(stored.version),
+        },
+    ];
+    if let Some(claim) = &receipt.park_cancel_claim {
+        let key = park_cancel_key(task.id());
+        let entry = store
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing parked cancel claim")?;
+        let saved: ParkCancelClaim =
+            serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+        if saved != *claim
+            || claim.task != task.id()
+            || Some(claim.kind.as_str()) != task.kind()
+            || claim.definition_version != task.definition_version()
+            || claim.checkpoint != *task.checkpoint()
+            || claim.version != 1
+            || claim.attempt.is_nil()
+            || claim.lease.is_nil()
+        {
+            return Err("parked cancel claim changed".into());
+        }
+        checks.push(park_cancel_original_intent_check(store, claim)?);
+        checks.push(durable_store::Check {
+            key,
+            expected: durable_store::Expected::Version(entry.version),
+        });
+    }
+    Ok((receipt.result, checks))
 }
 
 fn restart_receipt_key(id: Uuid) -> Vec<u8> {
@@ -1728,6 +1856,175 @@ impl AdmissionHandle<'_> {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// Claim once before entering external cleanup. A persisted claim from an
+    /// earlier attempt is evidence of uncertainty, never permission to replay.
+    pub(crate) fn park_cancel_claim(
+        &self,
+        handler: &dyn Handler,
+        finish: bool,
+    ) -> Result<bool, String> {
+        if !self.abort || !self.standalone || self.lease.retired {
+            return Err("invalid cancel lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let graph_version = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.running.task.id())
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.checkpoint().phase != "replay-safe-async-wait"
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cancel lease or live child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.version != current.task.definition_version()
+            || !reg.replay_safe
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("cancel registration changed".into());
+        }
+        let intent_key = abort_intent_key(current.task.id(), attempt);
+        let intent_entry = owner
+            .store()
+            .get(&intent_key)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing cancel reservation intent")?;
+        let intent: AbortHookIntent =
+            serde_json::from_slice(&intent_entry.value).map_err(|e| e.to_string())?;
+        if intent.version != 1
+            || intent.task != current.task.id()
+            || intent.kind != kind
+            || intent.definition_version != current.task.definition_version()
+            || intent.attempt != attempt
+            || intent.lease != self.lease.token
+        {
+            return Err("stale cancel reservation intent".into());
+        }
+        let key = park_cancel_key(current.task.id());
+        let existing = owner.store().get(&key).map_err(|e| e.to_string())?;
+        let mut claim = ParkCancelClaim {
+            version: 1,
+            task: current.task.id(),
+            kind: kind.into(),
+            definition_version: current.task.definition_version(),
+            attempt,
+            lease: self.lease.token,
+            checkpoint: current.task.checkpoint().clone(),
+            finished: false,
+        };
+        if let Some(entry) = &existing {
+            let prior: ParkCancelClaim =
+                serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if prior.version != 1
+                || prior.task != claim.task
+                || prior.kind != claim.kind
+                || prior.definition_version != claim.definition_version
+                || prior.checkpoint != claim.checkpoint
+                || prior.attempt.is_nil()
+                || prior.lease.is_nil()
+            {
+                return Err("invalid cancel claim".into());
+            }
+            let original_intent = park_cancel_original_intent_check(owner.store(), &prior)?;
+            if !finish {
+                owner
+                    .store()
+                    .commit(
+                        &[
+                            durable_store::Check {
+                                key: task_store::key(current.task.id()),
+                                expected: durable_store::Expected::Version(current.version),
+                            },
+                            durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            },
+                            durable_store::Check {
+                                key: intent_key.clone(),
+                                expected: durable_store::Expected::Version(intent_entry.version),
+                            },
+                            original_intent,
+                        ],
+                        &[],
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Ok(false);
+            }
+            if prior != claim {
+                return Err("stale cancel claim".into());
+            }
+            claim.finished = true;
+        } else if finish {
+            return Err("missing cancel claim".into());
+        }
+        let checks = [
+            durable_store::Check {
+                key: task_store::key(current.task.id()),
+                expected: durable_store::Expected::Version(current.version),
+            },
+            durable_store::Check {
+                key: key.clone(),
+                expected: existing
+                    .as_ref()
+                    .map_or(durable_store::Expected::Missing, |entry| {
+                        durable_store::Expected::Version(entry.version)
+                    }),
+            },
+            durable_store::Check {
+                key: intent_key,
+                expected: durable_store::Expected::Version(intent_entry.version),
+            },
+        ];
+        owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&claim).map_err(|e| e.to_string())?,
+                }],
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                graph_version,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
     /// Abort cleanup has its own reservation and never grants ordinary task memo.
     /// A result is stored once only while the exact attempt and definition are live.
     pub(crate) fn abort_hook_receipt(
@@ -1790,8 +2087,13 @@ impl AdmissionHandle<'_> {
         }
         let key = abort_receipt_key(current.task.id());
         if let Some(existing) = owner.store().get(&key).map_err(|e| e.to_string())? {
-            return abort_receipt_evidence(owner.store(), &current.task, &existing)
-                .map(|(value, _)| Some(value));
+            return abort_receipt_evidence(
+                owner.store(),
+                &current.task,
+                &existing,
+                handler.requires_park_cancel_claim(),
+            )
+            .map(|(value, _)| Some(value));
         }
         let intent = AbortHookIntent {
             version: 1,
@@ -1822,22 +2124,54 @@ impl AdmissionHandle<'_> {
             if stored != intent {
                 return Err("stale cleanup intent".into());
             }
+            let mut checks = vec![
+                task_check,
+                missing_receipt,
+                durable_store::Check {
+                    key: intent_key,
+                    expected: durable_store::Expected::Version(entry.version),
+                },
+            ];
+            let park_cancel_claim = if handler.requires_park_cancel_claim()
+                && current.task.checkpoint().phase == "replay-safe-async-wait"
+            {
+                let claim_key = park_cancel_key(current.task.id());
+                let claim_entry = owner
+                    .store()
+                    .get(&claim_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("missing parked cancel claim")?;
+                let claim: ParkCancelClaim =
+                    serde_json::from_slice(&claim_entry.value).map_err(|e| e.to_string())?;
+                if claim.version != 1
+                    || claim.task != current.task.id()
+                    || claim.kind != kind
+                    || claim.definition_version != current.task.definition_version()
+                    || claim.checkpoint != *current.task.checkpoint()
+                    || claim.attempt.is_nil()
+                    || claim.lease.is_nil()
+                {
+                    return Err("invalid parked cancel claim".into());
+                }
+                checks.push(park_cancel_original_intent_check(owner.store(), &claim)?);
+                checks.push(durable_store::Check {
+                    key: claim_key,
+                    expected: durable_store::Expected::Version(claim_entry.version),
+                });
+                Some(claim)
+            } else {
+                None
+            };
             let bytes = serde_json::to_vec(&AbortHookReceipt {
                 intent,
                 result: result.clone(),
+                park_cancel_claim,
             })
             .map_err(|e| e.to_string())?;
             owner
                 .store()
                 .commit(
-                    &[
-                        task_check,
-                        missing_receipt,
-                        durable_store::Check {
-                            key: intent_key,
-                            expected: durable_store::Expected::Version(entry.version),
-                        },
-                    ],
+                    &checks,
                     &[durable_store::Mutation::Put { key, value: bytes }],
                 )
                 .map_err(|e| e.to_string())?;
@@ -1955,6 +2289,7 @@ impl AdmissionHandle<'_> {
             let bytes = serde_json::to_vec(&AbortHookReceipt {
                 intent,
                 result: result.clone(),
+                park_cancel_claim: None,
             })
             .map_err(|e| e.to_string())?;
             owner
@@ -2114,6 +2449,7 @@ impl AdmissionHandle<'_> {
             let bytes = serde_json::to_vec(&AbortHookReceipt {
                 intent,
                 result: result.clone(),
+                park_cancel_claim: None,
             })
             .map_err(|e| e.to_string())?;
             owner
@@ -4302,9 +4638,13 @@ impl Scheduler {
                             .get(&abort_receipt_key(running.task.id()))
                             .map_err(task_store::Error::from)?
                             .ok_or(Error::Ownership)?;
-                        let (_, checks) =
-                            abort_receipt_evidence(self.ts().store(), &running.task, &entry)
-                                .map_err(Error::Handler)?;
+                        let (_, checks) = abort_receipt_evidence(
+                            self.ts().store(),
+                            &running.task,
+                            &entry,
+                            reg.handler.requires_park_cancel_claim(),
+                        )
+                        .map_err(Error::Handler)?;
                         let mut next = running.clone();
                         next.task.cancel().map_err(Error::Transition)?;
                         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
@@ -7502,7 +7842,15 @@ impl Scheduler {
                 });
                 let evidence = if valid_registration {
                     receipt.as_ref().and_then(|entry| {
-                        abort_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
+                        abort_receipt_evidence(
+                            self.ts().store(),
+                            &snapshot.task,
+                            entry,
+                            self.registered(&snapshot.task)
+                                .ok()
+                                .is_some_and(|reg| reg.handler.requires_park_cancel_claim()),
+                        )
+                        .ok()
                     })
                 } else {
                     None

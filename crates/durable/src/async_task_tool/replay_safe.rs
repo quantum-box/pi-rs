@@ -1,7 +1,7 @@
 //! Standalone checkpointable tools with an explicitly registered replay policy.
 use super::{
-    AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableTaskResult,
-    DurableToolResume, DurableToolStep, DurableWait, ToolIdentity,
+    AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableParkCancel, DurableTaskHost,
+    DurableTaskResult, DurableToolResume, DurableToolStep, DurableWait, ToolIdentity,
 };
 use crate::task::{Checkpoint, Task, WaitFor};
 use crate::task_scheduler::{AdmissionHandle, Handler, Scheduler, Step};
@@ -100,6 +100,7 @@ pub(super) fn register(
     abort_after: bool,
     restart_after: bool,
     unavailable: bool,
+    park_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -185,21 +186,22 @@ fn register_with_policy(
         child_identities.push((name, id));
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
-    let encoded = serde_json::to_vec(&(
-        if unavailable {
-            7u32
-        } else if restart_after {
-            6u32
-        } else if abort_after {
-            5u32
-        } else if block_results {
-            4u32
-        } else {
-            1u32
-        },
-        &identity,
-        &child_identities,
-    ))
+    let discriminator = if unavailable {
+        7u32
+    } else if restart_after {
+        6u32
+    } else if abort_after {
+        5u32
+    } else if block_results {
+        4u32
+    } else {
+        1u32
+    };
+    let encoded = if let Some((cancel_id, _)) = &park_cancel {
+        serde_json::to_vec(&(8u32, &identity, &child_identities, cancel_id))
+    } else {
+        serde_json::to_vec(&(discriminator, &identity, &child_identities))
+    }
     .map_err(|e| e.to_string())?;
     if encoded.len() > 65536 {
         return Err("definition identity too large".into());
@@ -224,6 +226,7 @@ fn register_with_policy(
         replay_safe,
         block_results,
         unavailable,
+        park_cancel: park_cancel.map(|(_, callback)| callback),
     });
     scheduler.install_checkpointable_async_handler(
         kind.clone(),
@@ -473,6 +476,7 @@ struct Executor {
     replay_safe: bool,
     block_results: bool,
     unavailable: bool,
+    park_cancel: Option<Arc<dyn DurableParkCancel>>,
 }
 
 struct Host<'a, 'b> {
@@ -1090,6 +1094,9 @@ impl Executor {
 }
 
 impl Handler for Executor {
+    fn requires_park_cancel_claim(&self) -> bool {
+        self.park_cancel.is_some()
+    }
     fn run(&self, _: &Task) -> Result<Step, String> {
         Err("driver reservation required".into())
     }
@@ -1112,6 +1119,63 @@ impl Handler for Executor {
         if let Some(value) = admission.abort_hook_receipt(self, None)? {
             super::validate_aborted_after_result(&value)?;
             return Ok(Step::Succeed(serde_json::Value::Null));
+        }
+        if let Some(cancel) = &self.park_cancel
+            && task.checkpoint().phase == "replay-safe-async-wait"
+        {
+            let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
+                .map_err(|_| "invalid parked cancel checkpoint")?;
+            if stored.version != 1
+                || !stored.arguments.is_object()
+                || !jsonschema::validator_for(&self.identity.spec.parameters)
+                    .is_ok_and(|schema| schema.is_valid(&stored.arguments))
+            {
+                return Err("unsupported parked cancel checkpoint".into());
+            }
+            if admission.park_cancel_claim(self, false)? {
+                #[cfg(test)]
+                if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_CLAIM") {
+                    std::fs::write(std::path::PathBuf::from(dir).join("cancel-claimed"), b"yes")
+                        .map_err(|e| e.to_string())?;
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let cancellation = pi_rs_core::CancellationToken::new();
+                let result = runtime.block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        cancel.cancel(
+                            stored.arguments,
+                            stored.checkpoint,
+                            ToolContext {
+                                operation_id: task.id(),
+                                cancellation: cancellation.clone(),
+                            },
+                        ),
+                    )
+                    .await
+                });
+                cancellation.cancel();
+                if matches!(result, Ok(Ok(()))) {
+                    admission.park_cancel_claim(self, true)?;
+                    #[cfg(test)]
+                    if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_RETURN") {
+                        std::fs::write(
+                            std::path::PathBuf::from(dir).join("cancel-returned"),
+                            b"yes",
+                        )
+                        .map_err(|e| e.to_string())?;
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                }
+            }
         }
         let args = match task.checkpoint().phase.as_str() {
             "initial" => task.input().clone(),

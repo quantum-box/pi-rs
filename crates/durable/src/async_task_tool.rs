@@ -143,7 +143,8 @@ pub fn read_aborted_after_result(
     let Some(entry) = store.get(key.as_bytes()).map_err(|e| e.to_string())? else {
         return Ok(None);
     };
-    let (value, _) = crate::task_scheduler::abort_receipt_evidence(store, &task.task, &entry)?;
+    let (value, _) =
+        crate::task_scheduler::abort_receipt_evidence(store, &task.task, &entry, false)?;
     serde_json::from_value(value)
         .map(Some)
         .map_err(|e| e.to_string())
@@ -452,6 +453,42 @@ pub trait DurableAsyncTool: Tool {
     ) -> Result<DurableToolStep, String>;
 }
 
+/// Explicitly registered cleanup for external work left by a parked tool.
+/// Implementations must be cooperative, start no detached work, and cannot
+/// admit nested tasks. A committed invocation claim is never replayed.
+#[async_trait::async_trait]
+pub trait DurableParkCancel: Send + Sync {
+    async fn cancel(
+        &self,
+        arguments: serde_json::Value,
+        checkpoint: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+    ) -> Result<(), String>;
+}
+
+/// Callback execution evidence. Neither variant proves an external effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkCancelEvidence {
+    AttemptedUnknown,
+    CallbackReturned,
+}
+
+/// Read a terminal task's fenced callback evidence for reconciliation.
+pub fn read_park_cancel_evidence(
+    store: &durable_store::Store,
+    task: uuid::Uuid,
+) -> Result<Option<ParkCancelEvidence>, String> {
+    Ok(
+        crate::task_scheduler::read_park_cancel_claim(store, task)?.map(|finished| {
+            if finished {
+                ParkCancelEvidence::CallbackReturned
+            } else {
+                ParkCancelEvidence::AttemptedUnknown
+            }
+        }),
+    )
+}
+
 /// The host attests that this named tool is unavailable for this task and that
 /// the supplied hook selection is the exact intended immutable selection.
 pub struct UnavailableAfterAuthorization(());
@@ -576,6 +613,7 @@ impl StandaloneNoHooksHost {
             false,
             false,
             false,
+            None,
         )
     }
 
@@ -874,6 +912,7 @@ impl StandaloneBeforeHookHost {
             false,
             false,
             false,
+            None,
         )
     }
     /// Register a stable ordered selection of replay-safe block-aware hooks.
@@ -925,6 +964,50 @@ impl StandaloneBeforeHookHost {
             false,
         )
     }
+    /// Register one explicitly identified parked-tool cleanup, together with
+    /// the selected abort-after hooks. The callback must not spawn detached work;
+    /// `cancel_identity` must change when its implementation or configuration changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_replay_safe_durable_tool_with_park_cancel(
+        &mut self,
+        tool: Arc<dyn DurableAsyncTool>,
+        implementation: &str,
+        version: u32,
+        children: Vec<Arc<crate::task_tool::TaskTool>>,
+        snapshot: &crate::extension::Snapshot,
+        names: &[String],
+        cancel_identity: &str,
+        cancel: Arc<dyn DurableParkCancel>,
+        _authorization: ReplaySafeAuthorization,
+        _cleanup: AbortAfterAuthorization,
+    ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+        if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+            return Err("invalid cancel identity".into());
+        }
+        let selection = snapshot
+            .stable_selection(names)
+            .ok_or("invalid selection")?;
+        let resolved = snapshot
+            .resolve_stable(names, &selection)
+            .ok_or("selection changed")?;
+        let identity = format!(
+            "selection-v1:{}",
+            serde_json::to_string(&selection).map_err(|e| e.to_string())?
+        );
+        replay_safe::register(
+            &mut self.scheduler,
+            tool,
+            implementation,
+            version,
+            children,
+            Some((identity, Arc::new(SelectedBeforeHooks(resolved)))),
+            true,
+            true,
+            false,
+            false,
+            Some((cancel_identity.to_owned(), cancel)),
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     fn register_content_hooks_inner(
         &mut self,
@@ -958,6 +1041,7 @@ impl StandaloneBeforeHookHost {
             abort_after,
             restart_after,
             false,
+            None,
         )
     }
     /// Register an explicitly unavailable name and its exact selected hooks.
@@ -997,6 +1081,7 @@ impl StandaloneBeforeHookHost {
             false,
             false,
             true,
+            None,
         )
     }
     /// Register an unsafe checkpointable tool with replay-safe hooks and argument preparation.
@@ -11844,6 +11929,299 @@ mod tests {
                 1
             );
         }
+    }
+    struct ParkCancelFixture(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl DurableParkCancel for ParkCancelFixture {
+        async fn cancel(
+            &self,
+            args: serde_json::Value,
+            checkpoint: serde_json::Value,
+            _: ToolContext,
+        ) -> Result<(), String> {
+            if args != json!({"token":"prepared"})
+                || checkpoint.get("call").is_none()
+                || !self.0.join("child-aborted").exists()
+            {
+                return Err("bad cancel input or child ordering".into());
+            }
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("cancel-count"))
+                .map_err(|e| e.to_string())?;
+            writeln!(file, "cancel").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            if self.0.join("pause-cancel").exists() {
+                std::fs::write(self.0.join("cancel-ready"), b"yes").map_err(|e| e.to_string())?;
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+    fn park_cancel_host(
+        root: &std::path::Path,
+    ) -> (StandaloneBeforeHookHost, Arc<crate::task_tool::TaskTool>) {
+        use crate::task_scheduler::Handler;
+        let leaf: Arc<dyn Handler> = Arc::new(ChainLeaf);
+        let mut registry = Registry::default();
+        assert!(registry.register_shared("park-cancel-leaf", true, leaf.clone()));
+        let child_marker = root.join("child-aborted");
+        assert!(registry.set_abort("park-cancel-leaf", move |_: &Task| {
+            std::fs::write(&child_marker, b"yes").map_err(|e| e.to_string())?;
+            Ok(crate::task_scheduler::Step::Succeed(json!(null)))
+        }));
+        let mut extensions = crate::extension::Registry::default();
+        extensions
+            .install_identified(
+                crate::extension::Extension {
+                    name: "hook".into(),
+                    hooks: vec![Arc::new(AbortResultHook(root.to_owned()))],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(
+                    1,
+                    "park-cancel-hook".into(),
+                    vec!["hook".into()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "leaf".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "park-cancel-leaf",
+            true,
+            1,
+            leaf,
+        ));
+        let tool = host
+            .register_replay_safe_durable_tool_with_park_cancel(
+                Arc::new(ChainTool {
+                    name: "root",
+                    child: "leaf",
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    any: false,
+                }),
+                "park-cancel-tool-v1",
+                1,
+                vec![child],
+                &extensions.snapshot(),
+                &["hook".into()],
+                "park-cancel-v1",
+                Arc::new(ParkCancelFixture(root.to_owned())),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                AbortAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        (host, tool)
+    }
+    fn wait_park_cancel(driver: &crate::task_driver::Driver, id: Uuid) {
+        let root = wait_state(driver, id, |s| {
+            matches!(
+                s,
+                crate::task::TaskState::Waiting(crate::task::WaitFor::Tasks(_))
+            )
+        });
+        let child: AsyncTaskCall =
+            serde_json::from_value(root.checkpoint().data["checkpoint"]["call"].clone()).unwrap();
+        wait_state(driver, child.task_id(), |s| {
+            matches!(
+                s,
+                crate::task::TaskState::Waiting(crate::task::WaitFor::Signal(_))
+            )
+        });
+    }
+    #[test]
+    fn parked_cancel_child_first_and_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (host, tool) = park_cancel_host(root);
+        let id = host
+            .start_replay_safe_root(&tool, json!({"token":"prepared"}), 3)
+            .unwrap();
+        let driver = host.into_driver();
+        wait_park_cancel(&driver, id);
+        driver.request_abort(id).unwrap();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert_eq!(
+            read_park_cancel_evidence(&store, id).unwrap(),
+            Some(ParkCancelEvidence::CallbackReturned)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn parked_cancel_unknown_checkpoint_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (host, tool) = park_cancel_host(root);
+        let id = host
+            .start_replay_safe_root(&tool, json!({"token":"prepared"}), 3)
+            .unwrap();
+        let driver = host.into_driver();
+        wait_park_cancel(&driver, id);
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let mut task = tasks.load(id).unwrap().unwrap();
+        let mut checkpoint = task.task.checkpoint().clone();
+        checkpoint.data["version"] = json!(99);
+        task.task.migrate(
+            task.task.definition_version(),
+            task.task.input().clone(),
+            checkpoint,
+        );
+        let batch = tasks
+            .prepare_save(&[crate::task_store::Save::Update(&task)])
+            .unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        drop(store);
+        let (host, _) = park_cancel_host(root);
+        let driver = host.into_driver();
+        driver.request_abort(id).unwrap();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert!(!root.join("cancel-count").exists());
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(read_park_cancel_evidence(&store, id).unwrap().is_none());
+    }
+    #[test]
+    fn parked_cancel_kill_and_reopen_does_not_duplicate() {
+        const ENV: &str = "PI_TEST_PARK_CANCEL_FIXTURE";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, tool) = park_cancel_host(&root);
+            let id = host
+                .start_replay_safe_root(&tool, json!({"token":"prepared"}), 3)
+                .unwrap();
+            std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+            let driver = host.into_driver();
+            wait_park_cancel(&driver, id);
+            driver.request_abort(id).unwrap();
+            loop {
+                std::hint::black_box(&driver);
+                std::thread::park();
+            }
+        }
+        for cut in ["claim", "running", "returned"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            if cut == "running" {
+                std::fs::write(root.join("pause-cancel"), b"yes").unwrap();
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("async_task_tool::tests::parked_cancel_kill_and_reopen_does_not_duplicate")
+                .env(ENV, root);
+            if cut == "returned" {
+                command.env("PI_TEST_PARK_CANCEL_AFTER_RETURN", root);
+            } else if cut == "claim" {
+                command.env("PI_TEST_PARK_CANCEL_AFTER_CLAIM", root);
+            }
+            let mut process = command.spawn().unwrap();
+            wait_file(&root.join(match cut {
+                "claim" => "cancel-claimed",
+                "returned" => "cancel-returned",
+                _ => "cancel-ready",
+            }));
+            process.kill().unwrap();
+            process.wait().unwrap();
+            let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let (host, _) = park_cancel_host(root);
+            let driver = host.into_driver();
+            assert!(matches!(
+                wait_terminal(&driver, id).state(),
+                crate::task::TaskState::Cancelled
+            ));
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            assert_eq!(
+                read_park_cancel_evidence(&store, id).unwrap(),
+                Some(if cut == "returned" {
+                    ParkCancelEvidence::CallbackReturned
+                } else {
+                    ParkCancelEvidence::AttemptedUnknown
+                })
+            );
+            if cut == "claim" {
+                assert!(!root.join("cancel-count").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("cancel-count"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+    #[test]
+    fn parked_cancel_deleted_claim_cannot_authorize_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::parked_cancel_kill_and_reopen_does_not_duplicate")
+            .env("PI_TEST_PARK_CANCEL_FIXTURE", root)
+            .env("PI_TEST_ABORT_AFTER_RECEIPT", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("abort-receipt"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let key = crate::task_scheduler::park_cancel_key(id);
+        let entry = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Delete { key }],
+            )
+            .unwrap();
+        drop(store);
+        let (host, _) = park_cancel_host(root);
+        let driver = host.into_driver();
+        let task = wait_terminal(&driver, id);
+        assert!(!matches!(task.state(), crate::task::TaskState::Cancelled));
+        let _ = driver.shutdown_with_pending().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
     struct SuppressGate;
     #[async_trait::async_trait]
