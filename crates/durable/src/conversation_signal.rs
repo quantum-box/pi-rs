@@ -88,10 +88,16 @@ pub(crate) fn prepare_callback_start_signal_fence(
     if marker.is_empty() {
         return Err(Error::Corrupt);
     }
+    let conversation_key = conversation_key(conversation);
+    let conversation_entry = store.get(&conversation_key)?.ok_or(Error::NotFound)?;
     let rev_key = revision(conversation);
     let observed = store.get(&rev_key)?;
     Ok(crate::task_store::OwnedBatch {
         checks: vec![
+            Check {
+                key: conversation_key,
+                expected: Expected::Version(conversation_entry.version),
+            },
             Check {
                 key: callback_start_key(conversation),
                 expected: Expected::Missing,
@@ -131,7 +137,10 @@ pub(crate) fn prepare_callback_finish_signal_fence(
     })
 }
 
-fn clear_callback_start_check(store: &Store, conversation: Uuid) -> Result<Check, Error> {
+pub(crate) fn clear_callback_start_check(
+    store: &Store,
+    conversation: Uuid,
+) -> Result<Check, Error> {
     let key = callback_start_key(conversation);
     if store.get(&key)?.is_some() {
         return Err(Error::CallbackStartBusy);

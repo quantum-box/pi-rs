@@ -1070,6 +1070,7 @@ fn pre_transaction_busy(error: &Error) -> bool {
 
 fn runtime_pre_transaction_busy(error: &crate::runtime::Error) -> bool {
     match error {
+        crate::runtime::Error::TaskPublicationBusy => true,
         crate::runtime::Error::Storage(durable_store::Error::WriteLockBusy(_)) => true,
         crate::runtime::Error::TaskScheduler(error) => pre_transaction_busy(error),
         crate::runtime::Error::Document(crate::document::Error::Store(
@@ -12350,15 +12351,25 @@ impl Scheduler {
         }
         let result = if let Some(harness) = self.validator.as_mut() {
             let owner = self.attachment.owner.clone();
-            owner
+            match owner
                 .conversation_controls()
                 .fence(|| harness.abort_owned_graph(None, Some(id)))
-                .map(|_| ())
-                .map_err(|e| Error::Handler(format!("foreground abort: {e:?}")))
+            {
+                Ok(_) => Ok(()),
+                Err(durable_store::controls::FenceError::Commit(error))
+                    if runtime_pre_transaction_busy(&error) =>
+                {
+                    Err(Error::Busy)
+                }
+                Err(error) => Err(Error::Handler(format!("foreground abort: {error:?}"))),
+            }
         } else {
             request_abort_subtree(&self.ts(), id)
         };
-        if result.is_err() && (self.validator.is_some() || matches!(result, Err(Error::Store(_)))) {
+        if result.is_err()
+            && !matches!(result, Err(Error::Busy))
+            && (self.validator.is_some() || matches!(result, Err(Error::Store(_))))
+        {
             self.poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
         }
@@ -13417,6 +13428,11 @@ fn request_abort_roots_with(
             }
         }
         for task_id in &ids {
+            match task_store::clear_callback_start_check(ts.store(), *task_id) {
+                Ok(check) => batch.checks.push(check),
+                Err(task_store::Error::CallbackStartBusy) => return Err(Error::Busy),
+                Err(error) => return Err(error.into()),
+            }
             let (check, mutation) =
                 crate::ownership_edge::prepare_abort_fence(ts.store(), &TaskOwner::Task(*task_id))
                     .map_err(task_store::Error::from)?;
@@ -19511,6 +19527,43 @@ mod tests {
             scheduler.get(root.id()).unwrap().unwrap().state(),
             &TaskState::Succeeded(json!("done"))
         );
+    }
+
+    #[test]
+    fn callback_marker_inserted_after_abort_scan_defers_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let ts = scheduler.ts();
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(100)),
+            "job",
+            true,
+            4,
+        );
+        ts.save(&[Save::Create(&root)]).unwrap();
+        let marker =
+            task_store::prepare_callback_start_task_fence(ts.store(), root.id(), b"claim").unwrap();
+        let mut injected = false;
+        let result = request_abort_subtree_with(&ts, root.id(), || {
+            if !injected {
+                ts.store()
+                    .commit(&marker.checks, &marker.mutations)
+                    .unwrap();
+                injected = true;
+            }
+        });
+        assert!(matches!(result, Err(Error::Busy)));
+        assert!(injected);
+        assert!(!ts.load(root.id()).unwrap().unwrap().task.abort_requested());
+        let finish =
+            task_store::prepare_callback_finish_task_fence(ts.store(), root.id(), b"claim")
+                .unwrap();
+        ts.store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        request_abort_subtree(&ts, root.id()).unwrap();
+        assert!(ts.load(root.id()).unwrap().unwrap().task.abort_requested());
     }
 
     #[test]

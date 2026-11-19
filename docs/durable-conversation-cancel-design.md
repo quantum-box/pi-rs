@@ -107,11 +107,15 @@ retirement helpers still require the owning claim and graph checks; they are
 not connected to callback dispatch, and a root marker alone does not cover a
 nested task graph.
 
-The synchronous Harness and task signal APIs still return a busy error when a
-marker or callback start wins; they have no automatic retry owner yet. Direct
-abort, full graph marker coverage and the composed callback start transaction
-remain unconnected. Callback dispatch remains disabled until every boundary
-and retry path is complete.
+Direct abort transactions now check marker absence for their discovered tasks
+and conversations; an existing marker makes abort return busy without writes,
+and a concurrent marker insertion forces transaction conflict and rescan.
+Deferred task cleanup retries this busy condition. The synchronous abort and
+signal APIs still expose busy to the caller and have no automatic retry owner.
+Direct abort still takes the legacy global poll fence; full graph marker
+coverage, generic public task mutation fencing, and the composed callback
+start transaction remain unconnected. Callback dispatch remains disabled until
+every boundary and retry path is complete.
 
 The pre-dispatch conversation cancel claim transaction also checks the root
 task signal revision and conversation signal revision. A public Inbox or task

@@ -14593,6 +14593,29 @@ impl Harness {
                     return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
                 }
             }
+            // Every selected callback-start marker is checked in the abort
+            // transaction. A competing start causes a non-mutating retry.
+            let mut callback_checks = Vec::new();
+            for id in &conversations {
+                match crate::conversation_signal::clear_callback_start_check(store, *id) {
+                    Ok(check) => callback_checks.push(check),
+                    Err(crate::conversation_signal::Error::CallbackStartBusy) => {
+                        return Err(Error::TaskPublicationBusy);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            for id in &tasks {
+                match crate::task_store::clear_callback_start_check(store, *id) {
+                    Ok(check) => callback_checks.push(check),
+                    Err(crate::task_store::Error::CallbackStartBusy) => {
+                        return Err(Error::TaskPublicationBusy);
+                    }
+                    Err(error) => {
+                        return Err(Error::Invalid(format!("task callback start: {error}")));
+                    }
+                }
+            }
             let mut updates = Vec::new();
             let mut generation_updates = Vec::new();
             for id in &tasks {
@@ -14704,6 +14727,7 @@ impl Harness {
                 });
             }
             batch.checks.extend(edge_checks);
+            batch.checks.extend(callback_checks);
             if let Some(parent) = nested_parent {
                 batch.checks.push(Check {
                     key: crate::task_store::key(parent),
@@ -25338,6 +25362,129 @@ mod scheduler_tests {
                 .poll_first(future.as_mut(), &mut context)
                 .is_pending()
         );
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn attached_task_abort_marker_busy_does_not_poison_scheduler() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let mut registry = crate::task_scheduler::Registry::default();
+        registry.register("task", true, |_: &crate::task::Task| {
+            Ok(crate::task_scheduler::Step::Succeed(serde_json::json!(
+                null
+            )))
+        });
+        let mut tasks = harness.attach_tasks(registry).unwrap();
+        let task = crate::task::Task::new(
+            Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(Uuid::new_v4()),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("task".into(), true);
+        tasks.submit(&task).unwrap();
+        let store = harness.owner.store();
+        let start =
+            crate::task_store::prepare_callback_start_task_fence(store, task.id(), b"claim")
+                .unwrap();
+        store.commit(&start.checks, &start.mutations).unwrap();
+        assert!(matches!(
+            tasks.request_abort(task.id()),
+            Err(crate::task_scheduler::Error::Busy)
+        ));
+        assert!(!tasks.get(task.id()).unwrap().unwrap().abort_requested());
+        let finish =
+            crate::task_store::prepare_callback_finish_task_fence(store, task.id(), b"claim")
+                .unwrap();
+        store.commit(&finish.checks, &finish.mutations).unwrap();
+        tasks.request_abort(task.id()).unwrap();
+        assert!(tasks.get(task.id()).unwrap().unwrap().abort_requested());
+    }
+
+    #[test]
+    fn callback_marker_inserted_after_conversation_abort_scan_defers_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let conversation = harness.create_conversation(config()).unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let marker = crate::conversation_signal::prepare_callback_start_signal_fence(
+            &store,
+            conversation,
+            b"claim",
+        )
+        .unwrap();
+        let mut injected = false;
+        let result =
+            harness.abort_owned_graph_impl_with(Some(conversation), None, None, false, || {
+                if !injected {
+                    store.commit(&marker.checks, &marker.mutations).unwrap();
+                    injected = true;
+                }
+            });
+        assert!(matches!(result, Err(Error::TaskPublicationBusy)));
+        assert!(injected);
+        assert!(!harness.conversation(conversation).unwrap().abort_requested);
+        let finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+            &store,
+            conversation,
+            b"claim",
+        )
+        .unwrap();
+        store.commit(&finish.checks, &finish.mutations).unwrap();
+        harness.request_abort(conversation).unwrap();
+        assert!(harness.conversation(conversation).unwrap().abort_requested);
+    }
+
+    #[tokio::test]
+    async fn durable_start_marker_fences_direct_conversation_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let other = scheduler.create_conversation(config()).unwrap();
+        let abort_first = scheduler.create_conversation(config()).unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let start = crate::conversation_signal::prepare_callback_start_signal_fence(
+            &store, target, b"claim",
+        )
+        .unwrap();
+        store.commit(&start.checks, &start.mutations).unwrap();
+        assert!(matches!(
+            scheduler.abort(target),
+            Err(Error::TaskPublicationBusy)
+        ));
+        assert!(!scheduler.conversation(target).unwrap().abort_requested);
+        let signal = crate::conversation_signal::Signal::new(
+            Uuid::new_v4(),
+            other,
+            "wake".into(),
+            serde_json::json!(1),
+        );
+        scheduler.send_signal(&signal).unwrap();
+        let finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+            &store, target, b"claim",
+        )
+        .unwrap();
+        store.commit(&finish.checks, &finish.mutations).unwrap();
+        scheduler.abort(target).unwrap();
+        let stale_start = crate::conversation_signal::prepare_callback_start_signal_fence(
+            &store,
+            abort_first,
+            b"claim-2",
+        )
+        .unwrap();
+        scheduler.abort(abort_first).unwrap();
+        assert!(matches!(
+            store.commit(&stale_start.checks, &stale_start.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
         scheduler.shutdown().await.unwrap();
     }
 

@@ -5892,6 +5892,92 @@ mod tests {
     }
 
     #[test]
+    fn task_start_marker_fences_driver_abort_until_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_with_abort(
+            "blocked",
+            true,
+            move |_: &Task| {
+                entered_tx.send(()).unwrap();
+                release.lock().unwrap().recv().unwrap();
+                Ok(task_scheduler::Step::Succeed(json!("done")))
+            },
+            |_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))),
+        );
+        let (other_tx, other_rx) = mpsc::channel();
+        registry.register("other", true, move |_: &Task| {
+            other_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("other")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("blocked".into(), true);
+        scheduler.submit(&task).unwrap();
+        let driver = Driver::start(scheduler);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        assert!(matches!(
+            driver.request_abort(task.id()),
+            Err(Error::Task(task_scheduler::Error::Busy))
+        ));
+        assert!(!driver.get(task.id()).unwrap().unwrap().abort_requested());
+        let other = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&other)])
+            .unwrap();
+        driver.shared.notify_work();
+        other_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        let stale_start =
+            task_store::prepare_callback_start_task_fence(owner.store(), task.id(), b"claim-2")
+                .unwrap();
+        driver.request_abort(task.id()).unwrap();
+        assert!(driver.get(task.id()).unwrap().unwrap().abort_requested());
+        assert!(matches!(
+            owner
+                .store()
+                .commit(&stale_start.checks, &stale_start.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        release_tx.send(()).unwrap();
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
     fn task_start_marker_defers_signal_and_driver_wake_until_release() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = task_scheduler::Registry::default();
