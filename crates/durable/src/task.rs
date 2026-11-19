@@ -52,6 +52,7 @@ impl Task {
             background: false,
             task_tool: false,
             retain_task_children_on_success: false,
+            restart_cleanup: false,
         })
     }
 
@@ -141,6 +142,7 @@ impl Task {
     pub(crate) fn is_fresh_admission(&self) -> bool {
         self.state == TaskState::Ready
             && !self.abort_requested
+            && !self.restart_cleanup
             && self.restarts == 0
             && self.attempt_id.is_none()
             && self.retired_attempt_id.is_none()
@@ -387,6 +389,46 @@ impl Task {
         )
     }
 
+    pub(crate) fn holds_restart_cleanup(&self) -> bool {
+        self.restart_cleanup
+    }
+    pub(crate) fn hold_restart_failure(&mut self) -> Result<(), TransitionError> {
+        self.hold_failure("restart limit".into())?;
+        self.restart_cleanup = true;
+        self.restarts = 0;
+        Ok(())
+    }
+    pub(crate) fn start_restart_cleanup(&mut self, attempt: Uuid) -> Result<(), TransitionError> {
+        if !self.restart_cleanup
+            || !matches!(&self.state, TaskState::CompletingFailed(reason) if reason == "restart limit")
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        if self.attempt_id.is_some() {
+            return Err(TransitionError::InvalidState);
+        }
+        self.attempt_id = Some(attempt);
+        self.retired_attempt_id = None;
+        self.restarts = 0;
+        Ok(())
+    }
+    pub(crate) fn finish_restart_cleanup(&mut self) -> Result<(), TransitionError> {
+        if !self.restart_cleanup
+            || !matches!(
+                self.state,
+                TaskState::Ready | TaskState::Running | TaskState::CompletingFailed(_)
+            )
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Failed("restart limit".into());
+        self.attempt_id = None;
+        self.retired_attempt_id = None;
+        self.typed_wake = None;
+        self.ended_children = None;
+        self.wake_children = None;
+        Ok(())
+    }
     pub(crate) fn hold_failure(&mut self, reason: String) -> Result<(), TransitionError> {
         self.fail(reason)?;
         self.state = match std::mem::replace(&mut self.state, TaskState::Ready) {
@@ -496,6 +538,23 @@ mod tests {
     }
 
     #[test]
+    fn restart_cleanup_reservation_preserves_failure_and_attempt_identity() {
+        let mut task = task(3);
+        task.start_attempt(Uuid::new_v4()).unwrap();
+        task.hold_restart_failure().unwrap();
+        assert!(
+            matches!(task.state(),TaskState::CompletingFailed(reason) if reason=="restart limit")
+        );
+        assert!(task.holds_restart_cleanup());
+        let attempt = Uuid::new_v4();
+        task.start_restart_cleanup(attempt).unwrap();
+        assert_eq!(task.attempt_id(), Some(attempt));
+        assert!(matches!(task.state(), TaskState::CompletingFailed(_)));
+        assert!(task.start_restart_cleanup(Uuid::new_v4()).is_err());
+        task.finish_restart_cleanup().unwrap();
+        assert_eq!(task.state(), &TaskState::Failed("restart limit".into()));
+    }
+    #[test]
     fn fresh_admission_requires_all_initial_lifecycle_fields() {
         let base = task(3)
             .registered_versioned("job".into(), false, 7, json!({"x":1}))
@@ -525,6 +584,9 @@ mod tests {
         cases.push(t);
         let mut t = base.clone();
         t.abort_requested = true;
+        cases.push(t);
+        let mut t = base.clone();
+        t.restart_cleanup = true;
         cases.push(t);
         let mut t = base.clone();
         t.state = TaskState::Running;

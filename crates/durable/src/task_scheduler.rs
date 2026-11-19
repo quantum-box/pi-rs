@@ -223,6 +223,55 @@ pub(crate) fn abort_receipt_evidence(
     ))
 }
 
+fn restart_receipt_key(id: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{id}/restart-after").into_bytes()
+}
+fn restart_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{id}/restart-intent/{attempt}").into_bytes()
+}
+pub(crate) fn restart_receipt_evidence(
+    store: &durable_store::Store,
+    task: &Task,
+    entry: &durable_store::Entry,
+) -> Result<(Value, Vec<durable_store::Check>), String> {
+    let receipt: AbortHookReceipt =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    let intent = &receipt.intent;
+    if intent.version != 1
+        || intent.task != task.id()
+        || Some(intent.kind.as_str()) != task.kind()
+        || intent.definition_version != task.definition_version()
+        || intent.attempt.is_nil()
+        || intent.lease.is_nil()
+    {
+        return Err("restart receipt identity mismatch".into());
+    }
+    crate::async_task_tool::validate_restart_after_result(&receipt.result)?;
+    let intent_key = restart_intent_key(task.id(), intent.attempt);
+    let stored = store
+        .get(&intent_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing restart intent")?;
+    let persisted: AbortHookIntent =
+        serde_json::from_slice(&stored.value).map_err(|e| e.to_string())?;
+    if persisted != *intent {
+        return Err("restart intent mismatch".into());
+    }
+    Ok((
+        receipt.result,
+        vec![
+            durable_store::Check {
+                key: restart_receipt_key(task.id()),
+                expected: durable_store::Expected::Version(entry.version),
+            },
+            durable_store::Check {
+                key: intent_key,
+                expected: durable_store::Expected::Version(stored.version),
+            },
+        ],
+    ))
+}
+
 #[derive(Clone)]
 struct ReceiptCapture {
     identity: crate::async_task_tool::ToolIdentity,
@@ -247,6 +296,7 @@ struct Registration {
     abort: Option<Arc<dyn Handler>>,
     receipt_capture: Option<Arc<ReceiptCapture>>,
     cancellable_durable_async: bool,
+    restart_after: bool,
 }
 /// Clones preserve definition identity for migration retry decisions.
 #[derive(Clone, Default)]
@@ -296,6 +346,7 @@ impl Registry {
                     abort: None,
                     receipt_capture: None,
                     cancellable_durable_async: false,
+                    restart_after: false,
                 });
                 true
             }
@@ -320,6 +371,7 @@ impl Registry {
                     abort: None,
                     receipt_capture: None,
                     cancellable_durable_async: false,
+                    restart_after: false,
                 });
                 true
             }
@@ -1679,6 +1731,135 @@ impl AdmissionHandle<'_> {
             .map_err(|e| e.to_string())?;
         Ok(None)
     }
+    pub(crate) fn restart_hook_receipt(
+        &self,
+        handler: &dyn Handler,
+        result: Option<&Value>,
+    ) -> Result<Option<Value>, String> {
+        if !self.abort || !self.standalone || self.lease.retired {
+            return Err("invalid cleanup lease".into());
+        }
+        let attempt = self
+            .running
+            .task
+            .attempt_id()
+            .ok_or("missing cleanup attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.running.task.id())
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || current != *self.running
+            || !matches!(current.task.state(), TaskState::CompletingFailed(reason) if reason == "restart limit")
+            || !current.task.holds_restart_cleanup()
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cleanup lease or live owned child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing cleanup definition")?;
+        let registration = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing cleanup definition")?;
+        if registration.version != current.task.definition_version()
+            || !registration.replay_safe
+            || !std::ptr::eq(registration.handler.as_ref(), handler)
+            || !registration.restart_after
+        {
+            return Err("cleanup definition changed".into());
+        }
+        let key = restart_receipt_key(current.task.id());
+        if let Some(existing) = owner.store().get(&key).map_err(|e| e.to_string())? {
+            return restart_receipt_evidence(owner.store(), &current.task, &existing)
+                .map(|(value, _)| Some(value));
+        }
+        let intent = AbortHookIntent {
+            version: 1,
+            task: current.task.id(),
+            kind: kind.to_owned(),
+            definition_version: current.task.definition_version(),
+            attempt,
+            lease: self.lease.token,
+        };
+        let intent_key = restart_intent_key(current.task.id(), attempt);
+        let task_check = durable_store::Check {
+            key: task_store::key(current.task.id()),
+            expected: durable_store::Expected::Version(current.version),
+        };
+        let missing_receipt = durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        };
+        if let Some(result) = result {
+            crate::async_task_tool::validate_restart_after_result(result)?;
+            let entry = owner
+                .store()
+                .get(&intent_key)
+                .map_err(|e| e.to_string())?
+                .ok_or("missing cleanup intent")?;
+            let stored: AbortHookIntent =
+                serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if stored != intent {
+                return Err("stale cleanup intent".into());
+            }
+            let bytes = serde_json::to_vec(&AbortHookReceipt {
+                intent,
+                result: result.clone(),
+            })
+            .map_err(|e| e.to_string())?;
+            owner
+                .store()
+                .commit(
+                    &[
+                        task_check,
+                        missing_receipt,
+                        durable_store::Check {
+                            key: intent_key,
+                            expected: durable_store::Expected::Version(entry.version),
+                        },
+                    ],
+                    &[durable_store::Mutation::Put { key, value: bytes }],
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(Some(result.clone()));
+        }
+        owner
+            .store()
+            .commit(
+                &[
+                    task_check,
+                    missing_receipt,
+                    durable_store::Check {
+                        key: intent_key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    },
+                ],
+                &[durable_store::Mutation::Put {
+                    key: intent_key,
+                    value: serde_json::to_vec(&intent).map_err(|e| e.to_string())?,
+                }],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(None)
+    }
     #[cfg(test)]
     pub(crate) fn test_abort_stale_lease(&self, handler: &dyn Handler, result: &Value) -> bool {
         let original = {
@@ -1696,6 +1877,41 @@ impl AdmissionHandle<'_> {
             .is_err_and(|error| error.contains("stale cleanup lease"));
         let key = format!(
             "durable/replay-safe-async/{}/abort-after",
+            self.running.task.id()
+        );
+        let missing = self
+            .lease
+            .attachment
+            .owner
+            .store()
+            .get(key.as_bytes())
+            .unwrap()
+            .is_none();
+        self.lease
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .insert(self.lease.id, original);
+        denied && missing
+    }
+    #[cfg(test)]
+    pub(crate) fn test_restart_stale_lease(&self, handler: &dyn Handler, result: &Value) -> bool {
+        let original = {
+            let mut state = self.lease.state.lock().unwrap();
+            state
+                .leases
+                .insert(
+                    self.lease.id,
+                    (Uuid::new_v4(), self.running.task.attempt_id()),
+                )
+                .unwrap()
+        };
+        let denied = self
+            .restart_hook_receipt(handler, Some(result))
+            .is_err_and(|error| error.contains("stale cleanup lease"));
+        let key = format!(
+            "durable/replay-safe-async/{}/restart-after",
             self.running.task.id()
         );
         let missing = self
@@ -3234,10 +3450,11 @@ impl Scheduler {
         let id = running.task.id();
         let registration = self.registered(&running.task)?;
         let abort_definition = (abort
-            && registration
-                .abort
-                .as_ref()
-                .is_some_and(|handler| Arc::ptr_eq(handler, &registration.handler)))
+            && ((running.task.holds_restart_cleanup() && registration.restart_after)
+                || registration
+                    .abort
+                    .as_ref()
+                    .is_some_and(|handler| Arc::ptr_eq(handler, &registration.handler))))
         .then(|| registration.identity.clone());
         let cancellable_durable_async = registration.cancellable_durable_async;
         let registered_capture = registration.receipt_capture.clone();
@@ -3457,6 +3674,67 @@ impl Scheduler {
                     return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
                 }
                 match outcome {
+                    None if running.task.holds_restart_cleanup() => {
+                        let reg = self.registered(&running.task)?;
+                        if !reg.restart_after
+                            || reg.version != running.task.definition_version()
+                            || abort_definition
+                                .as_ref()
+                                .is_none_or(|identity| !Arc::ptr_eq(identity, &reg.identity))
+                        {
+                            return Err(Error::Registration);
+                        }
+                        let entry = self
+                            .ts()
+                            .store()
+                            .get(&restart_receipt_key(running.task.id()))
+                            .map_err(task_store::Error::from)?
+                            .ok_or(Error::Ownership)?;
+                        let (_, checks) =
+                            restart_receipt_evidence(self.ts().store(), &running.task, &entry)
+                                .map_err(Error::Handler)?;
+                        let mut next = running.clone();
+                        next.task
+                            .finish_restart_cleanup()
+                            .map_err(Error::Transition)?;
+                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        batch.checks.extend(checks);
+                        self.ts()
+                            .store()
+                            .commit(&batch.checks, &batch.mutations)
+                            .map_err(task_store::Error::from)?;
+                    }
+                    Some(_) if running.task.holds_restart_cleanup() => {
+                        let key = restart_receipt_key(running.task.id());
+                        let entry = self
+                            .ts()
+                            .store()
+                            .get(&key)
+                            .map_err(task_store::Error::from)?;
+                        let mut next = running.clone();
+                        next.task
+                            .finish_restart_cleanup()
+                            .map_err(Error::Transition)?;
+                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        if let Some(entry) = entry {
+                            batch.checks.push(durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            });
+                            batch
+                                .mutations
+                                .push(durable_store::Mutation::Delete { key });
+                        } else {
+                            batch.checks.push(durable_store::Check {
+                                key,
+                                expected: durable_store::Expected::Missing,
+                            });
+                        }
+                        self.ts()
+                            .store()
+                            .commit(&batch.checks, &batch.mutations)
+                            .map_err(task_store::Error::from)?;
+                    }
                     None if abort_definition.is_some() => {
                         let reg = self.registered(&running.task)?;
                         if !Arc::ptr_eq(abort_definition.as_ref().unwrap(), &reg.identity)
@@ -4760,6 +5038,7 @@ impl Scheduler {
         replay_safe: bool,
         handler: Arc<dyn Handler>,
         abort_hook: bool,
+        restart_after: bool,
     ) -> Result<(), String> {
         if self.validator.is_some() {
             return Err("standalone scheduler required".into());
@@ -4774,6 +5053,11 @@ impl Scheduler {
             .get_mut(&kind)
             .expect("registered")
             .cancellable_durable_async = true;
+        registry
+            .entries
+            .get_mut(&kind)
+            .expect("registered")
+            .restart_after = restart_after;
         if abort_hook {
             registry.entries.get_mut(&kind).expect("registered").abort = Some(handler);
         } else if !registry.set_abort(&kind, |_: &Task| Ok(Step::Succeed(Value::Null))) {
@@ -5302,6 +5586,10 @@ impl Scheduler {
                 if item.task.state() != &TaskState::Running {
                     continue;
                 }
+                if item.task.holds_restart_cleanup() {
+                    self.ts().update(&item, |task| task.recover())?;
+                    continue;
+                }
                 if item.task.abort_requested() {
                     // Defer even restart-limit failure until owned cleanup settles.
                     self.ts().update(&item, |task| task.recover())?;
@@ -5361,7 +5649,14 @@ impl Scheduler {
                     let exhausted =
                         item.task.restarts().saturating_add(1) >= item.task.restart_limit();
                     if exhausted {
-                        self.finish_failed(&item, "restart limit".into())?;
+                        if reg.restart_after
+                            && item.task.checkpoint().phase != "replay-safe-async-after"
+                        {
+                            self.ts()
+                                .update(&item, |task| task.hold_restart_failure())?;
+                        } else {
+                            self.finish_failed(&item, "restart limit".into())?;
+                        }
                         self.deferred_recovery.extend(deferred);
                         continue 'scan;
                     } else {
@@ -5730,7 +6025,7 @@ impl Scheduler {
                 continue;
             }
             if matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
-                && !snapshot.task.abort_requested()
+                && (!snapshot.task.abort_requested() || snapshot.task.holds_restart_cleanup())
                 && owned_graph_uncertain(owner.store(), snapshot.task.id())?
             {
                 // Do not turn an unproven graph into cancellation authority.
@@ -5779,6 +6074,145 @@ impl Scheduler {
                     request_abort_subtree(&self.ts(), snapshot.task.id())?;
                 }
                 return Ok(TickReservation::Progress(true));
+            }
+            if !live && snapshot.task.holds_restart_cleanup() {
+                let active = self
+                    .live_invocations
+                    .lock()
+                    .map_err(|_| Error::Poisoned)?
+                    .attempts
+                    .contains(&snapshot.task.id());
+                if active {
+                    continue;
+                }
+                if snapshot.task.attempt_id().is_some() {
+                    let key = restart_receipt_key(snapshot.task.id());
+                    let receipt = self
+                        .ts()
+                        .store()
+                        .get(&key)
+                        .map_err(task_store::Error::from)?;
+                    let valid_registration =
+                        self.registered(&snapshot.task).ok().is_some_and(|reg| {
+                            reg.replay_safe
+                                && reg.restart_after
+                                && reg.version == snapshot.task.definition_version()
+                        });
+                    let evidence = if valid_registration {
+                        receipt.as_ref().and_then(|entry| {
+                            restart_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
+                        })
+                    } else {
+                        None
+                    };
+                    let mut next = snapshot.clone();
+                    next.task
+                        .finish_restart_cleanup()
+                        .map_err(Error::Transition)?;
+                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                    if let Some((_, checks)) = evidence {
+                        batch.checks.extend(checks);
+                    } else if let Some(entry) = receipt {
+                        batch.checks.push(durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        });
+                        batch
+                            .mutations
+                            .push(durable_store::Mutation::Delete { key });
+                    } else {
+                        batch.checks.push(durable_store::Check {
+                            key,
+                            expected: durable_store::Expected::Missing,
+                        });
+                    }
+                    self.poisoned
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    #[cfg(test)]
+                    if let Some(hook) = &self.reservation_commit_hook {
+                        hook(0, owner.store());
+                    }
+                    match owner.store().commit_with_prefix_put_fence(
+                        &batch.checks,
+                        &batch.mutations,
+                        &[
+                            task_store::PREFIX,
+                            crate::ownership_edge::PREFIX,
+                            b"runtime/conversation/",
+                        ],
+                        graph_version,
+                    ) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                            self.poisoned
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            return Ok(TickReservation::Progress(true));
+                        }
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
+                }
+                let handler = match self.registered(&snapshot.task) {
+                    Ok(reg)
+                        if reg.replay_safe
+                            && reg.restart_after
+                            && reg.version == snapshot.task.definition_version() =>
+                    {
+                        reg.handler.clone()
+                    }
+                    _ => {
+                        let mut next = snapshot.clone();
+                        next.task.finalize().map_err(Error::Transition)?;
+                        let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        match owner.store().commit_with_prefix_put_fence(
+                            &batch.checks,
+                            &batch.mutations,
+                            &[
+                                task_store::PREFIX,
+                                crate::ownership_edge::PREFIX,
+                                b"runtime/conversation/",
+                            ],
+                            graph_version,
+                        ) {
+                            Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                return Ok(TickReservation::Progress(true));
+                            }
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    }
+                };
+                let mut next = snapshot.clone();
+                next.task
+                    .start_restart_cleanup(Uuid::new_v4())
+                    .map_err(Error::Transition)?;
+                let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                match owner.store().commit_with_prefix_put_fence(
+                    &batch.checks,
+                    &batch.mutations,
+                    &[
+                        task_store::PREFIX,
+                        crate::ownership_edge::PREFIX,
+                        b"runtime/conversation/",
+                    ],
+                    graph_version,
+                ) {
+                    Ok(()) => (),
+                    Err(durable_store::Error::Conflict { .. }) => {
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(true));
+                    }
+                    Err(error) => return Err(task_store::Error::from(error).into()),
+                }
+                let running = self
+                    .ts()
+                    .load(snapshot.task.id())?
+                    .ok_or(Error::Ownership)?;
+                let invocation = self.make_invocation(running, handler, true)?;
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                drop(gate);
+                return Ok(TickReservation::Invocation(Box::new(invocation)));
             }
             if !live {
                 let mut next = snapshot.clone();
@@ -5877,10 +6311,10 @@ impl Scheduler {
         let tasks = self.ts().list()?;
         // Use one snapshot of the active ownership graph. Admission is fenced
         // by the task gate held above.
-        let cleanup_graph = if tasks
-            .iter()
-            .any(|task| task.task.abort_requested() && !task.task.is_terminal())
-        {
+        let cleanup_graph = if tasks.iter().any(|task| {
+            (task.task.abort_requested() || task.task.holds_restart_cleanup())
+                && !task.task.is_terminal()
+        }) {
             Some(
                 crate::ownership_edge::CleanupGraph::load(owner.store())
                     .map_err(|e| Error::Handler(format!("ownership graph: {e}")))?,
@@ -5908,7 +6342,7 @@ impl Scheduler {
         let mut abortable = None;
         for snapshot in &tasks {
             if !eligible(&snapshot.task)
-                || !snapshot.task.abort_requested()
+                || (!snapshot.task.abort_requested() && !snapshot.task.holds_restart_cleanup())
                 || snapshot.task.state() != &TaskState::Ready
             {
                 continue;
@@ -5986,6 +6420,55 @@ impl Scheduler {
         if let Some(snapshot) = abortable {
             self.poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
+            if snapshot.task.holds_restart_cleanup() {
+                // One bounded salvage attempt: a crashed attempt is never dispatched again.
+                let key = restart_receipt_key(snapshot.task.id());
+                let receipt = self
+                    .ts()
+                    .store()
+                    .get(&key)
+                    .map_err(task_store::Error::from)?;
+                let valid_registration = self.registered(&snapshot.task).ok().is_some_and(|reg| {
+                    reg.replay_safe
+                        && reg.restart_after
+                        && reg.version == snapshot.task.definition_version()
+                });
+                let evidence = if valid_registration {
+                    receipt.as_ref().and_then(|entry| {
+                        restart_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
+                    })
+                } else {
+                    None
+                };
+                let mut next = snapshot.clone();
+                next.task
+                    .finish_restart_cleanup()
+                    .map_err(Error::Transition)?;
+                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                if let Some((_, checks)) = evidence {
+                    batch.checks.extend(checks);
+                } else if let Some(entry) = receipt {
+                    batch.checks.push(durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    });
+                    batch
+                        .mutations
+                        .push(durable_store::Mutation::Delete { key });
+                } else {
+                    batch.checks.push(durable_store::Check {
+                        key,
+                        expected: durable_store::Expected::Missing,
+                    });
+                }
+                match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                    Ok(()) | Err(durable_store::Error::Conflict { .. }) => (),
+                    Err(error) => return Err(task_store::Error::from(error).into()),
+                }
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Ok(TickReservation::Progress(true));
+            }
             if snapshot.task.restarts() > 0
                 && snapshot.task.restarts() >= snapshot.task.restart_limit()
             {

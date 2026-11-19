@@ -718,13 +718,24 @@ restart limit; a committed receipt is reused without rerunning it, including at
 the limit. Hook failures fail the cleanup; a non-cooperative hook can still
 block shutdown, so the host's completion attestation is required. The normal
 content registration keeps its existing abort behavior. Dynamic conversation
-selection, hook parking, and after hooks for host interrupted, unavailable and
-restart-limit results remain unsupported. The abort cleanup lease cannot be
-reused for these failures: it requires an abort-marked task and leads to
-`Cancelled`, while interrupted work can have uncertain external effects and a
-restart-limit task must remain failed. A safe salvage path needs a distinct
-failed-result lease, child-drain ordering and its own bounded attempt budget;
-it must not replace a committed Tool outcome or final after result.
+selection and hook parking remain unsupported.
+
+`register_replay_safe_durable_tool_with_restart_after` independently opts in
+to a restart-limit after hook with its own definition identity and explicit
+`RestartAfterAuthorization`. At the limit, if no completed Tool outcome is
+already checkpointed, the task remains `CompletingFailed` while its owned
+children drain and one fenced cleanup attempt runs. Its result must retain the
+mandatory `restart_limit` error diagnostic stating that external effects may be
+unknown. Structured output and attachments are not supported, and normal memo
+reads and writes are denied; even an ignored memo error rejects the result.
+The attempt-bound receipt and final `Failed("restart limit")` transition are
+checked together. Process loss during the one cleanup attempt does not run the
+hook again; a previously committed receipt is recovered only with matching
+identity and evidence. `read_restart_after_result` reads this receipt after
+failure; a parent's `child_result` continues to report the failed task. A
+checkpointed Tool outcome is never replaced by the synthetic restart-limit
+result. The host must ensure hooks finish cooperatively and have
+no detached work. Host interrupted and unavailable results remain unsupported.
 `read_replay_safe_after_evidence` exposes a committed raw Tool outcome, or a
 distinct host error, from the after checkpoint of a failed or cancelled
 replay-safe task. It is reconciliation evidence only: it is not a final hook

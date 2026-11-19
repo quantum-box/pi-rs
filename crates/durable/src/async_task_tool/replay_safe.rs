@@ -67,6 +67,14 @@ impl AbortAfterAuthorization {
     }
 }
 
+/// The host attests that the restart-limit hook is replay-safe, cooperative, and starts no detached work.
+pub struct RestartAfterAuthorization(());
+impl RestartAfterAuthorization {
+    pub fn host_attests_cleanup_safe() -> Self {
+        Self(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Registration and both explicit hook policies are bound into identity.
 pub(super) fn register(
     scheduler: &mut Scheduler,
@@ -77,6 +85,7 @@ pub(super) fn register(
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
     block_results: bool,
     abort_after: bool,
+    restart_after: bool,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -88,6 +97,7 @@ pub(super) fn register(
         hook,
         block_results,
         abort_after,
+        restart_after,
     )
 }
 
@@ -108,6 +118,7 @@ pub(super) fn register_unsafe(
         None,
         false,
         false,
+        false,
     )
 }
 
@@ -122,8 +133,9 @@ fn register_with_policy(
     hook: Option<(String, Arc<dyn crate::extension::Hook>)>,
     block_results: bool,
     abort_after: bool,
+    restart_after: bool,
 ) -> Result<Arc<TaskTool>, String> {
-    if abort_after && !block_results {
+    if (abort_after || restart_after) && !block_results {
         return Err("abort hooks require content hooks".into());
     }
     if block_results && hook.is_none() {
@@ -153,7 +165,9 @@ fn register_with_policy(
     }
     child_identities.sort_by(|a, b| a.0.cmp(&b.0));
     let encoded = serde_json::to_vec(&(
-        if abort_after {
+        if restart_after {
+            6u32
+        } else if abort_after {
             5u32
         } else if block_results {
             4u32
@@ -190,6 +204,7 @@ fn register_with_policy(
         replay_safe,
         handler.clone(),
         abort_after,
+        restart_after,
     )?;
     Ok(Arc::new(
         TaskTool::new(spec, kind, replay_safe, version, handler).with_deferred_arguments(),
@@ -390,7 +405,7 @@ pub(super) fn validate_content_hook_result(
     if let Some(gate) = required
         && (result.extra.get("isError") != Some(&serde_json::Value::Bool(true))
             || !result.diagnostics.contains(gate)
-            || (gate.code.as_deref() == Some("aborted")
+            || (matches!(gate.code.as_deref(), Some("aborted" | "restart_limit"))
                 && (result.extra.contains_key("structuredOutput")
                     || result.extra.contains_key("attachments"))))
     {
@@ -902,6 +917,112 @@ impl Executor {
         }
         Ok(Step::Succeed(value))
     }
+    fn run_with_restart_cleanup(
+        &self,
+        task: &Task,
+        admission: &AdmissionHandle<'_>,
+    ) -> Result<Step, String> {
+        if !self.block_results
+            || !self
+                .identity
+                .matches(self.tool.as_ref(), &self.implementation, self.version)
+        {
+            return Err("restart hook identity changed".into());
+        }
+        if let Some(value) = admission.restart_hook_receipt(self, None)? {
+            super::validate_restart_after_result(&value)?;
+            return Ok(Step::Succeed(serde_json::Value::Null));
+        }
+        let args = match task.checkpoint().phase.as_str() {
+            "initial" => task.input().clone(),
+            "replay-safe-async-prepared" => {
+                serde_json::from_value::<HookCheckpoint>(task.checkpoint().data.clone())
+                    .map_err(|_| "invalid hook checkpoint")?
+                    .arguments
+            }
+            "replay-safe-async-wait" => {
+                serde_json::from_value::<ParkCheckpoint>(task.checkpoint().data.clone())
+                    .map_err(|_| "invalid park checkpoint")?
+                    .arguments
+            }
+            _ => return Err("unsupported restart checkpoint".into()),
+        };
+        self.bounded_hook_arguments(&args)?;
+        let gate = crate::runtime::ToolDiagnostic {
+            severity: crate::runtime::DiagnosticSeverity::Error,
+            code: Some("restart_limit".into()),
+            message: "Tool exceeded its restart limit; external effects may be unknown".into(),
+        };
+        let initial = crate::extension::ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text","text":gate.message})],
+            diagnostics: vec![gate.clone()],
+            extra: [("isError".into(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        };
+        let memo = AbortMemo(std::sync::atomic::AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let result = rt.block_on(async {
+            let call = crate::extension::ToolCall {
+                name: self.identity.spec.name.clone(),
+                arguments: args,
+            };
+            let snapshot = serde_json::Value::Null;
+            let ctx = crate::extension::Context {
+                snapshot: &snapshot,
+                memo: &memo,
+            };
+            let (value, reports) = self
+                .hook_registry()?
+                .after_tool_blocks(
+                    &call,
+                    initial,
+                    matches!(task.owner(), crate::task::TaskOwner::Task(_)),
+                    &ctx,
+                )
+                .await?;
+            if !reports.is_empty() {
+                return Err("restart hook failed".to_string());
+            }
+            Ok(value)
+        })?;
+        if memo.0.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("restart hook used unavailable memo".into());
+        }
+        validate_content_hook_result(&result, Some(&gate), false)?;
+        let value = serde_json::to_value(DurableTaskResult::Rich {
+            task_content_v1: result,
+        })
+        .map_err(|e| e.to_string())?;
+        super::validate_restart_after_result(&value)?;
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os("PI_TEST_RESTART_STALE_LEASE") {
+            if !admission.test_restart_stale_lease(self, &value) {
+                return Err("stale restart lease accepted".into());
+            }
+            std::fs::write(
+                std::path::PathBuf::from(dir).join("restart-stale-rejected"),
+                b"yes",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        admission.restart_hook_receipt(self, Some(&value))?;
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os("PI_TEST_RESTART_AFTER_RECEIPT") {
+            std::fs::write(
+                std::path::PathBuf::from(dir).join("restart-receipt"),
+                b"ready",
+            )
+            .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        Ok(Step::Succeed(serde_json::Value::Null))
+    }
 }
 
 impl Handler for Executor {
@@ -913,6 +1034,9 @@ impl Handler for Executor {
         task: &Task,
         admission: &AdmissionHandle<'_>,
     ) -> Result<Step, String> {
+        if task.holds_restart_cleanup() {
+            return self.run_with_restart_cleanup(task, admission);
+        }
         if !self.block_results
             || !self
                 .identity

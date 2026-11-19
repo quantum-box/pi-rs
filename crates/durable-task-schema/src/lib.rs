@@ -147,6 +147,9 @@ macro_rules! declare_task_schema {
             /// This adapter lets owned work finish after successful completion.
             #[serde(default, skip_serializing_if = "task_tool_is_false")]
             retain_task_children_on_success: bool,
+            /// A restart-limit failure awaiting its independent, one-attempt hook.
+            #[serde(default, skip_serializing_if = "task_tool_is_false")]
+            restart_cleanup: bool,
         }
     };
 }
