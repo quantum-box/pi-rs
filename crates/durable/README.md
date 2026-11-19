@@ -1899,8 +1899,12 @@ yet connected. A running generic parent is rejected because its child cannot
 currently execute while that parent runs. TaskTool children use ordinary worker
 capacity; the driver's reserved overflow worker is limited to generic children.
 Four simultaneously blocked TaskTool parents can occupy all ordinary workers
-and leave a TaskTool child waiting. Arbitrary-depth or multi-child progress
-requires a future park connection that releases the waiting parent's worker.
+and leave a TaskTool child waiting. A synchronous TaskTool handler can instead
+return `Step::Wait` after immediate admissions to release its worker; on wake it
+re-enters with its own checkpoint and `ended_children`. Real-driver tests cover
+six levels, two-child any/all waits, re-parking, abort and process-kill recovery
+before and after the parent park. This is task-handler composition, not ordinary
+async Tool parking or upstream `executeTool(..., {wait: false})`.
 
 New TaskTool tasks persist their adapter type. When a TaskTool settles with a
 success, failure or handler error, it holds its outcome and atomically marks

@@ -510,9 +510,16 @@ The driver has four ordinary workers. A test occupies all four with TaskTool
 parents and verifies that an admitted TaskTool child stays ready until an
 ordinary worker becomes free; the overflow reservation cannot run that child.
 Recursively blocking parents can therefore exhaust the pool. This primitive
-does not guarantee progress for arbitrary depth or multiple children. A future
-upstream-style connection must park a waiting parent and release its worker
-before relying on child progress.
+does not guarantee progress for blocking parents. Synchronous TaskTool handlers
+can instead return `Step::Wait` after immediate admission: this parks the task
+and releases its worker. Real-driver tests exercise six task levels, two owned
+children with any/all waits, checkpoint and ended-ID validation, re-parking,
+abort, and OS-kill recovery before parent park, after park and after an any wake.
+The tests verify no unsafe leaf re-dispatch once its park is persisted. This is
+a synchronous task-handler path; ordinary async Tool execution, its tool-visible
+wake and upstream `wait: false` remain separate integration work. Task wait
+sets also support existing non-child tasks, an intentional broader behavior
+than upstream's owned-task ToolPark rule.
 
 The generic scheduler's live handler can also call `TaskDocuments::stage_keyed_child`. The scheduler validates the candidate registration and atomically commits the key, child, handler documents and parent transition under the captured parent version. The handler can wait on the returned ID in that same transition; a matching persisted or already-staged key returns its original ID. A conflicting identity or task-tool handler fails. New children cannot be staged on successful terminal settlement, and failed handlers discard the staged admission. Document or staged-key conflicts use the existing replay-safe retry policy; a changed parent fences settlement and requires reopening and recovery. This mechanism is limited to generic scheduler handlers: it does not wire nested tools, transfer executor ownership, or provide an asynchronous park.
 
