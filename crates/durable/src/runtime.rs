@@ -3244,7 +3244,8 @@ thread_local! {
     static TASK_RESULT_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 #[cfg(test)]
-type StoppedReceiptReadHooks = std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+type StoppedReceiptReadHooks =
+    std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
 #[cfg(test)]
 fn stopped_receipt_read_hooks() -> &'static StoppedReceiptReadHooks {
     static HOOKS: std::sync::OnceLock<StoppedReceiptReadHooks> = std::sync::OnceLock::new();
@@ -12766,7 +12767,11 @@ impl Harness {
         Ok(page)
     }
     /// Persist a reset; busy conversations place it at the next safe boundary.
+    /// A callback-start fence returns `TaskPublicationBusy` before any write;
+    /// callers may retry the same operation after the fence is released.
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
+        let gate = self.owner.conversation_controls().get(id).callback_start;
+        let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
         loop {
             let (mut state, version) = self.load(id)?;
@@ -25101,6 +25106,37 @@ mod scheduler_tests {
         writer.join().unwrap();
         let id = harness.create_conversation(config()).unwrap();
         assert_eq!(harness.conversation(id).unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn direct_reset_is_retryable_while_callback_start_gate_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let (before, version) = scheduler.harness.load(id).unwrap();
+        let gate = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .callback_start;
+        let lease = gate.try_enter().unwrap();
+        assert!(matches!(
+            scheduler.reset(id, Some("handoff".into())),
+            Err(Error::TaskPublicationBusy)
+        ));
+        let (during, during_version) = scheduler.harness.load(id).unwrap();
+        assert_eq!(during_version, version);
+        assert_eq!(
+            serde_json::to_value(&during).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        drop(lease);
+        let reset = scheduler.reset(id, Some("handoff".into())).unwrap();
+        let after = scheduler.conversation(id).unwrap();
+        assert!(after.resets.iter().any(|entry| entry.id == reset));
+        scheduler.shutdown().await.unwrap();
     }
 
     #[tokio::test]
