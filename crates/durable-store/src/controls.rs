@@ -20,6 +20,31 @@ pub struct CallbackStartGate(Arc<std::sync::atomic::AtomicUsize>);
 
 const CALLBACK_ACTIVE: usize = 1 << (usize::BITS - 1);
 
+thread_local! {
+    static ACTIVE_CALLBACK_POLLS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct CallbackPollScope(usize);
+impl CallbackPollScope {
+    fn enter(state: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let id = Arc::as_ptr(state) as usize;
+        ACTIVE_CALLBACK_POLLS.with(|active| active.borrow_mut().push(id));
+        Self(id)
+    }
+}
+impl Drop for CallbackPollScope {
+    fn drop(&mut self) {
+        ACTIVE_CALLBACK_POLLS.with(|active| {
+            let mut active = active.borrow_mut();
+            let index = active
+                .iter()
+                .rposition(|id| *id == self.0)
+                .expect("callback poll scope missing");
+            active.remove(index);
+        });
+    }
+}
+
 #[must_use = "retain the lease until the callback's first poll finishes"]
 pub struct CallbackStartLease(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -43,6 +68,10 @@ impl CallbackStartGate {
         let mut state = self.0.load(Ordering::Relaxed);
         loop {
             if state & CALLBACK_ACTIVE != 0 {
+                let id = Arc::as_ptr(&self.0) as usize;
+                if ACTIVE_CALLBACK_POLLS.with(|active| active.borrow().contains(&id)) {
+                    return Err(TargetFenceBusy::Reentrant);
+                }
                 return Err(TargetFenceBusy::CallbackStart);
             }
             if state == CALLBACK_ACTIVE - 1 {
@@ -76,6 +105,7 @@ impl CallbackStartLease {
         future: std::pin::Pin<&mut F>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<F::Output> {
+        let _scope = CallbackPollScope::enter(&self.0);
         future.poll(context)
     }
 }
@@ -104,6 +134,12 @@ pub enum PollGateError {
     Reentrant,
     Busy,
     Poisoned,
+}
+
+impl std::fmt::Display for PollGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "gate {self:?}")
+    }
 }
 
 pub struct PollGateGuard<'a> {

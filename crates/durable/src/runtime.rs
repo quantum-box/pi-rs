@@ -99,6 +99,10 @@ pub enum Error {
     /// A task outcome is being published or settled; the admission can be retried.
     #[error("task publication is temporarily busy")]
     TaskPublicationBusy,
+    #[error("callback start is temporarily busy")]
+    CallbackStartBusy,
+    #[error("reentrant conversation abort")]
+    ReentrantAbort,
     #[error("invalid operation: {0}")]
     Invalid(String),
 }
@@ -14433,10 +14437,13 @@ impl Harness {
         let owner = self.owner.clone();
         let gate = match owner.task_gate().try_lock() {
             Ok(gate) => gate,
-            Err(std::sync::TryLockError::WouldBlock) => {
+            Err(durable_store::controls::PollGateError::Busy) => {
                 return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
             }
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Failed),
+            Err(durable_store::controls::PollGateError::Poisoned) => return Err(Error::Failed),
+            Err(durable_store::controls::PollGateError::Reentrant) => {
+                return Err(Error::ReentrantAbort);
+            }
         };
         let mode = match targets {
             Some(targets) => (false, targets),
@@ -14470,8 +14477,13 @@ impl Harness {
         let owner = self.owner.clone();
         let gate = match owner.task_gate().try_lock() {
             Ok(gate) => gate,
-            Err(std::sync::TryLockError::WouldBlock) => return Err(Error::TaskPublicationBusy),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Failed),
+            Err(durable_store::controls::PollGateError::Busy) => {
+                return Err(Error::TaskPublicationBusy);
+            }
+            Err(durable_store::controls::PollGateError::Poisoned) => return Err(Error::Failed),
+            Err(durable_store::controls::PollGateError::Reentrant) => {
+                return Err(Error::ReentrantAbort);
+            }
         };
         let mode = match targets {
             Some(targets) => (false, targets),
@@ -14494,7 +14506,7 @@ impl Harness {
     #[allow(clippy::too_many_arguments)]
     fn abort_owned_graph_impl_roots_locked(
         &mut self,
-        _gate: &std::sync::MutexGuard<'_, ()>,
+        _gate: &durable_store::controls::PollGateGuard<'_>,
         conversation: Option<Uuid>,
         fixed_task: Option<Uuid>,
         receipt: Option<(Vec<u8>, Vec<u8>)>,
@@ -14650,7 +14662,11 @@ impl Harness {
                 match crate::conversation_signal::clear_callback_start_check(store, *id) {
                     Ok(check) => callback_checks.push(check),
                     Err(crate::conversation_signal::Error::CallbackStartBusy) => {
-                        return Err(Error::TaskPublicationBusy);
+                        return Err(if graph_scope.is_some() {
+                            Error::CallbackStartBusy
+                        } else {
+                            Error::TaskPublicationBusy
+                        });
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -14659,7 +14675,11 @@ impl Harness {
                 match crate::task_store::clear_callback_start_check(store, *id) {
                     Ok(check) => callback_checks.push(check),
                     Err(crate::task_store::Error::CallbackStartBusy) => {
-                        return Err(Error::TaskPublicationBusy);
+                        return Err(if graph_scope.is_some() {
+                            Error::CallbackStartBusy
+                        } else {
+                            Error::TaskPublicationBusy
+                        });
                     }
                     Err(error) => {
                         return Err(Error::Invalid(format!("task callback start: {error}")));
@@ -22199,36 +22219,13 @@ impl Scheduler {
         self.abort_background_graph(id).map(|_| ())
     }
 
-    fn abort_background_graph(
-        &mut self,
-        id: Uuid,
-    ) -> Result<(Vec<Uuid>, Vec<Uuid>, ConversationAbortResult), Error> {
-        let owner = self.harness.owner.clone();
-        let mut tasks = Vec::new();
-        let mut result = ConversationAbortResult::default();
-        let affected = owner
-            .conversation_controls()
-            .fence(|| {
-                let (conversations, reached, withdrawn) =
-                    self.harness
-                        .abort_owned_graph_impl(Some(id), None, None, true)?;
-                tasks = reached;
-                result = withdrawn;
-                Ok(conversations)
-            })
-            .map_err(|error| match error {
-                durable_store::controls::FenceError::Poisoned => Error::Failed,
-                durable_store::controls::FenceError::Commit(error) => error,
-            })?;
-        for conversation in &affected {
-            self.schedule(*conversation);
-        }
-        Ok((affected, tasks, result))
+    fn abort_background_graph(&mut self, id: Uuid) -> Result<OwnedGraphAbort, Error> {
+        self.scoped_abort_sync(Some(id), None, true)
     }
 
     /// Abort a task and its foreground owned conversations.
     pub fn abort_task(&mut self, id: Uuid) -> Result<(), Error> {
-        self.abort_graph(None, Some(id)).map(|_| ())
+        self.scoped_abort_sync(None, Some(id), false).map(|_| ())
     }
 
     fn abort_graph(
@@ -22236,37 +22233,87 @@ impl Scheduler {
         conversation: Option<Uuid>,
         task: Option<Uuid>,
     ) -> Result<Vec<Uuid>, Error> {
-        self.abort_graph_with_result(conversation, task)
-            .map(|(affected, _)| affected)
+        self.scoped_abort_sync(conversation, task, false)
+            .map(|value| value.0)
     }
 
-    fn abort_graph_with_result(
+    fn scoped_abort_sync(
         &mut self,
         conversation: Option<Uuid>,
         task: Option<Uuid>,
-    ) -> Result<(Vec<Uuid>, ConversationAbortResult), Error> {
-        // Prevent controls from being created and fence every existing poll while
-        // discovering and committing the graph. A child may be admitted right up
-        // to the transaction, so fencing a previously read graph is insufficient.
-        let owner = self.harness.owner.clone();
-        let mut result = ConversationAbortResult::default();
-        let affected = owner
-            .conversation_controls()
-            .fence(|| {
-                let (affected, _, withdrawn) =
-                    self.harness
-                        .abort_owned_graph_impl(conversation, task, None, false)?;
-                result = withdrawn;
-                Ok(affected)
-            })
-            .map_err(|error| match error {
-                durable_store::controls::FenceError::Poisoned => Error::Failed,
-                durable_store::controls::FenceError::Commit(error) => error,
-            })?;
-        for id in &affected {
-            self.schedule(*id);
+        background: bool,
+    ) -> Result<OwnedGraphAbort, Error> {
+        use durable_store::controls::{FenceError, TargetFenceBusy};
+        let mut callback_retries = 0;
+        loop {
+            let discovery = self
+                .harness
+                .scoped_direct_abort(conversation, task, background, None);
+            let targets = match discovery {
+                Ok(Some(value)) => value.0,
+                Ok(None) => return Err(Error::Invalid("abort graph disappeared".into())),
+                Err(Error::TaskPublicationBusy)
+                | Err(Error::Storage(durable_store::Error::WriteLockBusy(_))) => {
+                    #[cfg(test)]
+                    if let Some(id) = conversation
+                        && let Some(signal) = scoped_abort_busy_hooks().lock().unwrap().remove(&id)
+                    {
+                        signal.add_permits(1);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let owner = self.harness.owner.clone();
+            let mut committed = None;
+            let result =
+                owner
+                    .conversation_controls()
+                    .try_fence_targets_classified(&targets, || {
+                        let value = self
+                            .harness
+                            .scoped_direct_abort(conversation, task, background, Some(&targets))?
+                            .ok_or_else(|| Error::Invalid("abort graph disappeared".into()))?;
+                        let affected = value.0.clone();
+                        committed = Some(value);
+                        Ok::<_, Error>(affected)
+                    });
+            let callback_busy = match result {
+                Ok(Ok(_)) => {
+                    let value =
+                        committed.ok_or_else(|| Error::Invalid("abort result missing".into()))?;
+                    for id in &value.0 {
+                        self.schedule(*id);
+                    }
+                    return Ok(value);
+                }
+                Ok(Err(TargetFenceBusy::Reentrant)) => return Err(Error::ReentrantAbort),
+                Ok(Err(TargetFenceBusy::CallbackStart))
+                | Err(FenceError::Commit(Error::CallbackStartBusy)) => true,
+                Ok(Err(
+                    TargetFenceBusy::Registry
+                    | TargetFenceBusy::Poll
+                    | TargetFenceBusy::MutationCapacity,
+                ))
+                | Err(FenceError::Commit(Error::TaskPublicationBusy))
+                | Err(FenceError::Commit(Error::Storage(durable_store::Error::WriteLockBusy(_))))
+                | Err(FenceError::Commit(Error::TaskScheduler(
+                    crate::task_scheduler::Error::Busy,
+                ))) => false,
+                Err(FenceError::Poisoned) => return Err(Error::Failed),
+                Err(FenceError::Commit(error)) => return Err(error),
+            };
+            if callback_busy {
+                callback_retries += 1;
+                if callback_retries >= 10 {
+                    return Err(Error::TaskPublicationBusy);
+                }
+            } else {
+                callback_retries = 0;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        Ok((affected, result))
     }
     // The existing synchronous abort API preserves its legacy behavior. This
     // asynchronous path can yield and safely retry a nonblocking graph fence.
@@ -22321,6 +22368,7 @@ impl Scheduler {
                     return Ok(value);
                 }
                 Err(Error::TaskPublicationBusy)
+                | Err(Error::CallbackStartBusy)
                 | Err(Error::Storage(durable_store::Error::WriteLockBusy(_))) => {
                     #[cfg(test)]
                     if let Some(signal) = scoped_abort_busy_hooks().lock().unwrap().remove(&id) {
@@ -25783,6 +25831,194 @@ mod scheduler_tests {
             drop(abort);
             scheduler.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn synchronous_abort_kill_worker() {
+        let Some(path) = std::env::var_os("PI_SYNC_ABORT_KILL_DB") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        scheduler.abort(target).unwrap();
+        std::fs::write(path.with_extension("ready"), target.to_string()).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_abort_commit_survives_process_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let ready = path.with_extension("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::scheduler_tests::synchronous_abort_kill_worker",
+                "--nocapture",
+            ])
+            .env("PI_SYNC_ABORT_KILL_DB", &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abort worker did not become ready"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "abort worker exited early"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let id = Uuid::parse_str(&std::fs::read_to_string(&ready).unwrap()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let harness = Harness::open_paused(&path, options(placement_model())).unwrap();
+        assert!(harness.conversation(id).unwrap().abort_requested);
+    }
+
+    #[tokio::test]
+    async fn synchronous_abort_rejects_task_gate_reentry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let owner = scheduler.harness.owner.clone();
+        let guard = owner.task_gate().lock().unwrap();
+        assert!(matches!(
+            scheduler.abort(target),
+            Err(Error::ReentrantAbort)
+        ));
+        assert!(!scheduler.conversation(target).unwrap().abort_requested);
+        drop(guard);
+        scheduler.abort(target).unwrap();
+        assert!(scheduler.conversation(target).unwrap().abort_requested);
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronous_abort_waits_for_other_thread_task_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let owner = scheduler.harness.owner.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _gate = owner.task_gate().lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let observed = Arc::new(tokio::sync::Semaphore::new(0));
+        scoped_abort_busy_hooks()
+            .lock()
+            .unwrap()
+            .insert(target, observed.clone());
+        let handle = tokio::runtime::Handle::current();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let aborter = std::thread::spawn(move || {
+            let _entered = handle.enter();
+            let result = scheduler.abort(target);
+            done_tx.send((scheduler, result)).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while observed.try_acquire().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task gate contention was not observed"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        let (scheduler, result) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        result.unwrap();
+        assert!(scheduler.conversation(target).unwrap().abort_requested);
+        holder.join().unwrap();
+        aborter.join().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronous_abort_callback_start_busy_retries_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let other = scheduler.create_conversation(config()).unwrap();
+        let control = scheduler.harness.owner.conversation_controls().get(target);
+        let callback = control.callback_start.try_start().unwrap();
+        assert!(matches!(
+            scheduler.abort(target),
+            Err(Error::TaskPublicationBusy)
+        ));
+        assert!(!scheduler.conversation(target).unwrap().abort_requested);
+        scheduler.abort(other).unwrap();
+        assert!(scheduler.conversation(other).unwrap().abort_requested);
+        drop(callback);
+        scheduler.abort(target).unwrap();
+        assert!(scheduler.conversation(target).unwrap().abort_requested);
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronous_abort_rejects_callback_poll_reentry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let control = scheduler.harness.owner.conversation_controls().get(target);
+        let lease = control.callback_start.try_start().unwrap();
+        let mut callback = std::pin::pin!(std::future::poll_fn(|_| {
+            assert!(matches!(
+                scheduler.abort(target),
+                Err(Error::ReentrantAbort)
+            ));
+            std::task::Poll::Ready(())
+        }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(lease.poll_first(callback.as_mut(), &mut context).is_ready());
+        drop(callback);
+        assert!(!scheduler.conversation(target).unwrap().abort_requested);
+        scheduler.abort(target).unwrap();
+        assert!(scheduler.conversation(target).unwrap().abort_requested);
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronous_abort_rejects_reentry_and_ignores_other_graph_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let other = scheduler.create_conversation(config()).unwrap();
+        let owner = scheduler.harness.owner.clone();
+        let target_control = owner.conversation_controls().get(target);
+        let other_control = owner.conversation_controls().get(other);
+        let held = target_control.gate.lock().unwrap();
+        assert!(matches!(
+            scheduler.abort(target),
+            Err(Error::ReentrantAbort)
+        ));
+        assert!(!scheduler.conversation(target).unwrap().abort_requested);
+        drop(held);
+        let unrelated = other_control.gate.lock().unwrap();
+        scheduler.abort(target).unwrap();
+        assert!(scheduler.conversation(target).unwrap().abort_requested);
+        assert!(!scheduler.conversation(other).unwrap().abort_requested);
+        drop(unrelated);
+        scheduler.shutdown().await.unwrap();
     }
 
     #[tokio::test]

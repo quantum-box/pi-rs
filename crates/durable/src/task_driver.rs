@@ -510,7 +510,7 @@ impl Driver {
                 let hook = abort_gate_hooks().lock().unwrap().remove(&id);
                 if let Some(hook) = hook {
                     match self.shared.owner.task_gate().try_lock() {
-                        Err(std::sync::TryLockError::WouldBlock) => {
+                        Err(durable_store::controls::PollGateError::Busy) => {
                             hook();
                             self.shared
                                 .owner

@@ -1087,7 +1087,9 @@ fn pre_transaction_busy(error: &Error) -> bool {
 
 fn runtime_pre_transaction_busy(error: &crate::runtime::Error) -> bool {
     match error {
-        crate::runtime::Error::TaskPublicationBusy => true,
+        crate::runtime::Error::TaskPublicationBusy | crate::runtime::Error::CallbackStartBusy => {
+            true
+        }
         crate::runtime::Error::Storage(durable_store::Error::WriteLockBusy(_)) => true,
         crate::runtime::Error::TaskScheduler(error) => pre_transaction_busy(error),
         crate::runtime::Error::Document(crate::document::Error::Store(
@@ -2464,7 +2466,7 @@ impl PreparedSettlement {
         &mut self,
         scheduler: &Scheduler,
         owner: &Arc<OwnedStore>,
-        _gate: &std::sync::MutexGuard<'_, ()>,
+        _gate: &durable_store::controls::PollGateGuard<'_>,
     ) -> Result<PreparedRevalidation, Error> {
         self.graph_version = owner
             .store()
@@ -8828,7 +8830,7 @@ impl Scheduler {
         owner: &Arc<OwnedStore>,
         root: Uuid,
         running: Uuid,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
     ) -> Result<(), Error> {
         if let Some(harness) = self.validator.as_mut() {
             drop(gate);
@@ -11677,7 +11679,7 @@ impl Scheduler {
         result: Result<Step, String>,
         mut documents: crate::document::DetachedTaskDocuments,
         reported_handler_failure: &mut bool,
-        _gate: std::sync::MutexGuard<'_, ()>,
+        _gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         ordering_graph_version: u64,
         deferred: &mut Option<DeferredSettlement>,
@@ -12420,7 +12422,7 @@ impl Scheduler {
         &mut self,
         prepared: &mut PreparedSettlement,
         owner: &Arc<OwnedStore>,
-        _gate: std::sync::MutexGuard<'_, ()>,
+        _gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
@@ -12632,7 +12634,7 @@ impl Scheduler {
         &mut self,
         prepared: &mut PreparedSettlement,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
     ) -> Result<bool, Error> {
         match prepared.revalidate(self, owner, &gate)? {
             PreparedRevalidation::Ready => {
@@ -12837,7 +12839,7 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
@@ -12857,7 +12859,7 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
@@ -12877,7 +12879,7 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
         completed: bool,
@@ -12919,7 +12921,7 @@ impl Scheduler {
         &mut self,
         parent: &task_store::StoredTask,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
