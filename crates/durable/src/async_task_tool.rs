@@ -3399,6 +3399,107 @@ mod tests {
         }
     }
     #[test]
+    fn hooked_durable_any_wake_retains_remaining_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let leaf: Arc<dyn crate::task_scheduler::Handler> = Arc::new(ChainLeaf);
+        let mut registry = Registry::default();
+        assert!(registry.register("production-outer", true, ProductionOuter(slot.clone())));
+        assert!(registry.register_shared("production-leaf", true, leaf.clone()));
+        for kind in ["production-outer", "production-leaf"] {
+            assert!(
+                registry.set_abort(kind, |_: &Task| Ok(crate::task_scheduler::Step::Succeed(
+                    json!(null)
+                )))
+            );
+        }
+        let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
+        let leaf_tool = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "leaf".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "production-leaf",
+            true,
+            1,
+            leaf,
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let root_tool = host
+            .register_replay_safe_durable_tool_with_hook(
+                Arc::new(TwoChildTool {
+                    any: true,
+                    calls: calls.clone(),
+                    fail_after_wake: false,
+                }),
+                "two-v1",
+                1,
+                vec![leaf_tool],
+                "hook-v1",
+                Arc::new(DurableHooks {
+                    before: before.clone(),
+                    after: after.clone(),
+                }),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        assert!(slot.set(root_tool).is_ok());
+        let scheduler = host.into_scheduler_for_test();
+        let outer = production_outer_task();
+        scheduler.submit(&outer).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        let outer_wait = wait_state(&driver, outer.id(), |s| {
+            matches!(s, crate::task::TaskState::Waiting(_))
+        });
+        let root: crate::task_tool::NestedTaskCall =
+            serde_json::from_value(outer_wait.checkpoint().data["call"].clone()).unwrap();
+        let root_wait = wait_state(&driver, root.task_id(), |s| {
+            matches!(s, crate::task::TaskState::Waiting(_))
+        });
+        let children: Vec<AsyncTaskCall> =
+            serde_json::from_value(root_wait.checkpoint().data["checkpoint"]["calls"].clone())
+                .unwrap();
+        for child in &children {
+            wait_state(&driver, child.task_id(), |s| {
+                matches!(s, crate::task::TaskState::Waiting(_))
+            });
+        }
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                children[0].task_id(),
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+        wait_state(&driver, root.task_id(), |s| {
+            matches!(s, crate::task::TaskState::Completing(_))
+        });
+        assert!(matches!(
+            driver.get(children[1].task_id()).unwrap().unwrap().state(),
+            crate::task::TaskState::Waiting(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                children[1].task_id(),
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+        wait_state(&driver, outer.id(), |s| {
+            matches!(s, crate::task::TaskState::Succeeded(_))
+        });
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
     fn production_all_and_any_freeze_ended_children_with_two_children() {
         for any in [false, true] {
             let dir = tempfile::tempdir().unwrap();
