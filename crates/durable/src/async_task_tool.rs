@@ -3465,6 +3465,173 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1, "{phase}");
         }
     }
+    struct RichAfterMemoRace {
+        fired: Arc<std::sync::atomic::AtomicBool>,
+        ignored_error: Arc<std::sync::atomic::AtomicBool>,
+        change_parent: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for RichAfterMemoRace {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                ctx.memo.get_or_insert("rich-race", json!("saved")).await?;
+                self.change_parent.get().unwrap()();
+                let error = ctx.memo.get("rich-race").await;
+                self.ignored_error.store(error.is_err(), Ordering::SeqCst);
+            } else if ctx.memo.get("rich-race").await? != Some(json!("saved")) {
+                return Err("memo was not preserved".into());
+            }
+            let mut result = input.clone();
+            result.output = vec![json!({"type":"text", "text":"rich-after-resumed"})];
+            Ok(Some(result))
+        }
+    }
+    #[test]
+    fn rich_after_child_defers_ignored_memo_error_with_running_unsafe_parent() {
+        use crate::task_scheduler::{Step, TickReservation};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        assert!(
+            registry.register("unsafe-parent-test", false, |_: &Task| Ok(Step::Succeed(
+                json!(null)
+            )))
+        );
+        let mut host = StandaloneBeforeHookHost::open(dir.path().join("db"), registry).unwrap();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ignored_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let change_parent: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut extensions = crate::extension::Registry::default();
+        extensions
+            .install_identified(
+                crate::extension::Extension {
+                    name: "rich-race".into(),
+                    hooks: vec![Arc::new(RichAfterMemoRace {
+                        fired: fired.clone(),
+                        ignored_error: ignored_error.clone(),
+                        change_parent: change_parent.clone(),
+                    })],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(
+                    1,
+                    "rich-race-v1".into(),
+                    vec!["hook".into()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let child_tool = host
+            .register_replay_safe_durable_tool_with_content_hooks(
+                Arc::new(HookRaceTool(calls.clone())),
+                "hook-race-v1",
+                1,
+                vec![],
+                &extensions.snapshot(),
+                &["rich-race".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let mut scheduler = host.into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let parent = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            10,
+        )
+        .unwrap()
+        .registered("unsafe-parent-test".into(), false)
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let tasks = TaskStore::new(owner.store());
+        let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+        tasks
+            .update(&snapshot, |task| {
+                task.start_attempt(Uuid::new_v4())?;
+                task.wait(crate::task::WaitFor::Signal("hold".into()))
+            })
+            .unwrap();
+        let waiting = tasks.load(parent.id()).unwrap().unwrap().task;
+        let (_, child) = child_tool.child_candidate(&waiting, json!({})).unwrap();
+        tasks.save(&[Save::Create(&child)]).unwrap();
+        let parent_id = parent.id();
+        let race_owner = owner.clone();
+        assert!(
+            change_parent
+                .set(Arc::new(move || {
+                    let tasks = TaskStore::new(race_owner.store());
+                    let snapshot = tasks.load(parent_id).unwrap().unwrap();
+                    tasks
+                        .update(&snapshot, |task| {
+                            task.wake()?;
+                            task.start_attempt(Uuid::new_v4())
+                        })
+                        .unwrap();
+                }))
+                .is_ok()
+        );
+        let mut deferred = false;
+        for _ in 0..8 {
+            let TickReservation::Invocation(job) = scheduler.reserve_tick(0).unwrap() else {
+                panic!("child not reserved")
+            };
+            assert_eq!(job.task_id(), child.id());
+            let completed = job.execute().unwrap();
+            let is_defer = matches!(
+                completed.handler_result(),
+                Some(Ok(Step::DeferUndispatched))
+            );
+            if is_defer {
+                assert!(ignored_error.load(Ordering::SeqCst));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            scheduler.settle_invocation(completed).unwrap();
+            if is_defer {
+                deferred = true;
+                let parked_child = scheduler.get(child.id()).unwrap().unwrap();
+                assert!(matches!(
+                    parked_child.state(),
+                    crate::task::TaskState::Ready
+                ));
+                assert_eq!(parked_child.checkpoint().phase, "replay-safe-async-after");
+                let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+                tasks
+                    .update(&snapshot, |task| {
+                        task.wait(crate::task::WaitFor::Signal("hold".into()))
+                    })
+                    .unwrap();
+            }
+            if scheduler.get(child.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert!(fired.load(Ordering::SeqCst) && ignored_error.load(Ordering::SeqCst) && deferred);
+        let task = scheduler.get(child.id()).unwrap().unwrap();
+        let crate::task::TaskState::Succeeded(value) = task.state() else {
+            panic!("unexpected child state {:?}", task.state())
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: result,
+        } = serde_json::from_value(value.clone()).unwrap()
+        else {
+            panic!("expected rich result")
+        };
+        assert_eq!(result.output[0]["text"], "rich-after-resumed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     struct DurableHooks {
         before: Arc<AtomicUsize>,
         after: Arc<AtomicUsize>,
