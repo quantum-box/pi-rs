@@ -5445,3 +5445,293 @@ async fn any_repark_with_completed_siblings_is_fenced_by_cas_and_abort() {
         scheduler.shutdown().await.unwrap();
     }
 }
+
+// Exercise early-any with an already-completed unsafe sibling through both wakes.
+struct MixedAnyDiskMiddle(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for MixedAnyDiskMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        use std::io::Write;
+        let wake = host.pending_wake();
+        if let Some(wake) = &wake {
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("mixed-any-wakes"))
+                    .unwrap(),
+                "{}",
+                serde_json::to_string(wake).unwrap()
+            )
+            .unwrap();
+        }
+        let done = host
+            .call_keyed_unpolled_with_id("done", "immediate", json!({}))
+            .await
+            .unwrap();
+        let a = host
+            .call_keyed_unpolled_with_id("a", "child", json!({"job":"a"}))
+            .await
+            .unwrap();
+        let b = host
+            .call_keyed_unpolled_with_id("b", "child", json!({"job":"b"}))
+            .await
+            .unwrap();
+        assert_eq!(done.outcome, Outcome::Succeeded("already done".into()));
+        if matches!(a.outcome, Outcome::Pending { .. })
+            || matches!(b.outcome, Outcome::Pending { .. })
+        {
+            host.suspend_pending_any_with_checkpoint(json!("mixed-any-checkpoint"))
+                .unwrap();
+            if wake.is_some() && self.0.join("stop-before-repark").exists() {
+                std::fs::write(self.0.join("at-before-repark"), b"ready").unwrap();
+                std::future::pending::<()>().await;
+            }
+            Outcome::Succeeded("park".into()).into()
+        } else {
+            assert_eq!(a.outcome, Outcome::Succeeded("a resolved".into()));
+            assert_eq!(b.outcome, Outcome::Succeeded("b resolved".into()));
+            Outcome::Succeeded("mixed any complete".into()).into()
+        }
+    }
+}
+fn mixed_any_disk_options(path: &std::path::Path) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyDiskRoot(path.into()))).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(MixedAnyDiskMiddle(path.into())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(FileImmediateMixedLeaf(path.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+            RegisteredTool {
+                tool: Arc::new(MultiParkFileLeaf(path.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+
+#[tokio::test]
+async fn mixed_any_process_worker() {
+    let Some(path) = std::env::var_os("PI_MIXED_ANY_PROCESS") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let mut scheduler = Scheduler::open(path.join("db"), mixed_any_disk_options(&path)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(path.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    std::fs::write(
+        path.join("job-ids"),
+        serde_json::to_vec(&vec![a.operation_id, b.operation_id]).unwrap(),
+    )
+    .unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("a resolved".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    assert_eq!(
+        scheduler.nested_pending_jobs(id, root).unwrap(),
+        vec![b.clone()]
+    );
+    std::fs::write(path.join("at-after-repark"), b"ready").unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn mixed_any_completes_after_repark_and_process_loss() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for stage in ["before", "after"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        if stage == "before" {
+            std::fs::write(path.join("stop-before-repark"), b"yes").unwrap();
+        }
+        let mut process = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mixed_any_process_worker"])
+                .env("PI_MIXED_ANY_PROCESS", path)
+                .spawn()
+                .unwrap(),
+        );
+        until(|| path.join(format!("at-{stage}-repark")).exists()).await;
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        if stage == "before" {
+            std::fs::remove_file(path.join("stop-before-repark")).unwrap();
+        }
+        let id = std::fs::read_to_string(path.join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let ids: Vec<uuid::Uuid> =
+            serde_json::from_slice(&std::fs::read(path.join("job-ids")).unwrap()).unwrap();
+        let mut scheduler = Scheduler::open(path.join("db"), mixed_any_disk_options(path)).unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(
+            scheduler.conversation(id).unwrap().nested_suspended(),
+            "{stage}"
+        );
+        let root = scheduler.blocked(id).unwrap().unwrap().0;
+        let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].reference, "b");
+        assert_eq!(jobs[0].operation_id, ids[1]);
+        scheduler
+            .reconcile_nested_pending(
+                id,
+                root,
+                ids[1],
+                &jobs[0].reference,
+                Outcome::Succeeded("b resolved".into()),
+            )
+            .unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(
+            scheduler.blocked(id).unwrap().is_none(),
+            "{stage}: {:?}",
+            scheduler.conversation(id).unwrap()
+        );
+        assert!(scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content == "mixed any complete")
+        ));
+        let wakes: Vec<Value> = std::fs::read_to_string(path.join("mixed-any-wakes"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let expected_count = if stage == "before" { 3 } else { 2 };
+        assert_eq!(wakes.len(), expected_count, "{stage}");
+        for wake in &wakes {
+            assert_eq!(wake["checkpoint"], json!("mixed-any-checkpoint"));
+        }
+        for wake in &wakes[..wakes.len() - 1] {
+            assert_eq!(wake["ended"], json!([ids[0]]));
+        }
+        assert_eq!(wakes.last().unwrap()["ended"], json!([ids[1]]));
+        assert_eq!(
+            std::fs::read_to_string(path.join("immediate-dispatches")).unwrap(),
+            "done\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("dispatches")).unwrap(),
+            "a\nb\n"
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn mixed_any_reparks_then_completes_after_both_wakes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let mut scheduler = Scheduler::open(path.join("db"), mixed_any_disk_options(path)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    assert_eq!(jobs.len(), 2);
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("a resolved".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    assert_eq!(
+        scheduler.nested_pending_jobs(id, root).unwrap(),
+        vec![b.clone()]
+    );
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            b.operation_id,
+            &b.reference,
+            Outcome::Succeeded("b resolved".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "mixed any complete"))
+    );
+    let wakes: Vec<Value> = std::fs::read_to_string(path.join("mixed-any-wakes"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        wakes,
+        vec![
+            json!({"checkpoint":"mixed-any-checkpoint", "ended":[a.operation_id]}),
+            json!({"checkpoint":"mixed-any-checkpoint", "ended":[b.operation_id]})
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("immediate-dispatches")).unwrap(),
+        "done\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("dispatches")).unwrap(),
+        "a\nb\n"
+    );
+    scheduler.shutdown().await.unwrap();
+}
