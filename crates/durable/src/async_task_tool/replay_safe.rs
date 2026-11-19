@@ -900,6 +900,12 @@ impl Handler for Executor {
             std::fs::write(std::path::PathBuf::from(dir).join("stale-rejected"), b"yes")
                 .map_err(|e| e.to_string())?;
         }
+        if !self
+            .identity
+            .matches(self.tool.as_ref(), &self.implementation, self.version)
+        {
+            return Err("abort hook identity changed during execution".into());
+        }
         admission.abort_hook_receipt(self, Some(&value))?;
         #[cfg(test)]
         if let Some(dir) = std::env::var_os("PI_TEST_ABORT_AFTER_RECEIPT") {

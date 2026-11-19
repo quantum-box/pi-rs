@@ -5996,6 +5996,147 @@ mod tests {
         assert!(!root.join("abort-hook-count").exists());
         let _ = driver.shutdown_with_pending().unwrap();
     }
+    struct MutableAbortTool {
+        changed: Arc<std::sync::atomic::AtomicBool>,
+        root: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl Tool for MutableAbortTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "mutable-abort-tool".into(),
+                description: if self.changed.load(Ordering::SeqCst) {
+                    "changed"
+                } else {
+                    "original"
+                }
+                .into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for MutableAbortTool {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            context: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            std::fs::write(self.root.join("tool-start"), b"ready").map_err(|e| e.to_string())?;
+            context.cancellation.cancelled().await;
+            Err("cancelled".into())
+        }
+    }
+    struct PausedIdentityAbortHook {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for PausedIdentityAbortHook {
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            self.entered.send(()).map_err(|e| e.to_string())?;
+            self.release
+                .lock()
+                .map_err(|e| e.to_string())?
+                .recv()
+                .map_err(|e| e.to_string())?;
+            let mut result = input.clone();
+            result.output = vec![json!({"type":"text", "text":"cleanup completed"})];
+            Ok(Some(result))
+        }
+    }
+    #[test]
+    fn aborted_after_rechecks_tool_identity_after_hook_before_receipt() {
+        for mutate in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let mut extensions = crate::extension::Registry::default();
+            extensions
+                .install_identified(
+                    crate::extension::Extension {
+                        name: "identity-hook".into(),
+                        hooks: vec![Arc::new(PausedIdentityAbortHook {
+                            entered,
+                            release: std::sync::Mutex::new(release_rx),
+                        })],
+                        ..Default::default()
+                    },
+                    crate::extension::ExtensionIdentity::new(
+                        1,
+                        "identity-hook-v1".into(),
+                        vec!["hook".into()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut host =
+                StandaloneBeforeHookHost::open(dir.path().join("db"), Registry::default()).unwrap();
+            let tool = host
+                .register_replay_safe_durable_tool_with_abort_after(
+                    Arc::new(MutableAbortTool {
+                        changed: changed.clone(),
+                        root: dir.path().into(),
+                    }),
+                    "mutable-abort-v1",
+                    1,
+                    vec![],
+                    &extensions.snapshot(),
+                    &["identity-hook".into()],
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                    AbortAfterAuthorization::host_attests_cleanup_safe(),
+                )
+                .unwrap();
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            wait_file(&dir.path().join("tool-start"));
+            driver.request_abort(id).unwrap();
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            if mutate {
+                changed.store(true, Ordering::SeqCst);
+            }
+            release.send(()).unwrap();
+            let task = wait_terminal(&driver, id);
+            if mutate {
+                assert!(
+                    matches!(task.state(), crate::task::TaskState::Failed(reason) if reason.contains("identity changed during execution")),
+                    "{:?}",
+                    task.state()
+                );
+            } else {
+                assert!(
+                    matches!(task.state(), crate::task::TaskState::Cancelled),
+                    "{:?}",
+                    task.state()
+                );
+            }
+            driver.shutdown().unwrap();
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let receipt = store
+                .get(format!("durable/replay-safe-async/{id}/abort-after").as_bytes())
+                .unwrap();
+            assert_eq!(receipt.is_some(), !mutate);
+            assert_eq!(
+                read_aborted_after_result(&store, id).unwrap().is_some(),
+                !mutate
+            );
+        }
+    }
+
     #[test]
     fn aborted_after_result_is_durable_and_memo_is_denied() {
         for memo in [false, true] {
