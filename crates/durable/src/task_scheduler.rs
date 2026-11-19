@@ -279,6 +279,12 @@ fn interrupted_receipt_key(id: Uuid) -> Vec<u8> {
 fn interrupted_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
     format!("durable/async-task/interrupted-after-intent/{id}/{attempt}").into_bytes()
 }
+fn interrupted_hook_commit_error(error: durable_store::Error) -> String {
+    match error {
+        durable_store::Error::Conflict { .. } => UNSAFE_ANCESTOR_BUSY.into(),
+        other => other.to_string(),
+    }
+}
 fn interrupted_owner_checks(
     store: &durable_store::Store,
     task: &Task,
@@ -303,9 +309,19 @@ fn interrupted_owner_checks(
                     .ok_or("missing owner")?;
                 if parent.task.abort_requested()
                     || parent.task.is_terminal()
-                    || parent.task.is_completing()
+                    || parent.task.is_background()
+                    || (parent.task.is_completing()
+                        && !(parent.task.retains_task_children_on_success()
+                            && matches!(parent.task.state(), TaskState::Completing(_))))
                 {
                     return Err("owner no longer authorizes cleanup".into());
+                }
+                if !parent.task.replay_safe()
+                    && !matches!(parent.task.state(), TaskState::Waiting(_))
+                    && !(parent.task.retains_task_children_on_success()
+                        && matches!(parent.task.state(), TaskState::Completing(_)))
+                {
+                    return Err(UNSAFE_ANCESTOR_BUSY.into());
                 }
                 checks.push(durable_store::Check {
                     key: task_store::key(*id),
@@ -2061,7 +2077,7 @@ impl AdmissionHandle<'_> {
             owner
                 .store()
                 .commit(&checks, &[])
-                .map_err(|e| e.to_string())?;
+                .map_err(interrupted_hook_commit_error)?;
             return Ok(Some(value));
         }
         checks.push(durable_store::Check {
@@ -2104,7 +2120,7 @@ impl AdmissionHandle<'_> {
                     &checks,
                     &[durable_store::Mutation::Put { key, value: bytes }],
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(interrupted_hook_commit_error)?;
             return Ok(Some(result.clone()));
         }
         checks.push(durable_store::Check {
@@ -2120,7 +2136,7 @@ impl AdmissionHandle<'_> {
                     value: serde_json::to_vec(&intent).map_err(|e| e.to_string())?,
                 }],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(interrupted_hook_commit_error)?;
         Ok(None)
     }
     #[cfg(test)]
@@ -4011,6 +4027,30 @@ impl Scheduler {
                         let key = interrupted_receipt_key(current.task.id());
                         let mut next = current.clone();
                         let mut batch;
+                        if !current.task.abort_requested()
+                            && (outcome.as_deref() == Some(UNSAFE_ANCESTOR_BUSY)
+                                || interrupted_owner_checks(self.ts().store(), &current.task)
+                                    .is_err_and(|error| error == UNSAFE_ANCESTOR_BUSY))
+                        {
+                            next.task
+                                .defer_interrupted_cleanup()
+                                .map_err(Error::Transition)?;
+                            let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            self.ts()
+                                .store()
+                                .commit_with_prefix_put_fence(
+                                    &batch.checks,
+                                    &batch.mutations,
+                                    &[
+                                        task_store::PREFIX,
+                                        crate::ownership_edge::PREFIX,
+                                        b"runtime/conversation/",
+                                    ],
+                                    ordering_graph_version,
+                                )
+                                .map_err(task_store::Error::from)?;
+                            return Ok(true);
+                        }
                         if current.task.abort_requested() {
                             next.task
                                 .cancel_interrupted_cleanup()

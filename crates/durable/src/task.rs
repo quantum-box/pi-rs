@@ -421,6 +421,18 @@ impl Task {
         self.retired_attempt_id = None;
         Ok(())
     }
+    pub(crate) fn defer_interrupted_cleanup(&mut self) -> Result<(), TransitionError> {
+        if !self.holds_interrupted_cleanup()
+            || self.abort_requested
+            || self.attempt_id.is_none()
+            || !matches!(self.state, TaskState::CompletingFailed(_))
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.attempt_id = None;
+        self.retired_attempt_id = None;
+        Ok(())
+    }
     pub(crate) fn finish_interrupted_cleanup(&mut self) -> Result<(), TransitionError> {
         if !self.holds_interrupted_cleanup()
             || !matches!(self.state, TaskState::CompletingFailed(_))

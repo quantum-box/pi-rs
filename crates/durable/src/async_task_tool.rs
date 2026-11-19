@@ -10590,6 +10590,142 @@ mod tests {
                 .unwrap(),
         )
     }
+    struct InterruptedBusyParent {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        child: Uuid,
+        runs: AtomicUsize,
+    }
+    impl crate::task_scheduler::Handler for InterruptedBusyParent {
+        fn run(&self, task: &Task) -> Result<crate::task_scheduler::Step, String> {
+            if self.runs.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(crate::task_scheduler::Step::Fail("child finished".into()));
+            }
+            self.entered.send(()).map_err(|e| e.to_string())?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|e| e.to_string())?;
+            Ok(crate::task_scheduler::Step::Wait {
+                checkpoint: task.checkpoint().clone(),
+                condition: crate::task::WaitFor::Tasks(vec![self.child]),
+                children: vec![],
+            })
+        }
+    }
+    #[test]
+    fn interrupted_cleanup_defers_while_unsafe_ancestor_is_running() {
+        use crate::task_store::TaskStore;
+        for race_during_hook in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (parent, child) = interrupted_kill_tool(root);
+            if race_during_hook {
+                std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
+            }
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let mut registry = Registry::default();
+            assert!(registry.register(
+                "parent",
+                false,
+                InterruptedBusyParent {
+                    entered,
+                    release: std::sync::Mutex::new(release_rx),
+                    child,
+                    runs: AtomicUsize::new(0),
+                }
+            ));
+            let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
+            host.register_tool_with_interrupted_after(
+                "leaf",
+                tool,
+                "backend",
+                1,
+                "hook-v1",
+                Arc::new(InterruptedAfterFixture(root.to_owned())),
+                InterruptedAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+            let scheduler = host.into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let tasks = TaskStore::new(owner.store());
+            let snapshot = tasks.load(parent).unwrap().unwrap();
+            tasks
+                .update(&snapshot, |task| {
+                    *task = task.clone().registered("parent".into(), false);
+                    if !race_during_hook {
+                        task.wake()?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            if race_during_hook {
+                wait_file(&root.join("interrupted-ready"));
+                let snapshot = tasks.load(parent).unwrap().unwrap();
+                tasks.update(&snapshot, |task| task.wake()).unwrap();
+            }
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("unsafe parent did not start");
+            if race_during_hook {
+                std::fs::write(root.join("interrupted-release"), b"yes").unwrap();
+                std::fs::remove_file(root.join("interrupted-pause")).unwrap();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let task = driver.get(child).unwrap().unwrap();
+                if task.holds_interrupted_cleanup() && task.attempt_id().is_none() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cleanup did not defer: {:?}",
+                    task.state()
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                driver.get(parent).unwrap().unwrap().state() == &crate::task::TaskState::Running
+            );
+            if !race_during_hook {
+                assert!(!root.join("interrupted-hook-count").exists());
+            }
+            release.send(()).unwrap();
+            assert!(matches!(
+                wait_terminal(&driver, child).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            let _ = driver.shutdown_with_pending().unwrap();
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            assert!(
+                read_interrupted_after_result(&store, child)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(matches!(
+                read_sealed_outcome_evidence(&store, child).unwrap(),
+                Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+            ));
+            let count = std::fs::read_to_string(root.join("interrupted-hook-count"))
+                .unwrap()
+                .lines()
+                .count();
+            assert_eq!(count, if race_during_hook { 2 } else { 1 });
+            assert_eq!(
+                std::fs::read_to_string(root.join("unsafe-invocations"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+
     #[test]
     fn interrupted_after_keeps_external_outcome_unknown() {
         let dir = tempfile::tempdir().unwrap();
