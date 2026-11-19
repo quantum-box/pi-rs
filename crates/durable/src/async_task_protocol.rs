@@ -1600,7 +1600,7 @@ mod tests {
             std::sync::Arc::new((std::sync::Mutex::new(mode == 0), std::sync::Condvar::new()));
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
         let resume = std::sync::Arc::new(tokio::sync::Notify::new());
-        let tool: std::sync::Arc<dyn Tool> = if mode == 1 || mode == 2 {
+        let tool: std::sync::Arc<dyn Tool> = if matches!(mode, 1 | 2 | 5 | 6) {
             std::sync::Arc::new(CancellationObservedTool {
                 entered,
                 cancelled: cancel_tx,
@@ -1680,12 +1680,11 @@ mod tests {
             if mode == 4 {
                 std::thread::scope(|scope| {
                     let (started_tx, started_rx) = std::sync::mpsc::channel();
-                    let driver_ref = &driver;
-                    let abort = scope.spawn(move || {
-                        driver_ref.request_abort_with_contention_probe_for_test(parent, || {
-                            started_tx.send(()).unwrap();
-                        })
+                    crate::task_driver::abort_gate_contention_for_test(parent, move || {
+                        started_tx.send(()).unwrap();
                     });
+                    let driver_ref = &driver;
+                    let abort = scope.spawn(move || driver_ref.request_abort(parent));
                     started_rx
                         .recv_timeout(std::time::Duration::from_secs(5))
                         .unwrap();
@@ -1719,19 +1718,31 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
             assert_eq!(driver.active_unhooked_count_for_test(), 2);
-            if mode == 1 {
-                driver.request_abort(parent).unwrap();
-            } else {
-                driver.stop_worker_for_test();
+            if mode == 1 || mode == 2 {
+                if mode == 1 {
+                    driver.request_abort(parent).unwrap();
+                } else {
+                    driver.stop_worker_for_test();
+                }
+                cancel_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
             }
-            cancel_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
             release_tx.send(()).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while driver.active_unhooked_count_for_test() != 1 {
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::yield_now();
+            }
+            if mode == 5 || mode == 6 {
+                if mode == 5 {
+                    driver.request_abort(parent).unwrap();
+                } else {
+                    driver.stop_worker_for_test();
+                }
+                cancel_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
             }
             resume.notify_one();
             assert_eq!(
@@ -1755,6 +1766,14 @@ mod tests {
     #[test]
     fn shutdown_during_ready_publication_retires_old_lease() {
         released_attempt_boundary(3);
+    }
+    #[test]
+    fn abort_cancels_new_attempt_after_old_registration_removed() {
+        released_attempt_boundary(5);
+    }
+    #[test]
+    fn shutdown_cancels_new_attempt_after_old_registration_removed() {
+        released_attempt_boundary(6);
     }
     #[test]
     fn old_cancellation_registration_cannot_block_new_attempt_or_abort() {

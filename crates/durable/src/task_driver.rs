@@ -473,21 +473,6 @@ impl Driver {
         self.request_abort_after_check(id, || {})
     }
 
-    #[cfg(test)]
-    pub(crate) fn request_abort_with_contention_probe_for_test(
-        &self,
-        id: Uuid,
-        observed: impl FnOnce(),
-    ) -> Result<(), Error> {
-        self.request_abort_after_check(id, || {
-            assert!(matches!(
-                self.shared.owner.task_gate().try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ));
-            observed();
-        })
-    }
-
     fn request_abort_after_check(&self, id: Uuid, after_check: impl FnOnce()) -> Result<(), Error> {
         // A conversation worker can consult driver state while holding its
         // execution gate. Do not hold driver state while fencing those gates.
@@ -504,6 +489,30 @@ impl Driver {
                     durable_store::controls::FenceError::Commit(e) => Error::Runtime(e),
                 })?;
         } else {
+            #[cfg(test)]
+            let _gate = {
+                let hook = abort_gate_hooks().lock().unwrap().remove(&id);
+                if let Some(hook) = hook {
+                    match self.shared.owner.task_gate().try_lock() {
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            hook();
+                            self.shared
+                                .owner
+                                .task_gate()
+                                .lock()
+                                .map_err(|_| Error::Poisoned)?
+                        }
+                        _ => panic!("abort gate was not contended"),
+                    }
+                } else {
+                    self.shared
+                        .owner
+                        .task_gate()
+                        .lock()
+                        .map_err(|_| Error::Poisoned)?
+                }
+            };
+            #[cfg(not(test))]
             let _gate = self
                 .shared
                 .owner
@@ -921,6 +930,19 @@ fn after_execute_hooks() -> &'static BoundaryHooks {
 #[cfg(test)]
 pub(crate) fn after_execute_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
     after_execute_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
+#[cfg(test)]
+fn abort_gate_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn abort_gate_contention_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    abort_gate_hooks()
         .lock()
         .unwrap()
         .insert(id, Box::new(hook));
