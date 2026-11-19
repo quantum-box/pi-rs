@@ -3228,6 +3228,115 @@ mod tests {
         }
     }
 
+    struct ConcurrentPoisonedMemoHook {
+        before_phase: bool,
+        observed: std::sync::mpsc::Sender<(bool, bool)>,
+    }
+    impl ConcurrentPoisonedMemoHook {
+        fn check(&self, ctx: &crate::extension::Context<'_>) {
+            let barrier = std::sync::Barrier::new(2);
+            let (failed_tx, failed_rx) = std::sync::mpsc::sync_channel(0);
+            let (failed, write) = std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    barrier.wait();
+                    let failed = runtime.block_on(ctx.memo.get("")).is_err();
+                    failed_tx.send(failed).unwrap();
+                    failed
+                });
+                let barrier_ref = &barrier;
+                let later = scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    barrier_ref.wait();
+                    // The write begins on another live thread only after the
+                    // failing access returned and its failure was observed.
+                    assert!(
+                        failed_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap()
+                    );
+                    runtime
+                        .block_on(
+                            ctx.memo
+                                .get_or_insert("concurrent-write", json!("forbidden")),
+                        )
+                        .is_err()
+                });
+                (first.join().unwrap(), later.join().unwrap())
+            });
+            self.observed.send((failed, write)).unwrap();
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for ConcurrentPoisonedMemoHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            if self.before_phase {
+                self.check(ctx);
+            }
+            Ok(crate::extension::BeforeTool::Pass)
+        }
+        async fn after_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &serde_json::Value,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if !self.before_phase {
+                self.check(ctx);
+            }
+            Ok(None)
+        }
+    }
+    #[test]
+    fn hooked_durable_concurrent_write_after_observed_memo_failure_is_rejected() {
+        for before_phase in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (observed, received) = std::sync::mpsc::channel();
+            let mut host = StandaloneBeforeHookHost::open(&path, Registry::default()).unwrap();
+            let tool = host
+                .register_replay_safe_durable_tool_with_hook(
+                    Arc::new(ImmediateDurable(calls.clone())),
+                    "immediate-v1",
+                    1,
+                    vec![],
+                    "concurrent-hook-v1",
+                    Arc::new(ConcurrentPoisonedMemoHook {
+                        before_phase,
+                        observed,
+                    }),
+                    ReplaySafeAuthorization::host_attests_replay_safe(),
+                )
+                .unwrap();
+            let id = host.start_replay_safe_root(&tool, json!({}), 4).unwrap();
+            let driver = host.into_driver();
+            assert_eq!(
+                received
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap(),
+                (true, true)
+            );
+            assert!(matches!(
+                wait_terminal(&driver, id).state(),
+                crate::task::TaskState::Failed(_)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!before_phase));
+            driver.shutdown().unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            let key = format!("runtime/extension-memo/{id}/concurrent-write");
+            assert!(store.get(key.as_bytes()).unwrap().is_none());
+        }
+    }
+
     #[test]
     fn hooked_durable_after_ignored_memo_error_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
