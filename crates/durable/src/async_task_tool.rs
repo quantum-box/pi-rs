@@ -9018,6 +9018,294 @@ mod tests {
             .unwrap();
         (host, tool)
     }
+    struct CombinedUnavailableRestartHook(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for CombinedUnavailableRestartHook {
+        async fn before_tool(
+            &self,
+            _: &crate::extension::ToolCall,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeTool, String> {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("combined-before"))
+                    .map_err(|e| e.to_string())?,
+                "called"
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(crate::extension::BeforeTool::Pass)
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &crate::extension::ToolCall,
+            input: &crate::extension::ToolBlockResult,
+            _: bool,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+            let code = input
+                .diagnostics
+                .iter()
+                .find_map(|d| d.code.as_deref())
+                .ok_or("missing diagnostic")?;
+            if !matches!(code, "tool_unavailable" | "restart_limit") {
+                return Err("unexpected hook".into());
+            }
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("combined-after"))
+                    .map_err(|e| e.to_string())?,
+                "{code}"
+            )
+            .map_err(|e| e.to_string())?;
+            let mut result = input.clone();
+            result.output = vec![json!({"type":"text", "text":format!("handled {code}")})];
+            Ok(Some(result))
+        }
+    }
+    fn combined_unavailable_restart_host(
+        root: &std::path::Path,
+    ) -> (
+        StandaloneBeforeHookHost,
+        Arc<crate::task_tool::TaskTool>,
+        Arc<crate::task_tool::TaskTool>,
+    ) {
+        let mut extensions = crate::extension::Registry::default();
+        extensions
+            .install_identified(
+                crate::extension::Extension {
+                    name: "combined".into(),
+                    hooks: vec![Arc::new(CombinedUnavailableRestartHook(root.to_owned()))],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(
+                    1,
+                    "combined-hooks-v1".into(),
+                    vec!["hook".into()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let snapshot = extensions.snapshot();
+        let mut host =
+            StandaloneBeforeHookHost::open(root.join("db"), Registry::default()).unwrap();
+        let missing = host
+            .register_unavailable_tool_with_content_hooks(
+                CrashUncertainTool(root.to_owned()).spec(),
+                "combined-v1",
+                1,
+                &snapshot,
+                &["combined".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                UnavailableAfterAuthorization::host_attests_unavailable_and_selection(),
+            )
+            .unwrap();
+        let restart = host
+            .register_replay_safe_durable_tool_with_restart_after(
+                Arc::new(CrashUncertainTool(root.to_owned())),
+                "combined-v1",
+                1,
+                vec![],
+                &snapshot,
+                &["combined".into()],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+                RestartAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        (host, missing, restart)
+    }
+    struct CombinedUnsafePending(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for CombinedUnsafePending {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "unsafe-pending".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for CombinedUnsafePending {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableToolStep::Complete(Outcome::Pending {
+                reference: "remote-combined".into(),
+            }))
+        }
+    }
+    #[test]
+    fn unavailable_restart_and_unsafe_registrations_coexist_on_real_drivers() {
+        const ENV: &str = "PI_RS_COMBINED_UNAVAILABLE_RESTART_FIXTURE";
+        if let Ok(root) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(root);
+            let (host, missing, restart) = combined_unavailable_restart_host(&root);
+            let missing_id = host.start_replay_safe_root(&missing, json!({}), 3).unwrap();
+            let restart_id = host.start_replay_safe_root(&restart, json!({}), 1).unwrap();
+            std::fs::write(
+                root.join("combined-ids"),
+                format!("{missing_id}\n{restart_id}\n"),
+            )
+            .unwrap();
+            let driver = host.into_driver();
+            let task = wait_terminal(&driver, missing_id);
+            assert!(matches!(task.state(), crate::task::TaskState::Succeeded(_)));
+            std::fs::write(root.join("combined-unavailable-done"), b"done").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("async_task_tool::tests::unavailable_restart_and_unsafe_registrations_coexist_on_real_drivers")
+            .env(ENV, root).spawn().unwrap();
+        wait_file(&root.join("combined-unavailable-done"));
+        wait_file(&root.join("uncertain-ready"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let ids: Vec<Uuid> = std::fs::read_to_string(root.join("combined-ids"))
+            .unwrap()
+            .lines()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let (host, _, _) = combined_unavailable_restart_host(root);
+        let hook_driver = host.into_driver();
+        let missing = hook_driver.get(ids[0]).unwrap().unwrap();
+        let failed = wait_terminal(&hook_driver, ids[1]);
+        assert_ne!(
+            missing.kind(),
+            failed.kind(),
+            "same spec and hook selection require distinct policy identities"
+        );
+        assert!(
+            matches!(failed.state(), crate::task::TaskState::Failed(reason) if reason == "restart limit")
+        );
+        let crate::task::TaskState::Succeeded(value) = missing.state() else {
+            panic!("unavailable did not finish")
+        };
+        let DurableTaskResult::Rich {
+            task_content_v1: result,
+        } = serde_json::from_value(value.clone()).unwrap()
+        else {
+            panic!("unavailable result not rich")
+        };
+        assert_eq!(
+            result.output,
+            vec![json!({"type":"text","text":"handled tool_unavailable"})]
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("tool_unavailable"))
+        );
+        assert_eq!(result.extra.get("isError"), Some(&json!(true)));
+        let unsafe_calls = Arc::new(AtomicUsize::new(0));
+        let mut unsafe_host = StandaloneNoHooksHost::open(
+            root.join("unsafe-db"),
+            Registry::default(),
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let unsafe_tool = unsafe_host
+            .register_unsafe_durable_tool(
+                Arc::new(CombinedUnsafePending(unsafe_calls.clone())),
+                "unsafe-v1",
+                1,
+                vec![],
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+            .unwrap();
+        let unsafe_id = unsafe_host
+            .start_unsafe_durable_root(&unsafe_tool, json!({}), 3)
+            .unwrap();
+        let unsafe_driver = unsafe_host.into_driver();
+        let unsafe_task = wait_terminal(&unsafe_driver, unsafe_id);
+        assert!(matches!(
+            unsafe_task.state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        assert_eq!(unsafe_calls.load(Ordering::SeqCst), 1);
+        unsafe_driver.shutdown().unwrap();
+        hook_driver.shutdown().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(
+            store
+                .list(format!("durable/replay-safe-async/{}/", ids[0]).as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        let Some(DurableTaskResult::Rich {
+            task_content_v1: restart_result,
+        }) = read_restart_after_result(&store, ids[1]).unwrap()
+        else {
+            panic!("missing restart cleanup receipt");
+        };
+        assert_eq!(
+            restart_result.output,
+            vec![json!({"type":"text", "text":"handled restart_limit"})]
+        );
+        assert!(
+            restart_result
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("restart_limit"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("combined-before"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let after = std::fs::read_to_string(root.join("combined-after")).unwrap();
+        assert_eq!(
+            after
+                .lines()
+                .filter(|line| *line == "tool_unavailable")
+                .count(),
+            1
+        );
+        assert_eq!(
+            after
+                .lines()
+                .filter(|line| *line == "restart_limit")
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("uncertain-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let unsafe_store = durable_store::Store::open(root.join("unsafe-db")).unwrap();
+        let evidence = read_unsafe_durable_receipts(&unsafe_store, unsafe_id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].outcome,
+            Outcome::Pending {
+                reference: "remote-combined".into()
+            }
+        );
+    }
+
     #[test]
     fn unavailable_after_kill_reopen_preserves_selection_memo_and_diagnostic() {
         const ENV: &str = "PI_RS_UNAVAILABLE_AFTER_FIXTURE";
