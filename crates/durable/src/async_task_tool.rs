@@ -10590,6 +10590,288 @@ mod tests {
                 .unwrap(),
         )
     }
+    struct UnsafeHookedSealedAncestor(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for UnsafeHookedSealedAncestor {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "unsafe-hooked-ancestor".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for UnsafeHookedSealedAncestor {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            context: ToolContext,
+            resume: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("ancestor-effects"))
+                .map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "{}",
+                if resume.checkpoint.is_none() {
+                    "initial"
+                } else {
+                    "resume"
+                }
+            )
+            .map_err(|e| e.to_string())?;
+            f.sync_all().map_err(|e| e.to_string())?;
+            if let Some(data) = resume.checkpoint {
+                let bridge: AsyncTaskCall =
+                    serde_json::from_value(data["bridge"].clone()).map_err(|e| e.to_string())?;
+                if resume.ended.contains(&bridge.task_id()) {
+                    return Ok(DurableToolStep::Complete(Outcome::Failed(
+                        "bridge finished".into(),
+                    )));
+                }
+                std::fs::write(self.0.join("ancestor-busy"), b"yes").map_err(|e| e.to_string())?;
+                loop {
+                    if context.cancellation.is_cancelled() {
+                        return Err("ancestor aborted".into());
+                    }
+                    if self.0.join("ancestor-release").exists() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok(DurableToolStep::Park {
+                    checkpoint: data,
+                    wait: DurableWait::All(vec![bridge]),
+                })
+            } else {
+                let bridge = host
+                    .start_child("bridge", "sealed-bridge", json!({}))
+                    .await?;
+                let gate = host.start_child("gate", "ancestor-gate", json!({})).await?;
+                Ok(DurableToolStep::Park {
+                    checkpoint: json!({"bridge":bridge, "gate":gate}),
+                    wait: DurableWait::Any(vec![bridge, gate]),
+                })
+            }
+        }
+    }
+    fn interrupted_unsafe_hooked_host(
+        root: &std::path::Path,
+    ) -> (
+        StandaloneBeforeHookHost,
+        Arc<crate::task_tool::TaskTool>,
+        crate::nested_identity::IdentityHandle,
+    ) {
+        let sealed: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let binding = crate::nested_identity::register(&sealed, Some("backend".into())).unwrap();
+        let bridge_cell = Arc::new(std::sync::OnceLock::new());
+        let bridge_handler: Arc<dyn crate::task_scheduler::Handler> =
+            Arc::new(CheckpointParent(bridge_cell.clone(), false));
+        let gate_handler: Arc<dyn crate::task_scheduler::Handler> = Arc::new(ChainLeaf);
+        let mut registry = Registry::default();
+        assert!(registry.register_shared("sealed-bridge", true, bridge_handler.clone()));
+        assert!(registry.register_shared("ancestor-gate", true, gate_handler.clone()));
+        let bridge = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "sealed-bridge".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "sealed-bridge",
+            true,
+            1,
+            bridge_handler,
+        ));
+        let gate = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "ancestor-gate".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "ancestor-gate",
+            true,
+            1,
+            gate_handler,
+        ));
+        let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
+        let adapter = host
+            .register_tool_with_interrupted_after(
+                "sealed-leaf",
+                sealed.clone(),
+                "backend",
+                1,
+                "interrupted-hook-v1",
+                Arc::new(InterruptedAfterFixture(root.to_owned())),
+                InterruptedAfterAuthorization::host_attests_cleanup_safe(),
+            )
+            .unwrap();
+        assert!(bridge_cell.set(adapter).is_ok());
+        let ancestor = host
+            .register_unsafe_durable_tool_with_hook(
+                Arc::new(UnsafeHookedSealedAncestor(root.to_owned())),
+                "unsafe-ancestor-v1",
+                1,
+                vec![bridge, gate],
+                "ancestor-hook-v1",
+                Arc::new(NoopDurableHook),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        (host, ancestor, binding)
+    }
+    #[test]
+    fn interrupted_sealed_child_late_receipt_under_busy_unsafe_hooked_ancestor() {
+        const ENV: &str = "PI_RS_INTERRUPTED_UNSAFE_ANCESTOR_COMBINED";
+        if let Ok(path) = std::env::var(ENV) {
+            let root = std::path::PathBuf::from(path);
+            let (host, tool, binding) = interrupted_unsafe_hooked_host(&root);
+            let id = host.start_unsafe_durable_root(&tool, json!({}), 5).unwrap();
+            let driver = host.into_driver();
+            let task = wait_state(&driver, id, |state| {
+                matches!(state, crate::task::TaskState::Waiting(_))
+            });
+            let bridge: AsyncTaskCall =
+                serde_json::from_value(task.checkpoint().data["checkpoint"]["bridge"].clone())
+                    .unwrap();
+            let gate: AsyncTaskCall =
+                serde_json::from_value(task.checkpoint().data["checkpoint"]["gate"].clone())
+                    .unwrap();
+            let bridge_task = wait_state(&driver, bridge.task_id(), |state| {
+                matches!(state, crate::task::TaskState::Waiting(_))
+            });
+            let sealed: AsyncTaskCall =
+                serde_json::from_value(bridge_task.checkpoint().data.clone()).unwrap();
+            wait_file(&root.join("unsafe-ready"));
+            wait_state(&driver, gate.task_id(), |state| {
+                matches!(state, crate::task::TaskState::Waiting(_))
+            });
+            std::fs::write(
+                root.join("combined-ids"),
+                serde_json::to_vec(&(id, bridge.task_id(), gate.task_id(), sealed.task_id()))
+                    .unwrap(),
+            )
+            .unwrap();
+            loop {
+                std::hint::black_box((&driver, &binding));
+                std::thread::park();
+            }
+        }
+        for abort_ancestor in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact").arg("async_task_tool::tests::interrupted_sealed_child_late_receipt_under_busy_unsafe_hooked_ancestor")
+                .env(ENV, root).spawn().unwrap();
+            wait_file(&root.join("combined-ids"));
+            process.kill().unwrap();
+            process.wait().unwrap();
+            let (id, _bridge, gate, child): (Uuid, Uuid, Uuid, Uuid) =
+                serde_json::from_slice(&std::fs::read(root.join("combined-ids")).unwrap()).unwrap();
+            std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
+            let (host, _, _binding) = interrupted_unsafe_hooked_host(root);
+            let scheduler = host.into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            wait_file(&root.join("interrupted-ready"));
+            driver
+                .signal(&crate::task_store::Signal::new(
+                    Uuid::new_v4(),
+                    gate,
+                    "release".into(),
+                    json!(null),
+                ))
+                .unwrap();
+            wait_file(&root.join("ancestor-busy"));
+            let intent = crate::async_task_protocol::load_intent(owner.store(), child).unwrap();
+            let batch = crate::async_task_protocol::prepare_raw_result(
+                owner.store(),
+                &intent,
+                &Outcome::Succeeded("late raw".into()),
+            )
+            .unwrap();
+            owner
+                .store()
+                .commit(&batch.checks, &batch.mutations)
+                .unwrap();
+            if abort_ancestor {
+                driver.request_abort(id).unwrap();
+            }
+            std::fs::write(root.join("interrupted-release"), b"yes").unwrap();
+            if !abort_ancestor {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let task = driver.get(child).unwrap().unwrap();
+                    if task.holds_interrupted_cleanup() && task.attempt_id().is_none() {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "child did not defer");
+                    std::thread::yield_now();
+                }
+                std::fs::write(root.join("ancestor-release"), b"yes").unwrap();
+            }
+            let task = wait_terminal(&driver, child);
+            if abort_ancestor {
+                assert!(matches!(task.state(), crate::task::TaskState::Cancelled));
+            } else {
+                assert!(matches!(task.state(), crate::task::TaskState::Failed(_)));
+            }
+            assert!(
+                matches!(read_sealed_outcome_evidence(owner.store(), child).unwrap(), Some(SealedOutcomeEvidence::AfterIncomplete(Outcome::Succeeded(value))) if value == "late raw")
+            );
+            assert!(
+                read_interrupted_after_result(owner.store(), child)
+                    .unwrap()
+                    .is_none()
+            );
+            let ancestor = wait_terminal(&driver, id);
+            if abort_ancestor {
+                assert!(matches!(
+                    ancestor.state(),
+                    crate::task::TaskState::Cancelled
+                ));
+            } else {
+                assert!(
+                    !matches!(ancestor.state(), crate::task::TaskState::Succeeded(value) if serde_json::from_value::<Outcome>(value.clone()).is_ok_and(|outcome| matches!(outcome, Outcome::Succeeded(_))))
+                );
+            }
+            let _ = driver.shutdown_with_pending().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("unsafe-invocations"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("interrupted-hook-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            let effects = std::fs::read_to_string(root.join("ancestor-effects")).unwrap();
+            let effects: Vec<_> = effects.lines().collect();
+            assert_eq!(
+                effects,
+                if abort_ancestor {
+                    vec!["initial", "resume"]
+                } else {
+                    vec!["initial", "resume", "resume"]
+                }
+            );
+        }
+    }
+
     struct InterruptedBusyParent {
         entered: std::sync::mpsc::Sender<()>,
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
