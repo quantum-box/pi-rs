@@ -1865,6 +1865,12 @@ scheduler-owned nested task settlement: it does not replay intermediate callers,
 legacy blocked records, extension-selected or stateful parent calls, or arbitrary
 interrupted nested calls without a persisted pending reference.
 
+Task-backed children can themselves call `TaskTool::start_child`, forming
+multiple independently owned task levels under a model-issued root. Each level
+checkpoints its own handle and receives its direct ended children; conversation
+abort propagates through the ownership chain. This is a separate task-backed
+scheduler path from the multi-level `KeyedHost` nested-call support above.
+
 For task-backed tools, `TaskTool::start_child` stages a keyed child and returns a
 serializable `NestedTaskCall`. The handler can checkpoint the handle and return
 `Step::Wait` with `WaitFor::TasksAny` and the handle's task ID. After a wake,

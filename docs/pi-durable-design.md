@@ -29,6 +29,14 @@ reservation-bound initial allowlist before submission, including through the
 parent-bound management extension. These controls remain pi-rs host APIs, not
 the complete upstream task and subagent extension semantics.
 
+The task-backed `TaskTool::start_child` API supports independently owned
+children at multiple levels, separately from `KeyedHost` nested calls. A
+model-issued root, intermediate task and leaf are covered by scheduler tests
+that kill and reopen the process after a committed leaf result, and that abort
+the parked ownership chain after reopening. These tests do not establish
+exactly-once execution when a process dies before a leaf result commits. See
+`crates/durable/README.md` for the API and recovery limits.
+
 The experimental `tool_progress` API provides opt-in, bounded replacement
 partials and a scoped `ToolHost` adapter. Hosts must explicitly connect a sink,
 commit snapshots with their own lease checks, and fence completion or abort in
