@@ -37,4 +37,4 @@ unicode-segmentation = "1.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }

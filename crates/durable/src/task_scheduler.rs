@@ -25679,7 +25679,7 @@ mod standalone_foreground_cleanup_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timed_out_cleanup_slots_release_for_an_unrelated_graph() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Stalled(Arc<AtomicUsize>);
@@ -25761,19 +25761,46 @@ mod standalone_foreground_cleanup_tests {
             .tick_with_conversation_cleanup(0, &CancellationToken::new())
             .await
             .unwrap();
+        // Hold virtual time still until all eight callbacks have started.
+        // The ninth graph must remain marked while every slot is occupied.
+        for _ in 0..1000 {
+            if entered.load(Ordering::SeqCst) == 8 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 8);
+        assert!(
+            scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(children[8])
+                .unwrap()
+                .abort_requested
+        );
+        assert!(scheduler.conversation_cleanup_failures().is_empty());
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 scheduler
                     .tick_with_conversation_cleanup(0, &CancellationToken::new())
                     .await
                     .unwrap();
-                if !scheduler
+                let independent_finished = !scheduler
                     .validator
                     .as_ref()
                     .unwrap()
                     .conversation(children[8])
                     .unwrap()
-                    .abort_requested
+                    .abort_requested;
+                // Each timeout is collected independently. A slot may be
+                // released and the ninth cleanup may finish before the other
+                // seven completed workers have been joined.
+                if independent_finished
+                    && children[..8]
+                        .iter()
+                        .all(|id| scheduler.conversation_cleanup_failures().contains_key(id))
                 {
                     break;
                 }
@@ -25781,7 +25808,7 @@ mod standalone_foreground_cleanup_tests {
             }
         })
         .await
-        .expect("saturated cleanups starved the ninth graph");
+        .expect("ninth cleanup or the eight timeout results did not settle");
         assert_eq!(entered.load(Ordering::SeqCst), 8);
         for child in &children[..8] {
             assert!(
@@ -25854,6 +25881,183 @@ mod standalone_foreground_cleanup_tests {
                     .abort_requested
             );
         }
+    }
+
+    #[tokio::test]
+    async fn driver_timeout_releases_graph_slot_and_preserves_other_graph() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+        struct TimeoutModel {
+            calls: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Semaphore>,
+            retry: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl Model for TimeoutModel {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                panic!("model must not run")
+            }
+            async fn record_usage(
+                &self,
+                _: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.add_permits(1);
+                if !self.retry.load(Ordering::SeqCst) {
+                    std::future::pending().await
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let retry = Arc::new(AtomicBool::new(false));
+        let mut opts = options();
+        opts.model = Arc::new(TimeoutModel {
+            calls: calls.clone(),
+            entered: entered.clone(),
+            retry: retry.clone(),
+        });
+        let mut harness = Harness::open_paused(&path, opts.clone()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = harness.create_conversation(cfg.clone()).unwrap();
+        let timed = harness.create_conversation(cfg.clone()).unwrap();
+        let independent = harness.create_conversation(cfg).unwrap();
+        let db = Store::open(&path).unwrap();
+        for (index, child) in [timed, independent].into_iter().enumerate() {
+            let parent = task(
+                (index + 1) as u128,
+                TaskOwner::Conversation(owner),
+                "parent",
+            );
+            TaskStore::new(&db).save(&[Save::Create(&parent)]).unwrap();
+            let edge = Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            };
+            let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            let ts = TaskStore::new(&db);
+            ts.update(&ts.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.succeed(json!(null))
+            })
+            .unwrap();
+            harness.request_abort(child).unwrap();
+        }
+        drop(harness);
+        let scheduler = Scheduler::open_with_conversation_runtime(&path, registry(), opts).unwrap();
+        // Keep the independent worker waiting until the first timeout has been
+        // observed, then release it without touching the uncertain graph.
+        let guard = scheduler
+            .owner()
+            .conversation_controls()
+            .get(independent)
+            .worker
+            .clone()
+            .lock_owned()
+            .await;
+        let request = Uuid::new_v4();
+        let key = format!("runtime/conversation/{timed}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        value["phase"] = json!({"ModelRunning": {"turns":0, "request_id":request, "restarts":0}});
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+        crate::runtime::cleanup_usage_timeouts()
+            .lock()
+            .unwrap()
+            .insert(request, Duration::from_secs(1));
+        let driver = crate::task_driver::Driver::start(scheduler);
+        tokio::time::timeout(Duration::from_secs(10), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if driver
+                    .conversation_cleanup_failures()
+                    .unwrap()
+                    .contains_key(&timed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out cleanup was not retired and reported");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            db.get(&crate::runtime::owned_cleanup_key(timed))
+                .unwrap()
+                .is_some()
+        );
+        drop(guard);
+        let marked = |id| -> bool {
+            let entry = db
+                .get(format!("runtime/conversation/{id}").as_bytes())
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&entry.value).unwrap()["abort_requested"]
+                .as_bool()
+                .unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while marked(independent)
+                || db
+                    .get(&crate::runtime::owned_cleanup_key(independent))
+                    .unwrap()
+                    .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("independent graph did not complete");
+        assert!(marked(timed));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        retry.store(true, Ordering::SeqCst);
+        driver.reconcile_owned_cleanup(timed).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while marked(timed)
+                || db
+                    .get(&crate::runtime::owned_cleanup_key(timed))
+                    .unwrap()
+                    .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reconciled graph did not restart");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            db.get(&crate::runtime::owned_cleanup_key(timed))
+                .unwrap()
+                .is_none()
+        );
+        driver.shutdown().unwrap();
     }
 
     #[test]

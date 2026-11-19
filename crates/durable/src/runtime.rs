@@ -139,6 +139,23 @@ pub(crate) fn driver_cleanup_hooks()
     HOOKS.get_or_init(Default::default)
 }
 
+// A shorter timeout may be injected for one request in unit tests. Normal
+// builds retain the production timeout and do not carry test state.
+#[cfg(test)]
+pub(crate) fn cleanup_usage_timeouts() -> &'static std::sync::Mutex<HashMap<Uuid, Duration>> {
+    static TIMEOUTS: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, Duration>>> =
+        std::sync::OnceLock::new();
+    TIMEOUTS.get_or_init(Default::default)
+}
+fn cleanup_usage_timeout(request_id: Uuid) -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = cleanup_usage_timeouts().lock().unwrap().remove(&request_id) {
+        return timeout;
+    }
+    let _ = request_id;
+    Duration::from_secs(120)
+}
+
 // Bound synchronous retries so unrelated sustained writes cannot block a caller forever.
 const FORK_DOCUMENT_ATTEMPTS: usize = 8;
 
@@ -15723,7 +15740,7 @@ impl Harness {
             };
             tokio::select! {
                 _ = cancel.cancelled() => return Err(Error::Interrupted),
-                result = tokio::time::timeout(Duration::from_secs(120), settlement) => match result {
+                result = tokio::time::timeout(cleanup_usage_timeout(request_id), settlement) => match result {
                     Ok(Ok(())) => (), Ok(Err(error)) => return Err(error.into()), Err(_) => return Err(Error::Interrupted),
                 }
             }

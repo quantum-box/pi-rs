@@ -59,3 +59,19 @@ require reconciliation, including when an unsafe Tool may have external effects.
 A pending synchronous outcome is transferred to the concurrent driver when the
 scheduler is handed to it. An indeterminate retained outcome stops that driver
 and remains available for reconciliation instead of being retried.
+
+## Owned conversation cleanup concurrency
+
+The concurrent task driver schedules marked owned conversations independently;
+it does not impose the synchronous cleanup tick's eight-worker limit. This
+keeps an unrelated graph runnable while another cleanup callback is stalled,
+consistent with upstream's per-task scheduling and bottom-up abort ordering.
+The synchronous cleanup tick has eight slots and releases them as individual
+workers finish; one graph finishing does not imply that every other timeout has
+already been collected.
+
+pi-rs bounds abort-time usage reporting at 120 seconds. If that callback times
+out after the durable cleanup marker was written, the marker and abort state
+remain for explicit reconciliation before another attempt. This timeout and
+marker protocol are pi-rs safety behavior; they do not establish that an
+external callback had no effects.
