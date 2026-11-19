@@ -485,6 +485,19 @@ tool dispatch, hooks, result/wake delivery, async cancellation or upstream
 `wait: false`; wiring those requires the separate executor integration. A crash
 after admission leaves a durable child to reconnect after parent recovery, not
 an atomic parent park. An uncertain storage commit requires reopen and inspection.
+Tests exercise the real driver with parent and child handlers concurrently after
+a test-only pre-execution admission, both orders and a race with conversation-root
+abort, and a descendant admission racing its ancestor's failure publication.
+They do not exercise admission from within the running handler, or a same-parent
+admission racing its own result publication: `execute(self)` consumes the only
+reservation from which the private admission method can currently be called.
+The driver has four ordinary workers. A test occupies all four with TaskTool
+parents and verifies that an admitted TaskTool child stays ready until an
+ordinary worker becomes free; the overflow reservation cannot run that child.
+Recursively blocking parents can therefore exhaust the pool. This primitive
+does not guarantee progress for arbitrary depth or multiple children. A future
+upstream-style connection must park a waiting parent and release its worker
+before relying on child progress.
 
 The generic scheduler's live handler can also call `TaskDocuments::stage_keyed_child`. The scheduler validates the candidate registration and atomically commits the key, child, handler documents and parent transition under the captured parent version. The handler can wait on the returned ID in that same transition; a matching persisted or already-staged key returns its original ID. A conflicting identity or task-tool handler fails. New children cannot be staged on successful terminal settlement, and failed handlers discard the staged admission. Document or staged-key conflicts use the existing replay-safe retry policy; a changed parent fences settlement and requires reopening and recovery. This mechanism is limited to generic scheduler handlers: it does not wire nested tools, transfer executor ownership, or provide an asynchronous park.
 

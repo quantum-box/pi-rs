@@ -828,6 +828,15 @@ enum WorkerEvent {
     Failed(String),
 }
 
+#[cfg(test)]
+type BeforeExecuteHook = Box<dyn FnOnce(&task_scheduler::DetachedInvocation) + Send>;
+#[cfg(test)]
+fn before_execute_hooks() -> &'static Mutex<std::collections::HashMap<Uuid, BeforeExecuteHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<std::collections::HashMap<Uuid, BeforeExecuteHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
 struct WorkerPool {
     jobs: Option<mpsc::Sender<Box<task_scheduler::DetachedInvocation>>>,
     done: mpsc::Receiver<WorkerEvent>,
@@ -896,6 +905,16 @@ impl Shared {
                         break;
                     };
                     let event = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        {
+                            let hook = before_execute_hooks()
+                                .lock()
+                                .unwrap()
+                                .remove(&job.task_id());
+                            if let Some(hook) = hook {
+                                hook(&job);
+                            }
+                        }
                         job.execute()
                     })) {
                         Ok(Ok(completed)) => WorkerEvent::Completed(Box::new(completed)),
@@ -1836,6 +1855,191 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn driver_runs_admitted_task_tool_child_while_parent_handler_is_live() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_entered_tx, parent_entered_rx) = mpsc::channel();
+        let (parent_release_tx, parent_release_rx) = mpsc::channel();
+        let parent_release_rx = Mutex::new(parent_release_rx);
+        let parent_handler: Arc<dyn task_scheduler::Handler> = Arc::new(move |_: &Task| {
+            parent_entered_tx.send(()).unwrap();
+            parent_release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("parent")))
+        });
+        let (child_entered_tx, child_entered_rx) = mpsc::channel();
+        let (child_release_tx, child_release_rx) = mpsc::channel();
+        let child_release_rx = Mutex::new(child_release_rx);
+        let child_handler: Arc<dyn task_scheduler::Handler> = Arc::new(move |_: &Task| {
+            child_entered_tx.send(()).unwrap();
+            child_release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("child")))
+        });
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            pi_rs_core::ToolSpec {
+                name: "child".into(),
+                description: "".into(),
+                parameters: json!({"type":"object"}),
+            },
+            "child",
+            true,
+            1,
+            child_handler.clone(),
+        ));
+        let mut registry = task_scheduler::Registry::default();
+        assert!(registry.register_shared("parent", true, parent_handler));
+        assert!(registry.register_shared("child", true, child_handler));
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let parent_id = Uuid::new_v4();
+        let parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), true)
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        before_execute_hooks().lock().unwrap().insert(
+            parent_id,
+            Box::new(move |invocation| {
+                admitted_tx
+                    .send(invocation.admit_task_tool_child(&child, "nested", json!({})))
+                    .unwrap();
+            }),
+        );
+        let driver = Driver::start(scheduler);
+        let child_id = admitted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        parent_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        child_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let tasks = TaskStore::new(driver.shared.owner.store());
+        assert_eq!(
+            tasks.load(parent_id).unwrap().unwrap().task.state(),
+            &crate::task::TaskState::Running
+        );
+        assert_eq!(
+            tasks.load(child_id).unwrap().unwrap().task.state(),
+            &crate::task::TaskState::Running
+        );
+        child_release_tx.send(()).unwrap();
+        parent_release_tx.send(()).unwrap();
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn task_tool_child_waits_for_ordinary_worker_capacity() {
+        use std::{collections::HashMap, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let parents: Vec<_> = (0..4)
+            .map(|i| Uuid::from_u128(0x7f_0000_1000 + i))
+            .collect();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut receivers = HashMap::new();
+        for id in &parents {
+            let (tx, rx) = mpsc::channel();
+            releases.push(tx);
+            receivers.insert(*id, Mutex::new(rx));
+        }
+        let parent_handler: Arc<dyn task_scheduler::Handler> = Arc::new(move |task: &Task| {
+            entered_tx.send(task.id()).unwrap();
+            receivers[&task.id()].lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!(null)))
+        });
+        let (child_tx, child_rx) = mpsc::channel();
+        let child_handler: Arc<dyn task_scheduler::Handler> = Arc::new(move |_: &Task| {
+            child_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!(null)))
+        });
+        let child = Arc::new(crate::task_tool::TaskTool::new(
+            pi_rs_core::ToolSpec {
+                name: "child".into(),
+                description: "".into(),
+                parameters: json!({"type":"object"}),
+            },
+            "child",
+            true,
+            1,
+            child_handler.clone(),
+        ));
+        let mut registry = task_scheduler::Registry::default();
+        assert!(registry.register_shared("parent", true, parent_handler));
+        assert!(registry.register_shared("child", true, child_handler));
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        for id in &parents {
+            let parent = Task::new(
+                *id,
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("parent".into(), true)
+            .into_task_tool();
+            scheduler.submit(&parent).unwrap();
+        }
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        before_execute_hooks().lock().unwrap().insert(
+            parents[0],
+            Box::new(move |invocation| {
+                admitted_tx
+                    .send(invocation.admit_task_tool_child(&child, "nested", json!({})))
+                    .unwrap();
+            }),
+        );
+        let driver = Driver::start(scheduler);
+        let child_id = admitted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let mut running = std::collections::HashSet::new();
+        for _ in 0..4 {
+            running.insert(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        assert_eq!(running.len(), 4);
+        let tasks = TaskStore::new(driver.shared.owner.store());
+        assert_eq!(
+            tasks.load(child_id).unwrap().unwrap().task.state(),
+            &crate::task::TaskState::Ready
+        );
+        // The overflow reservation explicitly excludes TaskTool children.
+        assert!(matches!(
+            driver
+                .shared
+                .scheduler
+                .lock()
+                .unwrap()
+                .try_reserve_task_tool_child(0)
+                .unwrap(),
+            task_scheduler::TickReservation::Progress(false)
+        ));
+        assert!(matches!(
+            child_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        releases[1].send(()).unwrap();
+        child_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for index in [0, 2, 3] {
+            releases[index].send(()).unwrap();
+        }
+        driver.shutdown().unwrap();
+    }
 
     #[test]
     fn owned_session_chain_checks_fence_abort_and_graph_aba() {

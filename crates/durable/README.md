@@ -1898,6 +1898,9 @@ async tools and their nested execution, hooks, wake and cancellation are not
 yet connected. A running generic parent is rejected because its child cannot
 currently execute while that parent runs. TaskTool children use ordinary worker
 capacity; the driver's reserved overflow worker is limited to generic children.
+Four simultaneously blocked TaskTool parents can occupy all ordinary workers
+and leave a TaskTool child waiting. Arbitrary-depth or multi-child progress
+requires a future park connection that releases the waiting parent's worker.
 
 New TaskTool tasks persist their adapter type. When a TaskTool succeeds, fails,
 returns a handler error, or is interrupted, it holds its outcome and atomically

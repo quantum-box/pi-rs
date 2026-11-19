@@ -5967,6 +5967,195 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_result_publication_fences_live_descendant_admission() {
+        use std::{sync::mpsc, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let parent_handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(Step::Fail("parent failure".into()))
+        });
+        let child_handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+        let child = crate::task_tool::TaskTool::new(
+            pi_rs_core::ToolSpec {
+                name: "child".into(),
+                description: "".into(),
+                parameters: json!({"type":"object"}),
+            },
+            "child",
+            true,
+            1,
+            child_handler.clone(),
+        );
+        let mut registry = Registry::default();
+        registry.register_shared("parent", true, parent_handler);
+        registry.register_shared("child", true, child_handler);
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        )
+        .into_task_tool();
+        scheduler.submit(&parent).unwrap();
+        let parent_invocation = async_admission_reserve(&mut scheduler);
+        let child_id = parent_invocation
+            .admit_task_tool_child(&child, "child", json!({}))
+            .unwrap();
+        let child_invocation = async_admission_reserve(&mut scheduler);
+        assert_eq!(child_invocation.task_id(), child_id);
+        let worker = std::thread::spawn(move || parent_invocation.execute().unwrap());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = child_invocation
+            .admit_task_tool_child(&child, "before", json!({}))
+            .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let racing = std::thread::scope(|scope| {
+            let admission = scope.spawn(|| {
+                barrier.wait();
+                child_invocation.admit_task_tool_child(&child, "racing", json!({}))
+            });
+            barrier.wait();
+            release_tx.send(()).unwrap();
+            admission.join().unwrap()
+        });
+        let completed = worker.join().unwrap();
+        assert!(
+            child_invocation
+                .admit_task_tool_child(&child, "after", json!({}))
+                .is_err()
+        );
+        assert!(scheduler.ts().load(before).unwrap().is_some());
+        if let Ok(id) = racing {
+            assert!(scheduler.ts().load(id).unwrap().is_some());
+            assert_eq!(scheduler.ts().list().unwrap().len(), 4);
+        } else {
+            assert_eq!(scheduler.ts().list().unwrap().len(), 3);
+        }
+        drop(completed);
+    }
+
+    #[test]
+    fn conversation_root_abort_races_admission_under_real_graph_fence() {
+        use crate::recovery::UncertainPolicy;
+        use crate::runtime::{Config, Harness, Options};
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        struct Stub;
+        #[async_trait::async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        for order in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut harness = Harness::open_paused(
+                dir.path().join("db"),
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: UncertainPolicy::RequireReconciliation,
+                },
+            )
+            .unwrap();
+            let conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+            let child = crate::task_tool::TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "child".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                "child",
+                true,
+                1,
+                handler.clone(),
+            );
+            let mut registry = Registry::default();
+            registry.register_shared("parent", true, handler.clone());
+            registry.register_shared("child", true, handler);
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            let parent =
+                task(1, TaskOwner::Conversation(conversation), "parent", true, 4).into_task_tool();
+            scheduler.submit(&parent).unwrap();
+            let invocation = async_admission_reserve(&mut scheduler);
+            let owner = scheduler.owner();
+            let mut abort = || {
+                owner
+                    .conversation_controls()
+                    .fence(|| harness.abort_owned_graph(Some(conversation), None))
+                    .unwrap();
+            };
+            let admitted = match order {
+                0 => {
+                    let result = invocation.admit_task_tool_child(&child, "race", json!({}));
+                    assert!(result.is_ok());
+                    abort();
+                    result
+                }
+                1 => {
+                    abort();
+                    let result = invocation.admit_task_tool_child(&child, "race", json!({}));
+                    assert!(result.is_err());
+                    result
+                }
+                _ => {
+                    let barrier = std::sync::Barrier::new(2);
+                    std::thread::scope(|scope| {
+                        let worker = scope.spawn(|| {
+                            barrier.wait();
+                            invocation.admit_task_tool_child(&child, "race", json!({}))
+                        });
+                        barrier.wait();
+                        abort();
+                        worker.join().unwrap()
+                    })
+                }
+            };
+            assert!(
+                scheduler
+                    .ts()
+                    .load(parent.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested()
+            );
+            if let Ok(id) = admitted {
+                assert!(
+                    scheduler
+                        .ts()
+                        .load(id)
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .abort_requested()
+                );
+            } else {
+                assert_eq!(scheduler.ts().list().unwrap().len(), 1);
+            }
+            assert!(
+                invocation
+                    .admit_task_tool_child(&child, "after", json!({}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn async_admission_reconnect_concurrent_and_abort() {
         let dir = tempfile::tempdir().unwrap();
         let (mut scheduler, child) = async_admission_setup(&dir.path().join("db"));
