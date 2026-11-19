@@ -100,7 +100,7 @@ pub(super) fn register(
     abort_after: bool,
     restart_after: bool,
     unavailable: bool,
-    park_cancel: Option<(String, Arc<dyn DurableParkCancel>)>,
+    park_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
 ) -> Result<Arc<TaskTool>, String> {
     register_with_policy(
         scheduler,
@@ -197,8 +197,13 @@ fn register_with_policy(
     } else {
         1u32
     };
-    let encoded = if let Some((cancel_id, _)) = &park_cancel {
-        serde_json::to_vec(&(8u32, &identity, &child_identities, cancel_id))
+    let encoded = if let Some((cancel_id, _, retry)) = &park_cancel {
+        serde_json::to_vec(&(
+            if *retry { 9u32 } else { 8u32 },
+            &identity,
+            &child_identities,
+            cancel_id,
+        ))
     } else {
         serde_json::to_vec(&(discriminator, &identity, &child_identities))
     }
@@ -226,7 +231,7 @@ fn register_with_policy(
         replay_safe,
         block_results,
         unavailable,
-        park_cancel: park_cancel.map(|(_, callback)| callback),
+        park_cancel: park_cancel.map(|(_, callback, retry)| (callback, retry)),
     });
     scheduler.install_checkpointable_async_handler(
         kind.clone(),
@@ -248,6 +253,90 @@ struct ParkCheckpoint {
     version: u32,
     arguments: serde_json::Value,
     checkpoint: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    park_attempt: Option<uuid::Uuid>,
+}
+
+pub(crate) fn park_cancel_provenance_checks(
+    store: &durable_store::Store,
+    task: &Task,
+    graph_version: u64,
+) -> Result<Vec<durable_store::Check>, String> {
+    if task.ended_children().is_some() {
+        return Err("park epoch was already woken".into());
+    }
+    let parked: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
+        .map_err(|_| "invalid park provenance")?;
+    let attempt = parked
+        .park_attempt
+        .filter(|id| !id.is_nil())
+        .ok_or("unproven legacy park")?;
+    if parked.version != 2 {
+        return Err("unsupported park provenance version".into());
+    }
+    let intent_key =
+        format!("durable/replay-safe-async/{}/{attempt}/intent", task.id()).into_bytes();
+    let mut result_key = intent_key.clone();
+    result_key.extend_from_slice(b"/result");
+    let intent_entry = store
+        .get(&intent_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing park intent")?;
+    let result_entry = store
+        .get(&result_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing park result")?;
+    let intent: Task = serde_json::from_slice(&intent_entry.value).map_err(|e| e.to_string())?;
+    let result: DurableToolStep =
+        serde_json::from_slice(&result_entry.value).map_err(|e| e.to_string())?;
+    if intent.id() != task.id()
+        || intent.kind() != task.kind()
+        || intent.definition_version() != task.definition_version()
+        || intent.owner() != task.owner()
+        || intent.input() != task.input()
+        || intent.attempt_id() != Some(attempt)
+        || intent.state() != &crate::task::TaskState::Running
+        || intent.abort_requested()
+        || !matches!(
+            intent.checkpoint().phase.as_str(),
+            "replay-safe-async-prepared" | "replay-safe-async-wait"
+        )
+        || intent.checkpoint().data.get("arguments") != Some(&parked.arguments)
+        || !matches!(result, DurableToolStep::Park { checkpoint, .. } if checkpoint == parked.checkpoint)
+    {
+        return Err("park intent or result mismatch".into());
+    }
+    let prefix = format!("durable/replay-safe-async/{}/", task.id()).into_bytes();
+    for (key, entry) in store.list(&prefix).map_err(|e| e.to_string())? {
+        if !key.ends_with(b"/intent") {
+            continue;
+        }
+        let later: Task =
+            serde_json::from_slice(&entry.value).map_err(|_| "invalid execution intent")?;
+        if later.id() != task.id() {
+            return Err("execution intent identity mismatch".into());
+        }
+        if later.attempt_id() != Some(attempt)
+            && later.checkpoint() == task.checkpoint()
+            && later.ended_children().is_some()
+        {
+            return Err("park epoch has a woken execution intent".into());
+        }
+    }
+    Ok(vec![
+        durable_store::Check {
+            key: intent_key,
+            expected: durable_store::Expected::Version(intent_entry.version),
+        },
+        durable_store::Check {
+            key: result_key,
+            expected: durable_store::Expected::Version(result_entry.version),
+        },
+        durable_store::Check {
+            key: prefix,
+            expected: durable_store::Expected::PrefixUnchangedSince(graph_version),
+        },
+    ])
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -476,7 +565,7 @@ struct Executor {
     replay_safe: bool,
     block_results: bool,
     unavailable: bool,
-    park_cancel: Option<Arc<dyn DurableParkCancel>>,
+    park_cancel: Option<(Arc<dyn DurableParkCancel>, bool)>,
 }
 
 struct Host<'a, 'b> {
@@ -1120,19 +1209,28 @@ impl Handler for Executor {
             super::validate_aborted_after_result(&value)?;
             return Ok(Step::Succeed(serde_json::Value::Null));
         }
-        if let Some(cancel) = &self.park_cancel
+        if let Some((cancel, retry)) = &self.park_cancel
             && task.checkpoint().phase == "replay-safe-async-wait"
         {
             let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
                 .map_err(|_| "invalid parked cancel checkpoint")?;
-            if stored.version != 1
+            if stored.version != 2
+                || stored.park_attempt.is_none()
                 || !stored.arguments.is_object()
                 || !jsonschema::validator_for(&self.identity.spec.parameters)
                     .is_ok_and(|schema| schema.is_valid(&stored.arguments))
             {
                 return Err("unsupported parked cancel checkpoint".into());
             }
-            if admission.park_cancel_claim(self, false)? {
+            if admission.park_cancel_claim(self, false, *retry)? {
+                #[cfg(test)]
+                if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_SPEC_BARRIER") {
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::write(dir.join("spec-barrier"), b"yes").map_err(|e| e.to_string())?;
+                    while !dir.join("spec-release").exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
                 #[cfg(test)]
                 if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_CLAIM") {
                     std::fs::write(std::path::PathBuf::from(dir).join("cancel-claimed"), b"yes")
@@ -1141,28 +1239,43 @@ impl Handler for Executor {
                         std::thread::park();
                     }
                 }
+                if !self
+                    .identity
+                    .matches(self.tool.as_ref(), &self.implementation, self.version)
+                {
+                    return Err("cancel tool identity changed before dispatch".into());
+                }
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())?;
                 let cancellation = pi_rs_core::CancellationToken::new();
                 let result = runtime.block_on(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        cancel.cancel(
-                            stored.arguments,
-                            stored.checkpoint,
-                            ToolContext {
-                                operation_id: task.id(),
-                                cancellation: cancellation.clone(),
-                            },
-                        ),
+                    if !self.identity.matches(
+                        self.tool.as_ref(),
+                        &self.implementation,
+                        self.version,
+                    ) {
+                        return Err("cancel tool identity changed before dispatch".to_string());
+                    }
+                    Ok::<_, String>(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            cancel.cancel(
+                                stored.arguments,
+                                stored.checkpoint,
+                                ToolContext {
+                                    operation_id: task.id(),
+                                    cancellation: cancellation.clone(),
+                                },
+                            ),
+                        )
+                        .await,
                     )
-                    .await
-                });
+                })?;
                 cancellation.cancel();
                 if matches!(result, Ok(Ok(()))) {
-                    admission.park_cancel_claim(self, true)?;
+                    admission.park_cancel_claim(self, true, *retry)?;
                     #[cfg(test)]
                     if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_RETURN") {
                         std::fs::write(
@@ -1349,7 +1462,9 @@ impl Handler for Executor {
             "replay-safe-async-wait" if task.ended_children().is_some() => {
                 let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
                     .map_err(|_| "invalid durable checkpoint")?;
-                if stored.version != 1 {
+                if !matches!(stored.version, 1 | 2)
+                    || (stored.version == 2 && stored.park_attempt.is_none())
+                {
                     return Err("unsupported durable checkpoint version".into());
                 }
                 (
@@ -1457,9 +1572,14 @@ impl Handler for Executor {
                     DurableWait::Signal(_) => return Err("signal waits are unsupported".into()),
                 };
                 let data = serde_json::to_value(ParkCheckpoint {
-                    version: 1,
+                    version: if self.park_cancel.is_some() { 2 } else { 1 },
                     arguments: args.clone(),
                     checkpoint: checkpoint.clone(),
+                    park_attempt: if self.park_cancel.is_some() {
+                        Some(task.attempt_id().ok_or("missing park attempt")?)
+                    } else {
+                        None
+                    },
                 })
                 .map_err(|e| e.to_string())?;
                 if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
