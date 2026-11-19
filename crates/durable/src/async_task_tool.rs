@@ -1,4 +1,4 @@
-//! Task-backed async leaf tools for an explicitly unhooked standalone host.
+//! Task-backed async leaf tools for standalone hosts with explicit hook policy.
 //!
 //! Conversation-attached execution and nested async calls remain unsupported.
 //! Task-owned dispatch uses its own attempt fence, cancellation and durable
@@ -144,7 +144,7 @@ impl StandaloneNoHooksHost {
 /// A standalone host for one replay-safe, stateless before-tool hook per tool.
 /// The caller must change `hook_identity` whenever hook code or configuration changes.
 /// Hooks must be side-effect-free: preflight can be retried after interruption.
-/// Memo, sleep, conversation state and after-tool hooks are not supported.
+/// Task-fenced memo is supported; sleep, conversation state and after-tool hooks are not.
 pub struct StandaloneBeforeHookHost {
     scheduler: crate::task_scheduler::Scheduler,
 }
