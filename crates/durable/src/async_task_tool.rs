@@ -12283,6 +12283,9 @@ mod tests {
         let cell = Arc::new(std::sync::OnceLock::new());
         let mut registry = Registry::default();
         assert!(registry.register("parent", true, CheckpointParent(cell.clone(), false)));
+        assert!(registry.register("independent-wake", true, |_: &Task| {
+            Ok(crate::task_scheduler::Step::Succeed(json!("woken")))
+        }));
         let mut host = StandaloneBeforeHookHost::open(root.join("db"), registry).unwrap();
         let adapter = host
             .register_tool_with_interrupted_after(
@@ -12650,7 +12653,7 @@ mod tests {
     #[test]
     fn interrupted_cleanup_waits_for_independent_uncertain_graph() {
         use crate::task_store::{Save, TaskStore};
-        for case in ["repair", "late-raw", "shutdown"] {
+        for case in ["repair", "late-raw", "shutdown", "waits", "waits-busy"] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let (_, child) = interrupted_kill_tool(root);
@@ -12676,6 +12679,18 @@ mod tests {
             unrelated.start_attempt(Uuid::new_v4()).unwrap();
             unrelated.hold_failure("unrelated failure".into()).unwrap();
             let edge = crate::ownership_edge::edge_key(Uuid::new_v4());
+            let edge_value = if case.starts_with("waits") {
+                let child = Uuid::from_slice(&edge[crate::ownership_edge::PREFIX.len()..]).unwrap();
+                serde_json::to_vec(&crate::ownership_edge::Edge {
+                    task: unrelated.id(),
+                    task_owner: unrelated.owner().clone(),
+                    child,
+                    mode: crate::ownership_edge::Mode::Foreground,
+                })
+                .unwrap()
+            } else {
+                b"invalid edge".to_vec()
+            };
             {
                 let _gate = owner.task_gate().lock().unwrap();
                 tasks.save(&[Save::Create(&unrelated)]).unwrap();
@@ -12688,7 +12703,7 @@ mod tests {
                         }],
                         &[durable_store::Mutation::Put {
                             key: edge.clone(),
-                            value: b"invalid edge".to_vec(),
+                            value: edge_value,
                         }],
                     )
                     .unwrap();
@@ -12710,6 +12725,154 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            if case.starts_with("waits") {
+                let gate = owner.task_gate().lock().unwrap();
+                let mut waiters = Vec::new();
+                for condition in [
+                    crate::task::WaitFor::Signal("go".into()),
+                    crate::task::WaitFor::DeadlineMillis(crate::runtime::wall_time_millis() - 1),
+                ] {
+                    let mut task = Task::new(
+                        Uuid::new_v4(),
+                        TaskOwner::Conversation(Uuid::new_v4()),
+                        Checkpoint {
+                            phase: "initial".into(),
+                            data: json!(null),
+                        },
+                        3,
+                    )
+                    .unwrap()
+                    .registered("independent-wake".into(), true);
+                    task.start().unwrap();
+                    task.wait(condition).unwrap();
+                    tasks.save(&[Save::Create(&task)]).unwrap();
+                    waiters.push(task.id());
+                }
+                let mut nested_parent = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Conversation(Uuid::new_v4()),
+                    Checkpoint {
+                        phase: "initial".into(),
+                        data: json!(null),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("independent-wake".into(), true);
+                nested_parent.start().unwrap();
+                nested_parent
+                    .wait(crate::task::WaitFor::Signal("never".into()))
+                    .unwrap();
+                let mut nested = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Task(nested_parent.id()),
+                    Checkpoint {
+                        phase: "initial".into(),
+                        data: json!(null),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("independent-wake".into(), true);
+                nested.start().unwrap();
+                nested
+                    .wait(crate::task::WaitFor::DeadlineMillis(
+                        crate::runtime::wall_time_millis() - 1,
+                    ))
+                    .unwrap();
+                tasks
+                    .save(&[Save::Create(&nested_parent), Save::Create(&nested)])
+                    .unwrap();
+                waiters.push(nested.id());
+                let mut maintenance = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Conversation(Uuid::new_v4()),
+                    Checkpoint {
+                        phase: "initial".into(),
+                        data: json!(null),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("independent-wake".into(), true);
+                maintenance.start().unwrap();
+                maintenance.hold_success(json!("maintenance")).unwrap();
+                tasks.save(&[Save::Create(&maintenance)]).unwrap();
+                let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+                let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+                if case == "waits-busy" {
+                    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
+                    let path = root.join("db");
+                    crate::task_scheduler::before_independent_wake_for_test(
+                        waiters[0],
+                        move || {
+                            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+                            let writer = std::thread::spawn(move || {
+                                let db = rusqlite::Connection::open(path).unwrap();
+                                db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                                locked_tx.send(()).unwrap();
+                                unlock_rx
+                                    .recv_timeout(std::time::Duration::from_secs(20))
+                                    .unwrap();
+                                db.execute_batch("COMMIT").unwrap();
+                            });
+                            locked_rx
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .unwrap();
+                            writer_tx.send(writer).unwrap();
+                        },
+                    );
+                    crate::task_scheduler::on_independent_wake_busy_for_test(
+                        waiters[0],
+                        move || {
+                            busy_tx.send(()).unwrap();
+                            unlock_tx.send(()).unwrap();
+                        },
+                    );
+                }
+                tasks
+                    .send_signal(&crate::task_store::Signal::new(
+                        Uuid::new_v4(),
+                        waiters[0],
+                        "go".into(),
+                        json!("signal"),
+                    ))
+                    .unwrap();
+                drop(gate);
+                if case == "waits-busy" {
+                    busy_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("wake commit did not hit writer busy");
+                    writer_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap()
+                        .join()
+                        .unwrap();
+                }
+                for id in waiters {
+                    assert_eq!(
+                        wait_terminal(&driver, id).state(),
+                        &crate::task::TaskState::Succeeded(json!("woken"))
+                    );
+                }
+                assert_eq!(
+                    wait_terminal(&driver, maintenance.id()).state(),
+                    &crate::task::TaskState::Succeeded(json!("maintenance"))
+                );
+                assert!(
+                    driver
+                        .get(child)
+                        .unwrap()
+                        .unwrap()
+                        .holds_interrupted_cleanup()
+                );
+                assert!(
+                    read_interrupted_after_result(owner.store(), child)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(owner.store().get(&edge).unwrap().is_some());
+            }
             if case == "shutdown" {
                 let report = driver.shutdown_with_pending().unwrap();
                 assert!(report.failure().is_none());
@@ -12784,6 +12947,152 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn pending_uncertain_cleanup_kill_reopen_retains_evidence() {
+        use crate::task_store::{Save, TaskStore};
+        use std::time::{Duration, Instant};
+        const ENV: &str = "PI_TEST_PENDING_WAKE_KILL_1120";
+        if let Some(path) = std::env::var_os(ENV) {
+            let root = std::path::PathBuf::from(path);
+            let (_, child) = interrupted_kill_tool(&root);
+            std::fs::write(root.join("interrupted-pause"), b"yes").unwrap();
+            let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.clone()));
+            let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+            let scheduler = interrupted_host(&root, tool, "hook-v1").into_scheduler_for_test();
+            let owner = scheduler.owner();
+            let driver = crate::task_driver::Driver::start(scheduler);
+            wait_file(&root.join("interrupted-ready"));
+            let mut unrelated = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(Uuid::new_v4()),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("parent".into(), true);
+            unrelated.start_attempt(Uuid::new_v4()).unwrap();
+            unrelated.hold_failure("unrelated failure".into()).unwrap();
+            let edge_child = Uuid::new_v4();
+            let edge = crate::ownership_edge::edge_key(edge_child);
+            let value = serde_json::to_vec(&crate::ownership_edge::Edge {
+                task: unrelated.id(),
+                task_owner: unrelated.owner().clone(),
+                child: edge_child,
+                mode: crate::ownership_edge::Mode::Foreground,
+            })
+            .unwrap();
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                TaskStore::new(owner.store())
+                    .save(&[Save::Create(&unrelated)])
+                    .unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[durable_store::Check {
+                            key: edge.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key: edge.clone(),
+                            value,
+                        }],
+                    )
+                    .unwrap();
+            }
+            let until = Instant::now() + Duration::from_secs(10);
+            while !driver.has_pending_task(child) {
+                assert!(Instant::now() < until, "cleanup did not retain its lease");
+                std::thread::yield_now();
+            }
+            assert!(
+                read_interrupted_after_result(owner.store(), child)
+                    .unwrap()
+                    .is_none()
+            );
+            std::fs::write(
+                root.join("pending-kill"),
+                serde_json::to_vec(&(child, edge)).unwrap(),
+            )
+            .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "async_task_tool::tests::pending_uncertain_cleanup_kill_reopen_retains_evidence",
+            ])
+            .env(ENV, root)
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while !root.join("pending-kill").exists() {
+            assert!(
+                process.try_wait().unwrap().is_none(),
+                "pending worker exited"
+            );
+            assert!(Instant::now() < until, "pending worker timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let (child, edge): (Uuid, Vec<u8>) =
+            serde_json::from_slice(&std::fs::read(root.join("pending-kill")).unwrap()).unwrap();
+        std::fs::write(root.join("interrupted-release"), b"release").unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(UnsafeCrashFixture(root.to_owned()));
+        let _binding = crate::nested_identity::register(&tool, Some("backend".into())).unwrap();
+        let scheduler = interrupted_host(root, tool, "hook-v1").into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        assert!(
+            read_interrupted_after_result(owner.store(), child)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("unsafe-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        {
+            let _gate = owner.task_gate().lock().unwrap();
+            let entry = owner.store().get(&edge).unwrap().unwrap();
+            owner
+                .store()
+                .commit(
+                    &[durable_store::Check {
+                        key: edge.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Delete { key: edge }],
+                )
+                .unwrap();
+        }
+        let result = wait_terminal(&driver, child);
+        assert!(matches!(result.state(), crate::task::TaskState::Failed(_)));
+        assert!(matches!(
+            read_sealed_outcome_evidence(owner.store(), child).unwrap(),
+            Some(SealedOutcomeEvidence::Uncertain(Outcome::Unknown(_)))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("unsafe-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
     }
 
     #[test]

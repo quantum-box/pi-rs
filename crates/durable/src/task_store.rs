@@ -1278,12 +1278,21 @@ impl<'a> TaskStore<'a> {
     /// Pending is only a snapshot: the scheduler must arrange another reevaluation
     /// without losing concurrent notifications (for example periodic rescanning).
     pub fn poll_wait(&self, snapshot: &StoredTask, now_millis: i64) -> Result<WakeResult, Error> {
-        self.evaluate_wait(snapshot, now_millis, true)
+        self.evaluate_wait(snapshot, now_millis, true, None)
+    }
+
+    pub(crate) fn poll_wait_with_graph_fence(
+        &self,
+        snapshot: &StoredTask,
+        now_millis: i64,
+        graph_version: u64,
+    ) -> Result<WakeResult, Error> {
+        self.evaluate_wait(snapshot, now_millis, true, Some(graph_version))
     }
 
     pub(crate) fn wait_ready(&self, snapshot: &StoredTask, now_millis: i64) -> Result<bool, Error> {
         Ok(matches!(
-            self.evaluate_wait(snapshot, now_millis, false)?,
+            self.evaluate_wait(snapshot, now_millis, false, None)?,
             WakeResult::Woken { .. }
         ))
     }
@@ -1293,6 +1302,7 @@ impl<'a> TaskStore<'a> {
         snapshot: &StoredTask,
         now_millis: i64,
         commit: bool,
+        graph_version: Option<u64>,
     ) -> Result<WakeResult, Error> {
         let condition = match snapshot.task.state() {
             TaskState::Waiting(condition) => condition,
@@ -1567,7 +1577,20 @@ impl<'a> TaskStore<'a> {
             key: key(next.id()),
             value: serde_json::to_vec(&next)?,
         });
-        self.store.commit(&checks, &mutations)?;
+        if let Some(version) = graph_version {
+            self.store.commit_with_prefix_put_fence(
+                &checks,
+                &mutations,
+                &[
+                    PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                version,
+            )?;
+        } else {
+            self.store.commit(&checks, &mutations)?;
+        }
         Ok(WakeResult::Woken { signal: delivered })
     }
 
@@ -2314,6 +2337,46 @@ mod tests {
             ts.load(t.id()).unwrap().unwrap().task.state(),
             &TaskState::Ready
         );
+    }
+
+    #[test]
+    fn independent_wake_rejects_changed_ownership_graph() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let t = task(1, 3);
+        ts.save(&[Save::Create(&t)]).unwrap();
+        ts.reserve(&ts.load(t.id()).unwrap().unwrap()).unwrap();
+        ts.update(&ts.load(t.id()).unwrap().unwrap(), |task| {
+            task.wait(WaitFor::DeadlineMillis(100))
+        })
+        .unwrap();
+        let version = db.put_version().unwrap();
+        let waiting = ts.load(t.id()).unwrap().unwrap();
+        let edge = crate::ownership_edge::edge_key(Uuid::new_v4());
+        db.commit(
+            &[Check {
+                key: edge.clone(),
+                expected: Expected::Missing,
+            }],
+            &[Mutation::Put {
+                key: edge,
+                value: b"changed".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            ts.poll_wait_with_graph_fence(&waiting, 100, version),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(
+            ts.load(t.id()).unwrap().unwrap().task.state(),
+            &TaskState::Waiting(WaitFor::DeadlineMillis(100))
+        );
+        let version = db.put_version().unwrap();
+        assert!(matches!(
+            ts.poll_wait_with_graph_fence(&waiting, 100, version),
+            Ok(WakeResult::Woken { .. })
+        ));
     }
 
     #[test]

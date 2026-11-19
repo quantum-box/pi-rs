@@ -14334,6 +14334,7 @@ impl Harness {
             nested_parent,
             None,
             None,
+            None,
             before_commit,
         )
         .map(|result| result.expect("unconditional abort always has a result"))
@@ -14359,6 +14360,7 @@ impl Harness {
             None,
             Some(running),
             None,
+            None,
             || {},
         )
         .map(|result| result.map(|(conversations, _, _)| conversations))
@@ -14369,6 +14371,7 @@ impl Harness {
     pub(crate) fn abort_maintenance_checked(
         &mut self,
         intent: crate::task_scheduler::MaintenanceIntent,
+        verify: impl Fn() -> Result<(), crate::task_scheduler::Error>,
     ) -> Result<Option<Vec<Uuid>>, Error> {
         let owner = self.owner.clone();
         let gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
@@ -14381,6 +14384,7 @@ impl Harness {
             None,
             None,
             Some(intent),
+            Some(&verify),
             || {},
         )
         .map(|result| result.map(|(conversations, _, _)| conversations))
@@ -14397,6 +14401,7 @@ impl Harness {
         nested_parent: Option<Uuid>,
         pending_running: Option<Uuid>,
         maintenance: Option<crate::task_scheduler::MaintenanceIntent>,
+        verify: Option<&dyn Fn() -> Result<(), crate::task_scheduler::Error>>,
         mut before_commit: impl FnMut(),
     ) -> Result<Option<OwnedGraphAbort>, Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
@@ -14404,6 +14409,9 @@ impl Harness {
         use std::collections::{HashMap, HashSet, VecDeque};
         let owner = self.owner.clone();
         loop {
+            if let Some(verify) = verify {
+                verify().map_err(Error::TaskScheduler)?;
+            }
             let store = owner.store();
             // Capture before discovery; creation can commit without rewriting
             // the observed owner. The checked prefixes catch such phantoms.

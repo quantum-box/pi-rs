@@ -1371,14 +1371,35 @@ impl Shared {
                             || pending
                             || scheduler.has_published_outcomes().unwrap_or(true)
                         {
-                            if active >= WORKERS {
-                                Ok(task_scheduler::TickReservation::Progress(false))
+                            if maintenance.is_some() {
+                                if active >= WORKERS {
+                                    Ok(task_scheduler::TickReservation::Progress(false))
+                                } else {
+                                    scheduler.reserve_independent_root().map(|value| {
+                                        value
+                                            .map(task_scheduler::TickReservation::Invocation)
+                                            .unwrap_or(task_scheduler::TickReservation::Progress(
+                                                false,
+                                            ))
+                                    })
+                                }
                             } else {
-                                scheduler.reserve_independent_root().map(|value| {
-                                    value
-                                        .map(task_scheduler::TickReservation::Invocation)
-                                        .unwrap_or(task_scheduler::TickReservation::Progress(false))
-                                })
+                                match scheduler.try_reserve_independent_maintenance(true) {
+                                    Ok(task_scheduler::TickReservation::Progress(false))
+                                        if active < WORKERS =>
+                                    {
+                                        scheduler.reserve_independent_root().map(|value| {
+                                            value
+                                                .map(task_scheduler::TickReservation::Invocation)
+                                                .unwrap_or(
+                                                    task_scheduler::TickReservation::Progress(
+                                                        false,
+                                                    ),
+                                                )
+                                        })
+                                    }
+                                    result => result,
+                                }
                             }
                         } else if active >= WORKERS {
                             scheduler.try_reserve_tick_live(true)
