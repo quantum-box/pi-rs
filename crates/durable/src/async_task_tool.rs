@@ -8,6 +8,7 @@ use pi_rs_core::{Outcome, Tool, ToolSpec};
 use std::sync::Arc;
 
 mod replay_safe;
+pub(crate) use replay_safe::after_checkpoint_evidence;
 pub(crate) use replay_safe::invalid_raw_checkpoint;
 pub(crate) use replay_safe::validate_content_hook_result;
 pub(crate) mod unsafe_park_proof;

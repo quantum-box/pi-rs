@@ -555,7 +555,7 @@ pub(crate) fn invalid_raw_checkpoint() -> Result<Checkpoint, String> {
         data,
     })
 }
-pub(super) fn after_checkpoint_evidence(
+pub(crate) fn after_checkpoint_evidence(
     data: &serde_json::Value,
 ) -> Result<super::ReplaySafeAfterEvidence, String> {
     if serde_json::to_vec(data).map_err(|e| e.to_string())?.len() > 65536 {
@@ -1133,8 +1133,28 @@ impl Executor {
                 _ => (),
             }
         }
+        let snapshot = admission.checkpointable_hook_snapshot()?;
+        // A conversation schema governs structured output, not an implicit text
+        // copy of it. Avoid creating that copy when it is already invalid, so a
+        // hook cannot accidentally retain fragments of the rejected projection.
+        let schema = snapshot
+            .get("tool_filters")
+            .and_then(|v| v.get("output_schemas"))
+            .and_then(|v| v.get(&self.identity.spec.name));
+        let suppress_projection = match (&outcome, schema) {
+            (Outcome::Structured { data, .. }, Some(schema))
+                if matches!(task.owner(), crate::task::TaskOwner::Conversation(_)) =>
+            {
+                !crate::runtime::local_schema_references(schema)
+                    || jsonschema::validator_for(schema)
+                        .map_or(true, |validator| !validator.is_valid(data))
+            }
+            _ => false,
+        };
         let initial = crate::extension::ToolBlockResult {
-            output: vec![serde_json::json!({"type":"text", "text":outcome.tool_content()})],
+            output: vec![
+                serde_json::json!({"type":"text", "text":if suppress_projection { String::new() } else { outcome.tool_content() }}),
+            ],
             diagnostics,
             extra,
         };
@@ -1143,7 +1163,6 @@ impl Executor {
             cancellation: cancel,
             failed: Mutex::new(None),
         };
-        let snapshot = admission.checkpointable_hook_snapshot()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

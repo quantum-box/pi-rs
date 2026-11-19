@@ -25,6 +25,26 @@ use std::{
     time::Duration,
 };
 struct ModelStub;
+struct ReviewModel(Arc<std::sync::Mutex<Vec<String>>>, &'static str);
+#[async_trait]
+impl Model for ReviewModel {
+    async fn stream(&self, r: ModelRequest) -> Result<ModelStream, Error> {
+        self.0
+            .lock()
+            .unwrap()
+            .extend(r.messages.iter().filter_map(|m| match m {
+                Message::Tool { content, .. } => Some(content.clone()),
+                _ => None,
+            }));
+        if r.messages.iter().any(|m| matches!(m, Message::Tool { .. }))
+            && let Some(path) = std::env::var_os("PI_REVIEW_PUBLICATION_READY")
+        {
+            std::fs::write(path, b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        InvalidModel(self.1).stream(r).await
+    }
+}
 struct InvalidModel(&'static str);
 #[async_trait]
 impl Model for InvalidModel {
@@ -915,7 +935,12 @@ impl pi_rs_durable::model::ProviderAdapter for RichAdapter {
                 .next()
                 .unwrap();
             assert_eq!(binding["blocks"][0]["text"], "first");
-            assert_eq!(binding["blocks"][1]["text"], "second");
+            assert!(
+                binding["blocks"][1]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("second")
+            );
             let encoded = binding.to_string();
             assert!(encoded.contains("hook diagnostic"));
             assert!(!encoded.contains("blocked by policy"));
@@ -965,6 +990,38 @@ impl Hook for RichHook {
         _: bool,
         ctx: &Context<'_>,
     ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        if self.mode == "invalid-structured-append"
+            && let Some(path) = std::env::var_os("PI_REVIEW_AFTER_GATE")
+        {
+            std::fs::write(path, b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        if self.mode == "invalid-structured" {
+            self.after.fetch_add(1, Ordering::SeqCst);
+            return Ok(None);
+        }
+        if self.mode == "invalid-structured-append" {
+            self.after.fetch_add(1, Ordering::SeqCst);
+            let mut replaced = result.clone();
+            let prior = replaced.output[0]["text"].as_str().unwrap();
+            assert!(!prior.contains("schema-secret"));
+            replaced.output[0]["text"] = format!("{prior}\nintentional hook text").into();
+            return Ok(Some(replaced));
+        }
+        if self.mode == "invalid-structured-legacy" {
+            self.after.fetch_add(1, Ordering::SeqCst);
+            let mut replaced = result.clone();
+            let projection =
+                json!({"data":result.extra["structuredOutput"], "attachments":[]}).to_string();
+            replaced.output[0]["text"] = format!("{projection}\nintentional hook text").into();
+            return Ok(Some(replaced));
+        }
+        if self.mode == "invalid-simple" {
+            self.after.fetch_add(1, Ordering::SeqCst);
+            let mut replaced = result.clone();
+            replaced.output = vec![json!({"type":"text", "text":"looks successful"})];
+            return Ok(Some(replaced));
+        }
         assert_eq!(
             ctx.memo
                 .get_or_insert("rich-after", json!("stable"))
@@ -992,6 +1049,15 @@ impl Hook for RichHook {
                 message: "hook diagnostic".into(),
                 code: Some("hook_note".into()),
             });
+        if self.mode == "diagnostic-collision" {
+            result
+                .diagnostics
+                .push(pi_rs_durable::runtime::ToolDiagnostic {
+                    severity: pi_rs_durable::runtime::DiagnosticSeverity::Error,
+                    message: "explicit hook warning must reach the model".into(),
+                    code: Some("tool_failed".into()),
+                });
+        }
         Ok(Some(result))
     }
 }
@@ -1029,12 +1095,354 @@ impl DurableAsyncTool for ErrorJob {
         _: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String> {
         self.executions.fetch_add(1, Ordering::SeqCst);
-        Ok(DurableToolStep::Complete(if self.mode == "failure" {
-            Outcome::Failed("tool failure".into())
-        } else {
-            Outcome::Succeeded("ok".into())
-        }))
+        Ok(DurableToolStep::Complete(
+            if self.mode.starts_with("invalid-structured") {
+                Outcome::Structured {
+                    data: json!({"secret":"schema-secret"}),
+                    attachments: vec![],
+                }
+            } else if self.mode == "failure" {
+                Outcome::Failed("tool failure".into())
+            } else {
+                Outcome::Succeeded("ok".into())
+            },
+        ))
     }
+}
+
+#[tokio::test]
+async fn invalid_structured_projection_is_not_sent_to_model() {
+    for mode in [
+        "invalid-structured",
+        "invalid-structured-append",
+        "invalid-structured-legacy",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut options, registry, extensions) = setup_rich(
+            mode,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        options.model = Arc::new(ReviewModel(seen.clone(), "{}"));
+        let mut scheduler =
+            Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler
+            .select_extensions(id, vec!["policy".into()])
+            .unwrap();
+        scheduler
+            .set_tool_output_schema(
+                id,
+                "root".into(),
+                Some(json!({"type":"object","required":["value"]})),
+            )
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let c = scheduler.conversation(id).unwrap();
+        assert!(c.tool_results[0].structured_output.is_none());
+        assert!(
+            c.tool_results[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("invalid_structured_output"))
+        );
+        assert!(!c.messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content.contains("schema-secret"))
+        ));
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains("schema-secret"))
+        );
+        if mode != "invalid-structured" {
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.contains("intentional hook text"))
+            );
+        }
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn invalid_error_status_reaches_model_without_status_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut options, registry, extensions) = setup_rich(
+        "invalid-simple",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    options.model = Arc::new(ReviewModel(seen.clone(), "[1,2]"));
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let c = scheduler.conversation(id).unwrap();
+    assert!(c.tool_results[0].is_error);
+    assert!(
+        c.tool_results[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("invalid_arguments"))
+    );
+    assert!(c.messages.iter().any(
+        |m| matches!(m, Message::Tool {content,..} if content == "looks successful\n[tool error]")
+    ));
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == "looks successful\n[tool error]")
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn result_publication_reopen_worker() {
+    let Some(root) = std::env::var_os("PI_RESULT_PUBLICATION_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mode = if root.join("structured").exists() {
+        "invalid-structured-append"
+    } else {
+        "invalid-simple"
+    };
+    let raw = if mode == "invalid-simple" {
+        "[1,2]"
+    } else {
+        "{}"
+    };
+    let (mut options, registry, extensions) = setup_rich(
+        mode,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    options.model = Arc::new(ReviewModel(
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        raw,
+    ));
+    let mut scheduler =
+        Scheduler::open_with_extensions(root.join("db"), options, extensions).unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    if mode != "invalid-simple" {
+        scheduler
+            .set_tool_output_schema(
+                id,
+                "root".into(),
+                Some(json!({"type":"object","required":["value"]})),
+            )
+            .unwrap();
+    }
+    std::fs::write(root.join("id"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn validated_publication_and_error_status_survive_kill_reopen() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for mode in ["invalid-structured-append", "invalid-simple"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if mode != "invalid-simple" {
+            std::fs::write(root.join("structured"), b"yes").unwrap();
+        }
+        let mut child = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "result_publication_reopen_worker"])
+                .env("PI_RESULT_PUBLICATION_DIR", root)
+                .env("PI_REVIEW_PUBLICATION_READY", root.join("ready"))
+                .spawn()
+                .unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !root.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let id = std::fs::read_to_string(root.join("id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let after = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (mut options, registry, extensions) =
+            setup_rich(mode, after.clone(), executions.clone());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        options.model = Arc::new(ReviewModel(
+            seen.clone(),
+            if mode == "invalid-simple" {
+                "[1,2]"
+            } else {
+                "{}"
+            },
+        ));
+        let mut scheduler =
+            Scheduler::open_with_extensions(root.join("db"), options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let c = scheduler.conversation(id).unwrap();
+        assert_eq!(c.tool_results.len(), 1);
+        assert_eq!(
+            c.messages
+                .iter()
+                .filter(|m| matches!(m, Message::Tool { .. }))
+                .count(),
+            1
+        );
+        let text = c
+            .messages
+            .iter()
+            .find_map(|m| {
+                if let Message::Tool { content, .. } = m {
+                    Some(content.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        if mode == "invalid-simple" {
+            assert_eq!(text, "looks successful\n[tool error]");
+            assert!(c.tool_results[0].is_error);
+        } else {
+            assert!(!text.contains("schema-secret"));
+            assert!(text.contains("intentional hook text"));
+        }
+        assert_eq!(after.load(Ordering::SeqCst), 0);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_structured_checkpoint_replays_after_hook_without_tool() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("structured"), b"yes").unwrap();
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "result_publication_reopen_worker"])
+            .env("PI_RESULT_PUBLICATION_DIR", root)
+            .env("PI_REVIEW_AFTER_GATE", root.join("ready"))
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !root.join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("id"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (mut options, registry, extensions) = setup_rich(
+        "invalid-structured-append",
+        after.clone(),
+        executions.clone(),
+    );
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    options.model = Arc::new(ReviewModel(seen.clone(), "{}"));
+    let mut scheduler =
+        Scheduler::open_with_extensions(root.join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let c = scheduler.conversation(id).unwrap();
+    assert_eq!(c.tool_results.len(), 1);
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("intentional hook text"))
+    );
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("schema-secret"))
+    );
+    assert_eq!(after.load(Ordering::SeqCst), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
 }
 fn setup_rich(
     mode: &'static str,
@@ -1139,6 +1547,12 @@ async fn selected_after_rich_and_error_results_resume_conversation() {
             .unwrap();
         assert_eq!(blocks.blocks[0]["text"], "first");
         assert_eq!(blocks.blocks[1]["text"], "second");
+        assert_eq!(
+            serde_json::to_string(&blocks.blocks)
+                .unwrap()
+                .contains("[tool error]"),
+            mode != "success"
+        );
         assert!(
             c.messages
                 .iter()
@@ -1165,6 +1579,54 @@ async fn selected_after_rich_and_error_results_resume_conversation() {
         driver.shutdown().unwrap();
         scheduler.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn review_explicit_hook_diagnostic_with_reserved_code_is_omitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_rich("diagnostic-collision", after, executions);
+    let mut scheduler =
+        Scheduler::open_with_provider_adapter(&path, options, extensions, Arc::new(RichAdapter))
+            .unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.select_provider_adapter(id, true).unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let c = scheduler.conversation(id).unwrap();
+    assert!(
+        c.tool_results[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "explicit hook warning must reach the model")
+    );
+    let blocks = c
+        .content_blocks
+        .values()
+        .find(|b| Some(b.message_id) == c.tool_results[0].content_block_id)
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&blocks.blocks)
+            .unwrap()
+            .contains("explicit hook warning must reach the model")
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
 }
 
 #[cfg(unix)]
@@ -1267,6 +1729,11 @@ async fn rich_after_published_result_survives_process_kill() {
         .unwrap();
     assert_eq!(blocks.blocks[0]["text"], "first");
     assert_eq!(blocks.blocks[1]["text"], "second");
+    assert!(
+        serde_json::to_string(&blocks.blocks)
+            .unwrap()
+            .contains("[tool error]")
+    );
     assert_eq!(after.load(Ordering::SeqCst), 0);
     assert_eq!(executions.load(Ordering::SeqCst), 0);
     driver.shutdown().unwrap();

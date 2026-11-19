@@ -1484,6 +1484,68 @@ fn append_diagnostic_text(content: &mut String, diagnostic: &str) {
     content.push_str(diagnostic);
 }
 
+// Remove an exact host-generated projection even if a hook split it across
+// text blocks, preserving independently written content and non-text blocks.
+fn strip_structured_projection(blocks: &mut [serde_json::Value], projection: &str) {
+    let combined: String = blocks
+        .iter()
+        .filter_map(|block| {
+            (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+        .collect();
+    let ranges: Vec<_> = combined
+        .match_indices(projection)
+        .map(|(start, value)| start..start + value.len())
+        .collect();
+    let mut offset = 0;
+    for block in blocks {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = block.get_mut("text") else {
+            continue;
+        };
+        let Some(value) = text.as_str() else {
+            continue;
+        };
+        let end = offset + value.len();
+        let mut kept = String::new();
+        let mut cursor = offset;
+        for range in &ranges {
+            let start = range.start.max(offset);
+            let stop = range.end.min(end);
+            if start < stop {
+                kept.push_str(&value[cursor - offset..start - offset]);
+                cursor = stop;
+            }
+        }
+        kept.push_str(&value[cursor - offset..]);
+        *text = kept.into();
+        offset = end;
+    }
+}
+
+#[cfg(test)]
+mod structured_projection_tests {
+    use super::strip_structured_projection;
+    use serde_json::json;
+
+    #[test]
+    fn removes_split_projection_and_preserves_hook_content() {
+        let mut blocks = vec![
+            json!({"type":"text", "text":"before {\"data\":\"日"}),
+            json!({"type":"image", "data":"unchanged"}),
+            json!({"type":"text", "text":"本\"} after"}),
+        ];
+        strip_structured_projection(&mut blocks, "{\"data\":\"日本\"}");
+        assert_eq!(blocks[0]["text"], "before ");
+        assert_eq!(blocks[1]["data"], "unchanged");
+        assert_eq!(blocks[2]["text"], " after");
+    }
+}
+
 fn diagnostic_origins(
     c: &Conversation,
     operation_id: Uuid,
@@ -5028,6 +5090,7 @@ impl Harness {
         index: usize,
         operation_id: Uuid,
         mut result: crate::extension::ToolBlockResult,
+        task: &crate::task::Task,
     ) -> Result<(), Error> {
         let call = calls
             .get(index)
@@ -5065,6 +5128,31 @@ impl Harness {
             diagnostics: result.diagnostics,
         };
         validate_tool_metadata(&c.tool_filters, &mut metadata);
+        // A structured Outcome is projected into text before the hook chain.
+        // Unlike text authored by a hook, that projection is not an independent
+        // output channel. Remove only the provable projection if the original
+        // structured value violates the currently configured schema.
+        if let Some(schema) = c.tool_filters.output_schemas.get(&call.name) {
+            if task.checkpoint().phase != "replay-safe-async-after" {
+                return Err(Error::Invalid("missing checkpointable raw result".into()));
+            }
+            let evidence =
+                crate::async_task_tool::after_checkpoint_evidence(&task.checkpoint().data)
+                    .map_err(|error| {
+                        Error::Invalid(format!("invalid checkpointable raw result: {error}"))
+                    })?;
+            if let crate::async_task_tool::ReplaySafeAfterEvidence::ToolOutcome(
+                outcome @ Outcome::Structured { .. },
+            ) = evidence
+                && let Outcome::Structured { ref data, .. } = outcome
+                && (!local_schema_references(schema)
+                    || jsonschema::validator_for(schema)
+                        .map_or(true, |validator| !validator.is_valid(data)))
+            {
+                let projection = outcome.tool_content();
+                strip_structured_projection(&mut result.output, &projection);
+            }
+        }
         // The saved result does not retain diagnostic provenance. Conservatively
         // withhold derived failure reasons from model text: an after hook may
         // have replaced the output to redact them. The host still retains them.
@@ -5101,6 +5189,24 @@ impl Harness {
                 result
                     .output
                     .push(serde_json::json!({"type":"text", "text":diagnostic}));
+            }
+        }
+        if metadata.is_error && !self.status_aware(c) {
+            if let Some(text) = result.output.last_mut().and_then(|block| {
+                (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .then(|| block.get_mut("text"))
+                    .flatten()
+            }) {
+                let mut value = text
+                    .as_str()
+                    .ok_or_else(|| Error::Invalid("invalid result text".into()))?
+                    .to_owned();
+                append_diagnostic_text(&mut value, "[tool error]");
+                *text = value.into();
+            } else {
+                result
+                    .output
+                    .push(serde_json::json!({"type":"text", "text":"[tool error]"}));
             }
         }
         let simple = result.output.len() == 1
@@ -15422,7 +15528,6 @@ impl Harness {
                     )?
                     .ok_or_else(|| Error::Invalid("task-backed tool cleanup incomplete".into()))?;
                 let rich = check.rich.clone();
-                task_result_check = Some(check);
                 if let Some(result) = rich {
                     self.append_checkpointable_hook_result(
                         &mut c,
@@ -15430,6 +15535,7 @@ impl Harness {
                         index,
                         operation_id,
                         result,
+                        &check.task,
                     )?;
                     for i in index + 1..calls.len() {
                         self.append_skipped_with_status(
@@ -15463,6 +15569,7 @@ impl Harness {
                         )?;
                     }
                 }
+                task_result_check = Some(check);
             }
             Phase::Pending {
                 turns,
@@ -19297,6 +19404,7 @@ impl Harness {
                             index,
                             operation_id,
                             result,
+                            &task_check.task,
                         )?;
                         c.pending_diagnostic_provenance = None;
                         c.phase = Phase::Tools {
