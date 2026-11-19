@@ -257,3 +257,100 @@ async fn selected_hook_candidate_requires_identified_order_and_stays_closed() {
     assert!(matches!(result, Outcome::Skipped(_)));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
+
+struct RequestCandidate;
+#[async_trait]
+impl Model for RequestCandidate {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "candidate".into(),
+                arguments: "{}".into(),
+            }],
+            usage: None,
+        })])
+        .boxed())
+    }
+}
+struct CountingHook(Arc<AtomicUsize>);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for CountingHook {
+    async fn before_tool(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(pi_rs_durable::extension::BeforeTool::Pass)
+    }
+}
+#[tokio::test]
+async fn selected_hook_is_rejected_before_driver_admission() {
+    use pi_rs_durable::async_task_tool::{
+        ReplaySafeConversationHooksAuthorization,
+        register_conversation_replay_safe_durable_tool_with_selected_hooks,
+    };
+    use pi_rs_durable::extension::{Extension, ExtensionIdentity};
+    use pi_rs_durable::runtime::{Config, Scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install_identified(
+            Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(CountingHook(hook_calls.clone()))],
+                ..Default::default()
+            },
+            ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()]).unwrap(),
+        )
+        .unwrap();
+    let mut registry = Registry::default();
+    let adapter = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(Candidate {
+            description: "test",
+            calls: tool_calls.clone(),
+        }),
+        "candidate-v1",
+        1,
+        vec![],
+        &extensions.snapshot(),
+        &["policy".into()],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    let mut opts = options(&adapter);
+    opts.model = Arc::new(RequestCandidate);
+    let path = dir.path().join("db");
+    let mut scheduler = Scheduler::open_with_extensions(&path, opts, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap();
+    assert!(result.is_err());
+    let store = durable_store::Store::open(&path).unwrap();
+    assert!(
+        pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    driver.shutdown().unwrap();
+}
