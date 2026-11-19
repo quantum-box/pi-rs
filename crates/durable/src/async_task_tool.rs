@@ -424,6 +424,7 @@ impl StandaloneBeforeHookHost {
     /// Register a replay-safe durable Tool and one replay-safe hook. The hook
     /// identity covers code and configuration. Memo is task-fenced; hook
     /// parking is not available in this initial integration.
+    #[allow(clippy::too_many_arguments)] // Explicit registration includes hook identity and replay authorization.
     pub fn register_replay_safe_durable_tool_with_hook(
         &mut self,
         tool: Arc<dyn DurableAsyncTool>,
