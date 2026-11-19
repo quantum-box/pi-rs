@@ -11059,6 +11059,7 @@ impl Harness {
                 task,
                 operation_id,
                 ref identity,
+                ref arguments,
                 ..
             } = c.phase
             {
@@ -11084,6 +11085,7 @@ impl Harness {
                     || child.task.kind() != Some(identity.kind.as_str())
                     || child.task.definition_version() != identity.definition_version
                     || child.task.replay_safe() != identity.replay_safe
+                    || child.task.input() != arguments
                 {
                     return Err(Error::Invalid(
                         "task adapter or definition identity changed".into(),
@@ -14460,6 +14462,8 @@ impl Harness {
         conversation: Uuid,
         operation: Uuid,
         task: Uuid,
+        arguments: &serde_json::Value,
+        identity: &crate::task_tool::Identity,
     ) -> Result<Option<Outcome>, Error> {
         let child = crate::task_store::TaskStore::new(self.owner.store())
             .load(task)
@@ -14467,8 +14471,14 @@ impl Harness {
             .ok_or_else(|| Error::Invalid("task-backed tool task missing".into()))?;
         if task != operation
             || child.task.owner() != &crate::task::TaskOwner::Conversation(conversation)
+            || child.task.kind() != Some(identity.kind.as_str())
+            || child.task.definition_version() != identity.definition_version
+            || child.task.replay_safe() != identity.replay_safe
+            || child.task.input() != arguments
         {
-            return Err(Error::Invalid("task-backed tool owner mismatch".into()));
+            return Err(Error::Invalid(
+                "task-backed tool identity or input mismatch".into(),
+            ));
         }
         Ok(match child.task.state() {
             crate::task::TaskState::Succeeded(value)
@@ -14802,7 +14812,15 @@ impl Harness {
             } => {
                 self.validate_pending_task_identity(&c, &calls, index, &identity)?;
                 let outcome = self
-                    .task_tool_result(c.id, operation_id, task)?
+                    .task_tool_result(
+                        c.id,
+                        operation_id,
+                        task,
+                        &arguments,
+                        identity.as_ref().ok_or_else(|| {
+                            Error::Invalid("task adapter identity missing".into())
+                        })?,
+                    )?
                     .ok_or_else(|| Error::Invalid("task-backed tool cleanup incomplete".into()))?;
                 if let Outcome::Unknown(reason) = outcome {
                     c.phase = Phase::Blocked {
@@ -18511,7 +18529,16 @@ impl Harness {
                     identity,
                 } => {
                     self.validate_pending_task_identity(&c, &calls, index, &identity)?;
-                    let Some(outcome) = self.task_tool_result(c.id, operation_id, task)? else {
+                    let Some(outcome) = self.task_tool_result(
+                        c.id,
+                        operation_id,
+                        task,
+                        &arguments,
+                        identity.as_ref().ok_or_else(|| {
+                            Error::Invalid("task adapter identity missing".into())
+                        })?,
+                    )?
+                    else {
                         return Ok(());
                     };
                     c.phase = if let Outcome::Unknown(reason) = outcome {
@@ -29846,6 +29873,89 @@ mod scheduler_tests {
                     .all(|s| s.task.state() != &TaskState::Running)
             );
         }
+    }
+
+    #[test]
+    fn conversation_task_binding_checks_input_and_definition_after_reopen() {
+        use crate::task::Task;
+        use crate::task_scheduler::{Handler, Registry, Step};
+        use crate::task_tool::TaskTool;
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let handler: Arc<dyn Handler> =
+            Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!("done"))));
+        let adapter = Arc::new(TaskTool::new(
+            pi_rs_core::ToolSpec {
+                name: "job".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            "task",
+            true,
+            1,
+            handler.clone(),
+        ));
+        let mut opts = options(model.clone());
+        opts.tools = vec![adapter.register()];
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, opts).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let operation_id = Uuid::new_v4();
+        let original = serde_json::json!({"input": 1});
+        let task = adapter.task(id, operation_id, original.clone(), 5).unwrap();
+        c.phase = Phase::TaskPending {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id,
+            arguments: original.clone(),
+            task: operation_id,
+            identity: adapter.identity(),
+        };
+        h.save_composed(&c, Expected::Version(version), None, &[task])
+            .unwrap();
+        drop(h);
+        let mut opts = options(model);
+        opts.tools = vec![adapter.register()];
+        let mut h = Harness::open_paused(&path, opts).unwrap();
+        let mut registry = Registry::default();
+        registry.register_shared("task", true, handler);
+        assert!(h.validate_task_tool_registry(&registry).is_ok());
+        let identity = adapter.identity().unwrap();
+        assert!(
+            h.task_tool_result(id, operation_id, operation_id, &original, &identity)
+                .unwrap()
+                .is_none()
+        );
+        let altered = serde_json::json!({"input": 2});
+        assert!(
+            h.task_tool_result(id, operation_id, operation_id, &altered, &identity)
+                .is_err()
+        );
+        let mut foreign = identity.clone();
+        foreign.kind = "foreign".into();
+        assert!(
+            h.task_tool_result(id, operation_id, operation_id, &original, &foreign)
+                .is_err()
+        );
+        let (mut c, version) = h.load(id).unwrap();
+        if let Phase::TaskPending { arguments, .. } = &mut c.phase {
+            *arguments = altered;
+        } else {
+            panic!("expected pending task");
+        }
+        h.save(&c, Expected::Version(version)).unwrap();
+        assert!(h.validate_task_tool_registry(&registry).is_err());
     }
 
     #[test]

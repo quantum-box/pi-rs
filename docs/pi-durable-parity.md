@@ -1,5 +1,6 @@
 **Task-backed multi-level waits:** A model-issued `TaskTool` can own a keyed
 `TaskTool::start_child` task whose handler starts another, independently owned
+
 child. Admission and the parent checkpoint/wait commit atomically; each wake
 reports ended direct children and keyed calls can reconnect to the same child.
 `WaitFor::Tasks` waits for all named children and `TasksAny` wakes on any. This
@@ -7,6 +8,8 @@ is a synchronous registered-task-handler API: nested children run task handlers,
 not the ordinary asynchronous `Tool` invocation or its nested tool-hook pipeline.
 It is separate from `KeyedHost` multi-level nested calls and does not establish
 parity with upstream `executeTool(..., { wait: false })` or its tool API.
+
+Conversation-owned checkpointable asynchronous tools and their extension hooks remain unsupported. The existing TaskPending boundary now checks the admitted input and task definition on attachment and outcome reading; see the [integration design](durable-conversation-async-integration.md) for the additional authorization, fencing and recovery work required before enabling dispatch.
 
 The scheduler integration tests kill the OS process with an unsafe root parked
 and a leaf result already committed, reopen, reconnect the root's key on wake,
