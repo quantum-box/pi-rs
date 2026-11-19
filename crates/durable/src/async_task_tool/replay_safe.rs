@@ -114,6 +114,7 @@ pub(super) fn register(
         abort_after,
         restart_after,
         unavailable,
+        park_cancel,
     )
 }
 
@@ -137,6 +138,7 @@ pub(super) fn register_unsafe(
         false,
         false,
         false,
+        None,
     )
 }
 
@@ -153,6 +155,7 @@ fn register_with_policy(
     abort_after: bool,
     restart_after: bool,
     unavailable: bool,
+    park_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
 ) -> Result<Arc<TaskTool>, String> {
     if unavailable && (!block_results || abort_after || restart_after || !children.is_empty()) {
         return Err("invalid unavailable registration".into());
