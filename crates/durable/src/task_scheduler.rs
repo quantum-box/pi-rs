@@ -1418,7 +1418,9 @@ impl AdmissionHandle<'_> {
             if !seen.insert(ancestor.id())
                 || ancestor.abort_requested()
                 || ancestor.is_terminal()
-                || ancestor.is_completing()
+                || (ancestor.is_completing()
+                    && !(ancestor.retains_task_children_on_success()
+                        && matches!(ancestor.state(), TaskState::Completing(_))))
                 || ancestor.is_background()
                 || (ancestor.id() != current.task.id()
                     && !ancestor.replay_safe()
@@ -2341,7 +2343,9 @@ impl DetachedInvocation {
                 }
                 InvocationResult::Handler(Err(_), _) => true,
                 InvocationResult::Handler(Ok(Step::Fail(_)), _) => true,
-                InvocationResult::Handler(Ok(Step::Succeed(_)), _) => running.task.is_task_tool(),
+                InvocationResult::Handler(Ok(Step::Succeed(_)), _) => {
+                    running.task.is_task_tool() && !running.task.retains_task_children_on_success()
+                }
                 _ => false,
             };
             state.published.push_back((running.task.id(), abort_intent));
@@ -2396,7 +2400,8 @@ impl WakeReader {
             }
             match task.state() {
                 TaskState::Completing(_) | TaskState::CompletingFailed(_)
-                    if task.is_task_tool() && has_unmarked_nested(task.id(), &tasks) =>
+                    if cancels_nested_on_completion(task)
+                        && has_unmarked_nested(task.id(), &tasks) =>
                 {
                     result.active = true
                 }
@@ -4579,8 +4584,7 @@ impl Scheduler {
             // generic siblings. Defer those roots and their ownership graphs until
             // the normal nested-abort transaction has marked them.
             for parent in &records {
-                if parent.task.is_task_tool()
-                    && parent.task.is_completing()
+                if cancels_nested_on_completion(&parent.task)
                     && has_unmarked_nested(parent.task.id(), &records)
                 {
                     pending_roots.extend(records.iter().filter_map(|child| {
@@ -5115,7 +5119,7 @@ impl Scheduler {
                 && !snapshot.task.abort_requested()
                 && (live || has_owned_work(owner.store(), snapshot.task.id(), &held_tasks, true)?);
             if !needs_cascade
-                && snapshot.task.is_task_tool()
+                && cancels_nested_on_completion(&snapshot.task)
                 && has_unmarked_nested(snapshot.task.id(), &held_tasks)
             {
                 if nonblocking && self.validator.is_some() {
@@ -6746,7 +6750,7 @@ pub(crate) fn pending_abort_root_for_running(
         {
             roots.push(parent.task.id());
         }
-        if parent.task.is_task_tool() && parent.task.is_completing() {
+        if cancels_nested_on_completion(&parent.task) {
             roots.extend(records.iter().filter_map(|child| {
                 (child.task.owner() == &TaskOwner::Task(parent.task.id())
                     && child.task.is_task_tool()
@@ -6913,9 +6917,7 @@ pub(crate) fn resolve_maintenance(
     };
     match intent {
         MaintenanceIntent::Nested(_)
-            if parent.task.is_task_tool()
-                && parent.task.is_completing()
-                && has_unmarked_nested(id, &records) =>
+            if cancels_nested_on_completion(&parent.task) && has_unmarked_nested(id, &records) =>
         {
             Ok(Some((None, Some(id))))
         }
@@ -6947,6 +6949,15 @@ fn has_unmarked_nested(parent: Uuid, tasks: &[task_store::StoredTask]) -> bool {
             && !child.task.is_terminal()
             && !child.task.abort_requested()
     })
+}
+
+fn cancels_nested_on_completion(task: &Task) -> bool {
+    task.is_task_tool()
+        && match task.state() {
+            TaskState::Completing(_) => !task.retains_task_children_on_success(),
+            TaskState::CompletingFailed(_) => true,
+            _ => false,
+        }
 }
 
 fn owned_graph_uncertain(store: &durable_store::Store, root: Uuid) -> Result<bool, Error> {
@@ -7073,9 +7084,7 @@ fn request_abort_roots_with(
             .iter()
             .find(|s| s.task.id() == id)
             .ok_or(Error::Ownership)?;
-        if root.task.is_terminal()
-            || (nested && (!root.task.is_task_tool() || !root.task.is_completing()))
-        {
+        if root.task.is_terminal() || (nested && !cancels_nested_on_completion(&root.task)) {
             return Err(Error::Transition(TransitionError::InvalidState));
         }
         let mut ids = if nested {

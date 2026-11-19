@@ -51,6 +51,7 @@ impl Task {
             abort_requested: false,
             background: false,
             task_tool: false,
+            retain_task_children_on_success: false,
         })
     }
 
@@ -77,6 +78,14 @@ impl Task {
 
     pub(crate) fn is_task_tool(&self) -> bool {
         self.task_tool
+    }
+
+    pub(crate) fn retain_task_children_on_success(mut self) -> Self {
+        self.retain_task_children_on_success = true;
+        self
+    }
+    pub(crate) fn retains_task_children_on_success(&self) -> bool {
+        self.task_tool && self.retain_task_children_on_success
     }
 
     /// Bind a new task to a registered implementation and its persisted replay policy.

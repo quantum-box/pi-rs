@@ -2746,6 +2746,7 @@ mod tests {
     struct TwoChildTool {
         any: bool,
         calls: Arc<AtomicUsize>,
+        fail_after_wake: bool,
     }
     #[async_trait::async_trait]
     impl Tool for TwoChildTool {
@@ -2786,6 +2787,9 @@ mod tests {
                     })
                 }
                 Some(value) => {
+                    if self.fail_after_wake {
+                        return Err("failure after wake".into());
+                    }
                     let calls: Vec<AsyncTaskCall> = serde_json::from_value(value["calls"].clone())
                         .map_err(|e| e.to_string())?;
                     if resume.ended.len() != if self.any { 1 } else { 2 } {
@@ -2843,6 +2847,7 @@ mod tests {
                     Arc::new(TwoChildTool {
                         any,
                         calls: calls.clone(),
+                        fail_after_wake: false,
                     }),
                     "two-v1",
                     1,
@@ -2884,11 +2889,12 @@ mod tests {
             });
             if any {
                 wait_state(&driver, root.task_id(), |s| {
-                    matches!(s, crate::task::TaskState::Succeeded(_))
+                    matches!(s, crate::task::TaskState::Completing(_))
                 });
-                wait_state(&driver, children[1].task_id(), |s| {
-                    matches!(s, crate::task::TaskState::Cancelled)
-                });
+                assert!(matches!(
+                    driver.get(children[1].task_id()).unwrap().unwrap().state(),
+                    crate::task::TaskState::Waiting(_)
+                ));
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
             } else {
                 assert!(matches!(
@@ -2896,15 +2902,15 @@ mod tests {
                     crate::task::TaskState::Waiting(_)
                 ));
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
-                driver
-                    .signal(&crate::task_store::Signal::new(
-                        Uuid::new_v4(),
-                        children[1].task_id(),
-                        "release".into(),
-                        json!(null),
-                    ))
-                    .unwrap();
             }
+            driver
+                .signal(&crate::task_store::Signal::new(
+                    Uuid::new_v4(),
+                    children[1].task_id(),
+                    "release".into(),
+                    json!(null),
+                ))
+                .unwrap();
             let completed = wait_state(&driver, outer.id(), |s| {
                 matches!(s, crate::task::TaskState::Succeeded(_))
             });
@@ -2917,6 +2923,249 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 2);
             driver.shutdown().unwrap();
         }
+    }
+
+    struct NamedGate;
+    impl crate::task_scheduler::Handler for NamedGate {
+        fn run(&self, task: &Task) -> Result<crate::task_scheduler::Step, String> {
+            use crate::task_scheduler::Step;
+            match task.checkpoint().phase.as_str() {
+                "initial" => Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "gate".into(),
+                        data: json!(null),
+                    },
+                    condition: crate::task::WaitFor::Signal("release".into()),
+                    children: vec![],
+                }),
+                "gate" if task.delivered_signal().is_some() => Ok(Step::Succeed(
+                    serde_json::to_value(Outcome::Succeeded("gate".into())).unwrap(),
+                )),
+                _ => Err("bad gate wake".into()),
+            }
+        }
+    }
+    fn completing_chain_host_with_failure(
+        path: &std::path::Path,
+        fail_after_wake: bool,
+    ) -> (StandaloneNoHooksHost, Arc<crate::task_tool::TaskTool>) {
+        let gate: Arc<dyn crate::task_scheduler::Handler> = Arc::new(NamedGate);
+        let mut registry = Registry::default();
+        assert!(registry.register_shared("completing-gate", true, gate.clone()));
+        assert!(registry.set_abort("completing-gate", |_: &Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!(null))
+        )));
+        let mut host =
+            StandaloneNoHooksHost::open(path, registry, UnhookedAuthorization::standalone_only())
+                .unwrap();
+        let gate_tool = Arc::new(crate::task_tool::TaskTool::new(
+            ToolSpec {
+                name: "gate".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            },
+            "completing-gate",
+            true,
+            1,
+            gate,
+        ));
+        let leaf = host
+            .register_replay_safe_durable_tool(
+                Arc::new(ChainTool {
+                    name: "leaf",
+                    child: "gate",
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    any: false,
+                }),
+                "completing-leaf-v1",
+                1,
+                vec![gate_tool],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let root = host
+            .register_replay_safe_durable_tool(
+                Arc::new(TwoChildTool {
+                    any: true,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_after_wake,
+                }),
+                "completing-root-v1",
+                1,
+                vec![leaf],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        (host, root)
+    }
+    fn completing_chain_host(
+        path: &std::path::Path,
+    ) -> (StandaloneNoHooksHost, Arc<crate::task_tool::TaskTool>) {
+        completing_chain_host_with_failure(path, false)
+    }
+    fn completing_chain_parked(
+        driver: &crate::task_driver::Driver,
+        root: Uuid,
+    ) -> (Vec<Uuid>, Vec<Uuid>) {
+        let root_task = wait_state(driver, root, |s| {
+            matches!(s, crate::task::TaskState::Waiting(_))
+        });
+        let calls: Vec<AsyncTaskCall> =
+            serde_json::from_value(root_task.checkpoint().data["checkpoint"]["calls"].clone())
+                .unwrap();
+        let mut children = vec![];
+        let mut gates = vec![];
+        for call in calls {
+            let task = wait_state(driver, call.task_id(), |s| {
+                matches!(s, crate::task::TaskState::Waiting(_))
+            });
+            let gate: AsyncTaskCall =
+                serde_json::from_value(task.checkpoint().data["checkpoint"]["call"].clone())
+                    .unwrap();
+            wait_state(driver, gate.task_id(), |s| {
+                matches!(s, crate::task::TaskState::Waiting(_))
+            });
+            children.push(call.task_id());
+            gates.push(gate.task_id());
+        }
+        (children, gates)
+    }
+    fn signal_gate(driver: &crate::task_driver::Driver, id: Uuid) {
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                id,
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+    }
+    #[test]
+    fn completing_any_parent_preserves_durable_child_across_reopen_and_abort() {
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (host, root_tool) = completing_chain_host(&path);
+            let root = host
+                .start_replay_safe_root(&root_tool, json!({}), 3)
+                .unwrap();
+            let driver = host.into_driver();
+            let (children, gates) = completing_chain_parked(&driver, root);
+            signal_gate(&driver, gates[0]);
+            wait_state(&driver, root, |s| {
+                matches!(s, crate::task::TaskState::Completing(_))
+            });
+            assert!(matches!(
+                driver.get(children[1]).unwrap().unwrap().state(),
+                crate::task::TaskState::Waiting(_)
+            ));
+            driver.shutdown().unwrap();
+            let (host, _) = completing_chain_host(&path);
+            let driver = host.into_driver();
+            if abort {
+                driver.request_abort(root).unwrap();
+                for id in [children[1], gates[1]] {
+                    wait_state(&driver, id, |s| {
+                        matches!(s, crate::task::TaskState::Cancelled)
+                    });
+                }
+                let completed = wait_state(&driver, root, |s| {
+                    matches!(s, crate::task::TaskState::Succeeded(_))
+                });
+                assert!(completed.abort_requested());
+            } else {
+                signal_gate(&driver, gates[1]);
+                wait_state(&driver, children[1], |s| {
+                    matches!(s, crate::task::TaskState::Succeeded(_))
+                });
+                wait_state(&driver, root, |s| {
+                    matches!(s, crate::task::TaskState::Succeeded(_))
+                });
+            }
+            driver.shutdown().unwrap();
+        }
+    }
+    #[test]
+    fn failure_after_any_wake_cancels_remaining_durable_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, tool) = completing_chain_host_with_failure(&dir.path().join("db"), true);
+        let root = host.start_replay_safe_root(&tool, json!({}), 3).unwrap();
+        let driver = host.into_driver();
+        let (children, gates) = completing_chain_parked(&driver, root);
+        signal_gate(&driver, gates[0]);
+        wait_state(
+            &driver,
+            root,
+            |s| matches!(s, crate::task::TaskState::Failed(reason) if reason.contains("failure after wake")),
+        );
+        for id in [children[1], gates[1]] {
+            wait_state(&driver, id, |s| {
+                matches!(s, crate::task::TaskState::Cancelled)
+            });
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn completing_any_kill_fixture() {
+        let Some(dir) = std::env::var_os("PI_COMPLETING_ANY_KILL_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let (host, tool) = completing_chain_host(&dir.join("db"));
+        let root = host.start_replay_safe_root(&tool, json!({}), 3).unwrap();
+        let driver = host.into_driver();
+        let (children, gates) = completing_chain_parked(&driver, root);
+        signal_gate(&driver, gates[0]);
+        wait_state(&driver, root, |s| {
+            matches!(s, crate::task::TaskState::Completing(_))
+        });
+        std::fs::write(
+            dir.join("ready.tmp"),
+            serde_json::to_vec(&(root, children[1], gates[1])).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(dir.join("ready.tmp"), dir.join("ready")).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    #[test]
+    fn completing_any_kill_reopen_finishes_remaining_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::completing_any_kill_fixture")
+            .env("PI_COMPLETING_ANY_KILL_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !dir.path().join("ready").exists() {
+            if std::time::Instant::now() >= deadline || process.try_wait().unwrap().is_some() {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("completing fixture did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let (root, child, gate): (Uuid, Uuid, Uuid) =
+            serde_json::from_slice(&std::fs::read(dir.path().join("ready")).unwrap()).unwrap();
+        let (host, _) = completing_chain_host(&dir.path().join("db"));
+        let driver = host.into_driver();
+        assert!(matches!(
+            driver.get(root).unwrap().unwrap().state(),
+            crate::task::TaskState::Completing(_)
+        ));
+        signal_gate(&driver, gate);
+        wait_state(&driver, child, |s| {
+            matches!(s, crate::task::TaskState::Succeeded(_))
+        });
+        wait_state(&driver, root, |s| {
+            matches!(s, crate::task::TaskState::Succeeded(_))
+        });
+        driver.shutdown().unwrap();
     }
 
     struct CancellationTool(std::sync::mpsc::Sender<()>);

@@ -215,6 +215,11 @@ impl TaskTool {
         })
         .map_err(|error| format!("task creation: {error:?}"))?
         .into_task_tool();
+        let child = if self.deferred_arguments {
+            child.retain_task_children_on_success()
+        } else {
+            child
+        };
         Ok((identity, child))
     }
 }
@@ -285,7 +290,14 @@ impl TaskTool {
                 input,
             )
         })
-        .map(|task| task.into_task_tool())
+        .map(|task| {
+            let task = task.into_task_tool();
+            if self.deferred_arguments {
+                task.retain_task_children_on_success()
+            } else {
+                task
+            }
+        })
         .map_err(|e| format!("task creation: {e:?}"))
     }
     pub(crate) fn handler(&self) -> Arc<dyn crate::task_scheduler::Handler> {

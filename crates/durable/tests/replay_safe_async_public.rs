@@ -412,3 +412,171 @@ fn public_root_runs_two_levels_of_async_child_parks() {
     }
     driver.shutdown().unwrap();
 }
+
+struct PendingPrepare(std::sync::mpsc::Sender<()>);
+#[async_trait]
+impl Tool for PendingPrepare {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "pending-prepare".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn prepare_arguments(&self, _: Value) -> ExtensionResult<Value> {
+        let _ = self.0.send(());
+        std::future::pending().await
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for PendingPrepare {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        panic!("pending prepare must not execute")
+    }
+}
+#[test]
+fn public_abort_and_shutdown_cancel_pending_argument_preparation() {
+    for abort in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            Registry::default(),
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tool = host
+            .register_replay_safe_durable_tool(
+                Arc::new(PendingPrepare(tx)),
+                "pending-v1",
+                1,
+                vec![],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let id = host.start_replay_safe_root(&tool, json!({}), 3).unwrap();
+        let driver = host.into_driver();
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        if abort {
+            driver.request_abort(id).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let task = driver.get(id).unwrap().unwrap();
+                if matches!(task.state(), TaskState::Cancelled) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "abort did not complete: {:?}",
+                    task.state()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(driver.shutdown());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("shutdown hung during preparation")
+            .unwrap();
+    }
+}
+
+struct OversizedPrepare(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for OversizedPrepare {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "oversized".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn prepare_arguments(&self, _: Value) -> ExtensionResult<Value> {
+        Ok(json!({"large":"x".repeat(16 * 1024 * 1024)}))
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for OversizedPrepare {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(DurableToolStep::Complete(Outcome::Succeeded(
+            "unexpected".into(),
+        )))
+    }
+}
+#[test]
+fn public_root_and_nested_reject_oversized_prepared_arguments_before_execution() {
+    for nested in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            Registry::default(),
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let oversized = host
+            .register_replay_safe_durable_tool(
+                Arc::new(OversizedPrepare(calls.clone())),
+                "oversize-v1",
+                1,
+                vec![],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap();
+        let root = if nested {
+            host.register_replay_safe_durable_tool(
+                Arc::new(Node {
+                    name: "root",
+                    child: "oversized",
+                    expected: "unexpected",
+                }),
+                "parent-v1",
+                1,
+                vec![oversized],
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+            .unwrap()
+        } else {
+            oversized
+        };
+        let id = host.start_replay_safe_root(&root, json!({}), 3).unwrap();
+        let driver = host.into_driver();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let task = driver.get(id).unwrap().unwrap();
+            if matches!(task.state(), TaskState::Failed(_)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "oversized task did not fail: {:?}",
+                task.state()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        driver.shutdown().unwrap();
+    }
+}

@@ -220,13 +220,15 @@ impl Handler for Executor {
         let (result, args) = runtime.block_on(async {
             let args = match saved_args {
                 Some(args) => args,
-                None => self
-                    .tool
-                    .prepare_arguments(task.input().clone())
-                    .await
-                    .map_err(|e| e.to_string())?,
+                None => tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err("argument preparation cancelled".into()),
+                    prepared = self.tool.prepare_arguments(task.input().clone()) => prepared.map_err(|e| e.to_string())?,
+                },
             };
+            if cancellation.is_cancelled() { return Err("tool execution cancelled".into()); }
             if !args.is_object()
+                || serde_json::to_vec(&args).map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024
                 || !jsonschema::validator_for(&self.tool.spec().parameters)
                     .is_ok_and(|v| v.is_valid(&args))
             {

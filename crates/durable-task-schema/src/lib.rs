@@ -144,6 +144,9 @@ macro_rules! declare_task_schema {
             /// Set only by the TaskTool adapter, never inferred from a task kind.
             #[serde(default, skip_serializing_if = "task_tool_is_false")]
             task_tool: bool,
+            /// This adapter lets owned work finish after successful completion.
+            #[serde(default, skip_serializing_if = "task_tool_is_false")]
+            retain_task_children_on_success: bool,
         }
     };
 }

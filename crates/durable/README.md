@@ -667,11 +667,15 @@ distinct direct children. A durable tool cannot itself complete with `Pending`
 or `Unknown`; those values returned by an allowed generic child are exposed as
 uncertain child results. Signal waits, UI, progress, extension state, unsafe
 Tool attempts and conversation hooks are not
-supported by this path. Completing a task-backed tool after an `Any` wake
-cancels its still-running task-backed children under pi-rs cleanup semantics;
-this differs from upstream's general task finishing behavior. A tool that wants
-all children to finish can park again before completing. The generic
-`register_durable_tool` entry remains disabled.
+supported by this path. After an `Any` wake, a successful tool remains
+`completing` until its remaining owned children finish; failure or abort still
+cancels those children. An abort during `completing` preserves the already
+decided successful parent outcome while cancelling the remaining work. Tasks
+admitted by the older experimental version lack the completion policy marker
+and retain its earlier child-cancellation behavior. Older executors do not
+honor the new marker and may cancel retained children; do not downgrade a store
+containing these tasks to an older executor.
+The generic `register_durable_tool` entry remains disabled.
 
 Pending nested jobs are resolved by tool name and replay policy; their stored
 references are not bound to an implementation or tenant identity. On reopen,
