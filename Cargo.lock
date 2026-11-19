@@ -721,6 +721,7 @@ name = "durable-store"
 version = "0.1.0"
 dependencies = [
  "durable-task-schema",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

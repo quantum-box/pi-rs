@@ -83,11 +83,16 @@ pub struct OwnedStore {
 
 // Dropped after `store`: explicitly unlock the shared open file description so
 // a child temporarily between fork and exec cannot retain an abandoned lock.
-struct OwnerLock(File);
+struct OwnerLock {
+    file: File,
+    owner_pid: u32,
+}
 
 impl Drop for OwnerLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        if self.owner_pid == std::process::id() {
+            let _ = self.file.unlock();
+        }
     }
 }
 
@@ -142,7 +147,10 @@ impl OwnedStore {
         validate_file(&db, false)?;
         Ok(Self {
             store,
-            _lock: OwnerLock(lock),
+            _lock: OwnerLock {
+                file: lock,
+                owner_pid: std::process::id(),
+            },
             task_gate: std::sync::Mutex::new(()),
             controls: crate::controls::ConversationControls::default(),
             summary_fences: Mutex::new(HashMap::new()),
@@ -224,13 +232,43 @@ mod inherited_lock_tests {
     use super::*;
 
     #[test]
+    fn fork_child_drop_does_not_unlock_live_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = OwnedStore::open(&path).unwrap();
+        let mut inherited = OwnerLock {
+            file: owner._lock.file.try_clone().unwrap(),
+            owner_pid: owner._lock.owner_pid,
+        };
+        // In the fork child do no allocation, locking, I/O through SQLite,
+        // or unwinding: just drop the copied descriptor and immediately exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            drop(inherited);
+            unsafe { libc::_exit(0) }
+        }
+        let mut child_status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut child_status, 0) }, pid);
+        assert!(libc::WIFEXITED(child_status));
+        assert_eq!(libc::WEXITSTATUS(child_status), 0);
+        assert!(matches!(OwnedStore::open(&path), Err(OwnerError::Busy)));
+        // Drop the parent's duplicate without running the ownership wrapper;
+        // the real owner retains the lock until its own shutdown.
+        inherited.owner_pid = 0;
+        drop(inherited);
+        drop(owner);
+        assert!(OwnedStore::open(&path).is_ok());
+    }
+
+    #[test]
     fn shutdown_releases_lock_even_if_an_inherited_descriptor_remains_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let owner = OwnedStore::open(&path).unwrap();
         // A duplicated descriptor models the open file description inherited
         // by a concurrent fork before close-on-exec takes effect.
-        let inherited = owner._lock.0.try_clone().unwrap();
+        let inherited = owner._lock.file.try_clone().unwrap();
         assert!(matches!(OwnedStore::open(&path), Err(OwnerError::Busy)));
         drop(owner);
         let reopened = OwnedStore::open(&path).unwrap();
