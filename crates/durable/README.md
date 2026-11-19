@@ -514,6 +514,11 @@ leaf child and checkpoint its `AsyncTaskCall`. The child's registered Tool
 identity is committed with admission. This is not an async ToolHost API: async
 Tools still cannot start children or park and resume through this interface.
 
+`DurableAsyncTool` defines an opt-in result that distinguishes a checkpointed
+park from an external `Pending` outcome. Its registration currently always
+fails: there is no driver implementation for per-attempt park/wake yet. Do not
+interpret the interface as support for nested async execution or crash recovery.
+
 A durable intent committed under the task gate is logical dispatch start. A prior
 abort rejects dispatch; a later abort requests cancellation and the driver joins
 the Tool future. A Tool can ignore cancellation and block shutdown indefinitely.

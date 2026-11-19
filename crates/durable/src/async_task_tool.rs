@@ -98,6 +98,59 @@ pub fn read_raw_outcome_for_reconciliation(
         .map_err(|error| error.to_string())
 }
 
+/// Why a durable Tool attempt was resumed after a committed park.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DurableWait {
+    All(Vec<AsyncTaskCall>),
+    Any(Vec<AsyncTaskCall>),
+}
+
+/// A completed Tool outcome or an explicit durable park. A park is distinct
+/// from `Outcome::Pending`, which names an external operation for reconciliation.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DurableToolStep {
+    Complete(Outcome),
+    Park {
+        checkpoint: serde_json::Value,
+        wait: DurableWait,
+    },
+}
+
+/// Data supplied to one driver-owned execution attempt. `checkpoint` is absent
+/// for the first attempt; `ended` contains direct children from the wake.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DurableToolResume {
+    pub checkpoint: Option<serde_json::Value>,
+    pub ended: Vec<uuid::Uuid>,
+}
+
+/// Task-owned nested admission and result access. Implementations must fence
+/// every operation against the current parent reservation and abort state.
+#[async_trait::async_trait]
+pub trait DurableTaskHost: Send + Sync {
+    async fn start_child(
+        &self,
+        key: &str,
+        tool: &str,
+        input: serde_json::Value,
+    ) -> Result<AsyncTaskCall, String>;
+    async fn child_result(&self, child: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String>;
+}
+
+/// Explicit opt-in for Tools that can checkpoint and resume after a park.
+/// Ordinary `Tool` implementations keep their existing behavior. This interface
+/// is not yet connected to a driver; registration is deliberately rejected.
+#[async_trait::async_trait]
+pub trait DurableAsyncTool: Tool {
+    async fn execute_durable(
+        &self,
+        arguments: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+        resume: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String>;
+}
+
 /// The host explicitly attests that its standalone task application does not
 /// require tool hooks for authorization or policy. This cannot establish facts
 /// about external policy; callers are responsible for that assertion.
@@ -145,6 +198,18 @@ impl StandaloneNoHooksHost {
             spec, kind, false, version, handler,
         ));
         Ok(Arc::new(AsyncTaskTool { adapter, identity }))
+    }
+
+    /// Fail closed until attempt-specific intents, park publication, and
+    /// resumed executor ownership are wired into the driver.
+    pub fn register_durable_tool(
+        &mut self,
+        _kind: impl Into<String>,
+        _tool: Arc<dyn DurableAsyncTool>,
+        _implementation: &str,
+        _version: u32,
+    ) -> Result<Arc<AsyncTaskTool>, String> {
+        Err("durable async Tool park/wake execution is not yet supported".into())
     }
 
     #[cfg(test)]
@@ -2032,6 +2097,74 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(received.try_recv().is_err());
         let _ = driver.shutdown_with_pending().unwrap();
+}
+
+    struct DurableStub(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for DurableStub {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "durable".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Succeeded("unexpected".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl DurableAsyncTool for DurableStub {
+        async fn execute_durable(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            _: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "unexpected".into(),
+            )))
+        }
+    }
+    #[test]
+    fn durable_contract_distinguishes_park_from_pending_and_rejects_registration() {
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let handle: AsyncTaskCall =
+            serde_json::from_value(json!({"parent":parent,"task_id":child})).unwrap();
+        let park = DurableToolStep::Park {
+            checkpoint: json!({"phase":1}),
+            wait: DurableWait::Any(vec![handle]),
+        };
+        let encoded = serde_json::to_value(&park).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DurableToolStep>(encoded).unwrap(),
+            park
+        );
+        assert_ne!(
+            park,
+            DurableToolStep::Complete(Outcome::Pending {
+                reference: "remote".into()
+            })
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = StandaloneNoHooksHost::open(
+            dir.path().join("db"),
+            Registry::default(),
+            UnhookedAuthorization::standalone_only(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn DurableAsyncTool> = Arc::new(DurableStub(calls.clone()));
+        assert!(
+            host.register_durable_tool("durable", tool, "backend", 1)
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        host.into_driver().shutdown().unwrap();
     }
 
     #[test]
