@@ -297,3 +297,78 @@ fn conversation_hook_registration_rejects_multiple_hooks() {
         .is_err()
     );
 }
+
+#[test]
+fn conversation_registration_rejects_mixed_child_hook_selection() {
+    use pi_rs_durable::async_task_tool::{
+        ReplaySafeConversationHooksAuthorization,
+        register_conversation_replay_safe_durable_tool_with_selected_hooks,
+    };
+    use pi_rs_durable::extension::{Extension, ExtensionIdentity};
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install_identified(
+            Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(HookStub)],
+                ..Default::default()
+            },
+            ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()]).unwrap(),
+        )
+        .unwrap();
+    let snapshot = extensions.snapshot();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = || {
+        Arc::new(Candidate {
+            description: "test",
+            calls: calls.clone(),
+        })
+    };
+    let mut registry = Registry::default();
+    let unhooked = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        tool(),
+        "plain-child",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    assert!(
+        register_conversation_replay_safe_durable_tool_with_selected_hooks(
+            &mut registry,
+            tool(),
+            "hooked-parent",
+            1,
+            vec![unhooked],
+            &snapshot,
+            &["policy".into()],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+            ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()
+        )
+        .is_err()
+    );
+    let hooked = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+        &mut registry,
+        tool(),
+        "hooked-child",
+        1,
+        vec![],
+        &snapshot,
+        &["policy".into()],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    assert!(
+        register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            tool(),
+            "plain-parent",
+            1,
+            vec![hooked],
+            ReplaySafeAuthorization::host_attests_replay_safe()
+        )
+        .is_err()
+    );
+}
