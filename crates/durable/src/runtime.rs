@@ -15176,6 +15176,16 @@ impl Harness {
                     .map_err(|e| {
                         Error::Invalid(format!("invalid checkpointable hook result: {e}"))
                     })?;
+                if !identity.replay_safe {
+                    result_evidence.extend(
+                        crate::async_task_tool::unsafe_park_proof::rich_hook_final_checks(
+                            self.owner.store(),
+                            &child.task,
+                            value,
+                        )
+                        .map_err(|e| Error::Invalid(format!("unsafe hook result proof: {e}")))?,
+                    );
+                }
                 rich_result = Some(result);
                 // The final status and content are carried by the checked rich result.
                 Some(Outcome::Succeeded(String::new()))

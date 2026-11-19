@@ -354,9 +354,6 @@ pub(super) fn register_conversation_candidate(
     )>,
     replay_safe: bool,
 ) -> Result<Arc<TaskTool>, String> {
-    if !replay_safe && selected.is_some() {
-        return Err("unsafe conversation hooks unsupported".into());
-    }
     let mut identity = ToolIdentity::new(tool.as_ref(), implementation, version)?;
     if let Some((selection, _, _)) = &selected {
         let hook_id = format!(
@@ -402,6 +399,8 @@ pub(super) fn register_conversation_candidate(
     }
     let prefix = if replay_safe {
         "pi-rs.replay-safe-async.v1."
+    } else if selected.is_some() {
+        "pi-rs.unsafe-park-async.v1.hook."
     } else {
         "pi-rs.unsafe-park-async.v1."
     };
@@ -871,6 +870,13 @@ impl DurableTaskHost for Host<'_, '_> {
             let (receipts, has_intent) = docs.read_unsafe_child_evidence(child.task_id())?;
             let outcome = receipts.into_iter().next().map(|receipt| receipt.outcome);
             return Ok(Some(match task.state() {
+                TaskState::Succeeded(value) if value.get("task_content_v1").is_some() => {
+                    let result: DurableTaskResult = serde_json::from_value(value.clone()).map_err(|_| "invalid unsafe rich child result")?;
+                    let DurableTaskResult::Rich { task_content_v1 } = result else { return Err("missing unsafe rich child result".into()); };
+                    validate_content_result(&task_content_v1)?;
+                    docs.verify_unsafe_rich_hook_final(&task, value)?;
+                    AsyncTaskResult::Rich(task_content_v1)
+                }
                 TaskState::Succeeded(value) => {
                     let result: Outcome = serde_json::from_value(value.clone()).map_err(|_| "invalid unsafe child result")?;
                     let raw = outcome.as_ref().ok_or("unsafe child result lacks receipt")?;

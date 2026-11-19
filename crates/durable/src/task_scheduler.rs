@@ -675,6 +675,7 @@ impl Registry {
         }
         let entry = self.entries.get_mut(&identity.kind).expect("inserted");
         entry.cancellable_durable_async = true;
+        entry.checkpointable_hooks = selection.is_some();
         entry.abort = Some(Arc::new(|_: &Task| Ok(Step::Succeed(Value::Null))));
         entry.conversation_checkpointable = Some((identity, validate, selection));
         Ok(())

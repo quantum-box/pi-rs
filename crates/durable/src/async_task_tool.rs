@@ -1,7 +1,7 @@
 //! Standalone task-backed async tools with explicit hook policy. Checkpointable
 //! tools have separate replay-safe and unsafe registrations. Conversation-
 //! attached checkpointable execution supports explicitly registered replay-safe
-//! task trees, one selected replay-safe hook, and unhooked unsafe task trees.
+//! task trees and explicitly selected replay-safe hooks for safe or unsafe Tools.
 
 use crate::task::Task;
 use pi_rs_core::{Outcome, Tool, ToolSpec};
@@ -119,6 +119,52 @@ pub fn register_conversation_replay_safe_durable_tool_with_selected_hooks(
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
         true,
+    )
+}
+
+/// Register an unsafe checkpointable conversation Tool with explicitly
+/// replay-safe selected hooks. Tool execution remains non-replayable; only
+/// separately proved before/after phases and committed parks may resume.
+/// The host must restore the same Tool and hook registrations after restart.
+/// External-job cancellation is not supported. Host-generated pre-dispatch
+/// errors, including before Block and invalid arguments, remain fail-closed
+/// pending a separate proof that no Tool intent was ever dispatched.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_selected_hooks(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    _tool_authorization: UnsafeDurableAuthorization,
+    _hook_authorization: ReplaySafeConversationHooksAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    let selection = snapshot
+        .stable_selection(names)
+        .ok_or("extension selection missing or unidentified")?;
+    if names.is_empty() || selection.hook_count() == 0 {
+        return Err("at least one selected hook is required".into());
+    }
+    let resolved = snapshot
+        .resolve_stable(names, &selection)
+        .ok_or("extension selection changed")?;
+    let registration = resolved
+        .registration_evidence()
+        .ok_or("invalid hook registration evidence")?;
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        Some((
+            selection,
+            registration,
+            Arc::new(SelectedBeforeHooks(resolved)),
+        )),
+        false,
     )
 }
 

@@ -2445,6 +2445,14 @@ impl<'a> TaskDocuments<'a> {
     ) -> Result<bool, String> {
         crate::async_task_tool::unsafe_park_proof::after_is_incomplete(self.store, task, raw)
     }
+    pub(crate) fn verify_unsafe_rich_hook_final(
+        &self,
+        task: &crate::task::Task,
+        value: &serde_json::Value,
+    ) -> Result<(), String> {
+        crate::async_task_tool::unsafe_park_proof::rich_hook_final_checks(self.store, task, value)
+            .map(|_| ())
+    }
     pub(crate) fn read_unsafe_hook_final(
         &self,
         task: &crate::task::Task,

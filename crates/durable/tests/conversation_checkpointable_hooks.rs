@@ -8,8 +8,9 @@ use pi_rs_durable::{
     async_task_tool::{
         AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
         DurableToolStep, DurableWait, ReplaySafeAuthorization,
-        ReplaySafeConversationHooksAuthorization,
+        ReplaySafeConversationHooksAuthorization, UnsafeDurableAuthorization,
         register_conversation_replay_safe_durable_tool_with_selected_hooks,
+        register_conversation_unsafe_durable_tool_with_selected_hooks,
     },
     extension::{BeforeTool, Context, Extension, ExtensionIdentity, Hook},
     recovery::UncertainPolicy,
@@ -148,8 +149,10 @@ impl Hook for OneHook {
                 .get_or_insert("late", json!("must-not-commit"))
                 .await?;
         }
-        if call.name == "root"
-            && std::env::var("PI_SELECTED_HOOK_CUT").ok().as_deref() == Some("after")
+        if ((call.name == "root"
+            && std::env::var("PI_SELECTED_HOOK_CUT").ok().as_deref() == Some("after"))
+            || (call.name == "leaf"
+                && std::env::var("PI_SELECTED_HOOK_CUT").ok().as_deref() == Some("leaf-after")))
             && let Some(path) = std::env::var_os("PI_SELECTED_HOOK_READY")
         {
             std::fs::write(path, "after").unwrap();
@@ -193,6 +196,13 @@ impl DurableAsyncTool for Job {
             return Err("before rewrite missing".into());
         }
         self.executions.fetch_add(1, Ordering::SeqCst);
+        if self.name == "root"
+            && std::env::var("PI_SELECTED_HOOK_CUT").ok().as_deref() == Some("execute")
+            && let Some(path) = std::env::var_os("PI_SELECTED_HOOK_READY")
+        {
+            std::fs::write(path, "effect-started").unwrap();
+            std::future::pending::<()>().await;
+        }
         if let Some(name) = self.child {
             if let Some(saved) = resume.checkpoint {
                 let child: AsyncTaskCall =
@@ -222,6 +232,226 @@ impl DurableAsyncTool for Job {
         }
     }
 }
+struct BlockHook;
+#[async_trait]
+impl Hook for BlockHook {
+    async fn before_tool(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        _: &Context<'_>,
+    ) -> Result<BeforeTool, String> {
+        Ok(BeforeTool::Block("denied".into()))
+    }
+}
+#[tokio::test]
+async fn unsafe_selected_before_block_is_fail_closed_without_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install_identified(
+            Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(BlockHook)],
+                ..Default::default()
+            },
+            ExtensionIdentity::new(1, "block-v1".into(), vec!["hook-v1".into()]).unwrap(),
+        )
+        .unwrap();
+    let mut registry = Registry::default();
+    let adapter = register_conversation_unsafe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(Job {
+            name: "root",
+            child: None,
+            executions: executions.clone(),
+        }),
+        "root",
+        1,
+        vec![],
+        &extensions.snapshot(),
+        &["policy".into()],
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert!(
+        !scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }))
+    );
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert!(matches!(
+        tasks[0].task.state(),
+        pi_rs_durable::task::TaskState::Failed(_)
+    ));
+    assert!(
+        pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, tasks[0].task.id())
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    let _ = driver.shutdown_with_pending();
+}
+
+struct PendingJob(bool);
+#[async_trait]
+impl Tool for PendingJob {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "root".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for PendingJob {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        Ok(DurableToolStep::Complete(if self.0 {
+            Outcome::Unknown("effect uncertain".into())
+        } else {
+            Outcome::Pending {
+                reference: "remote-job-id".into(),
+            }
+        }))
+    }
+}
+#[tokio::test]
+async fn unsafe_selected_hook_pending_reference_stays_uncertain() {
+    for unknown in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let mut extensions = pi_rs_durable::extension::Registry::default();
+        extensions
+            .install_identified(
+                Extension {
+                    name: "policy".into(),
+                    hooks: vec![Arc::new(OneHook {
+                        before: before.clone(),
+                        after: after.clone(),
+                        gate: None,
+                    })],
+                    ..Default::default()
+                },
+                ExtensionIdentity::new(1, "v1".into(), vec!["hook-v1".into()]).unwrap(),
+            )
+            .unwrap();
+        let mut registry = Registry::default();
+        let adapter = register_conversation_unsafe_durable_tool_with_selected_hooks(
+            &mut registry,
+            Arc::new(PendingJob(unknown)),
+            "pending",
+            1,
+            vec![],
+            &extensions.snapshot(),
+            &["policy".into()],
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+        )
+        .unwrap();
+        let options = Options {
+            model: Arc::new(ModelStub),
+            tools: vec![adapter.register()],
+            restart_limit: 5,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut scheduler =
+            Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler
+            .select_extensions(id, vec!["policy".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(after.load(Ordering::SeqCst), 0);
+        assert!(
+            !scheduler
+                .conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. }))
+        );
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        let receipt = pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(
+            &store,
+            tasks[0].task.id(),
+        )
+        .unwrap();
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(
+            receipt[0].outcome,
+            if unknown {
+                Outcome::Unknown("effect uncertain".into())
+            } else {
+                Outcome::Pending {
+                    reference: "remote-job-id".into(),
+                }
+            }
+        );
+        drop(store);
+        let _ = driver.shutdown_with_pending();
+    }
+}
+
 fn setup(
     depth: usize,
     before: Arc<AtomicUsize>,
@@ -281,6 +511,74 @@ fn setup_gated(
             &snapshot,
             &["policy".into()],
             ReplaySafeAuthorization::host_attests_replay_safe(),
+            ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+        )
+        .unwrap();
+        adapters.push(adapter.register());
+        child = Some(adapter);
+    }
+    (
+        Options {
+            model: Arc::new(ModelStub),
+            tools: adapters,
+            restart_limit: 5,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+        extensions,
+    )
+}
+fn setup_unsafe_gated(
+    depth: usize,
+    before: Arc<AtomicUsize>,
+    after: Arc<AtomicUsize>,
+    executions: Arc<AtomicUsize>,
+    fingerprint: &str,
+    gate: Option<(&'static str, Arc<AtomicUsize>)>,
+) -> (Options, Registry, pi_rs_durable::extension::Registry) {
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install_identified(
+            Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(OneHook {
+                    before,
+                    after,
+                    gate,
+                })],
+                ..Default::default()
+            },
+            ExtensionIdentity::new(1, fingerprint.into(), vec!["hook-v1".into()]).unwrap(),
+        )
+        .unwrap();
+    let snapshot = extensions.snapshot();
+    let mut registry = Registry::default();
+    let mut adapters = vec![];
+    let mut child = None;
+    let jobs: Vec<(&'static str, Option<&'static str>)> = if depth == 1 {
+        vec![("root", None)]
+    } else {
+        vec![
+            ("leaf", None),
+            ("middle", Some("leaf")),
+            ("root", Some("middle")),
+        ]
+    };
+    for (name, next) in jobs {
+        let adapter = register_conversation_unsafe_durable_tool_with_selected_hooks(
+            &mut registry,
+            Arc::new(Job {
+                name,
+                child: next,
+                executions: executions.clone(),
+            }),
+            name,
+            1,
+            child.into_iter().collect(),
+            &snapshot,
+            &["policy".into()],
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
             ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
         )
         .unwrap();
@@ -482,6 +780,57 @@ async fn invalid_raw_selection_change_fences_after_memo() {
     let _ = scheduler.shutdown().await;
 }
 #[tokio::test]
+async fn unsafe_selected_hooks_two_park_levels_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_unsafe_gated(
+        3,
+        before.clone(),
+        after.clone(),
+        executions.clone(),
+        "v1",
+        None,
+    );
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["policy".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    let wait = tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert!(wait.is_ok(), "{wait:?} {tasks:?}");
+    let conversation = scheduler.conversation(id).unwrap();
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "root-after")),
+        "{conversation:?} {tasks:?}"
+    );
+    assert_eq!(before.load(Ordering::SeqCst), 3);
+    assert_eq!(after.load(Ordering::SeqCst), 3);
+    assert_eq!(executions.load(Ordering::SeqCst), 5);
+    drop(store);
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
 async fn selected_hook_runs_once_per_phase_and_publishes_result() {
     let dir = tempfile::tempdir().unwrap();
     let before = Arc::new(AtomicUsize::new(0));
@@ -545,13 +894,29 @@ async fn selected_hook_kill_worker() {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
-    let (mut options, registry, extensions) = setup(
-        1,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicUsize::new(0)),
-        "v1",
-    );
+    let (mut options, registry, extensions) =
+        if std::env::var_os("PI_SELECTED_HOOK_UNSAFE").is_some() {
+            setup_unsafe_gated(
+                if std::env::var_os("PI_SELECTED_HOOK_DEPTH3").is_some() {
+                    3
+                } else {
+                    1
+                },
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                "v1",
+                None,
+            )
+        } else {
+            setup(
+                1,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                "v1",
+            )
+        };
     if std::env::var_os("PI_SELECTED_HOOK_INVALID_RAW").is_some() {
         options.model = Arc::new(InvalidModel("{invalid"));
     }
@@ -664,6 +1029,223 @@ async fn invalid_raw_after_recovers_after_process_kill() {
 }
 #[cfg(unix)]
 #[tokio::test]
+async fn unsafe_selected_hooks_resume_before_and_after_without_replaying_tool() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for stage in ["before", "after"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "selected_hook_kill_worker"])
+                .env("PI_SELECTED_HOOK_DIR", dir.path())
+                .env("PI_SELECTED_HOOK_UNSAFE", "1")
+                .env("PI_SELECTED_HOOK_CUT", stage)
+                .env("PI_SELECTED_HOOK_READY", dir.path().join("ready"))
+                .spawn()
+                .unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !dir.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let id = std::fs::read_to_string(dir.path().join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (options, registry, extensions) = setup_unsafe_gated(
+            1,
+            before.clone(),
+            after.clone(),
+            executions.clone(),
+            "v1",
+            None,
+        );
+        let scheduler =
+            Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        until_result(&scheduler, id).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            if stage == "after" { 0 } else { 1 }
+        );
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(
+                &store,
+                tasks[0].task.id()
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        drop(store);
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_selected_multilevel_park_recovers_leaf_after_hook() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "selected_hook_kill_worker"])
+            .env("PI_SELECTED_HOOK_DIR", dir.path())
+            .env("PI_SELECTED_HOOK_UNSAFE", "1")
+            .env("PI_SELECTED_HOOK_DEPTH3", "1")
+            .env("PI_SELECTED_HOOK_CUT", "leaf-after")
+            .env("PI_SELECTED_HOOK_READY", dir.path().join("ready"))
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|t| matches!(t.task.state(), pi_rs_durable::task::TaskState::Waiting(_)))
+            .count(),
+        2
+    );
+    drop(store);
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_unsafe_gated(
+        3,
+        before.clone(),
+        after.clone(),
+        executions.clone(),
+        "v1",
+        None,
+    );
+    let scheduler =
+        Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    until_result(&scheduler, id).await;
+    assert_eq!(before.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    assert_eq!(after.load(Ordering::SeqCst), 3);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_selected_hook_interrupted_tool_is_not_reexecuted() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "selected_hook_kill_worker"])
+            .env("PI_SELECTED_HOOK_DIR", dir.path())
+            .env("PI_SELECTED_HOOK_UNSAFE", "1")
+            .env("PI_SELECTED_HOOK_CUT", "execute")
+            .env("PI_SELECTED_HOOK_READY", dir.path().join("ready"))
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (options, registry, extensions) = setup_unsafe_gated(
+        1,
+        before.clone(),
+        after.clone(),
+        executions.clone(),
+        "v1",
+        None,
+    );
+    let mut scheduler =
+        Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+    assert!(
+        !scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }))
+    );
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert!(
+        matches!(tasks[0].task.state(), pi_rs_durable::task::TaskState::Failed(reason) if reason.contains("reconciliation"))
+    );
+    drop(store);
+    let _ = driver.shutdown_with_pending();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn selected_hook_before_and_after_survive_kill_and_reopen() {
     struct Kill(std::process::Child);
     impl Drop for Kill {
@@ -743,6 +1325,79 @@ async fn selected_hook_before_and_after_survive_kill_and_reopen() {
 }
 
 #[tokio::test]
+async fn unsafe_selected_hook_abort_fences_before_and_after() {
+    for stage in ["before", "after"] {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (options, registry, extensions) = setup_unsafe_gated(
+            1,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            executions.clone(),
+            "v1",
+            Some((stage, gate.clone())),
+        );
+        let mut scheduler =
+            Scheduler::open_with_extensions(dir.path().join("db"), options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler
+            .select_extensions(id, vec!["policy".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while gate.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(15), scheduler.abort_and_wait(id))
+            .await
+            .unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].task.is_terminal());
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            if stage == "before" { 0 } else { 1 }
+        );
+        assert!(
+            store
+                .get(format!("runtime/extension-memo/{}/late", tasks[0].task.id()).as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !scheduler
+                .conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m,Message::Tool {content,..} if content == "root-after"))
+        );
+        let receipts = pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(
+            &store,
+            tasks[0].task.id(),
+        )
+        .unwrap();
+        assert_eq!(receipts.len(), if stage == "before" { 0 } else { 1 });
+        drop(store);
+        let _ = driver.shutdown_with_pending();
+    }
+}
+
+#[tokio::test]
 async fn abort_during_before_or_after_fences_hook_and_tool_result() {
     for stage in ["before", "after"] {
         let dir = tempfile::tempdir().unwrap();
@@ -815,6 +1470,75 @@ async fn selection_change_during_hook_fences_memo_and_publication() {
         let gate = Arc::new(AtomicUsize::new(0));
         let executions = Arc::new(AtomicUsize::new(0));
         let (options, registry, extensions) = setup_gated(
+            1,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            executions.clone(),
+            "v1",
+            Some((stage, gate.clone())),
+        );
+        let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler
+            .select_extensions(id, vec!["policy".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while gate.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        scheduler.uninstall_extension("policy").unwrap();
+        gate.store(2, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let store = durable_store::Store::open(&path).unwrap();
+                let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+                    .list()
+                    .unwrap();
+                if tasks.iter().any(|t| t.task.is_terminal()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        let late = format!("runtime/extension-memo/{}/late", tasks[0].task.id());
+        assert!(store.get(late.as_bytes()).unwrap().is_none());
+        assert!(
+            !scheduler
+                .conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m,Message::Tool {content,..} if content=="root-after"))
+        );
+        let _ = driver.shutdown_with_pending();
+    }
+}
+
+#[tokio::test]
+async fn unsafe_selection_change_fences_hook_and_publication() {
+    for stage in ["before", "after"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let gate = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (options, registry, extensions) = setup_unsafe_gated(
             1,
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
@@ -1488,6 +2212,50 @@ fn setup_rich(
     };
     (options, registry, extensions)
 }
+fn setup_rich_unsafe(
+    mode: &'static str,
+    after: Arc<AtomicUsize>,
+    executions: Arc<AtomicUsize>,
+) -> (Options, Registry, pi_rs_durable::extension::Registry) {
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install_identified(
+            Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(RichHook {
+                    mode,
+                    after: after.clone(),
+                })],
+                ..Default::default()
+            },
+            ExtensionIdentity::new(1, "rich-v1".into(), vec!["hook-v1".into()]).unwrap(),
+        )
+        .unwrap();
+    let mut registry = Registry::default();
+    let root = register_conversation_unsafe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(ErrorJob {
+            mode,
+            executions: executions.clone(),
+        }),
+        "root",
+        1,
+        vec![],
+        &extensions.snapshot(),
+        &["policy".into()],
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![root.register()],
+        restart_limit: 5,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    (options, registry, extensions)
+}
 #[tokio::test]
 async fn selected_after_rich_and_error_results_resume_conversation() {
     for mode in ["success", "failure", "block", "schema"] {
@@ -1496,6 +2264,100 @@ async fn selected_after_rich_and_error_results_resume_conversation() {
         let after = Arc::new(AtomicUsize::new(0));
         let executions = Arc::new(AtomicUsize::new(0));
         let (options, registry, extensions) = setup_rich(mode, after.clone(), executions.clone());
+        let mut scheduler = Scheduler::open_with_provider_adapter(
+            &path,
+            options,
+            extensions,
+            Arc::new(RichAdapter),
+        )
+        .unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.select_provider_adapter(id, true).unwrap();
+        scheduler
+            .select_extensions(id, vec!["policy".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let c = scheduler.conversation(id).unwrap();
+        let meta = &c.tool_results[0];
+        assert_eq!(meta.is_error, mode != "success", "{mode}");
+        assert_eq!(meta.details, Some(json!({"kept":true})), "{mode}");
+        assert_eq!(meta.structured_output, Some(json!({"value":7})), "{mode}");
+        assert_eq!(meta.attachments.len(), 1, "{mode}");
+        assert!(
+            meta.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("hook_note")),
+            "{mode}"
+        );
+        if mode == "block" || mode == "schema" {
+            assert!(
+                meta.diagnostics
+                    .iter()
+                    .any(|d| d.severity == pi_rs_durable::runtime::DiagnosticSeverity::Error),
+                "{mode}"
+            );
+        }
+        let blocks = c
+            .content_blocks
+            .values()
+            .find(|b| Some(b.message_id) == meta.content_block_id)
+            .unwrap();
+        assert_eq!(blocks.blocks[0]["text"], "first");
+        assert_eq!(blocks.blocks[1]["text"], "second");
+        assert_eq!(
+            serde_json::to_string(&blocks.blocks)
+                .unwrap()
+                .contains("[tool error]"),
+            mode != "success"
+        );
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { .. }))
+        );
+        assert_eq!(after.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            usize::from(mode == "success" || mode == "failure"),
+            "{mode}"
+        );
+        let store = durable_store::Store::open(&path).unwrap();
+        let root = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()[0]
+            .task
+            .id();
+        assert!(
+            store
+                .get(format!("runtime/extension-memo/{root}/rich-after").as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unsafe_selected_after_rich_and_error_results_resume_conversation() {
+    for mode in ["success", "failure"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let after = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (options, registry, extensions) =
+            setup_rich_unsafe(mode, after.clone(), executions.clone());
         let mut scheduler = Scheduler::open_with_provider_adapter(
             &path,
             options,

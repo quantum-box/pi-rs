@@ -726,7 +726,12 @@ struct HookFinal {
     task: Uuid,
     raw_attempt: Uuid,
     raw: pi_rs_core::Outcome,
-    final_outcome: pi_rs_core::Outcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_outcome: Option<pi_rs_core::Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_rich: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_attempt: Option<Uuid>,
 }
 fn hook_final_key(task: Uuid) -> Vec<u8> {
     format!("durable/unsafe-park-async/{task}/hook-final").into_bytes()
@@ -752,14 +757,26 @@ pub(crate) fn prepare_hook_phase(
                 .into_iter()
                 .next()
                 .ok_or("missing unsafe receipt")?;
-            let final_outcome: pi_rs_core::Outcome =
-                serde_json::from_value(value.clone()).map_err(|_| "invalid hook final outcome")?;
+            let rich = matches!(
+                serde_json::from_value::<super::DurableTaskResult>(value.clone()),
+                Ok(super::DurableTaskResult::Rich { .. })
+            );
+            let final_outcome = if rich {
+                None
+            } else {
+                Some(
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| "invalid hook final outcome")?,
+                )
+            };
             let record = HookFinal {
-                version: 1,
+                version: if rich { 2 } else { 1 },
                 task: task.id(),
                 raw_attempt: receipt.attempt_id,
                 raw: receipt.outcome,
                 final_outcome,
+                final_rich: rich.then(|| value.clone()),
+                final_attempt: rich.then_some(attempt),
             };
             let key = hook_final_key(task.id());
             checks.push(Check {
@@ -810,7 +827,21 @@ pub(crate) fn after_is_incomplete(
     {
         // The hook finalized before a later owned-child failure. The raw
         // outcome remains uncertain, but the hook is not incomplete.
-        read_hook_final(store, task, raw)?;
+        let entry = store
+            .get(&hook_final_key(task.id()))
+            .map_err(|e| e.to_string())?
+            .ok_or("missing unsafe hook final")?;
+        let record: HookFinal =
+            serde_json::from_slice(&entry.value).map_err(|_| "invalid unsafe hook final")?;
+        if record.version == 2 {
+            let value = record
+                .final_rich
+                .as_ref()
+                .ok_or("missing rich hook final")?;
+            rich_hook_final_checks(store, task, value)?;
+        } else {
+            read_hook_final(store, task, raw)?;
+        }
         Ok(false)
     } else {
         Ok(true)
@@ -839,5 +870,55 @@ pub(crate) fn read_hook_final(
         return Err("unsafe hook final mismatch".into());
     }
     after_checks(store, task)?;
-    Ok(record.final_outcome)
+    if record.final_rich.is_some() || record.final_attempt.is_some() {
+        return Err("unexpected rich hook final".into());
+    }
+    record
+        .final_outcome
+        .ok_or_else(|| "missing hook final outcome".into())
+}
+
+/// Verify a rich final against its raw outcome and committed after phase.
+pub(crate) fn rich_hook_final_checks(
+    store: &Store,
+    task: &Task,
+    value: &serde_json::Value,
+) -> Result<Vec<Check>, String> {
+    let mut checks = after_checks(store, task)?;
+    let entry = store
+        .get(&hook_final_key(task.id()))
+        .map_err(|e| e.to_string())?
+        .ok_or("missing unsafe hook final")?;
+    let record: HookFinal =
+        serde_json::from_slice(&entry.value).map_err(|_| "invalid unsafe hook final")?;
+    let receipts = read_receipts(store, task.id())?;
+    if record.version != 2
+        || record.task != task.id()
+        || record.final_outcome.is_some()
+        || record.final_rich.as_ref() != Some(value)
+        || (matches!(task.state(), TaskState::Succeeded(_))
+            && record.final_attempt != task.retired_attempt_id())
+        || record.final_attempt.is_none()
+        || receipts.len() != 1
+        || receipts[0].attempt_id != record.raw_attempt
+        || receipts[0].outcome != record.raw
+    {
+        return Err("unsafe rich hook final mismatch".into());
+    }
+    let after_intent = intent_key(
+        task.id(),
+        record.final_attempt.ok_or("missing after attempt")?,
+    );
+    if store
+        .get(&after_intent)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Err("unsafe after attempt has tool intent".into());
+    }
+    checks.push(Check {
+        key: after_intent,
+        expected: Expected::Missing,
+    });
+    Ok(checks)
 }
