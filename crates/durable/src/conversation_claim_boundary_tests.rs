@@ -215,6 +215,68 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
+    if case == "late_after_claim" {
+        crate::task_scheduler::enable_test_conversation_receipt(root_id);
+        let mutation_path = path.clone();
+        crate::task_scheduler::on_conversation_claim_after_commit(root_id, move || {
+            let writer = durable_store::Store::open(mutation_path).unwrap();
+            let prefix = format!("durable/unsafe-park-async/{root_id}/");
+            let (mut key, entry) = writer
+                .list(prefix.as_bytes())
+                .unwrap()
+                .into_iter()
+                .find(|(key, _)| key.ends_with(b"/intent"))
+                .expect("park intent");
+            let intent: pi_rs_durable::task::Task = serde_json::from_slice(&entry.value).unwrap();
+            let attempt = serde_json::to_value(intent).unwrap()["attempt_id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap();
+            key.extend_from_slice(b"/receipt");
+            let late = pi_rs_durable::async_task_tool::UnsafeDurableReceipt {
+                task_id: root_id,
+                attempt_id: attempt,
+                outcome: Outcome::Pending {
+                    reference: "remote-job".into(),
+                },
+            };
+            writer
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&late).unwrap(),
+                    }],
+                )
+                .unwrap();
+        });
+        scheduler.abort_task(root_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let claim_key =
+            format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
+        let receipt_key =
+            format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        assert!(store.get(claim_key.as_bytes()).unwrap().is_some());
+        assert!(store.get(receipt_key.as_bytes()).unwrap().is_none());
+        let receipts =
+            pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, root_id).unwrap();
+        assert!(receipts.iter().any(
+            |r| matches!(&r.outcome, Outcome::Pending { reference } if reference == "remote-job")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = driver.shutdown_with_pending().unwrap();
+        return;
+    }
     if case.starts_with("save_receipt") {
         crate::task_scheduler::enable_test_conversation_receipt(root_id);
         scheduler.abort_task(root_id).unwrap();
@@ -568,6 +630,11 @@ async fn exercise_conversation_park_claim(case: &str) {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let _ = driver.shutdown_with_pending().unwrap();
+}
+
+#[tokio::test]
+async fn late_outcome_after_claim_blocks_pre_dispatch_check() {
+    exercise_conversation_park_claim("late_after_claim").await;
 }
 
 #[tokio::test]
