@@ -5735,3 +5735,426 @@ async fn mixed_any_reparks_then_completes_after_both_wakes() {
     );
     scheduler.shutdown().await.unwrap();
 }
+
+// The middle's before hook runs before its first intent, not on child wake.
+// The leaf hook's memo survives interruption between its side effect and commit.
+struct IntermediateHook(std::path::PathBuf);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for IntermediateHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        if call.name == "middle" {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("middle-before"))
+                    .unwrap(),
+                "before"
+            )
+            .unwrap();
+        }
+        Ok(pi_rs_durable::extension::BeforeTool::Pass)
+    }
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        context: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        use std::io::Write;
+        let candidate = if self.0.join("release-hook").exists() {
+            "second"
+        } else {
+            "first"
+        };
+        let memo = context
+            .memo
+            .get_or_insert("hook-key", json!(candidate))
+            .await?;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("hook-attempts"))
+                .unwrap(),
+            "{memo}"
+        )
+        .unwrap();
+        if !self.0.join("release-hook").exists() {
+            std::fs::write(self.0.join("hook-entered"), b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        Ok(Some(json!(format!("hook:{}", memo.as_str().unwrap()))))
+    }
+}
+
+fn open_intermediate_hooks(root: &std::path::Path) -> Scheduler {
+    Scheduler::open_with_extensions(
+        root.join("db"),
+        child_park_disk_options(root),
+        hook_registry(Arc::new(IntermediateHook(root.into()))),
+    )
+    .unwrap()
+}
+
+async fn start_intermediate_hooks(root: &std::path::Path) -> (Scheduler, uuid::Uuid) {
+    let mut scheduler = open_intermediate_hooks(root);
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    (scheduler, id)
+}
+
+#[tokio::test]
+async fn intermediate_hook_rewrites_leaf_before_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("release-hook"), b"yes").unwrap();
+    std::fs::write(root.join("finish"), b"yes").unwrap();
+    let (mut scheduler, id) = start_intermediate_hooks(root).await;
+    wait(&mut scheduler, id).await;
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content,..} if content == "middle:hook:second"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("middle-before"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn intermediate_hook_crash_worker() {
+    let Some(root) = std::env::var_os("PI_INTERMEDIATE_HOOK_CRASH") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let (_scheduler, id) = start_intermediate_hooks(&root).await;
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn intermediate_hook_crash_replays_memo_without_redispatch() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("finish"), b"yes").unwrap();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "intermediate_hook_crash_worker"])
+            .env("PI_INTERMEDIATE_HOOK_CRASH", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("hook-entered").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("release-hook"), b"yes").unwrap();
+    let mut scheduler = open_intermediate_hooks(root);
+    wait(&mut scheduler, id).await;
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content,..} if content == "middle:hook:first"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-attempts"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["\"first\"", "\"first\""]
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("middle-before"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn intermediate_hook_abort_prevents_wake_and_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("finish"), b"yes").unwrap();
+    let (mut scheduler, id) = start_intermediate_hooks(root).await;
+    until(|| root.join("hook-entered").exists()).await;
+    scheduler.abort(id).unwrap();
+    wait(&mut scheduler, id).await;
+    scheduler.shutdown().await.unwrap();
+    std::fs::write(root.join("release-hook"), b"yes").unwrap();
+    let mut scheduler = open_intermediate_hooks(root);
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().abort_requested);
+    assert!(
+        !scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool {content,..} if content.starts_with("middle:hook:"))
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct MixedAnyHook {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for MixedAnyHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("before:{}:{}", call.name, call.arguments));
+        Ok(pi_rs_durable::extension::BeforeTool::Pass)
+    }
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "child" && call.name != "immediate" {
+            return Ok(None);
+        }
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("after:{}:{}", call.name, call.arguments));
+        Ok(Some(json!(format!("hook:{}", result.as_str().unwrap()))))
+    }
+}
+struct HookedMixedAnyMiddle(Arc<std::sync::Mutex<Vec<pi_rs_durable::nested::PendingWake>>>);
+#[async_trait]
+impl KeyedTool for HookedMixedAnyMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if let Some(wake) = host.pending_wake() {
+            self.0.lock().unwrap().push(wake);
+        }
+        let done = host
+            .call_keyed_unpolled("done", "immediate", json!({}))
+            .await;
+        let a = host
+            .call_keyed_unpolled("a", "child", json!({"job":"a"}))
+            .await;
+        let b = host
+            .call_keyed_unpolled("b", "child", json!({"job":"b"}))
+            .await;
+        assert_eq!(done, Outcome::Succeeded("hook:already done".into()));
+        if matches!(a, Outcome::Pending { .. }) || matches!(b, Outcome::Pending { .. }) {
+            host.suspend_pending_any_with_checkpoint(json!("hooked-any"))
+                .unwrap();
+            Outcome::Succeeded("park".into()).into()
+        } else {
+            assert_eq!(a, Outcome::Succeeded("hook:a resolved".into()));
+            assert_eq!(b, Outcome::Succeeded("hook:b resolved".into()));
+            Outcome::Succeeded("hooked mixed complete".into()).into()
+        }
+    }
+}
+#[tokio::test]
+async fn hooks_transform_mixed_any_results_across_repark_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let immediate = Arc::new(AtomicUsize::new(0));
+    let pending = Arc::new(AtomicUsize::new(0));
+    let options = || Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(HookedMixedAnyMiddle(wakes.clone())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(ImmediateMixedLeaf(immediate.clone())),
+                replay: ReplayPolicy::Unsafe,
+            },
+            RegisteredTool {
+                tool: Arc::new(MultiParkLeaf(pending.clone())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let open = || {
+        Scheduler::open_with_extensions(
+            &path,
+            options(),
+            hook_registry(Arc::new(MixedAnyHook {
+                calls: calls.clone(),
+            })),
+        )
+        .unwrap()
+    };
+    let mut scheduler = open();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(
+        scheduler.conversation(id).unwrap().nested_suspended(),
+        "{:?}",
+        scheduler.conversation(id).unwrap()
+    );
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("a resolved".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(
+        scheduler.conversation(id).unwrap().nested_suspended(),
+        "{:?}",
+        scheduler.conversation(id).unwrap()
+    );
+    assert_eq!(
+        scheduler.nested_pending_jobs(id, root).unwrap(),
+        vec![b.clone()]
+    );
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = open();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            b.operation_id,
+            &b.reference,
+            Outcome::Succeeded("b resolved".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(
+        scheduler.blocked(id).unwrap().is_none(),
+        "{:?}",
+        scheduler.conversation(id).unwrap()
+    );
+    assert!(
+        scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content == "hooked mixed complete")
+        )
+    );
+    let wakes = wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 2);
+    assert_eq!(wakes[0].checkpoint, json!("hooked-any"));
+    assert_eq!(wakes[0].ended, vec![a.operation_id]);
+    assert_eq!(wakes[1].checkpoint, json!("hooked-any"));
+    assert_eq!(wakes[1].ended, vec![b.operation_id]);
+    assert_eq!(immediate.load(Ordering::SeqCst), 1);
+    assert_eq!(pending.load(Ordering::SeqCst), 2);
+    let calls = calls.lock().unwrap();
+    for entry in [
+        "before:middle:{}",
+        "before:immediate:{}",
+        "after:immediate:{}",
+        "before:child:{\"job\":\"a\"}",
+        "before:child:{\"job\":\"b\"}",
+        "after:child:{\"job\":\"a\"}",
+        "after:child:{\"job\":\"b\"}",
+    ] {
+        assert_eq!(
+            calls.iter().filter(|call| *call == entry).count(),
+            1,
+            "{entry}: {calls:?}"
+        );
+    }
+    drop(calls);
+    scheduler.shutdown().await.unwrap();
+}

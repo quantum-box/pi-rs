@@ -639,4 +639,68 @@ mod tests {
         ));
         assert!(store.get(&effect).unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn retired_intermediate_claim_rejects_memo_write() {
+        use crate::extension::Memo;
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, id, binding) = fixture(&path);
+        drop(h);
+        let owner = Arc::new(durable_store::owner::OwnedStore::open(&path).unwrap());
+        let child = Uuid::new_v4();
+        let batch = crate::nested_suspension::prepare_retired(
+            id,
+            child,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            json!({}),
+            vec![crate::nested_suspension::PendingJob {
+                operation_id: Uuid::new_v4(),
+                reference: "job".into(),
+            }],
+        )
+        .unwrap();
+        binding
+            .commit(owner.store(), &batch.checks, &batch.mutations)
+            .unwrap();
+        let retired = crate::nested_suspension::load(owner.store(), id, child)
+            .unwrap()
+            .unwrap();
+        let executor = Uuid::new_v4();
+        let batch = retired.claim(executor).unwrap();
+        binding
+            .commit(owner.store(), &batch.checks, &batch.mutations)
+            .unwrap();
+        let active = crate::nested_suspension::load(owner.store(), id, child)
+            .unwrap()
+            .unwrap();
+        let memo = crate::extension::DurableMemo::new(
+            owner.clone(),
+            child,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_nested_fence(Some(binding.clone()))
+        .with_nested_claim(Some(active.claim_check(executor).unwrap()));
+        assert_eq!(
+            memo.get_or_insert("existing", json!(1)).await.unwrap(),
+            json!(1)
+        );
+        let batch = active.retire(executor).unwrap();
+        binding
+            .commit(owner.store(), &batch.checks, &batch.mutations)
+            .unwrap();
+        assert!(memo.get_or_insert("stale", json!(1)).await.is_err());
+        assert!(memo.get("existing").await.is_err());
+        assert!(memo.get_or_insert("existing", json!(2)).await.is_err());
+        assert_eq!(
+            owner
+                .store()
+                .list(format!("runtime/extension-memo/{child}/").as_bytes())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

@@ -388,7 +388,18 @@ without redispatch. In-flight polls are dropped before replay; a still-pending
 job may be polled again after re-parking, so external polling must tolerate
 retries. The intermediate executor is retired before replay, and
 its checkpoint, claim and effects are fenced by the current root attempt and
-abort state. This subset excludes extension hooks,
+abort state. Selected extension hooks are supported for completed and pending
+descendants, including early any wakes. The raw remote receipt and the final
+hook-transformed result are stored separately and checked before the intermediate
+wakes and when completed siblings are included in a later park. Older records without a
+final projection retain the original exact-match check. Before-tool hooks run
+before intent and are not repeated on a child wake; the ordered result hooks
+finish before the intermediate wakes. A crash before hook-result commit can
+repeat hooks; durable per-operation memos preserve decisions but cannot make
+external side effects exactly once. Hosts must keep extension and tool
+registrations compatible across reopen. Memo operations and result publication
+are fenced by the root attempt and, where applicable, the intermediate claim.
+This subset excludes nested before-tool gates at this checkpoint,
 deeper intermediate parks, new descendants after a child wake, and independently
 scheduled or parallel child handles. Unsupported and legacy unbound cases fail
 closed; external job cancellation is not provided.

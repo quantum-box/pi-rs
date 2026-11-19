@@ -133,6 +133,28 @@ struct Resolution {
     outcome: Outcome,
     #[serde(default)]
     cancelled: bool,
+    // Set atomically with publication of a hook-transformed result. Older
+    // records have no projection and must still match the raw receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finalized_outcome: Option<Outcome>,
+}
+
+fn resolved_terminal(record: &Record) -> bool {
+    let Some(resolution) = &record.resolution else {
+        return false;
+    };
+    !matches!(
+        resolution.outcome,
+        Outcome::Pending { .. } | Outcome::Unknown(_)
+    ) && record.staged_outcome.is_none()
+        && record.outcome.as_ref().is_some_and(|outcome| {
+            !matches!(outcome, Outcome::Pending { .. } | Outcome::Unknown(_))
+                && Some(outcome)
+                    == resolution
+                        .finalized_outcome
+                        .as_ref()
+                        .or(Some(&resolution.outcome))
+        })
 }
 
 /// A pending remote job and its stable identity. References are opaque.
@@ -240,6 +262,7 @@ impl PendingPoll {
                 reference: reference.clone(),
                 outcome,
                 cancelled: false,
+                finalized_outcome: None,
             });
         }
         let record_check = Check {
@@ -627,12 +650,12 @@ pub(crate) fn freeze_any_wake(
         }
         let reference = match &leaf.outcome {
             Some(Outcome::Pending { reference }) => reference,
-            Some(outcome) => {
+            Some(_) => {
                 let resolution = leaf
                     .resolution
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("nested park leaf has no resolution".into()))?;
-                if outcome != &resolution.outcome || matches!(outcome, Outcome::Unknown(_)) {
+                if !resolved_terminal(&leaf) {
                     return Err(Error::Invalid("invalid nested park resolution".into()));
                 }
                 ended.push(leaf.operation_id);
@@ -686,19 +709,7 @@ pub(crate) fn resolved_for_replay(
                     return Ok(false);
                 };
                 let leaf: Record = serde_json::from_slice(&leaf.value)?;
-                if !matches!(
-                    leaf.outcome,
-                    Some(
-                        Outcome::Succeeded(_)
-                            | Outcome::SucceededWithDetails { .. }
-                            | Outcome::Failed(_)
-                            | Outcome::Skipped(_)
-                            | Outcome::Truncated { .. }
-                            | Outcome::Structured { .. }
-                    )
-                ) || leaf.resolution.is_none()
-                    || leaf.staged_outcome.is_some()
-                {
+                if !resolved_terminal(&leaf) {
                     return Ok(false);
                 }
             }
@@ -879,9 +890,13 @@ pub(crate) fn resolve_pending(
         reference: reference.into(),
         outcome: outcome.clone(),
         cancelled,
+        finalized_outcome: None,
     };
     if let Some(existing) = &record.resolution {
-        if *existing != resolution {
+        if existing.reference != resolution.reference
+            || existing.outcome != resolution.outcome
+            || existing.cancelled != resolution.cancelled
+        {
             return Err(Error::Invalid("conflicting nested resolution".into()));
         }
         // Check the conversation even on a retry.
@@ -1395,15 +1410,7 @@ impl NestedHost {
                     return Err("duplicate nested park descendant".into());
                 }
                 if !pending.contains(&leaf.operation_id) {
-                    let Some(resolution) = &leaf.resolution else {
-                        return Err("nested park descendant is not resolved".into());
-                    };
-                    if leaf.outcome.as_ref() != Some(&resolution.outcome)
-                        || matches!(
-                            resolution.outcome,
-                            Outcome::Pending { .. } | Outcome::Unknown(_)
-                        )
-                    {
+                    if !resolved_terminal(&leaf) {
                         return Err("nested park descendant is not terminal".into());
                     }
                 }
@@ -1433,14 +1440,12 @@ impl NestedHost {
         drop(lifecycle);
         Ok(())
     }
-    // Deliberately bounded: only one keyed intermediate, up to eight keyed pending
-    // descendant, replay-safe root and child, with no extension hooks.
+    // Bounded to one keyed intermediate and eight keyed descendants; gates are excluded.
     fn request_child_park(&self, checkpoint: Option<Value>, any: bool) -> Result<(), String> {
         let checkpoint = checkpoint.ok_or("nested child park requires a checkpoint")?;
         if self.depth != 1
             || (self.child_wake.is_some() && self.claim.is_none())
             || !self.child_replay_safe
-            || self.shared.hooks.is_some()
             || self.shared.failed.load(Ordering::Acquire)
         {
             return Err("unsupported nested child park".into());
@@ -1510,7 +1515,7 @@ impl NestedHost {
                 || record.before_gate.is_some()
                 || record.child_park.is_some()
                 || record.staged_outcome.is_some()
-                || record.hooks_required
+                || record.hooks_required != self.shared.hooks.is_some()
                 || !seen.insert(record.operation_id)
             {
                 return Err("unsupported nested descendant state".into());
@@ -1525,17 +1530,13 @@ impl NestedHost {
                     });
                 }
                 Some(
-                    outcome @ (Outcome::Succeeded(_)
+                    Outcome::Succeeded(_)
                     | Outcome::SucceededWithDetails { .. }
                     | Outcome::Failed(_)
                     | Outcome::Skipped(_)
                     | Outcome::Truncated { .. }
-                    | Outcome::Structured { .. }),
-                ) if record
-                    .resolution
-                    .as_ref()
-                    .is_none_or(|resolution| &resolution.outcome == outcome) =>
-                {
+                    | Outcome::Structured { .. },
+                ) if record.resolution.is_none() || resolved_terminal(&record) => {
                     completed_checks.push(Check {
                         key: leaf_key,
                         expected: Expected::Version(leaf.version),
@@ -2080,7 +2081,7 @@ impl NestedHost {
             if let Some(park) = &record.child_park {
                 if explicit.is_none()
                     || self.parent != self.shared.root
-                    || self.shared.hooks.is_some()
+                    || record.hooks_required != self.shared.hooks.is_some()
                     || reg.replay != ReplayPolicy::Safe
                 {
                     return self.fail("unsupported nested child park replay");
@@ -2492,11 +2493,7 @@ impl NestedHost {
                 .resolution
                 .as_ref()
                 .ok_or("nested park leaf has no terminal evidence")?;
-            if matches!(
-                resolution.outcome,
-                Outcome::Pending { .. } | Outcome::Unknown(_)
-            ) || leaf.outcome.as_ref() != Some(&resolution.outcome)
-                || leaf.staged_outcome.is_some()
+            if !resolved_terminal(&leaf)
                 || ended.contains(&leaf.operation_id)
                 || !suspension.jobs().iter().any(|job| {
                     job.operation_id == leaf.operation_id && job.reference == resolution.reference
@@ -2720,7 +2717,8 @@ impl NestedHost {
             record.operation_id,
             hooks.storage_failed.clone(),
         )
-        .with_nested_fence(self.shared.fence.clone());
+        .with_nested_fence(self.shared.fence.clone())
+        .with_nested_claim(self.claim.clone());
         let mut snapshot = hooks.snapshot.clone();
         if let Some(wake) = record
             .before_gate
@@ -2912,7 +2910,8 @@ impl NestedHost {
             record.operation_id,
             hooks.storage_failed.clone(),
         )
-        .with_nested_fence(self.shared.fence.clone());
+        .with_nested_fence(self.shared.fence.clone())
+        .with_nested_claim(self.claim.clone());
         let context = crate::extension::Context {
             snapshot: record.hook_snapshot.as_ref().unwrap_or(&hooks.snapshot),
             memo: &memo,
@@ -3112,6 +3111,14 @@ impl NestedHost {
             return self.fail("nested staged result changed");
         }
         record = current;
+        if let Some(resolution) = record.resolution.as_mut() {
+            if record.staged_outcome.as_ref() != Some(&resolution.outcome)
+                || resolution.finalized_outcome.is_some()
+            {
+                return self.fail("nested raw resolution changed before hook finalization");
+            }
+            resolution.finalized_outcome = Some(outcome.clone());
+        }
         record.staged_outcome = None;
         record.outcome = Some(outcome.clone());
         record.projected_structured = projected_structured;
@@ -3372,6 +3379,25 @@ mod tests {
     use pi_rs_core::{Tool, ToolContext};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn legacy_and_hook_finalized_receipts_require_matching_evidence() {
+        let raw = Outcome::Succeeded("raw".into());
+        let rewritten = Outcome::Succeeded("rewritten".into());
+        let mut record: Record = serde_json::from_value(json!({
+            "name": "leaf", "arguments": {}, "prepared": {},
+            "policy": ReplayPolicy::Safe, "operation_id": Uuid::new_v4(),
+            "outcome": raw, "resolution": { "reference": "job", "outcome": raw }
+        }))
+        .unwrap();
+        assert!(resolved_terminal(&record));
+        record.outcome = Some(rewritten.clone());
+        assert!(!resolved_terminal(&record));
+        record.resolution.as_mut().unwrap().finalized_outcome = Some(rewritten);
+        assert!(resolved_terminal(&record));
+        record.staged_outcome = Some(raw);
+        assert!(!resolved_terminal(&record));
+    }
 
     #[test]
     fn gate_recovery_accepts_pending_and_rejects_uncertain_children() {

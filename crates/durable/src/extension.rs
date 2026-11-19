@@ -89,6 +89,7 @@ pub struct DurableMemo {
     task: uuid::Uuid,
     failed: Arc<AtomicBool>,
     fence: Option<crate::nested_fence::Binding>,
+    claim: Option<durable_store::Check>,
 }
 
 impl DurableMemo {
@@ -102,11 +103,17 @@ impl DurableMemo {
             task,
             failed,
             fence: None,
+            claim: None,
         }
     }
 
     pub(crate) fn with_nested_fence(mut self, fence: Option<crate::nested_fence::Binding>) -> Self {
         self.fence = fence;
+        self
+    }
+
+    pub(crate) fn with_nested_claim(mut self, claim: Option<durable_store::Check>) -> Self {
+        self.claim = claim;
         self
     }
 
@@ -128,24 +135,43 @@ impl DurableMemo {
             .map(|e| serde_json::from_slice(&e.value).map_err(|e| e.to_string()))
             .transpose()
     }
+
+    fn check_live(&self) -> Result<(), String> {
+        let checks: Vec<_> = self.claim.iter().cloned().collect();
+        match &self.fence {
+            Some(binding) => binding
+                .commit(self.owner.store(), &checks, &[])
+                .map_err(|e| e.to_string()),
+            None if !checks.is_empty() => self
+                .owner
+                .store()
+                .commit(&checks, &[])
+                .map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
 impl Memo for DurableMemo {
     async fn get(&self, key: &str) -> Result<Option<Value>, String> {
-        self.read(&self.key(key))
+        let value = self.read(&self.key(key))?;
+        self.check_live()?;
+        Ok(value)
     }
 
     async fn get_or_insert(&self, key: &str, value: Value) -> Result<Value, String> {
         let key = self.key(key);
         if let Some(existing) = self.read(&key)? {
+            self.check_live()?;
             return Ok(existing);
         }
         let encoded = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        let checks = [durable_store::Check {
+        let mut checks = vec![durable_store::Check {
             key: key.clone(),
             expected: durable_store::Expected::Missing,
         }];
+        checks.extend(self.claim.iter().cloned());
         let mutations = [durable_store::Mutation::Put {
             key: key.clone(),
             value: encoded,
@@ -160,9 +186,18 @@ impl Memo for DurableMemo {
         };
         match result {
             Ok(()) => Ok(value),
-            Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict { .. })) => self
-                .read(&key)?
-                .ok_or_else(|| "memo disappeared after conflict".into()),
+            Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict {
+                key: conflict,
+            })) if conflict == key => {
+                let value = self
+                    .read(&key)?
+                    .ok_or_else(|| "memo disappeared after conflict".to_string())?;
+                self.check_live()?;
+                Ok(value)
+            }
+            Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict { .. })) => {
+                Err("nested memo claim changed".into())
+            }
             Err(crate::nested_fence::Error::Store(error)) => {
                 self.failed.store(true, Ordering::Release);
                 Err(error.to_string())
