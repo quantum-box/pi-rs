@@ -18711,6 +18711,9 @@ impl Harness {
     /// remote cancellation is confirmed. This does not cancel the remote job.
     /// A parked intermediate is not a remote job; resolve its listed pending
     /// descendant instead.
+    /// An any-wait whose wake is frozen may return a storage conflict for a
+    /// still-pending descendant. Retain the observation and retry after the
+    /// parent resumes and re-parks; this does not cancel the remote job.
     pub fn reconcile_nested_pending(
         &mut self,
         id: Uuid,
@@ -18727,7 +18730,7 @@ impl Harness {
         }
         crate::nested::resolve_pending(
             self.owner.store(),
-            (Self::key(id), version),
+            (id, c.abort_requested, Self::key(id), version),
             root,
             operation,
             reference,
@@ -18754,7 +18757,7 @@ impl Harness {
         }
         crate::nested::resolve_pending(
             self.owner.store(),
-            (Self::key(id), version),
+            (id, c.abort_requested, Self::key(id), version),
             root,
             operation,
             reference,

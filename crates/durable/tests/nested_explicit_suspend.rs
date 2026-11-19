@@ -6131,31 +6131,34 @@ async fn hooks_transform_mixed_any_results_across_repark_and_reopen() {
             |m| matches!(m, Message::Tool { content, .. } if content == "hooked mixed complete")
         )
     );
-    let wakes = wakes.lock().unwrap();
-    assert_eq!(wakes.len(), 2);
-    assert_eq!(wakes[0].checkpoint, json!("hooked-any"));
-    assert_eq!(wakes[0].ended, vec![a.operation_id]);
-    assert_eq!(wakes[1].checkpoint, json!("hooked-any"));
-    assert_eq!(wakes[1].ended, vec![b.operation_id]);
+    {
+        let wakes = wakes.lock().unwrap();
+        assert_eq!(wakes.len(), 2);
+        assert_eq!(wakes[0].checkpoint, json!("hooked-any"));
+        assert_eq!(wakes[0].ended, vec![a.operation_id]);
+        assert_eq!(wakes[1].checkpoint, json!("hooked-any"));
+        assert_eq!(wakes[1].ended, vec![b.operation_id]);
+    }
     assert_eq!(immediate.load(Ordering::SeqCst), 1);
     assert_eq!(pending.load(Ordering::SeqCst), 2);
-    let calls = calls.lock().unwrap();
-    for entry in [
-        "before:middle:{}",
-        "before:immediate:{}",
-        "after:immediate:{}",
-        "before:child:{\"job\":\"a\"}",
-        "before:child:{\"job\":\"b\"}",
-        "after:child:{\"job\":\"a\"}",
-        "after:child:{\"job\":\"b\"}",
-    ] {
-        assert_eq!(
-            calls.iter().filter(|call| *call == entry).count(),
-            1,
-            "{entry}: {calls:?}"
-        );
+    {
+        let calls = calls.lock().unwrap();
+        for entry in [
+            "before:middle:{}",
+            "before:immediate:{}",
+            "after:immediate:{}",
+            "before:child:{\"job\":\"a\"}",
+            "before:child:{\"job\":\"b\"}",
+            "after:child:{\"job\":\"a\"}",
+            "after:child:{\"job\":\"b\"}",
+        ] {
+            assert_eq!(
+                calls.iter().filter(|call| *call == entry).count(),
+                1,
+                "{entry}: {calls:?}"
+            );
+        }
     }
-    drop(calls);
     scheduler.shutdown().await.unwrap();
 }
 

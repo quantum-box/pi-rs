@@ -875,9 +875,19 @@ pub(crate) fn wake_before_gates(
     Ok(false)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_NESTED_RECONCILE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn resolve_pending(
     store: &durable_store::Store,
-    (conversation_key, conversation_version): (Vec<u8>, u64),
+    (conversation, abort_requested, conversation_key, conversation_version): (
+        Uuid,
+        bool,
+        Vec<u8>,
+        u64,
+    ),
     root: Uuid,
     operation: Uuid,
     reference: &str,
@@ -894,8 +904,12 @@ pub(crate) fn resolve_pending(
         ));
     }
     let mut found = None;
+    let mut parks = Vec::new();
     for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.child_park.as_ref().is_some_and(|park| park.any) {
+            parks.push((key.clone(), entry.version, record.clone()));
+        }
         if record.operation_id == operation {
             if found.is_some() {
                 return Err(Error::Invalid("duplicate nested operation ID".into()));
@@ -948,6 +962,53 @@ pub(crate) fn resolve_pending(
             "nested pending reference or outcome changed".into(),
         ));
     }
+    let mut checks = vec![
+        Check {
+            key: conversation_key,
+            expected: Expected::Version(conversation_version),
+        },
+        Check {
+            key: key.clone(),
+            expected: Expected::Version(entry.version),
+        },
+    ];
+    let mut matched = false;
+    for (park_key, park_version, parent) in parks {
+        let park = parent.child_park.as_ref().unwrap();
+        if !park.leaf_keys().any(|leaf| leaf == key.as_slice()) {
+            continue;
+        }
+        if matched {
+            return Err(Error::Invalid("ambiguous nested any park".into()));
+        }
+        matched = true;
+        let suspension = crate::nested_suspension::load(store, conversation, parent.operation_id)
+            .map_err(suspension_error)?
+            .ok_or_else(|| Error::Invalid("nested suspension missing".into()))?;
+        if suspension.suspension_id() != park.suspension
+            || !suspension
+                .jobs()
+                .iter()
+                .any(|job| job.operation_id == operation && job.reference == reference)
+        {
+            return Err(Error::Invalid("nested suspension evidence changed".into()));
+        }
+        // Once the wake is frozen, leave the remote receipt with the host until
+        // the parent has resumed and re-parked. A competing freeze checks this
+        // leaf's version; this check makes the inverse ordering conflict too.
+        if !abort_requested {
+            let check = suspension.retired_check().map_err(|_| {
+                Error::Storage(durable_store::Error::Conflict {
+                    key: park_key.clone(),
+                })
+            })?;
+            checks.push(check);
+            checks.push(Check {
+                key: park_key,
+                expected: Expected::Version(park_version),
+            });
+        }
+    }
     if record.hooks_required {
         record.staged_outcome = Some(outcome);
         record.outcome = None;
@@ -955,17 +1016,14 @@ pub(crate) fn resolve_pending(
         record.outcome = Some(outcome);
     }
     record.resolution = Some(resolution);
+    #[cfg(test)]
+    BEFORE_NESTED_RECONCILE_COMMIT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     store.commit(
-        &[
-            Check {
-                key: conversation_key,
-                expected: Expected::Version(conversation_version),
-            },
-            Check {
-                key: key.clone(),
-                expected: Expected::Version(entry.version),
-            },
-        ],
+        &checks,
         &[Mutation::Put {
             key,
             value: serde_json::to_vec(&record)?,
@@ -3403,6 +3461,158 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn frozen_any_wake_fences_racing_reconciliation_until_repark() {
+        use crate::runtime::Harness;
+        let store = Arc::new(durable_store::Store::memory().unwrap());
+        let conversation = Uuid::new_v4();
+        let root = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let executor = Uuid::new_v4();
+        let suspension_id = Uuid::new_v4();
+        let conversation_key = Harness::key(conversation);
+        let leaf_key = format!("nested/{root}/{middle}/k62").into_bytes();
+        let a_key = format!("nested/{root}/{middle}/k61").into_bytes();
+        let middle_key = format!("nested/{root}/{root}/k6d").into_bytes();
+        let leaf: Record = serde_json::from_value(json!({"name":"child", "arguments":{}, "prepared":{}, "policy":ReplayPolicy::Safe, "operation_id":b, "outcome":Outcome::Pending {reference:"b".into()}, "hooks_required":true})).unwrap();
+        let a_leaf: Record = serde_json::from_value(json!({"name":"child", "arguments":{}, "prepared":{}, "policy":ReplayPolicy::Safe, "operation_id":a, "outcome":Outcome::Succeeded("hook:a".into()), "hooks_required":true, "resolution": {"reference":"a", "outcome":Outcome::Succeeded("raw-a".into()), "finalized_outcome":Outcome::Succeeded("hook:a".into())}})).unwrap();
+        let mut parent: Record = serde_json::from_value(json!({"name":"middle", "arguments":{}, "prepared":{}, "policy":ReplayPolicy::Safe, "operation_id":middle, "outcome":Outcome::Pending {reference:format!("nested-child-park:{suspension_id}")}, "child_park":ChildPark {suspension:suspension_id,root_attempt:executor,leaf_key:a_key.clone(),additional_leaf_keys:vec![leaf_key.clone()],any:true}})).unwrap();
+        let jobs = vec![
+            crate::nested_suspension::PendingJob {
+                operation_id: a,
+                reference: "a".into(),
+            },
+            crate::nested_suspension::PendingJob {
+                operation_id: b,
+                reference: "b".into(),
+            },
+        ];
+        let batch = crate::nested_suspension::prepare_retired(
+            conversation,
+            middle,
+            suspension_id,
+            executor,
+            json!({}),
+            jobs.clone(),
+        )
+        .unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: conversation_key.clone(),
+                        value: b"{}".to_vec(),
+                    },
+                    Mutation::Put {
+                        key: middle_key.clone(),
+                        value: serde_json::to_vec(&parent).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: a_key.clone(),
+                        value: serde_json::to_vec(&a_leaf).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: leaf_key.clone(),
+                        value: serde_json::to_vec(&leaf).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let version = store.get(&conversation_key).unwrap().unwrap().version;
+        let snapshot = crate::nested_suspension::load(&store, conversation, middle)
+            .unwrap()
+            .unwrap();
+        let mut freeze = snapshot.freeze(vec![a]).unwrap();
+        for key in [&conversation_key, &middle_key, &a_key, &leaf_key] {
+            freeze.checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Version(store.get(key).unwrap().unwrap().version),
+            });
+        }
+        // The host starts reconciliation while unfrozen; freeze commits just
+        // before the host's atomic write, while the conversation is still blocked.
+        let writer = store.clone();
+        BEFORE_NESTED_RECONCILE_COMMIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                writer.commit(&freeze.checks, &freeze.mutations).unwrap()
+            }))
+        });
+        let reconcile = || {
+            resolve_pending(
+                &store,
+                (conversation, false, conversation_key.clone(), version),
+                root,
+                b,
+                "b",
+                Outcome::Succeeded("raw-b".into()),
+                false,
+            )
+        };
+        assert!(matches!(
+            reconcile(),
+            Err(crate::runtime::Error::Storage(
+                durable_store::Error::Conflict { .. }
+            ))
+        ));
+        let frozen = crate::nested_suspension::load(&store, conversation, middle)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.frozen_ended(), Some(&[a][..]));
+        assert!(matches!(
+            reconcile(),
+            Err(crate::runtime::Error::Storage(
+                durable_store::Error::Conflict { .. }
+            ))
+        ));
+        let retained: Record =
+            serde_json::from_slice(&store.get(&leaf_key).unwrap().unwrap().value).unwrap();
+        assert_eq!(retained.outcome, leaf.outcome);
+        assert!(retained.staged_outcome.is_none());
+
+        // Once the frozen wake is claimed and the child re-parks, the exact
+        // same authoritative receipt is accepted and staged for its hooks.
+        let next_executor = Uuid::new_v4();
+        let claim = frozen.claim(next_executor).unwrap();
+        store.commit(&claim.checks, &claim.mutations).unwrap();
+        let active = crate::nested_suspension::load(&store, conversation, middle)
+            .unwrap()
+            .unwrap();
+        let next_id = Uuid::new_v4();
+        let repark = active
+            .repark(next_executor, next_id, json!({}), vec![jobs[1].clone()])
+            .unwrap();
+        let park = parent.child_park.as_mut().unwrap();
+        park.suspension = next_id;
+        park.leaf_key = leaf_key.clone();
+        park.additional_leaf_keys.clear();
+        parent.outcome = Some(Outcome::Pending {
+            reference: format!("nested-child-park:{next_id}"),
+        });
+        let parent_entry = store.get(&middle_key).unwrap().unwrap();
+        let mut checks = repark.checks;
+        checks.push(Check {
+            key: middle_key.clone(),
+            expected: Expected::Version(parent_entry.version),
+        });
+        let mut mutations = repark.mutations;
+        mutations.push(Mutation::Put {
+            key: middle_key,
+            value: serde_json::to_vec(&parent).unwrap(),
+        });
+        store.commit(&checks, &mutations).unwrap();
+        reconcile().unwrap();
+        let staged: Record =
+            serde_json::from_slice(&store.get(&leaf_key).unwrap().unwrap().value).unwrap();
+        assert_eq!(
+            staged.staged_outcome,
+            Some(Outcome::Succeeded("raw-b".into()))
+        );
+    }
+
+    #[test]
     fn reconciliation_between_staged_scan_and_any_freeze_retries() {
         use crate::runtime::{Harness, ToolAttempt};
         let store = durable_store::Store::memory().unwrap();
@@ -3473,7 +3683,7 @@ mod tests {
         let version = store.get(&conversation_key).unwrap().unwrap().version;
         resolve_pending(
             &store,
-            (conversation_key, version),
+            (conversation, false, conversation_key, version),
             root,
             leaf_id,
             "job",
@@ -3682,7 +3892,7 @@ mod tests {
         assert!(
             resolve_pending(
                 &store,
-                (conversation, stale),
+                (Uuid::new_v4(), false, conversation, stale),
                 root,
                 operation,
                 "opaque",

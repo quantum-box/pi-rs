@@ -402,7 +402,11 @@ remains pending and can be polled again after re-parking. This does not cancel
 the external job or join work detached by a tool implementation. If a host
 reconciliation stages a valid terminal receipt while the any wake is being
 frozen, the wake retries so the next round can finish the hook; malformed
-receipts remain errors. A crash before hook-result commit can
+receipts remain errors. Reconciliation of another still-pending child races
+atomically with freezing: if freezing wins, reconciliation returns a storage
+conflict and the host must retain and retry its authoritative receipt after
+the parent resumes and re-parks. If reconciliation wins, the freeze retries.
+The frozen ended IDs remain unchanged; no remote job is cancelled. A crash before hook-result commit can
 repeat hooks; durable per-operation memos preserve decisions but cannot make
 external side effects exactly once. Hosts must keep extension and tool
 registrations compatible across reopen. Memo operations and result publication
