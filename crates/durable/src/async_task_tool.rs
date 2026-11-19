@@ -2266,9 +2266,10 @@ mod tests {
             }
         }
     }
+    type ParkBarrier = Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>;
     struct PureParkTool {
         calls: Arc<AtomicUsize>,
-        barrier: Option<Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>>,
+        barrier: Option<ParkBarrier>,
         fail: bool,
     }
     #[async_trait::async_trait]
@@ -2382,9 +2383,7 @@ mod tests {
                     match host.child_result(&call).await? {
                         Some(AsyncTaskResult::Outcome(Outcome::Succeeded(value)))
                             if value == self.child =>
-                        {
-                            ()
-                        }
+                        {}
                         other => return Err(format!("wrong child result: {other:?}")),
                     }
                     Ok(DurableToolStep::Complete(Outcome::Succeeded(
