@@ -573,6 +573,125 @@ async fn interrupted_woken_unsafe_conversation_root_never_replays() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn interrupted_woken_unsafe_root_preserves_late_receipt_on_reopen() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "conversation_checkpointable_kill_worker"])
+            .env("PI_CONV_ASYNC_KILL_DIR", dir.path())
+            .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
+            .env("PI_CONV_UNSAFE_TREE", "unsafe-leaf")
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("wake").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Simulate a receipt committed by an executor after its woken attempt was
+    // interrupted. Recovery must retain it and never treat cancellation as
+    // proof that the external execution had no outcome.
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let running = tasks
+        .iter()
+        .find(|t| {
+            matches!(
+                t.task.owner(),
+                pi_rs_durable::task::TaskOwner::Conversation(_)
+            )
+        })
+        .unwrap();
+    assert_eq!(running.task.state(), &TaskState::Running);
+    let attempt: uuid::Uuid =
+        serde_json::from_value(serde_json::to_value(&running.task).unwrap()["attempt_id"].clone())
+            .unwrap();
+    let receipt = pi_rs_durable::async_task_tool::UnsafeDurableReceipt {
+        task_id: running.task.id(),
+        attempt_id: attempt,
+        outcome: Outcome::Pending {
+            reference: "late-remote-job".into(),
+        },
+    };
+    let key = format!(
+        "durable/unsafe-park-async/{}/{attempt}/intent/receipt",
+        running.task.id()
+    )
+    .into_bytes();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&receipt).unwrap(),
+            }],
+        )
+        .unwrap();
+    drop(store);
+    let (options, registry) = setup_unsafe_tree(true);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let conversation = scheduler.conversation(id).unwrap();
+    assert!(
+        !conversation
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. })),
+        "{conversation:?}"
+    );
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let root = tasks
+        .iter()
+        .find(|t| {
+            matches!(
+                t.task.owner(),
+                pi_rs_durable::task::TaskOwner::Conversation(_)
+            )
+        })
+        .unwrap();
+    assert!(
+        matches!(root.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+        "{tasks:?}"
+    );
+    let receipts =
+        pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, root.task.id())
+            .unwrap();
+    assert!(receipts.iter().any(|receipt| matches!(&receipt.outcome, Outcome::Pending { reference } if reference == "late-remote-job")));
+
+    drop(store);
+    let _ = driver.shutdown_with_pending().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn conversation_two_park_levels_survive_kill_and_reopen() {
     struct Kill(std::process::Child);
     impl Drop for Kill {
