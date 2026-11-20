@@ -447,6 +447,27 @@ pub(crate) fn woken_cancel_candidate_checks(
     Ok((expected, checks))
 }
 
+/// Validate the prior wake for an already-reserved abort cleanup. This proves
+/// neither the current task version nor any conversation authorization.
+#[allow(dead_code)]
+pub(crate) fn woken_cleanup_checks(
+    store: &Store,
+    task: &Task,
+    boundary: u64,
+) -> Result<(Vec<Check>, Uuid), String> {
+    if task.state() != &TaskState::Running || !task.abort_requested() || task.replay_safe() {
+        return Err("invalid woken cleanup attempt".into());
+    }
+    let expected = task
+        .woken_interrupted_attempt()
+        .ok_or("missing interrupted wake")?;
+    let (checks, target) = cancel_checks_with_policy(store, task, boundary, true)?;
+    if target != Some(expected) {
+        return Err("interrupted wake does not match evidence".into());
+    }
+    Ok((checks, expected))
+}
+
 fn cancel_checks_with_policy(
     store: &Store,
     task: &Task,

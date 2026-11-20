@@ -249,6 +249,82 @@ pub(crate) struct ConversationCancelClaim {
     pub policy: crate::async_task_tool::ConversationCancelPolicy,
 }
 
+/// Proposed evidence for a woken conversation cleanup. This format is kept
+/// separate from parked v2 claims: readers cannot mistake a cleanup attempt
+/// for the earlier interrupted execution. It is not dispatch authorization.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenConversationCancelClaim {
+    pub version: u32,
+    pub claim_id: Uuid,
+    pub task: Uuid,
+    pub conversation: Uuid,
+    pub kind: String,
+    pub definition_version: u32,
+    pub cleanup_attempt: Uuid,
+    pub cleanup_lease: Uuid,
+    pub woken_attempt: Uuid,
+    pub checkpoint: crate::task::Checkpoint,
+    pub policy: crate::async_task_tool::ConversationCancelPolicy,
+}
+
+/// Builds only the execution evidence for a future claim transaction. The
+/// caller must atomically add task/version, conversation, ownership, registry,
+/// signal and exclusive-lease checks and persist this exact value. A returned
+/// check list alone must never start a callback.
+#[allow(dead_code)]
+pub(crate) fn prepare_woken_conversation_cancel_claim(
+    store: &durable_store::Store,
+    task: &Task,
+    cleanup_lease: Uuid,
+    policy: crate::async_task_tool::ConversationCancelPolicy,
+    boundary: u64,
+) -> Result<(WokenConversationCancelClaim, Vec<durable_store::Check>), String> {
+    if task.state() != &TaskState::Running
+        || !task.abort_requested()
+        || task.replay_safe()
+        || !matches!(task.owner(), TaskOwner::Conversation(_))
+        || cleanup_lease.is_nil()
+    {
+        return Err("invalid woken conversation cleanup attempt".into());
+    }
+    let TaskOwner::Conversation(conversation) = task.owner() else {
+        return Err("missing conversation owner".into());
+    };
+    if conversation.is_nil() || task.id().is_nil() || task.definition_version() == 0 {
+        return Err("invalid conversation cleanup identity".into());
+    }
+    let cleanup_attempt = task.attempt_id().ok_or("missing cleanup attempt")?;
+    let woken_attempt = task
+        .woken_interrupted_attempt()
+        .ok_or("missing interrupted wake")?;
+    if cleanup_attempt == woken_attempt {
+        return Err("cleanup and woken attempts must differ".into());
+    }
+    let (checks, target) =
+        crate::async_task_tool::unsafe_park_proof::woken_cleanup_checks(store, task, boundary)?;
+    if target != woken_attempt {
+        return Err("woken claim attempt mismatch".into());
+    }
+    Ok((
+        WokenConversationCancelClaim {
+            version: 3,
+            claim_id: Uuid::new_v4(),
+            task: task.id(),
+            conversation: *conversation,
+            kind: task.kind().ok_or("missing definition")?.to_owned(),
+            definition_version: task.definition_version(),
+            cleanup_attempt,
+            cleanup_lease,
+            woken_attempt,
+            checkpoint: task.checkpoint().clone(),
+            policy,
+        },
+        checks,
+    ))
+}
+
 /// Signal revisions observed by the claim transaction. Missing legacy evidence
 /// cannot authorize a callback-start transaction and requires reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

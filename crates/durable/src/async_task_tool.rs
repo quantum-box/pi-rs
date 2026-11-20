@@ -16524,6 +16524,25 @@ mod tests {
             store.put_version().unwrap(),
         )
         .unwrap();
+        let mut cleanup = running.task.clone();
+        cleanup.recover_interrupted_woken_for_cleanup().unwrap();
+        cleanup.start().unwrap();
+        let (cleanup_checks, cleanup_target) =
+            unsafe_park_proof::woken_cleanup_checks(&store, &cleanup, store.put_version().unwrap())
+                .unwrap();
+        assert_eq!(cleanup_target, target);
+        assert_ne!(cleanup.attempt_id(), Some(target));
+        assert!(
+            crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+                &store,
+                &cleanup,
+                Uuid::new_v4(),
+                ConversationCancelPolicy::AtMostOnce,
+                store.put_version().unwrap()
+            )
+            .is_err(),
+            "standalone owner cannot authorize a conversation claim"
+        );
         let key = format!("durable/unsafe-park-async/{id}/{target}/intent/receipt").into_bytes();
         let receipt = UnsafeDurableReceipt {
             task_id: id,
@@ -16544,6 +16563,14 @@ mod tests {
                 }],
             )
             .unwrap();
+        assert!(matches!(
+            store.commit(&cleanup_checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            unsafe_park_proof::woken_cleanup_checks(&store, &cleanup, store.put_version().unwrap())
+                .is_err()
+        );
         assert!(matches!(
             store.commit(&checks, &[]),
             Err(durable_store::Error::Conflict { .. })
