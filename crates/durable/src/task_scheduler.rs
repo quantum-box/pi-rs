@@ -3950,6 +3950,29 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        // Until evidence traversal covers conversation ownership edges, refuse
+        // to authorize cleanup through one, including after a live graph abort.
+        let records = tasks.list().map_err(|e| e.to_string())?;
+        let mut task_ids = HashSet::from([current.task.id()]);
+        loop {
+            let before = task_ids.len();
+            for record in &records {
+                if !record.task.is_background()
+                    && let TaskOwner::Task(parent) = record.task.owner()
+                    && task_ids.contains(parent)
+                {
+                    task_ids.insert(record.task.id());
+                }
+            }
+            if task_ids.len() == before {
+                break;
+            }
+        }
+        if crate::ownership_edge::reject_foreground_children(owner.store(), task_ids)
+            .map_err(|e| e.to_string())?
+        {
+            return Err("owned conversation requires reconciliation".into());
+        }
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
                 owner.store(),
