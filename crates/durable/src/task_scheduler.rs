@@ -16037,213 +16037,172 @@ impl Scheduler {
                 break;
             }
         }
-        if let Some((snapshot, woken_cleanup_lease, nested_identity_leases)) = abortable {
-            self.poisoned
-                .store(true, std::sync::atomic::Ordering::Release);
-            if snapshot.task.holds_restart_cleanup() {
-                // One bounded salvage attempt: a crashed attempt is never dispatched again.
-                let key = restart_receipt_key(snapshot.task.id());
-                let receipt = self
-                    .ts()
-                    .store()
-                    .get(&key)
-                    .map_err(task_store::Error::from)?;
-                let valid_registration = self.registered(&snapshot.task).ok().is_some_and(|reg| {
-                    reg.replay_safe
-                        && reg.restart_after
-                        && reg.version == snapshot.task.definition_version()
-                });
-                let evidence = if valid_registration {
-                    receipt.as_ref().and_then(|entry| {
-                        restart_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
-                    })
-                } else {
-                    None
-                };
-                let mut next = snapshot.clone();
-                next.task
-                    .finish_restart_cleanup()
-                    .map_err(Error::Transition)?;
-                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
-                if let Some((_, checks)) = evidence {
-                    batch.checks.extend(checks);
-                } else if let Some(entry) = receipt {
-                    batch.checks.push(durable_store::Check {
-                        key: key.clone(),
-                        expected: durable_store::Expected::Version(entry.version),
-                    });
-                    batch
-                        .mutations
-                        .push(durable_store::Mutation::Delete { key });
-                } else {
-                    batch.checks.push(durable_store::Check {
-                        key,
-                        expected: durable_store::Expected::Missing,
-                    });
-                }
-                let committed = if independent_only {
-                    self.commit_independent_abort_batch(&batch, graph_version)?
-                } else {
-                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
-                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => true,
-                        Err(error) => return Err(task_store::Error::from(error).into()),
-                    }
-                };
+        'abort_attempt: {
+            if let Some((snapshot, woken_cleanup_lease, nested_identity_leases)) = abortable {
                 self.poisoned
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(TickReservation::Progress(committed));
-            }
-            if snapshot.task.restarts() > 0
-                && snapshot.task.restarts() >= snapshot.task.restart_limit()
-            {
-                let key = abort_receipt_key(snapshot.task.id());
-                let receipt = self
-                    .ts()
-                    .store()
-                    .get(&key)
-                    .map_err(task_store::Error::from)?;
-                let valid_registration = self.registered(&snapshot.task).ok().is_some_and(|reg| {
-                    reg.version == snapshot.task.definition_version()
-                        && reg.replay_safe == snapshot.task.replay_safe()
-                        && (reg.replay_safe
-                            || (!snapshot.task.replay_safe()
-                                && reg.cancellable_durable_async
-                                && reg.checkpointable_hooks
-                                && reg.handler.requires_park_cancel_claim()))
-                        && reg
-                            .abort
-                            .as_ref()
-                            .is_some_and(|abort| Arc::ptr_eq(abort, &reg.handler))
-                });
-                let evidence = if valid_registration {
-                    receipt.as_ref().and_then(|entry| {
-                        abort_receipt_evidence(
-                            self.ts().store(),
-                            &snapshot.task,
-                            entry,
-                            self.registered(&snapshot.task)
-                                .ok()
-                                .is_some_and(|reg| reg.handler.requires_park_cancel_claim()),
-                        )
-                        .ok()
-                    })
-                } else {
-                    None
-                };
-                if let Some((_, checks)) = evidence {
-                    let mut next = snapshot.clone();
-                    if snapshot.task.woken_interrupted_attempt().is_some() {
-                        next.task
-                            .fail_interrupted_woken_ready()
-                            .map_err(Error::Transition)?;
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if snapshot.task.holds_restart_cleanup() {
+                    // One bounded salvage attempt: a crashed attempt is never dispatched again.
+                    let key = restart_receipt_key(snapshot.task.id());
+                    let receipt = self
+                        .ts()
+                        .store()
+                        .get(&key)
+                        .map_err(task_store::Error::from)?;
+                    let valid_registration =
+                        self.registered(&snapshot.task).ok().is_some_and(|reg| {
+                            reg.replay_safe
+                                && reg.restart_after
+                                && reg.version == snapshot.task.definition_version()
+                        });
+                    let evidence = if valid_registration {
+                        receipt.as_ref().and_then(|entry| {
+                            restart_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
+                        })
                     } else {
-                        next.task.cancel().map_err(Error::Transition)?;
-                    }
+                        None
+                    };
+                    let mut next = snapshot.clone();
+                    next.task
+                        .finish_restart_cleanup()
+                        .map_err(Error::Transition)?;
                     let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
-                    batch.checks.extend(checks);
-                    #[cfg(test)]
-                    if let Some(hook) = &self.reservation_commit_hook {
-                        hook(0, self.ts().store());
+                    if let Some((_, checks)) = evidence {
+                        batch.checks.extend(checks);
+                    } else if let Some(entry) = receipt {
+                        batch.checks.push(durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        });
+                        batch
+                            .mutations
+                            .push(durable_store::Mutation::Delete { key });
+                    } else {
+                        batch.checks.push(durable_store::Check {
+                            key,
+                            expected: durable_store::Expected::Missing,
+                        });
                     }
-                    if independent_only {
-                        let progress =
-                            self.commit_independent_abort_batch(&batch, graph_version)?;
-                        self.poisoned
-                            .store(false, std::sync::atomic::Ordering::Release);
-                        return Ok(TickReservation::Progress(progress));
-                    }
-                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
-                        Ok(()) => (),
-                        Err(durable_store::Error::Conflict { .. }) => {
+                    let committed = if independent_only {
+                        self.commit_independent_abort_batch(&batch, graph_version)?
+                    } else {
+                        match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                            Ok(()) | Err(durable_store::Error::Conflict { .. }) => true,
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    };
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(TickReservation::Progress(committed));
+                }
+                if snapshot.task.restarts() > 0
+                    && snapshot.task.restarts() >= snapshot.task.restart_limit()
+                {
+                    let key = abort_receipt_key(snapshot.task.id());
+                    let receipt = self
+                        .ts()
+                        .store()
+                        .get(&key)
+                        .map_err(task_store::Error::from)?;
+                    let valid_registration =
+                        self.registered(&snapshot.task).ok().is_some_and(|reg| {
+                            reg.version == snapshot.task.definition_version()
+                                && reg.replay_safe == snapshot.task.replay_safe()
+                                && (reg.replay_safe
+                                    || (!snapshot.task.replay_safe()
+                                        && reg.cancellable_durable_async
+                                        && reg.checkpointable_hooks
+                                        && reg.handler.requires_park_cancel_claim()))
+                                && reg
+                                    .abort
+                                    .as_ref()
+                                    .is_some_and(|abort| Arc::ptr_eq(abort, &reg.handler))
+                        });
+                    let evidence = if valid_registration {
+                        receipt.as_ref().and_then(|entry| {
+                            abort_receipt_evidence(
+                                self.ts().store(),
+                                &snapshot.task,
+                                entry,
+                                self.registered(&snapshot.task)
+                                    .ok()
+                                    .is_some_and(|reg| reg.handler.requires_park_cancel_claim()),
+                            )
+                            .ok()
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((_, checks)) = evidence {
+                        let mut next = snapshot.clone();
+                        if snapshot.task.woken_interrupted_attempt().is_some() {
+                            next.task
+                                .fail_interrupted_woken_ready()
+                                .map_err(Error::Transition)?;
+                        } else {
+                            next.task.cancel().map_err(Error::Transition)?;
+                        }
+                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        batch.checks.extend(checks);
+                        #[cfg(test)]
+                        if let Some(hook) = &self.reservation_commit_hook {
+                            hook(0, self.ts().store());
+                        }
+                        if independent_only {
+                            let progress =
+                                self.commit_independent_abort_batch(&batch, graph_version)?;
                             self.poisoned
                                 .store(false, std::sync::atomic::Ordering::Release);
+                            return Ok(TickReservation::Progress(progress));
+                        }
+                        match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                            Ok(()) => (),
+                            Err(durable_store::Error::Conflict { .. }) => {
+                                self.poisoned
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                return Ok(TickReservation::Progress(true));
+                            }
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    } else {
+                        if independent_only {
+                            let progress =
+                                self.independent_abort_update(snapshot, graph_version, |task| {
+                                    task.fail_abort_restart()
+                                })?;
+                            self.poisoned
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            return Ok(TickReservation::Progress(progress));
+                        }
+                        let update = self.ts().update(snapshot, |task| task.fail_abort_restart());
+                        if !self.reservation_update_committed(update)? {
                             return Ok(TickReservation::Progress(true));
                         }
-                        Err(error) => return Err(task_store::Error::from(error).into()),
                     }
-                } else {
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(TickReservation::Progress(true));
+                }
+                if let Some(reason) = self.blocked_reason(&snapshot.task) {
+                    let diagnostic = if matches!(reason, BlockedReason::MissingTask)
+                        && snapshot.task.checkpoint().phase == "replay-safe-async-wait"
+                    {
+                        "orphaned: missing task definition; parked external work requires reconciliation".into()
+                    } else {
+                        orphan_diagnostic(&reason)
+                    };
                     if independent_only {
                         let progress =
                             self.independent_abort_update(snapshot, graph_version, |task| {
-                                task.fail_abort_restart()
+                                task.start()?;
+                                task.fail(diagnostic)
                             })?;
                         self.poisoned
                             .store(false, std::sync::atomic::Ordering::Release);
                         return Ok(TickReservation::Progress(progress));
                     }
-                    let update = self.ts().update(snapshot, |task| task.fail_abort_restart());
-                    if !self.reservation_update_committed(update)? {
-                        return Ok(TickReservation::Progress(true));
-                    }
-                }
-                self.poisoned
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(TickReservation::Progress(true));
-            }
-            if let Some(reason) = self.blocked_reason(&snapshot.task) {
-                let diagnostic = if matches!(reason, BlockedReason::MissingTask)
-                    && snapshot.task.checkpoint().phase == "replay-safe-async-wait"
-                {
-                    "orphaned: missing task definition; parked external work requires reconciliation".into()
-                } else {
-                    orphan_diagnostic(&reason)
-                };
-                if independent_only {
-                    let progress =
-                        self.independent_abort_update(snapshot, graph_version, |task| {
-                            task.start()?;
-                            task.fail(diagnostic)
-                        })?;
-                    self.poisoned
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    return Ok(TickReservation::Progress(progress));
-                }
-                #[cfg(test)]
-                invoke_boundary(reservation_update_hooks(), snapshot.task.id());
-                let update = self.ts().update(snapshot, |t| {
-                    t.start()?;
-                    t.fail(diagnostic)
-                });
-                if !self.reservation_update_committed(update)? {
-                    return Ok(TickReservation::Progress(true));
-                }
-                self.poisoned
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(TickReservation::Progress(true));
-            }
-            let abort = self
-                .registered(&snapshot.task)
-                .ok()
-                .and_then(|r| r.abort.clone());
-            if let Some(abort) = abort {
-                #[cfg(test)]
-                if independent_only {
-                    let hook = independent_abort_reservation_hooks()
-                        .lock()
-                        .unwrap()
-                        .remove(&snapshot.task.id());
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                }
-                if !self.reserve_resolved(snapshot, independent_only.then_some(graph_version))? {
-                    if independent_only {
-                        #[cfg(test)]
-                        if let Some(hook) = independent_abort_conflict_hooks()
-                            .lock()
-                            .unwrap()
-                            .remove(&snapshot.task.id())
-                        {
-                            hook();
-                        }
-                        return Ok(TickReservation::Progress(false));
-                    }
-                    let Some(reason) = self.blocked_reason(&snapshot.task) else {
-                        // A checked reservation may lose a race or be deferred by
-                        // owned-graph evidence while its registration remains valid.
-                        return Ok(TickReservation::Progress(false));
-                    };
-                    let diagnostic = orphan_diagnostic(&reason);
+                    #[cfg(test)]
+                    invoke_boundary(reservation_update_hooks(), snapshot.task.id());
                     let update = self.ts().update(snapshot, |t| {
                         t.start()?;
                         t.fail(diagnostic)
@@ -16255,47 +16214,96 @@ impl Scheduler {
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(true));
                 }
-                let running = self
-                    .ts()
-                    .load(snapshot.task.id())?
-                    .ok_or(Error::Ownership)?;
-                let mut invocation = self.make_invocation(running, abort, true)?;
-                invocation.woken_cleanup_lease = woken_cleanup_lease;
-                invocation.nested_identity_leases = nested_identity_leases;
-                #[cfg(test)]
-                if let Some(hook) = woken_reserved_hooks()
-                    .lock()
-                    .unwrap()
-                    .remove(&snapshot.task.id())
-                {
-                    hook();
+                let abort = self
+                    .registered(&snapshot.task)
+                    .ok()
+                    .and_then(|r| r.abort.clone());
+                if let Some(abort) = abort {
+                    #[cfg(test)]
+                    if independent_only {
+                        let hook = independent_abort_reservation_hooks()
+                            .lock()
+                            .unwrap()
+                            .remove(&snapshot.task.id());
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    if !self
+                        .reserve_resolved(snapshot, independent_only.then_some(graph_version))?
+                    {
+                        if independent_only {
+                            #[cfg(test)]
+                            if let Some(hook) = independent_abort_conflict_hooks()
+                                .lock()
+                                .unwrap()
+                                .remove(&snapshot.task.id())
+                            {
+                                hook();
+                            }
+                            return Ok(TickReservation::Progress(false));
+                        }
+                        let Some(reason) = self.blocked_reason(&snapshot.task) else {
+                            // A checked reservation may lose a race or be deferred by
+                            // owned-graph evidence while its registration remains valid.
+                            break 'abort_attempt;
+                        };
+                        let diagnostic = orphan_diagnostic(&reason);
+                        let update = self.ts().update(snapshot, |t| {
+                            t.start()?;
+                            t.fail(diagnostic)
+                        });
+                        if !self.reservation_update_committed(update)? {
+                            return Ok(TickReservation::Progress(true));
+                        }
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(true));
+                    }
+                    let running = self
+                        .ts()
+                        .load(snapshot.task.id())?
+                        .ok_or(Error::Ownership)?;
+                    let mut invocation = self.make_invocation(running, abort, true)?;
+                    invocation.woken_cleanup_lease = woken_cleanup_lease;
+                    invocation.nested_identity_leases = nested_identity_leases;
+                    #[cfg(test)]
+                    if let Some(hook) = woken_reserved_hooks()
+                        .lock()
+                        .unwrap()
+                        .remove(&snapshot.task.id())
+                    {
+                        hook();
+                    }
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    drop(gate);
+                    return Ok(TickReservation::Invocation(Box::new(invocation)));
+                } else {
+                    if independent_only {
+                        let progress =
+                            self.independent_abort_update(snapshot, graph_version, |task| {
+                                task.start()?;
+                                task.fail(
+                                    "orphaned: missing abort handler or task definition".into(),
+                                )
+                            })?;
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(progress));
+                    }
+                    let update = self.ts().update(snapshot, |t| {
+                        t.start()?;
+                        t.fail("orphaned: missing abort handler or task definition".into())
+                    });
+                    if !self.reservation_update_committed(update)? {
+                        return Ok(TickReservation::Progress(true));
+                    }
                 }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
-                drop(gate);
-                return Ok(TickReservation::Invocation(Box::new(invocation)));
-            } else {
-                if independent_only {
-                    let progress =
-                        self.independent_abort_update(snapshot, graph_version, |task| {
-                            task.start()?;
-                            task.fail("orphaned: missing abort handler or task definition".into())
-                        })?;
-                    self.poisoned
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    return Ok(TickReservation::Progress(progress));
-                }
-                let update = self.ts().update(snapshot, |t| {
-                    t.start()?;
-                    t.fail("orphaned: missing abort handler or task definition".into())
-                });
-                if !self.reservation_update_committed(update)? {
-                    return Ok(TickReservation::Progress(true));
-                }
+                return Ok(TickReservation::Progress(true));
             }
-            self.poisoned
-                .store(false, std::sync::atomic::Ordering::Release);
-            return Ok(TickReservation::Progress(true));
         }
         if independent_only {
             return Ok(TickReservation::Progress(progress));
