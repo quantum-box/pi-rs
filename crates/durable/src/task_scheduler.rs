@@ -595,10 +595,13 @@ pub(crate) fn nested_cancel_terminal_checks(
     {
         return Err(Error::Registration);
     }
-    let identity_lease = reg
-        .handler
-        .conversation_cleanup_identity_lease()
-        .map_err(|_| Error::Ownership)?;
+    let identity_lease =
+        reg.handler
+            .conversation_cleanup_identity_lease()
+            .map_err(|e| match e {
+                crate::nested_identity::LeaseFailure::Busy => Error::Busy,
+                crate::nested_identity::LeaseFailure::Mismatch => Error::Ownership,
+            })?;
     let (conversation, ancestry, mut checks, ancestry_version) =
         task_store::read_nested_cancel_claim_ancestry(store, task.task.id(), claim.claim_id)?;
     validate_nested_cancel_terminal_evidence(
@@ -2121,6 +2124,19 @@ pub(crate) fn on_conversation_cancel_settlement(id: Uuid, hook: impl FnOnce() + 
 }
 
 #[cfg(test)]
+fn nested_preflight_test_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_nested_preflight_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    nested_preflight_test_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
+#[cfg(test)]
 fn test_nested_claim_tasks() -> &'static Mutex<HashSet<Uuid>> {
     static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
     TASKS.get_or_init(Default::default)
@@ -2436,6 +2452,7 @@ pub struct DetachedInvocation {
     abort_definition: Option<Arc<()>>,
     // Acquired before a woken abort reservation, held until its callback joins.
     woken_cleanup_lease: Option<crate::nested_identity::IdentityLease>,
+    nested_identity_leases: Vec<crate::nested_identity::IdentityLease>,
 }
 
 #[derive(Clone)]
@@ -2457,6 +2474,7 @@ pub struct CompletedInvocation {
     writer_busy: bool,
     // Pin the exact host registration until receipt persistence or abandonment.
     _identity_lease: Option<crate::nested_identity::IdentityLease>,
+    nested_identity_leases: Vec<crate::nested_identity::IdentityLease>,
 }
 
 impl CompletedInvocation {
@@ -7433,6 +7451,7 @@ impl DetachedInvocation {
             receipt_capture: false,
             abort_definition: self.abort_definition,
             _identity_lease: None,
+            nested_identity_leases: self.nested_identity_leases,
             writer_busy: false,
         })
     }
@@ -7722,6 +7741,7 @@ impl DetachedInvocation {
             sealed_registration: _,
             abort_definition,
             woken_cleanup_lease: _woken_cleanup_lease,
+            nested_identity_leases,
         } = self;
         let capture_enabled =
             receipt_capture.is_some() && intent.is_some() && (!after_enabled || after_success);
@@ -7878,6 +7898,7 @@ impl DetachedInvocation {
             receipt_capture: capture_enabled,
             abort_definition,
             _identity_lease: identity_lease,
+            nested_identity_leases,
             writer_busy: false,
         })
     }
@@ -8440,6 +8461,7 @@ impl Scheduler {
             sealed_registration,
             abort_definition,
             woken_cleanup_lease: None,
+            nested_identity_leases: Vec::new(),
             validator: self.validator.as_ref().map(|harness| harness.worker()),
             definitions: self.wake_reader.definitions.clone(),
             activity: self.activity.clone(),
@@ -8650,6 +8672,7 @@ impl Scheduler {
             receipt_capture,
             abort_definition,
             _identity_lease: _,
+            nested_identity_leases,
             writer_busy: _,
         } = completed;
         let mut reported_handler_failure = false;
@@ -9432,6 +9455,7 @@ impl Scheduler {
                             receipt_capture,
                             abort_definition,
                             _identity_lease: None,
+                            nested_identity_leases,
                             writer_busy: false,
                         })),
                     });
@@ -9463,6 +9487,7 @@ impl Scheduler {
                             receipt_capture,
                             abort_definition,
                             _identity_lease: None,
+                            nested_identity_leases,
                             writer_busy: false,
                         }),
                     }
@@ -9518,6 +9543,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    nested_identity_leases,
                     writer_busy: true,
                 }),
             });
@@ -9551,6 +9577,7 @@ impl Scheduler {
                         receipt_capture,
                         abort_definition,
                         _identity_lease: None,
+                        nested_identity_leases,
                         writer_busy: false,
                     }),
                 });
@@ -9581,6 +9608,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    nested_identity_leases,
                     writer_busy: false,
                 }),
             });
@@ -9604,6 +9632,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    nested_identity_leases,
                     writer_busy: false,
                 })),
             });
@@ -14457,11 +14486,48 @@ impl Scheduler {
                     } else {
                         None
                     };
-                abortable = Some((snapshot, lease));
+                // Pin each proven child identity before reserving the parent.
+                // Busy is transient: skip this graph and let independent work
+                // proceed; the driver's next tick retries without dispatch.
+                #[cfg(test)]
+                invoke_boundary(nested_preflight_test_hooks(), snapshot.task.id());
+                let mut nested_identity_leases = Vec::new();
+                if let (Some(harness), Ok(registration)) =
+                    (self.validator.as_ref(), self.registered(&snapshot.task))
+                    && registration.handler.conversation_cancel_dispatch_enabled()
+                {
+                    let selection_gate = harness.checkpointable_extension_gate();
+                    let _selection = selection_gate.lock().map_err(|_| Error::Poisoned)?;
+                    match registration.handler.conversation_cleanup_identity_lease() {
+                        Ok(identity) => nested_identity_leases.push(identity),
+                        Err(crate::nested_identity::LeaseFailure::Busy) => continue,
+                        Err(crate::nested_identity::LeaseFailure::Mismatch) => (),
+                    }
+                    let boundary = owner
+                        .store()
+                        .put_version()
+                        .map_err(task_store::Error::from)?;
+                    match authenticated_unsafe_descendant_reconciliation(
+                        owner.store(),
+                        snapshot.task.id(),
+                        &tasks,
+                        boundary,
+                        &self.registry,
+                        harness,
+                        None,
+                    ) {
+                        Ok((_, _, mut identities)) => {
+                            nested_identity_leases.append(&mut identities)
+                        }
+                        Err(Error::Busy) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                abortable = Some((snapshot, lease, nested_identity_leases));
                 break;
             }
         }
-        if let Some((snapshot, woken_cleanup_lease)) = abortable {
+        if let Some((snapshot, woken_cleanup_lease, nested_identity_leases)) = abortable {
             self.poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
             if snapshot.task.holds_restart_cleanup() {
@@ -14683,6 +14749,7 @@ impl Scheduler {
                     .ok_or(Error::Ownership)?;
                 let mut invocation = self.make_invocation(running, abort, true)?;
                 invocation.woken_cleanup_lease = woken_cleanup_lease;
+                invocation.nested_identity_leases = nested_identity_leases;
                 #[cfg(test)]
                 if let Some(hook) = woken_reserved_hooks()
                     .lock()
@@ -16734,27 +16801,32 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
             if item.task.state() == &TaskState::Cancelled
                 && let Ok((conversation, binding_checks)) =
                     harness.checkpointable_nested_cancel_result_checks(&item.task, registry)
-                && let Ok((terminal_checks, lease)) = nested_cancel_terminal_checks(
+            {
+                match nested_cancel_terminal_checks(
                     store,
                     item,
                     registry,
                     boundary,
                     active_parent_marker,
-                )
-            {
-                let key = nested_cancel_terminal_key(item.task.id());
-                let evidence_entry = store
-                    .get(&key)
-                    .map_err(task_store::Error::from)?
-                    .ok_or(Error::Ownership)?;
-                let evidence: NestedCancelTerminalEvidence =
-                    serde_json::from_slice(&evidence_entry.value)
-                        .map_err(|e| Error::Handler(e.to_string()))?;
-                if evidence.conversation == conversation {
-                    checks.extend(binding_checks);
-                    checks.extend(terminal_checks);
-                    leases.push(lease);
-                    continue;
+                ) {
+                    Ok((terminal_checks, lease)) => {
+                        let key = nested_cancel_terminal_key(item.task.id());
+                        let evidence_entry = store
+                            .get(&key)
+                            .map_err(task_store::Error::from)?
+                            .ok_or(Error::Ownership)?;
+                        let evidence: NestedCancelTerminalEvidence =
+                            serde_json::from_slice(&evidence_entry.value)
+                                .map_err(|e| Error::Handler(e.to_string()))?;
+                        if evidence.conversation == conversation {
+                            checks.extend(binding_checks);
+                            checks.extend(terminal_checks);
+                            leases.push(lease);
+                            continue;
+                        }
+                    }
+                    Err(Error::Busy) => return Err(Error::Busy),
+                    Err(_) => (),
                 }
             }
             unresolved.get_or_insert(item.task.id());

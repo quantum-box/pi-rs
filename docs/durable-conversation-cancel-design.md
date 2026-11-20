@@ -9,22 +9,16 @@ prepared arguments, disallows nested work from `cancel`, and runs abort or
 interruption after hooks where applicable. `packages/durable` is unchanged
 from the local `9cd49d2c00ac446f774b878d25923bdb3739dadd` reference.
 
-The task store can prepare callback-start markers for an exact child-to-root
-task ancestry in one checked batch. It checks each task version and signal
-revision; public task signals and aborts for the marked chain are fenced, while
-another graph can continue. The existing root callback uses the same machinery
-with a one-task chain. The returned ancestry is provisional evidence: a future
-child callback implementation must persist and validate the complete chain in
-the same claim, retain the conversation and identity start leases through first
-poll, and retire the exact recorded markers with its receipt. A finish batch
-does not independently authenticate a substituted subset of the chain.
-
-Nested callback dispatch remains disabled. In particular, a callback that
-reenters an ancestor via a separate async task needs scoped self-wait detection;
-marker recovery and an ancestor abort racing first poll also need complete
-coverage. The separately opted-in unhooked woken path described below binds the
-interrupted wake attempt to its original park and preserves an unknown Tool
-outcome after successful cancellation.
+Explicitly registered at-most-once park cancellation applies to a conversation
+root and its registered nested children, including selected replay-safe hooks.
+The child claim commits its exact ancestry and signal revisions; first poll is
+fenced by conversation, selection and task markers. Callback receipt and marker
+retirement commit together. Parent cancellation validates the child's committed
+terminal evidence and holds its identity lease through settlement. Busy identity
+leases defer reservation while unrelated graphs continue. A killed callback is
+not repeated and requires reconciliation; recovery retires its exact markers.
+Nested callback self-wait uses the explicit callback scope, including across
+joined tasks. Hosts must keep their registrations and identities stable.
 
 Woken-cancel preparation exposes checked evidence for the exact running attempt
 and reuses it in standalone recovery. The checks bind the original park and
@@ -49,8 +43,8 @@ cannot authorize a new callback; the claim and any receipt remain available.
 ## Opt-in first-poll dispatch
 
 `register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel`
-explicitly enables cancellation only for an unhooked, conversation-owned root
-with a confirmed park and no live owned children. The host identity must cover
+explicitly enables cancellation for an unhooked, conversation-owned root or
+registered child with a confirmed park and no live owned children. The host identity must cover
 the Tool and cancel handler, and host updates must use its `IdentityHandle`.
 The original registration still does not dispatch callbacks and keeps its
 existing definition identity. Opting in changes the registered definition identity;
@@ -68,8 +62,7 @@ redispatch the same claim. A process interruption recovers the original claim
 and matching markers into a reconciliation-required terminal task. The callback
 is bounded to 30 seconds and must cooperate with cancellation and avoid detached
 work. Direct Store writes outside the public mutation APIs are a trusted-host
-boundary. Nested cancel callbacks and woken cancellation remain unsupported by
-this opt-in.
+boundary. Woken cancellation remains unsupported by this opt-in.
 
 `register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel`
 records a selected-hook identity and a cancel identity in one definition. It
@@ -91,8 +84,7 @@ receipt when it can be safely committed and requires reconciliation for the
 incomplete after result. A process interruption before the after result is saved
 still requires reconciliation; memo persistence does not authorize another callback. A configured output schema does not prevent this abort path; the host-generated
 abort result has no structured output. A hook that attempts to introduce structured
-output still fails closed. Nested child callbacks and woken cancellation are
-not enabled by this registration. Result publication currently requires the
+output still fails closed. Woken cancellation is not enabled by this registration. Result publication currently requires the
 root adapter in the Harness tool list; an extension-only tool is rejected before
 callback dispatch. The abort hook currently receives a fresh `Tool was aborted`
 result with an error diagnostic, rather than upstream’s tool-named message and

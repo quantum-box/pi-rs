@@ -440,6 +440,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         case,
         "nested_claim_selected"
             | "nested_claim_actual_selected"
+            | "nested_claim_actual_selected_kill_parent"
             | "selection_hook_fence"
             | "selection_hook_test_dispatch"
             | "selection_hook_kill"
@@ -465,6 +466,7 @@ async fn exercise_conversation_park_claim(case: &str) {
                             case,
                             "nested_claim_selected"
                                 | "nested_claim_actual_selected"
+                                | "nested_claim_actual_selected_kill_parent"
                                 | "selection_hook_after_memo"
                                 | "selection_hook_memo_conflict"
                                 | "selection_hook_kill"
@@ -537,14 +539,14 @@ async fn exercise_conversation_park_claim(case: &str) {
     } else {
         None
     };
-    let leaf = if case == "nested_claim_selected" || case == "nested_claim_actual_selected" {
+    let leaf = if case == "nested_claim_selected" || case == "nested_claim_actual_selected" || case == "nested_claim_actual_selected_kill_parent" {
         crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
             &mut registry, leaf_tool, "leaf", 1, grandchild.clone().into_iter().collect(), &snapshot, &selection_names,
             "cancel-v1", Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), leaf_identity.clone().unwrap(), callback_scheduler.clone())),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
             crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
         )
-    } else if case == "nested_claim_success" || case == "nested_claim_success_late" || case == "nested_claim_parent" || case == "nested_claim_actual" || case == "nested_claim_actual_kill" || case == "nested_claim_actual_signal" || case == "nested_claim_actual_late" {
+    } else if case == "nested_claim_success" || case == "nested_claim_success_late" || case == "nested_claim_parent" || case == "nested_claim_actual" || case == "nested_claim_actual_kill" || case == "nested_claim_actual_signal" || case == "nested_claim_actual_late" || case == "nested_claim_actual_busy" {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
             &mut registry, leaf_tool, "leaf", 1, grandchild.clone().into_iter().collect(), "cancel-v1",
             Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), leaf_identity.clone().unwrap(), callback_scheduler.clone())),
@@ -599,7 +601,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
         )
-    } else if case.starts_with("dispatch_") || case == "nested_claim_parent" || case == "nested_claim_actual" {
+    } else if case.starts_with("dispatch_") || case == "nested_claim_parent" || case == "nested_claim_actual" || case == "nested_claim_actual_busy" {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
             &mut registry, root_tool, "root", 1, vec![leaf.clone()], "cancel-v1",
             Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
@@ -678,11 +680,33 @@ async fn exercise_conversation_park_claim(case: &str) {
         .unwrap();
         if case != "nested_claim_actual"
             && case != "nested_claim_actual_selected"
+            && case != "nested_claim_actual_selected_kill_parent"
             && case != "nested_claim_actual_kill"
             && case != "nested_claim_actual_signal"
             && case != "nested_claim_actual_late"
+            && case != "nested_claim_actual_busy"
         {
             crate::task_scheduler::enable_test_nested_claim(child_id);
+        }
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        if case == "nested_claim_actual_busy" {
+            let identity = leaf_identity.as_ref().unwrap().clone();
+            crate::task_scheduler::on_nested_preflight_for_test(root_id, move || {
+                let (held_tx, held_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    rt.block_on(identity.update(Some("leaf-backend".into()), || {
+                        held_tx.send(()).unwrap();
+                        busy_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }))
+                    .unwrap();
+                });
+                held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
         }
         if case == "nested_claim_callback"
             || case == "nested_claim_kill"
@@ -835,9 +859,27 @@ async fn exercise_conversation_park_claim(case: &str) {
                 }
             });
         }
+        if case == "nested_claim_actual_selected_kill_parent" {
+            let probe_path = path.clone();
+            let directory = std::path::PathBuf::from(
+                std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
+            );
+            crate::task_scheduler::on_conversation_receipt_saved(root_id, move || {
+                let store = durable_store::Store::open(probe_path).unwrap();
+                let key =
+                    format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
+                let claim = store.get(key.as_bytes()).unwrap().unwrap();
+                std::fs::write(directory.join("ready"), claim.value).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            });
+        }
         if case == "nested_claim_parent"
             || case == "nested_claim_actual"
             || case == "nested_claim_actual_selected"
+            || case == "nested_claim_actual_selected_kill_parent"
+            || case == "nested_claim_actual_busy"
         {
             scheduler.abort_task(root_id).unwrap();
         } else {
@@ -922,7 +964,11 @@ async fn exercise_conversation_park_claim(case: &str) {
         );
         if !matches!(
             case,
-            "nested_claim_parent" | "nested_claim_actual" | "nested_claim_actual_selected"
+            "nested_claim_parent"
+                | "nested_claim_actual"
+                | "nested_claim_actual_selected"
+                | "nested_claim_actual_selected_kill_parent"
+                | "nested_claim_actual_busy"
         ) {
             assert!(
                 store
@@ -934,7 +980,56 @@ async fn exercise_conversation_park_claim(case: &str) {
         if case == "nested_claim_parent"
             || case == "nested_claim_actual"
             || case == "nested_claim_actual_selected"
+            || case == "nested_claim_actual_selected_kill_parent"
+            || case == "nested_claim_actual_busy"
         {
+            if case == "nested_claim_actual_busy" {
+                busy_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "parent callback ran while child identity was busy"
+                );
+                assert_eq!(
+                    tasks.load(root_id).unwrap().unwrap().task.state(),
+                    &TaskState::Ready
+                );
+                let independent_owner = scheduler
+                    .create_conversation(Config {
+                        model: "test".into(),
+                        system_prompt: "".into(),
+                        max_output_tokens: 100,
+                    })
+                    .unwrap();
+                let independent = crate::task::Task::new(
+                    uuid::Uuid::new_v4(),
+                    crate::task::TaskOwner::Conversation(independent_owner),
+                    crate::task::Checkpoint {
+                        phase: "initial".into(),
+                        data: json!({}),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("independent-maintenance".into(), true);
+                driver.submit(&independent).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if driver.get(independent.id()).unwrap().unwrap().is_terminal() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("independent task stalled while identity was busy");
+                assert_eq!(
+                    driver.get(independent.id()).unwrap().unwrap().state(),
+                    &TaskState::Succeeded(json!("done"))
+                );
+                release_tx.send(()).unwrap();
+            }
             tokio::time::timeout(Duration::from_secs(10), async {
                 while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5534,4 +5629,224 @@ async fn nested_production_cancel_rejects_signal_and_late_receipt() {
     for case in ["nested_claim_actual_signal", "nested_claim_actual_late"] {
         exercise_conversation_park_claim(case).await;
     }
+}
+
+#[tokio::test]
+async fn nested_selected_parent_kill_worker() {
+    if std::env::var_os("PI_TEST_NESTED_PARENT_KILL").is_some() {
+        exercise_conversation_park_claim("nested_claim_actual_selected_kill_parent").await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_parent_receipt_survives_kill_and_reopen() {
+    for late in [false, true] {
+        exercise_nested_parent_receipt_recovery(late).await;
+    }
+}
+
+#[cfg(unix)]
+async fn exercise_nested_parent_receipt_recovery(late: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Cancel(Arc<AtomicUsize>);
+    #[async_trait]
+    impl crate::async_task_tool::DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::nested_selected_parent_kill_worker",
+        ])
+        .env("PI_TEST_NESTED_PARENT_KILL", "1")
+        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+        .spawn()
+        .unwrap();
+    let claim: crate::task_scheduler::ConversationCancelClaim =
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(value) = std::fs::read(dir.path().join("ready")) {
+                    if let Ok(claim) = serde_json::from_slice(&value) {
+                        break claim;
+                    }
+                }
+                assert!(
+                    process.try_wait().unwrap().is_none(),
+                    "worker exited before receipt"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let path = dir.path().join("db");
+    let store = durable_store::Store::open(&path).unwrap();
+    let children = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let child = children
+        .iter()
+        .find(|item| item.task.owner() == &crate::task::TaskOwner::Task(claim.task))
+        .unwrap();
+    assert_eq!(child.task.state(), &TaskState::Cancelled);
+    let child_id = child.task.id();
+    if late {
+        let prefix = format!("durable/unsafe-park-async/{child_id}/");
+        let (mut key, entry) = store
+            .list(prefix.as_bytes())
+            .unwrap()
+            .into_iter()
+            .find(|(key, _)| key.ends_with(b"/intent"))
+            .unwrap();
+        let intent: crate::task::Task = serde_json::from_slice(&entry.value).unwrap();
+        let receipt = crate::async_task_tool::UnsafeDurableReceipt {
+            task_id: child_id,
+            attempt_id: intent.attempt_id().unwrap(),
+            outcome: Outcome::Pending {
+                reference: "late-after-parent-receipt".into(),
+            },
+        };
+        key.extend_from_slice(b"/receipt");
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Missing,
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&receipt).unwrap(),
+                }],
+            )
+            .unwrap();
+    }
+    assert!(
+        store
+            .get(
+                format!(
+                    "durable/replay-safe-async/{}/nested-cancel-terminal-v1",
+                    child.task.id()
+                )
+                .as_bytes()
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get(
+                format!(
+                    "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+                    claim.task
+                )
+                .as_bytes()
+            )
+            .unwrap()
+            .is_some()
+    );
+    drop(store);
+
+    let mut extensions = crate::extension::Registry::default();
+    extensions
+        .install_identified(
+            crate::extension::Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(ClaimPassHook(None, false))],
+                ..Default::default()
+            },
+            crate::extension::ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()])
+                .unwrap(),
+        )
+        .unwrap();
+    let snapshot = extensions.snapshot();
+    let names = vec!["policy".to_owned()];
+    let hooks = crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    let grandchild =
+        crate::async_task_tool::register_conversation_replay_safe_durable_tool_with_selected_hooks(
+            &mut registry,
+            Arc::new(AsyncTool {
+                name: "grandchild",
+                child: None,
+                gate: None,
+                early: false,
+            }),
+            "grandchild",
+            1,
+            vec![],
+            &snapshot,
+            &names,
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+            hooks(),
+        )
+        .unwrap();
+    let leaf_tool = Arc::new(AsyncTool {
+        name: "leaf",
+        child: Some("grandchild"),
+        gate: None,
+        early: false,
+    });
+    let leaf_identity_tool: Arc<dyn Tool> = leaf_tool.clone();
+    let _leaf_identity =
+        crate::nested_identity::register(&leaf_identity_tool, Some("leaf-backend".into())).unwrap();
+    let leaf = crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
+        &mut registry, leaf_tool, "leaf", 1, vec![grandchild.clone()], &snapshot, &names, "cancel-v1", Arc::new(Cancel(calls.clone())),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(), hooks(),
+    ).unwrap();
+    let root_tool = Arc::new(AsyncTool {
+        name: "root",
+        child: Some("leaf"),
+        gate: None,
+        early: false,
+    });
+    let root_identity_tool: Arc<dyn Tool> = root_tool.clone();
+    let _root_identity =
+        crate::nested_identity::register(&root_identity_tool, Some("backend-v1".into())).unwrap();
+    let root = crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
+        &mut registry, root_tool, "root", 1, vec![leaf.clone()], &snapshot, &names, "cancel-v1", Arc::new(Cancel(calls.clone())),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(), hooks(),
+    ).unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![root.register(), leaf.register(), grandchild.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = crate::task_store::TaskStore::new(&store);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !tasks.load(claim.task).unwrap().unwrap().task.is_terminal() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let terminal = tasks.load(claim.task).unwrap().unwrap();
+    if late {
+        assert!(
+            matches!(terminal.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        assert!(crate::async_task_tool::read_unsafe_durable_receipts(&store, child_id).unwrap().iter().any(|r| matches!(&r.outcome, Outcome::Pending { reference } if reference == "late-after-parent-receipt")));
+    } else {
+        assert_eq!(terminal.task.state(), &TaskState::Cancelled);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let _ = driver.shutdown_with_pending().unwrap();
+    let _ = scheduler.shutdown().await;
+}
+
+#[tokio::test]
+async fn nested_busy_identity_defers_parent_callback() {
+    exercise_conversation_park_claim("nested_claim_actual_busy").await;
 }
