@@ -181,6 +181,262 @@ mod task_record {
         }
         Some(task.state.is_terminal_state())
     }
+
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(super) fn is_owned_reservation(
+        before: &[u8],
+        after: &[u8],
+        id: Uuid,
+        interrupted: Uuid,
+    ) -> bool {
+        let Ok(mut old) = serde_json::from_slice::<Task>(before) else {
+            return false;
+        };
+        let Ok(new) = serde_json::from_slice::<Task>(after) else {
+            return false;
+        };
+        if old.id != id
+            || old.state != TaskState::Ready
+            || !old.abort_requested
+            || old.woken_interrupted_attempt != Some(interrupted)
+            || old.restarts > 0 && old.restarts >= old.restart_limit
+            || new.attempt_id.is_none_or(|id| id.is_nil())
+        {
+            return false;
+        }
+        old.state = TaskState::Running;
+        old.attempt_id = new.attempt_id;
+        old.retired_attempt_id = None;
+        old == new
+    }
+}
+
+// Experimental protocol: validate the entire reservation write set under the
+// SQLite write lock. A verifier must not consume this evidence until every
+// writer is fenced by a protocol version requiring this validation.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+fn validate_owned_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    mutations: &[Mutation],
+) -> Result<(), Error> {
+    const PREFIX: &[u8] = b"runtime/woken-owned-reservation/v1/";
+    let markers: Vec<_> = mutations
+        .iter()
+        .filter_map(|m| match m {
+            Mutation::Put { key, value } if key.starts_with(PREFIX) => Some((key, value)),
+            Mutation::Delete { key } if key.starts_with(PREFIX) => Some((key, key)),
+            _ => None,
+        })
+        .collect();
+    if markers.is_empty() {
+        return Ok(());
+    }
+    let fail = || Error::Conflict {
+        key: markers[0].0.clone(),
+    };
+    if markers.len() != 1 || mutations.len() != 2 {
+        return Err(fail());
+    }
+    let (marker_key, marker_bytes) = markers[0];
+    let id = std::str::from_utf8(&marker_key[PREFIX.len()..])
+        .ok()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(fail)?;
+    if marker_key != format!("runtime/woken-owned-reservation/v1/{id}").as_bytes() {
+        return Err(fail());
+    }
+    let marker: serde_json::Value = serde_json::from_slice(marker_bytes).map_err(|_| fail())?;
+    if marker.as_object().is_none_or(|v| v.len() != 4) || marker["version"] != 1 {
+        return Err(fail());
+    }
+    let task_key = [b"durable/task/".as_slice(), id.as_bytes()].concat();
+    let after = mutations
+        .iter()
+        .find_map(|m| match m {
+            Mutation::Put { key, value } if key == &task_key => Some(value),
+            _ => None,
+        })
+        .ok_or_else(fail)?;
+    let (before, ready_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&task_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let graph_key = format!("runtime/woken-owned-graph/v1/{id}").into_bytes();
+    let (graph_bytes, graph_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&graph_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let graph: serde_json::Value = serde_json::from_slice(&graph_bytes).map_err(|_| fail())?;
+    let same_commit: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions a JOIN durable_commit_versions b ON a.sequence=b.sequence WHERE a.key=?1 AND a.version=?2 AND b.key=?3 AND b.version=?4)", rusqlite::params![&task_key, ready_version, &graph_key, graph_version], |r| r.get(0))?;
+    let interrupted = graph["interrupted_attempt"]
+        .as_str()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        .ok_or_else(fail)?;
+    if !same_commit
+        || graph["version"] != 1
+        || graph["root"] != id.to_string()
+        || marker["graph_version"].as_u64() != Some(graph_version)
+        || marker["ready_version"].as_u64() != Some(ready_version)
+        || marker["running"]
+            != serde_json::from_slice::<serde_json::Value>(after).map_err(|_| fail())?
+        || !task_record::is_owned_reservation(&before, after, id, interrupted)
+    {
+        return Err(fail());
+    }
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+        [marker_key],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Err(fail());
+    }
+    let boundary = graph["structure"]["boundary"].as_u64().ok_or_else(fail)?;
+    for (key, field) in [
+        (graph_revision::task_structure_revision(id), "root_revision"),
+        (
+            graph_revision::global_structure_revision(),
+            "global_revision",
+        ),
+    ] {
+        let expected = &graph["structure"][field];
+        let version: Option<u64> = tx
+            .query_row(
+                "SELECT version FROM durable_store_entries WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if expected.as_u64() != version || (!expected.is_null() && expected.as_u64().is_none()) {
+            return Err(fail());
+        }
+        if version.is_none() {
+            let changed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_commit_versions WHERE key=?1 AND version>?2)",
+                rusqlite::params![&key, boundary],
+                |r| r.get(0),
+            )?;
+            if changed {
+                return Err(fail());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "experimental-graph-revision"))]
+mod owned_reservation_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reservation_rejects_wrong_task_and_mixed_graph_mutation() {
+        let store = Store::memory().unwrap();
+        let id = uuid::Uuid::from_u128(1);
+        let interrupted = uuid::Uuid::from_u128(2);
+        let task_key = [b"durable/task/".as_slice(), id.as_bytes()].concat();
+        let graph_key = format!("runtime/woken-owned-graph/v1/{id}").into_bytes();
+        let marker_key = format!("runtime/woken-owned-reservation/v1/{id}").into_bytes();
+        let mut task = json!({"id": id, "owner": {"Conversation": uuid::Uuid::from_u128(3)}, "checkpoint": {"phase":"wait", "data":null}, "state":"Running", "restarts":0, "restart_limit":4, "abort_requested":true, "woken_interrupted_attempt":interrupted});
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: task_key.clone(),
+                    value: serde_json::to_vec(&task).unwrap(),
+                }],
+            )
+            .unwrap();
+        let task_entry = store.get(&task_key).unwrap().unwrap();
+        let root_revision = store
+            .get(&graph_revision::task_structure_revision(id))
+            .unwrap()
+            .map(|e| e.version);
+        let global_revision = store
+            .get(&graph_revision::global_structure_revision())
+            .unwrap()
+            .map(|e| e.version);
+        let boundary = store.put_version().unwrap();
+        let graph = json!({"version":1, "root":id, "interrupted_attempt":interrupted, "structure":{"boundary":boundary,"root_revision":root_revision,"global_revision":global_revision}});
+        task["state"] = json!("Ready");
+        store
+            .commit(
+                &[Check {
+                    key: task_key.clone(),
+                    expected: Expected::Version(task_entry.version),
+                }],
+                &[
+                    Mutation::Put {
+                        key: task_key.clone(),
+                        value: serde_json::to_vec(&task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: graph_key.clone(),
+                        value: serde_json::to_vec(&graph).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let ready_version = store.get(&task_key).unwrap().unwrap().version;
+        let graph_version = store.get(&graph_key).unwrap().unwrap().version;
+        task["state"] = json!("Running");
+        task["attempt_id"] = json!(uuid::Uuid::from_u128(4));
+        let marker = json!({"version":1,"graph_version":graph_version,"ready_version":ready_version,"running":task});
+        let mut writes = vec![
+            Mutation::Put {
+                key: task_key.clone(),
+                value: serde_json::to_vec(&task).unwrap(),
+            },
+            Mutation::Put {
+                key: marker_key,
+                value: serde_json::to_vec(&marker).unwrap(),
+            },
+        ];
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(validate_owned_reservation(&tx, &writes).is_ok());
+        let mut bad = task.clone();
+        bad["abort_requested"] = json!(false);
+        writes[0] = Mutation::Put {
+            key: task_key.clone(),
+            value: serde_json::to_vec(&bad).unwrap(),
+        };
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
+        let mut forged_marker = marker.clone();
+        forged_marker["running"] = bad;
+        let marker_key = match &writes[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        writes[1] = Mutation::Put {
+            key: marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
+        writes[0] = Mutation::Put {
+            key: task_key,
+            value: serde_json::to_vec(&task).unwrap(),
+        };
+        writes[1] = Mutation::Put {
+            key: marker_key,
+            value: serde_json::to_vec(&marker).unwrap(),
+        };
+        writes.push(Mutation::Delete {
+            key: b"durable/task/other".to_vec(),
+        });
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
+    }
 }
 
 /// A single connection, safe to share between threads. Different instances
