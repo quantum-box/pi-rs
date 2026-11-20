@@ -2119,6 +2119,7 @@ pub(crate) fn read_finished_callback_ancestry(
     task: Uuid,
     conversation: Uuid,
     marker: &[u8],
+    active_parent_marker: Option<&[u8]>,
 ) -> Result<(Vec<Uuid>, Vec<Check>, u64), Error> {
     let key = callback_ancestry_key(task);
     let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
@@ -2138,18 +2139,20 @@ pub(crate) fn read_finished_callback_ancestry(
         key,
         expected: Expected::Version(entry.version),
     }];
-    for id in &evidence.ancestry {
+    for (index, id) in evidence.ancestry.iter().enumerate() {
         if id.is_nil() || !seen.insert(*id) {
             return Err(Error::InvalidKey);
         }
         let key = callback_start_key(*id);
-        if store.get(&key)?.is_some() {
-            return Err(Error::InvalidKey);
-        }
-        checks.push(Check {
-            key,
-            expected: Expected::Missing,
-        });
+        let current = store.get(&key)?;
+        let expected = match current {
+            None => Expected::Missing,
+            Some(entry) if index > 0 && active_parent_marker == Some(entry.value.as_slice()) => {
+                Expected::Version(entry.version)
+            }
+            Some(_) => return Err(Error::InvalidKey),
+        };
+        checks.push(Check { key, expected });
     }
     Ok((evidence.ancestry, checks, entry.version))
 }

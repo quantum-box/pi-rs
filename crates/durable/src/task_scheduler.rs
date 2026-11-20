@@ -398,6 +398,7 @@ pub(crate) fn nested_cancel_terminal_checks(
     task: &task_store::StoredTask,
     registry: &Registry,
     boundary: u64,
+    active_parent_marker: Option<&[u8]>,
 ) -> Result<
     (
         Vec<durable_store::Check>,
@@ -464,23 +465,32 @@ pub(crate) fn nested_cancel_terminal_checks(
     .map_err(Error::Handler)?;
     let marker = serde_json::to_vec(&serde_json::json!({"version":1,"claim_id":claim.claim_id,"task":claim.task,"attempt":claim.attempt,"lease":claim.lease,"policy":claim.policy})).map_err(|e| Error::Handler(e.to_string()))?;
     let (finished_ancestry, finished_checks, finished_version) =
-        task_store::read_finished_callback_ancestry(store, task.task.id(), conversation, &marker)?;
+        task_store::read_finished_callback_ancestry(
+            store,
+            task.task.id(),
+            conversation,
+            &marker,
+            active_parent_marker,
+        )?;
     if ancestry != finished_ancestry {
         return Err(Error::Ownership);
     }
     checks.extend(finished_checks);
     let conversation_marker =
         format!("runtime/conversation-callback-start/{conversation}").into_bytes();
-    if store
+    let current_marker = store
         .get(&conversation_marker)
-        .map_err(task_store::Error::from)?
-        .is_some()
-    {
-        return Err(Error::Ownership);
-    }
+        .map_err(task_store::Error::from)?;
+    let expected = match current_marker {
+        None => durable_store::Expected::Missing,
+        Some(entry) if active_parent_marker == Some(entry.value.as_slice()) => {
+            durable_store::Expected::Version(entry.version)
+        }
+        Some(_) => return Err(Error::Ownership),
+    };
     checks.push(durable_store::Check {
         key: conversation_marker,
-        expected: durable_store::Expected::Missing,
+        expected,
     });
     checks.extend(
         crate::async_task_tool::unsafe_park_proof::cancel_checks(store, &task.task, boundary)
@@ -3314,13 +3324,17 @@ impl AdmissionHandle<'_> {
                     .map_err(|e| e.to_string())?,
             )
         };
-        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-            owner.store(),
-            current.task.id(),
-            &tasks.list().map_err(|e| e.to_string())?,
-            boundary,
-        )
-        .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks, _nested_identity_leases) =
+            authenticated_unsafe_descendant_reconciliation(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+                boundary,
+                &definitions.registry,
+                validator,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
         if uncertain.is_some() {
             return Err("unsafe descendant requires reconciliation".into());
         }
@@ -3587,13 +3601,17 @@ impl AdmissionHandle<'_> {
                     .map_err(|e| e.to_string())?,
             )
         };
-        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-            owner.store(),
-            current.task.id(),
-            &tasks.list().map_err(|e| e.to_string())?,
-            boundary,
-        )
-        .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks, _nested_identity_leases) =
+            authenticated_unsafe_descendant_reconciliation(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+                boundary,
+                &definitions.registry,
+                validator,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
         if uncertain.is_some() {
             return Err("unsafe descendant requires reconciliation".into());
         }
@@ -4013,13 +4031,17 @@ impl AdmissionHandle<'_> {
                     .map_err(|e| e.to_string())?,
             )
         };
-        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-            owner.store(),
-            current.task.id(),
-            &tasks.list().map_err(|e| e.to_string())?,
-            boundary,
-        )
-        .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks, _nested_identity_leases) =
+            authenticated_unsafe_descendant_reconciliation(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+                boundary,
+                &definitions.registry,
+                validator,
+                marker,
+            )
+            .map_err(|e| e.to_string())?;
         if uncertain.is_some() {
             return Err("unsafe descendant requires reconciliation".into());
         }
@@ -4187,6 +4209,39 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: &[u8],
     ) -> Result<(), String> {
+        self.retire_conversation_cancel_unknown_inner(
+            claim,
+            identity_lease,
+            expected_identity,
+            marker,
+            false,
+        )
+    }
+
+    pub(crate) fn retire_nested_conversation_cancel_unknown(
+        &self,
+        claim: &ConversationCancelClaim,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+    ) -> Result<(), String> {
+        self.retire_conversation_cancel_unknown_inner(
+            claim,
+            identity_lease,
+            expected_identity,
+            marker,
+            true,
+        )
+    }
+
+    fn retire_conversation_cancel_unknown_inner(
+        &self,
+        claim: &ConversationCancelClaim,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        nested: bool,
+    ) -> Result<(), String> {
         if identity_lease.as_deref() != Some(expected_identity)
             || !self.abort
             || self.standalone
@@ -4216,8 +4271,39 @@ impl AdmissionHandle<'_> {
         {
             return Err("stale uncertain callback attempt".into());
         }
-        let TaskOwner::Conversation(conversation) = current.task.owner() else {
-            return Err("uncertain callback owner changed".into());
+        let (conversation, ancestry_checks) = if nested {
+            let (conversation, _, checks, ancestry_version) =
+                task_store::read_nested_cancel_claim_ancestry(
+                    owner.store(),
+                    current.task.id(),
+                    claim.claim_id,
+                )
+                .map_err(|e| e.to_string())?;
+            let ancestry_key =
+                format!("durable/task-callback-claim-ancestry/{}", current.task.id()).into_bytes();
+            let claim_key = conversation_cancel_claim_key(current.task.id());
+            let claim_entry = owner
+                .store()
+                .get(&claim_key)
+                .map_err(|e| e.to_string())?
+                .ok_or("missing claim")?;
+            let claim_commit = owner
+                .store()
+                .commit_for_version(&claim_key, claim_entry.version)
+                .map_err(|e| e.to_string())?;
+            let ancestry_commit = owner
+                .store()
+                .commit_for_version(&ancestry_key, ancestry_version)
+                .map_err(|e| e.to_string())?;
+            if claim_commit.is_none() || claim_commit != ancestry_commit {
+                return Err("nested claim ancestry mismatch".into());
+            }
+            (conversation, checks)
+        } else {
+            let TaskOwner::Conversation(conversation) = current.task.owner() else {
+                return Err("uncertain callback owner changed".into());
+            };
+            (*conversation, Vec::new())
         };
         let (saved, claim_check) = read_conversation_cancel_claim(
             owner.store(),
@@ -4239,15 +4325,20 @@ impl AdmissionHandle<'_> {
         }
         let conversation_finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
             owner.store(),
-            *conversation,
+            conversation,
             marker,
         )
         .map_err(|e| e.to_string())?;
-        let task_finish = task_store::prepare_callback_finish_task_fence(
-            owner.store(),
-            current.task.id(),
-            marker,
-        )
+        let task_finish = if nested {
+            task_store::prepare_authenticated_callback_ancestry_finish(
+                owner.store(),
+                current.task.id(),
+                conversation,
+                marker,
+            )
+        } else {
+            task_store::prepare_callback_finish_task_fence(owner.store(), current.task.id(), marker)
+        }
         .map_err(|e| e.to_string())?;
         let key = format!(
             "durable/replay-safe-async/{}/conversation-park-cancel-unknown",
@@ -4265,6 +4356,7 @@ impl AdmissionHandle<'_> {
                 expected: durable_store::Expected::Missing,
             },
         ];
+        checks.extend(ancestry_checks);
         checks.extend(conversation_finish.checks);
         checks.extend(task_finish.checks);
         let mut mutations = conversation_finish.mutations;
@@ -8191,12 +8283,16 @@ impl Scheduler {
                             if has_live_owned(store, running.task.id(), &self.ts().list()?)? {
                                 return Err(Error::Ownership);
                             }
-                            let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-                                store,
-                                running.task.id(),
-                                &self.ts().list()?,
-                                boundary,
-                            )?;
+                            let (uncertain, descendant_checks, _nested_identity_leases) =
+                                authenticated_unsafe_descendant_reconciliation(
+                                    store,
+                                    running.task.id(),
+                                    &self.ts().list()?,
+                                    boundary,
+                                    &self.registry,
+                                    harness,
+                                    None,
+                                )?;
                             if uncertain.is_some() {
                                 return Err(Error::Handler(
                                     "unsafe descendant requires reconciliation".into(),
@@ -11017,6 +11113,7 @@ impl Scheduler {
                             .map_err(|_| Error::Poisoned)?;
                         let mut recovered_checks = Vec::new();
                         let mut _recovered_identity = None;
+                        let mut _recovered_nested_identities = Vec::new();
                         let mut recovered_after = false;
                         if let (Some(receipt_entry), Ok(reg), Some(harness)) = (
                             &receipt_entry,
@@ -11054,18 +11151,22 @@ impl Scheduler {
                                             &self.ts().list()?,
                                         )?
                                     {
-                                        let (uncertain, descendant_checks) =
-                                            unsafe_descendant_reconciliation(
+                                        let (uncertain, descendant_checks, nested_identities) =
+                                            authenticated_unsafe_descendant_reconciliation(
                                                 store,
                                                 item.task.id(),
                                                 &self.ts().list()?,
                                                 recovery_graph_version,
+                                                &self.registry,
+                                                harness,
+                                                None,
                                             )?;
                                         if uncertain.is_none() {
                                             recovered_checks.extend(owner_checks);
                                             recovered_checks.extend(park_checks);
                                             recovered_checks.extend(descendant_checks);
                                             _recovered_identity = Some(identity);
+                                            _recovered_nested_identities = nested_identities;
                                             recovered_after = true;
                                         }
                                     }
@@ -15390,6 +15491,98 @@ pub(crate) fn unsafe_descendant_reconciliation(
         }
     }
     Ok((unresolved, checks))
+}
+
+/// Verify nested cancelled children while the caller holds the Harness
+/// selection gate. The returned identity leases must remain held through the
+/// same commit as every returned store check. Unverifiable evidence remains an
+/// unresolved effect rather than an authorization.
+#[allow(dead_code)]
+pub(crate) fn authenticated_unsafe_descendant_reconciliation(
+    store: &durable_store::Store,
+    parent: Uuid,
+    tasks: &[task_store::StoredTask],
+    boundary: u64,
+    registry: &Registry,
+    harness: &crate::runtime::Harness,
+    active_parent_marker: Option<&[u8]>,
+) -> Result<
+    (
+        Option<Uuid>,
+        Vec<durable_store::Check>,
+        Vec<crate::nested_identity::IdentityLease>,
+    ),
+    Error,
+> {
+    let mut pending = vec![parent];
+    let mut seen = HashSet::new();
+    let mut checks = Vec::new();
+    let mut leases = Vec::new();
+    let mut unresolved = None;
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            return Err(Error::Ownership);
+        }
+        for item in tasks
+            .iter()
+            .filter(|item| item.task.owner() == &TaskOwner::Task(id) && !item.task.is_background())
+        {
+            pending.push(item.task.id());
+            if item.task.replay_safe()
+                || !item
+                    .task
+                    .kind()
+                    .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."))
+                || !matches!(
+                    item.task.state(),
+                    TaskState::Failed(_) | TaskState::Cancelled
+                )
+            {
+                continue;
+            }
+            let prefix = format!("durable/unsafe-park-async/{}/", item.task.id()).into_bytes();
+            let has_intent = store
+                .list(&prefix)
+                .map_err(task_store::Error::from)?
+                .iter()
+                .any(|(key, _)| key.ends_with(b"/intent"));
+            checks.push(durable_store::Check {
+                key: prefix,
+                expected: durable_store::Expected::PrefixUnchangedSince(boundary),
+            });
+            if !has_intent {
+                continue;
+            }
+            if item.task.state() == &TaskState::Cancelled
+                && let Ok((conversation, binding_checks)) =
+                    harness.checkpointable_nested_cancel_result_checks(&item.task, registry)
+                && let Ok((terminal_checks, lease)) = nested_cancel_terminal_checks(
+                    store,
+                    item,
+                    registry,
+                    boundary,
+                    active_parent_marker,
+                )
+            {
+                let key = nested_cancel_terminal_key(item.task.id());
+                let evidence_entry = store
+                    .get(&key)
+                    .map_err(task_store::Error::from)?
+                    .ok_or(Error::Ownership)?;
+                let evidence: NestedCancelTerminalEvidence =
+                    serde_json::from_slice(&evidence_entry.value)
+                        .map_err(|e| Error::Handler(e.to_string()))?;
+                if evidence.conversation == conversation {
+                    checks.extend(binding_checks);
+                    checks.extend(terminal_checks);
+                    leases.push(lease);
+                    continue;
+                }
+            }
+            unresolved.get_or_insert(item.task.id());
+        }
+    }
+    Ok((unresolved, checks, leases))
 }
 
 fn cancels_nested_on_completion(task: &Task) -> bool {
