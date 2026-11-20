@@ -505,7 +505,13 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!(
+            "change={change}, tasks={:?}, driver={:?}",
+            tasks.list(),
+            driver.get(root_id)
+        )
+    });
     assert_eq!(cancellations.load(Ordering::SeqCst), usize::from(enabled));
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     let claim = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
