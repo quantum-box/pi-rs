@@ -111,6 +111,28 @@ pub(crate) fn owned_cleanup_key(id: Uuid) -> Vec<u8> {
     format!("runtime/owned-cleanup-attempt/{id}").into_bytes()
 }
 
+// Immutable evidence of the exact owned-conversation graph marked with a
+// recovered woken root. This is not callback authorization on its own.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenOwnedGraphEvidence {
+    pub version: u32,
+    pub root: Uuid,
+    pub interrupted_attempt: Uuid,
+    pub root_before_version: u64,
+    pub edges: Vec<WokenOwnedEdgeEvidence>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenOwnedEdgeEvidence {
+    pub edge: crate::ownership_edge::Edge,
+    pub edge_version: u64,
+    pub conversation_before_version: u64,
+}
+pub(crate) fn woken_owned_graph_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-graph/v1/{root}").into_bytes()
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CleanupAttempt {
     attempt: Uuid,
@@ -15020,6 +15042,7 @@ impl Harness {
             }
             let mut states = Vec::new();
             let mut edge_checks = Vec::new();
+            let mut woken_edges = Vec::new();
             while !cq.is_empty() || !tq.is_empty() {
                 while let Some(id) = cq.pop_front() {
                     if !conversations.insert(id) {
@@ -15059,6 +15082,9 @@ impl Harness {
                             expected: Expected::Version(edge.version),
                         });
                         if background || edge.edge.mode == Mode::Foreground {
+                            if woken.is_some() && edge.edge.mode == Mode::Foreground {
+                                woken_edges.push(edge.clone());
+                            }
                             cq.push_back(edge.edge.child);
                         }
                     }
@@ -15240,8 +15266,40 @@ impl Harness {
             }
             batch.checks.extend(edge_checks);
             batch.checks.extend(callback_checks);
-            if let Some((_, checks)) = woken {
+            if let Some((root, checks)) = woken {
                 batch.checks.extend_from_slice(checks);
+                let mut edges = Vec::new();
+                for edge in &woken_edges {
+                    let (_, conversation_before_version) = states
+                        .iter()
+                        .find(|(state, _)| state.id == edge.edge.child)
+                        .ok_or(Error::NotFound)?;
+                    edges.push(WokenOwnedEdgeEvidence {
+                        edge: edge.edge.clone(),
+                        edge_version: edge.version,
+                        conversation_before_version: *conversation_before_version,
+                    });
+                }
+                edges.sort_by_key(|edge| edge.edge.child);
+                let evidence = WokenOwnedGraphEvidence {
+                    version: 1,
+                    root: root.task.id(),
+                    interrupted_attempt: root
+                        .task
+                        .attempt_id()
+                        .ok_or_else(|| Error::Invalid("missing woken attempt".into()))?,
+                    root_before_version: root.version,
+                    edges,
+                };
+                let key = woken_owned_graph_key(root.task.id());
+                batch.checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                batch.mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&evidence)?,
+                });
             }
             if let Some(parent) = nested_parent {
                 batch.checks.push(Check {

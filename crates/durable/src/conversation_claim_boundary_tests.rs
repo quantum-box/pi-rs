@@ -7988,6 +7988,33 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         recovered.task.woken_interrupted_attempt(),
         root.task.attempt_id()
     );
+    let evidence_key = crate::runtime::woken_owned_graph_key(root.task.id());
+    let evidence_entry = store.get(&evidence_key).unwrap().unwrap();
+    let evidence: crate::runtime::WokenOwnedGraphEvidence =
+        serde_json::from_slice(&evidence_entry.value).unwrap();
+    assert_eq!(evidence.root, root.task.id());
+    assert_eq!(Some(evidence.interrupted_attempt), root.task.attempt_id());
+    assert_eq!(evidence.edges.len(), 1);
+    assert_eq!(evidence.edges[0].edge.child, conversation);
+    let graph_commit = store
+        .commit_for_version(&evidence_key, evidence_entry.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_for_version(&crate::task_store::key(root.task.id()), recovered.version)
+            .unwrap(),
+        Some(graph_commit)
+    );
+    let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+    let conversation_entry = store.get(&conversation_key).unwrap().unwrap();
+    assert_eq!(
+        store
+            .commit_for_version(&conversation_key, conversation_entry.version)
+            .unwrap(),
+        Some(graph_commit)
+    );
+
     drop(store);
     drop(harness);
     let options = Options {
