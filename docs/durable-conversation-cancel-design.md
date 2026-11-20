@@ -9,29 +9,22 @@ prepared arguments, disallows nested work from `cancel`, and runs abort or
 interruption after hooks where applicable. `packages/durable` is unchanged
 from the local `9cd49d2c00ac446f774b878d25923bdb3739dadd` reference.
 
-The task store can prepare callback-start markers for an exact child-to-root
-task ancestry in one checked batch. It checks each task version and signal
-revision; public task signals and aborts for the marked chain are fenced, while
-another graph can continue. The existing root callback uses the same machinery
-with a one-task chain. The returned ancestry is provisional evidence: a future
-child callback implementation must persist and validate the complete chain in
-the same claim, retain the conversation and identity start leases through first
-poll, and retire the exact recorded markers with its receipt. A finish batch
-does not independently authenticate a substituted subset of the chain.
-
-Nested callback dispatch remains disabled. In particular, a callback that
-reenters an ancestor via a separate async task needs scoped self-wait detection;
-marker recovery and an ancestor abort racing first poll also need complete
-coverage. Woken conversation cancellation remains disabled: the immutable claim
-and receipt must bind the interrupted wake attempt to its original park,
-prepared arguments and missing late outcome, and a successful cancel must not
-turn the interrupted Tool execution into a known successful result.
+Explicitly registered at-most-once park cancellation applies to a conversation
+root and its registered nested children, including selected replay-safe hooks.
+The child claim commits its exact ancestry and signal revisions; first poll is
+fenced by conversation, selection and task markers. Callback receipt and marker
+retirement commit together. Parent cancellation validates the child's committed
+terminal evidence and holds its identity lease through settlement. Busy identity
+leases defer reservation while unrelated graphs continue. A killed callback is
+not repeated and requires reconciliation; recovery retires its exact markers.
+Nested callback self-wait uses the explicit callback scope, including across
+joined tasks. Hosts must keep their registrations and identities stable.
 
 Woken-cancel preparation exposes checked evidence for the exact running attempt
 and reuses it in standalone recovery. The checks bind the original park and
 prepared arguments and fence joined outcomes. They do not authorize a callback:
-conversation owner, registration, abort and claim/receipt evidence must still
-be joined to the same transaction.
+the production unhooked opt-in joins conversation owner, registration, abort
+and claim/receipt evidence at the relevant boundaries.
 
 `register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel`
 opts an unhooked conversation root into cancellation after a committed park or
@@ -41,7 +34,7 @@ and park proof to claim, first poll and receipt; a late Tool result blocks
 receipt settlement and remains reconciliation evidence. The callback is polled
 at most once. A successful callback does not determine the interrupted Tool's
 outcome: the task fails for reconciliation and `abort_and_wait` can report
-pending cleanup. Roots with live owned work fail closed; child cancellation remains unsupported.
+pending cleanup. Woken roots with live owned work fail closed; woken child cancellation remains unsupported.
 A separate `register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel`
 registration runs the replay-safe selected after hook with fenced memo and
 retains its rich result with the callback receipt and snapshot version. An
@@ -58,8 +51,8 @@ cannot authorize a new callback; the claim and any receipt remain available.
 ## Opt-in first-poll dispatch
 
 `register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel`
-explicitly enables cancellation only for an unhooked, conversation-owned root
-with a confirmed park and no live owned children. The host identity must cover
+explicitly enables cancellation for an unhooked, conversation-owned root or
+registered child with a confirmed park and no live owned children. The host identity must cover
 the Tool and cancel handler, and host updates must use its `IdentityHandle`.
 The original registration still does not dispatch callbacks and keeps its
 existing definition identity. Opting in changes the registered definition identity;
@@ -77,8 +70,7 @@ redispatch the same claim. A process interruption recovers the original claim
 and matching markers into a reconciliation-required terminal task. The callback
 is bounded to 30 seconds and must cooperate with cancellation and avoid detached
 work. Direct Store writes outside the public mutation APIs are a trusted-host
-boundary. Nested cancel callbacks and woken cancellation remain unsupported by
-this opt-in.
+boundary. Woken cancellation remains unsupported by this opt-in.
 
 `register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel`
 records a selected-hook identity and a cancel identity in one definition. It
@@ -100,10 +92,11 @@ receipt when it can be safely committed and requires reconciliation for the
 incomplete after result. A process interruption before the after result is saved
 still requires reconciliation; memo persistence does not authorize another callback. A configured output schema does not prevent this abort path; the host-generated
 abort result has no structured output. A hook that attempts to introduce structured
-output still fails closed. Nested child callbacks and woken cancellation are
-not enabled by this registration. Result publication currently requires the
+output is discarded before downstream hooks. Woken cancellation is not enabled by this registration. Result publication currently requires the
 root adapter in the Harness tool list; an extension-only tool is rejected before
-callback dispatch.
+callback dispatch. The abort hook currently receives a fresh `Tool was aborted`
+result with an error diagnostic, rather than upstream’s tool-named message and
+its preserved partial output.
 
 The claim, start-marker and receipt transactions hold the selection gate
 from validation through commit. A per-name, nonblocking selection start lease
@@ -331,3 +324,60 @@ late receipt races, replaced task/conversation/selection/attempt evidence,
 identity busy and reentrant update, callback failure and retry authorization,
 and process kill/reopen. Until these paths are implemented and verified, the
 existing standalone-only guards and conversation fail-closed behavior remain.
+
+## Nested cancellation status
+
+This branch connects explicit at-most-once park cancellation for conversation-owned
+nested tools, including selected replay-safe hooks. Claim, marker, receipt and
+terminal evidence are checked against the full ancestry; parent claim and
+settlement authenticate the child evidence while holding selection and identity
+leases. Real-driver tests exercise unhooked and selected child-to-parent cancel,
+late outcome and signal conflicts, and callback kill/reopen. A selected parent's receipt survives process loss and recovers after checking
+the child evidence; a late child Tool result forces reconciliation.
+Woken cancellation remains unsupported. This branch does not solve durable
+publication fencing or the associated owner reacquisition race.
+
+## Historical nested design notes
+
+The following notes describe earlier stages; the status above supersedes their
+statements that dispatch and parent evidence consumption are unconnected.
+
+The provisional nested cleanup conversation check walks and version-fences the
+exact task ancestry, then binds it to the pending root, selected registration,
+conversation snapshot and root capability restrictions. It is evidence for a
+future child claim transaction, not authorization to run a callback. The
+cleanup attempt and identity lease, park, signal revisions, claim, first-poll
+markers, callback receipt and parent settlement still require their own
+composed checks. Child callback dispatch remains disabled.
+
+A separate provisional nested-claim ancestry sidecar captures the full
+child-to-root chain and each task's version and signal revision. It can be
+composed with a claim and later checked while creating the authenticated start
+markers, so a signal or owner change between the claim and first poll causes a
+conflict. Its reopen and ancestor-signal race are tested, but neither the claim
+nor dispatch calls it yet; the sidecar alone does not authorize a callback.
+
+An experimental, test-only nested path now composes the child claim with the
+ancestry sidecar, creates the full marker chain, polls an unhooked cancellation
+callback once under the conversation start lease, and saves its receipt while
+retiring the markers in one checked commit. Real-driver tests reject an
+ancestor signal or late Tool receipt arriving between claim and marker creation;
+a process killed during callback leaves its claim and ancestor markers durable.
+On real-driver reopen, the original interrupted cleanup is failed for
+reconciliation and its authenticated markers are retired atomically; the
+callback is not rerun. This path is not enabled in production. In particular,
+parent settlement does not yet consume a successful child. A test-only path
+commits the cancelled child and its terminal evidence together; a late Tool
+receipt arriving at settlement forces reconciliation. A selected-child test
+also pins selection through first poll and runs the replay-safe after hook with
+fenced memo before its version-2 receipt. These paths are not enabled in
+production.
+
+The provisional nested-success reader checks the claim and ancestry sidecar
+were co-committed, marker creation preceded the callback receipt, and the
+receipt preceded the atomic task and terminal-evidence commit. It checks the
+park and late-outcome fence, registration identity, marker retirement and
+current ancestry, and returns a host identity lease plus store checks. A
+separate Harness check binds an already-cancelled child to the current root and
+selection. Neither check is wired into parent settlement; a caller must hold
+the selection gate and the returned identity lease through the parent commit.

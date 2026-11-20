@@ -107,7 +107,8 @@ pub fn register_conversation_unsafe_durable_tool_with_park_cancel(
 }
 
 /// Explicitly enable at-most-once cancellation for a conversation-owned,
-/// unhooked unsafe root. An interrupted callback requires reconciliation.
+/// unhooked unsafe conversation tool, including an owned child. An interrupted
+/// callback requires reconciliation.
 #[allow(clippy::too_many_arguments)]
 pub fn register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
     registry: &mut crate::task_scheduler::Registry,
@@ -296,7 +297,7 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_ca
     )
 }
 
-/// Opt in a conversation root with selected replay-safe hooks to an at-most-once
+/// Opt in a conversation tool with selected replay-safe hooks to an at-most-once
 /// parked cancellation callback. If the callback or after hook is interrupted,
 /// reconciliation is required. Abort-time memo operations are fenced to the active cleanup attempt.
 #[allow(clippy::too_many_arguments)]

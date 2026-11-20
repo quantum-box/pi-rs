@@ -1726,7 +1726,7 @@ pub(crate) fn callback_start_key(task_id: Uuid) -> Vec<u8> {
 }
 
 pub(crate) fn reentrant_callback(store: &Store, task: Uuid) -> Result<bool, Error> {
-    let Some(marker) = durable_store::controls::callback_marker_for_task(task) else {
+    let Some(marker) = durable_store::controls::current_callback_marker() else {
         return Ok(false);
     };
     Ok(store
@@ -1876,6 +1876,360 @@ pub(crate) fn prepare_callback_finish_ancestry_fence(
     Ok(batch)
 }
 
+/// Ancestor versions and signal revisions read before a nested callback claim.
+/// It must be committed atomically with the identity-bound claim; neither this
+/// sidecar nor its presence authorizes execution.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NestedCancelClaimAncestry {
+    version: u32,
+    conversation: Uuid,
+    task: Uuid,
+    claim: Uuid,
+    ancestry: Vec<NestedCancelClaimAncestor>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NestedCancelClaimAncestor {
+    task: Uuid,
+    version: u64,
+    signal_revision: Option<u64>,
+}
+fn nested_cancel_claim_ancestry_key(task: Uuid) -> Vec<u8> {
+    format!("durable/task-callback-claim-ancestry/{task}").into_bytes()
+}
+
+/// Compose with the nested claim and its conversation, park, registration and
+/// lease checks. The signal revision and owner versions are captured together.
+#[allow(dead_code)]
+pub(crate) fn prepare_nested_cancel_claim_ancestry(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    claim: Uuid,
+) -> Result<OwnedBatch, Error> {
+    if claim.is_nil() || task.is_nil() || conversation.is_nil() {
+        return Err(Error::InvalidKey);
+    }
+    let (ancestry, _) =
+        prepare_callback_start_ancestry_fence(store, task, conversation, b"claim-probe")?;
+    if ancestry.len() < 2 {
+        return Err(Error::InvalidKey);
+    }
+    let tasks = TaskStore::new(store);
+    let mut checks = Vec::new();
+    let mut records = Vec::with_capacity(ancestry.len());
+    for (i, id) in ancestry.iter().enumerate() {
+        let record = tasks.load(*id)?.ok_or(Error::SignalTargetNotFound)?;
+        let expected_owner = ancestry
+            .get(i + 1)
+            .map_or(TaskOwner::Conversation(conversation), |parent| {
+                TaskOwner::Task(*parent)
+            });
+        if record.task.owner() != &expected_owner {
+            return Err(Error::InvalidKey);
+        }
+        let revision = store.get(&signal_revision_key(*id))?.map(|e| e.version);
+        checks.push(Check {
+            key: key(*id),
+            expected: Expected::Version(record.version),
+        });
+        checks.push(Check {
+            key: signal_revision_key(*id),
+            expected: revision.map_or(Expected::Missing, Expected::Version),
+        });
+        records.push(NestedCancelClaimAncestor {
+            task: *id,
+            version: record.version,
+            signal_revision: revision,
+        });
+    }
+    let evidence = NestedCancelClaimAncestry {
+        version: 1,
+        conversation,
+        task,
+        claim,
+        ancestry: records,
+    };
+    let key = nested_cancel_claim_ancestry_key(task);
+    checks.push(Check {
+        key: key.clone(),
+        expected: Expected::Missing,
+    });
+    Ok(OwnedBatch {
+        checks,
+        mutations: vec![Mutation::Put {
+            key,
+            value: serde_json::to_vec(&evidence)?,
+        }],
+    })
+}
+
+/// Read and authenticate the stored nested claim ancestry for recovery. The
+/// caller must check the claim/sidecar commit identity and compose these checks
+/// with the terminal transition and any exact marker retirement.
+#[allow(dead_code)]
+pub(crate) fn read_nested_cancel_claim_ancestry(
+    store: &Store,
+    task: Uuid,
+    claim: Uuid,
+) -> Result<(Uuid, Vec<Uuid>, Vec<Check>, u64), Error> {
+    let key = nested_cancel_claim_ancestry_key(task);
+    let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
+    let evidence: NestedCancelClaimAncestry = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.claim != claim
+        || claim.is_nil()
+        || evidence.conversation.is_nil()
+        || evidence.ancestry.len() < 2
+        || evidence.ancestry.len() > 1024
+    {
+        return Err(Error::InvalidKey);
+    }
+    let chain: Vec<_> = evidence.ancestry.iter().map(|item| item.task).collect();
+    let mut seen = std::collections::HashSet::new();
+    if chain.first() != Some(&task) || chain.iter().any(|id| id.is_nil() || !seen.insert(*id)) {
+        return Err(Error::InvalidKey);
+    }
+    let tasks = TaskStore::new(store);
+    let mut checks = vec![Check {
+        key,
+        expected: Expected::Version(entry.version),
+    }];
+    for (i, id) in chain.iter().enumerate() {
+        let record = tasks.load(*id)?.ok_or(Error::SignalTargetNotFound)?;
+        let expected_owner = chain
+            .get(i + 1)
+            .map_or(TaskOwner::Conversation(evidence.conversation), |parent| {
+                TaskOwner::Task(*parent)
+            });
+        if record.task.owner() != &expected_owner {
+            return Err(Error::InvalidKey);
+        }
+        checks.push(Check {
+            key: self::key(*id),
+            expected: Expected::Version(record.version),
+        });
+    }
+    Ok((evidence.conversation, chain, checks, entry.version))
+}
+
+/// Start the exact chain and recheck the immutable sidecar and every version
+/// observed at claim time. Compose with the live claim, park, identity and
+/// conversation marker checks in the same transaction before first poll.
+#[allow(dead_code)]
+pub(crate) fn prepare_nested_cancel_claimed_ancestry_start(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    claim: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    let key = nested_cancel_claim_ancestry_key(task);
+    let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
+    let evidence: NestedCancelClaimAncestry = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.conversation != conversation
+        || evidence.claim != claim
+        || claim.is_nil()
+        || evidence.ancestry.len() < 2
+        || evidence.ancestry.len() > 1024
+    {
+        return Err(Error::InvalidKey);
+    }
+    let (chain, _) = prepare_callback_start_ancestry_fence(store, task, conversation, marker)?;
+    if chain
+        .iter()
+        .copied()
+        .ne(evidence.ancestry.iter().map(|e| e.task))
+    {
+        return Err(Error::InvalidKey);
+    }
+    let mut batch =
+        prepare_authenticated_callback_ancestry_start(store, task, conversation, marker)?;
+    batch.checks.push(Check {
+        key,
+        expected: Expected::Version(entry.version),
+    });
+    for ancestor in evidence.ancestry {
+        batch.checks.push(Check {
+            key: self::key(ancestor.task),
+            expected: Expected::Version(ancestor.version),
+        });
+        batch.checks.push(Check {
+            key: signal_revision_key(ancestor.task),
+            expected: ancestor
+                .signal_revision
+                .map_or(Expected::Missing, Expected::Version),
+        });
+    }
+    Ok(batch)
+}
+
+/// Immutable ancestry evidence. This authenticates which markers a future
+/// cleanup must retire; it does not by itself authorize external dispatch.
+#[derive(Serialize, Deserialize)]
+struct CallbackAncestryEvidence {
+    version: u32,
+    conversation: Uuid,
+    task: Uuid,
+    marker: Vec<u8>,
+    ancestry: Vec<Uuid>,
+}
+fn callback_ancestry_key(task: Uuid) -> Vec<u8> {
+    format!("durable/task-callback-ancestry/{task}").into_bytes()
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_authenticated_callback_ancestry_start(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    let (ancestry, mut batch) =
+        prepare_callback_start_ancestry_fence(store, task, conversation, marker)?;
+    let evidence = CallbackAncestryEvidence {
+        version: 1,
+        conversation,
+        task,
+        marker: marker.to_vec(),
+        ancestry,
+    };
+    let key = callback_ancestry_key(task);
+    batch.checks.push(Check {
+        key: key.clone(),
+        expected: Expected::Missing,
+    });
+    batch.mutations.push(Mutation::Put {
+        key,
+        value: serde_json::to_vec(&evidence)?,
+    });
+    Ok(batch)
+}
+
+/// Read the exact marker chain after retirement. The caller must bind this
+/// record to a trusted receipt and claim and check that those commits occurred
+/// in order; missing markers alone do not prove a callback ran.
+#[allow(dead_code)]
+pub(crate) fn read_finished_callback_ancestry(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    marker: &[u8],
+    active_parent_marker: Option<&[u8]>,
+) -> Result<(Vec<Uuid>, Vec<Check>, u64), Error> {
+    let key = callback_ancestry_key(task);
+    let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
+    let evidence: CallbackAncestryEvidence = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.conversation != conversation
+        || evidence.marker != marker
+        || evidence.ancestry.first() != Some(&task)
+        || evidence.ancestry.len() < 2
+        || evidence.ancestry.len() > 1024
+    {
+        return Err(Error::InvalidKey);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut checks = vec![Check {
+        key,
+        expected: Expected::Version(entry.version),
+    }];
+    for (index, id) in evidence.ancestry.iter().enumerate() {
+        if id.is_nil() || !seen.insert(*id) {
+            return Err(Error::InvalidKey);
+        }
+        let key = callback_start_key(*id);
+        let current = store.get(&key)?;
+        let expected = match current {
+            None => Expected::Missing,
+            Some(entry) if index > 0 && active_parent_marker == Some(entry.value.as_slice()) => {
+                Expected::Version(entry.version)
+            }
+            Some(_) => return Err(Error::InvalidKey),
+        };
+        checks.push(Check { key, expected });
+    }
+    Ok((evidence.ancestry, checks, entry.version))
+}
+
+/// Finish exactly the persisted chain. The caller must also authenticate its
+/// immutable claim, callback outcome, identity, and active attempt atomically.
+#[allow(dead_code)]
+pub(crate) fn prepare_authenticated_callback_ancestry_finish(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    let key = callback_ancestry_key(task);
+    let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
+    let evidence: CallbackAncestryEvidence = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.conversation != conversation
+        || evidence.marker != marker
+        || evidence.ancestry.first() != Some(&task)
+    {
+        return Err(Error::InvalidKey);
+    }
+    let mut batch = prepare_callback_finish_ancestry_fence(store, &evidence.ancestry, marker)?;
+    batch.checks.push(Check {
+        key,
+        expected: Expected::Version(entry.version),
+    });
+    Ok(batch)
+}
+
+/// Retire only the chain co-committed with this exact nested claim. A valid
+/// marker on a substituted subset must never release only part of the graph.
+#[allow(dead_code)]
+pub(crate) fn prepare_nested_cancel_ancestry_finish(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    claim: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    let (saved_conversation, ancestry, ancestry_checks, ancestry_version) =
+        read_nested_cancel_claim_ancestry(store, task, claim)?;
+    if saved_conversation != conversation {
+        return Err(Error::InvalidKey);
+    }
+    let evidence_key = callback_ancestry_key(task);
+    let entry = store.get(&evidence_key)?.ok_or(Error::InvalidKey)?;
+    let evidence: CallbackAncestryEvidence = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.conversation != conversation
+        || evidence.marker != marker
+        || evidence.ancestry != ancestry
+    {
+        return Err(Error::InvalidKey);
+    }
+    let claim_key =
+        format!("durable/replay-safe-async/{task}/conversation-park-cancel-claim").into_bytes();
+    let claim_entry = store.get(&claim_key)?.ok_or(Error::InvalidKey)?;
+    let ancestry_key = nested_cancel_claim_ancestry_key(task);
+    let claim_commit = store.commit_for_version(&claim_key, claim_entry.version)?;
+    let ancestry_commit = store.commit_for_version(&ancestry_key, ancestry_version)?;
+    if claim_commit.is_none() || claim_commit != ancestry_commit {
+        return Err(Error::InvalidKey);
+    }
+    let mut batch =
+        prepare_authenticated_callback_ancestry_finish(store, task, conversation, marker)?;
+    batch.checks.extend(ancestry_checks);
+    batch.checks.push(Check {
+        key: claim_key,
+        expected: Expected::Version(claim_entry.version),
+    });
+    Ok(batch)
+}
+
 pub(crate) fn signal_revision_key(task_id: Uuid) -> Vec<u8> {
     let mut key = SIGNAL_REVISION_PREFIX.to_vec();
     key.extend_from_slice(task_id.as_bytes());
@@ -1963,6 +2317,314 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ancestry_callback_fences_each_owner_and_detects_scoped_reentry() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let root = task(1, 3);
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(root.id()),
+            Checkpoint {
+                phase: "first".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap();
+        let unrelated = task(3, 3);
+        ts.save(&[
+            Save::Create(&root),
+            Save::Create(&child),
+            Save::Create(&unrelated),
+        ])
+        .unwrap();
+        let marker = b"authenticated claim";
+        let (ancestry, prepared) =
+            prepare_callback_start_ancestry_fence(&db, child.id(), Uuid::from_u128(100), marker)
+                .unwrap();
+        assert_eq!(ancestry, vec![child.id(), root.id()]);
+        db.commit(&prepared.checks, &prepared.mutations).unwrap();
+        for id in &ancestry {
+            assert!(matches!(
+                ts.update(&ts.load(*id).unwrap().unwrap(), |t| t.request_abort()),
+                Err(Error::CallbackStartBusy)
+            ));
+        }
+        ts.update(&ts.load(unrelated.id()).unwrap().unwrap(), |t| {
+            t.request_abort()
+        })
+        .unwrap();
+        durable_store::controls::with_callback_context(
+            Uuid::from_u128(100),
+            child.id(),
+            marker.to_vec(),
+            async {
+                assert!(reentrant_callback(&db, child.id()).unwrap());
+                assert!(reentrant_callback(&db, root.id()).unwrap());
+                assert!(!reentrant_callback(&db, unrelated.id()).unwrap());
+                let scope = durable_store::controls::CallbackScope::current().unwrap();
+                std::thread::scope(|threads| {
+                    threads
+                        .spawn(|| {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .build()
+                                .unwrap();
+                            rt.block_on(scope.scope(async {
+                                assert!(reentrant_callback(&db, root.id()).unwrap());
+                            }));
+                        })
+                        .join()
+                        .unwrap();
+                });
+            },
+        )
+        .await;
+        assert!(prepare_callback_finish_ancestry_fence(&db, &ancestry, b"wrong").is_err());
+        let finish = prepare_callback_finish_ancestry_fence(&db, &ancestry, marker).unwrap();
+        db.commit(&finish.checks, &finish.mutations).unwrap();
+        assert!(!reentrant_callback(&db, root.id()).unwrap());
+    }
+
+    #[test]
+    fn ancestry_callback_start_rejects_changed_owner_before_commit() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let root = task(1, 3);
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(root.id()),
+            Checkpoint {
+                phase: "first".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap();
+        ts.save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        let (_, prepared) =
+            prepare_callback_start_ancestry_fence(&db, child.id(), Uuid::from_u128(100), b"claim")
+                .unwrap();
+        ts.update(&ts.load(root.id()).unwrap().unwrap(), |t| t.request_abort())
+            .unwrap();
+        assert!(matches!(
+            db.commit(&prepared.checks, &prepared.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(db.get(&callback_start_key(child.id())).unwrap().is_none());
+        assert!(
+            prepare_callback_start_ancestry_fence(&db, child.id(), Uuid::new_v4(), b"claim")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_finish_rejects_substituted_ancestry_subset() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let root = task(1, 3);
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(root.id()),
+            Checkpoint {
+                phase: "first".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap();
+        ts.save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        let conversation = Uuid::from_u128(100);
+        let claim = Uuid::new_v4();
+        let mut batch =
+            prepare_nested_cancel_claim_ancestry(&db, child.id(), conversation, claim).unwrap();
+        let claim_key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-claim",
+            child.id()
+        )
+        .into_bytes();
+        batch.checks.push(Check {
+            key: claim_key.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: claim_key,
+            value: vec![1],
+        });
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let start = prepare_nested_cancel_claimed_ancestry_start(
+            &db,
+            child.id(),
+            conversation,
+            claim,
+            b"marker",
+        )
+        .unwrap();
+        db.commit(&start.checks, &start.mutations).unwrap();
+        let key = callback_ancestry_key(child.id());
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut evidence: CallbackAncestryEvidence = serde_json::from_slice(&entry.value).unwrap();
+        evidence.ancestry.pop();
+        db.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&evidence).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(
+            prepare_nested_cancel_ancestry_finish(&db, child.id(), conversation, claim, b"marker")
+                .is_err()
+        );
+        assert!(db.get(&callback_start_key(root.id())).unwrap().is_some());
+        assert!(db.get(&callback_start_key(child.id())).unwrap().is_some());
+    }
+
+    #[test]
+    fn nested_claim_fences_ancestor_signal_and_attempt_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&db);
+        let root = task(1, 3);
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(root.id()),
+            Checkpoint {
+                phase: "first".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap();
+        ts.save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        let conversation = Uuid::from_u128(100);
+        let claim = Uuid::new_v4();
+        let batch =
+            prepare_nested_cancel_claim_ancestry(&db, child.id(), conversation, claim).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        assert!(
+            prepare_nested_cancel_claimed_ancestry_start(
+                &db,
+                child.id(),
+                conversation,
+                Uuid::new_v4(),
+                b"marker"
+            )
+            .is_err()
+        );
+        let start = prepare_nested_cancel_claimed_ancestry_start(
+            &db,
+            child.id(),
+            conversation,
+            claim,
+            b"marker",
+        )
+        .unwrap();
+        db.commit(&start.checks, &[]).unwrap();
+        let rev = signal_revision_key(root.id());
+        db.commit(
+            &[Check {
+                key: rev.clone(),
+                expected: Expected::Missing,
+            }],
+            &[Mutation::Put {
+                key: rev,
+                value: vec![1],
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.commit(&start.checks, &start.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(db.get(&callback_start_key(child.id())).unwrap().is_none());
+        let stale = prepare_nested_cancel_claimed_ancestry_start(
+            &db,
+            child.id(),
+            conversation,
+            claim,
+            b"marker",
+        )
+        .unwrap();
+        assert!(matches!(
+            db.commit(&stale.checks, &stale.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn authenticated_callback_ancestry_survives_reopen_and_rejects_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&db);
+        let root = task(1, 3);
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(root.id()),
+            Checkpoint {
+                phase: "first".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap();
+        ts.save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        let conversation = Uuid::from_u128(100);
+        let start =
+            prepare_authenticated_callback_ancestry_start(&db, child.id(), conversation, b"claim")
+                .unwrap();
+        db.commit(&start.checks, &start.mutations).unwrap();
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        assert!(
+            prepare_authenticated_callback_ancestry_finish(&db, child.id(), conversation, b"wrong")
+                .is_err()
+        );
+        let finish =
+            prepare_authenticated_callback_ancestry_finish(&db, child.id(), conversation, b"claim")
+                .unwrap();
+        let key = callback_ancestry_key(child.id());
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: entry.value,
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.commit(&finish.checks, &finish.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        let finish =
+            prepare_authenticated_callback_ancestry_finish(&db, child.id(), conversation, b"claim")
+                .unwrap();
+        db.commit(&finish.checks, &finish.mutations).unwrap();
+        assert!(db.get(&callback_start_key(root.id())).unwrap().is_none());
+        assert!(db.get(&callback_start_key(child.id())).unwrap().is_none());
+        assert!(
+            db.get(&callback_ancestry_key(child.id()))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

@@ -883,6 +883,7 @@ struct ConversationAbortMemo<'a, 'b> {
     expected_identity: &'a str,
     marker: &'a [u8],
     snapshot: &'a durable_store::Check,
+    nested: bool,
     failed: Mutex<bool>,
 }
 impl ConversationAbortMemo<'_, '_> {
@@ -905,6 +906,7 @@ impl ConversationAbortMemo<'_, '_> {
                 self.snapshot,
                 key,
                 value,
+                self.nested,
             ),
             ConversationAbortClaim::Woken(claim) => {
                 self.admission.woken_conversation_cancel_hook_memo(
@@ -1928,6 +1930,7 @@ impl Handler for Executor {
                             admission,
                             handler: self,
                             claim: ConversationAbortClaim::Woken(&claim),
+                            nested: false,
                             identity: &_identity_lease,
                             expected_identity: expected,
                             marker: &marker,
@@ -2093,6 +2096,7 @@ impl Handler for Executor {
                                 admission,
                                 handler: self,
                                 claim: ConversationAbortClaim::Woken(&claim),
+                                nested: false,
                                 identity: &_identity_lease,
                                 expected_identity: expected,
                                 marker: &marker,
@@ -2172,8 +2176,163 @@ impl Handler for Executor {
                 // known result. Preserve the receipt for reconciliation.
                 return Err("interrupted woken execution; reconciliation required".into());
             }
-            let _claim = admission
-                .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
+            #[cfg(test)]
+            if crate::task_scheduler::take_test_nested_claim(task.id()) {
+                let claim = admission.record_nested_conversation_park_claim(
+                    self,
+                    cancel.conversation_cancel_policy(),
+                    &_identity_lease,
+                    expected,
+                )?;
+                let real_callback = crate::task_scheduler::take_test_nested_callback(task.id());
+                let start = if real_callback {
+                    Some(admission.nested_conversation_callback_start_lease()?)
+                } else {
+                    None
+                };
+                let marker = admission.record_nested_conversation_start_markers(
+                    self,
+                    claim.claim_id,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                let mut after_arguments = None;
+                let result = if let Some((conversation, start)) = start {
+                    let stored: ParkCheckpoint =
+                        serde_json::from_value(task.checkpoint().data.clone())
+                            .map_err(|_| "invalid park")?;
+                    after_arguments = Some(stored.arguments.clone());
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let cancellation = pi_rs_core::CancellationToken::new();
+                    rt.block_on(durable_store::controls::with_callback_context(
+                        conversation,
+                        task.id(),
+                        marker.clone(),
+                        async {
+                            let scope = durable_store::controls::CallbackScope::current()
+                                .ok_or("missing scope")?;
+                            let future = cancel.cancel_scoped(
+                                stored.arguments,
+                                stored.checkpoint,
+                                ToolContext {
+                                    operation_id: task.id(),
+                                    cancellation,
+                                },
+                                scope,
+                            );
+                            let mut future = std::pin::pin!(future);
+                            let mut lease = Some((start, selection_start));
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                std::future::poll_fn(|cx| match lease.take() {
+                                    Some((lease, Some(selection))) => {
+                                        selection.poll_first(lease, future.as_mut(), cx)
+                                    }
+                                    Some((lease, None)) => lease.poll_first(future.as_mut(), cx),
+                                    None => future.as_mut().poll(cx),
+                                }),
+                            )
+                            .await
+                            .map_err(|_| "callback timed out")?
+                        },
+                    ))?;
+                    "callback returned"
+                } else {
+                    "test evidence only"
+                };
+                let (after_result, snapshot_check) = if self.block_results && real_callback {
+                    let (snapshot, check) = admission.nested_conversation_cancel_hook_snapshot()?;
+                    let memo = ConversationAbortMemo {
+                        admission,
+                        handler: self,
+                        claim: ConversationAbortClaim::Parked(&claim),
+                        identity: &_identity_lease,
+                        expected_identity: expected,
+                        marker: &marker,
+                        snapshot: &check,
+                        nested: true,
+                        failed: Mutex::new(false),
+                    };
+                    let result = self.conversation_cancel_after_result(
+                        task,
+                        after_arguments.ok_or("missing arguments")?,
+                        snapshot,
+                        &memo,
+                    )?;
+                    (Some(result), Some(check))
+                } else {
+                    (None, None)
+                };
+                let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                    version: if after_result.is_some() { 2 } else { 1 },
+                    claim,
+                    result: result.into(),
+                    after_result,
+                };
+                if let Some(check) = snapshot_check.as_ref() {
+                    if admission
+                        .store_nested_conversation_cancel_receipt_and_after(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            b"wrong-marker",
+                            check,
+                        )
+                        .is_ok()
+                    {
+                        return Err("substituted nested marker accepted".into());
+                    }
+                    admission.store_nested_conversation_cancel_receipt_and_after(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                        check,
+                    )?;
+                } else {
+                    if admission
+                        .store_nested_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            b"wrong-marker",
+                        )
+                        .is_ok()
+                    {
+                        return Err("substituted nested marker accepted".into());
+                    }
+                    admission.store_nested_conversation_cancel_receipt_and_retire(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                }
+                if crate::task_scheduler::take_test_nested_success(task.id()) {
+                    return Ok(Step::Succeed(serde_json::Value::Null));
+                }
+                return Err("nested claim probe complete; reconciliation required".into());
+            }
+            let nested = matches!(task.owner(), crate::task::TaskOwner::Task(_));
+            let _claim = if nested {
+                admission.record_nested_conversation_park_claim(
+                    self,
+                    cancel.conversation_cancel_policy(),
+                    &_identity_lease,
+                    expected,
+                )?
+            } else {
+                admission
+                    .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?
+            };
             #[cfg(test)]
             if crate::task_scheduler::take_test_conversation_start(task.id()) {
                 let result = admission.record_conversation_start_markers(
@@ -2319,24 +2478,38 @@ impl Handler for Executor {
                 .build()
                 .map_err(|e| e.to_string())?;
             let after_arguments = stored.arguments.clone();
-            let start = admission.conversation_callback_start_lease()?;
-            let marker_result = admission.record_conversation_start_markers(
-                self,
-                _claim.claim_id,
-                &_identity_lease,
-                expected,
-                cancel.conversation_cancel_policy(),
-            );
+            let (conversation, start) = if nested {
+                admission.nested_conversation_callback_start_lease()?
+            } else {
+                let crate::task::TaskOwner::Conversation(id) = task.owner() else {
+                    unreachable!()
+                };
+                (*id, admission.conversation_callback_start_lease()?)
+            };
+            let marker_result = if nested {
+                admission.record_nested_conversation_start_markers(
+                    self,
+                    _claim.claim_id,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )
+            } else {
+                admission.record_conversation_start_markers(
+                    self,
+                    _claim.claim_id,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )
+            };
             #[cfg(test)]
             crate::task_scheduler::report_conversation_start_result(task.id());
             let marker = marker_result?;
             let cancellation = pi_rs_core::CancellationToken::new();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let crate::task::TaskOwner::Conversation(conversation) = task.owner() else {
-                    unreachable!("conversation cancel requires a root");
-                };
                 runtime.block_on(durable_store::controls::with_callback_context(
-                    *conversation,
+                    conversation,
                     task.id(),
                     marker.clone(),
                     async {
@@ -2369,37 +2542,44 @@ impl Handler for Executor {
             }));
             cancellation.cancel();
             if !matches!(result, Ok(Ok(Ok(())))) {
-                admission.retire_conversation_cancel_unknown(
-                    &_claim,
-                    &_identity_lease,
-                    expected,
-                    &marker,
-                )?;
+                if nested {
+                    admission.retire_nested_conversation_cancel_unknown(
+                        &_claim,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                } else {
+                    admission.retire_conversation_cancel_unknown(
+                        &_claim,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                }
                 return Err("conversation cancel outcome unknown; reconciliation required".into());
             }
             let (after_result, snapshot_check) = if self.block_results {
-                let after =
-                    admission
-                        .conversation_cancel_hook_snapshot()
-                        .and_then(|(snapshot, check)| {
-                            let memo = ConversationAbortMemo {
-                                admission,
-                                handler: self,
-                                claim: ConversationAbortClaim::Parked(&_claim),
-                                identity: &_identity_lease,
-                                expected_identity: expected,
-                                marker: &marker,
-                                snapshot: &check,
-                                failed: Mutex::new(false),
-                            };
-                            self.conversation_cancel_after_result(
-                                task,
-                                after_arguments,
-                                snapshot,
-                                &memo,
-                            )
-                            .map(|result| (result, check))
-                        });
+                let after = (if nested {
+                    admission.nested_conversation_cancel_hook_snapshot()
+                } else {
+                    admission.conversation_cancel_hook_snapshot()
+                })
+                .and_then(|(snapshot, check)| {
+                    let memo = ConversationAbortMemo {
+                        admission,
+                        handler: self,
+                        claim: ConversationAbortClaim::Parked(&_claim),
+                        identity: &_identity_lease,
+                        expected_identity: expected,
+                        marker: &marker,
+                        snapshot: &check,
+                        nested,
+                        failed: Mutex::new(false),
+                    };
+                    self.conversation_cancel_after_result(task, after_arguments, snapshot, &memo)
+                        .map(|result| (result, check))
+                });
                 match after {
                     Ok((result, check)) => (Some(result), Some(check)),
                     Err(error) => {
@@ -2409,22 +2589,39 @@ impl Handler for Executor {
                             result: "callback returned".into(),
                             after_result: None,
                         };
-                        if admission
-                            .store_conversation_cancel_receipt_and_retire(
+                        let saved = if nested {
+                            admission.store_nested_conversation_cancel_receipt_and_retire(
                                 self,
                                 &receipt,
                                 &_identity_lease,
                                 expected,
                                 &marker,
                             )
-                            .is_err()
-                        {
-                            admission.retire_conversation_cancel_unknown(
-                                &_claim,
+                        } else {
+                            admission.store_conversation_cancel_receipt_and_retire(
+                                self,
+                                &receipt,
                                 &_identity_lease,
                                 expected,
                                 &marker,
-                            )?;
+                            )
+                        };
+                        if saved.is_err() {
+                            if nested {
+                                admission.retire_nested_conversation_cancel_unknown(
+                                    &_claim,
+                                    &_identity_lease,
+                                    expected,
+                                    &marker,
+                                )?;
+                            } else {
+                                admission.retire_conversation_cancel_unknown(
+                                    &_claim,
+                                    &_identity_lease,
+                                    expected,
+                                    &marker,
+                                )?;
+                            }
                         }
                         return Err(format!(
                             "conversation cancel after hook incomplete; reconciliation required: {error}"
@@ -2440,8 +2637,17 @@ impl Handler for Executor {
                 result: "callback returned".into(),
                 after_result,
             };
-            let saved = match snapshot_check.as_ref() {
-                Some(check) => admission.store_conversation_cancel_receipt_and_after(
+            let saved = match (nested, snapshot_check.as_ref()) {
+                (true, Some(check)) => admission
+                    .store_nested_conversation_cancel_receipt_and_after(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                        check,
+                    ),
+                (false, Some(check)) => admission.store_conversation_cancel_receipt_and_after(
                     self,
                     &receipt,
                     &_identity_lease,
@@ -2449,7 +2655,14 @@ impl Handler for Executor {
                     &marker,
                     check,
                 ),
-                None => admission.store_conversation_cancel_receipt_and_retire(
+                (true, None) => admission.store_nested_conversation_cancel_receipt_and_retire(
+                    self,
+                    &receipt,
+                    &_identity_lease,
+                    expected,
+                    &marker,
+                ),
+                (false, None) => admission.store_conversation_cancel_receipt_and_retire(
                     self,
                     &receipt,
                     &_identity_lease,
@@ -2464,22 +2677,39 @@ impl Handler for Executor {
                     result: "callback returned".into(),
                     after_result: None,
                 };
-                if admission
-                    .store_conversation_cancel_receipt_and_retire(
+                let known = if nested {
+                    admission.store_nested_conversation_cancel_receipt_and_retire(
                         self,
                         &known_callback,
                         &_identity_lease,
                         expected,
                         &marker,
                     )
-                    .is_err()
-                {
-                    admission.retire_conversation_cancel_unknown(
-                        &receipt.claim,
+                } else {
+                    admission.store_conversation_cancel_receipt_and_retire(
+                        self,
+                        &known_callback,
                         &_identity_lease,
                         expected,
                         &marker,
-                    )?;
+                    )
+                };
+                if known.is_err() {
+                    if nested {
+                        admission.retire_nested_conversation_cancel_unknown(
+                            &receipt.claim,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )?;
+                    } else {
+                        admission.retire_conversation_cancel_unknown(
+                            &receipt.claim,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )?;
+                    }
                 }
                 return Err(format!(
                     "conversation cancel result requires reconciliation: {error}"
