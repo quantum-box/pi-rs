@@ -16099,11 +16099,14 @@ impl Harness {
                 if !handler.conversation_cancel_dispatch_enabled() {
                     return Err(Error::Invalid("hooked cancel dispatch not enabled".into()));
                 }
-                cancel_identity = Some(
-                    handler
-                        .conversation_cleanup_identity_lease()
-                        .map_err(|_| Error::Invalid("cancel identity unavailable".into()))?,
-                );
+                cancel_identity = Some(handler.conversation_cleanup_identity_lease().map_err(
+                    |error| match error {
+                        crate::nested_identity::LeaseFailure::Busy => Error::TaskPublicationBusy,
+                        crate::nested_identity::LeaseFailure::Mismatch => {
+                            Error::Invalid("cancel identity unavailable".into())
+                        }
+                    },
+                )?);
                 let marker_key = crate::task_scheduler::conversation_cancel_terminal_key(task);
                 let marker_entry = store
                     .get(&marker_key)?
@@ -16183,20 +16186,51 @@ impl Harness {
                 let descendants = crate::task_store::TaskStore::new(store)
                     .list()
                     .map_err(|e| Error::Invalid(format!("cancel descendants: {e}")))?;
-                let (uncertain, descendant_checks) =
-                    crate::task_scheduler::unsafe_descendant_reconciliation(
+                let driver = self
+                    .task_driver
+                    .try_lock()
+                    .map_err(|error| match error {
+                        std::sync::TryLockError::WouldBlock => Error::TaskPublicationBusy,
+                        std::sync::TryLockError::Poisoned(_) => Error::Failed,
+                    })?
+                    .as_ref()
+                    .and_then(|driver| driver.upgrade())
+                    .ok_or_else(|| Error::Invalid("cancel result driver unavailable".into()))?;
+                let (registry, lease) = driver.lease_cleanup_registry()?;
+                let (uncertain, descendant_checks, leases) =
+                    crate::task_scheduler::authenticated_parked_terminal_descendants(
                         store,
-                        task,
+                        &child,
                         &descendants,
                         boundary,
+                        &registry,
+                        self,
                     )
-                    .map_err(|e| Error::Invalid(format!("cancel descendants: {e}")))?;
+                    .map_err(|e| match e {
+                        crate::task_scheduler::Error::Busy => Error::TaskPublicationBusy,
+                        _ => Error::Invalid(format!("cancel descendants: {e}")),
+                    })?;
+                registry_lease = Some(lease);
+                nested_identities = leases;
                 if uncertain.is_some() {
                     return Err(Error::Invalid(
                         "unsafe descendant requires reconciliation".into(),
                     ));
                 }
-                result_evidence.extend(descendant_checks);
+                let conversation_key = Self::key(conversation);
+                let current_version = store
+                    .get(&conversation_key)?
+                    .ok_or(Error::NotFound)?
+                    .version;
+                for check in descendant_checks {
+                    if check.key == conversation_key {
+                        if check.expected != Expected::Version(current_version) {
+                            return Err(Error::Invalid("cancel conversation changed".into()));
+                        }
+                    } else {
+                        result_evidence.push(check);
+                    }
+                }
                 rich_result = Some(result);
                 Some(Outcome::Succeeded(String::new()))
             }

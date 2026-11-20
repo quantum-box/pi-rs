@@ -262,6 +262,12 @@ impl DurableAsyncTool for MutableSpecTool {
     }
 }
 async fn exercise_conversation_park_claim(case: &str) {
+    exercise_conversation_park_claim_with_late_publication(case, false).await;
+}
+async fn exercise_conversation_park_claim_with_late_publication(
+    case: &str,
+    late_publication: bool,
+) {
     use pi_rs_durable::async_task_tool::{
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
     };
@@ -1121,6 +1127,40 @@ async fn exercise_conversation_park_claim(case: &str) {
             .await
             .unwrap();
         }
+        if late_publication {
+            let probe_path = path.clone();
+            crate::task_scheduler::on_conversation_cancel_after_settlement(root_id, move || {
+                let store = durable_store::Store::open(probe_path).unwrap();
+                let prefix = format!("durable/unsafe-park-async/{child_id}/");
+                let (mut key, entry) = store
+                    .list(prefix.as_bytes())
+                    .unwrap()
+                    .into_iter()
+                    .find(|(key, _)| key.ends_with(b"/intent"))
+                    .unwrap();
+                let intent: crate::task::Task = serde_json::from_slice(&entry.value).unwrap();
+                let receipt = crate::async_task_tool::UnsafeDurableReceipt {
+                    task_id: child_id,
+                    attempt_id: intent.attempt_id().unwrap(),
+                    outcome: Outcome::Pending {
+                        reference: "late-publication".into(),
+                    },
+                };
+                key.extend_from_slice(b"/receipt");
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&receipt).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+            });
+        }
         if case == "nested_claim_parent"
             || case == "nested_claim_actual"
             || case == "nested_claim_actual_selected"
@@ -1314,6 +1354,20 @@ async fn exercise_conversation_park_claim(case: &str) {
                         2
                     }
                 );
+            }
+            if case == "nested_claim_actual_selected" {
+                scheduler.schedule(conversation);
+                let result = scheduler.wait(conversation).await;
+                if late_publication {
+                    assert!(
+                        result.is_err(),
+                        "late child outcome must prevent after publication"
+                    );
+                } else {
+                    result.unwrap();
+                    let state = scheduler.conversation(conversation).unwrap();
+                    assert!(format!("{state:?}").contains("after cancel"), "{state:?}");
+                }
             }
             let _ = driver.shutdown_with_pending().unwrap();
             return;
@@ -6851,6 +6905,12 @@ async fn nested_selected_production_cancel_allows_parent_cancel() {
 }
 
 #[tokio::test]
+async fn nested_selected_late_child_receipt_prevents_after_publication() {
+    exercise_conversation_park_claim_with_late_publication("nested_claim_actual_selected", true)
+        .await;
+}
+
+#[tokio::test]
 async fn nested_production_cancel_rejects_signal_and_late_receipt() {
     for case in ["nested_claim_actual_signal", "nested_claim_actual_late"] {
         exercise_conversation_park_claim(case).await;
@@ -6867,8 +6927,8 @@ async fn nested_selected_parent_kill_worker() {
 #[cfg(unix)]
 #[tokio::test]
 async fn nested_parent_receipt_survives_kill_and_reopen() {
-    for late in [false, true] {
-        exercise_nested_parent_receipt_recovery(if late { "late" } else { "good" }, false).await;
+    for mode in ["good", "late"] {
+        exercise_nested_parent_receipt_recovery(mode, false).await;
     }
 }
 
@@ -7130,7 +7190,7 @@ async fn exercise_nested_parent_receipt_recovery(mode: &str, child_cut: bool) {
         max_turns: 4,
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
-    let scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     if mode == "busy" {
         let (held_tx, held_rx) = std::sync::mpsc::channel();
@@ -7186,6 +7246,16 @@ async fn exercise_nested_parent_receipt_recovery(mode: &str, child_cut: bool) {
         calls.load(Ordering::SeqCst),
         usize::from(child_cut && (mode == "good" || mode == "unhooked" || mode == "busy"))
     );
+    if !unhooked && mode == "good" {
+        let conversation = match terminal.task.owner() {
+            crate::task::TaskOwner::Conversation(id) => *id,
+            _ => unreachable!(),
+        };
+        scheduler.schedule(conversation);
+        scheduler.wait(conversation).await.unwrap();
+        let state = scheduler.conversation(conversation).unwrap();
+        assert!(format!("{state:?}").contains("after cancel"), "{state:?}");
+    }
     let _ = driver.shutdown_with_pending().unwrap();
     let _ = scheduler.shutdown().await;
 }

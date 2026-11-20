@@ -18279,6 +18279,94 @@ pub(crate) fn authenticated_woken_terminal_descendants(
     Ok((uncertain, checks, leases))
 }
 
+/// The terminal marker must have been committed with the cancelled root and
+/// the caller must retain its registration and identity through publication.
+pub(crate) fn authenticated_parked_terminal_descendants(
+    store: &durable_store::Store,
+    parent: &task_store::StoredTask,
+    tasks: &[task_store::StoredTask],
+    boundary: u64,
+    registry: &Registry,
+    harness: &crate::runtime::Harness,
+) -> Result<
+    (
+        Option<Uuid>,
+        Vec<durable_store::Check>,
+        Vec<crate::nested_identity::IdentityLease>,
+    ),
+    Error,
+> {
+    let task = parent.task.id();
+    let key = conversation_cancel_terminal_key(task);
+    let entry = store
+        .get(&key)
+        .map_err(task_store::Error::from)?
+        .ok_or(Error::Ownership)?;
+    let marker: ConversationCancelTerminalMarker =
+        serde_json::from_slice(&entry.value).map_err(|e| Error::Handler(e.to_string()))?;
+    if parent.task.state() != &TaskState::Cancelled
+        || marker.version != 2
+        || marker.terminal_task != parent.task
+        || marker.running_task_version == 0
+        || store
+            .commit_for_version(&task_store::key(task), parent.version)
+            .map_err(task_store::Error::from)?
+            != store
+                .commit_for_version(&key, entry.version)
+                .map_err(task_store::Error::from)?
+        || store
+            .commit_for_version(&key, entry.version)
+            .map_err(task_store::Error::from)?
+            .is_none()
+    {
+        return Err(Error::Ownership);
+    }
+    let (claim, claim_check) =
+        read_conversation_cancel_claim(store, task, marker.attempt, marker.claim_id)
+            .map_err(Error::Handler)?
+            .ok_or(Error::Ownership)?;
+    if claim.checkpoint != *parent.task.checkpoint()
+        || Some(claim.kind.as_str()) != parent.task.kind()
+        || claim.definition_version != parent.task.definition_version()
+    {
+        return Err(Error::Ownership);
+    }
+    let receipt_key =
+        format!("durable/replay-safe-async/{task}/conversation-park-cancel-receipt").into_bytes();
+    let receipt_entry = store
+        .get(&receipt_key)
+        .map_err(task_store::Error::from)?
+        .ok_or(Error::Ownership)?;
+    if marker.receipt_version != Some(receipt_entry.version) {
+        return Err(Error::Ownership);
+    }
+    let receipt: ConversationCancelReceipt =
+        serde_json::from_slice(&receipt_entry.value).map_err(|e| Error::Handler(e.to_string()))?;
+    validate_conversation_cancel_receipt(&receipt, &claim).map_err(Error::Handler)?;
+    if receipt.version != 2 || receipt.after_result.is_none() {
+        return Err(Error::Ownership);
+    }
+    let (uncertain, mut checks, leases) = authenticated_unsafe_descendant_reconciliation_inner(
+        store, task, tasks, boundary, registry, harness, None, true,
+    )?;
+    checks.extend(
+        crate::async_task_tool::unsafe_park_proof::cancel_checks(store, &parent.task, boundary)
+            .map_err(Error::Handler)?,
+    );
+    checks.extend([
+        claim_check,
+        durable_store::Check {
+            key,
+            expected: durable_store::Expected::Version(entry.version),
+        },
+        durable_store::Check {
+            key: receipt_key,
+            expected: durable_store::Expected::Version(receipt_entry.version),
+        },
+    ]);
+    Ok((uncertain, checks, leases))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn authenticated_unsafe_descendant_reconciliation_inner(
     store: &durable_store::Store,
