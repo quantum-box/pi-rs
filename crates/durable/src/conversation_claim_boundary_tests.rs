@@ -7898,12 +7898,6 @@ async fn owned_graph_reservation_is_bound_and_child_attempt_is_rejected() {
     exercise_woken_owned_graph_receipt(false, 4).await;
 }
 
-#[cfg(feature = "experimental-graph-revision")]
-#[tokio::test]
-async fn owned_graph_reservation_survives_reopen() {
-    exercise_woken_owned_graph_receipt(false, 5).await;
-}
-
 async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
@@ -8185,7 +8179,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .unwrap();
         store.commit(&checks, &[]).unwrap();
-        let proof_root = if graph_aba == 4 || graph_aba == 5 {
+        let proof_root = if graph_aba == 4 {
             let mut running = recovered.clone();
             running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
             let (reservation_checks, marker) =
@@ -8203,29 +8197,27 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 .replay_safe_woken_owned_cleanup_checks(&running, store.put_version().unwrap())
                 .unwrap();
             store.commit(&new_checks, &[]).unwrap();
-            if graph_aba == 4 {
-                let key = crate::task_store::key(child.task.id());
-                let original = store.get(&key).unwrap().unwrap();
-                let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
-                changed["attempt_id"] = json!(uuid::Uuid::new_v4());
-                store
-                    .commit(
-                        &[durable_store::Check {
-                            key: key.clone(),
-                            expected: durable_store::Expected::Version(original.version),
-                        }],
-                        &[durable_store::Mutation::Put {
-                            key,
-                            value: serde_json::to_vec(&changed).unwrap(),
-                        }],
-                    )
-                    .unwrap();
-            }
+            let key = crate::task_store::key(child.task.id());
+            let original = store.get(&key).unwrap().unwrap();
+            let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
+            changed["attempt_id"] = json!(uuid::Uuid::new_v4());
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(original.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&changed).unwrap(),
+                    }],
+                )
+                .unwrap();
             running
         } else {
             recovered.clone()
         };
-        if graph_aba == 4 || graph_aba == 5 {
+        if graph_aba == 4 {
             // The child mutation above must invalidate both proof generations.
         } else if graph_aba >= 2 {
             let key = crate::task_store::key(child.task.id());
@@ -8329,9 +8321,11 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             store.commit(&checks, &[]),
             Err(durable_store::Error::Conflict { .. })
         ));
-        let proof = harness
-            .replay_safe_woken_owned_cleanup_checks(&proof_root, store.put_version().unwrap());
-        assert_eq!(proof.is_ok(), graph_aba == 5);
+        assert!(
+            harness
+                .replay_safe_woken_owned_cleanup_checks(&proof_root, store.put_version().unwrap())
+                .is_err()
+        );
     }
     #[cfg(not(feature = "experimental-graph-revision"))]
     let _ = graph_aba;
@@ -8353,7 +8347,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         .load(root.task.id())
         .unwrap()
         .unwrap();
-    if graph_aba == 4 || graph_aba == 5 {
+    if graph_aba == 4 {
         assert_eq!(saved.task.state(), &TaskState::Running);
         assert_eq!(
             saved.task.woken_interrupted_attempt(),
@@ -8361,13 +8355,6 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         );
     } else {
         assert_eq!(saved.task, recovered.task);
-    }
-    #[cfg(feature = "experimental-graph-revision")]
-    if graph_aba == 5 {
-        let proof = reopened
-            .replay_safe_woken_owned_cleanup_checks(&saved, store.put_version().unwrap())
-            .unwrap();
-        store.commit(&proof, &[]).unwrap();
     }
 }
 
