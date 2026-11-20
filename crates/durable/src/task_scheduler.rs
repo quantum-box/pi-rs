@@ -3886,13 +3886,17 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
-        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-            owner.store(),
-            current.task.id(),
-            &tasks.list().map_err(|e| e.to_string())?,
-            boundary,
-        )
-        .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks, _nested_identity_leases) =
+            authenticated_unsafe_descendant_reconciliation(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+                boundary,
+                &definitions.registry,
+                self.validator.ok_or("missing harness")?,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
         if uncertain.is_some() {
             return Err("unsafe descendant requires reconciliation".into());
         }
@@ -4335,13 +4339,17 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
-        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-            owner.store(),
-            current.task.id(),
-            &tasks.list().map_err(|e| e.to_string())?,
-            boundary,
-        )
-        .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks, _nested_identity_leases) =
+            authenticated_unsafe_descendant_reconciliation(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+                boundary,
+                &definitions.registry,
+                self.validator.ok_or("missing harness")?,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
         if uncertain.is_some() {
             return Err("unsafe descendant requires reconciliation".into());
         }
@@ -5078,13 +5086,17 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
-        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-            owner.store(),
-            current.task.id(),
-            &tasks.list().map_err(|e| e.to_string())?,
-            boundary,
-        )
-        .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks, _nested_identity_leases) =
+            authenticated_unsafe_descendant_reconciliation(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+                boundary,
+                &definitions.registry,
+                self.validator.ok_or("missing harness")?,
+                Some(marker),
+            )
+            .map_err(|e| e.to_string())?;
         if uncertain.is_some() {
             return Err("unsafe descendant requires reconciliation".into());
         }
@@ -11672,7 +11684,6 @@ impl Scheduler {
                 .store()
                 .put_version()
                 .map_err(task_store::Error::from)?;
-            let records = self.ts().list()?;
             let proof =
                 crate::async_task_tool::unsafe_park_proof::woken_live_abort_candidate_checks(
                     owner.store(),
@@ -11682,39 +11693,32 @@ impl Scheduler {
             let binding =
                 harness.checkpointable_cancel_conversation_checks(&latest.task, &self.registry);
             if _identity.is_some()
-                && !has_live_owned(owner.store(), latest.task.id(), &records)?
                 && let (Ok(mut checks), Ok(binding)) = (proof, binding)
             {
-                let (uncertain, descendants) = unsafe_descendant_reconciliation(
-                    owner.store(),
-                    latest.task.id(),
-                    &records,
-                    boundary,
-                )?;
-                if uncertain.is_none() {
-                    checks.extend(binding);
-                    checks.extend(descendants);
-                    let mut next = latest.clone();
-                    next.task
-                        .yield_aborted_woken_for_cleanup()
-                        .map_err(Error::Transition)?;
-                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
-                    batch.checks.extend(checks);
-                    owner
-                        .store()
-                        .commit_with_prefix_put_fence(
-                            &batch.checks,
-                            &batch.mutations,
-                            &[
-                                task_store::PREFIX,
-                                crate::ownership_edge::PREFIX,
-                                b"runtime/conversation/",
-                            ],
-                            boundary,
-                        )
-                        .map_err(task_store::Error::from)?;
-                    return Ok(());
-                }
+                // The graph abort transaction has marked owned work. Preserve
+                // the joined wake even while children drain; the later claim
+                // must separately prove every unsafe descendant is settled.
+                checks.extend(binding);
+                let mut next = latest.clone();
+                next.task
+                    .yield_aborted_woken_for_cleanup()
+                    .map_err(Error::Transition)?;
+                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                batch.checks.extend(checks);
+                owner
+                    .store()
+                    .commit_with_prefix_put_fence(
+                        &batch.checks,
+                        &batch.mutations,
+                        &[
+                            task_store::PREFIX,
+                            crate::ownership_edge::PREFIX,
+                            b"runtime/conversation/",
+                        ],
+                        boundary,
+                    )
+                    .map_err(task_store::Error::from)?;
+                return Ok(());
             }
         }
         self.ts().update(latest, |task| task.yield_ready())?;
@@ -13204,13 +13208,6 @@ impl Scheduler {
                         .put_version()
                         .map_err(task_store::Error::from)?;
                     let records = self.ts().list()?;
-                    if has_live_owned(owner.store(), item.task.id(), &records)? {
-                        recovery_failure!(
-                            "interrupted: live owned work requires reconciliation".into()
-                        );
-                        self.deferred_recovery.extend(deferred);
-                        continue 'scan;
-                    }
                     let (target, mut checks) = match crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
                         owner.store(), &item.task, boundary,
                     ) {
@@ -13229,29 +13226,88 @@ impl Scheduler {
                             .checkpointable_conversation_checks(&item.task, &self.registry)
                             .map_err(|e| Error::Handler(e.to_string()))?,
                     );
-                    let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
-                        owner.store(),
-                        item.task.id(),
-                        &records,
-                        boundary,
-                    )?;
-                    if uncertain.is_some() {
-                        return Err(Error::Ownership);
+                    // Mark the entire known foreground task graph before any
+                    // cleanup can run. Background tasks remain independent.
+                    // Owned conversations and damaged graphs stay fail closed.
+                    if owned_graph_uncertain(owner.store(), item.task.id())? {
+                        recovery_failure!(
+                            "interrupted: uncertain owner graph requires reconciliation".into()
+                        );
+                        self.deferred_recovery.extend(deferred);
+                        continue 'scan;
                     }
-                    checks.extend(descendant_checks);
-                    let mut next = item.clone();
-                    next.task
-                        .recover_interrupted_woken_for_cleanup()
-                        .map_err(Error::Transition)?;
-                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
-                    batch.checks.extend(checks);
-                    let (check, mutation) = crate::ownership_edge::prepare_abort_fence(
+                    let mut ids = HashSet::from([item.task.id()]);
+                    loop {
+                        let before = ids.len();
+                        for record in &records {
+                            if !record.task.is_background()
+                                && let TaskOwner::Task(parent) = record.task.owner()
+                                && ids.contains(parent)
+                            {
+                                ids.insert(record.task.id());
+                            }
+                        }
+                        if ids.len() == before {
+                            break;
+                        }
+                    }
+                    if crate::ownership_edge::reject_foreground_children(
                         owner.store(),
-                        &TaskOwner::Task(item.task.id()),
+                        records
+                            .iter()
+                            .filter(|r| ids.contains(&r.task.id()))
+                            .map(|r| r.task.id()),
                     )
-                    .map_err(task_store::Error::from)?;
-                    batch.checks.push(check);
-                    batch.mutations.push(mutation);
+                    .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+                    {
+                        recovery_failure!(
+                            "interrupted: owned conversation requires reconciliation".into()
+                        );
+                        self.deferred_recovery.extend(deferred);
+                        continue 'scan;
+                    }
+                    let mut updates = Vec::new();
+                    for record in &records {
+                        if !ids.contains(&record.task.id()) || record.task.is_terminal() {
+                            continue;
+                        }
+                        let mut next = record.clone();
+                        if record.task.id() == item.task.id() {
+                            if record != &item {
+                                continue 'scan;
+                            }
+                            next.task
+                                .recover_interrupted_woken_for_cleanup()
+                                .map_err(Error::Transition)?;
+                            updates.push(next);
+                        } else if !record.task.abort_requested() {
+                            next.task.request_abort().map_err(Error::Transition)?;
+                            updates.push(next);
+                        }
+                    }
+                    let mut batch = self
+                        .ts()
+                        .prepare_save(&updates.iter().map(Save::Update).collect::<Vec<_>>())?;
+                    batch.checks.extend(checks);
+                    for record in &records {
+                        if ids.contains(&record.task.id())
+                            && !updates.iter().any(|u| u.task.id() == record.task.id())
+                        {
+                            batch.checks.push(durable_store::Check {
+                                key: task_store::key(record.task.id()),
+                                expected: durable_store::Expected::Version(record.version),
+                            });
+                        }
+                    }
+                    for id in &ids {
+                        let (check, mutation) = crate::ownership_edge::prepare_abort_fence(
+                            owner.store(),
+                            &TaskOwner::Task(*id),
+                        )
+                        .map_err(task_store::Error::from)?;
+                        batch.checks.push(check);
+                        batch.mutations.push(mutation);
+                    }
                     #[cfg(test)]
                     if let Some(hook) = woken_recovery_hooks()
                         .lock()

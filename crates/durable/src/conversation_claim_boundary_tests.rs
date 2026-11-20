@@ -6734,3 +6734,370 @@ async fn exercise_nested_parent_receipt_recovery(late: bool) {
 async fn nested_busy_identity_defers_parent_callback() {
     exercise_conversation_park_claim("nested_claim_actual_busy").await;
 }
+
+struct WokenAnyFixture {
+    name: &'static str,
+    dir: std::path::PathBuf,
+}
+#[async_trait]
+impl Tool for WokenAnyFixture {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        panic!("durable only")
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for WokenAnyFixture {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        context: ToolContext,
+        resume: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        match self.name {
+            "slow" if self.dir.join("unsafe-mode").exists() => {
+                let blocker = host
+                    .start_child("blocker-key", "blocker", json!({}))
+                    .await?;
+                Ok(DurableToolStep::Park {
+                    checkpoint: json!({"blocker": blocker}),
+                    wait: DurableWait::All(vec![blocker]),
+                })
+            }
+            "slow" | "blocker" => {
+                std::fs::write(self.dir.join("slow-ready"), b"ready").unwrap();
+                context.cancellation.cancelled().await;
+                Err("cancelled".into())
+            }
+            "fast" => {
+                while !self.dir.join("slow-ready").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                if self.dir.join("unsafe-mode").exists() {
+                    loop {
+                        let store = durable_store::Store::open(self.dir.join("db"))
+                            .map_err(|e| e.to_string())?;
+                        let waiting = crate::task_store::TaskStore::new(&store)
+                            .list()
+                            .map_err(|e| e.to_string())?
+                            .iter()
+                            .any(|r| {
+                                matches!(r.task.owner(), crate::task::TaskOwner::Task(_))
+                                    && matches!(r.task.state(), TaskState::Waiting(_))
+                            });
+                        if waiting {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+                Ok(DurableToolStep::Complete(Outcome::Succeeded("fast".into())))
+            }
+            "root" if resume.checkpoint.is_none() => {
+                let slow = host.start_child("slow-key", "slow", json!({})).await?;
+                let fast = host.start_child("fast-key", "fast", json!({})).await?;
+                Ok(DurableToolStep::Park {
+                    checkpoint: json!({"slow":slow,"fast":fast}),
+                    wait: DurableWait::Any(vec![slow, fast]),
+                })
+            }
+            "root" => {
+                std::fs::write(self.dir.join("any-woken"), b"ready").unwrap();
+                if std::env::var_os("PI_TEST_WOKEN_ANY_LIVE").is_some() {
+                    context.cancellation.cancelled().await;
+                    return Err("cancelled".into());
+                }
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_driver::Driver) {
+    use crate::async_task_tool::{
+        DurableParkCancel, register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel,
+        register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel,
+    };
+    struct Cancel(std::path::PathBuf, bool);
+    #[async_trait]
+    impl DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, checkpoint: Value, _: ToolContext) -> Result<(), String> {
+            if self.1 {
+                let blocker: AsyncTaskCall =
+                    serde_json::from_value(checkpoint["blocker"].clone()).unwrap();
+                let store = durable_store::Store::open(self.0.join("db")).unwrap();
+                assert!(
+                    crate::task_store::TaskStore::new(&store)
+                        .load(blocker.task_id())
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .is_terminal()
+                );
+                std::fs::write(self.0.join("slow-cancel"), b"called").unwrap();
+                return Ok(());
+            }
+            let slow: AsyncTaskCall = serde_json::from_value(checkpoint["slow"].clone()).unwrap();
+            let store = durable_store::Store::open(self.0.join("db")).unwrap();
+            let slow = crate::task_store::TaskStore::new(&store)
+                .load(slow.task_id())
+                .unwrap()
+                .unwrap();
+            assert!(
+                slow.task.is_terminal(),
+                "child must be drained before parent cancel"
+            );
+            if self.0.join("unsafe-mode").exists() {
+                assert!(
+                    self.0.join("slow-cancel").exists(),
+                    "unsafe child must cancel first"
+                );
+            }
+            std::fs::write(self.0.join("parent-cancel"), b"called").unwrap();
+            Ok(())
+        }
+    }
+    let dir = path.parent().unwrap().to_owned();
+    let mut registry = Registry::default();
+    let mut extra = Vec::new();
+    let slow = if dir.join("unsafe-mode").exists() {
+        let blocker = register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            Arc::new(WokenAnyFixture {
+                name: "blocker",
+                dir: dir.clone(),
+            }),
+            "blocker",
+            1,
+            vec![],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap();
+        let slow = Arc::new(WokenAnyFixture {
+            name: "slow",
+            dir: dir.clone(),
+        });
+        let identity: Arc<dyn Tool> = slow.clone();
+        let _identity =
+            crate::nested_identity::register(&identity, Some("slow-backend".into())).unwrap();
+        let slow = register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
+            &mut registry,
+            slow,
+            "slow",
+            1,
+            vec![blocker.clone()],
+            "slow-cancel-v1",
+            Arc::new(Cancel(dir.clone(), true)),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        )
+        .unwrap();
+        extra.push(blocker);
+        slow
+    } else {
+        register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            Arc::new(WokenAnyFixture {
+                name: "slow",
+                dir: dir.clone(),
+            }),
+            "slow",
+            1,
+            vec![],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap()
+    };
+    let fast = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(WokenAnyFixture {
+            name: "fast",
+            dir: dir.clone(),
+        }),
+        "fast",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let children = vec![slow, fast];
+    let root = Arc::new(WokenAnyFixture {
+        name: "root",
+        dir: dir.clone(),
+    });
+    let identity: Arc<dyn Tool> = root.clone();
+    let _identity = crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
+    let root = register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel(
+        &mut registry,
+        root,
+        "root",
+        1,
+        children.clone(),
+        "cancel-v1",
+        Arc::new(Cancel(dir, false)),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: std::iter::once(root.register())
+            .chain(children.iter().map(|c| c.register()))
+            .chain(extra.iter().map(|c| c.register()))
+            .collect(),
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let scheduler = Scheduler::open(path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    (scheduler, driver)
+}
+
+#[tokio::test]
+async fn woken_any_child_drain_worker() {
+    if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_ANY_DIR") {
+        let path = std::path::Path::new(&dir).join("db");
+        let (mut scheduler, _driver) = start_woken_any_scheduler(&path);
+        let conversation = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.submit(conversation, None, "work".into()).unwrap();
+        if std::env::var_os("PI_TEST_WOKEN_ANY_LIVE").is_some() {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !std::path::Path::new(&dir).join("any-woken").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                scheduler.abort_and_wait(conversation),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err(), "the interrupted outcome remains unknown");
+            assert!(
+                std::path::Path::new(&dir).join("parent-cancel").exists(),
+                "tasks: {:?}",
+                crate::task_store::TaskStore::new(&durable_store::Store::open(&path).unwrap())
+                    .list()
+            );
+            assert!(_driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
+#[tokio::test]
+async fn interrupted_woken_root_drains_any_loser_before_cancel() {
+    use std::process::{Command, Stdio};
+    for unsafe_child in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        if unsafe_child {
+            std::fs::write(dir.path().join("unsafe-mode"), b"yes").unwrap();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+            ])
+            .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !dir.path().join("any-woken").exists() {
+                assert!(child.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let path = dir.path().join("db");
+        let store = durable_store::Store::open(&path).unwrap();
+        let roots = crate::task_store::TaskStore::new(&store).list().unwrap();
+        let root = roots
+            .iter()
+            .find(|r| {
+                matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
+                    && r.task.state() == &TaskState::Running
+            })
+            .unwrap()
+            .task
+            .id();
+        drop(store);
+        let (scheduler, driver) = start_woken_any_scheduler(&path);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if driver.get(root).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            dir.path().join("parent-cancel").exists(),
+            "tasks: {:?}",
+            crate::task_store::TaskStore::new(&durable_store::Store::open(&path).unwrap()).list()
+        );
+        assert!(
+            matches!(driver.get(root).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn live_woken_root_drains_any_loser_before_cancel() {
+    use std::process::{Command, Stdio};
+    for unsafe_child in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        if unsafe_child {
+            std::fs::write(dir.path().join("unsafe-mode"), b"yes").unwrap();
+        }
+        let status = tokio::task::spawn_blocking({
+            let path = dir.path().to_owned();
+            move || {
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+                        "--nocapture",
+                    ])
+                    .env("PI_TEST_WOKEN_ANY_DIR", &path)
+                    .env("PI_TEST_WOKEN_ANY_LIVE", "1")
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .unwrap()
+            }
+        })
+        .await
+        .unwrap();
+        assert!(status.success());
+        assert!(dir.path().join("parent-cancel").exists());
+    }
+}
