@@ -213,6 +213,20 @@ impl DurableParkCancel for CancelCounter {
 
 #[tokio::test]
 async fn selected_hook_cancel_registration_parks_and_remains_fail_closed() {
+    exercise_selected_hook_cancel_registration("unchanged").await;
+}
+
+#[tokio::test]
+async fn selected_hook_cancel_registration_rejects_changed_identity() {
+    exercise_selected_hook_cancel_registration("identity").await;
+}
+
+#[tokio::test]
+async fn selected_hook_cancel_registration_rejects_changed_selection() {
+    exercise_selected_hook_cancel_registration("selection").await;
+}
+
+async fn exercise_selected_hook_cancel_registration(change: &str) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let before = Arc::new(AtomicUsize::new(0));
@@ -255,7 +269,7 @@ async fn selected_hook_cancel_registration_parks_and_remains_fail_closed() {
         executions: executions.clone(),
     });
     let identity_tool: Arc<dyn Tool> = tool.clone();
-    let _identity =
+    let identity =
         pi_rs_durable::nested_identity::register(&identity_tool, Some("backend".into())).unwrap();
     let root = register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel(
         &mut registry,
@@ -309,6 +323,21 @@ async fn selected_hook_cancel_registration_parks_and_remains_fail_closed() {
     .unwrap();
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     assert!(before.load(Ordering::SeqCst) >= 1);
+    if change == "identity" {
+        identity
+            .update(Some("different-backend".into()), || {})
+            .await
+            .unwrap();
+    }
+    if change == "selection" {
+        scheduler
+            .install_extension(Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(BlockHook)],
+                ..Default::default()
+            })
+            .unwrap();
+    }
     scheduler.abort_task(root_id).unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -322,6 +351,11 @@ async fn selected_hook_cancel_registration_parks_and_remains_fail_closed() {
     .unwrap();
     assert_eq!(cancellations.load(Ordering::SeqCst), 0);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
+    let claim = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
+    assert_eq!(
+        store.get(claim.as_bytes()).unwrap().is_none(),
+        change != "unchanged"
+    );
     let report = driver.shutdown_with_pending().unwrap();
     assert!(report.pending().is_empty());
     let _ = scheduler.shutdown().await;
