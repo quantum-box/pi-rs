@@ -7961,6 +7961,19 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
             .unwrap(),
         root
     );
+    assert!(
+        harness
+            .authenticated_scoped_woken_abort_graph(&root, &Registry::default(), &[conversation])
+            .is_err()
+    );
+    assert!(!harness.conversation(conversation).unwrap().abort_requested);
+    assert_eq!(
+        crate::task_store::TaskStore::new(&store)
+            .load(root.task.id())
+            .unwrap()
+            .unwrap(),
+        root
+    );
     harness
         .authenticated_scoped_woken_abort_graph(&root, &registry, &[conversation])
         .unwrap();
