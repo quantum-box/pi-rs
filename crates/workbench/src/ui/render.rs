@@ -1917,13 +1917,23 @@ fn markdown_plain_at_depth(
         let starts_item_block = matches!(
             &event,
             Event::Start(
-                Tag::Paragraph | Tag::CodeBlock(_) | Tag::Heading { .. } | Tag::BlockQuote(_)
+                Tag::Paragraph
+                    | Tag::CodeBlock(_)
+                    | Tag::Heading { .. }
+                    | Tag::BlockQuote(_)
+                    | Tag::List(_)
             ) | Event::Rule
         );
         if starts_item_block
             && !item_after_math.last().copied().unwrap_or(false)
             && let Some(Some(end)) = item_block_ends.last().copied()
             && end <= range.start
+            && (!matches!(&event, Event::Start(Tag::List(_)))
+                || text[end..range.start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    >= if text[..end].ends_with('\n') { 1 } else { 2 })
         {
             let gap = &text[end..range.start];
             let mut blank = false;
@@ -2188,6 +2198,15 @@ fn markdown_plain_at_depth(
             }
             Event::End(TagEnd::List(_)) => {
                 lists.pop();
+                // The nested list belongs to the parent item's preceding
+                // block, so its internal gaps must not be counted again.
+                if !lists.is_empty()
+                    && let Some(end) = item_block_ends.last_mut()
+                {
+                    let trimmed =
+                        text[range.clone()].trim_end_matches(|c: char| c.is_ascii_whitespace());
+                    *end = Some(range.start + trimmed.len());
+                }
             }
             Event::Start(Tag::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());

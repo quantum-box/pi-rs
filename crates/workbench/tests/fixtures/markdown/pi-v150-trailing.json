@@ -1282,6 +1282,95 @@
       ]
     },
     {
+      "source": "- a\n  - b\n  1. b",
+      "lines": [
+        "- a",
+        "    - b",
+        "    1. b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n  - b\n  1. b"
+        }
+      ]
+    },
+    {
+      "source": "- a\n\n  ```\n  x\n  ```\n  - b",
+      "lines": [
+        "- a",
+        "",
+        "  ```",
+        "    x",
+        "  ```",
+        "    - b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n\n  ```\n  x\n  ```\n  - b"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n\n  - inner\n\n    second\n\n  tail",
+      "lines": [
+        "- outer",
+        "",
+        "    - inner",
+        "",
+        "      second",
+        "",
+        "  tail"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n\n  - inner\n\n    second\n\n  tail"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n\n  1. inner\n\n     next\n\n  tail\n\n- sibling",
+      "lines": [
+        "- outer",
+        "",
+        "    1. inner",
+        "",
+        "       next",
+        "",
+        "  tail",
+        "",
+        "- sibling"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n\n  1. inner\n\n     next\n\n  tail\n\n- sibling"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n  - first\n    - nested\n\n      next\n\n    tail\n\n  end",
+      "lines": [
+        "- outer",
+        "    - first",
+        "        - nested",
+        "",
+        "          next",
+        "",
+        "      tail",
+        "",
+        "  end"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n  - first\n    - nested\n\n      next\n\n    tail\n\n  end"
+        }
+      ]
+    },
+    {
       "source": "[r]: https://e.co",
       "lines": [
         ""

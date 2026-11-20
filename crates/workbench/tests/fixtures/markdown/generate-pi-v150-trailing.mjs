@@ -28,6 +28,10 @@ const blocks = ['hello', '# head', '---', '- item', '> quoted', '```\nx\n```', '
 const tails = ['', '\n', '\n\n', '\n\n\n', '\n\n[r]: https://e.co', '\n\n[r]: https://e.co\n', '\n\n[r]: https://e.co\n\n'];
 const sources = blocks.flatMap(block => tails.map(tail => block + tail));
 const extras = [
+  '- a\n  - b\n  1. b', '- a\n\n  ```\n  x\n  ```\n  - b',
+  '- outer\n\n  - inner\n\n    second\n\n  tail',
+  '- outer\n\n  1. inner\n\n     next\n\n  tail\n\n- sibling',
+  '- outer\n  - first\n    - nested\n\n      next\n\n    tail\n\n  end',
   '[r]: https://e.co', '[r]: https://e.co\n\n', '> quoted\n>\n',
   '- item\n\n  $$x^2$$\n\n', 'hello\n\n[r]: https://e.co\n\n[s]: https://s.co', '$$x$$\n[r]: https://e.co',
   '[r]: https://e.co\n\ntext', '[r]: https://e.co\n\n$$x^2$$\n\n[s]: https://s.co',

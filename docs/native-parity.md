@@ -2015,6 +2015,9 @@ indentation for code and quotes. A pinned Pi fixture checks these layouts,
 including duplicate definitions and narrow quotes. Inventory and rendering
 have native work limits; inputs that exceed them use the existing bounded
 renderer and can differ in spacing from Pi.
+Nested list spacing follows source block boundaries. Soft-wrapped source lines
+inside list items can differ from Pi in line breaks, indentation, and wrapping;
+some numbered nested lists and list-contained horizontal rules also differ.
 If nested-math scanning exceeds its resource limit, reference links may remain
 unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
