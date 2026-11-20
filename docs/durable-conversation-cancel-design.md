@@ -302,3 +302,13 @@ composed with a claim and later checked while creating the authenticated start
 markers, so a signal or owner change between the claim and first poll causes a
 conflict. Its reopen and ancestor-signal race are tested, but neither the claim
 nor dispatch calls it yet; the sidecar alone does not authorize a callback.
+
+An experimental, test-only nested path now composes the child claim with the
+ancestry sidecar, creates the full marker chain, polls an unhooked cancellation
+callback once under the conversation start lease, and saves its receipt while
+retiring the markers in one checked commit. Real-driver tests reject an
+ancestor signal or late Tool receipt arriving between claim and marker creation;
+a process killed during callback leaves its claim and ancestor markers durable.
+This path is not enabled in production. In particular, nested terminal evidence,
+parent settlement, selected hooks and recovery of a killed nested callback are
+not yet connected or verified.

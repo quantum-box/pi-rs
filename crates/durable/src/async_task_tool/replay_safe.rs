@@ -1822,6 +1822,96 @@ impl Handler for Executor {
                 .as_ref()
                 .ok_or("missing cancel registration")?;
             let selection_start = admission.conversation_selection_start_lease(self)?;
+            #[cfg(test)]
+            if crate::task_scheduler::take_test_nested_claim(task.id()) {
+                let claim = admission.record_nested_conversation_park_claim(
+                    self,
+                    cancel.conversation_cancel_policy(),
+                    &_identity_lease,
+                    expected,
+                )?;
+                let real_callback = crate::task_scheduler::take_test_nested_callback(task.id());
+                let start = if real_callback {
+                    Some(admission.nested_conversation_callback_start_lease()?)
+                } else {
+                    None
+                };
+                let marker = admission.record_nested_conversation_start_markers(
+                    self,
+                    claim.claim_id,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                let result = if let Some((conversation, start)) = start {
+                    let stored: ParkCheckpoint =
+                        serde_json::from_value(task.checkpoint().data.clone())
+                            .map_err(|_| "invalid park")?;
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let cancellation = pi_rs_core::CancellationToken::new();
+                    rt.block_on(durable_store::controls::with_callback_context(
+                        conversation,
+                        task.id(),
+                        marker.clone(),
+                        async {
+                            let scope = durable_store::controls::CallbackScope::current()
+                                .ok_or("missing scope")?;
+                            let future = cancel.cancel_scoped(
+                                stored.arguments,
+                                stored.checkpoint,
+                                ToolContext {
+                                    operation_id: task.id(),
+                                    cancellation,
+                                },
+                                scope,
+                            );
+                            let mut future = std::pin::pin!(future);
+                            let mut lease = Some(start);
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                std::future::poll_fn(|cx| match lease.take() {
+                                    Some(lease) => lease.poll_first(future.as_mut(), cx),
+                                    None => future.as_mut().poll(cx),
+                                }),
+                            )
+                            .await
+                            .map_err(|_| "callback timed out")?
+                        },
+                    ))?;
+                    "callback returned"
+                } else {
+                    "test evidence only"
+                };
+                let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                    version: 1,
+                    claim,
+                    result: result.into(),
+                    after_result: None,
+                };
+                if admission
+                    .store_nested_conversation_cancel_receipt_and_retire(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        b"wrong-marker",
+                    )
+                    .is_ok()
+                {
+                    return Err("substituted nested marker accepted".into());
+                }
+                admission.store_nested_conversation_cancel_receipt_and_retire(
+                    self,
+                    &receipt,
+                    &_identity_lease,
+                    expected,
+                    &marker,
+                )?;
+                return Err("nested claim probe complete; reconciliation required".into());
+            }
             let _claim = admission
                 .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
             #[cfg(test)]
