@@ -287,3 +287,11 @@ late receipt races, replaced task/conversation/selection/attempt evidence,
 identity busy and reentrant update, callback failure and retry authorization,
 and process kill/reopen. Until these paths are implemented and verified, the
 existing standalone-only guards and conversation fail-closed behavior remain.
+
+The provisional nested cleanup conversation check walks and version-fences the
+exact task ancestry, then binds it to the pending root, selected registration,
+conversation snapshot and root capability restrictions. It is evidence for a
+future child claim transaction, not authorization to run a callback. The
+cleanup attempt and identity lease, park, signal revisions, claim, first-poll
+markers, callback receipt and parent settlement still require their own
+composed checks. Child callback dispatch remains disabled.
