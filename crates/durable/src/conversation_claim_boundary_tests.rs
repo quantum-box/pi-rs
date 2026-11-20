@@ -7500,3 +7500,102 @@ async fn live_woken_root_drains_any_loser_before_cancel() {
         assert!(dir.path().join("parent-cancel").exists());
     }
 }
+
+#[tokio::test]
+async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_together() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+        ])
+        .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("any-woken").exists() {
+            assert!(child.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let path = dir.path().join("db");
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    let conversation = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let root = records
+        .into_iter()
+        .find(|r| {
+            matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
+                && r.task.state() == &TaskState::Running
+        })
+        .unwrap();
+    let edge = crate::ownership_edge::Edge {
+        task: root.task.id(),
+        task_owner: root.task.owner().clone(),
+        child: conversation,
+        mode: crate::ownership_edge::Mode::Foreground,
+    };
+    let prepared = crate::ownership_edge::EdgeStore::new(&store)
+        .prepare_create(&edge)
+        .unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    let root = crate::task_store::TaskStore::new(&store)
+        .load(root.task.id())
+        .unwrap()
+        .unwrap();
+    let boundary = store.put_version().unwrap();
+    let (_, proof) = crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
+        &store, &root.task, boundary,
+    )
+    .unwrap();
+    assert!(
+        harness
+            .scoped_woken_abort_graph(&root, &proof, &[])
+            .is_err()
+    );
+    assert!(!harness.conversation(conversation).unwrap().abort_requested);
+    assert_eq!(
+        crate::task_store::TaskStore::new(&store)
+            .load(root.task.id())
+            .unwrap()
+            .unwrap(),
+        root
+    );
+    harness
+        .scoped_woken_abort_graph(&root, &proof, &[conversation])
+        .unwrap();
+    assert!(harness.conversation(conversation).unwrap().abort_requested);
+    let recovered = crate::task_store::TaskStore::new(&store)
+        .load(root.task.id())
+        .unwrap()
+        .unwrap();
+    assert!(recovered.task.abort_requested());
+    assert_eq!(recovered.task.state(), &TaskState::Ready);
+    assert_eq!(
+        recovered.task.woken_interrupted_attempt(),
+        root.task.attempt_id()
+    );
+}

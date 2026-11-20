@@ -14686,6 +14686,7 @@ impl Harness {
             None,
             None,
             None,
+            None,
             before_commit,
         )
         .map(|result| result.expect("unconditional abort always has a result"))
@@ -14710,6 +14711,7 @@ impl Harness {
             false,
             None,
             Some(running),
+            None,
             None,
             None,
             None,
@@ -14753,9 +14755,48 @@ impl Harness {
             maintenance,
             Some(mode),
             verify,
+            None,
             || {},
         )
         .map(|result| result.map(|(conversations, _, _)| conversations))
+    }
+
+    /// Caller holds the selected conversation controls, extension selection,
+    /// and cleanup identity through this commit. `checks` must authenticate the
+    /// original wake and conversation binding at the sampled boundary.
+    #[allow(dead_code)]
+    pub(crate) fn scoped_woken_abort_graph(
+        &mut self,
+        expected: &crate::task_store::StoredTask,
+        checks: &[Check],
+        targets: &[Uuid],
+    ) -> Result<Vec<Uuid>, Error> {
+        let owner = self.owner.clone();
+        let gate = match owner.task_gate().try_lock() {
+            Ok(gate) => gate,
+            Err(durable_store::controls::PollGateError::Busy) => {
+                return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
+            }
+            Err(durable_store::controls::PollGateError::Poisoned) => return Err(Error::Failed),
+            Err(durable_store::controls::PollGateError::Reentrant) => {
+                return Err(Error::ReentrantAbort);
+            }
+        };
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            None,
+            Some(expected.task.id()),
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some((false, targets)),
+            None,
+            Some((expected, checks)),
+            || {},
+        )
+        .map(|result| result.expect("woken graph has a fixed root").0)
     }
 
     // Discovery is read-only; commit repeats the graph scan under the task
@@ -14793,6 +14834,7 @@ impl Harness {
             None,
             Some(mode),
             None,
+            None,
             || {},
         )
     }
@@ -14810,6 +14852,7 @@ impl Harness {
         maintenance: Option<crate::task_scheduler::MaintenanceIntent>,
         graph_scope: Option<(bool, &[Uuid])>,
         verify: Option<&dyn Fn() -> Result<(), crate::task_scheduler::Error>>,
+        woken: Option<(&crate::task_store::StoredTask, &[Check])>,
         mut before_commit: impl FnMut(),
     ) -> Result<Option<OwnedGraphAbort>, Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
@@ -15005,6 +15048,23 @@ impl Harness {
                     generation_updates.push((state.id, next));
                 }
             }
+            if let Some((expected, _)) = woken {
+                let root = by_id.get(&expected.task.id()).ok_or(Error::NotFound)?;
+                if *root != expected || task != Some(expected.task.id()) {
+                    return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
+                }
+                let update = updates
+                    .iter_mut()
+                    .find(|record| record.task.id() == expected.task.id())
+                    .ok_or_else(|| Error::Invalid("woken graph root not abortable".into()))?;
+                // Use the exact pre-abort snapshot: recovery retains the joined
+                // wake and requests abort in the same graph transaction.
+                *update = expected.clone();
+                update
+                    .task
+                    .recover_interrupted_woken_for_cleanup()
+                    .map_err(|e| Error::Invalid(format!("woken cleanup: {e:?}")))?;
+            }
             let mut withdrawn = Vec::new();
             for (state, _) in &mut states {
                 for submission in &mut state.submissions {
@@ -15096,6 +15156,9 @@ impl Harness {
             }
             batch.checks.extend(edge_checks);
             batch.checks.extend(callback_checks);
+            if let Some((_, checks)) = woken {
+                batch.checks.extend_from_slice(checks);
+            }
             if let Some(parent) = nested_parent {
                 batch.checks.push(Check {
                     key: crate::task_store::key(parent),
@@ -15127,6 +15190,9 @@ impl Harness {
                         tasks.into_iter().collect(),
                         ConversationAbortResult { withdrawn },
                     )));
+                }
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) if woken.is_some() => {
+                    return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
                 }
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
