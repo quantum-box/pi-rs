@@ -271,7 +271,7 @@ async fn exercise_conversation_park_claim(case: &str) {
                 std::fs::write(dir.join("ready"), context.operation_id.to_string()).unwrap();
                 std::future::pending::<()>().await;
             }
-            if self.1 == "dispatch_late" {
+            if self.1 == "dispatch_late" || self.1 == "nested_claim_late_kill" {
                 let store = durable_store::Store::open(&self.2).unwrap();
                 let prefix = format!("durable/unsafe-park-async/{}/", context.operation_id);
                 let (mut key, entry) = store
@@ -302,6 +302,13 @@ async fn exercise_conversation_park_claim(case: &str) {
                         }],
                     )
                     .unwrap();
+                if self.1 == "nested_claim_late_kill" {
+                    let dir = std::path::PathBuf::from(
+                        std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
+                    );
+                    std::fs::write(dir.join("ready"), context.operation_id.to_string()).unwrap();
+                    std::future::pending::<()>().await;
+                }
             }
             if self.1 == "dispatch_hold" || self.1 == "dispatch_hold_cleanup" {
                 while !self.2.with_extension("release").exists() {
@@ -660,6 +667,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         crate::task_scheduler::enable_test_nested_claim(child_id);
         if case == "nested_claim_callback"
             || case == "nested_claim_kill"
+            || case == "nested_claim_late_kill"
             || case == "nested_claim_selected"
             || case == "nested_claim_success"
             || case == "nested_claim_success_late"
@@ -3999,15 +4007,31 @@ async fn nested_callback_probe_commits_receipt_once() {
 #[tokio::test]
 async fn nested_callback_kill_worker() {
     if std::env::var_os("PI_TEST_NESTED_CALLBACK_KILL").is_some() {
-        exercise_conversation_park_claim("nested_claim_kill").await;
+        let case = if std::env::var_os("PI_TEST_NESTED_CALLBACK_LATE").is_some() {
+            "nested_claim_late_kill"
+        } else {
+            "nested_claim_kill"
+        };
+        exercise_conversation_park_claim(case).await;
     }
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn nested_callback_kill_preserves_claim_and_ancestor_markers() {
+    for late in [false, true] {
+        exercise_nested_callback_kill(late).await;
+    }
+}
+
+#[cfg(unix)]
+async fn exercise_nested_callback_kill(late: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    if late {
+        command.env("PI_TEST_NESTED_CALLBACK_LATE", "1");
+    }
+    let mut process = command
         .arg("--exact")
         .arg("conversation_claim_boundary_tests::nested_callback_kill_worker")
         .env("PI_TEST_NESTED_CALLBACK_KILL", "1")
@@ -4155,6 +4179,17 @@ async fn nested_callback_kill_preserves_claim_and_ancestor_markers() {
         }
     }).await.unwrap();
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    if late {
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let prefix = format!("durable/unsafe-park-async/{task}/");
+        assert!(
+            store
+                .list(prefix.as_bytes())
+                .unwrap()
+                .iter()
+                .any(|(key, _)| key.ends_with(b"/intent/receipt"))
+        );
+    }
     let _ = driver.shutdown_with_pending().unwrap();
     let _ = scheduler.shutdown().await;
 }
