@@ -7892,12 +7892,6 @@ async fn owned_graph_abort_clear_requires_scoped_revision() {
     exercise_woken_owned_graph_receipt(false, 3).await;
 }
 
-#[cfg(feature = "experimental-graph-revision")]
-#[tokio::test]
-async fn owned_graph_reservation_is_bound_and_child_attempt_is_rejected() {
-    exercise_woken_owned_graph_receipt(false, 4).await;
-}
-
 async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
@@ -8179,47 +8173,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .unwrap();
         store.commit(&checks, &[]).unwrap();
-        let proof_root = if graph_aba == 4 {
-            let mut running = recovered.clone();
-            running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
-            let (reservation_checks, marker) =
-                crate::runtime::prepare_woken_owned_reservation(&store, &recovered, &running.task)
-                    .unwrap()
-                    .unwrap();
-            let mut batch = tasks
-                .prepare_save(&[crate::task_store::Save::Update(&running)])
-                .unwrap();
-            batch.checks.extend(reservation_checks);
-            batch.mutations.push(marker);
-            store.commit(&batch.checks, &batch.mutations).unwrap();
-            let running = tasks.load(root.task.id()).unwrap().unwrap();
-            let new_checks = harness
-                .replay_safe_woken_owned_cleanup_checks(&running, store.put_version().unwrap())
-                .unwrap();
-            store.commit(&new_checks, &[]).unwrap();
-            let key = crate::task_store::key(child.task.id());
-            let original = store.get(&key).unwrap().unwrap();
-            let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
-            changed["attempt_id"] = json!(uuid::Uuid::new_v4());
-            store
-                .commit(
-                    &[durable_store::Check {
-                        key: key.clone(),
-                        expected: durable_store::Expected::Version(original.version),
-                    }],
-                    &[durable_store::Mutation::Put {
-                        key,
-                        value: serde_json::to_vec(&changed).unwrap(),
-                    }],
-                )
-                .unwrap();
-            running
-        } else {
-            recovered.clone()
-        };
-        if graph_aba == 4 {
-            // The child mutation above must invalidate both proof generations.
-        } else if graph_aba >= 2 {
+        if graph_aba >= 2 {
             let key = crate::task_store::key(child.task.id());
             let original = store.get(&key).unwrap().unwrap();
             let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
@@ -8323,7 +8277,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         ));
         assert!(
             harness
-                .replay_safe_woken_owned_cleanup_checks(&proof_root, store.put_version().unwrap())
+                .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
                 .is_err()
         );
     }
@@ -8347,15 +8301,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         .load(root.task.id())
         .unwrap()
         .unwrap();
-    if graph_aba == 4 {
-        assert_eq!(saved.task.state(), &TaskState::Running);
-        assert_eq!(
-            saved.task.woken_interrupted_attempt(),
-            recovered.task.woken_interrupted_attempt()
-        );
-    } else {
-        assert_eq!(saved.task, recovered.task);
-    }
+    assert_eq!(saved.task, recovered.task);
 }
 
 #[tokio::test]

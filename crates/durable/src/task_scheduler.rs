@@ -12524,23 +12524,6 @@ impl Scheduler {
             .store(true, std::sync::atomic::Ordering::Release);
         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
         batch.checks.extend(child_checks);
-        #[cfg(feature = "experimental-graph-revision")]
-        match crate::runtime::prepare_woken_owned_reservation(
-            self.ts().store(),
-            snapshot,
-            &next.task,
-        ) {
-            Ok(Some((checks, mutation))) => {
-                batch.checks.extend(checks);
-                batch.mutations.push(mutation);
-            }
-            Ok(None) => (),
-            Err(_) => {
-                self.poisoned
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(false);
-            }
-        }
         #[cfg(test)]
         if let Some(hook) = &self.reservation_commit_hook {
             hook(0, self.ts().store());
