@@ -7910,6 +7910,12 @@ async fn owned_graph_driver_commits_reservation_evidence() {
     exercise_woken_owned_graph_receipt(false, 6).await;
 }
 
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_rejects_unauthenticated_unsafe_conversation_child() {
+    exercise_woken_owned_graph_receipt(false, 7).await;
+}
+
 async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
@@ -7962,6 +7968,25 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         .prepare_create(&edge)
         .unwrap();
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    let unsafe_owned = if graph_aba == 7 {
+        let task = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(conversation),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("unverified-owned-child".into(), false);
+        crate::task_store::TaskStore::new(&store)
+            .save(&[crate::task_store::Save::Create(&task)])
+            .unwrap();
+        Some(task.id())
+    } else {
+        None
+    };
     let root = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
         .unwrap()
@@ -8019,6 +8044,12 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     harness
         .authenticated_scoped_woken_abort_graph(&root, &registry, &[conversation])
         .unwrap();
+    if let Some(id) = unsafe_owned {
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let task = tasks.load(id).unwrap().unwrap();
+        assert!(task.task.abort_requested());
+        tasks.update(&task, |task| task.cancel()).unwrap();
+    }
     assert!(harness.conversation(conversation).unwrap().abort_requested);
     let recovered = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
@@ -8145,6 +8176,15 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         .unwrap()
         .unwrap();
     assert!(start_commit < receipt_commit);
+    #[cfg(feature = "experimental-graph-revision")]
+    if graph_aba == 7 {
+        assert!(
+            harness
+                .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+                .is_err()
+        );
+        return;
+    }
     #[cfg(not(feature = "experimental-graph-revision"))]
     assert!(
         harness
