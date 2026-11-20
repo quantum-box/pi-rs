@@ -77,11 +77,13 @@ hooks. Its definition identity differs from the registration-only form; hosts
 must retain the original registration for existing parked tasks. Abort cleanup
 waits for owned children before invoking the callback and fences unresolved
 unsafe descendant evidence at claim, receipt, settlement and publication. The selected after hook
-runs with the committed conversation snapshot and prepared arguments. It may
-not use memo storage during abort cleanup: attempting that, a hook error or a
-timeout, or a conflict saving the after result, retains a confirmed callback
+runs with the committed conversation snapshot and prepared arguments. Its memo
+operations are durable and fenced by the active cleanup attempt, identity,
+claim, snapshot, and start markers. A failed memo operation, hook error or
+timeout, or a conflict saving the after result retains a confirmed callback
 receipt when it can be safely committed and requires reconciliation for the
-incomplete after result. Hook output schemas on this
+incomplete after result. A process interruption before the after result is saved
+still requires reconciliation; memo persistence does not authorize another callback. Hook output schemas on this
 abort path are not supported. Nested child callbacks and woken cancellation are
 not enabled by this registration. Result publication currently requires the
 root adapter in the Harness tool list; an extension-only tool is rejected before
@@ -127,7 +129,11 @@ classify an indeterminate commit as uncommitted.
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.
 
-Status: cancellation is not enabled. The scheduler defers conversation-owned
+## Historical design notes
+
+The remainder records the earlier, pre-dispatch design and its open questions.
+The opt-in status and limits above supersede statements below that dispatch is
+disabled. The scheduler defers conversation-owned
 interrupted wake or parked-abort recovery and its owned task graph until a
 Harness is bound; unrelated tasks continue. Binding triggers re-evaluation,
 which still uses the existing refusal for unsupported cancellation. Standalone cancel registrations must

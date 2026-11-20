@@ -268,7 +268,7 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_ca
 
 /// Opt in a conversation root with selected replay-safe hooks to an at-most-once
 /// parked cancellation callback. If the callback or after hook is interrupted,
-/// reconciliation is required. Abort-time after hooks cannot use memo storage.
+/// reconciliation is required. Abort-time memo operations are fenced to the active cleanup attempt.
 #[allow(clippy::too_many_arguments)]
 pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
     registry: &mut crate::task_scheduler::Registry,
@@ -12368,7 +12368,8 @@ mod tests {
             let child: AsyncTaskCall =
                 serde_json::from_value(parent_task.checkpoint().data.clone()).unwrap();
             std::fs::write(root.join("parent-id"), parent.id().to_string()).unwrap();
-            std::fs::write(root.join("child-id"), child.task_id().to_string()).unwrap();
+            std::fs::write(root.join("child-id.tmp"), child.task_id().to_string()).unwrap();
+            std::fs::rename(root.join("child-id.tmp"), root.join("child-id")).unwrap();
             loop {
                 std::hint::black_box((&driver, &binding));
                 std::thread::park();
@@ -12521,7 +12522,8 @@ mod tests {
         let task = driver.get(parent.id()).unwrap().unwrap();
         let child: AsyncTaskCall = serde_json::from_value(task.checkpoint().data.clone()).unwrap();
         std::fs::write(root.join("parent-id"), parent.id().to_string()).unwrap();
-        std::fs::write(root.join("child-id"), child.task_id().to_string()).unwrap();
+        std::fs::write(root.join("child-id.tmp"), child.task_id().to_string()).unwrap();
+        std::fs::rename(root.join("child-id.tmp"), root.join("child-id")).unwrap();
         loop {
             std::hint::black_box((&driver, &binding));
             std::thread::park();

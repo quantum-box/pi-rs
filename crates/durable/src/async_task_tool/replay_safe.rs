@@ -868,6 +868,57 @@ impl crate::extension::Memo for AbortMemo {
     }
 }
 
+struct ConversationAbortMemo<'a, 'b> {
+    admission: &'a AdmissionHandle<'b>,
+    handler: &'a dyn Handler,
+    claim: &'a crate::task_scheduler::ConversationCancelClaim,
+    identity: &'a crate::nested_identity::IdentityLease,
+    expected_identity: &'a str,
+    marker: &'a [u8],
+    snapshot: &'a durable_store::Check,
+    failed: Mutex<bool>,
+}
+impl ConversationAbortMemo<'_, '_> {
+    fn access(
+        &self,
+        key: &str,
+        value: Option<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let mut failed = self.failed.lock().map_err(|_| "abort memo unavailable")?;
+        if *failed {
+            return Err("abort memo unavailable after failure".into());
+        }
+        let result = self.admission.conversation_cancel_hook_memo(
+            self.handler,
+            self.claim,
+            self.identity,
+            self.expected_identity,
+            self.marker,
+            self.snapshot,
+            key,
+            value,
+        );
+        if result.is_err() {
+            *failed = true;
+        }
+        result
+    }
+}
+#[async_trait::async_trait]
+impl crate::extension::Memo for ConversationAbortMemo<'_, '_> {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        self.access(key, None)
+    }
+    async fn get_or_insert(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.access(key, Some(value))?
+            .ok_or_else(|| "memo insertion failed".into())
+    }
+}
+
 struct Executor {
     tool: Arc<dyn DurableAsyncTool>,
     identity: ToolIdentity,
@@ -1009,6 +1060,7 @@ impl Executor {
         task: &Task,
         arguments: serde_json::Value,
         snapshot: serde_json::Value,
+        memo: &ConversationAbortMemo<'_, '_>,
     ) -> Result<serde_json::Value, String> {
         self.bounded_hook_arguments(&arguments)?;
         let gate = crate::runtime::ToolDiagnostic {
@@ -1023,7 +1075,6 @@ impl Executor {
                 .into_iter()
                 .collect(),
         };
-        let memo = AbortMemo(std::sync::atomic::AtomicBool::new(false));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1035,7 +1086,7 @@ impl Executor {
             };
             let ctx = crate::extension::Context {
                 snapshot: &snapshot,
-                memo: &memo,
+                memo,
             };
             let hooks = self.hook_registry()?;
             let (result, reports) = tokio::time::timeout(
@@ -1054,8 +1105,8 @@ impl Executor {
             }
             Ok(result)
         })?;
-        if memo.0.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("abort hook used unavailable memo".into());
+        if *memo.failed.lock().map_err(|_| "abort memo unavailable")? {
+            return Err("abort hook memo failed".into());
         }
         validate_content_hook_result(&result, Some(&gate), false)?;
         let value = serde_json::to_value(DurableTaskResult::Rich {
@@ -2083,8 +2134,23 @@ impl Handler for Executor {
                     admission
                         .conversation_cancel_hook_snapshot()
                         .and_then(|(snapshot, check)| {
-                            self.conversation_cancel_after_result(task, after_arguments, snapshot)
-                                .map(|result| (result, check))
+                            let memo = ConversationAbortMemo {
+                                admission,
+                                handler: self,
+                                claim: &_claim,
+                                identity: &_identity_lease,
+                                expected_identity: expected,
+                                marker: &marker,
+                                snapshot: &check,
+                                failed: Mutex::new(false),
+                            };
+                            self.conversation_cancel_after_result(
+                                task,
+                                after_arguments,
+                                snapshot,
+                                &memo,
+                            )
+                            .map(|result| (result, check))
                         });
                 match after {
                     Ok((result, check)) => (Some(result), Some(check)),
