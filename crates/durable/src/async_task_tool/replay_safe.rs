@@ -2411,9 +2411,11 @@ impl Handler for Executor {
                         finish?;
                         return Err("test receipt evidence only; callback remains disabled".into());
                     }
-                    crate::task_scheduler::report_conversation_start_result(task.id());
-                    result?;
-                    if admission
+                    if let Err(error) = result {
+                        crate::task_scheduler::report_conversation_start_result(task.id());
+                        return Err(error);
+                    }
+                    let duplicate = admission
                         .record_conversation_start_markers(
                             self,
                             _claim.claim_id,
@@ -2421,8 +2423,10 @@ impl Handler for Executor {
                             expected,
                             cancel.conversation_cancel_policy(),
                         )
-                        .is_ok()
-                    {
+                        .is_ok();
+                    // Retire the first markers only after the duplicate probe.
+                    crate::task_scheduler::report_conversation_start_result(task.id());
+                    if duplicate {
                         return Err("duplicate start markers accepted".into());
                     }
                     return Err("test start evidence only; callback remains disabled".into());

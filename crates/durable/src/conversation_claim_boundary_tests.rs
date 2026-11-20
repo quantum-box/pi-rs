@@ -2543,6 +2543,13 @@ async fn exercise_conversation_park_claim(case: &str) {
         let conversation_marker_key = format!("runtime/conversation-callback-start/{conversation}");
         let task_marker_key = format!("durable/task-callback-start/{root_id}");
         if case == "start_ok" {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !finished.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
             let marker = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if let Some(entry) = store.get(conversation_marker_key.as_bytes()).unwrap() {
