@@ -250,6 +250,27 @@ mod task_record {
 // can consume its evidence.
 #[cfg(feature = "experimental-graph-revision")]
 #[allow(dead_code)]
+fn marked_owned_child_matches(marked: &serde_json::Value, current: &serde_json::Value) -> bool {
+    [
+        "id",
+        "owner",
+        "kind",
+        "definition_version",
+        "input",
+        "checkpoint",
+        "replay_safe",
+        "background",
+        "task_tool",
+        "retain_task_children_on_success",
+        "interrupted_dispatch_attempt",
+        "woken_interrupted_attempt",
+    ]
+    .iter()
+    .all(|field| marked.get(*field) == current.get(*field))
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
 fn validate_owned_child_reservation(
     tx: &rusqlite::Transaction<'_>,
     mutations: &[Mutation],
@@ -353,18 +374,19 @@ fn validate_owned_child_reservation(
             matches.next().is_none().then_some(task)
         })
         .ok_or_else(fail)?;
-    for field in [
-        "id",
-        "owner",
-        "kind",
-        "definition_version",
-        "input",
-        "replay_safe",
-        "background",
-        "task_tool",
-        "retain_task_children_on_success",
+    if !marked_owned_child_matches(marked, &current) {
+        return Err(fail());
+    }
+    let new_attempt = &marker["running"]["attempt_id"];
+    for previous in [
+        &current["attempt_id"],
+        &current["retired_attempt_id"],
+        &marked["attempt_id"],
+        &marked["retired_attempt_id"],
+        &marked["interrupted_dispatch_attempt"],
+        &marked["woken_interrupted_attempt"],
     ] {
-        if marked.get(field) != current.get(field) {
+        if !previous.is_null() && previous == new_attempt {
             return Err(fail());
         }
     }
@@ -601,6 +623,15 @@ mod owned_reservation_validation_tests {
     use serde_json::json;
 
     #[test]
+    fn child_checkpoint_cannot_be_substituted() {
+        let marked = json!({"id":"child","checkpoint":{"phase":"parked","data":{"nonce":1}}});
+        let mut changed = marked.clone();
+        changed["checkpoint"]["data"]["nonce"] = json!(2);
+        assert!(marked_owned_child_matches(&marked, &marked));
+        assert!(!marked_owned_child_matches(&marked, &changed));
+    }
+
+    #[test]
     fn direct_owned_child_reservation_checks_graph_and_entire_write_set() {
         let store = Store::memory().unwrap();
         let root = uuid::Uuid::from_u128(10);
@@ -619,7 +650,7 @@ mod owned_reservation_validation_tests {
         let marker_key =
             format!("runtime/woken-owned-child-reservation/v1/{root}/{child}").into_bytes();
         let mut root_task = json!({"id":root,"owner":{"Conversation":outer},"checkpoint":{"phase":"wait","data":null},"state":"Running","restarts":0,"restart_limit":4,"abort_requested":true,"woken_interrupted_attempt":interrupted});
-        let mut child_task = json!({"id":child,"owner":{"Conversation":conversation},"checkpoint":{"phase":"parked","data":null},"state":"Ready","restarts":0,"restart_limit":4,"abort_requested":true,"kind":"unsafe-child","replay_safe":false});
+        let mut child_task = json!({"id":child,"owner":{"Conversation":conversation},"checkpoint":{"phase":"parked","data":null},"state":"Ready","restarts":0,"restart_limit":4,"abort_requested":true,"kind":"unsafe-child","replay_safe":false,"retired_attempt_id":uuid::Uuid::from_u128(15)});
         let edge = json!({"task":root,"task_owner":{"Conversation":outer},"child":conversation,"mode":"Foreground"});
         store
             .commit(
@@ -674,7 +705,11 @@ mod owned_reservation_validation_tests {
             .unwrap();
         let graph_version = store.get(&graph_key).unwrap().unwrap().version;
         child_task["state"] = json!("Running");
-        child_task["attempt_id"] = json!(uuid::Uuid::from_u128(15));
+        child_task["attempt_id"] = json!(uuid::Uuid::from_u128(16));
+        child_task
+            .as_object_mut()
+            .unwrap()
+            .remove("retired_attempt_id");
         let marker = json!({"version":1,"root":root,"child":child,"graph_version":graph_version,"ready_version":child_before.version,"running":child_task});
         let mut writes = vec![
             Mutation::Put {
@@ -691,6 +726,27 @@ mod owned_reservation_validation_tests {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
         assert!(validate_owned_child_reservation(&tx, &writes).is_ok());
+        let mut reused = child_task.clone();
+        reused["attempt_id"] = json!(uuid::Uuid::from_u128(15));
+        let mut reused_marker = marker.clone();
+        reused_marker["running"] = reused.clone();
+        let reused_key = match &writes[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        writes[0] = Mutation::Put {
+            key: child_key.clone(),
+            value: serde_json::to_vec(&reused).unwrap(),
+        };
+        writes[1] = Mutation::Put {
+            key: reused_key.clone(),
+            value: serde_json::to_vec(&reused_marker).unwrap(),
+        };
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        writes[1] = Mutation::Put {
+            key: reused_key,
+            value: serde_json::to_vec(&marker).unwrap(),
+        };
         let mut altered = child_task.clone();
         altered["abort_requested"] = json!(false);
         writes[0] = Mutation::Put {
