@@ -3666,7 +3666,43 @@ async fn woken_conversation_claim_binds_interrupted_attempt_and_late_receipt() {
     assert_eq!(claim.cleanup_attempt, root.attempt_id().unwrap());
     assert_ne!(claim.cleanup_attempt, claim.woken_attempt);
     assert_eq!(claim.cleanup_lease, lease);
+    let claim_key = crate::task_scheduler::woken_conversation_claim_key(root.id());
+    let mut claim_checks = checks.clone();
+    claim_checks.push(durable_store::Check {
+        key: claim_key.clone(),
+        expected: durable_store::Expected::Missing,
+    });
+    store
+        .commit(
+            &claim_checks,
+            &[durable_store::Mutation::Put {
+                key: claim_key,
+                value: serde_json::to_vec(&claim).unwrap(),
+            }],
+        )
+        .unwrap();
+    let rechecked = crate::task_scheduler::woken_conversation_claim_checks(
+        &store,
+        &root,
+        &claim,
+        lease,
+        store.put_version().unwrap(),
+    )
+    .unwrap();
+    let mut foreign = claim.clone();
+    foreign.woken_attempt = uuid::Uuid::new_v4();
+    assert!(
+        crate::task_scheduler::woken_conversation_claim_checks(
+            &store,
+            &root,
+            &foreign,
+            lease,
+            store.put_version().unwrap()
+        )
+        .is_err()
+    );
     store.commit(&checks, &[]).unwrap();
+    store.commit(&rechecked, &[]).unwrap();
     let key = format!(
         "durable/unsafe-park-async/{}/{original}/intent/receipt",
         root.id()
@@ -3695,6 +3731,20 @@ async fn woken_conversation_claim_binds_interrupted_attempt_and_late_receipt() {
         store.commit(&checks, &[]),
         Err(durable_store::Error::Conflict { .. })
     ));
+    assert!(matches!(
+        store.commit(&rechecked, &[]),
+        Err(durable_store::Error::Conflict { .. })
+    ));
+    assert!(
+        crate::task_scheduler::woken_conversation_claim_checks(
+            &store,
+            &root,
+            &claim,
+            lease,
+            store.put_version().unwrap()
+        )
+        .is_err()
+    );
     assert!(
         crate::task_scheduler::prepare_woken_conversation_cancel_claim(
             &store,

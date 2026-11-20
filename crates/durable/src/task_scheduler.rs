@@ -325,6 +325,64 @@ pub(crate) fn prepare_woken_conversation_cancel_claim(
     ))
 }
 
+#[allow(dead_code)]
+pub(crate) fn woken_conversation_claim_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/conversation-woken-cancel-claim-v3").into_bytes()
+}
+
+/// Recheck a prepared woken claim at a later boundary. Callers must still
+/// authenticate the persisted claim and fence the live owner, registration,
+/// signal revisions, task version, and cleanup lease in the same commit.
+#[allow(dead_code)]
+pub(crate) fn woken_conversation_claim_checks(
+    store: &durable_store::Store,
+    task: &Task,
+    claim: &WokenConversationCancelClaim,
+    cleanup_lease: Uuid,
+    boundary: u64,
+) -> Result<Vec<durable_store::Check>, String> {
+    if claim.version != 3
+        || claim.claim_id.is_nil()
+        || claim.cleanup_lease != cleanup_lease
+        || cleanup_lease.is_nil()
+        || claim.task != task.id()
+        || task.owner() != &TaskOwner::Conversation(claim.conversation)
+        || claim.conversation.is_nil()
+        || claim.kind.is_empty()
+        || task.kind() != Some(claim.kind.as_str())
+        || claim.definition_version == 0
+        || task.definition_version() != claim.definition_version
+        || task.attempt_id() != Some(claim.cleanup_attempt)
+        || task.woken_interrupted_attempt() != Some(claim.woken_attempt)
+        || claim.woken_attempt.is_nil()
+        || claim.cleanup_attempt.is_nil()
+        || claim.woken_attempt == claim.cleanup_attempt
+        || claim.checkpoint != *task.checkpoint()
+    {
+        return Err("woken conversation claim identity mismatch".into());
+    }
+    let key = woken_conversation_claim_key(task.id());
+    let entry = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing woken claim")?;
+    let persisted: WokenConversationCancelClaim =
+        serde_json::from_slice(&entry.value).map_err(|_| "invalid woken claim")?;
+    if persisted != *claim {
+        return Err("woken claim changed".into());
+    }
+    let (mut checks, target) =
+        crate::async_task_tool::unsafe_park_proof::woken_cleanup_checks(store, task, boundary)?;
+    checks.push(durable_store::Check {
+        key,
+        expected: durable_store::Expected::Version(entry.version),
+    });
+    if target != claim.woken_attempt {
+        return Err("woken conversation claim evidence changed".into());
+    }
+    Ok(checks)
+}
+
 /// Signal revisions observed by the claim transaction. Missing legacy evidence
 /// cannot authorize a callback-start transaction and requires reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
