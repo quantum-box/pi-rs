@@ -1068,7 +1068,9 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         master.write_all(b"hello\r").unwrap();
         output_until(&mut master, |text| text.contains("live-stream-marker"));
         master.write_all(b"/settings\r").unwrap();
-        output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+        output_until(&mut master, |text| {
+            text.contains("HTTP idle timeout") && text.contains("Maximum idle gap")
+        });
         master.write_all(b" ").unwrap();
         output_until(&mut master, |text| {
             text.contains("HTTP idle timeout") && text.contains("disabled")

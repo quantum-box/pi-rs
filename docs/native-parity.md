@@ -2158,7 +2158,8 @@ components and the remaining extension events are still tracked above.
 editor for implemented model defaults, resource lists, native packages, tool
 selection, trust defaults, terminal mode and codemode settings. Ctrl+S validates
 and saves, Escape discards the edit. Invalid values keep the editor open and
-show the failing settings path. Unrecognized extension-owned keys survive
+show the failing settings path. The selected setting includes an explanatory
+hint below the searchable list. Unrecognized extension-owned keys survive
 updates. Runtime/resource changes take effect on reload or the next startup,
 and theme changes apply immediately.
 
