@@ -398,6 +398,165 @@ pub(crate) struct WokenConversationCancelReceipt {
     pub result: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_version: Option<u64>,
+}
+
+/// Atomic evidence that a woken cleanup's replay-safe after result was
+/// retained while the underlying Tool outcome remains uncertain.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenConversationCancelTerminalMarker {
+    pub version: u32,
+    pub claim_id: Uuid,
+    pub cleanup_attempt: Uuid,
+    pub woken_attempt: Uuid,
+    pub running_task_version: u64,
+    pub terminal_task: Task,
+    pub receipt_version: u64,
+}
+#[allow(dead_code)]
+pub(crate) fn woken_conversation_terminal_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/conversation-woken-cancel-terminal-v1").into_bytes()
+}
+#[allow(dead_code)]
+pub(crate) fn woken_conversation_receipt_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/conversation-woken-cancel-receipt-v1").into_bytes()
+}
+
+/// Fetch a v2 after result while the original cleanup attempt remains running.
+/// The caller must additionally fence the selected registration, identity,
+/// conversation binding, descendants and terminal commit.
+#[allow(dead_code)]
+pub(crate) fn woken_after_candidate_checks(
+    store: &durable_store::Store,
+    task: &Task,
+    claim: &WokenConversationCancelClaim,
+    boundary: u64,
+) -> Result<(Value, u64, Vec<durable_store::Check>), String> {
+    let mut checks =
+        woken_conversation_claim_checks(store, task, claim, claim.cleanup_lease, boundary)?;
+    let key = woken_conversation_receipt_key(task.id());
+    let entry = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("woken after receipt missing")?;
+    let receipt: WokenConversationCancelReceipt =
+        serde_json::from_slice(&entry.value).map_err(|_| "invalid woken after receipt")?;
+    if receipt.version != 2 || receipt.claim != *claim || receipt.result != "callback returned" {
+        return Err("woken after receipt identity mismatch".into());
+    }
+    let result = receipt.after_result.ok_or("woken after result missing")?;
+    crate::async_task_tool::validate_aborted_after_result(&result)?;
+    checks.push(durable_store::Check {
+        key: crate::runtime::Harness::key(claim.conversation),
+        expected: durable_store::Expected::Version(receipt.snapshot_version.unwrap()),
+    });
+    checks.push(durable_store::Check {
+        key,
+        expected: durable_store::Expected::Version(entry.version),
+    });
+    Ok((result, entry.version, checks))
+}
+
+/// Read an after result only when the terminal marker and failed task were
+/// committed together and still bind the exact receipt, snapshot and wake.
+/// The returned result is supplemental and never resolves the Tool outcome.
+#[allow(dead_code)]
+pub(crate) fn woken_terminal_after_checks(
+    store: &durable_store::Store,
+    task: &task_store::StoredTask,
+    boundary: u64,
+) -> Result<(Value, Vec<durable_store::Check>), String> {
+    let key = woken_conversation_terminal_key(task.task.id());
+    let entry = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing woken terminal marker")?;
+    let marker: WokenConversationCancelTerminalMarker =
+        serde_json::from_slice(&entry.value).map_err(|_| "invalid woken terminal marker")?;
+    if marker.version != 1
+        || marker.claim_id.is_nil()
+        || marker.running_task_version == 0
+        || marker.terminal_task != task.task
+        || marker.receipt_version == 0
+        || task.task.woken_interrupted_attempt() != Some(marker.woken_attempt)
+        || store
+            .commit_for_version(&task_store::key(task.task.id()), task.version)
+            .map_err(|e| e.to_string())?
+            != store
+                .commit_for_version(&key, entry.version)
+                .map_err(|e| e.to_string())?
+        || store
+            .commit_for_version(&key, entry.version)
+            .map_err(|e| e.to_string())?
+            .is_none()
+    {
+        return Err("woken terminal evidence mismatch".into());
+    }
+    let claim_key = woken_conversation_claim_key(task.task.id());
+    let claim_entry = store
+        .get(&claim_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing woken claim")?;
+    let claim: WokenConversationCancelClaim =
+        serde_json::from_slice(&claim_entry.value).map_err(|_| "invalid woken claim")?;
+    if claim.version != 3
+        || claim.claim_id != marker.claim_id
+        || claim.cleanup_attempt != marker.cleanup_attempt
+        || claim.woken_attempt != marker.woken_attempt
+        || claim.task != task.task.id()
+        || task.task.owner() != &TaskOwner::Conversation(claim.conversation)
+        || Some(claim.kind.as_str()) != task.task.kind()
+        || claim.definition_version != task.task.definition_version()
+        || claim.checkpoint != *task.task.checkpoint()
+        || claim.cleanup_lease.is_nil()
+    {
+        return Err("terminal woken claim changed".into());
+    }
+    let receipt_key = woken_conversation_receipt_key(task.task.id());
+    let receipt_entry = store
+        .get(&receipt_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing woken receipt")?;
+    let receipt: WokenConversationCancelReceipt =
+        serde_json::from_slice(&receipt_entry.value).map_err(|_| "invalid woken receipt")?;
+    if receipt_entry.version != marker.receipt_version
+        || receipt.version != 2
+        || receipt.claim != claim
+        || receipt.result != "callback returned"
+    {
+        return Err("terminal woken receipt changed".into());
+    }
+    let version = receipt.snapshot_version.ok_or("missing woken snapshot")?;
+    let result = receipt.after_result.ok_or("missing woken after result")?;
+    crate::async_task_tool::validate_aborted_after_result(&result)?;
+    let mut checks = crate::async_task_tool::unsafe_park_proof::woken_terminal_checks(
+        store,
+        &task.task,
+        claim.woken_attempt,
+        boundary,
+    )?;
+    checks.extend([
+        durable_store::Check {
+            key,
+            expected: durable_store::Expected::Version(entry.version),
+        },
+        durable_store::Check {
+            key: claim_key,
+            expected: durable_store::Expected::Version(claim_entry.version),
+        },
+        durable_store::Check {
+            key: receipt_key,
+            expected: durable_store::Expected::Version(receipt_entry.version),
+        },
+        durable_store::Check {
+            key: crate::runtime::Harness::key(claim.conversation),
+            expected: durable_store::Expected::Version(version),
+        },
+    ]);
+    Ok((result, checks))
 }
 
 /// Signal revisions observed by the claim transaction. Missing legacy evidence
@@ -4282,6 +4441,7 @@ impl AdmissionHandle<'_> {
             claim: claim.clone(),
             result: "callback returned".into(),
             after_result: None,
+            snapshot_version: None,
         };
         self.store_woken_conversation_cancel_receipt_inner(
             handler,
@@ -4391,10 +4551,17 @@ impl AdmissionHandle<'_> {
             return Err("invalid woken cleanup receipt".into());
         }
         if let Some(after) = receipt.after_result.as_ref() {
+            if !matches!(snapshot, Some(durable_store::Check { key, expected: durable_store::Expected::Version(v) }) if *key == crate::runtime::Harness::key(receipt.claim.conversation) && Some(*v) == receipt.snapshot_version)
+            {
+                return Err("after snapshot identity mismatch".into());
+            }
             if snapshot.is_none() {
                 return Err("missing after snapshot".into());
             }
             crate::async_task_tool::validate_aborted_after_result(after)?;
+        }
+        if receipt.after_result.is_none() && receipt.snapshot_version.is_some() {
+            return Err("unexpected after snapshot".into());
         }
         if let Some(snapshot) = snapshot {
             checks.push(snapshot.clone());

@@ -465,6 +465,29 @@ pub(crate) fn woken_live_abort_candidate_checks(
     Ok(checks)
 }
 
+/// Recheck a terminal woken cleanup without interpreting the interrupted Tool
+/// as successful. This fences the original wake and late outcome namespace.
+#[allow(dead_code)]
+pub(crate) fn woken_terminal_checks(
+    store: &Store,
+    task: &Task,
+    attempt: Uuid,
+    boundary: u64,
+) -> Result<Vec<Check>, String> {
+    if !matches!(task.state(), TaskState::Failed(_))
+        || !task.abort_requested()
+        || task.woken_interrupted_attempt() != Some(attempt)
+        || task.replay_safe()
+    {
+        return Err("invalid terminal woken cleanup".into());
+    }
+    let (checks, target) = cancel_checks_with_policy(store, task, boundary, true)?;
+    if target != Some(attempt) {
+        return Err("terminal wake changed".into());
+    }
+    Ok(checks)
+}
+
 /// Validate the prior wake for an already-reserved abort cleanup. This proves
 /// neither the current task version nor any conversation authorization.
 #[allow(dead_code)]

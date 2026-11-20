@@ -1960,6 +1960,10 @@ impl Handler for Executor {
                         version: if after_result.is_some() { 2 } else { 1 },
                         claim: claim.clone(),
                         result: "callback returned".into(),
+                        snapshot_version: check.as_ref().and_then(|c| match c.expected {
+                            durable_store::Expected::Version(v) => Some(v),
+                            _ => None,
+                        }),
                         after_result,
                     };
                     if let Some(check) = check.as_ref() {
@@ -2112,6 +2116,10 @@ impl Handler for Executor {
                     version: if after_result.is_some() { 2 } else { 1 },
                     claim: claim.clone(),
                     result: "callback returned".into(),
+                    snapshot_version: snapshot.as_ref().and_then(|c| match c.expected {
+                        durable_store::Expected::Version(v) => Some(v),
+                        _ => None,
+                    }),
                     after_result,
                 };
                 let saved = match snapshot.as_ref() {

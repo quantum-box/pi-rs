@@ -4208,7 +4208,15 @@ async fn woken_driver_start_marker_kill_worker() {
 #[tokio::test]
 async fn woken_driver_claim_and_start_markers_survive_process_kill() {
     use std::process::{Command, Stdio};
-    for mode in ["start", "callback", "receipt", "memo"] {
+    for mode in [
+        "start",
+        "callback",
+        "receipt",
+        "memo",
+        "memo-receipt",
+        "memo-late",
+        "memo-snapshot",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let mut wake = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -4261,7 +4269,7 @@ async fn woken_driver_claim_and_start_markers_survive_process_kill() {
         if mode == "callback" {
             command.env("PI_TEST_WOKEN_HOLD_CALLBACK", "1");
         }
-        if mode == "memo" {
+        if mode.starts_with("memo") {
             command.env("PI_TEST_WOKEN_MEMO", "1");
         }
         let mut start = command.spawn().unwrap();
@@ -4292,7 +4300,7 @@ async fn woken_driver_claim_and_start_markers_survive_process_kill() {
             root.task.id()
         )
         .into_bytes();
-        if mode == "receipt" || mode == "memo" {
+        if mode == "receipt" || mode.starts_with("memo") {
             assert!(store.get(&task_key).unwrap().is_none());
             assert!(store.get(&conversation_key).unwrap().is_none());
             assert!(store.get(&receipt_key).unwrap().is_some());
@@ -4306,6 +4314,159 @@ async fn woken_driver_claim_and_start_markers_survive_process_kill() {
                 store.get(&conversation_key).unwrap().unwrap().value
             );
             assert!(store.get(&receipt_key).unwrap().is_none());
+        }
+        if mode.starts_with("memo") {
+            let tasks = crate::task_store::TaskStore::new(&store);
+            let running = tasks.load(root.task.id()).unwrap().unwrap();
+            let mut terminal = running.clone();
+            terminal
+                .task
+                .fail("interrupted woken execution; reconciliation required".into())
+                .unwrap();
+            let receipt_entry = store.get(&receipt_key).unwrap().unwrap();
+            let marker = crate::task_scheduler::WokenConversationCancelTerminalMarker {
+                version: 1,
+                claim_id: claim.claim_id,
+                cleanup_attempt: claim.cleanup_attempt,
+                woken_attempt: claim.woken_attempt,
+                running_task_version: running.version,
+                terminal_task: terminal.task.clone(),
+                receipt_version: receipt_entry.version,
+            };
+            let marker_key = crate::task_scheduler::woken_conversation_terminal_key(root.task.id());
+            let mut batch = tasks
+                .prepare_save(&[crate::task_store::Save::Update(&terminal)])
+                .unwrap();
+            batch.checks.push(durable_store::Check {
+                key: marker_key.clone(),
+                expected: durable_store::Expected::Missing,
+            });
+            batch.mutations.push(durable_store::Mutation::Put {
+                key: marker_key.clone(),
+                value: serde_json::to_vec(&marker).unwrap(),
+            });
+            store.commit(&batch.checks, &batch.mutations).unwrap();
+            let finished = tasks.load(root.task.id()).unwrap().unwrap();
+            let (result, checks) = crate::task_scheduler::woken_terminal_after_checks(
+                &store,
+                &finished,
+                store.put_version().unwrap(),
+            )
+            .unwrap();
+            assert!(result.is_object());
+            store.commit(&checks, &[]).unwrap();
+            match mode {
+                "memo" => {
+                    let mut foreign = marker.clone();
+                    foreign.woken_attempt = uuid::Uuid::new_v4();
+                    let entry = store.get(&marker_key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: marker_key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key: marker_key.clone(),
+                                value: serde_json::to_vec(&foreign).unwrap(),
+                            }],
+                        )
+                        .unwrap();
+                    assert!(
+                        crate::task_scheduler::woken_terminal_after_checks(
+                            &store,
+                            &finished,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                    );
+                }
+                "memo-receipt" => {
+                    let entry = store.get(&receipt_key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: receipt_key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key: receipt_key.clone(),
+                                value: entry.value,
+                            }],
+                        )
+                        .unwrap();
+                    assert!(
+                        crate::task_scheduler::woken_terminal_after_checks(
+                            &store,
+                            &finished,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                    );
+                }
+                "memo-late" => {
+                    let key = format!(
+                        "durable/unsafe-park-async/{}/{}/intent/receipt",
+                        root.task.id(),
+                        claim.woken_attempt
+                    )
+                    .into_bytes();
+                    let late = crate::async_task_tool::UnsafeDurableReceipt {
+                        task_id: root.task.id(),
+                        attempt_id: claim.woken_attempt,
+                        outcome: Outcome::Pending {
+                            reference: "late".into(),
+                        },
+                    };
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Missing,
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: serde_json::to_vec(&late).unwrap(),
+                            }],
+                        )
+                        .unwrap();
+                    assert!(
+                        crate::task_scheduler::woken_terminal_after_checks(
+                            &store,
+                            &finished,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                    );
+                }
+                "memo-snapshot" => {
+                    let key = crate::runtime::Harness::key(claim.conversation);
+                    let entry = store.get(&key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: entry.value,
+                            }],
+                        )
+                        .unwrap();
+                    let (_, stale_checks) = crate::task_scheduler::woken_terminal_after_checks(
+                        &store,
+                        &finished,
+                        store.put_version().unwrap(),
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        store.commit(&stale_checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                }
+                _ => unreachable!(),
+            }
         }
         drop(store);
         let (_harness, driver) = start_woken_test_driver(&path);
@@ -4327,9 +4488,9 @@ async fn woken_driver_claim_and_start_markers_survive_process_kill() {
         assert!(store.get(&conversation_key).unwrap().is_none());
         assert_eq!(
             store.get(&receipt_key).unwrap().is_some(),
-            mode == "receipt" || mode == "memo"
+            mode == "receipt" || mode.starts_with("memo")
         );
-        if mode == "memo" {
+        if mode.starts_with("memo") {
             let key = format!("runtime/extension-memo/{}/woken-test", root.task.id());
             assert_eq!(
                 serde_json::from_slice::<Value>(&store.get(key.as_bytes()).unwrap().unwrap().value)
