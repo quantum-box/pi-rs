@@ -323,6 +323,68 @@ pub(crate) struct ConversationCancelTerminalMarker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_version: Option<u64>,
 }
+/// Proposed evidence format for an individually cancelled nested tool. This
+/// structural check is not authorization: a caller must additionally fence
+/// the original park, claim, receipt and ancestry records, terminal co-commit,
+/// registry/selection and host identity, and absence of a late Tool outcome.
+/// No production path consumes this candidate while those checks are incomplete.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NestedCancelTerminalEvidence {
+    version: u32,
+    conversation: Uuid,
+    ancestry: Vec<Uuid>,
+    claim: ConversationCancelClaim,
+    identity: crate::task_tool::Identity,
+    receipt_version: u64,
+    terminal_task: Task,
+}
+
+#[allow(dead_code)]
+fn validate_nested_cancel_terminal_evidence(
+    evidence: &NestedCancelTerminalEvidence,
+    conversation: Uuid,
+    ancestry: &[Uuid],
+    task: &Task,
+    identity: &crate::task_tool::Identity,
+    claim: &ConversationCancelClaim,
+    receipt_version: u64,
+    receipt: &ConversationCancelReceipt,
+) -> Result<(), String> {
+    let unique: HashSet<_> = ancestry.iter().copied().collect();
+    if evidence.version != 1
+        || conversation.is_nil()
+        || evidence.conversation != conversation
+        || evidence.ancestry != ancestry
+        || ancestry.len() < 2
+        || ancestry.len() > 1024
+        || unique.len() != ancestry.len()
+        || ancestry.contains(&Uuid::nil())
+        || ancestry[0] != task.id()
+        || task.owner() != &TaskOwner::Task(ancestry[1])
+        || task.state() != &TaskState::Cancelled
+        || evidence.terminal_task != *task
+        || evidence.identity != *identity
+        || !identity.is_checkpointable()
+        || identity.replay_safe
+        || identity.kind != claim.kind
+        || identity.definition_version != claim.definition_version
+        || task.replay_safe()
+        || task.kind() != Some(claim.kind.as_str())
+        || task.definition_version() != claim.definition_version
+        || task.checkpoint() != &claim.checkpoint
+        || evidence.claim != *claim
+        || claim.task != task.id()
+        || receipt_version == 0
+        || evidence.receipt_version != receipt_version
+        || receipt.result != "callback returned"
+        || identity.has_conversation_hooks() != (receipt.version == 2)
+    {
+        return Err("nested cancel terminal evidence mismatch".into());
+    }
+    validate_conversation_cancel_receipt(receipt, claim)
+}
+
 pub(crate) fn conversation_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-terminal").into_bytes()
 }
@@ -14886,6 +14948,85 @@ mod tests {
             phase: phase.into(),
             data: json!(null),
         }
+    }
+
+    #[test]
+    fn nested_cancel_evidence_rejects_substituted_identity_and_result() {
+        let conversation = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let checkpoint = cp("replay-safe-async-wait");
+        let mut task = Task::new(id, TaskOwner::Task(parent), checkpoint.clone(), 3)
+            .unwrap()
+            .registered("nested-kind".into(), false);
+        task.start().unwrap();
+        task.request_abort().unwrap();
+        task.cancel().unwrap();
+        let identity: crate::task_tool::Identity = serde_json::from_value(json!({
+            "adapter_version": 1,
+            "spec": { "name": "nested", "description": "", "parameters": {"type":"object"} },
+            "kind": "nested-kind", "definition_version": 1, "replay_safe": false,
+            "deferred_arguments": true
+        }))
+        .unwrap();
+        let claim = ConversationCancelClaim {
+            version: 2,
+            claim_id: Uuid::new_v4(),
+            task: id,
+            kind: "nested-kind".into(),
+            definition_version: 1,
+            attempt: Uuid::new_v4(),
+            lease: Uuid::new_v4(),
+            checkpoint,
+            policy: crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+        };
+        let receipt = ConversationCancelReceipt {
+            version: 1,
+            claim: claim.clone(),
+            result: "callback returned".into(),
+            after_result: None,
+        };
+        let ancestry = vec![id, parent];
+        let evidence = NestedCancelTerminalEvidence {
+            version: 1,
+            conversation,
+            ancestry: ancestry.clone(),
+            claim: claim.clone(),
+            identity: identity.clone(),
+            receipt_version: 17,
+            terminal_task: task.clone(),
+        };
+        let check = |e: &NestedCancelTerminalEvidence,
+                     a: &[Uuid],
+                     i: &crate::task_tool::Identity,
+                     c: &ConversationCancelClaim,
+                     v: u64,
+                     r: &ConversationCancelReceipt| {
+            validate_nested_cancel_terminal_evidence(e, conversation, a, &task, i, c, v, r)
+        };
+        assert!(check(&evidence, &ancestry, &identity, &claim, 17, &receipt).is_ok());
+        assert!(
+            check(
+                &evidence,
+                &[id, Uuid::new_v4()],
+                &identity,
+                &claim,
+                17,
+                &receipt
+            )
+            .is_err()
+        );
+        assert!(check(&evidence, &[id, id], &identity, &claim, 17, &receipt).is_err());
+        assert!(check(&evidence, &ancestry, &identity, &claim, 18, &receipt).is_err());
+        let mut changed = claim.clone();
+        changed.lease = Uuid::new_v4();
+        assert!(check(&evidence, &ancestry, &identity, &changed, 17, &receipt).is_err());
+        let mut other_identity = identity.clone();
+        other_identity.kind = "different".into();
+        assert!(check(&evidence, &ancestry, &other_identity, &claim, 17, &receipt).is_err());
+        let mut other_receipt = receipt.clone();
+        other_receipt.result = "unknown".into();
+        assert!(check(&evidence, &ancestry, &identity, &claim, 17, &other_receipt).is_err());
     }
 
     #[test]
