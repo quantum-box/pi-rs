@@ -389,6 +389,160 @@ fn nested_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/nested-cancel-terminal-v1").into_bytes()
 }
 
+/// Provisional proof of a cancelled child result. The caller must also bind
+/// the conversation root and selected registry under its selection gate and
+/// retain the returned host identity lease through the parent commit.
+#[allow(dead_code)]
+pub(crate) fn nested_cancel_terminal_checks(
+    store: &durable_store::Store,
+    task: &task_store::StoredTask,
+    registry: &Registry,
+    boundary: u64,
+) -> Result<
+    (
+        Vec<durable_store::Check>,
+        crate::nested_identity::IdentityLease,
+    ),
+    Error,
+> {
+    let evidence_key = nested_cancel_terminal_key(task.task.id());
+    let evidence_entry = store
+        .get(&evidence_key)
+        .map_err(task_store::Error::from)?
+        .ok_or(Error::Ownership)?;
+    let evidence: NestedCancelTerminalEvidence =
+        serde_json::from_slice(&evidence_entry.value).map_err(|e| Error::Handler(e.to_string()))?;
+    let claim_key = conversation_cancel_claim_key(task.task.id());
+    let claim_entry = store
+        .get(&claim_key)
+        .map_err(task_store::Error::from)?
+        .ok_or(Error::Ownership)?;
+    let claim: ConversationCancelClaim =
+        serde_json::from_slice(&claim_entry.value).map_err(|e| Error::Handler(e.to_string()))?;
+    let receipt_key = format!(
+        "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+        task.task.id()
+    )
+    .into_bytes();
+    let receipt_entry = store
+        .get(&receipt_key)
+        .map_err(task_store::Error::from)?
+        .ok_or(Error::Ownership)?;
+    let receipt: ConversationCancelReceipt =
+        serde_json::from_slice(&receipt_entry.value).map_err(|e| Error::Handler(e.to_string()))?;
+    let reg = registry
+        .entries
+        .get(task.task.kind().ok_or(Error::Ownership)?)
+        .ok_or(Error::Registration)?;
+    let (identity, validate, _) = reg
+        .conversation_checkpointable
+        .as_ref()
+        .ok_or(Error::Registration)?;
+    if !validate()
+        || reg.replay_safe
+        || reg.version != task.task.definition_version()
+        || !reg.handler.conversation_cancel_dispatch_enabled()
+    {
+        return Err(Error::Registration);
+    }
+    let identity_lease = reg
+        .handler
+        .conversation_cleanup_identity_lease()
+        .map_err(|_| Error::Ownership)?;
+    let (conversation, ancestry, mut checks, ancestry_version) =
+        task_store::read_nested_cancel_claim_ancestry(store, task.task.id(), claim.claim_id)?;
+    validate_nested_cancel_terminal_evidence(
+        &evidence,
+        conversation,
+        &ancestry,
+        &task.task,
+        identity,
+        &claim,
+        receipt_entry.version,
+        &receipt,
+    )
+    .map_err(Error::Handler)?;
+    let marker = serde_json::to_vec(&serde_json::json!({"version":1,"claim_id":claim.claim_id,"task":claim.task,"attempt":claim.attempt,"lease":claim.lease,"policy":claim.policy})).map_err(|e| Error::Handler(e.to_string()))?;
+    let (finished_ancestry, finished_checks, finished_version) =
+        task_store::read_finished_callback_ancestry(store, task.task.id(), conversation, &marker)?;
+    if ancestry != finished_ancestry {
+        return Err(Error::Ownership);
+    }
+    checks.extend(finished_checks);
+    let conversation_marker =
+        format!("runtime/conversation-callback-start/{conversation}").into_bytes();
+    if store
+        .get(&conversation_marker)
+        .map_err(task_store::Error::from)?
+        .is_some()
+    {
+        return Err(Error::Ownership);
+    }
+    checks.push(durable_store::Check {
+        key: conversation_marker,
+        expected: durable_store::Expected::Missing,
+    });
+    checks.extend(
+        crate::async_task_tool::unsafe_park_proof::cancel_checks(store, &task.task, boundary)
+            .map_err(Error::Handler)?,
+    );
+    let ancestry_key =
+        format!("durable/task-callback-claim-ancestry/{}", task.task.id()).into_bytes();
+    let start_key = format!("durable/task-callback-ancestry/{}", task.task.id()).into_bytes();
+    let claim_commit = store
+        .commit_for_version(&claim_key, claim_entry.version)
+        .map_err(task_store::Error::from)?;
+    let ancestry_commit = store
+        .commit_for_version(&ancestry_key, ancestry_version)
+        .map_err(task_store::Error::from)?;
+    let start_commit = store
+        .commit_for_version(&start_key, finished_version)
+        .map_err(task_store::Error::from)?;
+    let receipt_commit = store
+        .commit_for_version(&receipt_key, receipt_entry.version)
+        .map_err(task_store::Error::from)?;
+    let terminal_commit = store
+        .commit_for_version(&evidence_key, evidence_entry.version)
+        .map_err(task_store::Error::from)?;
+    let task_commit = store
+        .commit_for_version(&task_store::key(task.task.id()), task.version)
+        .map_err(task_store::Error::from)?;
+    match (
+        claim_commit,
+        ancestry_commit,
+        start_commit,
+        receipt_commit,
+        terminal_commit,
+        task_commit,
+    ) {
+        (Some(claim), Some(ancestry), Some(start), Some(receipt), Some(terminal), Some(task))
+            if claim == ancestry
+                && claim < start
+                && start < receipt
+                && receipt < terminal
+                && terminal == task =>
+        {
+            ()
+        }
+        _ => return Err(Error::Ownership),
+    }
+    checks.extend([
+        durable_store::Check {
+            key: evidence_key,
+            expected: durable_store::Expected::Version(evidence_entry.version),
+        },
+        durable_store::Check {
+            key: claim_key,
+            expected: durable_store::Expected::Version(claim_entry.version),
+        },
+        durable_store::Check {
+            key: receipt_key,
+            expected: durable_store::Expected::Version(receipt_entry.version),
+        },
+    ]);
+    Ok((checks, identity_lease))
+}
+
 pub(crate) fn conversation_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-terminal").into_bytes()
 }

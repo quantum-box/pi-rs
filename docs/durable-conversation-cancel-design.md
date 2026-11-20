@@ -318,3 +318,12 @@ receipt arriving at settlement forces reconciliation. A selected-child test
 also pins selection through first poll and runs the replay-safe after hook with
 fenced memo before its version-2 receipt. These paths are not enabled in
 production.
+
+The provisional nested-success reader checks the claim and ancestry sidecar
+were co-committed, marker creation preceded the callback receipt, and the
+receipt preceded the atomic task and terminal-evidence commit. It checks the
+park and late-outcome fence, registration identity, marker retirement and
+current ancestry, and returns a host identity lease plus store checks. A
+separate Harness check binds an already-cancelled child to the current root and
+selection. Neither check is wired into parent settlement; a caller must hold
+the selection gate and the returned identity lease through the parent commit.

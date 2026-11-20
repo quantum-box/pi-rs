@@ -2110,6 +2110,50 @@ pub(crate) fn prepare_authenticated_callback_ancestry_start(
     Ok(batch)
 }
 
+/// Read the exact marker chain after retirement. The caller must bind this
+/// record to a trusted receipt and claim and check that those commits occurred
+/// in order; missing markers alone do not prove a callback ran.
+#[allow(dead_code)]
+pub(crate) fn read_finished_callback_ancestry(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    marker: &[u8],
+) -> Result<(Vec<Uuid>, Vec<Check>, u64), Error> {
+    let key = callback_ancestry_key(task);
+    let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
+    let evidence: CallbackAncestryEvidence = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.conversation != conversation
+        || evidence.marker != marker
+        || evidence.ancestry.first() != Some(&task)
+        || evidence.ancestry.len() < 2
+        || evidence.ancestry.len() > 1024
+    {
+        return Err(Error::InvalidKey);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut checks = vec![Check {
+        key,
+        expected: Expected::Version(entry.version),
+    }];
+    for id in &evidence.ancestry {
+        if id.is_nil() || !seen.insert(*id) {
+            return Err(Error::InvalidKey);
+        }
+        let key = callback_start_key(*id);
+        if store.get(&key)?.is_some() {
+            return Err(Error::InvalidKey);
+        }
+        checks.push(Check {
+            key,
+            expected: Expected::Missing,
+        });
+    }
+    Ok((evidence.ancestry, checks, entry.version))
+}
+
 /// Finish exactly the persisted chain. The caller must also authenticate its
 /// immutable claim, callback outcome, identity, and active attempt atomically.
 #[allow(dead_code)]

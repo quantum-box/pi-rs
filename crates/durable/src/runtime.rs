@@ -11745,7 +11745,7 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<Vec<Check>, Error> {
-        self.checkpointable_conversation_checks_inner(task, registry, false, false)
+        self.checkpointable_conversation_checks_inner(task, registry, false, false, false)
     }
 
     // Provisional evidence only: callers must include it in the same checked
@@ -11768,7 +11768,9 @@ impl Harness {
             unreachable!()
         };
         let mut checks = self.checkpointable_cancel_root_capability_checks(*id)?;
-        checks.extend(self.checkpointable_conversation_checks_inner(task, registry, true, false)?);
+        checks.extend(
+            self.checkpointable_conversation_checks_inner(task, registry, true, false, false)?,
+        );
         Ok(checks)
     }
 
@@ -11782,8 +11784,33 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<(Uuid, Vec<Check>), Error> {
+        self.checkpointable_nested_cancel_checks_inner(task, registry, false)
+    }
+
+    /// Provisional root binding for an already-cancelled nested child. The
+    /// caller must separately authenticate its terminal claim and receipt.
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_nested_cancel_result_checks(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<(Uuid, Vec<Check>), Error> {
+        self.checkpointable_nested_cancel_checks_inner(task, registry, true)
+    }
+
+    fn checkpointable_nested_cancel_checks_inner(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+        terminal: bool,
+    ) -> Result<(Uuid, Vec<Check>), Error> {
         if !task.abort_requested()
-            || task.state() != &crate::task::TaskState::Running
+            || task.state()
+                != if terminal {
+                    &crate::task::TaskState::Cancelled
+                } else {
+                    &crate::task::TaskState::Running
+                }
             || !matches!(task.owner(), crate::task::TaskOwner::Task(_))
         {
             return Err(Error::Invalid("nested cleanup attempt unavailable".into()));
@@ -11813,7 +11840,9 @@ impl Harness {
         };
         let mut checks = self.checkpointable_cancel_root_capability_checks(conversation)?;
         checks.extend(ancestry_checks);
-        checks.extend(self.checkpointable_conversation_checks_inner(task, registry, true, false)?);
+        checks.extend(
+            self.checkpointable_conversation_checks_inner(task, registry, true, false, terminal)?,
+        );
         Ok((conversation, checks))
     }
 
@@ -11882,7 +11911,7 @@ impl Harness {
                 "checkpointable recovery task unavailable".into(),
             ));
         }
-        self.checkpointable_conversation_checks_inner(task, registry, true, true)
+        self.checkpointable_conversation_checks_inner(task, registry, true, true, false)
     }
 
     fn checkpointable_conversation_checks_inner(
@@ -11891,6 +11920,7 @@ impl Harness {
         registry: &crate::task_scheduler::Registry,
         cleanup: bool,
         allow_failed_root: bool,
+        allow_cancelled_child: bool,
     ) -> Result<Vec<Check>, Error> {
         let store = self.owner.store();
         let tasks = crate::task_store::TaskStore::new(store);
@@ -11910,9 +11940,11 @@ impl Harness {
                     && !registry.is_conversation_checkpointable_task(&stored.task))
                 || (!cleanup && stored.task.abort_requested())
                 || (stored.task.is_terminal()
-                    && !(allow_failed_root
-                        && next == task.id()
-                        && matches!(stored.task.state(), crate::task::TaskState::Failed(_))))
+                    && !(next == task.id()
+                        && ((allow_failed_root
+                            && matches!(stored.task.state(), crate::task::TaskState::Failed(_)))
+                            || (allow_cancelled_child
+                                && stored.task.state() == &crate::task::TaskState::Cancelled))))
                 || (stored.task.is_completing()
                     && !(stored.task.retains_task_children_on_success()
                         && matches!(stored.task.state(), crate::task::TaskState::Completing(_))))
@@ -34383,6 +34415,35 @@ mod scheduler_tests {
                     .checkpointable_nested_cancel_conversation_checks(&child, &registry)
                     .unwrap();
                 assert_eq!(owner_conversation, id);
+                // A separate terminal child can be checked as a candidate
+                // result, but this is not itself receipt authorization.
+                let ended_id = Uuid::new_v4();
+                let mut ended = Task::new(
+                    ended_id,
+                    crate::task::TaskOwner::Task(op),
+                    crate::task::Checkpoint {
+                        phase: "initial".into(),
+                        data: serde_json::json!(null),
+                    },
+                    5,
+                )
+                .unwrap()
+                .registered("checkpointable-child".into(), false);
+                ended.start_attempt(Uuid::new_v4()).unwrap();
+                ended.request_abort().unwrap();
+                ended.cancel().unwrap();
+                tasks
+                    .save(&[crate::task_store::Save::Create(&ended)])
+                    .unwrap();
+                let (result_conversation, result_checks) = h
+                    .checkpointable_nested_cancel_result_checks(&ended, &registry)
+                    .unwrap();
+                assert_eq!(result_conversation, id);
+                h.owner.store().commit(&result_checks, &[]).unwrap();
+                assert!(
+                    h.checkpointable_nested_cancel_conversation_checks(&ended, &registry)
+                        .is_err()
+                );
                 let nested_authorized = format!("test/nested-authorized/{stage}/{op}").into_bytes();
                 h.owner
                     .store()

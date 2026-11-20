@@ -885,6 +885,64 @@ async fn exercise_conversation_park_claim(case: &str) {
                     .commit_for_version(&crate::task_store::key(child_id), terminal.version)
                     .unwrap()
             );
+            let boundary = store.put_version().unwrap();
+            let (checks, _identity) = crate::task_scheduler::nested_cancel_terminal_checks(
+                &store,
+                &terminal,
+                &recovery_registry,
+                boundary,
+            )
+            .unwrap();
+            store.commit(&checks, &[]).unwrap();
+            assert!(
+                leaf_identity
+                    .as_ref()
+                    .unwrap()
+                    .update(Some("changed".into()), || {})
+                    .await
+                    .is_err()
+            );
+            let prefix = format!("durable/unsafe-park-async/{child_id}/");
+            let (mut key, entry) = store
+                .list(prefix.as_bytes())
+                .unwrap()
+                .into_iter()
+                .find(|(key, _)| key.ends_with(b"/intent"))
+                .unwrap();
+            let intent: pi_rs_durable::task::Task = serde_json::from_slice(&entry.value).unwrap();
+            let receipt = crate::async_task_tool::UnsafeDurableReceipt {
+                task_id: child_id,
+                attempt_id: intent.attempt_id().unwrap(),
+                outcome: Outcome::Pending {
+                    reference: "late-after-terminal".into(),
+                },
+            };
+            key.extend_from_slice(b"/receipt");
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&receipt).unwrap(),
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.commit(&checks, &[]),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(
+                crate::task_scheduler::nested_cancel_terminal_checks(
+                    &store,
+                    &terminal,
+                    &recovery_registry,
+                    store.put_version().unwrap()
+                )
+                .is_err()
+            );
         }
         if case == "nested_claim_selected" {
             let receipt = store.get(receipt_key.as_bytes()).unwrap().unwrap();
