@@ -8660,7 +8660,8 @@ async fn exercise_woken_owned_coordinator(invalid_proof: bool) {
                 },
                 3,
             )
-            .unwrap();
+            .unwrap()
+            .registered("owned-independent".into(), true);
             let key = crate::task_store::key(child.id());
             store
                 .commit(
