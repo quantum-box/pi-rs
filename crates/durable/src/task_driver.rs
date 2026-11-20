@@ -2333,6 +2333,14 @@ mod tests {
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         use std::time::{Duration, Instant};
+        // Hooks are process-global and keyed by task ID. Different fixtures
+        // must not share IDs when the test harness runs them concurrently;
+        // the path also keeps IDs stable across the kill/reopen child process.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        root.hash(&mut hasher);
+        let namespace = (u128::from(hasher.finish())) << 64;
+        let fixture_id = |id: u128| Uuid::from_u128(namespace | id);
         struct Stub;
         #[async_trait]
         impl Model for Stub {
@@ -2360,7 +2368,7 @@ mod tests {
                 })
                 .unwrap()
         } else {
-            Uuid::from_u128(200)
+            fixture_id(200)
         };
         let mut registry = task_scheduler::Registry::default();
         let abort_log = root.join("multi-abort-log");
@@ -2390,9 +2398,9 @@ mod tests {
             phase: "initial".into(),
             data: json!(null),
         };
-        let parent_id = Uuid::from_u128(1);
-        let child_id = Uuid::from_u128(2);
-        let owner_id = Uuid::from_u128(100);
+        let parent_id = fixture_id(1);
+        let child_id = fixture_id(2);
+        let owner_id = fixture_id(100);
         if !reopen {
             let mut parent = Task::new(parent_id, TaskOwner::Conversation(owner_id), cp.clone(), 3)
                 .unwrap()
@@ -2402,7 +2410,7 @@ mod tests {
                 .unwrap()
                 .registered("work".into(), true);
             let mut related = Task::new(
-                Uuid::from_u128(3),
+                fixture_id(3),
                 TaskOwner::Task(parent_id),
                 cp.clone(),
                 3,
@@ -2412,7 +2420,7 @@ mod tests {
             related.start().unwrap();
             related.wait(WaitFor::Signal("related".into())).unwrap();
             let mut related_held = Task::new(
-                Uuid::from_u128(4),
+                fixture_id(4),
                 TaskOwner::Task(parent_id),
                 cp.clone(),
                 3,
@@ -2435,7 +2443,7 @@ mod tests {
                 })
                 .unwrap();
             let mut second = Task::new(
-                Uuid::from_u128(5),
+                fixture_id(5),
                 TaskOwner::Conversation(second_owner),
                 cp.clone(),
                 3,
@@ -2444,7 +2452,7 @@ mod tests {
             .registered("work".into(), true);
             second.start().unwrap();
             let second_child = Task::new(
-                Uuid::from_u128(6),
+                fixture_id(6),
                 TaskOwner::Task(second.id()),
                 cp.clone(),
                 3,
@@ -2470,8 +2478,8 @@ mod tests {
         }
         let offset = if reopen { 20 } else { 10 };
         let mut signal_task = Task::new(
-            Uuid::from_u128(offset),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 100)),
+            fixture_id(offset),
+            TaskOwner::Conversation(fixture_id(offset + 100)),
             cp.clone(),
             3,
         )
@@ -2480,8 +2488,8 @@ mod tests {
         signal_task.start().unwrap();
         signal_task.wait(WaitFor::Signal("go".into())).unwrap();
         let mut timer = Task::new(
-            Uuid::from_u128(offset + 1),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 101)),
+            fixture_id(offset + 1),
+            TaskOwner::Conversation(fixture_id(offset + 101)),
             cp.clone(),
             3,
         )
@@ -2494,8 +2502,8 @@ mod tests {
             ))
             .unwrap();
         let mut aborted = Task::new(
-            Uuid::from_u128(offset + 2),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 102)),
+            fixture_id(offset + 2),
+            TaskOwner::Conversation(fixture_id(offset + 102)),
             cp,
             3,
         )
@@ -2512,8 +2520,8 @@ mod tests {
             .unwrap();
         let cp = signal_task.checkpoint().clone();
         let mut ended = Task::new(
-            Uuid::from_u128(offset + 3),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 103)),
+            fixture_id(offset + 3),
+            TaskOwner::Conversation(fixture_id(offset + 103)),
             cp.clone(),
             3,
         )
@@ -2522,8 +2530,8 @@ mod tests {
         ended.start().unwrap();
         ended.succeed(json!("done")).unwrap();
         let mut dependent = Task::new(
-            Uuid::from_u128(offset + 4),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 104)),
+            fixture_id(offset + 4),
+            TaskOwner::Conversation(fixture_id(offset + 104)),
             cp,
             3,
         )
@@ -2531,14 +2539,14 @@ mod tests {
         .registered("work".into(), true);
         dependent.start().unwrap();
         dependent
-            .wait(WaitFor::TasksAny(vec![Uuid::from_u128(3), ended.id()]))
+            .wait(WaitFor::TasksAny(vec![fixture_id(3), ended.id()]))
             .unwrap();
         tasks
             .save(&[Save::Create(&ended), Save::Create(&dependent)])
             .unwrap();
         let mut ready_dependent = Task::new(
-            Uuid::from_u128(offset + 5),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 105)),
+            fixture_id(offset + 5),
+            TaskOwner::Conversation(fixture_id(offset + 105)),
             signal_task.checkpoint().clone(),
             3,
         )
@@ -2546,12 +2554,12 @@ mod tests {
         .registered("work".into(), true);
         ready_dependent.start().unwrap();
         ready_dependent
-            .wait(WaitFor::TasksAny(vec![Uuid::from_u128(3), ended.id()]))
+            .wait(WaitFor::TasksAny(vec![fixture_id(3), ended.id()]))
             .unwrap();
         tasks.save(&[Save::Create(&ready_dependent)]).unwrap();
         let mut held = Task::new(
-            Uuid::from_u128(offset + 6),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 106)),
+            fixture_id(offset + 6),
+            TaskOwner::Conversation(fixture_id(offset + 106)),
             signal_task.checkpoint().clone(),
             3,
         )
@@ -2574,23 +2582,23 @@ mod tests {
                 json!(1),
             ))
             .unwrap();
-        let control = owner.conversation_controls().get(Uuid::from_u128(999));
+        let control = owner.conversation_controls().get(fixture_id(999));
         let poll = control.gate.lock().unwrap();
         // Both maintenance graphs lack conversation descendants. A scoped
         // fence ignores the unrelated poll, so hold both reservations here.
         crate::task_scheduler::set_maintenance_busy_for_test(parent_id, true);
-        crate::task_scheduler::set_maintenance_busy_for_test(Uuid::from_u128(5), true);
+        crate::task_scheduler::set_maintenance_busy_for_test(fixture_id(5), true);
         let (reserved_tx, reserved_rx) = mpsc::channel();
         on_maintenance_reserved_for_test(parent_id, move || reserved_tx.send(()).unwrap());
         let (second_tx, second_rx) = mpsc::channel();
-        on_maintenance_reserved_for_test(Uuid::from_u128(5), move || second_tx.send(()).unwrap());
+        on_maintenance_reserved_for_test(fixture_id(5), move || second_tx.send(()).unwrap());
         let (mutation_tx, mutation_rx) = mpsc::channel();
-        let edge_key = crate::ownership_edge::edge_key(Uuid::from_u128(offset + 100));
+        let edge_key = crate::ownership_edge::edge_key(fixture_id(offset + 100));
         if mutation {
             let edge = crate::ownership_edge::Edge {
                 task: parent_id,
                 task_owner: TaskOwner::Conversation(owner_id),
-                child: Uuid::from_u128(offset + 100),
+                child: fixture_id(offset + 100),
                 mode: crate::ownership_edge::Mode::Foreground,
             };
             let edge_key = edge_key.clone();
@@ -2715,7 +2723,7 @@ mod tests {
         ));
         assert!(matches!(
             tasks
-                .load(Uuid::from_u128(5))
+                .load(fixture_id(5))
                 .unwrap()
                 .unwrap()
                 .task
@@ -2724,7 +2732,7 @@ mod tests {
         ));
         assert!(matches!(
             tasks
-                .load(Uuid::from_u128(4))
+                .load(fixture_id(4))
                 .unwrap()
                 .unwrap()
                 .task
@@ -2741,7 +2749,7 @@ mod tests {
         );
         assert!(matches!(
             tasks
-                .load(Uuid::from_u128(3))
+                .load(fixture_id(3))
                 .unwrap()
                 .unwrap()
                 .task
@@ -2753,7 +2761,7 @@ mod tests {
         if writer_busy {
             let (unlock_tx, unlock_rx) = mpsc::channel();
             let path = root.join("db");
-            crate::task_scheduler::on_maintenance_checked_for_test(Uuid::from_u128(5), move || {
+            crate::task_scheduler::on_maintenance_checked_for_test(fixture_id(5), move || {
                 let (locked_tx, locked_rx) = mpsc::channel();
                 let writer = thread::spawn(move || {
                     let db = rusqlite::Connection::open(path).unwrap();
@@ -2766,7 +2774,7 @@ mod tests {
                 writer_handle_tx.send(writer).unwrap();
             });
             crate::task_scheduler::on_maintenance_write_busy_for_test(
-                Uuid::from_u128(5),
+                fixture_id(5),
                 move || {
                     writer_busy_tx.send(()).unwrap();
                     unlock_tx.send(()).unwrap();
@@ -2782,11 +2790,11 @@ mod tests {
                 mode: crate::ownership_edge::Mode::Foreground,
             };
             let key = crate::ownership_edge::edge_key(second_owner);
-            crate::task_scheduler::on_maintenance_overlap_for_test(Uuid::from_u128(5), move || {
+            crate::task_scheduler::on_maintenance_overlap_for_test(fixture_id(5), move || {
                 overlap_tx.send(()).unwrap()
             });
             let writer = owner.clone();
-            crate::task_scheduler::on_maintenance_checked_for_test(Uuid::from_u128(5), move || {
+            crate::task_scheduler::on_maintenance_checked_for_test(fixture_id(5), move || {
                 // Insert after independence was checked but before the abort
                 // transaction commits; the graph fence must force a retry.
                 writer
@@ -2811,7 +2819,7 @@ mod tests {
             }
         }
         drop(poll);
-        crate::task_scheduler::set_maintenance_busy_for_test(Uuid::from_u128(5), false);
+        crate::task_scheduler::set_maintenance_busy_for_test(fixture_id(5), false);
         if !hold_first {
             crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
         }
@@ -2830,12 +2838,12 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("merged graph was not serialized");
             assert!(matches!(
-                driver.get(Uuid::from_u128(5)).unwrap().unwrap().state(),
+                driver.get(fixture_id(5)).unwrap().unwrap().state(),
                 TaskState::CompletingFailed(_)
             ));
             assert!(
                 !driver
-                    .get(Uuid::from_u128(6))
+                    .get(fixture_id(6))
                     .unwrap()
                     .unwrap()
                     .abort_requested()
@@ -2844,7 +2852,7 @@ mod tests {
         } else if hold_first {
             let until = Instant::now() + Duration::from_secs(10);
             while !driver
-                .get(Uuid::from_u128(5))
+                .get(fixture_id(5))
                 .unwrap()
                 .unwrap()
                 .is_terminal()
@@ -2864,7 +2872,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(10);
         while !driver.get(parent_id).unwrap().unwrap().is_terminal()
             || !driver
-                .get(Uuid::from_u128(5))
+                .get(fixture_id(5))
                 .unwrap()
                 .unwrap()
                 .is_terminal()
@@ -2872,11 +2880,11 @@ mod tests {
             assert!(Instant::now() < until, "maintenance did not settle");
             thread::sleep(Duration::from_millis(5));
         }
-        let related = driver.get(Uuid::from_u128(3)).unwrap().unwrap();
+        let related = driver.get(fixture_id(3)).unwrap().unwrap();
         assert!(related.abort_requested());
         assert!(!matches!(related.state(), TaskState::Succeeded(_)));
         let log = std::fs::read_to_string(root.join("multi-abort-log")).unwrap();
-        for id in [child_id, Uuid::from_u128(6)] {
+        for id in [child_id, fixture_id(6)] {
             assert_eq!(
                 log.lines().filter(|line| *line == id.to_string()).count(),
                 1
