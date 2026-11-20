@@ -34345,6 +34345,23 @@ mod scheduler_tests {
                     h.checkpointable_conversation_checks(&running.task, &registry)
                         .is_err()
                 );
+                let child_adapter = Arc::new(
+                    TaskTool::new(
+                        pi_rs_core::ToolSpec {
+                            name: "child".into(),
+                            description: "".into(),
+                            parameters: serde_json::json!({"type":"object"}),
+                        },
+                        "checkpointable-child",
+                        false,
+                        1,
+                        Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!(null)))),
+                    )
+                    .with_deferred_arguments(),
+                );
+                registry
+                    .register_conversation_checkpointable(&child_adapter, Arc::new(|| true), None)
+                    .unwrap();
                 let child_id = Uuid::new_v4();
                 let mut child = Task::new(
                     child_id,
@@ -34356,7 +34373,7 @@ mod scheduler_tests {
                     5,
                 )
                 .unwrap()
-                .registered("checkpointable-test".into(), true);
+                .registered("checkpointable-child".into(), false);
                 child.start_attempt(Uuid::new_v4()).unwrap();
                 child.request_abort().unwrap();
                 tasks
