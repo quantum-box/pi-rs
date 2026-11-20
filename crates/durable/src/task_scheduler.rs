@@ -26553,8 +26553,11 @@ mod standalone_foreground_cleanup_tests {
             .unwrap()
             .child;
         let other = h.create_conversation(cfg).unwrap();
-        let descendant = task(2, TaskOwner::Conversation(child), "blocked");
-        let independent = task(3, TaskOwner::Conversation(other), "work");
+        // Keep scheduler order deterministic while avoiding process-wide test
+        // hook collisions with other fixtures that use task IDs 2 and 3.
+        let task_base = Uuid::new_v4().as_u128() & (u128::MAX >> 1);
+        let descendant = task(task_base, TaskOwner::Conversation(child), "blocked");
+        let independent = task(task_base + 1, TaskOwner::Conversation(other), "work");
         tasks
             .save(&[Save::Create(&descendant), Save::Create(&independent)])
             .unwrap();
@@ -26626,7 +26629,26 @@ mod standalone_foreground_cleanup_tests {
                 driver.get(independent.id()).unwrap().unwrap().state(),
                 &TaskState::Succeeded(json!("independent"))
             );
-            assert!(driver.has_pending_task(descendant.id()));
+            // A retry owns the result outside the queue. Pause it there so the
+            // test observes the exact transient that made queue emptiness look
+            // like completed settlement.
+            let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            crate::task_driver::after_pending_take_for_test(descendant.id(), move || {
+                taken_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            taken_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("retry did not take the result");
+            assert!(!driver.has_pending_task(descendant.id()));
+            assert!(
+                !driver
+                    .get(descendant.id())
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
             let entry = db.get(&key).unwrap().unwrap();
             db.commit(
                 &[durable_store::Check {
@@ -26639,13 +26661,19 @@ mod standalone_foreground_cleanup_tests {
                 }],
             )
             .unwrap();
+            release_tx.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
-                while driver.has_pending_task(descendant.id()) {
+                while !driver
+                    .get(descendant.id())
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+                {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .expect("repaired graph must release the result");
+            .expect("repaired graph must mark the descendant aborted");
             assert!(
                 driver
                     .get(descendant.id())
