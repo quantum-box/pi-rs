@@ -273,6 +273,21 @@ impl Store {
             if version != Some(1) {
                 return Err(Error::IncompatibleGraphProtocol);
             }
+            for (name, action) in [
+                ("durable_graph_protocol_insert", "INSERT"),
+                ("durable_graph_protocol_update", "UPDATE"),
+                ("durable_graph_protocol_delete", "DELETE"),
+            ] {
+                let sql: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name='durable_store_entries'", [name], |row| row.get(0)).optional()?;
+                let expected = format!("BEFORE {action} ON durable_store_entries");
+                if !sql.as_deref().is_some_and(|sql| {
+                    sql.contains(&expected)
+                        && sql.contains("pi_graph_protocol() != 1")
+                        && sql.contains("RAISE(ABORT, 'graph protocol required')")
+                }) {
+                    return Err(Error::IncompatibleGraphProtocol);
+                }
+            }
         }
         if disk {
             let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -327,7 +342,8 @@ impl Store {
             INSERT OR IGNORE INTO durable_document_commit_meta SELECT 1, (SELECT revision FROM durable_document_history_meta WHERE id=1), (SELECT sequence FROM durable_commit_meta WHERE id=1);
             COMMIT;")?;
         #[cfg(feature = "experimental-graph-revision")]
-        conn.execute_batch("BEGIN IMMEDIATE;
+        if !protected {
+            conn.execute_batch("BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=1));
             INSERT OR IGNORE INTO durable_graph_protocol(id,version) VALUES(1,1);
             DROP TRIGGER IF EXISTS durable_graph_protocol_insert;
@@ -337,6 +353,7 @@ impl Store {
             CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
             CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
             COMMIT;")?;
+        }
         let sequence = conn.query_row(
             "SELECT sequence FROM durable_commit_meta WHERE id=1",
             [],

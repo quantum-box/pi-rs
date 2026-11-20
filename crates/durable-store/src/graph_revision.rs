@@ -215,6 +215,24 @@ mod tests {
     }
 
     #[test]
+    fn missing_guard_rejects_reopen_without_repairing_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged.sqlite");
+        drop(Store::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER durable_graph_protocol_update")
+            .unwrap();
+        drop(conn);
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::IncompatibleGraphProtocol)
+        ));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='durable_graph_protocol_update'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn unknown_protocol_version_rejects_before_schema_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unknown.sqlite");
