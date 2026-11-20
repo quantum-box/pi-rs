@@ -8197,6 +8197,12 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         )
         .unwrap();
         assert_eq!(identity_leases.len(), 2);
+        let identity_lock = tokio::sync::OwnedRwLockReadGuard::rwlock(&identity_leases[0]).clone();
+        assert!(Arc::ptr_eq(
+            &identity_lock,
+            tokio::sync::OwnedRwLockReadGuard::rwlock(&identity_leases[1])
+        ));
+        assert!(identity_lock.try_write().is_err());
         let mut changed_identity = serde_json::to_value(&running.task).unwrap();
         changed_identity["kind"] = json!("different-registration");
         let changed_identity: crate::task::Task = serde_json::from_value(changed_identity).unwrap();
@@ -8238,6 +8244,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 .is_err()
         );
         drop(identity_leases);
+        assert!(identity_lock.try_write().is_ok());
         let modified = store.get(&binding_key).unwrap().unwrap();
         store
             .commit(
