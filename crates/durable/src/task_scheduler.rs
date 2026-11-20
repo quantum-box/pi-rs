@@ -4677,10 +4677,11 @@ impl AdmissionHandle<'_> {
                 )
                 .map_err(|e| e.to_string())?;
             let task_finish = if nested {
-                task_store::prepare_authenticated_callback_ancestry_finish(
+                task_store::prepare_nested_cancel_ancestry_finish(
                     owner.store(),
                     current.task.id(),
                     conversation,
+                    claim.claim_id,
                     marker,
                 )
             } else {
@@ -5059,10 +5060,11 @@ impl AdmissionHandle<'_> {
         )
         .map_err(|e| e.to_string())?;
         let task_finish = if nested {
-            task_store::prepare_authenticated_callback_ancestry_finish(
+            task_store::prepare_nested_cancel_ancestry_finish(
                 owner.store(),
                 current.task.id(),
                 conversation,
+                claim.claim_id,
                 marker,
             )
         } else {
@@ -12088,13 +12090,13 @@ impl Scheduler {
                                             "interrupted nested marker mismatch".into(),
                                         ));
                                     }
-                                    let finish =
-                                        task_store::prepare_authenticated_callback_ancestry_finish(
-                                            store,
-                                            item.task.id(),
-                                            conversation,
-                                            &marker_bytes,
-                                        )?;
+                                    let finish = task_store::prepare_nested_cancel_ancestry_finish(
+                                        store,
+                                        item.task.id(),
+                                        conversation,
+                                        claim.claim_id,
+                                        &marker_bytes,
+                                    )?;
                                     let conversation_finish = crate::conversation_signal::prepare_callback_finish_signal_fence(store, conversation, &marker_bytes).map_err(|e| Error::Handler(e.to_string()))?;
                                     batch.checks.retain(|check| check.key != task_marker_key);
                                     batch.checks.extend(finish.checks);

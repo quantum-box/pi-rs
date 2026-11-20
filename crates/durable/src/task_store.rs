@@ -2185,6 +2185,51 @@ pub(crate) fn prepare_authenticated_callback_ancestry_finish(
     Ok(batch)
 }
 
+/// Retire only the chain co-committed with this exact nested claim. A valid
+/// marker on a substituted subset must never release only part of the graph.
+#[allow(dead_code)]
+pub(crate) fn prepare_nested_cancel_ancestry_finish(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    claim: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    let (saved_conversation, ancestry, ancestry_checks, ancestry_version) =
+        read_nested_cancel_claim_ancestry(store, task, claim)?;
+    if saved_conversation != conversation {
+        return Err(Error::InvalidKey);
+    }
+    let evidence_key = callback_ancestry_key(task);
+    let entry = store.get(&evidence_key)?.ok_or(Error::InvalidKey)?;
+    let evidence: CallbackAncestryEvidence = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.conversation != conversation
+        || evidence.marker != marker
+        || evidence.ancestry != ancestry
+    {
+        return Err(Error::InvalidKey);
+    }
+    let claim_key =
+        format!("durable/replay-safe-async/{task}/conversation-park-cancel-claim").into_bytes();
+    let claim_entry = store.get(&claim_key)?.ok_or(Error::InvalidKey)?;
+    let ancestry_key = nested_cancel_claim_ancestry_key(task);
+    let claim_commit = store.commit_for_version(&claim_key, claim_entry.version)?;
+    let ancestry_commit = store.commit_for_version(&ancestry_key, ancestry_version)?;
+    if claim_commit.is_none() || claim_commit != ancestry_commit {
+        return Err(Error::InvalidKey);
+    }
+    let mut batch =
+        prepare_authenticated_callback_ancestry_finish(store, task, conversation, marker)?;
+    batch.checks.extend(ancestry_checks);
+    batch.checks.push(Check {
+        key: claim_key,
+        expected: Expected::Version(claim_entry.version),
+    });
+    Ok(batch)
+}
+
 pub(crate) fn signal_revision_key(task_id: Uuid) -> Vec<u8> {
     let mut key = SIGNAL_REVISION_PREFIX.to_vec();
     key.extend_from_slice(task_id.as_bytes());
@@ -2374,6 +2419,73 @@ mod tests {
             prepare_callback_start_ancestry_fence(&db, child.id(), Uuid::new_v4(), b"claim")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn nested_finish_rejects_substituted_ancestry_subset() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let root = task(1, 3);
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(root.id()),
+            Checkpoint {
+                phase: "first".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap();
+        ts.save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        let conversation = Uuid::from_u128(100);
+        let claim = Uuid::new_v4();
+        let mut batch =
+            prepare_nested_cancel_claim_ancestry(&db, child.id(), conversation, claim).unwrap();
+        let claim_key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-claim",
+            child.id()
+        )
+        .into_bytes();
+        batch.checks.push(Check {
+            key: claim_key.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: claim_key,
+            value: vec![1],
+        });
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let start = prepare_nested_cancel_claimed_ancestry_start(
+            &db,
+            child.id(),
+            conversation,
+            claim,
+            b"marker",
+        )
+        .unwrap();
+        db.commit(&start.checks, &start.mutations).unwrap();
+        let key = callback_ancestry_key(child.id());
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut evidence: CallbackAncestryEvidence = serde_json::from_slice(&entry.value).unwrap();
+        evidence.ancestry.pop();
+        db.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&evidence).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(
+            prepare_nested_cancel_ancestry_finish(&db, child.id(), conversation, claim, b"marker")
+                .is_err()
+        );
+        assert!(db.get(&callback_start_key(root.id())).unwrap().is_some());
+        assert!(db.get(&callback_start_key(child.id())).unwrap().is_some());
     }
 
     #[test]
