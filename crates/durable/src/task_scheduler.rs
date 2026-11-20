@@ -25103,10 +25103,20 @@ mod tests {
         let writer = std::thread::spawn(move || {
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let store = owner.store();
-            let batch = TaskStore::new(store)
-                .prepare_save(&[Save::Create(&child)])
+            // Simulate a legacy writer that bypassed current admission checks.
+            let key = task_store::key(child.id());
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&child).unwrap(),
+                    }],
+                )
                 .unwrap();
-            store.commit(&batch.checks, &batch.mutations).unwrap();
             done_tx.send(()).unwrap();
         });
         let mut attempts = 0;
@@ -25159,18 +25169,25 @@ mod tests {
         let version = scheduler.ts().load(root.id()).unwrap().unwrap().version;
         let child = task(2, TaskOwner::Task(root.id()), "job", true, 4);
         let owner = scheduler.owner();
+        let child_owner = root.id();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let store = owner.store();
-            let batch = TaskStore::new(store)
-                .prepare_save(&[Save::Create(&child)])
-                .unwrap();
+            // A legacy prepared batch still carries the ownership abort fence.
+            let check =
+                crate::ownership_edge::abort_fence_check(store, &TaskOwner::Task(child_owner))
+                    .unwrap();
+            let key = task_store::key(child.id());
+            let mutation = durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&child).unwrap(),
+            };
             ready_tx.send(()).unwrap();
             release_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .unwrap();
-            store.commit(&batch.checks, &batch.mutations)
+            store.commit(&[check], &[mutation])
         });
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(10))

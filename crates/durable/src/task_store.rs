@@ -527,6 +527,19 @@ impl<'a> TaskStore<'a> {
         loop {
             if fence_scope {
                 checks.push(crate::ownership_edge::abort_fence_check(self.store, &next)?);
+                let marker_key = match &next {
+                    TaskOwner::Task(id) => callback_start_key(*id),
+                    TaskOwner::Conversation(id) => {
+                        crate::conversation_signal::callback_start_key(*id)
+                    }
+                };
+                if self.store.get(&marker_key)?.is_some() {
+                    return Err(Error::CallbackStartBusy);
+                }
+                checks.push(Check {
+                    key: marker_key,
+                    expected: Expected::Missing,
+                });
             }
             match next {
                 TaskOwner::Task(id) => {
@@ -534,6 +547,9 @@ impl<'a> TaskStore<'a> {
                         return Err(Error::InvalidOwnership);
                     }
                     if let Some(parent) = created.get(&id) {
+                        if fence_scope && parent.abort_requested() {
+                            return Err(Error::InvalidOwnership);
+                        }
                         if matches!(task.owner(), TaskOwner::Task(owner) if *owner == id)
                             && parent.is_completing()
                         {
@@ -553,6 +569,9 @@ impl<'a> TaskStore<'a> {
                         });
                         match parent {
                             Some(parent) => {
+                                if fence_scope && parent.task.abort_requested() {
+                                    return Err(Error::InvalidOwnership);
+                                }
                                 if matches!(task.owner(), TaskOwner::Task(owner) if *owner == id)
                                     && parent.task.is_completing()
                                 {
@@ -2305,6 +2324,54 @@ mod tests {
         );
     }
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn child_creation_rejects_abort_and_callback_marker_races() {
+        let store = Store::memory().unwrap();
+        let tasks = TaskStore::new(&store);
+        let mut parent = task(1, 3);
+        parent.start().unwrap();
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        let mut child = task(2, 3);
+        child = Task::new(
+            child.id(),
+            TaskOwner::Task(parent.id()),
+            child.checkpoint().clone(),
+            3,
+        )
+        .unwrap();
+        let prepared = tasks.prepare_save(&[Save::Create(&child)]).unwrap();
+        let marker = callback_start_key(parent.id());
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: marker.clone(),
+                    value: b"marker".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&prepared.checks, &prepared.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(matches!(
+            tasks.save(&[Save::Create(&child)]),
+            Err(Error::CallbackStartBusy)
+        ));
+        store
+            .commit(&[], &[Mutation::Delete { key: marker }])
+            .unwrap();
+        let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+        tasks
+            .update(&snapshot, |task| task.request_abort())
+            .unwrap();
+        assert!(matches!(
+            tasks.save(&[Save::Create(&child)]),
+            Err(Error::InvalidOwnership)
+        ));
+        assert!(tasks.load(child.id()).unwrap().is_none());
+    }
 
     fn task(id: u128, limit: u32) -> Task {
         Task::new(
