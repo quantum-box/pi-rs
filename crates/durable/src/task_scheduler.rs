@@ -383,6 +383,17 @@ pub(crate) fn woken_conversation_claim_checks(
     Ok(checks)
 }
 
+/// A callback receipt is cleanup evidence, not an execution outcome. In
+/// particular it cannot prove the interrupted woken Tool succeeded.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenConversationCancelReceipt {
+    pub version: u32,
+    pub claim: WokenConversationCancelClaim,
+    pub result: String,
+}
+
 /// Signal revisions observed by the claim transaction. Missing legacy evidence
 /// cannot authorize a callback-start transaction and requires reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4109,6 +4120,184 @@ impl AdmissionHandle<'_> {
             conversation_receipt_before_commit_hooks(),
             current.task.id(),
         );
+        owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &mutations,
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Store cleanup evidence and retire exact start markers atomically.
+    /// Not connected to callback dispatch or recovery.
+    #[allow(dead_code)]
+    fn store_woken_conversation_cancel_receipt(
+        &self,
+        handler: &dyn Handler,
+        receipt: &WokenConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+    ) -> Result<(), String> {
+        if identity_lease.as_deref() != Some(expected_identity) {
+            return Err("conversation identity lease mismatch".into());
+        }
+        if !self.abort || self.standalone || self.lease.retired {
+            return Err("invalid conversation cleanup lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cleanup attempt or live child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation cancel registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
+        if receipt.version != 1 || receipt.result.len() > 65536 {
+            return Err("invalid woken cleanup receipt".into());
+        }
+        let claim = &receipt.claim;
+        checks.extend(woken_conversation_claim_checks(
+            owner.store(),
+            &current.task,
+            claim,
+            self.lease.token,
+            boundary,
+        )?);
+        let key = format!(
+            "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+            current.task.id()
+        )
+        .into_bytes();
+        let existing = owner.store().get(&key).map_err(|e| e.to_string())?;
+        let expected = if let Some(ref entry) = existing {
+            let saved: WokenConversationCancelReceipt =
+                serde_json::from_slice(&entry.value).map_err(|_| "invalid receipt")?;
+            if saved != *receipt {
+                return Err("conflicting receipt".into());
+            }
+            durable_store::Expected::Version(entry.version)
+        } else {
+            durable_store::Expected::Missing
+        };
+        checks.push(durable_store::Check {
+            key: key.clone(),
+            expected,
+        });
+        let mut mutations = if existing.is_none() {
+            vec![durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(receipt).map_err(|e| e.to_string())?,
+            }]
+        } else {
+            vec![]
+        };
+        {
+            let TaskOwner::Conversation(conversation) = current.task.owner() else {
+                return Err("receipt root owner changed".into());
+            };
+            let expected_marker = serde_json::to_vec(&serde_json::json!({
+                "version": 3,
+                "claim_id": claim.claim_id,
+                "task": claim.task,
+                "woken_attempt": claim.woken_attempt,
+                "attempt": claim.cleanup_attempt,
+                "lease": claim.cleanup_lease,
+                "policy": claim.policy,
+            }))
+            .map_err(|e| e.to_string())?;
+            if marker != expected_marker {
+                return Err("receipt marker claim mismatch".into());
+            }
+            let conversation_finish =
+                crate::conversation_signal::prepare_callback_finish_signal_fence(
+                    owner.store(),
+                    *conversation,
+                    marker,
+                )
+                .map_err(|e| e.to_string())?;
+            let task_finish = task_store::prepare_callback_finish_ancestry_fence(
+                owner.store(),
+                &[current.task.id()],
+                marker,
+            )
+            .map_err(|e| e.to_string())?;
+            checks.extend(conversation_finish.checks);
+            checks.extend(task_finish.checks);
+            mutations.extend(conversation_finish.mutations);
+            mutations.extend(task_finish.mutations);
+        }
         owner
             .store()
             .commit_with_prefix_put_fence(
