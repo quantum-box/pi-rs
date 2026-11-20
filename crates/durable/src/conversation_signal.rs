@@ -31,6 +31,8 @@ pub enum Error {
     CallbackStartBusy,
     #[error("signal retry cancelled")]
     Cancelled,
+    #[error("callback cannot wait for its own signal fence")]
+    ReentrantCallback,
 }
 
 /// Signal IDs are scoped to a conversation and remain reserved after delivery.
@@ -74,7 +76,7 @@ pub(crate) fn revision(id: Uuid) -> Vec<u8> {
 // Durable counterpart of the process-local start gate. The marker spans the
 // first poll through receipt or unknown settlement; a crash leaves evidence
 // requiring reconciliation.
-fn callback_start_key(conversation: Uuid) -> Vec<u8> {
+pub(crate) fn callback_start_key(conversation: Uuid) -> Vec<u8> {
     format!("runtime/conversation-callback-start/{conversation}").into_bytes()
 }
 
@@ -154,6 +156,16 @@ pub(crate) fn clear_callback_start_check(
     })
 }
 
+pub(crate) fn reentrant_callback(store: &Store, conversation: Uuid) -> Result<bool, Error> {
+    let Some(marker) = durable_store::controls::callback_marker_for_conversation(conversation)
+    else {
+        return Ok(false);
+    };
+    Ok(store
+        .get(&callback_start_key(conversation))?
+        .is_some_and(|entry| entry.value == marker))
+}
+
 fn slot(conversation: Uuid, name: &str) -> Vec<u8> {
     let encoded: String = name.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     format!("runtime/conversation-signal-slot/{conversation}/{encoded}").into_bytes()
@@ -217,6 +229,9 @@ impl<'a> Inbox<'a> {
             }
             match self.send(signal) {
                 Err(Error::CallbackStartBusy) => {
+                    if reentrant_callback(self.store, signal.conversation_id)? {
+                        return Err(Error::ReentrantCallback);
+                    }
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(Error::Cancelled),
                         _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => (),

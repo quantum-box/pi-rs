@@ -32,6 +32,8 @@ pub enum Error {
     UnknownTask(Uuid),
     #[error("task wait cancelled")]
     WaitCancelled,
+    #[error("callback cannot wait for its own task signal fence")]
+    ReentrantCallback,
     #[error("conversation runtime: {0}")]
     Runtime(#[from] crate::runtime::Error),
 }
@@ -591,6 +593,14 @@ impl Driver {
         signal: &Signal,
         cancel: &pi_rs_core::CancellationToken,
     ) -> Result<(), Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::WaitCancelled);
+        }
+        if task_store::reentrant_callback(self.shared.owner.store(), signal.task_id)
+            .map_err(task_scheduler::Error::from)?
+        {
+            return Err(Error::ReentrantCallback);
+        }
         loop {
             if cancel.is_cancelled() {
                 return Err(Error::WaitCancelled);
@@ -642,6 +652,14 @@ impl Driver {
         value: serde_json::Value,
         cancel: &pi_rs_core::CancellationToken,
     ) -> Result<task_store::SignalResult, Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::WaitCancelled);
+        }
+        if task_store::reentrant_callback(self.shared.owner.store(), task_id)
+            .map_err(task_scheduler::Error::from)?
+        {
+            return Err(Error::ReentrantCallback);
+        }
         loop {
             if cancel.is_cancelled() {
                 return Err(Error::WaitCancelled);

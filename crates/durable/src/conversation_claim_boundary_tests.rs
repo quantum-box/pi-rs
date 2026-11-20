@@ -133,6 +133,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         String,
         std::path::PathBuf,
         pi_rs_durable::nested_identity::IdentityHandle,
+        Arc<std::sync::Mutex<Option<Scheduler>>>,
     );
     #[async_trait]
     impl DurableParkCancel for Cancel {
@@ -177,6 +178,67 @@ async fn exercise_conversation_park_claim(case: &str) {
             }
             if self.1 == "dispatch_panic" {
                 panic!("cancel panic");
+            }
+            if self.1 == "dispatch_reentrant" {
+                // Test after a yield as well as the first poll: the callback
+                // must never wait for the marker it owns.
+                tokio::task::yield_now().await;
+                let store = durable_store::Store::open(&self.2).unwrap();
+                let task = pi_rs_durable::task_store::TaskStore::new(&store)
+                    .load(context.operation_id)
+                    .unwrap()
+                    .unwrap();
+                let pi_rs_durable::task::TaskOwner::Conversation(conversation) = task.task.owner()
+                else {
+                    panic!("not a root")
+                };
+                let signal = crate::conversation_signal::Signal::new(
+                    uuid::Uuid::new_v4(),
+                    *conversation,
+                    "reentrant".into(),
+                    json!(1),
+                );
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    crate::conversation_signal::Inbox::new(&store)
+                        .send_with_retry(&signal, &context.cancellation),
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Ok(Err(crate::conversation_signal::Error::ReentrantCallback))
+                ));
+                assert!(
+                    crate::task_store::reentrant_callback(&store, context.operation_id).unwrap()
+                );
+            }
+            if self.1 == "dispatch_reentrant_abort" {
+                let store = durable_store::Store::open(&self.2).unwrap();
+                let task = pi_rs_durable::task_store::TaskStore::new(&store)
+                    .load(context.operation_id)
+                    .unwrap()
+                    .unwrap();
+                let pi_rs_durable::task::TaskOwner::Conversation(conversation) = task.task.owner()
+                else {
+                    panic!("not a root")
+                };
+                let mut scheduler = loop {
+                    let next = self.4.lock().unwrap().take();
+                    if let Some(scheduler) = next {
+                        break scheduler;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    scheduler.abort_and_wait(*conversation),
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Ok(Err(crate::runtime::Error::ReentrantAbort))
+                ));
+                *self.4.lock().unwrap() = Some(scheduler);
             }
             if self.1 == "dispatch_guard" {
                 use futures_util::FutureExt;
@@ -229,6 +291,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         .join("db");
     let gate = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
+    let callback_scheduler = Arc::new(std::sync::Mutex::new(None));
     let mut registry = Registry::default();
     registry.register(
         "independent-maintenance",
@@ -264,13 +327,13 @@ async fn exercise_conversation_park_claim(case: &str) {
     let root = if case.starts_with("dispatch_") {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
             &mut registry, root_tool, "root", 1, vec![leaf.clone()], "cancel-v1",
-            Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone())),
+            Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
         )
     } else {
         register_conversation_unsafe_durable_tool_with_park_cancel(
             &mut registry, root_tool, "root", 1, vec![leaf.clone()], "cancel-v1",
-            Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone())),
+            Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
         )
     }.unwrap();
@@ -581,6 +644,27 @@ async fn exercise_conversation_park_claim(case: &str) {
         );
         return;
     }
+    if case == "dispatch_reentrant_abort" {
+        scheduler.abort_task(root_id).unwrap();
+        *callback_scheduler.lock().unwrap() = Some(scheduler);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
+        let scheduler = callback_scheduler.lock().unwrap().take().unwrap();
+        scheduler.shutdown().await.unwrap();
+        return;
+    }
     if case == "dispatch_hold" {
         let other = scheduler
             .create_conversation(Config {
@@ -629,7 +713,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         );
         return;
     }
-    if case == "dispatch_ok" || case == "dispatch_guard" {
+    if case == "dispatch_ok" || case == "dispatch_guard" || case == "dispatch_reentrant" {
         scheduler.abort_task(root_id).unwrap();
         let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1561,6 +1645,16 @@ async fn conversation_cancel_abort_before_first_poll_prevents_dispatch() {
 #[tokio::test]
 async fn conversation_cancel_signal_before_first_poll_prevents_dispatch() {
     exercise_conversation_park_claim("dispatch_signal_before").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_reentrant_abort_fails_without_waiting() {
+    exercise_conversation_park_claim("dispatch_reentrant_abort").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_reentrant_signal_fails_after_yield() {
+    exercise_conversation_park_claim("dispatch_reentrant").await;
 }
 
 #[tokio::test]

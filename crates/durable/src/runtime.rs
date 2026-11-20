@@ -144,10 +144,10 @@ fn scoped_abort_busy_hooks() -> &'static std::sync::Mutex<HashMap<Uuid, Arc<toki
 }
 
 #[cfg(test)]
-fn scoped_abort_discovery_hooks()
--> &'static std::sync::Mutex<HashMap<Uuid, Box<dyn FnOnce() + Send>>> {
-    static HOOKS: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, Box<dyn FnOnce() + Send>>>> =
-        std::sync::OnceLock::new();
+type ScopedAbortDiscoveryHooks = std::sync::Mutex<HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn scoped_abort_discovery_hooks() -> &'static ScopedAbortDiscoveryHooks {
+    static HOOKS: std::sync::OnceLock<ScopedAbortDiscoveryHooks> = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
 
@@ -21547,6 +21547,15 @@ impl Scheduler {
         signal: &crate::conversation_signal::Signal,
         cancel: &CancellationToken,
     ) -> Result<(), Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::Interrupted);
+        }
+        if crate::conversation_signal::reentrant_callback(
+            self.harness.owner.store(),
+            signal.conversation_id,
+        )? {
+            return Err(Error::ReentrantAbort);
+        }
         loop {
             if cancel.is_cancelled() {
                 return Err(Error::Interrupted);
@@ -22323,6 +22332,9 @@ impl Scheduler {
         id: Uuid,
         background: bool,
     ) -> Result<OwnedGraphAbort, Error> {
+        if crate::conversation_signal::reentrant_callback(self.harness.owner.store(), id)? {
+            return Err(Error::ReentrantAbort);
+        }
         loop {
             let result = (|| {
                 let (targets, _, _) = self
@@ -25981,16 +25993,17 @@ mod scheduler_tests {
         let target = scheduler.create_conversation(config()).unwrap();
         let control = scheduler.harness.owner.conversation_controls().get(target);
         let lease = control.callback_start.try_start().unwrap();
-        let mut callback = std::pin::pin!(std::future::poll_fn(|_| {
-            assert!(matches!(
-                scheduler.abort(target),
-                Err(Error::ReentrantAbort)
-            ));
-            std::task::Poll::Ready(())
-        }));
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(lease.poll_first(callback.as_mut(), &mut context).is_ready());
-        drop(callback);
+        {
+            let mut callback = std::pin::pin!(std::future::poll_fn(|_| {
+                assert!(matches!(
+                    scheduler.abort(target),
+                    Err(Error::ReentrantAbort)
+                ));
+                std::task::Poll::Ready(())
+            }));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(lease.poll_first(callback.as_mut(), &mut context).is_ready());
+        }
         assert!(!scheduler.conversation(target).unwrap().abort_requested);
         scheduler.abort(target).unwrap();
         assert!(scheduler.conversation(target).unwrap().abort_requested);

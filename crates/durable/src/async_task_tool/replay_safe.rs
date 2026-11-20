@@ -1866,26 +1866,34 @@ impl Handler for Executor {
             let marker = marker_result?;
             let cancellation = pi_rs_core::CancellationToken::new();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(async {
-                    let future = cancel.cancel(
-                        stored.arguments,
-                        stored.checkpoint,
-                        ToolContext {
-                            operation_id: task.id(),
-                            cancellation: cancellation.clone(),
-                        },
-                    );
-                    let mut future = std::pin::pin!(future);
-                    let mut start = Some(start);
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        std::future::poll_fn(|cx| match start.take() {
-                            Some(lease) => lease.poll_first(future.as_mut(), cx),
-                            None => future.as_mut().poll(cx),
-                        }),
-                    )
-                    .await
-                })
+                let crate::task::TaskOwner::Conversation(conversation) = task.owner() else {
+                    unreachable!("conversation cancel requires a root");
+                };
+                runtime.block_on(durable_store::controls::with_callback_context(
+                    *conversation,
+                    task.id(),
+                    marker.clone(),
+                    async {
+                        let future = cancel.cancel(
+                            stored.arguments,
+                            stored.checkpoint,
+                            ToolContext {
+                                operation_id: task.id(),
+                                cancellation: cancellation.clone(),
+                            },
+                        );
+                        let mut future = std::pin::pin!(future);
+                        let mut start = Some(start);
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            std::future::poll_fn(|cx| match start.take() {
+                                Some(lease) => lease.poll_first(future.as_mut(), cx),
+                                None => future.as_mut().poll(cx),
+                            }),
+                        )
+                        .await
+                    },
+                ))
             }));
             cancellation.cancel();
             if !matches!(result, Ok(Ok(Ok(())))) {

@@ -1725,6 +1725,15 @@ fn callback_start_key(task_id: Uuid) -> Vec<u8> {
     format!("durable/task-callback-start/{task_id}").into_bytes()
 }
 
+pub(crate) fn reentrant_callback(store: &Store, task: Uuid) -> Result<bool, Error> {
+    let Some(marker) = durable_store::controls::callback_marker_for_task(task) else {
+        return Ok(false);
+    };
+    Ok(store
+        .get(&callback_start_key(task))?
+        .is_some_and(|entry| entry.value == marker))
+}
+
 pub(crate) fn clear_callback_start_check(store: &Store, task_id: Uuid) -> Result<Check, Error> {
     let key = callback_start_key(task_id);
     if store.get(&key)?.is_some() {

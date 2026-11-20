@@ -20,6 +20,37 @@ pub struct CallbackStartGate(Arc<std::sync::atomic::AtomicUsize>);
 
 const CALLBACK_ACTIVE: usize = 1 << (usize::BITS - 1);
 
+tokio::task_local! {
+    static CALLBACK_CONTEXT: (Uuid, Uuid, Vec<u8>);
+}
+
+/// Scope callback execution across every poll, including after it yields.
+pub async fn with_callback_context<F: std::future::Future>(
+    conversation: Uuid,
+    task: Uuid,
+    marker: Vec<u8>,
+    future: F,
+) -> F::Output {
+    CALLBACK_CONTEXT
+        .scope((conversation, task, marker), future)
+        .await
+}
+
+/// Match the exact durable claim, avoiding collisions across separate stores.
+pub fn callback_marker_for_conversation(id: Uuid) -> Option<Vec<u8>> {
+    CALLBACK_CONTEXT
+        .try_with(|(conversation, _, marker)| (*conversation == id).then(|| marker.clone()))
+        .ok()
+        .flatten()
+}
+
+pub fn callback_marker_for_task(id: Uuid) -> Option<Vec<u8>> {
+    CALLBACK_CONTEXT
+        .try_with(|(_, task, marker)| (*task == id).then(|| marker.clone()))
+        .ok()
+        .flatten()
+}
+
 thread_local! {
     static ACTIVE_CALLBACK_POLLS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
