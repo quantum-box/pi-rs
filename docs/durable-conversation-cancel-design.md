@@ -38,8 +38,10 @@ poll. Selected registry updates return busy during that lease; updates to other
 names remain independent. The selected-hook registration still disables
 callback dispatch: the new lease has not yet been validated by the complete
 hooked callback and process-recovery test matrix. A test-only dispatch exercises
-the real driver's claim, start marker, first poll and receipt; it does not
-enable the public registration or prove after-hook settlement.
+the real driver's claim, start marker, first poll and receipt. Killing the
+process immediately before or during the first poll recovers as unknown without
+another dispatch; a late pending outcome remains available for reconciliation.
+These tests do not enable the public registration or prove after-hook settlement.
 
 A confirmed cancel receipt must also be linked to replay-safe after-hook evidence and the
 conversation's terminal result; a crash or unknown callback result cannot be

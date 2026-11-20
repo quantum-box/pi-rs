@@ -338,7 +338,14 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
             })
             .unwrap();
     }
-    scheduler.abort_task(root_id).unwrap();
+    if let Err(error) = scheduler.abort_task(root_id) {
+        assert!(
+            change == "selection"
+                && matches!(&error, pi_rs_durable::runtime::Error::Invalid(reason) if reason == "task is terminal")
+                && tasks.load(root_id).unwrap().unwrap().task.is_terminal(),
+            "abort failed: {error}"
+        );
+    }
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
