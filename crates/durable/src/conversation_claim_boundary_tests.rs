@@ -2658,7 +2658,8 @@ async fn exercise_conversation_park_claim(case: &str) {
             let store = durable_store::Store::open(claim_path).unwrap();
             let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
             let claim = store.get(key.as_bytes()).unwrap().expect("claim committed");
-            std::fs::write(directory.join("ready"), claim.value).unwrap();
+            std::fs::write(directory.join("ready.tmp"), claim.value).unwrap();
+            std::fs::rename(directory.join("ready.tmp"), directory.join("ready")).unwrap();
             loop {
                 std::thread::park();
             }
