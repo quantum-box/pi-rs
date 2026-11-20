@@ -47,7 +47,9 @@ still requires reconciliation; memo persistence does not authorize another callb
 abort path are not supported. Nested child callbacks and woken cancellation are
 not enabled by this registration. Result publication currently requires the
 root adapter in the Harness tool list; an extension-only tool is rejected before
-callback dispatch.
+callback dispatch. The abort hook currently receives a fresh `Tool was aborted`
+result with an error diagnostic, rather than upstream’s tool-named message and
+its preserved partial output.
 
 The claim, start-marker and receipt transactions hold the selection gate
 from validation through commit. A per-name, nonblocking selection start lease
