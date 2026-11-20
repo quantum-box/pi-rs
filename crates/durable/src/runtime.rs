@@ -14875,7 +14875,10 @@ impl Harness {
             Some((false, targets)),
             None,
             Some((expected, &checks)),
-            || {},
+            || {
+                #[cfg(test)]
+                crate::task_scheduler::run_woken_recovery_hook(expected.task.id());
+            },
         )
         .map(|result| result.expect("woken graph has a fixed root").0)
     }

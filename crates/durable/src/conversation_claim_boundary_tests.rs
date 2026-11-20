@@ -8201,6 +8201,38 @@ async fn interrupted_woken_owned_conversation_is_marked_by_driver_before_refusal
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
     drop(store);
     drop(harness);
+    let conflict_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = conflict_observed.clone();
+    let writer_path = path.clone();
+    let parent = root.task.id();
+    crate::task_scheduler::before_woken_recovery_commit_for_test(parent, move || {
+        use std::sync::atomic::Ordering;
+        let store = durable_store::Store::open(writer_path).unwrap();
+        let child = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Task(parent),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap();
+        let key = crate::task_store::key(child.id());
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Missing,
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&child).unwrap(),
+                }],
+            )
+            .unwrap();
+        observed.store(true, Ordering::SeqCst);
+    });
     let (scheduler, driver) = start_woken_any_scheduler(&path);
     tokio::time::timeout(Duration::from_secs(15), async {
         while !scheduler
@@ -8213,6 +8245,7 @@ async fn interrupted_woken_owned_conversation_is_marked_by_driver_before_refusal
     })
     .await
     .unwrap();
+    assert!(conflict_observed.load(std::sync::atomic::Ordering::SeqCst));
     let recovered = driver.get(root.task.id()).unwrap().unwrap();
     assert!(recovered.abort_requested());
     assert_eq!(

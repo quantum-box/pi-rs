@@ -2876,6 +2876,13 @@ pub(crate) fn before_woken_recovery_commit_for_test(
         .insert(id, Box::new(hook));
 }
 #[cfg(test)]
+pub(crate) fn run_woken_recovery_hook(id: Uuid) {
+    let hook = woken_recovery_hooks().lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+#[cfg(test)]
 pub(crate) fn after_ready_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
     release_hooks().lock().unwrap().insert(id, Box::new(hook));
 }
