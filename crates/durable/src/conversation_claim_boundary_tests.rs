@@ -7904,6 +7904,12 @@ async fn owned_graph_reservation_survives_reopen() {
     exercise_woken_owned_graph_receipt(false, 5).await;
 }
 
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_driver_commits_reservation_evidence() {
+    exercise_woken_owned_graph_receipt(false, 6).await;
+}
+
 async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
@@ -8185,6 +8191,27 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .unwrap();
         store.commit(&checks, &[]).unwrap();
+        if graph_aba == 6 {
+            drop(store);
+            drop(harness);
+            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            let marker = format!("runtime/woken-owned-reservation/v1/{}", root.task.id());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let store = durable_store::Store::open(&path).unwrap();
+                    if store.get(marker.as_bytes()).unwrap().is_some() {
+                        break;
+                    }
+                    drop(store);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(driver);
+            drop(scheduler);
+            return;
+        }
         let proof_root = if graph_aba == 4 || graph_aba == 5 {
             let mut running = recovered.clone();
             running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
