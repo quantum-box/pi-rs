@@ -262,11 +262,12 @@ impl DurableAsyncTool for MutableSpecTool {
     }
 }
 async fn exercise_conversation_park_claim(case: &str) {
-    exercise_conversation_park_claim_with_late_publication(case, false).await;
+    exercise_conversation_park_claim_with_late_publication(case, false, false).await;
 }
 async fn exercise_conversation_park_claim_with_late_publication(
     case: &str,
     late_publication: bool,
+    graph_aba: bool,
 ) {
     use pi_rs_durable::async_task_tool::{
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
@@ -1699,7 +1700,33 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 }
             }
         });
-        if case == "selection_hook_writer_busy" {
+        if case == "selection_hook_writer_busy" && graph_aba {
+            let path = path.clone();
+            crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
+                let store = durable_store::Store::open(path).unwrap();
+                let child = crate::task::Task::new(
+                    uuid::Uuid::new_v4(),
+                    crate::task::TaskOwner::Task(root_id),
+                    crate::task::Checkpoint {
+                        phase: "initial".into(),
+                        data: json!({}),
+                    },
+                    3,
+                )
+                .unwrap();
+                let tasks = crate::task_store::TaskStore::new(&store);
+                tasks
+                    .save(&[crate::task_store::Save::Create(&child)])
+                    .unwrap();
+                let ready = tasks.load(child.id()).unwrap().unwrap();
+                tasks.update(&ready, |task| task.start()).unwrap();
+                let running = tasks.load(child.id()).unwrap().unwrap();
+                tasks
+                    .update(&running, |task| task.succeed(json!("external work")))
+                    .unwrap();
+            });
+        }
+        if case == "selection_hook_writer_busy" && !graph_aba {
             let path = path.clone();
             crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1792,6 +1819,36 @@ async fn exercise_conversation_park_claim_with_late_publication(
             scheduler.abort_task(root_id).unwrap();
         }
         let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        if case == "selection_hook_writer_busy" {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while after_calls.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let report = driver.shutdown_with_pending().unwrap();
+            let known = report
+                .pending()
+                .iter()
+                .filter_map(|p| p.completed())
+                .filter_map(|c| c.known_conversation_cancel())
+                .next()
+                .expect("known cancel result retained");
+            assert_eq!(
+                known.commit_state(),
+                if graph_aba {
+                    crate::task_scheduler::KnownCancelCommitState::Stale
+                } else {
+                    crate::task_scheduler::KnownCancelCommitState::Busy
+                }
+            );
+            assert!(known.after_result().is_some());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+            assert!(store.get(key.as_bytes()).unwrap().is_none());
+            return;
+        }
         if matches!(
             case,
             "selection_hook_marker_conflict" | "selection_hook_snapshot_conflict"
@@ -3417,7 +3474,17 @@ async fn selected_hook_callback_pins_selection_and_publishes_after_result() {
 }
 
 #[tokio::test]
-async fn selected_hook_cancel_retries_busy_receipt_without_reinvoking_hooks() {
+async fn selected_parked_child_graph_aba_is_retained_without_retry() {
+    exercise_conversation_park_claim_with_late_publication(
+        "selection_hook_writer_busy",
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn selected_hook_busy_receipt_is_retained_without_retry() {
     exercise_conversation_park_claim("selection_hook_writer_busy").await;
 }
 
@@ -5975,8 +6042,13 @@ async fn selected_woken_after_is_retained_without_resolving_uncertain_effect() {
 }
 
 #[tokio::test]
-async fn selected_woken_receipt_retries_busy_without_reinvoking_callback() {
+async fn selected_woken_busy_receipt_is_retained_without_retry() {
     exercise_selected_woken_receipt("busy").await;
+}
+
+#[tokio::test]
+async fn selected_woken_child_graph_aba_is_retained_without_retry() {
+    exercise_selected_woken_receipt("graph_aba").await;
 }
 
 #[tokio::test]
@@ -6059,6 +6131,11 @@ async fn exercise_selected_woken_receipt(mode: &str) {
     let snapshot = extensions.snapshot();
     let names = vec!["policy".to_owned()];
     let mut registry = Registry::default();
+    assert!(
+        registry.register("independent-safe", true, |_: &crate::task::Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!("independent"))
+        ))
+    );
     let leaf = crate::async_task_tool::register_conversation_replay_safe_durable_tool_with_selected_hooks(
         &mut registry, Arc::new(AsyncTool {name:"leaf", child:None, gate:None, early:false}), "leaf", 1, vec![], &snapshot, &names,
         ReplaySafeAuthorization::host_attests_replay_safe(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
@@ -6096,10 +6173,19 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let independent_conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let busy_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let busy_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if mode == "busy" {
         let writer_path = path.clone();
         let busy_ready = busy_ready.clone();
+        let busy_released = busy_released.clone();
         crate::task_scheduler::on_conversation_receipt_before_commit(root.task.id(), move || {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -6109,8 +6195,36 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_secs(6));
                 conn.execute_batch("ROLLBACK").unwrap();
+                busy_released.store(true, Ordering::SeqCst);
             });
             ready_rx.recv().unwrap();
+        });
+    }
+    if mode == "graph_aba" {
+        let writer_path = path.clone();
+        let parent = root.task.id();
+        crate::task_scheduler::on_conversation_receipt_before_commit(parent, move || {
+            let store = durable_store::Store::open(writer_path).unwrap();
+            let child = crate::task::Task::new(
+                uuid::Uuid::new_v4(),
+                crate::task::TaskOwner::Task(parent),
+                crate::task::Checkpoint {
+                    phase: "initial".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap();
+            let tasks = crate::task_store::TaskStore::new(&store);
+            tasks
+                .save(&[crate::task_store::Save::Create(&child)])
+                .unwrap();
+            let ready = tasks.load(child.id()).unwrap().unwrap();
+            tasks.update(&ready, |task| task.start()).unwrap();
+            let running = tasks.load(child.id()).unwrap().unwrap();
+            tasks
+                .update(&running, |task| task.succeed(json!("external work")))
+                .unwrap();
         });
     }
     if mode == "stale" {
@@ -6188,7 +6302,55 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 .is_some()
         );
     }
-    if mode == "stale" {
+    if mode == "busy" {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !busy_released.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let independent = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(independent_conversation),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("independent-safe".into(), true);
+        driver.submit(&independent).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !driver.get(independent.id()).unwrap().unwrap().is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            driver.get(independent.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("independent"))
+        );
+        let report = driver.shutdown_with_pending().unwrap();
+        let known = report
+            .pending()
+            .iter()
+            .filter_map(|p| p.completed())
+            .filter_map(|c| c.known_woken_cancel())
+            .next()
+            .expect("known woken result retained");
+        assert_eq!(
+            known.commit_state(),
+            crate::task_scheduler::KnownCancelCommitState::Busy
+        );
+        assert!(known.after_result().is_some());
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+        return;
+    }
+    if mode == "stale" || mode == "graph_aba" {
         tokio::time::timeout(Duration::from_secs(10), async {
             while after_calls.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6906,8 +7068,12 @@ async fn nested_selected_production_cancel_allows_parent_cancel() {
 
 #[tokio::test]
 async fn nested_selected_late_child_receipt_prevents_after_publication() {
-    exercise_conversation_park_claim_with_late_publication("nested_claim_actual_selected", true)
-        .await;
+    exercise_conversation_park_claim_with_late_publication(
+        "nested_claim_actual_selected",
+        true,
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]

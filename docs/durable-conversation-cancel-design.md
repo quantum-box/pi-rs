@@ -139,10 +139,19 @@ the original claim, attempt, owner, definition identity and both markers in one
 transaction. External cleanup work is deferred while the unsafe checkpointable
 root remains live. Direct writes to the store remain outside these API fences.
 
-If the store reports writer contention before a settlement transaction starts,
-driver shutdown returns the pending outcome and its lease for retry or
-reconciliation instead of waiting for the unrelated writer. This does not
-classify an indeterminate commit as uncommitted.
+If writer contention prevents a cancellation receipt commit, the completed
+callback result, selected after result, identity and lease remain pending for
+reconciliation and are returned on driver shutdown. The driver does not retry
+these receipts automatically: a later graph snapshot could include different
+children than the callback-start snapshot. Other independent graphs continue
+to run. Indeterminate commits also remain unresolved rather than being treated
+as uncommitted.
+
+Interrupted-woken cancellation drains foreground task descendants before the
+parent callback. Foreground owned conversations are not yet supported by this
+path: recovery and callback authorization fail closed when one is present.
+Atomic graph marking, conversation-edge authentication and child-conversation
+terminal evidence are not yet connected to production recovery.
 
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.
