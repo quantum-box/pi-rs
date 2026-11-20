@@ -8,6 +8,17 @@ const TASK: &[u8] = b"durable/task/";
 const EDGE: &[u8] = b"durable/conversation-owner/";
 const CONVERSATION: &[u8] = b"runtime/conversation/";
 const REVISION: &[u8] = b"durable/experimental-graph-revision/v1/";
+const STRUCTURE: &[u8] = b"durable/experimental-graph-structure/v1/";
+
+pub fn task_structure_revision(id: Uuid) -> Vec<u8> {
+    [STRUCTURE, b"task/", id.as_bytes()].concat()
+}
+pub fn conversation_structure_revision(id: Uuid) -> Vec<u8> {
+    [STRUCTURE, b"conversation/", id.as_bytes()].concat()
+}
+pub fn global_structure_revision() -> Vec<u8> {
+    [STRUCTURE, b"global"].concat()
+}
 
 pub fn task_revision(id: Uuid) -> Vec<u8> {
     [REVISION, b"task/", id.as_bytes()].concat()
@@ -126,6 +137,64 @@ pub(crate) fn affected(
     tx: &Transaction<'_>,
     mutations: &[Mutation],
 ) -> Result<Vec<Vec<u8>>, Error> {
+    let mut structural = Vec::new();
+    for mutation in mutations {
+        let (key, next) = match mutation {
+            Mutation::Put { key, value } => (key, Some(value.as_slice())),
+            Mutation::Delete { key } => (key, None),
+        };
+        let changed = if key.starts_with(EDGE) || key.starts_with(STRUCTURE) {
+            true
+        } else if key.starts_with(TASK) {
+            let old = read(tx, key, None)?;
+            match (old.as_deref(), next) {
+                (Some(old), Some(next)) => {
+                    match (
+                        serde_json::from_slice::<serde_json::Value>(old),
+                        serde_json::from_slice::<serde_json::Value>(next),
+                    ) {
+                        (Ok(old), Ok(next)) if old.is_object() && next.is_object() => [
+                            "id",
+                            "owner",
+                            "kind",
+                            "definition_version",
+                            "background",
+                            "task_tool",
+                        ]
+                        .iter()
+                        .any(|field| old.get(*field) != next.get(*field)),
+                        _ => true,
+                    }
+                }
+                (None, None) => false,
+                _ => true,
+            }
+        } else if key.starts_with(CONVERSATION) {
+            read(tx, key, None)?.is_some() != next.is_some()
+        } else {
+            false
+        };
+        if changed {
+            structural.push(mutation.clone());
+        }
+    }
+    let mut result = affected_graph(tx, mutations)?;
+    let mut structure = affected_graph(tx, &structural)?;
+    for key in &mut structure {
+        if let Some(suffix) = key.strip_prefix(REVISION) {
+            *key = [STRUCTURE, suffix].concat();
+        }
+    }
+    if mutations.iter().any(|m| match m {
+        Mutation::Put { key, .. } | Mutation::Delete { key } => key.starts_with(STRUCTURE),
+    }) {
+        structure.push(global_structure_revision());
+    }
+    result.extend(structure);
+    Ok(result)
+}
+
+fn affected_graph(tx: &Transaction<'_>, mutations: &[Mutation]) -> Result<Vec<Vec<u8>>, Error> {
     let mut overlay = Overlay::new();
     for mutation in mutations {
         let key = match mutation {
@@ -212,6 +281,52 @@ mod tests {
     }
     fn version(store: &Store, key: &[u8]) -> Option<u64> {
         store.get(key).unwrap().map(|entry| entry.version)
+    }
+
+    #[test]
+    fn structure_revision_ignores_state_but_detects_child_aba() {
+        let store = Store::memory().unwrap();
+        let root = next_uuid();
+        let child = next_uuid();
+        let conversation = next_uuid();
+        let key = task_key(root);
+        let initial = json!({"id":root,"owner":{"Conversation":conversation},"state":"Ready","kind":"worker","definition_version":1});
+        store
+            .commit(
+                &[],
+                &[put(key.clone(), serde_json::to_vec(&initial).unwrap())],
+            )
+            .unwrap();
+        let revision = task_structure_revision(root);
+        let start = version(&store, &revision).unwrap();
+        let mut next = initial.clone();
+        next["state"] = json!("Running");
+        store
+            .commit(&[], &[put(key, serde_json::to_vec(&next).unwrap())])
+            .unwrap();
+        assert_eq!(version(&store, &revision), Some(start));
+        let unrelated = next_uuid();
+        store
+            .commit(
+                &[],
+                &[put(
+                    task_key(unrelated),
+                    task(unrelated, json!({"Conversation":next_uuid()})),
+                )],
+            )
+            .unwrap();
+        assert_eq!(version(&store, &revision), Some(start));
+        let child_key = task_key(child);
+        store
+            .commit(
+                &[],
+                &[put(child_key.clone(), task(child, json!({"Task":root})))],
+            )
+            .unwrap();
+        store
+            .commit(&[], &[Mutation::Delete { key: child_key }])
+            .unwrap();
+        assert_ne!(version(&store, &revision), Some(start));
     }
 
     #[test]
