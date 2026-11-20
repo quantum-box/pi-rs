@@ -295,3 +295,10 @@ future child claim transaction, not authorization to run a callback. The
 cleanup attempt and identity lease, park, signal revisions, claim, first-poll
 markers, callback receipt and parent settlement still require their own
 composed checks. Child callback dispatch remains disabled.
+
+A separate provisional nested-claim ancestry sidecar captures the full
+child-to-root chain and each task's version and signal revision. It can be
+composed with a claim and later checked while creating the authenticated start
+markers, so a signal or owner change between the claim and first poll causes a
+conflict. Its reopen and ancestor-signal race are tested, but neither the claim
+nor dispatch calls it yet; the sidecar alone does not authorize a callback.
