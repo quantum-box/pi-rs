@@ -245,11 +245,9 @@ mod task_record {
     }
 }
 
-// Prototype for a single direct owned-conversation child. It is deliberately
-// not wired into the protocol until child callback and receipt authentication
-// can consume its evidence.
+// A single direct owned-conversation child; this validates only the reservation,
+// never selection, callback dispatch, or receipt authorization.
 #[cfg(feature = "experimental-graph-revision")]
-#[allow(dead_code)]
 fn marked_owned_child_matches(marked: &serde_json::Value, current: &serde_json::Value) -> bool {
     [
         "id",
@@ -270,7 +268,6 @@ fn marked_owned_child_matches(marked: &serde_json::Value, current: &serde_json::
 }
 
 #[cfg(feature = "experimental-graph-revision")]
-#[allow(dead_code)]
 fn validate_owned_child_reservation(
     tx: &rusqlite::Transaction<'_>,
     mutations: &[Mutation],
@@ -473,7 +470,7 @@ fn validate_owned_child_reservation(
     Ok(())
 }
 
-// Protocol v3 validates the entire reservation write set under the SQLite
+// Protocol v4 validates the entire reservation write set under the SQLite
 // write lock and prevents older writers from bypassing this validation.
 #[cfg(feature = "experimental-graph-revision")]
 fn validate_owned_reservation(
@@ -488,9 +485,8 @@ fn validate_owned_reservation(
         }
         _ => None,
     }) {
-        // The child path remains disabled until its graph and identity proof
-        // can be consumed at every callback boundary.
-        return Err(Error::Conflict { key: key.clone() });
+        let _ = key;
+        return validate_owned_child_reservation(tx, mutations);
     }
     let markers: Vec<_> = mutations
         .iter()
@@ -780,6 +776,32 @@ mod owned_reservation_validation_tests {
         writes.pop();
         drop(tx);
         drop(connection);
+        let mut forged = writes.clone();
+        let forged_key = match &forged[0] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        let forged_marker_key = match &forged[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        forged[0] = Mutation::Put {
+            key: forged_key.clone(),
+            value: serde_json::to_vec(&forged_marker["running"]).unwrap(),
+        };
+        forged[1] = Mutation::Put {
+            key: forged_marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(matches!(
+            store.commit(&[], &forged),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(store.get(&forged_marker_key).unwrap().is_none());
+        assert_eq!(
+            store.get(&forged_key).unwrap().unwrap().version,
+            child_before.version
+        );
         let edge_entry = store.get(&edge_key).unwrap().unwrap();
         store
             .commit(
@@ -1025,7 +1047,7 @@ impl Store {
             } else {
                 None
             };
-            if version.is_none() || matches!(version, Some(1 | 2)) {
+            if version.is_none() || matches!(version, Some(1 | 2 | 3)) {
                 let (db, _lock) = owner::acquire_owner_lock(path)
                     .map_err(|error| Error::MigrationOwnerUnavailable(error.to_string()))?;
                 return Self::initialize(Connection::open(db)?, true, true);
@@ -1047,7 +1069,7 @@ impl Store {
         {
             let active = graph_protocol_active.clone();
             conn.create_scalar_function(
-                "pi_graph_protocol_v3",
+                "pi_graph_protocol_v4",
                 0,
                 rusqlite::functions::FunctionFlags::SQLITE_UTF8,
                 move |_| Ok(i64::from(active.load(std::sync::atomic::Ordering::Acquire))),
@@ -1066,6 +1088,8 @@ impl Store {
         #[cfg(feature = "experimental-graph-revision")]
         let mut migrate_old = false;
         #[cfg(feature = "experimental-graph-revision")]
+        let mut old_version = None;
+        #[cfg(feature = "experimental-graph-revision")]
         if protected {
             let version: Option<i64> = conn
                 .query_row(
@@ -1074,16 +1098,18 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if !matches!(version, Some(1 | 2 | 3))
-                || (matches!(version, Some(1 | 2)) && disk && !_migration_authorized)
+            if !matches!(version, Some(1 | 2 | 3 | 4))
+                || (matches!(version, Some(1 | 2 | 3)) && disk && !_migration_authorized)
             {
                 return Err(Error::IncompatibleGraphProtocol);
             }
-            migrate_old = matches!(version, Some(1 | 2));
+            migrate_old = matches!(version, Some(1 | 2 | 3));
+            old_version = version;
             let guard_name = match version {
                 Some(1) => "pi_graph_protocol() != 1",
                 Some(2) => "pi_graph_protocol_v2() != 1",
                 Some(3) => "pi_graph_protocol_v3() != 1",
+                Some(4) => "pi_graph_protocol_v4() != 1",
                 _ => unreachable!(),
             };
             for (name, action) in [
@@ -1160,8 +1186,8 @@ impl Store {
             let marker_prefix = b"runtime/woken-owned-reservation/v1/";
             let child_marker_prefix = b"runtime/woken-owned-child-reservation/";
             let old_marker: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE substr(key,1,?1)=?2 OR substr(key,1,?3)=?4)",
-                rusqlite::params![marker_prefix.len() as i64, marker_prefix, child_marker_prefix.len() as i64, child_marker_prefix],
+                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE (?5 AND substr(key,1,?1)=?2) OR substr(key,1,?3)=?4)",
+                rusqlite::params![marker_prefix.len() as i64, marker_prefix, child_marker_prefix.len() as i64, child_marker_prefix, old_version != Some(3)],
                 |row| row.get(0),
             )?;
             if old_marker {
@@ -1173,11 +1199,11 @@ impl Store {
             DROP TRIGGER IF EXISTS durable_graph_protocol_update;
             DROP TRIGGER IF EXISTS durable_graph_protocol_delete;
             DROP TABLE IF EXISTS durable_graph_protocol;
-            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=3));
-            INSERT INTO durable_graph_protocol(id,version) VALUES(1,3);
-            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
-            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
-            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=4));
+            INSERT INTO durable_graph_protocol(id,version) VALUES(1,4);
+            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v4() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v4() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v4() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
             COMMIT;")?;
         }
         let sequence = conn.query_row(
