@@ -5146,6 +5146,18 @@ mod tests {
                 .send(replacing.replace_registry(task_scheduler::Registry::default()))
                 .unwrap()
         });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver
+            .shared
+            .registry_replacing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replacement did not start"
+            );
+            thread::yield_now();
+        }
         assert!(matches!(
             done_rx.recv_timeout(Duration::from_millis(150)),
             Err(mpsc::RecvTimeoutError::Timeout)
