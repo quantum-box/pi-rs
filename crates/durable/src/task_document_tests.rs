@@ -1170,12 +1170,13 @@ fn corrupt_legacy_owner_only_blocks_its_own_mutations() {
     // Model data committed by the earlier partial-schema implementation.
     let invalid =
         serde_json::to_vec(&json!({"id": bad.id(), "state": {"Succeeded": null}})).unwrap();
+    // A legacy corrupt row cannot be written through Store's current validation.
+    // Model it with a trusted raw connection using the active protocol guard.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        // This fixture deliberately models a trusted host corrupting a legacy row.
         #[cfg(feature = "experimental-graph-revision")]
         conn.create_scalar_function(
-            "pi_graph_protocol",
+            "pi_graph_protocol_v2",
             0,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8,
             |_| Ok(1_i64),
