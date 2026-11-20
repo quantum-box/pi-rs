@@ -12368,7 +12368,8 @@ mod tests {
             let child: AsyncTaskCall =
                 serde_json::from_value(parent_task.checkpoint().data.clone()).unwrap();
             std::fs::write(root.join("parent-id"), parent.id().to_string()).unwrap();
-            std::fs::write(root.join("child-id"), child.task_id().to_string()).unwrap();
+            std::fs::write(root.join("child-id.tmp"), child.task_id().to_string()).unwrap();
+            std::fs::rename(root.join("child-id.tmp"), root.join("child-id")).unwrap();
             loop {
                 std::hint::black_box((&driver, &binding));
                 std::thread::park();
@@ -12521,7 +12522,8 @@ mod tests {
         let task = driver.get(parent.id()).unwrap().unwrap();
         let child: AsyncTaskCall = serde_json::from_value(task.checkpoint().data.clone()).unwrap();
         std::fs::write(root.join("parent-id"), parent.id().to_string()).unwrap();
-        std::fs::write(root.join("child-id"), child.task_id().to_string()).unwrap();
+        std::fs::write(root.join("child-id.tmp"), child.task_id().to_string()).unwrap();
+        std::fs::rename(root.join("child-id.tmp"), root.join("child-id")).unwrap();
         loop {
             std::hint::black_box((&driver, &binding));
             std::thread::park();
