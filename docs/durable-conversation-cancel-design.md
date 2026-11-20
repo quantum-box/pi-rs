@@ -31,6 +31,17 @@ does not enable callback dispatch. Aborting a parked call still requires
 reconciliation; in particular, this registration does not yet authorize the
 callback or run the conversation after hook on abort.
 
+The remaining selected-hook dispatch work includes two distinct boundaries.
+The claim, start-marker and receipt transactions validate the persisted
+selection, but selection publication must also be excluded from each validation
+through its commit and from start authorization through the callback's first
+poll. That exclusion must release before user code continues and must not block
+unrelated graphs or reentrant registry changes. In addition, a confirmed
+cancel receipt must be linked to replay-safe after-hook evidence and the
+conversation's terminal result; a crash or unknown callback result cannot be
+converted to a successful abort or cause a second callback. The registration
+tests do not establish either property and must not be used to enable dispatch.
+
 `DurableParkCancel::cancel_scoped` supplies an explicit callback scope. When a
 callback uses a joined Tokio task, it must pass the scope into that task and
 run its work through `scope.scope(...)`; task-local state is not inherited by
