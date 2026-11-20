@@ -12535,6 +12535,11 @@ impl Scheduler {
                 batch.mutations.push(mutation);
             }
             Ok(None) => (),
+            Err(crate::runtime::Error::Storage(error)) => {
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(task_store::Error::from(error).into());
+            }
             Err(_) => {
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
