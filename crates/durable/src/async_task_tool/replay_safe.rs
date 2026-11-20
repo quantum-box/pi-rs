@@ -1100,7 +1100,7 @@ impl Executor {
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
-        let result = runtime.block_on(async {
+        let mut result = runtime.block_on(async {
             let call = crate::extension::ToolCall {
                 name: self.identity.spec.name.clone(),
                 arguments,
@@ -1126,6 +1126,9 @@ impl Executor {
             }
             Ok(result)
         })?;
+        // A host-generated abort is not the Tool's structured result, even if
+        // an after hook supplies one. Upstream discards it for this path.
+        result.extra.remove("structuredOutput");
         if *memo.failed.lock().map_err(|_| "abort memo unavailable")? {
             return Err("abort hook memo failed".into());
         }

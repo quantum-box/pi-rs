@@ -741,25 +741,10 @@ async fn exercise_conversation_park_claim(case: &str) {
         let _ = driver.shutdown_with_pending().unwrap();
         return;
     }
-    if case == "selection_hook_output_schema" {
-        scheduler.abort_task(root_id).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
-        assert!(store.get(key.as_bytes()).unwrap().is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(after_calls.load(Ordering::SeqCst), 0);
-        let _ = driver.shutdown_with_pending().unwrap();
-        return;
-    }
     if matches!(
         case,
         "selection_hook_test_dispatch"
+            | "selection_hook_output_schema"
             | "selection_hook_kill"
             | "selection_hook_marker_conflict"
             | "selection_hook_multilevel"
@@ -981,11 +966,22 @@ async fn exercise_conversation_park_claim(case: &str) {
         let entry = store.get(key.as_bytes()).unwrap().unwrap();
         let receipt: crate::task_scheduler::ConversationCancelReceipt =
             serde_json::from_slice(&entry.value).unwrap();
-        assert_eq!(receipt.version, 2);
+        assert_eq!(
+            receipt.version,
+            2,
+            "task: {:?}",
+            tasks.load(root_id).unwrap().unwrap().task.state()
+        );
         assert_eq!(
             receipt.after_result.as_ref().unwrap()["task_content_v1"]["output"][0]["text"],
             "after cancel"
         );
+        if case == "selection_hook_output_schema" {
+            assert!(
+                receipt.after_result.as_ref().unwrap()["task_content_v1"]["structuredOutput"]
+                    .is_null()
+            );
+        }
         crate::async_task_tool::validate_aborted_after_result(
             receipt.after_result.as_ref().unwrap(),
         )
@@ -995,6 +991,9 @@ async fn exercise_conversation_park_claim(case: &str) {
                 let conversation = scheduler.conversation(conversation).unwrap();
                 if conversation.messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content.contains("after cancel"))) {
                     assert!(conversation.tool_results[0].is_error);
+                    if case == "selection_hook_output_schema" {
+                        assert!(conversation.tool_results[0].structured_output.is_none());
+                    }
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2509,7 +2508,7 @@ async fn selected_hook_abort_memo_snapshot_conflict_fails_closed() {
 }
 
 #[tokio::test]
-async fn selected_hook_output_schema_is_rejected_before_cancel() {
+async fn selected_hook_output_schema_allows_cancel_and_after_result() {
     exercise_conversation_park_claim("selection_hook_output_schema").await;
 }
 
