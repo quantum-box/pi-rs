@@ -128,6 +128,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[derive(Clone)]
     struct Cancel(
         Arc<AtomicUsize>,
         String,
@@ -137,6 +138,58 @@ async fn exercise_conversation_park_claim(case: &str) {
     );
     #[async_trait]
     impl DurableParkCancel for Cancel {
+        async fn cancel_scoped(
+            &self,
+            arguments: Value,
+            checkpoint: Value,
+            context: ToolContext,
+            scope: durable_store::controls::CallbackScope,
+        ) -> Result<(), String> {
+            if self.1 == "dispatch_spawn_unscoped_cancel" {
+                let path = self.2.clone();
+                let cancellation = context.cancellation.clone();
+                let child = tokio::spawn(async move {
+                    let store = durable_store::Store::open(path).unwrap();
+                    let task = pi_rs_durable::task_store::TaskStore::new(&store)
+                        .load(context.operation_id)
+                        .unwrap()
+                        .unwrap();
+                    let pi_rs_durable::task::TaskOwner::Conversation(conversation) =
+                        task.task.owner()
+                    else {
+                        panic!("not a root")
+                    };
+                    let signal = crate::conversation_signal::Signal::new(
+                        uuid::Uuid::new_v4(),
+                        *conversation,
+                        "unscoped".into(),
+                        json!(1),
+                    );
+                    crate::conversation_signal::Inbox::new(&store)
+                        .send_with_retry(&signal, &context.cancellation)
+                        .await
+                });
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                cancellation.cancel();
+                assert!(matches!(
+                    child.await.unwrap(),
+                    Err(crate::conversation_signal::Error::Cancelled)
+                ));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            if self.1.starts_with("dispatch_spawn_") {
+                let this = self.clone();
+                return tokio::spawn(async move {
+                    scope
+                        .scope(this.cancel(arguments, checkpoint, context))
+                        .await
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            self.cancel(arguments, checkpoint, context).await
+        }
         async fn cancel(&self, _: Value, _: Value, context: ToolContext) -> Result<(), String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             if self.1 == "dispatch_late" {
@@ -179,7 +232,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             if self.1 == "dispatch_panic" {
                 panic!("cancel panic");
             }
-            if self.1 == "dispatch_reentrant" {
+            if self.1 == "dispatch_reentrant" || self.1 == "dispatch_spawn_signal" {
                 // Test after a yield as well as the first poll: the callback
                 // must never wait for the marker it owns.
                 tokio::task::yield_now().await;
@@ -212,7 +265,7 @@ async fn exercise_conversation_park_claim(case: &str) {
                     crate::task_store::reentrant_callback(&store, context.operation_id).unwrap()
                 );
             }
-            if self.1 == "dispatch_reentrant_abort" {
+            if self.1 == "dispatch_reentrant_abort" || self.1 == "dispatch_spawn_abort" {
                 let store = durable_store::Store::open(&self.2).unwrap();
                 let task = pi_rs_durable::task_store::TaskStore::new(&store)
                     .load(context.operation_id)
@@ -644,7 +697,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         );
         return;
     }
-    if case == "dispatch_reentrant_abort" {
+    if case == "dispatch_reentrant_abort" || case == "dispatch_spawn_abort" {
         scheduler.abort_task(root_id).unwrap();
         *callback_scheduler.lock().unwrap() = Some(scheduler);
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -713,7 +766,12 @@ async fn exercise_conversation_park_claim(case: &str) {
         );
         return;
     }
-    if case == "dispatch_ok" || case == "dispatch_guard" || case == "dispatch_reentrant" {
+    if case == "dispatch_ok"
+        || case == "dispatch_guard"
+        || case == "dispatch_reentrant"
+        || case == "dispatch_spawn_signal"
+        || case == "dispatch_spawn_unscoped_cancel"
+    {
         scheduler.abort_task(root_id).unwrap();
         let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1655,6 +1713,21 @@ async fn conversation_cancel_reentrant_abort_fails_without_waiting() {
 #[tokio::test]
 async fn conversation_cancel_reentrant_signal_fails_after_yield() {
     exercise_conversation_park_claim("dispatch_reentrant").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_scoped_spawn_rejects_signal_self_wait() {
+    exercise_conversation_park_claim("dispatch_spawn_signal").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_scoped_spawn_rejects_abort_self_wait() {
+    exercise_conversation_park_claim("dispatch_spawn_abort").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_unscoped_spawn_retry_can_be_cancelled() {
+    exercise_conversation_park_claim("dispatch_spawn_unscoped_cancel").await;
 }
 
 #[tokio::test]

@@ -1874,13 +1874,16 @@ impl Handler for Executor {
                     task.id(),
                     marker.clone(),
                     async {
-                        let future = cancel.cancel(
+                        let scope = durable_store::controls::CallbackScope::current()
+                            .expect("callback scope installed");
+                        let future = cancel.cancel_scoped(
                             stored.arguments,
                             stored.checkpoint,
                             ToolContext {
                                 operation_id: task.id(),
                                 cancellation: cancellation.clone(),
                             },
+                            scope,
                         );
                         let mut future = std::pin::pin!(future);
                         let mut start = Some(start);

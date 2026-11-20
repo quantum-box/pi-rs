@@ -25,6 +25,14 @@ work. Direct Store writes outside the public mutation APIs are a trusted-host
 boundary. Nested cancel callbacks, selected hooks and woken cancellation remain
 unsupported by this opt-in.
 
+`DurableParkCancel::cancel_scoped` supplies an explicit callback scope. When a
+callback uses a joined Tokio task, it must pass the scope into that task and
+run its work through `scope.scope(...)`; task-local state is not inherited by
+`tokio::spawn`. This lets same-target retrying signal and abort operations reject
+self-wait. Without the scope, use a cancellation token or an explicit timeout
+for retrying operations, and join every spawned task before returning. The
+30-second callback timeout cannot preempt blocking work or join detached tasks.
+
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.
 

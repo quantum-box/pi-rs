@@ -698,6 +698,22 @@ pub trait DurableParkCancel: Send + Sync {
         checkpoint: serde_json::Value,
         context: pi_rs_core::ToolContext,
     ) -> Result<(), String>;
+
+    /// Conversation dispatch supplies a scope for joined child tasks. Pass it
+    /// to a spawned task and run the task's work through `scope.scope(...)` so
+    /// same-target control operations reject self-wait. Tokio does not inherit
+    /// task-local context automatically. Unscoped work must use a cancellation
+    /// token or an explicit timeout for any retrying control operation; all
+    /// spawned work must be joined before this callback returns.
+    async fn cancel_scoped(
+        &self,
+        arguments: serde_json::Value,
+        checkpoint: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+        _scope: durable_store::controls::CallbackScope,
+    ) -> Result<(), String> {
+        self.cancel(arguments, checkpoint, context).await
+    }
 }
 
 /// Callback execution evidence. Neither variant proves an external effect.

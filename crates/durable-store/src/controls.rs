@@ -24,6 +24,34 @@ tokio::task_local! {
     static CALLBACK_CONTEXT: (Uuid, Uuid, Vec<u8>);
 }
 
+/// An explicit callback context for work that must be joined by the callback.
+/// Tokio does not propagate task-local values through `spawn`; pass this token
+/// to the child and run its future with `scope` instead.
+#[derive(Clone)]
+pub struct CallbackScope {
+    conversation: Uuid,
+    task: Uuid,
+    marker: Vec<u8>,
+}
+
+impl CallbackScope {
+    pub fn current() -> Option<Self> {
+        CALLBACK_CONTEXT
+            .try_with(|(conversation, task, marker)| Self {
+                conversation: *conversation,
+                task: *task,
+                marker: marker.clone(),
+            })
+            .ok()
+    }
+
+    pub async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        CALLBACK_CONTEXT
+            .scope((self.conversation, self.task, self.marker.clone()), future)
+            .await
+    }
+}
+
 /// Scope callback execution across every poll, including after it yields.
 pub async fn with_callback_context<F: std::future::Future>(
     conversation: Uuid,
