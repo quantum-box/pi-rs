@@ -2104,6 +2104,15 @@ async fn interrupted_conversation_claim_settles_original_attempt_and_other_graph
 
 #[test]
 fn claim_recovery_progresses_during_independent_maintenance() {
+    exercise_claim_recovery_during_maintenance(false);
+}
+
+#[test]
+fn repeated_claim_conflicts_yield_to_independent_signal_and_maintenance() {
+    exercise_claim_recovery_during_maintenance(true);
+}
+
+fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
     use crate::async_task_tool::{
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
     };
@@ -2119,28 +2128,31 @@ fn claim_recovery_progresses_during_independent_maintenance() {
         }
     }
     let dir = tempfile::tempdir().unwrap();
+    let root = std::env::var_os("PI_TEST_CLAIM_CONFLICT_KILL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.path().to_path_buf());
     let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "conversation_claim_boundary_tests::conversation_cancel_claim_kill_worker",
         ])
-        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", root.as_path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
     let until = Instant::now() + Duration::from_secs(20);
-    while !dir.path().join("ready").exists() {
+    while !root.as_path().join("ready").exists() {
         assert!(worker.try_wait().unwrap().is_none(), "claim worker exited");
         assert!(Instant::now() < until, "claim worker timed out");
         std::thread::sleep(Duration::from_millis(5));
     }
-    let claim_bytes = std::fs::read(dir.path().join("ready")).unwrap();
+    let claim_bytes = std::fs::read(root.as_path().join("ready")).unwrap();
     let claim: crate::task_scheduler::ConversationCancelClaim =
         serde_json::from_slice(&claim_bytes).unwrap();
     worker.kill().unwrap();
     worker.wait().unwrap();
-    let path = dir.path().join("db");
+    let path = root.join("db");
     let store = durable_store::Store::open(&path).unwrap();
     let tasks = TaskStore::new(&store);
     let original = tasks.load(claim.task).unwrap().unwrap();
@@ -2271,10 +2283,118 @@ fn claim_recovery_progresses_during_independent_maintenance() {
             })
             .unwrap();
     }
+    let signal_id = uuid::Uuid::new_v4();
+    let mut signal_task = Task::new(
+        signal_id,
+        TaskOwner::Conversation(uuid::Uuid::new_v4()),
+        Checkpoint {
+            phase: "initial".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("independent".into(), true);
+    signal_task.start().unwrap();
+    signal_task
+        .wait(crate::task::WaitFor::Signal("go".into()))
+        .unwrap();
+    let conflict_id = uuid::Uuid::new_v4();
+    let mut conflict_task = Task::new(
+        conflict_id,
+        TaskOwner::Conversation(uuid::Uuid::new_v4()),
+        Checkpoint {
+            phase: "initial".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("independent".into(), true);
+    conflict_task.start().unwrap();
+    conflict_task.succeed(json!(null)).unwrap();
+    let conflict_enabled = Arc::new(std::sync::atomic::AtomicBool::new(conflicts));
+    let conflict_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    if conflicts {
+        let tasks = TaskStore::new(owner.store());
+        tasks
+            .save(&[Save::Create(&signal_task), Save::Create(&conflict_task)])
+            .unwrap();
+        tasks
+            .send_signal(&crate::task_store::Signal::new(
+                uuid::Uuid::new_v4(),
+                signal_id,
+                "go".into(),
+                json!(null),
+            ))
+            .unwrap();
+        fn install_conflict(
+            id: uuid::Uuid,
+            conflict_id: uuid::Uuid,
+            path: std::path::PathBuf,
+            enabled: Arc<std::sync::atomic::AtomicBool>,
+            count: Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            crate::task_scheduler::on_conversation_claim_recovery_before_commit(id, move || {
+                if !enabled.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let store = durable_store::Store::open(&path).unwrap();
+                let tasks = TaskStore::new(&store);
+                let current = tasks.load(conflict_id).unwrap().unwrap();
+                tasks.save(&[Save::Update(&current)]).unwrap();
+                let previous = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if previous >= 2
+                    && let Some(root) = std::env::var_os("PI_TEST_CLAIM_CONFLICT_KILL_DIR")
+                {
+                    std::fs::write(
+                        std::path::PathBuf::from(root).join("conflict-ready"),
+                        b"yes",
+                    )
+                    .unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                install_conflict(id, conflict_id, path, enabled, count);
+            });
+        }
+        install_conflict(
+            claim.task,
+            conflict_id,
+            path.clone(),
+            conflict_enabled.clone(),
+            conflict_count.clone(),
+        );
+    }
     resume_tx.send(()).unwrap();
     reserved_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("maintenance was not retained");
+    if conflicts {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if conflict_count.load(std::sync::atomic::Ordering::SeqCst) >= 3
+                && driver.get(signal_id).unwrap().unwrap().is_terminal()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "signal was starved by repeated recovery conflicts: count {}, signal {:?}, claim {:?}",
+                conflict_count.load(std::sync::atomic::Ordering::SeqCst),
+                driver.get(signal_id),
+                driver.get(claim.task)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!driver.get(claim.task).unwrap().unwrap().is_terminal());
+        assert!(matches!(
+            driver.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::CompletingFailed(_)
+        ));
+        conflict_enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let current = driver.get(claim.task).unwrap().unwrap();
@@ -2314,5 +2434,149 @@ fn claim_recovery_progresses_during_independent_maintenance() {
     );
     drop(poll);
     crate::task_scheduler::set_maintenance_busy_for_test(parent.id(), false);
-    assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(driver.shutdown_with_pending());
+    });
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .failure()
+            .is_none()
+    );
+}
+
+#[test]
+fn claim_recovery_repeated_conflicts_survive_process_kill() {
+    if std::env::var_os("PI_TEST_CLAIM_CONFLICT_KILL_DIR").is_some() {
+        return;
+    }
+    use crate::async_task_tool::{
+        DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
+    };
+    struct Cancel;
+    #[async_trait]
+    impl DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            panic!("callback disabled")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "conversation_claim_boundary_tests::repeated_claim_conflicts_yield_to_independent_signal_and_maintenance"])
+        .env("PI_TEST_CLAIM_CONFLICT_KILL_DIR", dir.path())
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while !dir.path().join("conflict-ready").exists() {
+        assert!(
+            process.try_wait().unwrap().is_none(),
+            "conflict worker exited"
+        );
+        assert!(
+            std::time::Instant::now() < until,
+            "conflict worker timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let claim: crate::task_scheduler::ConversationCancelClaim =
+        serde_json::from_slice(&std::fs::read(dir.path().join("ready")).unwrap()).unwrap();
+    let path = dir.path().join("db");
+    let store = durable_store::Store::open(&path).unwrap();
+    let original = crate::task_store::TaskStore::new(&store)
+        .load(claim.task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.task.attempt_id(), Some(claim.attempt));
+    assert!(
+        store
+            .get(&crate::task_scheduler::conversation_cancel_terminal_key(
+                claim.task
+            ))
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    let mut registry = Registry::default();
+    registry.register("independent", true, |_: &crate::task::Task| {
+        Ok(crate::task_scheduler::Step::Succeed(json!("ok")))
+    });
+    let leaf = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(AsyncTool {
+            name: "leaf",
+            child: None,
+            gate: None,
+            early: false,
+        }),
+        "leaf",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let tool = Arc::new(AsyncTool {
+        name: "root",
+        child: Some("leaf"),
+        gate: None,
+        early: false,
+    });
+    let identity: Arc<dyn Tool> = tool.clone();
+    let _identity = crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
+    let root = register_conversation_unsafe_durable_tool_with_park_cancel(
+        &mut registry,
+        tool,
+        "root",
+        1,
+        vec![leaf.clone()],
+        "cancel-v1",
+        Arc::new(Cancel),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![root.register(), leaf.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    let scheduler = harness.attach_tasks(registry).unwrap();
+    let driver = crate::task_driver::Driver::start_with_harness(scheduler, harness.worker());
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if driver.get(claim.task).unwrap().unwrap().is_terminal() {
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "claim did not recover");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let store = durable_store::Store::open(&path).unwrap();
+    let entry = store
+        .get(&crate::task_scheduler::conversation_cancel_terminal_key(
+            claim.task,
+        ))
+        .unwrap()
+        .unwrap();
+    let marker: crate::task_scheduler::ConversationCancelTerminalMarker =
+        serde_json::from_slice(&entry.value).unwrap();
+    assert_eq!(marker.claim_id, claim.claim_id);
+    assert_eq!(marker.attempt, claim.attempt);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(driver.shutdown_with_pending());
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .failure()
+            .is_none()
+    );
 }
