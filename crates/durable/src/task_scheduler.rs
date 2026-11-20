@@ -610,6 +610,9 @@ pub struct KnownConversationCancel {
     commit_state: KnownCancelCommitState,
     identity: Option<Arc<crate::nested_identity::IdentityLease>>,
     attachment: Option<Arc<KnownCancelAttachment>>,
+    receipt: Option<ConversationCancelReceipt>,
+    snapshot_check: Option<durable_store::Check>,
+    nested: bool,
 }
 impl std::fmt::Debug for KnownConversationCancel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -624,6 +627,34 @@ impl std::fmt::Debug for KnownConversationCancel {
     }
 }
 impl KnownConversationCancel {
+    pub(crate) fn from_receipt(
+        receipt: ConversationCancelReceipt,
+        marker: Vec<u8>,
+        identity: crate::nested_identity::IdentityLease,
+        snapshot_check: durable_store::Check,
+        nested: bool,
+    ) -> Self {
+        Self {
+            claim: receipt.claim.clone(),
+            result: receipt.result.clone(),
+            marker,
+            commit_state: KnownCancelCommitState::Uncertain,
+            identity: Some(Arc::new(identity)),
+            attachment: None,
+            receipt: Some(receipt),
+            snapshot_check: Some(snapshot_check),
+            nested,
+        }
+    }
+    pub fn after_result(&self) -> Option<&Value> {
+        self.receipt.as_ref().and_then(|r| r.after_result.as_ref())
+    }
+    pub fn has_snapshot_check(&self) -> bool {
+        self.snapshot_check.is_some()
+    }
+    pub fn is_nested(&self) -> bool {
+        self.nested
+    }
     /// The original immutable claim; this is evidence and grants no authority.
     pub fn claim(&self) -> &ConversationCancelClaim {
         &self.claim
@@ -3647,6 +3678,9 @@ impl AdmissionHandle<'_> {
             commit_state: KnownCancelCommitState::NotCommitted,
             identity: None,
             attachment: None,
+            receipt: None,
+            snapshot_check: None,
+            nested: false,
         }
     }
     #[cfg(test)]
