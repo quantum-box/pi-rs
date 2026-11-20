@@ -12218,6 +12218,7 @@ impl Harness {
             false,
             false,
             &Default::default(),
+            None,
         )
     }
 
@@ -12248,6 +12249,64 @@ impl Harness {
             false,
             false,
             &Default::default(),
+            None,
+        )?);
+        Ok(checks)
+    }
+
+    /// Provisional direct-child binding. Callers must hold both selected
+    /// registration and identity leases, and separately authenticate park,
+    /// claim, first poll, receipt, and all descendant effects. This does not
+    /// authorize callback dispatch.
+    #[cfg(feature = "experimental-graph-revision")]
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_owned_child_admission_checks(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<Vec<Check>, Error> {
+        let crate::task::TaskOwner::Conversation(conversation) = task.owner() else {
+            return Err(Error::Invalid("owned child conversation missing".into()));
+        };
+        let store = self.owner.store();
+        let tasks = crate::task_store::TaskStore::new(store);
+        let child = tasks
+            .load(task.id())
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .ok_or(Error::NotFound)?;
+        if child.task != *task {
+            return Err(Error::Invalid("owned child changed".into()));
+        }
+        let (root, mut checks) = woken_owned_child_reservation_checks(store, &child)?;
+        let edge = store
+            .get(&crate::ownership_edge::edge_key(*conversation))?
+            .ok_or(Error::NotFound)?;
+        checks.extend(self.checkpointable_cancel_root_capability_checks(*conversation)?);
+        checks.extend(self.checkpointable_conversation_checks_inner(
+            task,
+            registry,
+            true,
+            false,
+            false,
+            &Default::default(),
+            Some((*conversation, edge.version)),
+        )?);
+        let root = tasks
+            .load(root)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .ok_or(Error::NotFound)?;
+        let crate::task::TaskOwner::Conversation(parent_conversation) = root.task.owner() else {
+            return Err(Error::Invalid("owned root conversation missing".into()));
+        };
+        checks.extend(self.checkpointable_cancel_root_capability_checks(*parent_conversation)?);
+        checks.extend(self.checkpointable_conversation_checks_inner(
+            &root.task,
+            registry,
+            true,
+            false,
+            false,
+            &Default::default(),
+            None,
         )?);
         Ok(checks)
     }
@@ -12342,6 +12401,7 @@ impl Harness {
             false,
             terminal,
             authenticated_ancestors,
+            None,
         )?);
         Ok((conversation, checks))
     }
@@ -12398,6 +12458,7 @@ impl Harness {
             true,
             false,
             &Default::default(),
+            None,
         )
     }
 
@@ -12409,6 +12470,7 @@ impl Harness {
         allow_failed_root: bool,
         allow_cancelled_child: bool,
         authenticated_ancestors: &std::collections::HashSet<Uuid>,
+        allowed_owned_edge: Option<(Uuid, u64)>,
     ) -> Result<Vec<Check>, Error> {
         let store = self.owner.store();
         let tasks = crate::task_store::TaskStore::new(store);
@@ -12459,16 +12521,25 @@ impl Harness {
                 crate::task::TaskOwner::Conversation(id) => {
                     let edge = crate::ownership_edge::edge_key(*id);
                     let edge_boundary = store.put_version()?;
-                    if store.get(&edge)?.is_some() {
-                        return Err(Error::Invalid(
+                    match store.get(&edge)? {
+                        Some(entry) if allowed_owned_edge == Some((*id, entry.version)) => {
+                            checks.push(Check {
+                                key: edge,
+                                expected: Expected::Version(entry.version),
+                            });
+                        }
+                        Some(_) => return Err(Error::Invalid(
                             "owned conversations are not supported for checkpointable execution"
                                 .into(),
-                        ));
+                        )),
+                        None if allowed_owned_edge.is_none() => checks.push(Check {
+                            key: edge,
+                            expected: Expected::MissingUnchangedSince(edge_boundary),
+                        }),
+                        None => {
+                            return Err(Error::Invalid("owned conversation edge missing".into()));
+                        }
                     }
-                    checks.push(Check {
-                        key: edge,
-                        expected: Expected::MissingUnchangedSince(edge_boundary),
-                    });
                     let key = Self::key(*id);
                     let entry = store.get(&key)?.ok_or_else(|| {
                         Error::Invalid("checkpointable conversation missing".into())

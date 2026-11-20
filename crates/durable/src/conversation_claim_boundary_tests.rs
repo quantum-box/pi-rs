@@ -8145,6 +8145,15 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             crate::runtime::woken_owned_child_reservation_checks(&store, &child_record).unwrap();
         assert_eq!(owned_root, root.task.id());
         store.commit(&checks, &[]).unwrap();
+        let (options, registry, _) = build_woken_any(&path);
+        let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
+        assert!(
+            reopened
+                .checkpointable_owned_child_admission_checks(&child_record.task, &registry)
+                .is_err(),
+            "reservation evidence alone cannot authorize an idle conversation"
+        );
+        drop(reopened);
         let other = crate::task::Task::new(
             uuid::Uuid::new_v4(),
             crate::task::TaskOwner::Conversation(uuid::Uuid::new_v4()),
