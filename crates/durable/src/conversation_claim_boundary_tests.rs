@@ -1715,8 +1715,19 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 )
                 .unwrap();
                 let tasks = crate::task_store::TaskStore::new(&store);
-                tasks
-                    .save(&[crate::task_store::Save::Create(&child)])
+                // Simulate an older writer bypassing current admission checks.
+                let key = crate::task_store::key(child.id());
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&child).unwrap(),
+                        }],
+                    )
                     .unwrap();
                 let ready = tasks.load(child.id()).unwrap().unwrap();
                 tasks.update(&ready, |task| task.start()).unwrap();
@@ -6216,8 +6227,19 @@ async fn exercise_selected_woken_receipt(mode: &str) {
             )
             .unwrap();
             let tasks = crate::task_store::TaskStore::new(&store);
-            tasks
-                .save(&[crate::task_store::Save::Create(&child)])
+            // Simulate an older writer bypassing current admission checks.
+            let key = crate::task_store::key(child.id());
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&child).unwrap(),
+                    }],
+                )
                 .unwrap();
             let ready = tasks.load(child.id()).unwrap().unwrap();
             tasks.update(&ready, |task| task.start()).unwrap();
