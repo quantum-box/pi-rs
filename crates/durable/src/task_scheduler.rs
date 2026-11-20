@@ -705,6 +705,58 @@ fn validate_nested_cancel_terminal_evidence(
     validate_conversation_cancel_receipt(receipt, claim)
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NestedCancelRetirement {
+    version: u32,
+    task: Uuid,
+    claim_id: Uuid,
+    marker: Vec<u8>,
+}
+
+fn nested_cancel_retirement_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/nested-cancel-retirement-v1").into_bytes()
+}
+
+// A missing marker alone does not prove that this receipt retired it. Bind an
+// immutable record to the receipt in the same checked commit.
+fn nested_cancel_retirement_check(
+    store: &durable_store::Store,
+    task: Uuid,
+    claim_id: Uuid,
+    marker: &[u8],
+    receipt_key: &[u8],
+    receipt_version: u64,
+) -> Result<durable_store::Check, Error> {
+    let key = nested_cancel_retirement_key(task);
+    let entry = store
+        .get(&key)
+        .map_err(task_store::Error::from)?
+        .ok_or(Error::Ownership)?;
+    let saved: NestedCancelRetirement =
+        serde_json::from_slice(&entry.value).map_err(|e| Error::Handler(e.to_string()))?;
+    if saved.version != 1
+        || saved.task != task
+        || saved.claim_id != claim_id
+        || saved.marker != marker
+    {
+        return Err(Error::Ownership);
+    }
+    let finish = store
+        .commit_for_version(&key, entry.version)
+        .map_err(task_store::Error::from)?;
+    let receipt = store
+        .commit_for_version(receipt_key, receipt_version)
+        .map_err(task_store::Error::from)?;
+    if finish.is_none() || finish != receipt {
+        return Err(Error::Ownership);
+    }
+    Ok(durable_store::Check {
+        key,
+        expected: durable_store::Expected::Version(entry.version),
+    })
+}
+
 fn nested_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/nested-cancel-terminal-v1").into_bytes()
 }
@@ -799,6 +851,14 @@ pub(crate) fn nested_cancel_terminal_checks(
         return Err(Error::Ownership);
     }
     checks.extend(finished_checks);
+    checks.push(nested_cancel_retirement_check(
+        store,
+        task.task.id(),
+        claim.claim_id,
+        &marker,
+        &receipt_key,
+        receipt_entry.version,
+    )?);
     let conversation_marker =
         format!("runtime/conversation-callback-start/{conversation}").into_bytes();
     let current_marker = store
@@ -4876,6 +4936,23 @@ impl AdmissionHandle<'_> {
             if memo.is_none() {
                 mutations.extend(conversation_finish.mutations);
                 mutations.extend(task_finish.mutations);
+                if nested {
+                    let key = nested_cancel_retirement_key(current.task.id());
+                    checks.push(durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    });
+                    let retirement = NestedCancelRetirement {
+                        version: 1,
+                        task: current.task.id(),
+                        claim_id: claim.claim_id,
+                        marker: marker.to_vec(),
+                    };
+                    mutations.push(durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&retirement).map_err(|e| e.to_string())?,
+                    });
+                }
             }
         }
         let memo_result = if let Some((memo_key, value)) = memo {
@@ -9471,10 +9548,19 @@ impl Scheduler {
                             batch.checks.extend(checks);
                             batch.checks.push(claim_check);
                             batch.checks.push(durable_store::Check {
-                                key: receipt_key,
+                                key: receipt_key.clone(),
                                 expected: durable_store::Expected::Version(entry.version),
                             });
                             if let Some((conversation, _)) = &nested_conversation {
+                                let marker = serde_json::to_vec(&serde_json::json!({"version": 1, "claim_id":claim.claim_id, "task":claim.task, "attempt":claim.attempt, "lease":claim.lease, "policy":claim.policy})).map_err(|e| Error::Handler(e.to_string()))?;
+                                batch.checks.push(nested_cancel_retirement_check(
+                                    store,
+                                    running.task.id(),
+                                    claim.claim_id,
+                                    &marker,
+                                    &receipt_key,
+                                    entry.version,
+                                )?);
                                 let (
                                     saved_conversation,
                                     ancestry,
@@ -12009,6 +12095,283 @@ impl Scheduler {
         }
         Ok(true)
     }
+    // Recover only a completely persisted nested callback receipt. Missing or
+    // conflicting evidence falls back to reconciliation; it never redispatches.
+    fn recover_nested_cancel_receipt(
+        &self,
+        item: &task_store::StoredTask,
+        claim: &ConversationCancelClaim,
+        receipt_entry: &durable_store::Entry,
+        boundary: u64,
+    ) -> Result<bool, Error> {
+        let Some(harness) = self.validator.as_ref() else {
+            return Ok(false);
+        };
+        let Ok(reg) = self.registered(&item.task) else {
+            return Ok(false);
+        };
+        let Some((identity, validate, _)) = &reg.conversation_checkpointable else {
+            return Ok(false);
+        };
+        if !validate()
+            || !reg.handler.conversation_cancel_dispatch_enabled()
+            || reg.replay_safe
+            || reg.version != item.task.definition_version()
+        {
+            return Ok(false);
+        }
+        let Ok(receipt) = serde_json::from_slice::<ConversationCancelReceipt>(&receipt_entry.value)
+        else {
+            return Ok(false);
+        };
+        if validate_conversation_cancel_receipt(&receipt, claim).is_err()
+            || receipt.result != "callback returned"
+            || identity.has_conversation_hooks() != (receipt.version == 2)
+        {
+            return Ok(false);
+        }
+        let selection_gate = harness.checkpointable_extension_gate();
+        let _selection = selection_gate.lock().map_err(|_| Error::Poisoned)?;
+        let _identity = match reg.handler.conversation_cleanup_identity_lease() {
+            Ok(lease) => lease,
+            Err(crate::nested_identity::LeaseFailure::Busy) => return Err(Error::Busy),
+            Err(crate::nested_identity::LeaseFailure::Mismatch) => return Ok(false),
+        };
+        let owner = self.owner();
+        let store = owner.store();
+        let Ok((conversation, mut checks)) =
+            harness.checkpointable_nested_cancel_conversation_checks(&item.task, &self.registry)
+        else {
+            return Ok(false);
+        };
+        let Ok(park_checks) =
+            crate::async_task_tool::unsafe_park_proof::cancel_checks(store, &item.task, boundary)
+        else {
+            return Ok(false);
+        };
+        if has_live_owned(store, item.task.id(), &self.ts().list()?)? {
+            return Ok(false);
+        }
+        let (uncertain, descendant_checks, _nested_leases) =
+            authenticated_unsafe_descendant_reconciliation(
+                &store,
+                item.task.id(),
+                &self.ts().list()?,
+                boundary,
+                &self.registry,
+                harness,
+                None,
+            )?;
+        if uncertain.is_some() {
+            return Ok(false);
+        }
+        checks.extend(park_checks);
+        checks.extend(descendant_checks);
+        let (saved_conversation, ancestry, ancestry_checks, ancestry_version) =
+            task_store::read_nested_cancel_claim_ancestry(&store, item.task.id(), claim.claim_id)?;
+        if saved_conversation != conversation {
+            return Ok(false);
+        }
+        let marker = serde_json::to_vec(&serde_json::json!({"version": 1, "claim_id":claim.claim_id, "task":claim.task, "attempt":claim.attempt, "lease":claim.lease, "policy":claim.policy})).map_err(|e| Error::Handler(e.to_string()))?;
+        let Ok((finished, finished_checks, start_version)) =
+            task_store::read_finished_callback_ancestry(
+                &store,
+                item.task.id(),
+                conversation,
+                &marker,
+                None,
+            )
+        else {
+            return Ok(false);
+        };
+        if finished != ancestry {
+            return Ok(false);
+        }
+        let claim_key = conversation_cancel_claim_key(item.task.id());
+        let Some(claim_entry) = store.get(&claim_key).map_err(task_store::Error::from)? else {
+            return Ok(false);
+        };
+        let Ok(saved_claim) = serde_json::from_slice::<ConversationCancelClaim>(&claim_entry.value)
+        else {
+            return Ok(false);
+        };
+        if saved_claim != *claim {
+            return Ok(false);
+        }
+        let ancestry_key =
+            format!("durable/task-callback-claim-ancestry/{}", item.task.id()).into_bytes();
+        let start_key = format!("durable/task-callback-ancestry/{}", item.task.id()).into_bytes();
+        let receipt_key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+            item.task.id()
+        )
+        .into_bytes();
+        let Some(claim_commit) = store
+            .commit_for_version(&claim_key, claim_entry.version)
+            .map_err(task_store::Error::from)?
+        else {
+            return Ok(false);
+        };
+        let Some(ancestry_commit) = store
+            .commit_for_version(&ancestry_key, ancestry_version)
+            .map_err(task_store::Error::from)?
+        else {
+            return Ok(false);
+        };
+        let Some(start_commit) = store
+            .commit_for_version(&start_key, start_version)
+            .map_err(task_store::Error::from)?
+        else {
+            return Ok(false);
+        };
+        let Some(receipt_commit) = store
+            .commit_for_version(&receipt_key, receipt_entry.version)
+            .map_err(task_store::Error::from)?
+        else {
+            return Ok(false);
+        };
+        if claim_commit != ancestry_commit
+            || claim_commit >= start_commit
+            || start_commit >= receipt_commit
+        {
+            return Ok(false);
+        }
+        let Ok(retirement_check) = nested_cancel_retirement_check(
+            store,
+            item.task.id(),
+            claim.claim_id,
+            &marker,
+            &receipt_key,
+            receipt_entry.version,
+        ) else {
+            return Ok(false);
+        };
+        checks.push(retirement_check);
+        let conversation_marker =
+            format!("runtime/conversation-callback-start/{conversation}").into_bytes();
+        if store
+            .get(&conversation_marker)
+            .map_err(task_store::Error::from)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        checks.push(durable_store::Check {
+            key: conversation_marker,
+            expected: durable_store::Expected::Missing,
+        });
+        checks.extend(ancestry_checks);
+        checks.extend(finished_checks);
+        checks.push(durable_store::Check {
+            key: claim_key,
+            expected: durable_store::Expected::Version(claim_entry.version),
+        });
+        checks.push(durable_store::Check {
+            key: receipt_key,
+            expected: durable_store::Expected::Version(receipt_entry.version),
+        });
+        let signal_key = conversation_cancel_signal_evidence_key(item.task.id());
+        let Some(signal_entry) = store.get(&signal_key).map_err(task_store::Error::from)? else {
+            return Ok(false);
+        };
+        let Ok(signal) =
+            serde_json::from_slice::<ConversationCancelSignalEvidence>(&signal_entry.value)
+        else {
+            return Ok(false);
+        };
+        if signal.version != 1
+            || signal.claim_id != claim.claim_id
+            || signal.task != item.task.id()
+            || signal.conversation != conversation
+            || store
+                .commit_for_version(&signal_key, signal_entry.version)
+                .map_err(task_store::Error::from)?
+                != Some(claim_commit)
+        {
+            return Ok(false);
+        }
+        checks.push(durable_store::Check {
+            key: signal_key,
+            expected: durable_store::Expected::Version(signal_entry.version),
+        });
+        // A selected after result used the claim-time conversation snapshot.
+        // A change since then cannot be proven compatible with that result.
+        if receipt.version == 2 {
+            let Some(version) = signal.conversation_version else {
+                return Ok(false);
+            };
+            let key = crate::runtime::Harness::key(conversation);
+            if store
+                .get(&key)
+                .map_err(task_store::Error::from)?
+                .is_none_or(|entry| entry.version != version)
+            {
+                return Ok(false);
+            }
+            checks.push(durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(version),
+            });
+        }
+        let mut next = item.clone();
+        next.task.cancel().map_err(Error::Transition)?;
+        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+        batch.checks.extend(checks);
+        let evidence = NestedCancelTerminalEvidence {
+            version: 1,
+            conversation,
+            ancestry,
+            claim: claim.clone(),
+            identity: identity.clone(),
+            receipt_version: receipt_entry.version,
+            terminal_task: next.task.clone(),
+        };
+        let key = nested_cancel_terminal_key(item.task.id());
+        batch.checks.push(durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        batch.mutations.push(durable_store::Mutation::Put {
+            key,
+            value: serde_json::to_vec(&evidence).map_err(|e| Error::Handler(e.to_string()))?,
+        });
+        if receipt.version == 2 {
+            let key = conversation_cancel_terminal_key(item.task.id());
+            let terminal = ConversationCancelTerminalMarker {
+                version: 2,
+                claim_id: claim.claim_id,
+                attempt: claim.attempt,
+                running_task_version: item.version,
+                terminal_task: next.task,
+                receipt_version: Some(receipt_entry.version),
+            };
+            batch.checks.push(durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            });
+            batch.mutations.push(durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&terminal).map_err(|e| Error::Handler(e.to_string()))?,
+            });
+        }
+        match store.commit_with_prefix_put_fence(
+            &batch.checks,
+            &batch.mutations,
+            &[
+                task_store::PREFIX,
+                crate::ownership_edge::PREFIX,
+                b"runtime/conversation/",
+            ],
+            boundary,
+        ) {
+            Ok(()) => Ok(true),
+            Err(durable_store::Error::Conflict { .. } | durable_store::Error::WriteLockBusy(_)) => {
+                Err(Error::Busy)
+            }
+            Err(error) => Err(task_store::Error::from(error).into()),
+        }
+    }
+
     fn reconcile(&mut self) -> Result<(), Error> {
         self.reconcile_inner(false, &[])
     }
@@ -12573,6 +12936,26 @@ impl Scheduler {
                             .into_bytes();
                             let receipt =
                                 store.get(&receipt_key).map_err(task_store::Error::from)?;
+                            if let Some(receipt_entry) = receipt.as_ref() {
+                                match self.recover_nested_cancel_receipt(
+                                    &item,
+                                    &claim,
+                                    receipt_entry,
+                                    recovery_graph_version,
+                                ) {
+                                    Ok(true) => {
+                                        self.deferred_recovery.extend(deferred);
+                                        continue 'scan;
+                                    }
+                                    Ok(false) => (),
+                                    Err(Error::Busy) => {
+                                        self.deferred_recovery.extend(deferred);
+                                        self.deferred_recovery.insert(item.task.id());
+                                        return Ok(());
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
                             let marker_bytes = serde_json::to_vec(&serde_json::json!({
                                 "version": 1, "claim_id": claim.claim_id, "task": claim.task,
                                 "attempt": claim.attempt, "lease": claim.lease, "policy": claim.policy,
