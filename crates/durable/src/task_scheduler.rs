@@ -15907,6 +15907,12 @@ impl Scheduler {
             {
                 continue;
             }
+            #[cfg(feature = "experimental-graph-revision")]
+            if !crate::runtime::woken_owned_reservation_may_start(owner.store(), &snapshot.task)
+                .map_err(|error| Error::Handler(error.to_string()))?
+            {
+                continue;
+            }
             let graph = cleanup_graph.as_ref().unwrap();
             let mut pending = false;
             let mut anchors = vec![snapshot.task.id()];

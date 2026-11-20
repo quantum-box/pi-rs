@@ -8655,6 +8655,21 @@ async fn exercise_woken_owned_coordinator(invalid_proof: bool) {
             )
             .unwrap();
     }
+    let mut independent_abort = crate::task::Task::new(
+        uuid::Uuid::from_u128(u128::MAX),
+        crate::task::TaskOwner::Conversation(independent_conversation),
+        crate::task::Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("owned-independent".into(), true);
+    independent_abort.request_abort().unwrap();
+    crate::task_store::TaskStore::new(&store)
+        .save(&[crate::task_store::Save::Create(&independent_abort)])
+        .unwrap();
     drop(store);
     drop(harness);
     let conflict_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -8742,6 +8757,18 @@ async fn exercise_woken_owned_coordinator(invalid_proof: bool) {
         driver.get(independent.id()).unwrap().unwrap().state(),
         &TaskState::Succeeded(json!("independent"))
     );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !driver
+            .get(independent_abort.id())
+            .unwrap()
+            .unwrap()
+            .is_terminal()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
     let _ = scheduler.shutdown().await;
 }

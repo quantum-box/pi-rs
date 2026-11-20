@@ -161,6 +161,48 @@ fn woken_owned_reservation_key(root: Uuid) -> Vec<u8> {
     format!("runtime/woken-owned-reservation/v1/{root}").into_bytes()
 }
 
+// Read-only scheduling hint. The reservation transaction repeats every check;
+// stale or invalid evidence merely keeps this root out of the candidate set.
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn woken_owned_reservation_may_start(
+    store: &durable_store::Store,
+    task: &crate::task::Task,
+) -> Result<bool, Error> {
+    let Some(entry) = store.get(&woken_owned_graph_key(task.id()))? else {
+        return Ok(true);
+    };
+    let Ok(graph) = serde_json::from_slice::<WokenOwnedGraphEvidence>(&entry.value) else {
+        return Ok(false);
+    };
+    let Some(structure) = graph.structure else {
+        return Ok(false);
+    };
+    if graph.version != 1
+        || graph.root != task.id()
+        || task.woken_interrupted_attempt() != Some(graph.interrupted_attempt)
+        || store
+            .get(&woken_owned_reservation_key(task.id()))?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    for (key, expected) in [
+        (
+            durable_store::graph_revision::task_structure_revision(task.id()),
+            structure.root_revision,
+        ),
+        (
+            durable_store::graph_revision::global_structure_revision(),
+            structure.global_revision,
+        ),
+    ] {
+        if store.get(&key)?.map(|entry| entry.version) != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(feature = "experimental-graph-revision")]
 pub(crate) fn prepare_woken_owned_reservation(
     store: &durable_store::Store,
