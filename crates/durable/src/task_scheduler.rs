@@ -10163,6 +10163,7 @@ impl Scheduler {
                                 None
                             };
                             let boundary = store.put_version().map_err(task_store::Error::from)?;
+                            let mut _nested_identity_leases = Vec::new();
                             let after = if _identity.is_some() {
                                 match (
                                     self.validator.as_ref(),
@@ -10181,12 +10182,15 @@ impl Scheduler {
                                             )
                                         {
                                             let records = self.ts().list()?;
-                                            let (uncertain, descendants) =
-                                                unsafe_descendant_reconciliation(
+                                            let (uncertain, descendants, leases) =
+                                                authenticated_unsafe_descendant_reconciliation(
                                                     store,
                                                     running.task.id(),
                                                     &records,
                                                     boundary,
+                                                    &self.registry,
+                                                    harness,
+                                                    None,
                                                 )?;
                                             if uncertain.is_none()
                                                 && !has_live_owned(
@@ -10197,6 +10201,7 @@ impl Scheduler {
                                             {
                                                 checks.extend(binding);
                                                 checks.extend(descendants);
+                                                _nested_identity_leases = leases;
                                                 Some((version, checks))
                                             } else {
                                                 None
@@ -13242,6 +13247,7 @@ impl Scheduler {
                         } else {
                             None
                         };
+                        let mut _nested_identity_leases = Vec::new();
                         let after = if _identity.is_some()
                             && task_marker.is_none()
                             && conversation_marker.is_none()
@@ -13263,18 +13269,22 @@ impl Scheduler {
                                         )
                                     {
                                         let records = self.ts().list()?;
-                                        let (uncertain, descendants) =
-                                            unsafe_descendant_reconciliation(
+                                        let (uncertain, descendants, leases) =
+                                            authenticated_unsafe_descendant_reconciliation(
                                                 store,
                                                 item.task.id(),
                                                 &records,
                                                 recovery_graph_version,
+                                                &self.registry,
+                                                harness,
+                                                None,
                                             )?;
                                         if uncertain.is_none()
                                             && !has_live_owned(store, item.task.id(), &records)?
                                         {
                                             checks.extend(binding);
                                             checks.extend(descendants);
+                                            _nested_identity_leases = leases;
                                             Some((version, checks))
                                         } else {
                                             None
