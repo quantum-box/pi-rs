@@ -15806,11 +15806,14 @@ impl Harness {
                     return Err(Error::Invalid("woken cancel adapter changed".into()));
                 }
                 let handler = adapter.handler();
-                cancel_identity = Some(
-                    handler
-                        .conversation_cleanup_identity_lease()
-                        .map_err(|_| Error::Invalid("woken cancel identity unavailable".into()))?,
-                );
+                cancel_identity = Some(handler.conversation_cleanup_identity_lease().map_err(
+                    |error| match error {
+                        crate::nested_identity::LeaseFailure::Busy => Error::TaskPublicationBusy,
+                        crate::nested_identity::LeaseFailure::Mismatch => {
+                            Error::Invalid("woken cancel identity changed".into())
+                        }
+                    },
+                )?);
                 let store = self.owner.store();
                 let boundary = store.put_version()?;
                 let (value, checks) =
