@@ -7708,6 +7708,25 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         recovered.task.woken_interrupted_attempt(),
         root.task.attempt_id()
     );
+    drop(store);
+    drop(harness);
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    assert!(reopened.conversation(conversation).unwrap().abort_requested);
+    let store = durable_store::Store::open(&path).unwrap();
+    let saved = crate::task_store::TaskStore::new(&store)
+        .load(root.task.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.task, recovered.task);
 }
 
 #[tokio::test]
