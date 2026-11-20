@@ -436,6 +436,36 @@ mod owned_reservation_validation_tests {
             key: b"durable/task/other".to_vec(),
         });
         assert!(validate_owned_reservation(&tx, &writes).is_err());
+        writes.pop();
+        drop(tx);
+        drop(connection);
+        let child = uuid::Uuid::from_u128(5);
+        let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
+        let child_value = json!({"id":child,"owner":{"Task":id},"checkpoint":{"phase":"initial","data":null},"state":"Ready","restarts":0,"restart_limit":4});
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: child_key.clone(),
+                    value: serde_json::to_vec(&child_value).unwrap(),
+                }],
+            )
+            .unwrap();
+        let child_entry = store.get(&child_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: child_key.clone(),
+                    expected: Expected::Version(child_entry.version),
+                }],
+                &[Mutation::Delete { key: child_key }],
+            )
+            .unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
     }
 }
 
