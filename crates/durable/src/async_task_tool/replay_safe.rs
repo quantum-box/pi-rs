@@ -356,7 +356,7 @@ pub(super) fn register_conversation_candidate(
         Arc<dyn crate::extension::Hook>,
     )>,
     replay_safe: bool,
-    conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
+    conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool, bool)>,
 ) -> Result<Arc<TaskTool>, String> {
     let identity_tool: Arc<dyn Tool> = tool.clone();
     let identity_guard = if conversation_cancel.is_some() {
@@ -417,9 +417,11 @@ pub(super) fn register_conversation_candidate(
         &child_identities,
     ))
     .map_err(|e| e.to_string())?;
-    let encoded = if let Some((cancel_identity, _, enabled)) = &conversation_cancel {
+    let encoded = if let Some((cancel_identity, _, enabled, woken)) = &conversation_cancel {
         serde_json::to_vec(&(
-            if *enabled {
+            if *woken {
+                "conversation-woken-cancel-dispatch-v1"
+            } else if *enabled {
                 "conversation-cancel-dispatch-v1"
             } else {
                 "conversation-cancel-v2"
@@ -931,7 +933,7 @@ struct Executor {
     unavailable: bool,
     park_cancel: Option<(Arc<dyn DurableParkCancel>, bool)>,
     // Identity-bound callback and explicit dispatch opt-in.
-    _conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
+    _conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool, bool)>,
     conversation_identity: Option<String>,
     woken_identity: Option<String>,
 }
@@ -1747,7 +1749,13 @@ impl Handler for Executor {
     fn conversation_cancel_dispatch_enabled(&self) -> bool {
         self._conversation_cancel
             .as_ref()
-            .is_some_and(|(_, _, enabled)| *enabled)
+            .is_some_and(|(_, _, enabled, _)| *enabled)
+    }
+    fn conversation_woken_cancel_enabled(&self) -> bool {
+        self._conversation_cancel
+            .as_ref()
+            .is_some_and(|(_, _, enabled, woken)| *enabled && *woken)
+            && !self.block_results
     }
     fn conversation_cleanup_identity_lease(
         &self,
@@ -1820,11 +1828,236 @@ impl Handler for Executor {
             {
                 return Err("conversation cancel tool identity changed".into());
             }
-            let (_, cancel, enabled) = self
+            let (_, cancel, enabled, woken) = self
                 ._conversation_cancel
                 .as_ref()
                 .ok_or("missing cancel registration")?;
             let selection_start = admission.conversation_selection_start_lease(self)?;
+            #[cfg(test)]
+            if task.woken_interrupted_attempt().is_some()
+                && std::env::var_os("PI_TEST_WOKEN_REAL").is_none()
+                && let Some(dir) = std::env::var_os("PI_TEST_WOKEN_START_DIR")
+            {
+                let claim = admission.record_conversation_woken_claim(
+                    self,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                let start = admission.conversation_callback_start_lease()?;
+                let marker = admission.record_woken_conversation_start_markers(
+                    self,
+                    &claim,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                std::fs::write(std::path::Path::new(&dir).join("woken-start.tmp"), &marker)
+                    .map_err(|e| e.to_string())?;
+                std::fs::rename(
+                    std::path::Path::new(&dir).join("woken-start.tmp"),
+                    std::path::Path::new(&dir).join("woken-start"),
+                )
+                .map_err(|e| e.to_string())?;
+                if std::env::var_os("PI_TEST_WOKEN_DISPATCH").is_some() {
+                    let stored: ParkCheckpoint =
+                        serde_json::from_value(task.checkpoint().data.clone())
+                            .map_err(|_| "invalid woken cancel checkpoint")?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let cancellation = pi_rs_core::CancellationToken::new();
+                    let result =
+                        runtime.block_on(durable_store::controls::with_callback_context(
+                            claim.conversation,
+                            task.id(),
+                            marker.clone(),
+                            async {
+                                let scope = durable_store::controls::CallbackScope::current()
+                                    .ok_or("missing callback scope")?;
+                                let future = cancel.cancel_scoped(
+                                    stored.arguments,
+                                    stored.checkpoint,
+                                    ToolContext {
+                                        operation_id: task.id(),
+                                        cancellation: cancellation.clone(),
+                                    },
+                                    scope,
+                                );
+                                let mut future = std::pin::pin!(future);
+                                let mut leases = Some((start, selection_start));
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    std::future::poll_fn(|cx| match leases.take() {
+                                        Some((lease, Some(selection))) => {
+                                            selection.poll_first(lease, future.as_mut(), cx)
+                                        }
+                                        Some((lease, None)) => {
+                                            lease.poll_first(future.as_mut(), cx)
+                                        }
+                                        None => future.as_mut().poll(cx),
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| "woken callback timeout")?
+                            },
+                        ))?;
+                    let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
+                        version: 1,
+                        claim: claim.clone(),
+                        result: "callback returned".into(),
+                    };
+                    admission.store_woken_conversation_cancel_receipt(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                    std::fs::write(
+                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                        b"saved",
+                    )
+                    .map_err(|e| e.to_string())?;
+                    std::fs::rename(
+                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                        std::path::Path::new(&dir).join("woken-receipt"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    std::hint::black_box(result);
+                } else {
+                    let _leases = (start, selection_start);
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                loop {
+                    std::thread::park();
+                }
+            }
+            if *woken && task.woken_interrupted_attempt().is_some() {
+                let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
+                    .map_err(|_| "invalid woken cancel checkpoint")?;
+                if stored.version != 2
+                    || stored.park_attempt.is_none()
+                    || !stored.arguments.is_object()
+                    || !jsonschema::validator_for(&self.identity.spec.parameters)
+                        .is_ok_and(|schema| schema.is_valid(&stored.arguments))
+                {
+                    return Err(
+                        "unsupported woken cancel checkpoint; reconciliation required".into(),
+                    );
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let claim = admission.record_conversation_woken_claim(
+                    self,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                let start = admission.conversation_callback_start_lease()?;
+                let marker = admission.record_woken_conversation_start_markers(
+                    self,
+                    &claim,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                let cancellation = pi_rs_core::CancellationToken::new();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(durable_store::controls::with_callback_context(
+                        claim.conversation,
+                        task.id(),
+                        marker.clone(),
+                        async {
+                            let scope = durable_store::controls::CallbackScope::current()
+                                .expect("callback scope installed");
+                            let future = cancel.cancel_scoped(
+                                stored.arguments,
+                                stored.checkpoint,
+                                ToolContext {
+                                    operation_id: task.id(),
+                                    cancellation: cancellation.clone(),
+                                },
+                                scope,
+                            );
+                            let mut future = std::pin::pin!(future);
+                            let mut leases = Some((start, selection_start));
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                std::future::poll_fn(|cx| match leases.take() {
+                                    Some((lease, Some(selection))) => {
+                                        selection.poll_first(lease, future.as_mut(), cx)
+                                    }
+                                    Some((lease, None)) => lease.poll_first(future.as_mut(), cx),
+                                    None => future.as_mut().poll(cx),
+                                }),
+                            )
+                            .await
+                        },
+                    ))
+                }));
+                cancellation.cancel();
+                if !matches!(result, Ok(Ok(Ok(())))) {
+                    admission.retire_woken_conversation_cancel_unknown(
+                        &claim,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                    return Err(
+                        "woken cancellation outcome unknown; reconciliation required".into(),
+                    );
+                }
+                let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
+                    version: 1,
+                    claim: claim.clone(),
+                    result: "callback returned".into(),
+                };
+                if admission
+                    .store_woken_conversation_cancel_receipt(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )
+                    .is_err()
+                {
+                    admission.retire_woken_conversation_cancel_unknown(
+                        &claim,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                    return Err(
+                        "woken cancellation receipt uncertain; reconciliation required".into(),
+                    );
+                }
+                #[cfg(test)]
+                if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT") {
+                    std::fs::write(
+                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                        b"saved",
+                    )
+                    .map_err(|e| e.to_string())?;
+                    std::fs::rename(
+                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                        std::path::Path::new(&dir).join("woken-receipt"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                // Cleanup does not turn the interrupted Tool's outcome into a
+                // known result. Preserve the receipt for reconciliation.
+                return Err("interrupted woken execution; reconciliation required".into());
+            }
             let _claim = admission
                 .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
             #[cfg(test)]

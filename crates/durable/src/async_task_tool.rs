@@ -102,7 +102,7 @@ pub fn register_conversation_unsafe_durable_tool_with_park_cancel(
         children,
         None,
         false,
-        Some((cancel_identity.to_owned(), cancel, false)),
+        Some((cancel_identity.to_owned(), cancel, false, false)),
     )
 }
 
@@ -130,7 +130,37 @@ pub fn register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
         children,
         None,
         false,
-        Some((cancel_identity.to_owned(), cancel, true)),
+        Some((cancel_identity.to_owned(), cancel, true, false)),
+    )
+}
+
+/// Explicitly enable at-most-once external cancellation for an unhooked
+/// unsafe conversation Tool after a committed park or an interrupted wake.
+/// A stopped or uncertain callback and the interrupted Tool outcome require
+/// reconciliation. Existing parked records cannot change registration.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _authorization: UnsafeDurableAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+        return Err("invalid cancel identity".into());
+    }
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        None,
+        false,
+        Some((cancel_identity.to_owned(), cancel, true, true)),
     )
 }
 
@@ -337,7 +367,7 @@ pub(crate) fn register_selected_unsafe_cancel_candidate(
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
         false,
-        Some((cancel_identity.to_owned(), cancel, enabled)),
+        Some((cancel_identity.to_owned(), cancel, enabled, false)),
     )
 }
 
@@ -16497,6 +16527,108 @@ mod tests {
         );
     }
     #[test]
+    fn woken_cancel_candidate_late_receipt_invalidates_checked_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("woken-case"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let running = crate::task_store::TaskStore::new(&store)
+            .load(id)
+            .unwrap()
+            .unwrap();
+        let (target, checks) = unsafe_park_proof::woken_cancel_candidate_checks(
+            &store,
+            &running.task,
+            store.put_version().unwrap(),
+        )
+        .unwrap();
+        let mut cleanup = running.task.clone();
+        cleanup.recover_interrupted_woken_for_cleanup().unwrap();
+        cleanup.start_attempt(Uuid::new_v4()).unwrap();
+        let (cleanup_checks, cleanup_target) =
+            unsafe_park_proof::woken_cleanup_checks(&store, &cleanup, store.put_version().unwrap())
+                .unwrap();
+        assert_eq!(cleanup_target, target);
+        assert_ne!(cleanup.attempt_id(), Some(target));
+        // This fixture uses a synthetic conversation owner. Preparing the
+        // evidence is allowed, but only a bound Harness may authorize dispatch.
+        let (claim, _) = crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+            &store,
+            &cleanup,
+            Uuid::new_v4(),
+            ConversationCancelPolicy::AtMostOnce,
+            store.put_version().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claim.woken_attempt, target);
+        let key = format!("durable/unsafe-park-async/{id}/{target}/intent/receipt").into_bytes();
+        let receipt = UnsafeDurableReceipt {
+            task_id: id,
+            attempt_id: target,
+            outcome: Outcome::Pending {
+                reference: "late-job".into(),
+            },
+        };
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Missing,
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&receipt).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&cleanup_checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            unsafe_park_proof::woken_cleanup_checks(&store, &cleanup, store.put_version().unwrap())
+                .is_err()
+        );
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            unsafe_park_proof::woken_cancel_candidate_checks(
+                &store,
+                &running.task,
+                store.put_version().unwrap()
+            )
+            .is_err()
+        );
+        drop(store);
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(read_unsafe_durable_receipts(&store, id).unwrap().iter().any(|value| matches!(&value.outcome, Outcome::Pending { reference } if reference == "late-job")));
+        assert!(!root.join("cancel-count").exists());
+    }
+
+    #[test]
     fn unsafe_woken_cancel_rejects_changed_attempt_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -16516,6 +16648,16 @@ mod tests {
             .parse()
             .unwrap();
         let store = durable_store::Store::open(root.join("db")).unwrap();
+        let running = crate::task_store::TaskStore::new(&store)
+            .load(id)
+            .unwrap()
+            .unwrap();
+        let boundary = store.put_version().unwrap();
+        let (target, checks) =
+            unsafe_park_proof::woken_cancel_candidate_checks(&store, &running.task, boundary)
+                .unwrap();
+        assert_eq!(Some(target), running.task.attempt_id());
+        store.commit(&checks, &[]).unwrap();
         let prefix = format!("durable/unsafe-park-async/{id}/");
         for (key, entry) in store.list(prefix.as_bytes()).unwrap() {
             if !key.ends_with(b"/intent") {
@@ -16539,6 +16681,18 @@ mod tests {
                 break;
             }
         }
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            unsafe_park_proof::woken_cancel_candidate_checks(
+                &store,
+                &running.task,
+                store.put_version().unwrap(),
+            )
+            .is_err()
+        );
         drop(store);
         let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
         let driver = host.into_driver();

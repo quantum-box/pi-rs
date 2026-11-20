@@ -1805,6 +1805,77 @@ pub(crate) fn prepare_callback_finish_task_fence(
     })
 }
 
+/// Prepare task markers for the exact child-to-root ownership chain. The
+/// caller must compose conversation, claim, attempt, identity, park and graph
+/// evidence in the same checked commit. This batch alone does not authorize a
+/// callback. Persist the returned chain with the claim before dispatch so that
+/// recovery can retire exactly these markers.
+#[allow(dead_code)]
+pub(crate) fn prepare_callback_start_ancestry_fence(
+    store: &Store,
+    task_id: Uuid,
+    conversation: Uuid,
+    marker: &[u8],
+) -> Result<(Vec<Uuid>, OwnedBatch), Error> {
+    let tasks = TaskStore::new(store);
+    let mut current = task_id;
+    let mut seen = std::collections::HashSet::new();
+    let mut ancestry = Vec::new();
+    let mut batch = OwnedBatch {
+        checks: Vec::new(),
+        mutations: Vec::new(),
+    };
+    loop {
+        if !seen.insert(current) || seen.len() > 1024 {
+            return Err(Error::InvalidKey);
+        }
+        let task = tasks.load(current)?.ok_or(Error::SignalTargetNotFound)?;
+        batch.checks.push(Check {
+            key: key(current),
+            expected: Expected::Version(task.version),
+        });
+        let part = prepare_callback_start_task_fence(store, current, marker)?;
+        batch.checks.extend(part.checks);
+        batch.mutations.extend(part.mutations);
+        ancestry.push(current);
+        match task.task.owner() {
+            crate::task::TaskOwner::Task(parent) => current = *parent,
+            crate::task::TaskOwner::Conversation(id) if *id == conversation => break,
+            crate::task::TaskOwner::Conversation(_) => return Err(Error::InvalidKey),
+        }
+    }
+    Ok((ancestry, batch))
+}
+
+/// Prepare marker retirement for an authenticated persisted chain. The caller
+/// must fence that chain against its immutable claim in the same commit; this
+/// helper cannot detect a substituted subset. Duplicates and a missing or
+/// changed marker fail closed.
+#[allow(dead_code)]
+pub(crate) fn prepare_callback_finish_ancestry_fence(
+    store: &Store,
+    ancestry: &[Uuid],
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    if ancestry.is_empty() || ancestry.len() > 1024 {
+        return Err(Error::InvalidKey);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut batch = OwnedBatch {
+        checks: Vec::new(),
+        mutations: Vec::new(),
+    };
+    for &id in ancestry {
+        if !seen.insert(id) {
+            return Err(Error::InvalidKey);
+        }
+        let part = prepare_callback_finish_task_fence(store, id, marker)?;
+        batch.checks.extend(part.checks);
+        batch.mutations.extend(part.mutations);
+    }
+    Ok(batch)
+}
+
 pub(crate) fn signal_revision_key(task_id: Uuid) -> Vec<u8> {
     let mut key = SIGNAL_REVISION_PREFIX.to_vec();
     key.extend_from_slice(task_id.as_bytes());

@@ -308,6 +308,18 @@ impl Task {
         Ok(())
     }
 
+    /// The joined woken invocation stopped after an abort was recorded. The
+    /// caller must fence its original wake intent and absence of outcomes.
+    pub(crate) fn yield_aborted_woken_for_cleanup(&mut self) -> Result<(), TransitionError> {
+        if !self.abort_requested {
+            return Err(TransitionError::InvalidState);
+        }
+        let attempt = self.attempt_id.ok_or(TransitionError::InvalidState)?;
+        self.yield_ready()?;
+        self.woken_interrupted_attempt = Some(attempt);
+        Ok(())
+    }
+
     /// A changed checkpoint is durable progress and resets the restart count.
     pub fn advance(&mut self, checkpoint: Checkpoint) -> Result<(), TransitionError> {
         self.require_running()?;
