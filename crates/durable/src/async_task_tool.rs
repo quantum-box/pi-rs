@@ -16526,23 +16526,23 @@ mod tests {
         .unwrap();
         let mut cleanup = running.task.clone();
         cleanup.recover_interrupted_woken_for_cleanup().unwrap();
-        cleanup.start().unwrap();
+        cleanup.start_attempt(Uuid::new_v4()).unwrap();
         let (cleanup_checks, cleanup_target) =
             unsafe_park_proof::woken_cleanup_checks(&store, &cleanup, store.put_version().unwrap())
                 .unwrap();
         assert_eq!(cleanup_target, target);
         assert_ne!(cleanup.attempt_id(), Some(target));
-        assert!(
-            crate::task_scheduler::prepare_woken_conversation_cancel_claim(
-                &store,
-                &cleanup,
-                Uuid::new_v4(),
-                ConversationCancelPolicy::AtMostOnce,
-                store.put_version().unwrap()
-            )
-            .is_err(),
-            "standalone owner cannot authorize a conversation claim"
-        );
+        // This fixture uses a synthetic conversation owner. Preparing the
+        // evidence is allowed, but only a bound Harness may authorize dispatch.
+        let (claim, _) = crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+            &store,
+            &cleanup,
+            Uuid::new_v4(),
+            ConversationCancelPolicy::AtMostOnce,
+            store.put_version().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claim.woken_attempt, target);
         let key = format!("durable/unsafe-park-async/{id}/{target}/intent/receipt").into_bytes();
         let receipt = UnsafeDurableReceipt {
             task_id: id,

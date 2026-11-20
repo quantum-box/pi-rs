@@ -552,6 +552,11 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
+    if case == "dispatch_woken_claim" {
+        gate.store(false, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
     if case == "selection_hook_unsafe_descendant" {
         let child_id = uuid::Uuid::new_v4();
         let attempt = uuid::Uuid::new_v4();
@@ -3592,5 +3597,112 @@ fn claim_recovery_repeated_conflicts_survive_process_kill() {
             .unwrap()
             .failure()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn woken_conversation_claim_worker() {
+    if std::env::var_os("PI_TEST_WOKEN_CLAIM_DIR").is_some() {
+        exercise_conversation_park_claim("dispatch_woken_claim").await;
+    }
+}
+
+#[tokio::test]
+async fn woken_conversation_claim_binds_interrupted_attempt_and_late_receipt() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::woken_conversation_claim_worker",
+        ])
+        .env("PI_TEST_WOKEN_CLAIM_DIR", dir.path())
+        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+        .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("wake").exists() {
+            if let Some(status) = process.try_wait().unwrap() {
+                panic!("worker exited: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        let _ = process.kill();
+        let _ = process.wait();
+        panic!("wake timed out");
+    }
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let mut root = tasks
+        .iter()
+        .find(|r| {
+            matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
+                && r.task.state() == &TaskState::Running
+        })
+        .unwrap()
+        .task
+        .clone();
+    let original = root.attempt_id().unwrap();
+    root.recover_interrupted_woken_for_cleanup().unwrap();
+    root.start_attempt(uuid::Uuid::new_v4()).unwrap();
+    let lease = uuid::Uuid::new_v4();
+    let (claim, checks) = crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+        &store,
+        &root,
+        lease,
+        crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+        store.put_version().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claim.woken_attempt, original);
+    assert_eq!(claim.cleanup_attempt, root.attempt_id().unwrap());
+    assert_ne!(claim.cleanup_attempt, claim.woken_attempt);
+    assert_eq!(claim.cleanup_lease, lease);
+    store.commit(&checks, &[]).unwrap();
+    let key = format!(
+        "durable/unsafe-park-async/{}/{original}/intent/receipt",
+        root.id()
+    )
+    .into_bytes();
+    let receipt = crate::async_task_tool::UnsafeDurableReceipt {
+        task_id: root.id(),
+        attempt_id: original,
+        outcome: Outcome::Pending {
+            reference: "late".into(),
+        },
+    };
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&receipt).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.commit(&checks, &[]),
+        Err(durable_store::Error::Conflict { .. })
+    ));
+    assert!(
+        crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+            &store,
+            &root,
+            lease,
+            crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+            store.put_version().unwrap()
+        )
+        .is_err()
     );
 }
