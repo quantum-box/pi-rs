@@ -15772,6 +15772,31 @@ mod tests {
             .start_unsafe_durable_root(&tool, json!({"token":"prepared"}), 3)
             .unwrap();
         std::fs::write(root.join("task-id"), id.to_string()).unwrap();
+        #[cfg(feature = "test-hooks")]
+        if root.join("stale-kill-case").exists() {
+            let path = root.join("db");
+            let marker = root.join("stale-commit-ready");
+            crate::task_scheduler::hook_fence_test_hook::install(
+                id,
+                "abort-settlement",
+                move || {
+                    let store = durable_store::Store::open(path).unwrap();
+                    let tasks = crate::task_store::TaskStore::new(&store);
+                    let running = tasks.load(id).unwrap().unwrap();
+                    let receipt = store
+                        .get(format!("durable/replay-safe-async/{id}/abort-after").as_bytes())
+                        .unwrap()
+                        .unwrap();
+                    tasks
+                        .save(&[crate::task_store::Save::Update(&running)])
+                        .unwrap();
+                    std::fs::write(marker, receipt.value).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                },
+            );
+        }
         let driver = host.into_driver();
         wait_park_cancel(&driver, id);
         let task = driver.get(id).unwrap().unwrap();
@@ -15858,6 +15883,63 @@ mod tests {
                 1
             );
         }
+    }
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn woken_cancel_stale_receipt_survives_process_kill_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["woken-case", "abort-woken", "stale-kill-case"] {
+            std::fs::write(root.join(name), b"yes").unwrap();
+        }
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("stale-commit-ready"));
+        let receipt = std::fs::read(root.join("stale-commit-ready")).unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Cancelled
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(driver.shutdown_with_pending());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .pending()
+                .is_empty()
+        );
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert_eq!(
+            store
+                .get(format!("durable/replay-safe-async/{id}/abort-after").as_bytes())
+                .unwrap()
+                .unwrap()
+                .value,
+            receipt
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
     #[test]
     fn woken_cancel_identity_lease_rejects_reentry_and_concurrent_update() {
@@ -15962,6 +16044,113 @@ mod tests {
             .lock()
             .unwrap()
             .remove(root);
+    }
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn woken_cancel_stale_settlement_retains_result_and_receipt() {
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for marker in ["woken-case", "any-case", "pause-cancel"] {
+            std::fs::write(root.join(marker), b"yes").unwrap();
+        }
+        let (host, tool) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let id = host
+            .start_unsafe_durable_root(&tool, json!({"token":"prepared"}), 3)
+            .unwrap();
+        let driver = host.into_driver();
+        wait_park_cancel(&driver, id);
+        let task = driver.get(id).unwrap().unwrap();
+        let child: AsyncTaskCall =
+            serde_json::from_value(task.checkpoint().data["checkpoint"]["call"].clone()).unwrap();
+        driver
+            .signal(&crate::task_store::Signal::new(
+                Uuid::new_v4(),
+                child.task_id(),
+                "release".into(),
+                json!(null),
+            ))
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        driver.request_abort(id).unwrap();
+        wait_file(&root.join("cancel-ready"));
+        let path = root.join("db");
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        crate::task_scheduler::hook_fence_test_hook::install(id, "abort-settlement", move || {
+            let store = durable_store::Store::open(path).unwrap();
+            let tasks = TaskStore::new(&store);
+            let running = tasks.load(id).unwrap().unwrap();
+            let receipt_key = format!("durable/replay-safe-async/{id}/abort-after");
+            let receipt = store
+                .get(receipt_key.as_bytes())
+                .unwrap()
+                .expect("abort receipt committed");
+            tasks.save(&[Save::Update(&running)]).unwrap();
+            observed_tx
+                .send((running.task.attempt_id(), receipt.value))
+                .unwrap();
+        });
+        std::fs::write(root.join("cancel-release"), b"yes").unwrap();
+        let (attempt, receipt) = observed_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(driver.shutdown_with_pending());
+        });
+        let report = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("shutdown must return the stale outcome")
+            .unwrap();
+        assert!(report.failure().is_some());
+        let pending = report
+            .pending()
+            .iter()
+            .find(|p| p.task_id() == id)
+            .expect("original outcome retained");
+        assert_eq!(pending.attempt_id(), attempt);
+        assert_eq!(
+            pending
+                .read_durable(format!("durable/replay-safe-async/{id}/abort-after").as_bytes())
+                .unwrap()
+                .unwrap()
+                .value,
+            receipt
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        drop(report);
+        let (reopened, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let driver = reopened.into_driver();
+        let recovered = wait_terminal(&driver, id);
+        assert!(matches!(
+            recovered.state(),
+            crate::task::TaskState::Cancelled
+        ));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(driver.shutdown_with_pending());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .pending()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("cancel-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
     #[test]
     fn woken_cancel_registration_requires_identity_binding() {

@@ -6805,8 +6805,7 @@ impl Scheduler {
         // A conflict on that record cannot be fixed by retrying the same
         // immutable snapshot, even if its graph is otherwise independent.
         // Return the original outcome and lease for reconciliation instead.
-        if independent_abort
-            && !woken_abort
+        if (independent_abort || woken_abort)
             && let Some((running, InvocationResult::Abort(_))) = &backup
             && !running.task.holds_interrupted_cleanup()
             && matches!(&result,
@@ -9066,12 +9065,14 @@ impl Scheduler {
                                 .map_err(|e| Error::Handler(e.to_string()))?,
                         });
                         #[cfg(test)]
-                        if let Some(hook) = conversation_claim_recovery_hooks()
-                            .lock()
-                            .unwrap()
-                            .remove(&item.task.id())
                         {
-                            hook();
+                            let hook = conversation_claim_recovery_hooks()
+                                .lock()
+                                .unwrap()
+                                .remove(&item.task.id());
+                            if let Some(hook) = hook {
+                                hook();
+                            }
                         }
                         #[allow(unused_mut)]
                         let mut commit = if independent_only {
@@ -9098,9 +9099,17 @@ impl Scheduler {
                             commit = Err(durable_store::Error::LockPoisoned);
                         }
                         match commit {
-                            Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                            Ok(()) => {
                                 self.deferred_recovery.extend(deferred);
                                 continue 'scan;
+                            }
+                            Err(durable_store::Error::Conflict { .. }) => {
+                                // Yield to independent work instead of spinning under
+                                // the scheduler lock on a continually changing graph.
+                                // The next pass reloads the claim, attempt and fence.
+                                self.deferred_recovery.extend(deferred);
+                                self.deferred_recovery.insert(item.task.id());
+                                return Ok(());
                             }
                             Err(durable_store::Error::WriteLockBusy(_)) => {
                                 #[cfg(test)]
@@ -10640,6 +10649,18 @@ impl Scheduler {
                 return Ok(TickReservation::Progress(true));
             }
         }
+        // Recovery may have observed a conflicting graph write. Sample again
+        // before discovering waits; using the earlier boundary would make every
+        // independent wake conflict with the already-observed write.
+        let wake_graph_version = if self.validator.is_some() && self.unbound_cancel_roots.is_empty()
+        {
+            owner
+                .store()
+                .put_version()
+                .map_err(task_store::Error::from)?
+        } else {
+            graph_version
+        };
         for snapshot in self.ts().list()? {
             if independent_only {
                 if !self.independent_root_safe(&owner, &snapshot.task)?
@@ -10692,7 +10713,7 @@ impl Scheduler {
                 }
                 let wake = if independent_only {
                     self.ts()
-                        .poll_wait_with_graph_fence(&snapshot, now_millis, graph_version)
+                        .poll_wait_with_graph_fence(&snapshot, now_millis, wake_graph_version)
                 } else {
                     self.ts().poll_wait(&snapshot, now_millis)
                 };
@@ -10759,7 +10780,7 @@ impl Scheduler {
                                         crate::ownership_edge::PREFIX,
                                         b"runtime/conversation/",
                                     ],
-                                    graph_version,
+                                    wake_graph_version,
                                 )
                             } else {
                                 owner.store().commit(&batch.checks, &batch.mutations)
@@ -10812,6 +10833,13 @@ impl Scheduler {
                 }
             }
         }
+        // A bound harness has no unbound-cancellation graph derived from the
+        // earlier snapshot; its later reservation scan may use the fresh fence.
+        let graph_version = if self.validator.is_some() && self.unbound_cancel_roots.is_empty() {
+            wake_graph_version
+        } else {
+            graph_version
+        };
         let tasks = self.ts().list()?;
         // Use one snapshot of the active ownership graph. Admission is fenced
         // by the task gate held above.
