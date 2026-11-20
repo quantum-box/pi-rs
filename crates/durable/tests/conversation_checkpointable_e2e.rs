@@ -175,6 +175,22 @@ fn setup_unsafe_tree_with_gate(
     unsafe_leaf: bool,
     gate: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> (Options, Registry) {
+    setup_unsafe_tree_with_cancel(unsafe_leaf, gate, None)
+}
+
+struct CancelMarker(std::path::PathBuf);
+#[async_trait]
+impl pi_rs_durable::async_task_tool::DurableParkCancel for CancelMarker {
+    async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+        std::fs::write(&self.0, b"called").map_err(|error| error.to_string())
+    }
+}
+
+fn setup_unsafe_tree_with_cancel(
+    unsafe_leaf: bool,
+    gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+    cancel_marker: Option<std::path::PathBuf>,
+) -> (Options, Registry) {
     let mut registry = Registry::default();
     let mut adapters = vec![];
     let mut child = None;
@@ -189,7 +205,17 @@ fn setup_unsafe_tree_with_gate(
             gate: if name == "leaf" { gate.clone() } else { None },
             early: false,
         });
-        let adapter = if name != "leaf" || unsafe_leaf {
+        let adapter = if name == "root" && cancel_marker.is_some() {
+            let identity_tool: Arc<dyn Tool> = tool.clone();
+            let _identity =
+                pi_rs_durable::nested_identity::register(&identity_tool, Some("backend-v1".into()))
+                    .unwrap();
+            pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
+                &mut registry, tool, name, 1, child.into_iter().collect(), "cancel-v1",
+                Arc::new(CancelMarker(cancel_marker.clone().unwrap())),
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            ).unwrap()
+        } else if name != "leaf" || unsafe_leaf {
             register_conversation_unsafe_durable_tool(
                 &mut registry,
                 tool,
@@ -375,6 +401,9 @@ async fn conversation_checkpointable_kill_worker() {
     };
     let directory = std::path::PathBuf::from(directory);
     let (options, registry) = match std::env::var("PI_CONV_UNSAFE_TREE").ok().as_deref() {
+        Some("unsafe-cancel") => {
+            setup_unsafe_tree_with_cancel(true, None, Some(directory.join("cancel-called")))
+        }
         Some("unsafe-leaf") => setup_unsafe_tree(true),
         Some("safe-leaf") => setup_unsafe_tree(false),
         _ => setup(),
@@ -688,6 +717,127 @@ async fn interrupted_woken_unsafe_root_preserves_late_receipt_on_reopen() {
 
     drop(store);
     let _ = driver.shutdown_with_pending().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_woken_cancel_registration_fails_closed_on_late_receipt() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "conversation_checkpointable_kill_worker"])
+            .env("PI_CONV_ASYNC_KILL_DIR", dir.path())
+            .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
+            .env("PI_CONV_UNSAFE_TREE", "unsafe-cancel")
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !dir.path().join("wake").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let id = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Simulate a receipt committed by an executor after its woken attempt was
+    // interrupted. Recovery must retain it and never treat cancellation as
+    // proof that the external execution had no outcome.
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let running = tasks
+        .iter()
+        .find(|t| {
+            matches!(
+                t.task.owner(),
+                pi_rs_durable::task::TaskOwner::Conversation(_)
+            )
+        })
+        .unwrap();
+    assert_eq!(running.task.state(), &TaskState::Running);
+    let attempt: uuid::Uuid =
+        serde_json::from_value(serde_json::to_value(&running.task).unwrap()["attempt_id"].clone())
+            .unwrap();
+    let receipt = pi_rs_durable::async_task_tool::UnsafeDurableReceipt {
+        task_id: running.task.id(),
+        attempt_id: attempt,
+        outcome: Outcome::Pending {
+            reference: "late-remote-job".into(),
+        },
+    };
+    let key = format!(
+        "durable/unsafe-park-async/{}/{attempt}/intent/receipt",
+        running.task.id()
+    )
+    .into_bytes();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&receipt).unwrap(),
+            }],
+        )
+        .unwrap();
+    drop(store);
+    let (options, registry) =
+        setup_unsafe_tree_with_cancel(true, None, Some(dir.path().join("cancel-called")));
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let conversation = scheduler.conversation(id).unwrap();
+    assert!(
+        !conversation
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. })),
+        "{conversation:?}"
+    );
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let root = tasks
+        .iter()
+        .find(|t| {
+            matches!(
+                t.task.owner(),
+                pi_rs_durable::task::TaskOwner::Conversation(_)
+            )
+        })
+        .unwrap();
+    assert!(
+        matches!(root.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+        "{tasks:?}"
+    );
+    let receipts =
+        pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, root.task.id())
+            .unwrap();
+    assert!(receipts.iter().any(|receipt| matches!(&receipt.outcome, Outcome::Pending { reference } if reference == "late-remote-job")));
+
+    drop(store);
+    let _ = driver.shutdown_with_pending().unwrap();
+    assert!(!dir.path().join("cancel-called").exists());
 }
 
 #[cfg(unix)]
