@@ -486,6 +486,23 @@ mod tests {
                 [key.as_slice()],
             )
             .unwrap();
+        let child_key = b"runtime/woken-owned-child-reservation/v1/forged";
+        legacy
+            .execute(
+                "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,1)",
+                rusqlite::params![child_key.as_slice(), b"forged".as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::IncompatibleGraphProtocol)
+        ));
+        legacy
+            .execute(
+                "DELETE FROM durable_store_entries WHERE key=?1",
+                [child_key.as_slice()],
+            )
+            .unwrap();
         let store = Store::open(&path).unwrap();
         assert_eq!(
             legacy

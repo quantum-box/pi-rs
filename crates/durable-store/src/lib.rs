@@ -219,6 +219,16 @@ fn validate_owned_reservation(
     mutations: &[Mutation],
 ) -> Result<(), Error> {
     const PREFIX: &[u8] = b"runtime/woken-owned-reservation/v1/";
+    const CHILD_PREFIX: &[u8] = b"runtime/woken-owned-child-reservation/";
+    if let Some(key) = mutations.iter().find_map(|mutation| match mutation {
+        Mutation::Put { key, .. } | Mutation::Delete { key } if key.starts_with(CHILD_PREFIX) => {
+            Some(key)
+        }
+        _ => None,
+    }) {
+        // Child reservations are not yet authenticated by this protocol.
+        return Err(Error::Conflict { key: key.clone() });
+    }
     let markers: Vec<_> = mutations
         .iter()
         .filter_map(|m| match m {
@@ -352,6 +362,16 @@ mod owned_reservation_validation_tests {
     #[test]
     fn reservation_rejects_wrong_task_and_mixed_graph_mutation() {
         let store = Store::memory().unwrap();
+        assert!(matches!(
+            store.commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"runtime/woken-owned-child-reservation/v1/forged".to_vec(),
+                    value: b"forged".to_vec(),
+                }]
+            ),
+            Err(Error::Conflict { .. })
+        ));
         let id = uuid::Uuid::from_u128(1);
         let interrupted = uuid::Uuid::from_u128(2);
         let task_key = [b"durable/task/".as_slice(), id.as_bytes()].concat();
@@ -675,9 +695,10 @@ impl Store {
         if !protected || migrate_old {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             let marker_prefix = b"runtime/woken-owned-reservation/v1/";
+            let child_marker_prefix = b"runtime/woken-owned-child-reservation/";
             let old_marker: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE substr(key,1,?1)=?2)",
-                rusqlite::params![marker_prefix.len() as i64, marker_prefix],
+                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE substr(key,1,?1)=?2 OR substr(key,1,?3)=?4)",
+                rusqlite::params![marker_prefix.len() as i64, marker_prefix, child_marker_prefix.len() as i64, child_marker_prefix],
                 |row| row.get(0),
             )?;
             if old_marker {
