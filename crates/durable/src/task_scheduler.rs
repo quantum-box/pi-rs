@@ -7978,11 +7978,13 @@ impl DetachedInvocation {
             && identity.has_interrupted_after()
             && let Some(dir) = std::env::var_os("PI_TEST_INTERRUPTED_BEFORE_INTENT")
         {
+            let dir = std::path::PathBuf::from(dir);
             std::fs::write(
-                std::path::PathBuf::from(dir).join("before-intent"),
+                dir.join("before-intent.tmp"),
                 self.running.task.id().to_string(),
             )
             .unwrap();
+            std::fs::rename(dir.join("before-intent.tmp"), dir.join("before-intent")).unwrap();
             loop {
                 std::thread::park();
             }
