@@ -153,19 +153,38 @@ pub(crate) fn affected(
                         serde_json::from_slice::<serde_json::Value>(old),
                         serde_json::from_slice::<serde_json::Value>(next),
                     ) {
-                        (Ok(old), Ok(next)) if old.is_object() && next.is_object() => [
-                            "id",
-                            "owner",
-                            "kind",
-                            "definition_version",
-                            "background",
-                            "task_tool",
-                            "input",
-                            "replay_safe",
-                            "retain_task_children_on_success",
-                        ]
-                        .iter()
-                        .any(|field| old.get(*field) != next.get(*field)),
+                        (Ok(old), Ok(next)) if old.is_object() && next.is_object() => {
+                            [
+                                "id",
+                                "owner",
+                                "kind",
+                                "definition_version",
+                                "background",
+                                "task_tool",
+                                "input",
+                                "replay_safe",
+                                "retain_task_children_on_success",
+                            ]
+                            .iter()
+                            .any(|field| old.get(*field) != next.get(*field))
+                                || (old.get("abort_requested")
+                                    == Some(&serde_json::Value::Bool(true))
+                                    && next.get("abort_requested")
+                                        != Some(&serde_json::Value::Bool(true)))
+                                || (next.get("attempt_id").is_some_and(|v| !v.is_null())
+                                    && old.get("attempt_id") != next.get("attempt_id"))
+                                || (matches!(old.get("state"), Some(serde_json::Value::String(state)) if state == "Cancelled")
+                                    || old.get("state").and_then(|v| v.as_object()).is_some_and(
+                                        |state| {
+                                            state.contains_key("Succeeded")
+                                                || state.contains_key("Failed")
+                                        },
+                                    ))
+                                    && (old.get("state") != next.get("state")
+                                        || old.get("attempt_id") != next.get("attempt_id")
+                                        || old.get("retired_attempt_id")
+                                            != next.get("retired_attempt_id"))
+                        }
                         _ => true,
                     }
                 }
@@ -549,6 +568,71 @@ mod tests {
             .unwrap();
         assert_ne!(version(&store, &task_revision(a)), av2);
         assert_eq!(version(&store, &task_revision(b)), Some(bv));
+    }
+
+    #[test]
+    fn structure_tracks_new_attempt_and_terminal_resurrection_but_allows_cleanup() {
+        let store = Store::memory().unwrap();
+        let id = next_uuid();
+        let key = task_key(id);
+        let revision = task_structure_revision(id);
+        let attempt = next_uuid();
+        let mut value = json!({"id": id, "owner": {"Conversation": next_uuid()}, "state": "Running", "attempt_id": attempt});
+        store
+            .commit(
+                &[],
+                &[put(key.clone(), serde_json::to_vec(&value).unwrap())],
+            )
+            .unwrap();
+        let start = version(&store, &revision);
+        value["state"] = json!("Cancelled");
+        value.as_object_mut().unwrap().remove("attempt_id");
+        value["retired_attempt_id"] = json!(attempt);
+        store
+            .commit(
+                &[],
+                &[put(key.clone(), serde_json::to_vec(&value).unwrap())],
+            )
+            .unwrap();
+        assert_eq!(start, version(&store, &revision));
+        let terminal = value.clone();
+        value["state"] = json!("Running");
+        store
+            .commit(
+                &[],
+                &[put(key.clone(), serde_json::to_vec(&value).unwrap())],
+            )
+            .unwrap();
+        let resurrected = version(&store, &revision);
+        assert_ne!(start, resurrected);
+        store
+            .commit(
+                &[],
+                &[put(key.clone(), serde_json::to_vec(&terminal).unwrap())],
+            )
+            .unwrap();
+        assert_eq!(resurrected, version(&store, &revision));
+        value["attempt_id"] = json!(next_uuid());
+        store
+            .commit(
+                &[],
+                &[put(key.clone(), serde_json::to_vec(&value).unwrap())],
+            )
+            .unwrap();
+        assert_ne!(resurrected, version(&store, &revision));
+        value["abort_requested"] = json!(true);
+        store
+            .commit(
+                &[],
+                &[put(key.clone(), serde_json::to_vec(&value).unwrap())],
+            )
+            .unwrap();
+        let aborted = version(&store, &revision);
+        value["abort_requested"] = json!(false);
+        store
+            .commit(&[], &[put(key, serde_json::to_vec(&value).unwrap())])
+            .unwrap();
+        assert_ne!(aborted, version(&store, &revision));
     }
 
     #[test]
