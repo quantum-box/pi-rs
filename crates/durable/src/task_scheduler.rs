@@ -94,6 +94,17 @@ pub trait Handler: Send + Sync {
     ) -> Result<Step, String> {
         self.run(task)
     }
+    /// Return a completed abort or a known result retained for later receipt publication.
+    #[doc(hidden)]
+    fn run_abort_with_retained_result(
+        &self,
+        task: &Task,
+        admission: &AdmissionHandle<'_>,
+        cancellation: Option<&pi_rs_core::CancellationToken>,
+    ) -> Result<AbortRun, String> {
+        self.run_abort_with_admission(task, admission, cancellation)
+            .map(AbortRun::Step)
+    }
     /// The default preserves existing handlers. A cancellation-aware adapter
     /// must join its own executor before returning.
     fn run_with_cancellation(
@@ -139,6 +150,13 @@ pub enum Step {
     },
     Succeed(Value),
     Fail(String),
+}
+
+/// Internal abort completion transported without discarding its known result.
+#[doc(hidden)]
+pub enum AbortRun {
+    Step(Step),
+    KnownConversationCancel(KnownConversationCancel),
 }
 
 pub(crate) const UNSAFE_ANCESTOR_BUSY: &str = "checkpointable unsafe ancestor is not parked";
@@ -241,7 +259,7 @@ fn abort_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
 /// of authorization only; it is not evidence that a callback ran.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ConversationCancelClaim {
+pub struct ConversationCancelClaim {
     pub version: u32,
     pub claim_id: Uuid,
     pub task: Uuid,
@@ -567,6 +585,32 @@ pub(crate) fn woken_terminal_after_checks(
         },
     ]);
     Ok((result, checks))
+}
+
+/// A callback result and its original claim. This is evidence for later
+/// revalidation, not authority to dispatch a callback or settle a task.
+#[derive(Clone, Debug)]
+pub struct KnownConversationCancel {
+    claim: ConversationCancelClaim,
+    result: String,
+}
+impl KnownConversationCancel {
+    /// The original immutable claim; this is evidence and grants no authority.
+    pub fn claim(&self) -> &ConversationCancelClaim {
+        &self.claim
+    }
+    pub fn claim_id(&self) -> Uuid {
+        self.claim.claim_id
+    }
+    pub fn attempt_id(&self) -> Uuid {
+        self.claim.attempt
+    }
+    pub fn lease_id(&self) -> Uuid {
+        self.claim.lease
+    }
+    pub fn result(&self) -> &str {
+        &self.result
+    }
 }
 
 /// Signal revisions observed by the claim transaction. Missing legacy evidence
@@ -2633,6 +2677,7 @@ enum InvocationResult {
         Box<crate::document::DetachedTaskDocuments>,
     ),
     Abort(Option<String>),
+    KnownConversationCancel(KnownConversationCancel),
 }
 
 /// Completed handler output, still fenced by its exclusive reservation.
@@ -2996,6 +3041,12 @@ impl PendingSettlement {
     // fence during graceful driver shutdown. This only observes the graph;
     // the returned settlement retains its lease and is always revalidated.
     pub(crate) fn waits_for_uncertain_graph(&self, include_background: bool) -> bool {
+        if self
+            .completed()
+            .is_some_and(|value| value.known_conversation_cancel().is_some())
+        {
+            return true;
+        }
         let owner = &self.lease().attachment.owner;
         let Ok(_gate) = owner.task_gate().lock() else {
             return false;
@@ -3126,6 +3177,12 @@ impl PendingSettlement {
         }
         if !Arc::ptr_eq(owner, &harness.owner) {
             return Err(Error::Ownership);
+        }
+        if self
+            .completed()
+            .is_some_and(|value| value.known_conversation_cancel().is_some())
+        {
+            return Ok(false);
         }
         let targets = match harness.scoped_abort_graph(Some(lease.id), None, None, None) {
             Ok(Some(targets)) => targets,
@@ -3414,6 +3471,13 @@ impl CompletedInvocation {
             _ => None,
         }
     }
+    /// A completed callback result held without retry authorization.
+    pub fn known_conversation_cancel(&self) -> Option<&KnownConversationCancel> {
+        match &self.result {
+            InvocationResult::KnownConversationCancel(value) => Some(value),
+            _ => None,
+        }
+    }
     pub fn task_id(&self) -> Uuid {
         self.running.task.id()
     }
@@ -3507,6 +3571,27 @@ impl AdmissionHandle<'_> {
             .transpose()
     }
 
+    #[cfg(test)]
+    pub(crate) fn synthetic_known_conversation_cancel(
+        &self,
+        result: &str,
+    ) -> KnownConversationCancel {
+        let task = &self.running.task;
+        KnownConversationCancel {
+            claim: ConversationCancelClaim {
+                version: 2,
+                claim_id: Uuid::new_v4(),
+                task: task.id(),
+                kind: task.kind().unwrap().to_owned(),
+                definition_version: task.definition_version(),
+                attempt: task.attempt_id().unwrap(),
+                lease: self.lease.token,
+                checkpoint: task.checkpoint().clone(),
+                policy: crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+            },
+            result: result.to_owned(),
+        }
+    }
     /// Acquire the root's nonblocking start lease before marker commit and
     /// retain it through the callback's first poll.
     pub(crate) fn conversation_callback_start_lease(
@@ -8065,23 +8150,39 @@ impl DetachedInvocation {
                     standalone: validator.is_none(),
                     validator: validator.as_ref(),
                 };
-                handler.run_abort_with_admission(
+                handler.run_abort_with_retained_result(
                     &running.task,
                     &admission,
                     unhooked_cancellation.as_ref(),
                 )
             }));
-            let outcome = match result {
-                Ok(Ok(Step::Succeed(_))) => None,
-                Ok(Ok(Step::Fail(reason))) => Some(reason),
-                Ok(Ok(_)) => Some("abort handler must return Succeed or Fail".into()),
-                Ok(Err(reason)) => Some(format!("abort handler failed: {reason}")),
-                Err(payload) => {
-                    crate::extension::discard_panic_payload(payload);
-                    Some("abort handler panicked".into())
+            if let Ok(Ok(AbortRun::KnownConversationCancel(value))) = &result
+                && (value.claim.version != 2
+                    || value.claim.claim_id.is_nil()
+                    || value.claim.task != running.task.id()
+                    || Some(value.claim.kind.as_str()) != running.task.kind()
+                    || value.claim.definition_version != running.task.definition_version()
+                    || Some(value.claim.attempt) != running.task.attempt_id()
+                    || value.claim.lease != lease.token
+                    || value.claim.checkpoint != *running.task.checkpoint())
+            {
+                return Err(Error::Ownership);
+            }
+            match result {
+                Ok(Ok(AbortRun::KnownConversationCancel(value))) => {
+                    InvocationResult::KnownConversationCancel(value)
                 }
-            };
-            InvocationResult::Abort(outcome)
+                result => InvocationResult::Abort(match result {
+                    Ok(Ok(AbortRun::Step(Step::Succeed(_)))) => None,
+                    Ok(Ok(AbortRun::Step(Step::Fail(reason)))) => Some(reason),
+                    Ok(Ok(_)) => Some("abort handler must return Succeed or Fail".into()),
+                    Ok(Err(reason)) => Some(format!("abort handler failed: {reason}")),
+                    Err(payload) => {
+                        crate::extension::discard_panic_payload(payload);
+                        Some("abort handler panicked".into())
+                    }
+                }),
+            }
         } else {
             let owner = &lease.attachment.owner;
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
@@ -8178,7 +8279,7 @@ impl DetachedInvocation {
             let _fence = lease.failure_fence.lock().map_err(|_| Error::Poisoned)?;
             let mut state = lease.state.lock().map_err(|_| Error::Poisoned)?;
             let abort_intent = match &result {
-                InvocationResult::Abort(_) => true,
+                InvocationResult::Abort(_) | InvocationResult::KnownConversationCancel(_) => true,
                 InvocationResult::Handler(_, documents)
                     if documents.task_input_storage.is_some() =>
                 {
@@ -8838,6 +8939,19 @@ impl Scheduler {
         completed: CompletedInvocation,
         nonblocking_abort: bool,
     ) -> Result<bool, SettlementError> {
+        if completed.known_conversation_cancel().is_some() {
+            if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+                || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+            {
+                return Err(SettlementError::Rejected {
+                    error: Error::Ownership,
+                    completed: Box::new(completed),
+                });
+            }
+            return Err(SettlementError::Pending {
+                completed: Box::new(completed),
+            });
+        }
         if completed.receipt_capture {
             return Err(SettlementError::Rejected {
                 error: Error::Handler("tool receipt capture is required before settlement".into()),
@@ -8987,6 +9101,7 @@ impl Scheduler {
         let mut reported_handler_failure = false;
         let mut deferred = None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match result {
+            InvocationResult::KnownConversationCancel(_) => Err(Error::Ownership),
             InvocationResult::Handler(result, documents) => self.settle_handler_result(
                 running,
                 result,
@@ -10094,6 +10209,19 @@ impl Scheduler {
         &mut self,
         mut completed: CompletedInvocation,
     ) -> Result<bool, SettlementError> {
+        if completed.known_conversation_cancel().is_some() {
+            if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+                || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+            {
+                return Err(SettlementError::Rejected {
+                    error: Error::Ownership,
+                    completed: Box::new(completed),
+                });
+            }
+            return Err(SettlementError::Pending {
+                completed: Box::new(completed),
+            });
+        }
         if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
             || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
         {

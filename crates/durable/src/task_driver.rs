@@ -1874,6 +1874,16 @@ impl Shared {
                 hook();
             }
         }
+        if pending
+            .completed()
+            .is_some_and(|value| value.known_conversation_cancel().is_some())
+        {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(pending);
+            return Ok(false);
+        }
         let result = match self.scheduler.lock() {
             Ok(mut scheduler) => scheduler.try_resume_pending(pending),
             Err(_) => {
@@ -5155,6 +5165,139 @@ mod tests {
             &TaskState::Succeeded(json!("old"))
         );
         Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
+    }
+
+    #[test]
+    fn known_cancel_results_release_workers_and_survive_shutdown() {
+        use crate::task_scheduler::{AbortRun, AdmissionHandle, Handler, Step};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Known {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Known {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_abort_with_retained_result(
+                &self,
+                task: &Task,
+                admission: &AdmissionHandle<'_>,
+                _: Option<&pi_rs_core::CancellationToken>,
+            ) -> Result<AbortRun, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(AbortRun::KnownConversationCancel(
+                    admission.synthetic_known_conversation_cancel(&format!("result:{}", task.id())),
+                ))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = task_scheduler::Registry::default();
+        assert!(registry.register_with_abort(
+            "known",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            Known {
+                calls: calls.clone()
+            }
+        ));
+        assert!(
+            registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!(
+                "progress"
+            ))))
+        );
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+        let owner = scheduler.owner();
+        let mut ids = Vec::new();
+        for index in 0..7u128 {
+            let mut task = Task::new(
+                Uuid::from_u128(index + 1),
+                TaskOwner::Conversation(Uuid::from_u128(index + 101)),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("known".into(), true);
+            task.request_abort().unwrap();
+            scheduler.submit(&task).unwrap();
+            ids.push(task.id());
+        }
+        let mut other = Task::new(
+            Uuid::from_u128(1000),
+            TaskOwner::Conversation(Uuid::from_u128(1001)),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        other.start().unwrap();
+        other
+            .wait(crate::task::WaitFor::Signal("go".into()))
+            .unwrap();
+        TaskStore::new(scheduler.owner().store())
+            .save(&[Save::Create(&other)])
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while ids.iter().any(|id| !driver.has_pending_task(*id)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "known outcomes did not leave workers"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), ids.len());
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                other.id(),
+                "go".into(),
+                json!(null),
+            ))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !driver.get(other.id()).unwrap().unwrap().is_terminal() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "independent graph did not progress"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(driver.shutdown_with_pending());
+        });
+        let report = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown timed out")
+            .unwrap();
+        assert!(report.failure().is_none());
+        assert_eq!(report.pending().len(), ids.len());
+        for pending in report.pending() {
+            let outcome = pending
+                .completed()
+                .unwrap()
+                .known_conversation_cancel()
+                .unwrap();
+            assert_eq!(Some(outcome.attempt_id()), pending.attempt_id());
+            assert!(!outcome.claim_id().is_nil());
+            assert!(!outcome.lease_id().is_nil());
+            assert_eq!(outcome.result(), format!("result:{}", pending.task_id()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), ids.len());
+        assert!(matches!(
+            task_scheduler::Scheduler::attach(owner.clone(), registry.clone()),
+            Err(task_scheduler::Error::AlreadyAttached)
+        ));
+        drop(report);
+        assert!(task_scheduler::Scheduler::attach(owner, registry).is_ok());
     }
 
     #[test]
