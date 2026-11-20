@@ -268,7 +268,7 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_ca
 
 /// Opt in a conversation root with selected replay-safe hooks to an at-most-once
 /// parked cancellation callback. If the callback or after hook is interrupted,
-/// reconciliation is required. Abort-time after hooks cannot use memo storage.
+/// reconciliation is required. Abort-time memo operations are fenced to the active cleanup attempt.
 #[allow(clippy::too_many_arguments)]
 pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
     registry: &mut crate::task_scheduler::Registry,

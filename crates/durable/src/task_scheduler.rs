@@ -3331,7 +3331,9 @@ impl AdmissionHandle<'_> {
             expected_identity,
             None,
             None,
+            None,
         )
+        .map(|_| ())
     }
 
     /// Save the successful callback receipt and retire both exact start markers
@@ -3352,7 +3354,9 @@ impl AdmissionHandle<'_> {
             expected_identity,
             Some(marker),
             None,
+            None,
         )
+        .map(|_| ())
     }
 
     pub(crate) fn store_conversation_cancel_receipt_and_after(
@@ -3374,7 +3378,9 @@ impl AdmissionHandle<'_> {
             expected_identity,
             Some(marker),
             Some(snapshot_check),
+            None,
         )
+        .map(|_| ())
     }
 
     pub(crate) fn conversation_cancel_hook_snapshot(
@@ -3403,6 +3409,37 @@ impl AdmissionHandle<'_> {
         ))
     }
 
+    pub(crate) fn conversation_cancel_hook_memo(
+        &self,
+        handler: &dyn Handler,
+        claim: &ConversationCancelClaim,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        snapshot_check: &durable_store::Check,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<Option<Value>, String> {
+        if key.is_empty() || key.len() > 4096 {
+            return Err("invalid memo key".into());
+        }
+        let receipt = ConversationCancelReceipt {
+            version: 1,
+            claim: claim.clone(),
+            result: "callback returned".into(),
+            after_result: None,
+        };
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            &receipt,
+            identity_lease,
+            expected_identity,
+            Some(marker),
+            Some(snapshot_check),
+            Some((key, value)),
+        )
+    }
+
     fn store_conversation_cancel_receipt_inner(
         &self,
         handler: &dyn Handler,
@@ -3411,7 +3448,8 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: Option<&[u8]>,
         snapshot_check: Option<&durable_store::Check>,
-    ) -> Result<(), String> {
+        memo: Option<(&str, Option<Value>)>,
+    ) -> Result<Option<Value>, String> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
         }
@@ -3525,6 +3563,9 @@ impl AdmissionHandle<'_> {
         )
         .into_bytes();
         let existing = owner.store().get(&key).map_err(|e| e.to_string())?;
+        if memo.is_some() && (existing.is_some() || marker.is_none() || snapshot_check.is_none()) {
+            return Err("invalid abort memo state".into());
+        }
         let expected = if let Some(ref entry) = existing {
             let saved: ConversationCancelReceipt =
                 serde_json::from_slice(&entry.value).map_err(|_| "invalid receipt")?;
@@ -3540,7 +3581,7 @@ impl AdmissionHandle<'_> {
             key: key.clone(),
             expected,
         });
-        let mut mutations = if existing.is_none() {
+        let mut mutations = if existing.is_none() && memo.is_none() {
             vec![durable_store::Mutation::Put {
                 key,
                 value: serde_json::to_vec(receipt).map_err(|e| e.to_string())?,
@@ -3579,9 +3620,43 @@ impl AdmissionHandle<'_> {
             .map_err(|e| e.to_string())?;
             checks.extend(conversation_finish.checks);
             checks.extend(task_finish.checks);
-            mutations.extend(conversation_finish.mutations);
-            mutations.extend(task_finish.mutations);
+            if memo.is_none() {
+                mutations.extend(conversation_finish.mutations);
+                mutations.extend(task_finish.mutations);
+            }
         }
+        let memo_result = if let Some((memo_key, value)) = memo {
+            let storage_key =
+                format!("runtime/extension-memo/{}/{}", current.task.id(), memo_key).into_bytes();
+            let entry = owner.store().get(&storage_key).map_err(|e| e.to_string())?;
+            checks.push(durable_store::Check {
+                key: storage_key.clone(),
+                expected: entry
+                    .as_ref()
+                    .map_or(durable_store::Expected::Missing, |e| {
+                        durable_store::Expected::Version(e.version)
+                    }),
+            });
+            match (entry, value) {
+                (Some(entry), _) => {
+                    Some(serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?)
+                }
+                (None, Some(value)) => {
+                    let encoded = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+                    if encoded.len() > 65536 {
+                        return Err("memo value exceeds 64 KiB".into());
+                    }
+                    mutations.push(durable_store::Mutation::Put {
+                        key: storage_key,
+                        value: encoded,
+                    });
+                    Some(value)
+                }
+                (None, None) => None,
+            }
+        } else {
+            None
+        };
         #[cfg(test)]
         invoke_boundary(
             conversation_receipt_before_commit_hooks(),
@@ -3600,7 +3675,7 @@ impl AdmissionHandle<'_> {
                 boundary,
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(memo_result)
     }
 
     /// Preserve an uncertain callback outcome and release its exact markers.

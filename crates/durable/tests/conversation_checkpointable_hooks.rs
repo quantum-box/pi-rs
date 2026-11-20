@@ -214,15 +214,22 @@ impl DurableParkCancel for CancelCounter {
 struct CancelHooks {
     before: Arc<AtomicUsize>,
     after: Arc<AtomicUsize>,
+    identity: Arc<std::sync::Mutex<Option<pi_rs_durable::nested_identity::IdentityHandle>>>,
 }
 #[async_trait]
 impl Hook for CancelHooks {
     async fn before_tool(
         &self,
         call: &pi_rs_durable::extension::ToolCall,
-        _: &Context<'_>,
+        ctx: &Context<'_>,
     ) -> Result<BeforeTool, String> {
         if call.name == "root" {
+            assert_eq!(
+                ctx.memo
+                    .get_or_insert("cancel-before", json!("stable"))
+                    .await?,
+                "stable"
+            );
             self.before.fetch_add(1, Ordering::SeqCst);
             return Ok(BeforeTool::Rewrite(
                 json!({"before":"prepared", "prepared_by_hook":true}),
@@ -234,10 +241,32 @@ impl Hook for CancelHooks {
         &self,
         call: &pi_rs_durable::extension::ToolCall,
         _: &Value,
-        _: &Context<'_>,
+        ctx: &Context<'_>,
     ) -> Result<Option<Value>, String> {
         if call.name == "root" {
             assert_eq!(call.arguments["before"], "prepared");
+            let identity = self.identity.lock().unwrap().clone().unwrap();
+            assert!(
+                identity
+                    .update(Some("changed".into()), || panic!(
+                        "identity update ran during abort hook"
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(ctx.memo.get("cancel-before").await?, Some(json!("stable")));
+            assert_eq!(
+                ctx.memo
+                    .get_or_insert("cancel-after", json!("saved"))
+                    .await?,
+                "saved"
+            );
+            assert_eq!(
+                ctx.memo
+                    .get_or_insert("cancel-after", json!("other"))
+                    .await?,
+                "saved"
+            );
             self.after.fetch_add(1, Ordering::SeqCst);
             return Ok(Some(json!("public cancel after")));
         }
@@ -272,10 +301,12 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     let after = Arc::new(AtomicUsize::new(0));
     let executions = Arc::new(AtomicUsize::new(0));
     let cancellations = Arc::new(AtomicUsize::new(0));
+    let hook_identity = Arc::new(std::sync::Mutex::new(None));
     let hook: Arc<dyn Hook> = if change == "enabled" {
         Arc::new(CancelHooks {
             before: before.clone(),
             after: after.clone(),
+            identity: hook_identity.clone(),
         })
     } else {
         Arc::new(OneHook {
@@ -318,6 +349,7 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     let identity_tool: Arc<dyn Tool> = tool.clone();
     let identity =
         pi_rs_durable::nested_identity::register(&identity_tool, Some("backend".into())).unwrap();
+    *hook_identity.lock().unwrap() = Some(identity.clone());
     let root = if change == "enabled" {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
             &mut registry, tool, "root", 1, vec![leaf.clone()], &snapshot, &names, "cancel-v1",
@@ -430,6 +462,12 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
             }
         }).await.unwrap();
         assert_eq!(after.load(Ordering::SeqCst), 1);
+        let key = format!("runtime/extension-memo/{root_id}/cancel-after");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&store.get(key.as_bytes()).unwrap().unwrap().value)
+                .unwrap(),
+            json!("saved")
+        );
     }
     let report = driver.shutdown_with_pending().unwrap();
     assert!(report.pending().is_empty());
