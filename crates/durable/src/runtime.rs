@@ -3316,6 +3316,8 @@ fn checkpointable_root_binding_key(task: Uuid) -> Vec<u8> {
 struct TaskResultFence {
     // Mutable host identity remains pinned until the conversation save commits.
     _cancel_identity: Option<crate::nested_identity::IdentityLease>,
+    _nested_identities: Vec<crate::nested_identity::IdentityLease>,
+    _registry_lease: Option<crate::task_driver::RegistryLease>,
     rich: Option<crate::extension::ToolBlockResult>,
     evidence: Vec<Check>,
     task: crate::task::Task,
@@ -3555,10 +3557,15 @@ impl PreparedConversationSave {
                 "prepared saves belong to different stores".into(),
             ));
         }
-        // Both signal authorization and notification admission fence the same
-        // reservation. Sharing that exact observation is safe only when neither
-        // participant changes the reservation itself.
+        // Independent evidence may fence the same callback marker. Only
+        // coalesce identical observations when neither batch mutates the key.
         other.checks.retain(|check| {
+            let shareable = check
+                .key
+                .starts_with(crate::owned_subagent::NOTIFICATION_BINDING_PREFIX)
+                || check
+                    .key
+                    .starts_with(b"runtime/conversation-callback-start/");
             let mutated = self
                 .mutations
                 .iter()
@@ -3566,11 +3573,7 @@ impl PreparedConversationSave {
                 .any(|mutation| match mutation {
                     Mutation::Put { key, .. } | Mutation::Delete { key } => key == &check.key,
                 });
-            !(check
-                .key
-                .starts_with(crate::owned_subagent::NOTIFICATION_BINDING_PREFIX)
-                && !mutated
-                && self.checks.iter().any(|existing| existing == check))
+            !(shareable && !mutated && self.checks.iter().any(|existing| existing == check))
         });
         let keys: std::collections::HashSet<&[u8]> = self
             .checks
@@ -11980,7 +11983,10 @@ impl Harness {
                             || (allow_cancelled_child
                                 && stored.task.state() == &crate::task::TaskState::Cancelled)))
                     && !(next != task.id()
-                        && stored.task.state() == &crate::task::TaskState::Cancelled
+                        && matches!(
+                            stored.task.state(),
+                            crate::task::TaskState::Cancelled | crate::task::TaskState::Failed(_)
+                        )
                         && authenticated_ancestors.contains(&next)))
                 || (stored.task.is_completing()
                     && !(stored.task.retains_task_children_on_success()
@@ -15879,6 +15885,8 @@ impl Harness {
         let mut rich_result = None;
         let mut result_evidence = Vec::new();
         let mut cancel_identity = None;
+        let mut nested_identities = Vec::new();
+        let mut registry_lease = None;
         let outcome = match child.task.state() {
             crate::task::TaskState::Succeeded(value)
                 if child.task.kind() == Some(crate::foreground_subagent::KIND)
@@ -16011,14 +16019,32 @@ impl Harness {
                 let descendants = crate::task_store::TaskStore::new(store)
                     .list()
                     .map_err(|e| Error::Invalid(e.to_string()))?;
-                let (uncertain, descendant_checks) =
-                    crate::task_scheduler::unsafe_descendant_reconciliation(
+                let driver = self
+                    .task_driver
+                    .try_lock()
+                    .map_err(|error| match error {
+                        std::sync::TryLockError::WouldBlock => Error::TaskPublicationBusy,
+                        std::sync::TryLockError::Poisoned(_) => Error::Failed,
+                    })?
+                    .as_ref()
+                    .and_then(|driver| driver.upgrade())
+                    .ok_or_else(|| Error::Invalid("woken result driver unavailable".into()))?;
+                let (registry, lease) = driver.lease_cleanup_registry()?;
+                let (uncertain, descendant_checks, leases) =
+                    crate::task_scheduler::authenticated_woken_terminal_descendants(
                         store,
-                        task,
+                        &child,
                         &descendants,
                         boundary,
+                        &registry,
+                        self,
                     )
-                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                    .map_err(|e| match e {
+                        crate::task_scheduler::Error::Busy => Error::TaskPublicationBusy,
+                        _ => Error::Invalid(e.to_string()),
+                    })?;
+                registry_lease = Some(lease);
+                nested_identities = leases;
                 if uncertain.is_some() {
                     return Err(Error::Invalid(
                         "unsafe descendant requires reconciliation".into(),
@@ -16032,7 +16058,7 @@ impl Harness {
                     .get(&conversation_key)?
                     .ok_or(Error::NotFound)?
                     .version;
-                for check in checks {
+                for check in checks.into_iter().chain(descendant_checks) {
                     if check.key == conversation_key {
                         if check.expected != Expected::Version(current_version) {
                             return Err(Error::Invalid("woken hook snapshot changed".into()));
@@ -16041,7 +16067,6 @@ impl Harness {
                         result_evidence.push(check);
                     }
                 }
-                result_evidence.extend(descendant_checks);
                 rich_result = Some(result);
                 Some(Outcome::Unknown(reason.clone()))
             }
@@ -16190,6 +16215,8 @@ impl Harness {
                 outcome,
                 TaskResultFence {
                     _cancel_identity: cancel_identity,
+                    _nested_identities: nested_identities,
+                    _registry_lease: registry_lease,
                     rich: rich_result,
                     evidence: result_evidence,
                     task: child.task.clone(),

@@ -42,6 +42,7 @@ pub(crate) struct Shared {
     failure_publication: task_scheduler::FailurePublication,
     reservation_stop: Arc<std::sync::atomic::AtomicBool>,
     registry_gate: Mutex<()>,
+    registry_readers: Arc<std::sync::atomic::AtomicUsize>,
     registry_replacing: std::sync::atomic::AtomicBool,
     activity: crate::worker_activity::WorkerActivity,
     wake_reader: task_scheduler::WakeReader,
@@ -56,7 +57,31 @@ pub(crate) struct Shared {
     subscription: Mutex<Option<Receiver<()>>>,
 }
 
+pub(crate) struct RegistryLease(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for RegistryLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl Shared {
+    pub(crate) fn lease_cleanup_registry(
+        &self,
+    ) -> Result<(task_scheduler::Registry, RegistryLease), crate::runtime::Error> {
+        let _gate = self.registry_gate.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => crate::runtime::Error::TaskPublicationBusy,
+            std::sync::TryLockError::Poisoned(_) => crate::runtime::Error::Failed,
+        })?;
+        let scheduler = self.scheduler.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => crate::runtime::Error::TaskPublicationBusy,
+            std::sync::TryLockError::Poisoned(_) => crate::runtime::Error::Failed,
+        })?;
+        let registry = scheduler.cleanup_registry().clone();
+        self.registry_readers
+            .fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        Ok((registry, RegistryLease(self.registry_readers.clone())))
+    }
+
     /// Keep registry replacement excluded while a cleanup transaction checks
     /// the selected definition. Never wait for either lock from cleanup.
     pub(crate) fn with_cleanup_registry<T>(
@@ -207,6 +232,7 @@ impl Driver {
         let _ = notify_tx.try_send(());
         let shared = Arc::new(Shared {
             registry_gate: Mutex::new(()),
+            registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
@@ -433,6 +459,14 @@ impl Driver {
             }
         }
         let _replacing = Replacing(&self.shared);
+        while self
+            .shared
+            .registry_readers
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            self.wait_for_registry_boundary()?;
+        }
         loop {
             let mut scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
             let failure = match self.shared.failure_publication.try_lock() {
@@ -3942,6 +3976,7 @@ mod tests {
                 wake_reader: scheduler.wake_reader(),
                 activity: scheduler.worker_activity(),
                 registry_gate: Mutex::new(()),
+                registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 registry_replacing: std::sync::atomic::AtomicBool::new(false),
                 reservation_stop: scheduler.reservation_stop_token(),
                 failure_publication: scheduler.failure_publication(),
@@ -5095,6 +5130,36 @@ mod tests {
     }
 
     #[test]
+    fn registry_replacement_waits_for_result_publication_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = task_scheduler::Scheduler::open(
+            dir.path().join("db"),
+            task_scheduler::Registry::default(),
+        )
+        .unwrap();
+        let driver = Arc::new(Driver::start(scheduler));
+        let (_, lease) = driver.shared.lease_cleanup_registry().unwrap();
+        let replacing = driver.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let replacement = thread::spawn(move || {
+            done_tx
+                .send(replacing.replace_registry(task_scheduler::Registry::default()))
+                .unwrap()
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(lease);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        replacement.join().unwrap();
+        Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
+    }
+
+    #[test]
     fn registry_replacement_waits_for_detached_live_invocation() {
         let dir = tempfile::tempdir().unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -6005,6 +6070,7 @@ mod tests {
                 wake_reader: scheduler.wake_reader(),
                 activity: scheduler.worker_activity(),
                 registry_gate: Mutex::new(()),
+                registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 registry_replacing: std::sync::atomic::AtomicBool::new(false),
                 reservation_stop: scheduler.reservation_stop_token(),
                 failure_publication: scheduler.failure_publication(),
@@ -6174,6 +6240,7 @@ mod tests {
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             registry_gate: Mutex::new(()),
+            registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
@@ -6397,6 +6464,7 @@ mod tests {
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             registry_gate: Mutex::new(()),
+            registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
@@ -7277,6 +7345,7 @@ mod tests {
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             registry_gate: Mutex::new(()),
+            registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
@@ -7356,6 +7425,7 @@ mod tests {
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             registry_gate: Mutex::new(()),
+            registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
@@ -7643,6 +7713,7 @@ mod tests {
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             registry_gate: Mutex::new(()),
+            registry_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),

@@ -7713,7 +7713,8 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
 #[tokio::test]
 async fn selected_woken_unsafe_child_keeps_after_through_settlement_and_reopen() {
     use std::process::{Command, Stdio};
-    for kill_after_receipt in [false, true] {
+    for scenario in ["normal", "reopen", "changed_child"] {
+        let kill_after_receipt = scenario == "reopen";
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("unsafe-mode"), b"yes").unwrap();
         std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
@@ -7753,9 +7754,12 @@ async fn selected_woken_unsafe_child_keeps_after_through_settlement_and_reopen()
                 matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
                     && r.task.state() == &TaskState::Running
             })
-            .unwrap()
-            .task
-            .id();
+            .unwrap();
+        let conversation = match root.task.owner() {
+            crate::task::TaskOwner::Conversation(id) => *id,
+            _ => unreachable!(),
+        };
+        let root = root.task.id();
         drop(store);
         if kill_after_receipt {
             let mut resume = Command::new(std::env::current_exe().unwrap())
@@ -7781,7 +7785,7 @@ async fn selected_woken_unsafe_child_keeps_after_through_settlement_and_reopen()
             resume.kill().unwrap();
             resume.wait().unwrap();
         }
-        let (scheduler, driver) = start_woken_any_scheduler(&path);
+        let (mut scheduler, driver) = start_woken_any_scheduler(&path);
         tokio::time::timeout(Duration::from_secs(15), async {
             while !driver.get(root).unwrap().unwrap().is_terminal() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7798,6 +7802,50 @@ async fn selected_woken_unsafe_child_keeps_after_through_settlement_and_reopen()
                 .unwrap()
                 .is_some(),
             "kill_after_receipt={kill_after_receipt}"
+        );
+        if scenario == "changed_child" {
+            let child = crate::task_store::TaskStore::new(&store)
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|item| {
+                    item.task.owner() == &crate::task::TaskOwner::Task(root)
+                        && !item.task.replay_safe()
+                })
+                .unwrap();
+            let key = format!(
+                "durable/replay-safe-async/{}/nested-cancel-terminal-v1",
+                child.task.id()
+            )
+            .into_bytes();
+            let entry = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Delete { key }],
+                )
+                .unwrap();
+        }
+        scheduler.schedule(conversation);
+        let result = scheduler.wait(conversation).await;
+        if scenario == "changed_child" {
+            assert!(
+                result.is_err(),
+                "changed child evidence must not publish after"
+            );
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            let _ = scheduler.shutdown().await;
+            continue;
+        }
+        result.unwrap();
+        let state = scheduler.conversation(conversation).unwrap();
+        let text = format!("{state:?}");
+        assert!(
+            text.contains("after cancel") && text.contains("reconciliation"),
+            "{text}"
         );
         assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
         scheduler.shutdown().await.unwrap();

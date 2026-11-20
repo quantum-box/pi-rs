@@ -18236,6 +18236,67 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
     ),
     Error,
 > {
+    authenticated_unsafe_descendant_reconciliation_inner(
+        store,
+        parent,
+        tasks,
+        boundary,
+        registry,
+        harness,
+        active_parent_marker,
+        false,
+    )
+}
+
+pub(crate) fn authenticated_woken_terminal_descendants(
+    store: &durable_store::Store,
+    parent: &task_store::StoredTask,
+    tasks: &[task_store::StoredTask],
+    boundary: u64,
+    registry: &Registry,
+    harness: &crate::runtime::Harness,
+) -> Result<
+    (
+        Option<Uuid>,
+        Vec<durable_store::Check>,
+        Vec<crate::nested_identity::IdentityLease>,
+    ),
+    Error,
+> {
+    let (_, root_checks) =
+        woken_terminal_after_checks(store, parent, boundary).map_err(Error::Handler)?;
+    let (uncertain, mut checks, leases) = authenticated_unsafe_descendant_reconciliation_inner(
+        store,
+        parent.task.id(),
+        tasks,
+        boundary,
+        registry,
+        harness,
+        None,
+        true,
+    )?;
+    checks.extend(root_checks);
+    Ok((uncertain, checks, leases))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authenticated_unsafe_descendant_reconciliation_inner(
+    store: &durable_store::Store,
+    parent: Uuid,
+    tasks: &[task_store::StoredTask],
+    boundary: u64,
+    registry: &Registry,
+    harness: &crate::runtime::Harness,
+    active_parent_marker: Option<&[u8]>,
+    authenticated_woken_root: bool,
+) -> Result<
+    (
+        Option<Uuid>,
+        Vec<durable_store::Check>,
+        Vec<crate::nested_identity::IdentityLease>,
+    ),
+    Error,
+> {
     let mut pending = vec![parent];
     let mut seen = HashSet::new();
     let mut checks = Vec::new();
@@ -18244,6 +18305,9 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
     // A terminal ancestor is usable only after its own evidence and identity
     // lease have been retained for this same checked parent transaction.
     let mut authenticated_ancestors = HashSet::new();
+    if authenticated_woken_root {
+        authenticated_ancestors.insert(parent);
+    }
     while let Some(id) = pending.pop() {
         if !seen.insert(id) {
             return Err(Error::Ownership);
