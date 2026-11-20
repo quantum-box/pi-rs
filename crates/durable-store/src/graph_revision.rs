@@ -160,6 +160,9 @@ pub(crate) fn affected(
                             "definition_version",
                             "background",
                             "task_tool",
+                            "input",
+                            "replay_safe",
+                            "retain_task_children_on_success",
                         ]
                         .iter()
                         .any(|field| old.get(*field) != next.get(*field)),
@@ -327,6 +330,15 @@ mod tests {
             .commit(&[], &[Mutation::Delete { key: child_key }])
             .unwrap();
         assert_ne!(version(&store, &revision), Some(start));
+        let before_input = version(&store, &revision).unwrap();
+        next["input"] = json!({"changed": true});
+        store
+            .commit(
+                &[],
+                &[put(task_key(root), serde_json::to_vec(&next).unwrap())],
+            )
+            .unwrap();
+        assert_ne!(version(&store, &revision), Some(before_input));
     }
 
     #[test]
