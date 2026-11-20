@@ -7,6 +7,8 @@
 //! the database before deciding whether to retry a non-idempotent operation.
 
 pub mod controls;
+#[cfg(feature = "experimental-graph-revision")]
+pub mod graph_revision;
 pub mod owner;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -111,6 +113,7 @@ pub enum Error {
     LockPoisoned,
     VersionExhausted,
     InvalidSnapshot,
+    IncompatibleGraphProtocol,
     DocumentFrameTooLarge,
 }
 impl fmt::Display for Error {
@@ -121,6 +124,10 @@ impl fmt::Display for Error {
             Self::WriteLockBusy(e) => write!(f, "writer lock unavailable before transaction: {e}"),
             Self::LockPoisoned => write!(f, "store lock poisoned"),
             Self::VersionExhausted => write!(f, "store version exhausted"),
+            Self::IncompatibleGraphProtocol => write!(
+                f,
+                "durable graph protocol is incompatible with this runtime"
+            ),
             Self::InvalidSnapshot => write!(
                 f,
                 "snapshot is newer than document history or lacks tracking evidence"
@@ -175,6 +182,8 @@ mod task_record {
 /// opening the same database coordinate through SQLite's write lock.
 pub struct Store {
     connection: Mutex<Connection>,
+    #[cfg(feature = "experimental-graph-revision")]
+    graph_protocol_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     commits: tokio::sync::watch::Sender<u64>,
 }
 
@@ -202,7 +211,37 @@ impl Store {
         Self::initialize(Connection::open(path)?, true)
     }
     fn initialize(conn: Connection, disk: bool) -> Result<Self, Error> {
+        #[cfg(feature = "experimental-graph-revision")]
+        let graph_protocol_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(feature = "experimental-graph-revision")]
+        {
+            let active = graph_protocol_active.clone();
+            conn.create_scalar_function(
+                "pi_graph_protocol",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |_| Ok(i64::from(active.load(std::sync::atomic::Ordering::Acquire))),
+            )?;
+        }
         conn.busy_timeout(Duration::from_secs(5))?;
+        let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_protocol')", [], |row| row.get(0))?;
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        if protected {
+            return Err(Error::IncompatibleGraphProtocol);
+        }
+        #[cfg(feature = "experimental-graph-revision")]
+        if protected {
+            let version: Option<i64> = conn
+                .query_row(
+                    "SELECT version FROM durable_graph_protocol WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if version != Some(1) {
+                return Err(Error::IncompatibleGraphProtocol);
+            }
+        }
         if disk {
             let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
             if !mode.eq_ignore_ascii_case("wal") {
@@ -255,6 +294,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_document_commit_sequences (revision INTEGER PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE);
             INSERT OR IGNORE INTO durable_document_commit_meta SELECT 1, (SELECT revision FROM durable_document_history_meta WHERE id=1), (SELECT sequence FROM durable_commit_meta WHERE id=1);
             COMMIT;")?;
+        #[cfg(feature = "experimental-graph-revision")]
+        conn.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=1));
+            INSERT OR IGNORE INTO durable_graph_protocol(id,version) VALUES(1,1);
+            DROP TRIGGER IF EXISTS durable_graph_protocol_insert;
+            DROP TRIGGER IF EXISTS durable_graph_protocol_update;
+            DROP TRIGGER IF EXISTS durable_graph_protocol_delete;
+            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            COMMIT;")?;
         let sequence = conn.query_row(
             "SELECT sequence FROM durable_commit_meta WHERE id=1",
             [],
@@ -263,6 +313,8 @@ impl Store {
         let (commits, _) = tokio::sync::watch::channel(sequence);
         Ok(Self {
             connection: Mutex::new(conn),
+            #[cfg(feature = "experimental-graph-revision")]
+            graph_protocol_active,
             commits,
         })
     }
@@ -1345,6 +1397,18 @@ impl Store {
         prefix_fence: Option<(&[&[u8]], u64)>,
     ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        #[cfg(feature = "experimental-graph-revision")]
+        let _protocol = {
+            struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Reset<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            self.graph_protocol_active
+                .store(true, std::sync::atomic::Ordering::Release);
+            Reset(&self.graph_protocol_active)
+        };
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| match &error {
@@ -1665,6 +1729,14 @@ impl Store {
                     effective.push(Mutation::Delete { key: doc.clone() });
                 }
             }
+        }
+        #[cfg(feature = "experimental-graph-revision")]
+        {
+            let revisions = graph_revision::affected(&tx, &effective)?;
+            effective.extend(revisions.into_iter().map(|key| Mutation::Put {
+                key,
+                value: vec![1],
+            }));
         }
         let mutations = effective.as_slice();
         for acquisition in acquisitions {
