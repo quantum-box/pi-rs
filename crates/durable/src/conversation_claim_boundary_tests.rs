@@ -8203,6 +8203,24 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             tokio::sync::OwnedRwLockReadGuard::rwlock(&identity_leases[1])
         ));
         assert!(identity_lock.try_write().is_err());
+        let selection_lease = if graph_aba == 10 {
+            let parent_selection = registry
+                .checkpointable_selection_for_kind(marked_root.task.kind().unwrap())
+                .unwrap();
+            let child_selection = registry
+                .checkpointable_selection_for_kind(running.task.kind().unwrap())
+                .unwrap();
+            let lease = harness
+                .checkpointable_selection_start_many([parent_selection, child_selection])
+                .unwrap();
+            assert!(matches!(
+                harness.uninstall_extension("policy"),
+                Err(crate::runtime::Error::TaskPublicationBusy)
+            ));
+            Some(lease)
+        } else {
+            None
+        };
         let mut changed_identity = serde_json::to_value(&running.task).unwrap();
         changed_identity["kind"] = json!("different-registration");
         let changed_identity: crate::task::Task = serde_json::from_value(changed_identity).unwrap();
@@ -8244,6 +8262,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 .is_err()
         );
         drop(identity_leases);
+        drop(selection_lease);
         assert!(identity_lock.try_write().is_ok());
         let modified = store.get(&binding_key).unwrap().unwrap();
         store
