@@ -5301,6 +5301,258 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_known_cancel_retains_original_attachments_until_report_drop() {
+        exercise_uncertain_known_cancel_attachment(false);
+    }
+
+    #[test]
+    fn dropped_driver_retains_uncertain_known_cancel_attachments() {
+        const ENV: &str = "PI_TEST_UNCERTAIN_CANCEL_DROP";
+        if std::env::var_os(ENV).is_some() {
+            exercise_uncertain_known_cancel_attachment(true);
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_driver::tests::dropped_driver_retains_uncertain_known_cancel_attachments",
+            ])
+            .env(ENV, "1")
+            .spawn()
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("drop fixture timed out");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn exercise_uncertain_known_cancel_attachment(drop_driver: bool) {
+        use crate::task_scheduler::{
+            AbortRun, AdmissionHandle, Handler, KnownCancelCommitState, Step,
+        };
+        use async_trait::async_trait;
+        use futures_util::FutureExt;
+        use pi_rs_core::{Model, ModelRequest, ModelStream, Outcome, Tool, ToolContext, ToolSpec};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+                unreachable!()
+            }
+        }
+        struct IdentityTool;
+        #[async_trait]
+        impl Tool for IdentityTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "identity".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+                unreachable!()
+            }
+        }
+        struct Known {
+            calls: Arc<AtomicUsize>,
+            tool: Arc<dyn Tool>,
+            witness: Arc<()>,
+        }
+        impl Handler for Known {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_abort_with_retained_result(
+                &self,
+                _: &Task,
+                admission: &AdmissionHandle<'_>,
+                _: Option<&pi_rs_core::CancellationToken>,
+            ) -> Result<AbortRun, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = &self.witness;
+                let lease =
+                    crate::nested_identity::checked_lease(&self.tool, "identity-v1").unwrap();
+                Ok(AbortRun::KnownConversationCancel(
+                    admission.synthetic_known_cancel_with_attachment(
+                        "known-result",
+                        b"exact-marker".to_vec(),
+                        lease,
+                        KnownCancelCommitState::Uncertain,
+                    ),
+                ))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let harness = crate::runtime::Harness::open_paused(
+            dir.path().join("db"),
+            crate::runtime::Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(IdentityTool);
+        let identity = crate::nested_identity::register(&tool, Some("identity-v1".into())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let witness = Arc::new(());
+        let weak = Arc::downgrade(&witness);
+        let mut registry = task_scheduler::Registry::default();
+        assert!(registry.register_with_abort(
+            "known-attachment",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            Known {
+                calls: calls.clone(),
+                tool: tool.clone(),
+                witness: witness.clone()
+            }
+        ));
+        assert!(
+            registry.register("other-attachment", true, |_: &Task| Ok(Step::Succeed(
+                json!("ok")
+            )))
+        );
+        drop(witness);
+        let scheduler = harness.attach_tasks(registry).unwrap();
+        let mut task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("known-attachment".into(), true);
+        task.request_abort().unwrap();
+        scheduler.submit(&task).unwrap();
+        let mut other = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("other-attachment".into(), true);
+        other.start().unwrap();
+        other.wait(WaitFor::Signal("go".into())).unwrap();
+        TaskStore::new(scheduler.owner().store())
+            .save(&[Save::Create(&other)])
+            .unwrap();
+        let (taken_tx, taken_rx) = mpsc::channel();
+        after_pending_take_for_test(task.id(), move || {
+            taken_tx.send(()).unwrap();
+        });
+        let driver = Driver::start_with_harness(scheduler, harness.worker());
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !driver.has_pending_task(task.id()) {
+            assert!(std::time::Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        taken_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("coordinator did not examine pending outcome");
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                other.id(),
+                "go".into(),
+                json!(null),
+            ))
+            .unwrap();
+        while !driver.get(other.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            identity
+                .update(Some("v2".into()), || {})
+                .now_or_never()
+                .unwrap()
+                .is_err()
+        );
+        let outcomes = if drop_driver {
+            drop(driver);
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let found = {
+                    let mut pending = ABANDONED_PENDING
+                        .get_or_init(|| Mutex::new(Vec::new()))
+                        .lock()
+                        .unwrap();
+                    pending
+                        .iter()
+                        .position(|item| item.task_id() == task.id())
+                        .map(|index| pending.remove(index))
+                };
+                if let Some(pending) = found {
+                    break vec![pending];
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "dropped driver did not publish pending outcome"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(driver.shutdown_with_pending());
+            });
+            let report = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            assert_eq!(report.pending().len(), 1);
+            report.into_pending()
+        };
+        let pending = outcomes[0]
+            .completed()
+            .unwrap()
+            .known_conversation_cancel()
+            .unwrap();
+        assert_eq!(pending.commit_state(), KnownCancelCommitState::Uncertain);
+        assert_eq!(pending.result(), "known-result");
+        assert_eq!(pending.marker(), b"exact-marker");
+        assert_eq!(pending.identity(), Some("identity-v1"));
+        assert!(pending.has_handler() && pending.has_harness_attachment());
+        assert!(weak.upgrade().is_some());
+        assert!(
+            identity
+                .update(Some("v2".into()), || {})
+                .now_or_never()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(outcomes);
+        assert!(
+            identity
+                .update(Some("v2".into()), || {})
+                .now_or_never()
+                .unwrap()
+                .is_ok()
+        );
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn shutdown_transfers_uncertain_outcome_and_keeps_attachment() {
         for legacy_shutdown in [false, true] {
             let dir = tempfile::tempdir().unwrap();

@@ -587,12 +587,41 @@ pub(crate) fn woken_terminal_after_checks(
     Ok((result, checks))
 }
 
-/// A callback result and its original claim. This is evidence for later
-/// revalidation, not authority to dispatch a callback or settle a task.
-#[derive(Clone, Debug)]
+/// Whether receipt publication definitely did not commit or has an
+/// uncertain outcome. An uncertain commit must never be retried blindly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnownCancelCommitState {
+    NotCommitted,
+    Uncertain,
+}
+
+struct KnownCancelAttachment {
+    handler: Arc<dyn Handler>,
+    harness: Option<Mutex<crate::runtime::Harness>>,
+}
+
+/// Identity, marker and original execution attachment remain owned by the
+/// pending result. None of this evidence authorizes a retry by itself.
+#[derive(Clone)]
 pub struct KnownConversationCancel {
     claim: ConversationCancelClaim,
     result: String,
+    marker: Vec<u8>,
+    commit_state: KnownCancelCommitState,
+    identity: Option<Arc<crate::nested_identity::IdentityLease>>,
+    attachment: Option<Arc<KnownCancelAttachment>>,
+}
+impl std::fmt::Debug for KnownConversationCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KnownConversationCancel")
+            .field("claim", &self.claim)
+            .field("result", &self.result)
+            .field("marker", &self.marker)
+            .field("commit_state", &self.commit_state)
+            .field("identity_retained", &self.identity.is_some())
+            .field("handler_retained", &self.attachment.is_some())
+            .finish()
+    }
 }
 impl KnownConversationCancel {
     /// The original immutable claim; this is evidence and grants no authority.
@@ -610,6 +639,30 @@ impl KnownConversationCancel {
     }
     pub fn result(&self) -> &str {
         &self.result
+    }
+    pub fn marker(&self) -> &[u8] {
+        &self.marker
+    }
+    pub fn commit_state(&self) -> KnownCancelCommitState {
+        self.commit_state
+    }
+    pub fn identity(&self) -> Option<&str> {
+        self.identity
+            .as_ref()
+            .and_then(|identity| identity.as_ref().as_deref())
+    }
+    pub fn has_harness_attachment(&self) -> bool {
+        self.attachment
+            .as_ref()
+            .is_some_and(|attachment| attachment.harness.is_some())
+    }
+    pub fn handler(&self) -> Option<&dyn Handler> {
+        self.attachment
+            .as_ref()
+            .map(|attachment| attachment.handler.as_ref())
+    }
+    pub fn has_handler(&self) -> bool {
+        self.handler().is_some()
     }
 }
 
@@ -3590,7 +3643,25 @@ impl AdmissionHandle<'_> {
                 policy: crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
             },
             result: result.to_owned(),
+            marker: Vec::new(),
+            commit_state: KnownCancelCommitState::NotCommitted,
+            identity: None,
+            attachment: None,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn synthetic_known_cancel_with_attachment(
+        &self,
+        result: &str,
+        marker: Vec<u8>,
+        identity: crate::nested_identity::IdentityLease,
+        commit_state: KnownCancelCommitState,
+    ) -> KnownConversationCancel {
+        let mut pending = self.synthetic_known_conversation_cancel(result);
+        pending.marker = marker;
+        pending.identity = Some(Arc::new(identity));
+        pending.commit_state = commit_state;
+        pending
     }
     /// Acquire the root's nonblocking start lease before marker commit and
     /// retain it through the callback's first poll.
@@ -8169,7 +8240,11 @@ impl DetachedInvocation {
                 return Err(Error::Ownership);
             }
             match result {
-                Ok(Ok(AbortRun::KnownConversationCancel(value))) => {
+                Ok(Ok(AbortRun::KnownConversationCancel(mut value))) => {
+                    value.attachment = Some(Arc::new(KnownCancelAttachment {
+                        handler: handler.clone(),
+                        harness: validator.map(Mutex::new),
+                    }));
                     InvocationResult::KnownConversationCancel(value)
                 }
                 result => InvocationResult::Abort(match result {
