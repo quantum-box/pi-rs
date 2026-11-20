@@ -3763,3 +3763,174 @@ async fn woken_conversation_claim_binds_interrupted_attempt_and_late_receipt() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn interrupted_woken_claim_and_markers_reconcile_through_driver() {
+    use crate::async_task_tool::{
+        DurableParkCancel, register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel,
+    };
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Cancel(Arc<AtomicUsize>);
+    #[async_trait]
+    impl DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::woken_conversation_claim_worker",
+        ])
+        .env("PI_TEST_WOKEN_CLAIM_DIR", dir.path())
+        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+        .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("wake").exists() {
+            assert!(process.try_wait().unwrap().is_none(), "worker exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let path = dir.path().join("db");
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = crate::task_store::TaskStore::new(&store);
+    let snapshot = tasks
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| {
+            matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
+                && r.task.state() == &TaskState::Running
+        })
+        .unwrap();
+    let mut task = snapshot.task.clone();
+    task.recover_interrupted_woken_for_cleanup().unwrap();
+    task.start_attempt(uuid::Uuid::new_v4()).unwrap();
+    tasks
+        .update(&snapshot, |t| {
+            *t = task.clone();
+            Ok(())
+        })
+        .unwrap();
+    let (claim, mut checks) = crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+        &store,
+        &task,
+        uuid::Uuid::new_v4(),
+        crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+        store.put_version().unwrap(),
+    )
+    .unwrap();
+    let claim_key = crate::task_scheduler::woken_conversation_claim_key(task.id());
+    let task_key = format!("durable/task-callback-start/{}", task.id()).into_bytes();
+    let conversation_key =
+        format!("runtime/conversation-callback-start/{}", claim.conversation).into_bytes();
+    let marker = serde_json::to_vec(&json!({
+        "version": 3, "claim_id": claim.claim_id, "task": claim.task,
+        "woken_attempt": claim.woken_attempt, "attempt": claim.cleanup_attempt,
+        "lease": claim.cleanup_lease, "policy": claim.policy,
+    }))
+    .unwrap();
+    for key in [&claim_key, &task_key, &conversation_key] {
+        checks.push(durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+    }
+    store
+        .commit(
+            &checks,
+            &[
+                durable_store::Mutation::Put {
+                    key: claim_key.clone(),
+                    value: serde_json::to_vec(&claim).unwrap(),
+                },
+                durable_store::Mutation::Put {
+                    key: task_key.clone(),
+                    value: marker.clone(),
+                },
+                durable_store::Mutation::Put {
+                    key: conversation_key.clone(),
+                    value: marker,
+                },
+            ],
+        )
+        .unwrap();
+    drop(store);
+    let mut registry = Registry::default();
+    let leaf = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(AsyncTool {
+            name: "leaf",
+            child: None,
+            gate: None,
+            early: false,
+        }),
+        "leaf",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let tool = Arc::new(AsyncTool {
+        name: "root",
+        child: Some("leaf"),
+        gate: None,
+        early: false,
+    });
+    let identity: Arc<dyn Tool> = tool.clone();
+    let _identity = crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let root = register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
+        &mut registry,
+        tool,
+        "root",
+        1,
+        vec![leaf.clone()],
+        "cancel-v1",
+        Arc::new(Cancel(calls.clone())),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![root.register(), leaf.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    let scheduler = harness.attach_tasks(registry).unwrap();
+    let driver = crate::task_driver::Driver::start_with_harness(scheduler, harness.worker());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = driver.get(task.id()).unwrap().unwrap();
+            if let TaskState::Failed(reason) = current.state() {
+                assert!(reason.contains("reconciliation"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let store = durable_store::Store::open(&path).unwrap();
+    assert!(store.get(&claim_key).unwrap().is_some());
+    assert!(store.get(&task_key).unwrap().is_none());
+    assert!(store.get(&conversation_key).unwrap().is_none());
+    let report = driver.shutdown_with_pending().unwrap();
+    assert!(report.failure().is_none());
+}
