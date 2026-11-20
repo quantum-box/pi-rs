@@ -209,6 +209,246 @@ mod task_record {
         old.retired_attempt_id = None;
         old == new
     }
+
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(super) fn is_owned_child_reservation(before: &[u8], after: &[u8], id: Uuid) -> bool {
+        let Ok(mut old) = serde_json::from_slice::<Task>(before) else {
+            return false;
+        };
+        let Ok(new) = serde_json::from_slice::<Task>(after) else {
+            return false;
+        };
+        if old.id != id
+            || old.state != TaskState::Ready
+            || !old.abort_requested
+            || old.restarts > 0 && old.restarts >= old.restart_limit
+            || new.attempt_id.is_none_or(|id| id.is_nil())
+        {
+            return false;
+        }
+        old.state = TaskState::Running;
+        old.attempt_id = new.attempt_id;
+        old.retired_attempt_id = None;
+        old == new
+    }
+
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(super) fn is_owned_graph_root(value: &[u8], id: Uuid, interrupted: Uuid) -> bool {
+        let Ok(task) = serde_json::from_slice::<Task>(value) else {
+            return false;
+        };
+        !interrupted.is_nil()
+            && task.id == id
+            && task.state == TaskState::Ready
+            && task.abort_requested
+            && task.woken_interrupted_attempt == Some(interrupted)
+    }
+}
+
+// Prototype for a single direct owned-conversation child. It is deliberately
+// not wired into the protocol until child callback and receipt authentication
+// can consume its evidence.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+fn validate_owned_child_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    mutations: &[Mutation],
+) -> Result<(), Error> {
+    const PREFIX: &[u8] = b"runtime/woken-owned-child-reservation/v1/";
+    let Some((key, bytes)) = mutations.iter().find_map(|m| match m {
+        Mutation::Put { key, value } if key.starts_with(PREFIX) => Some((key, value)),
+        _ => None,
+    }) else {
+        return Err(Error::InvalidSnapshot);
+    };
+    let fail = || Error::Conflict { key: key.clone() };
+    if mutations.len() != 2 {
+        return Err(fail());
+    }
+    let suffix = std::str::from_utf8(&key[PREFIX.len()..]).map_err(|_| fail())?;
+    let Some((root_text, child_text)) = suffix.split_once('/') else {
+        return Err(fail());
+    };
+    let root = uuid::Uuid::parse_str(root_text).map_err(|_| fail())?;
+    let child = uuid::Uuid::parse_str(child_text).map_err(|_| fail())?;
+    if suffix != format!("{root}/{child}") || root == child {
+        return Err(fail());
+    }
+    let marker: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| fail())?;
+    if marker.as_object().is_none_or(|object| object.len() != 6)
+        || marker["version"] != 1
+        || marker["root"] != root.to_string()
+        || marker["child"] != child.to_string()
+    {
+        return Err(fail());
+    }
+    let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
+    let after = mutations
+        .iter()
+        .find_map(|m| match m {
+            Mutation::Put { key, value } if key == &child_key => Some(value),
+            _ => None,
+        })
+        .ok_or_else(fail)?;
+    let (before, child_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&child_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let current: serde_json::Value = serde_json::from_slice(&before).map_err(|_| fail())?;
+    if current["background"] == true
+        || marker["ready_version"].as_u64() != Some(child_version)
+        || marker["running"]
+            != serde_json::from_slice::<serde_json::Value>(after).map_err(|_| fail())?
+        || !task_record::is_owned_child_reservation(&before, after, child)
+    {
+        return Err(fail());
+    }
+    let conversation = current["owner"]["Conversation"]
+        .as_str()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        .ok_or_else(fail)?;
+    let graph_key = format!("runtime/woken-owned-graph/v1/{root}").into_bytes();
+    let (graph_bytes, graph_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&graph_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let graph: serde_json::Value = serde_json::from_slice(&graph_bytes).map_err(|_| fail())?;
+    if graph["version"] != 1
+        || graph["root"] != root.to_string()
+        || marker["graph_version"].as_u64() != Some(graph_version)
+    {
+        return Err(fail());
+    }
+    let root_key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+    let (root_bytes, root_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&root_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let root_task: serde_json::Value = serde_json::from_slice(&root_bytes).map_err(|_| fail())?;
+    let interrupted = graph["interrupted_attempt"]
+        .as_str()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        .ok_or_else(fail)?;
+    let same_commit: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions a JOIN durable_commit_versions b ON a.sequence=b.sequence WHERE a.key=?1 AND a.version=?2 AND b.key=?3 AND b.version=?4)", rusqlite::params![&root_key,root_version,&graph_key,graph_version], |r| r.get(0))?;
+    if !same_commit || !task_record::is_owned_graph_root(&root_bytes, root, interrupted) {
+        return Err(fail());
+    }
+    let marked = graph["tasks"]
+        .as_array()
+        .and_then(|tasks| {
+            let mut matches = tasks.iter().filter(|task| task["id"] == child.to_string());
+            let task = matches.next()?;
+            matches.next().is_none().then_some(task)
+        })
+        .ok_or_else(fail)?;
+    for field in [
+        "id",
+        "owner",
+        "kind",
+        "definition_version",
+        "input",
+        "replay_safe",
+        "background",
+        "task_tool",
+        "retain_task_children_on_success",
+    ] {
+        if marked.get(field) != current.get(field) {
+            return Err(fail());
+        }
+    }
+    let edge = graph["edges"]
+        .as_array()
+        .and_then(|edges| {
+            let mut matches = edges
+                .iter()
+                .filter(|edge| edge["edge"]["child"] == conversation.to_string());
+            let edge = matches.next()?;
+            matches.next().is_none().then_some(edge)
+        })
+        .ok_or_else(fail)?;
+    if edge["edge"]["task"] != root.to_string()
+        || edge["edge"]["mode"] != "Foreground"
+        || edge["edge"]["task_owner"] != root_task["owner"]
+    {
+        return Err(fail());
+    }
+    let edge_key = [
+        b"durable/conversation-owner/".as_slice(),
+        conversation.as_bytes(),
+    ]
+    .concat();
+    let (edge_bytes, edge_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&edge_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    if edge["edge_version"].as_u64() != Some(edge_version)
+        || edge["edge"]
+            != serde_json::from_slice::<serde_json::Value>(&edge_bytes).map_err(|_| fail())?
+    {
+        return Err(fail());
+    }
+    let marker_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+        [key],
+        |r| r.get(0),
+    )?;
+    if marker_exists {
+        return Err(fail());
+    }
+    let boundary = graph["structure"]["boundary"].as_u64().ok_or_else(fail)?;
+    let (current_version, legacy): (u64,u64) = tx.query_row("SELECT s.version,c.legacy_version FROM durable_store_meta s JOIN durable_commit_meta c ON s.id=c.id WHERE s.id=1", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    if boundary < legacy || boundary > current_version {
+        return Err(fail());
+    }
+    for (revision_key, field) in [
+        (
+            graph_revision::task_structure_revision(root),
+            "root_revision",
+        ),
+        (
+            graph_revision::global_structure_revision(),
+            "global_revision",
+        ),
+    ] {
+        let expected = &graph["structure"][field];
+        let version: Option<u64> = tx
+            .query_row(
+                "SELECT version FROM durable_store_entries WHERE key=?1",
+                [&revision_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if expected.as_u64() != version || (!expected.is_null() && expected.as_u64().is_none()) {
+            return Err(fail());
+        }
+        if version.is_none() {
+            let changed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_commit_versions WHERE key=?1 AND version>?2)",
+                rusqlite::params![&revision_key, boundary],
+                |r| r.get(0),
+            )?;
+            if changed {
+                return Err(fail());
+            }
+        }
+    }
+    Ok(())
 }
 
 // Protocol v3 validates the entire reservation write set under the SQLite
@@ -226,7 +466,8 @@ fn validate_owned_reservation(
         }
         _ => None,
     }) {
-        // Child reservations are not yet authenticated by this protocol.
+        // The child path remains disabled until its graph and identity proof
+        // can be consumed at every callback boundary.
         return Err(Error::Conflict { key: key.clone() });
     }
     let markers: Vec<_> = mutations
@@ -358,6 +599,127 @@ fn validate_owned_reservation(
 mod owned_reservation_validation_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn direct_owned_child_reservation_checks_graph_and_entire_write_set() {
+        let store = Store::memory().unwrap();
+        let root = uuid::Uuid::from_u128(10);
+        let child = uuid::Uuid::from_u128(11);
+        let outer = uuid::Uuid::from_u128(12);
+        let conversation = uuid::Uuid::from_u128(13);
+        let interrupted = uuid::Uuid::from_u128(14);
+        let root_key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+        let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
+        let edge_key = [
+            b"durable/conversation-owner/".as_slice(),
+            conversation.as_bytes(),
+        ]
+        .concat();
+        let graph_key = format!("runtime/woken-owned-graph/v1/{root}").into_bytes();
+        let marker_key =
+            format!("runtime/woken-owned-child-reservation/v1/{root}/{child}").into_bytes();
+        let mut root_task = json!({"id":root,"owner":{"Conversation":outer},"checkpoint":{"phase":"wait","data":null},"state":"Running","restarts":0,"restart_limit":4,"abort_requested":true,"woken_interrupted_attempt":interrupted});
+        let mut child_task = json!({"id":child,"owner":{"Conversation":conversation},"checkpoint":{"phase":"parked","data":null},"state":"Ready","restarts":0,"restart_limit":4,"abort_requested":true,"kind":"unsafe-child","replay_safe":false});
+        let edge = json!({"task":root,"task_owner":{"Conversation":outer},"child":conversation,"mode":"Foreground"});
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: root_key.clone(),
+                        value: serde_json::to_vec(&root_task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: child_key.clone(),
+                        value: serde_json::to_vec(&child_task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: edge_key.clone(),
+                        value: serde_json::to_vec(&edge).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let root_before = store.get(&root_key).unwrap().unwrap();
+        let child_before = store.get(&child_key).unwrap().unwrap();
+        let edge_version = store.get(&edge_key).unwrap().unwrap().version;
+        let root_revision = store
+            .get(&graph_revision::task_structure_revision(root))
+            .unwrap()
+            .map(|entry| entry.version);
+        let global_revision = store
+            .get(&graph_revision::global_structure_revision())
+            .unwrap()
+            .map(|entry| entry.version);
+        let boundary = store.put_version().unwrap();
+        let graph = json!({"version":1,"root":root,"interrupted_attempt":interrupted,"tasks":[root_task,child_task],"edges":[{"edge":edge,"edge_version":edge_version}],"structure":{"boundary":boundary,"root_revision":root_revision,"global_revision":global_revision}});
+        root_task["state"] = json!("Ready");
+        store
+            .commit(
+                &[Check {
+                    key: root_key.clone(),
+                    expected: Expected::Version(root_before.version),
+                }],
+                &[
+                    Mutation::Put {
+                        key: root_key,
+                        value: serde_json::to_vec(&root_task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: graph_key.clone(),
+                        value: serde_json::to_vec(&graph).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let graph_version = store.get(&graph_key).unwrap().unwrap().version;
+        child_task["state"] = json!("Running");
+        child_task["attempt_id"] = json!(uuid::Uuid::from_u128(15));
+        let marker = json!({"version":1,"root":root,"child":child,"graph_version":graph_version,"ready_version":child_before.version,"running":child_task});
+        let mut writes = vec![
+            Mutation::Put {
+                key: child_key.clone(),
+                value: serde_json::to_vec(&child_task).unwrap(),
+            },
+            Mutation::Put {
+                key: marker_key,
+                value: serde_json::to_vec(&marker).unwrap(),
+            },
+        ];
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(validate_owned_child_reservation(&tx, &writes).is_ok());
+        let mut altered = child_task.clone();
+        altered["abort_requested"] = json!(false);
+        writes[0] = Mutation::Put {
+            key: child_key.clone(),
+            value: serde_json::to_vec(&altered).unwrap(),
+        };
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        let mut forged_marker = marker.clone();
+        forged_marker["running"] = altered;
+        let marker_key = match &writes[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        writes[1] = Mutation::Put {
+            key: marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        writes[1] = Mutation::Put {
+            key: marker_key,
+            value: serde_json::to_vec(&marker).unwrap(),
+        };
+        writes[0] = Mutation::Put {
+            key: child_key,
+            value: serde_json::to_vec(&child_task).unwrap(),
+        };
+        writes.push(Mutation::Delete { key: edge_key });
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+    }
 
     #[test]
     fn reservation_rejects_wrong_task_and_mixed_graph_mutation() {
