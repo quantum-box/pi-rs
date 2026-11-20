@@ -4139,7 +4139,7 @@ impl AdmissionHandle<'_> {
     /// Store cleanup evidence and retire exact start markers atomically.
     /// Not connected to callback dispatch or recovery.
     #[allow(dead_code)]
-    fn store_woken_conversation_cancel_receipt(
+    pub(crate) fn store_woken_conversation_cancel_receipt(
         &self,
         handler: &dyn Handler,
         receipt: &WokenConversationCancelReceipt,

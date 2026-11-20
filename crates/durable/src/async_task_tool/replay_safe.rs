@@ -1796,7 +1796,79 @@ impl Handler for Executor {
                     std::path::Path::new(&dir).join("woken-start"),
                 )
                 .map_err(|e| e.to_string())?;
-                let _leases = (start, selection_start);
+                if std::env::var_os("PI_TEST_WOKEN_DISPATCH").is_some() {
+                    let stored: ParkCheckpoint =
+                        serde_json::from_value(task.checkpoint().data.clone())
+                            .map_err(|_| "invalid woken cancel checkpoint")?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let cancellation = pi_rs_core::CancellationToken::new();
+                    let result =
+                        runtime.block_on(durable_store::controls::with_callback_context(
+                            claim.conversation,
+                            task.id(),
+                            marker.clone(),
+                            async {
+                                let scope = durable_store::controls::CallbackScope::current()
+                                    .ok_or("missing callback scope")?;
+                                let future = cancel.cancel_scoped(
+                                    stored.arguments,
+                                    stored.checkpoint,
+                                    ToolContext {
+                                        operation_id: task.id(),
+                                        cancellation: cancellation.clone(),
+                                    },
+                                    scope,
+                                );
+                                let mut future = std::pin::pin!(future);
+                                let mut leases = Some((start, selection_start));
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    std::future::poll_fn(|cx| match leases.take() {
+                                        Some((lease, Some(selection))) => {
+                                            selection.poll_first(lease, future.as_mut(), cx)
+                                        }
+                                        Some((lease, None)) => {
+                                            lease.poll_first(future.as_mut(), cx)
+                                        }
+                                        None => future.as_mut().poll(cx),
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| "woken callback timeout")?
+                            },
+                        ))?;
+                    let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
+                        version: 1,
+                        claim: claim.clone(),
+                        result: "callback returned".into(),
+                    };
+                    admission.store_woken_conversation_cancel_receipt(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                    std::fs::write(
+                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                        b"saved",
+                    )
+                    .map_err(|e| e.to_string())?;
+                    std::fs::rename(
+                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                        std::path::Path::new(&dir).join("woken-receipt"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    std::hint::black_box(result);
+                } else {
+                    let _leases = (start, selection_start);
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 loop {
                     std::thread::park();
                 }

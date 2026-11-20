@@ -3945,7 +3945,18 @@ fn start_woken_test_driver(
     #[async_trait]
     impl DurableParkCancel for Cancel {
         async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
-            panic!("test-only evidence route must not dispatch callback")
+            if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_START_DIR") {
+                let path = std::path::Path::new(&dir);
+                std::fs::write(path.join("woken-callback.tmp"), b"called").unwrap();
+                std::fs::rename(path.join("woken-callback.tmp"), path.join("woken-callback"))
+                    .unwrap();
+                if std::env::var_os("PI_TEST_WOKEN_HOLD_CALLBACK").is_some() {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            } else {
+                panic!("test-only evidence route must not dispatch callback")
+            }
         }
     }
     let mut registry = Registry::default();
@@ -4009,97 +4020,127 @@ async fn woken_driver_start_marker_kill_worker() {
 #[tokio::test]
 async fn woken_driver_claim_and_start_markers_survive_process_kill() {
     use std::process::{Command, Stdio};
-    let dir = tempfile::tempdir().unwrap();
-    let mut wake = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "conversation_claim_boundary_tests::woken_conversation_claim_worker",
-        ])
-        .env("PI_TEST_WOKEN_CLAIM_DIR", dir.path())
-        .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
-        .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while !dir.path().join("wake").exists() {
-            assert!(wake.try_wait().unwrap().is_none(), "wake worker exited");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    wake.kill().unwrap();
-    wake.wait().unwrap();
-    let path = dir.path().join("db");
-    let store = durable_store::Store::open(&path).unwrap();
-    let tasks = crate::task_store::TaskStore::new(&store);
-    let root = tasks
-        .list()
-        .unwrap()
-        .into_iter()
-        .find(|r| {
-            matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
-                && r.task.state() == &TaskState::Running
-        })
-        .unwrap();
-    tasks
-        .update(&root, |t| t.recover_interrupted_woken_for_cleanup())
-        .unwrap();
-    drop(store);
-    let mut start = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "conversation_claim_boundary_tests::woken_driver_start_marker_kill_worker",
-        ])
-        .env("PI_TEST_WOKEN_START_DIR", dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while !dir.path().join("woken-start").exists() {
-            assert!(start.try_wait().unwrap().is_none(), "start worker exited");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    start.kill().unwrap();
-    start.wait().unwrap();
-    let store = durable_store::Store::open(&path).unwrap();
-    let claim_key = crate::task_scheduler::woken_conversation_claim_key(root.task.id());
-    let claim: crate::task_scheduler::WokenConversationCancelClaim =
-        serde_json::from_slice(&store.get(&claim_key).unwrap().unwrap().value).unwrap();
-    let task_key = format!("durable/task-callback-start/{}", root.task.id()).into_bytes();
-    let conversation_key =
-        format!("runtime/conversation-callback-start/{}", claim.conversation).into_bytes();
-    assert_eq!(
-        store.get(&task_key).unwrap().unwrap().value,
-        std::fs::read(dir.path().join("woken-start")).unwrap()
-    );
-    assert_eq!(
-        store.get(&task_key).unwrap().unwrap().value,
-        store.get(&conversation_key).unwrap().unwrap().value
-    );
-    drop(store);
-    let (_harness, driver) = start_woken_test_driver(&path);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let current = driver.get(root.task.id()).unwrap().unwrap();
-            if let TaskState::Failed(reason) = current.state() {
-                assert!(reason.contains("reconciliation"));
-                break;
+    for mode in ["start", "callback", "receipt"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wake = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_conversation_claim_worker",
+            ])
+            .env("PI_TEST_WOKEN_CLAIM_DIR", dir.path())
+            .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
+            .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !dir.path().join("wake").exists() {
+                assert!(wake.try_wait().unwrap().is_none(), "wake worker exited");
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        })
+        .await
+        .unwrap();
+        wake.kill().unwrap();
+        wake.wait().unwrap();
+        let path = dir.path().join("db");
+        let store = durable_store::Store::open(&path).unwrap();
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let root = tasks
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|r| {
+                matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
+                    && r.task.state() == &TaskState::Running
+            })
+            .unwrap();
+        tasks
+            .update(&root, |t| t.recover_interrupted_woken_for_cleanup())
+            .unwrap();
+        drop(store);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_driver_start_marker_kill_worker",
+            ])
+            .env("PI_TEST_WOKEN_START_DIR", dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if mode != "start" {
+            command.env("PI_TEST_WOKEN_DISPATCH", "1");
         }
-    })
-    .await
-    .unwrap();
-    let store = durable_store::Store::open(&path).unwrap();
-    assert!(store.get(&claim_key).unwrap().is_some());
-    assert!(store.get(&task_key).unwrap().is_none());
-    assert!(store.get(&conversation_key).unwrap().is_none());
-    assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        if mode == "callback" {
+            command.env("PI_TEST_WOKEN_HOLD_CALLBACK", "1");
+        }
+        let mut start = command.spawn().unwrap();
+        let ready = match mode {
+            "start" => "woken-start",
+            "callback" => "woken-callback",
+            _ => "woken-receipt",
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !dir.path().join(ready).exists() {
+                assert!(start.try_wait().unwrap().is_none(), "start worker exited");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        start.kill().unwrap();
+        start.wait().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let claim_key = crate::task_scheduler::woken_conversation_claim_key(root.task.id());
+        let claim: crate::task_scheduler::WokenConversationCancelClaim =
+            serde_json::from_slice(&store.get(&claim_key).unwrap().unwrap().value).unwrap();
+        let task_key = format!("durable/task-callback-start/{}", root.task.id()).into_bytes();
+        let conversation_key =
+            format!("runtime/conversation-callback-start/{}", claim.conversation).into_bytes();
+        let receipt_key = format!(
+            "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+            root.task.id()
+        )
+        .into_bytes();
+        if mode == "receipt" {
+            assert!(store.get(&task_key).unwrap().is_none());
+            assert!(store.get(&conversation_key).unwrap().is_none());
+            assert!(store.get(&receipt_key).unwrap().is_some());
+        } else {
+            assert_eq!(
+                store.get(&task_key).unwrap().unwrap().value,
+                std::fs::read(dir.path().join("woken-start")).unwrap()
+            );
+            assert_eq!(
+                store.get(&task_key).unwrap().unwrap().value,
+                store.get(&conversation_key).unwrap().unwrap().value
+            );
+            assert!(store.get(&receipt_key).unwrap().is_none());
+        }
+        drop(store);
+        let (_harness, driver) = start_woken_test_driver(&path);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let current = driver.get(root.task.id()).unwrap().unwrap();
+                if let TaskState::Failed(reason) = current.state() {
+                    assert!(reason.contains("reconciliation"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        assert!(store.get(&claim_key).unwrap().is_some());
+        assert!(store.get(&task_key).unwrap().is_none());
+        assert!(store.get(&conversation_key).unwrap().is_none());
+        assert_eq!(
+            store.get(&receipt_key).unwrap().is_some(),
+            mode == "receipt"
+        );
+        assert_eq!(dir.path().join("woken-callback").exists(), mode != "start");
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    }
 }
