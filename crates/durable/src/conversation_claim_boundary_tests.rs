@@ -8015,6 +8015,40 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         Some(graph_commit)
     );
 
+    harness
+        .drive_owned_cleanup_fenced(conversation, &pi_rs_core::CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!harness.conversation(conversation).unwrap().abort_requested);
+    assert!(
+        store
+            .get(&crate::runtime::owned_cleanup_key(conversation))
+            .unwrap()
+            .is_none()
+    );
+    let prefix = format!("runtime/owned-cleanup-receipt/v1/{conversation}/");
+    let receipts = store.list(prefix.as_bytes()).unwrap();
+    assert_eq!(receipts.len(), 1);
+    let (receipt_key, receipt_entry) = &receipts[0];
+    let receipt: crate::runtime::OwnedCleanupReceipt =
+        serde_json::from_slice(&receipt_entry.value).unwrap();
+    assert_eq!(receipt.conversation, conversation);
+    assert_eq!(receipt.edge.child, conversation);
+    assert_eq!(receipt.edge.task, root.task.id());
+    let finished = store.get(&conversation_key).unwrap().unwrap();
+    assert_eq!(receipt.finished_conversation_version, finished.version);
+    let start_commit = store
+        .commit_for_version(
+            &crate::runtime::owned_cleanup_key(conversation),
+            receipt.marker_version,
+        )
+        .unwrap()
+        .unwrap();
+    let receipt_commit = store
+        .commit_for_version(receipt_key, receipt_entry.version)
+        .unwrap()
+        .unwrap();
+    assert!(start_commit < receipt_commit);
     drop(store);
     drop(harness);
     let options = Options {
@@ -8027,7 +8061,7 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
-    assert!(reopened.conversation(conversation).unwrap().abort_requested);
+    assert!(!reopened.conversation(conversation).unwrap().abort_requested);
     let store = durable_store::Store::open(&path).unwrap();
     let saved = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())

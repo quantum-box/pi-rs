@@ -133,6 +133,24 @@ pub(crate) fn woken_owned_graph_key(root: Uuid) -> Vec<u8> {
     format!("runtime/woken-owned-graph/v1/{root}").into_bytes()
 }
 
+/// Provisional evidence that an owned conversation's abort cleanup completed.
+/// Callback authorization must still bind this to the graph mark and children.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OwnedCleanupReceipt {
+    pub version: u32,
+    pub conversation: Uuid,
+    pub attempt: Uuid,
+    pub marker_version: u64,
+    pub edge: crate::ownership_edge::Edge,
+    pub edge_version: u64,
+    pub started_conversation_version: u64,
+    pub finished_conversation_version: u64,
+}
+pub(crate) fn owned_cleanup_receipt_key(conversation: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("runtime/owned-cleanup-receipt/v1/{conversation}/{attempt}").into_bytes()
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CleanupAttempt {
     attempt: Uuid,
@@ -16585,6 +16603,7 @@ impl Harness {
         let edge_expected = edge
             .as_ref()
             .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+        let conversation_id = c.id;
         let key = owned_cleanup_key(c.id);
         if let Some(marker) = store.get(&key)? {
             let ephemeral = serde_json::from_slice::<CleanupAttempt>(&marker.value)
@@ -16658,13 +16677,56 @@ impl Harness {
             if cleanup_attempt_id(&marker.value) != Some(attempt) {
                 return Err(Error::Invalid("cleanup marker changed".into()));
             }
-            store.commit(
-                &[Check {
-                    key: key.clone(),
-                    expected: Expected::Version(marker.version),
-                }],
-                &[Mutation::Delete { key }],
-            )?;
+            let mut checks = vec![Check {
+                key: key.clone(),
+                expected: Expected::Version(marker.version),
+            }];
+            let mut mutations = vec![Mutation::Delete { key }];
+            if matches!(result, Ok(true))
+                && let Some(edge_entry) = edge
+            {
+                let conversation_key = Self::key(conversation_id);
+                let finished = store.get(&conversation_key)?.ok_or(Error::NotFound)?;
+                let state: Conversation = serde_json::from_slice(&finished.value)?;
+                if state.id != conversation_id {
+                    return Err(Error::Invalid("cleanup conversation changed".into()));
+                }
+                if !state.abort_requested && !matches!(state.phase, Phase::Blocked { .. }) {
+                    let edge_key = crate::ownership_edge::edge_key(conversation_id);
+                    let stored_edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+                        .map_err(|e| Error::Invalid(format!("ownership edge: {e}")))?;
+                    let receipt_key = owned_cleanup_receipt_key(conversation_id, attempt);
+                    let receipt = OwnedCleanupReceipt {
+                        version: 1,
+                        conversation: conversation_id,
+                        attempt,
+                        marker_version: marker.version,
+                        edge: stored_edge.edge,
+                        edge_version: edge_entry.version,
+                        started_conversation_version: version,
+                        finished_conversation_version: finished.version,
+                    };
+                    checks.extend([
+                        Check {
+                            key: conversation_key,
+                            expected: Expected::Version(finished.version),
+                        },
+                        Check {
+                            key: edge_key,
+                            expected: Expected::Version(edge_entry.version),
+                        },
+                        Check {
+                            key: receipt_key.clone(),
+                            expected: Expected::Missing,
+                        },
+                    ]);
+                    mutations.push(Mutation::Put {
+                        key: receipt_key,
+                        value: serde_json::to_vec(&receipt)?,
+                    });
+                }
+            }
+            store.commit(&checks, &mutations)?;
         }
         result
     }
