@@ -2484,8 +2484,41 @@ mod tests {
         assert!(scheduler.tick(0).unwrap());
         assert!(scheduler.tick(0).unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let child = crate::task_store::TaskStore::new(scheduler.owner().store())
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.task.checkpoint().phase == "sealed.execute.v1")
+            .expect("committed before-hook checkpoint")
+            .task
+            .id();
         drop(scheduler);
-        let driver = before_fixture_host(&path, tool, hook, "hook-v2").into_driver();
+        let scheduler = before_fixture_host(&path, tool, hook, "hook-v2").into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let (failed, failure_ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        crate::task_driver::after_execute_failure_for_test(child, move || {
+            failed.send(()).unwrap();
+            proceed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        });
+        let (deferred, observed) = std::sync::mpsc::channel();
+        crate::task_driver::on_deferred_poison_for_test(&owner, move || {
+            deferred.send(()).unwrap();
+        });
+        let driver = crate::task_driver::Driver::start(scheduler);
+        failure_ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        observed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("coordinator did not encounter poisoned executor");
+        assert!(
+            driver.get(parent.id()).is_ok(),
+            "generic poison escaped before original failure"
+        );
+        release.send(()).unwrap();
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match driver.get(parent.id()) {

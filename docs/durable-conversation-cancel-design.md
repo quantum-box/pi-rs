@@ -41,6 +41,11 @@ the original claim, attempt, owner, definition identity and both markers in one
 transaction. External cleanup work is deferred while the unsafe checkpointable
 root remains live. Direct writes to the store remain outside these API fences.
 
+If the store reports writer contention before a settlement transaction starts,
+driver shutdown returns the pending outcome and its lease for retry or
+reconciliation instead of waiting for the unrelated writer. This does not
+classify an indeterminate commit as uncommitted.
+
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.
 

@@ -1000,7 +1000,7 @@ fn fail_cleanup(shared: &Shared, error: String) {
             .reservation_stop
             .store(true, std::sync::atomic::Ordering::Release);
         if let Ok(mut state) = shared.state.lock() {
-            state.failure = Some(error);
+            state.failure.get_or_insert(error);
             state.stop = true;
             shared.wake.notify_all();
         }
@@ -1012,9 +1012,18 @@ fn fail_cleanup(shared: &Shared, error: String) {
 }
 
 enum WorkerEvent {
-    Released,
+    Released(Uuid),
     Completed(Box<task_scheduler::CompletedInvocation>),
-    Failed(String),
+    Failed(Uuid, String),
+}
+
+impl WorkerEvent {
+    fn task_id(&self) -> Uuid {
+        match self {
+            Self::Released(id) | Self::Failed(id, _) => *id,
+            Self::Completed(completed) => completed.task_id(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1074,6 +1083,36 @@ pub(crate) fn after_execute_for_test(id: Uuid, hook: impl FnOnce() + Send + 'sta
         .lock()
         .unwrap()
         .insert(id, Box::new(hook));
+}
+
+#[cfg(test)]
+fn execute_failure_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_execute_failure_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    execute_failure_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+type DeferredPoisonHooks = Mutex<HashMap<usize, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn deferred_poison_hooks() -> &'static DeferredPoisonHooks {
+    static HOOKS: std::sync::OnceLock<DeferredPoisonHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_deferred_poison_for_test(
+    owner: &Arc<OwnedStore>,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    deferred_poison_hooks()
+        .lock()
+        .unwrap()
+        .insert(Arc::as_ptr(owner) as usize, Box::new(hook));
 }
 
 #[cfg(test)]
@@ -1140,8 +1179,8 @@ impl Drop for WorkerPool {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(task_scheduler::PendingSettlement::Unprepared(*completed)),
-                WorkerEvent::Released => (),
-                WorkerEvent::Failed(_) => failed = true,
+                WorkerEvent::Released(_) => (),
+                WorkerEvent::Failed(_, _) => failed = true,
             }
         }
         if failed {
@@ -1277,7 +1316,8 @@ impl Shared {
                             Ok(())
                         })();
                         if let Err(error) = registration {
-                            let _ = done.send(WorkerEvent::Failed(error));
+                            shared.stop_for_failure(error.clone());
+                            let _ = done.send(WorkerEvent::Failed(task_id, error));
                             break;
                         }
                     }
@@ -1298,12 +1338,13 @@ impl Shared {
                             Ok(()) => WorkerEvent::Completed(Box::new(completed)),
                             Err(error) if error.pre_transaction_busy() => {
                                 // The outcome and lease remain owned until receipt capture succeeds.
+                                completed.mark_writer_busy();
                                 shared
                                     .pending
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .push(task_scheduler::PendingSettlement::Unprepared(completed));
-                                WorkerEvent::Released
+                                WorkerEvent::Released(task_id)
                             }
                             Err(error) => {
                                 let message = format!("uncertain receipt capture: {error}");
@@ -1315,18 +1356,31 @@ impl Shared {
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .push(task_scheduler::PendingSettlement::Unprepared(completed));
-                                WorkerEvent::Failed(message)
+                                WorkerEvent::Failed(task_id, message)
                             }
                         },
-                        Ok(Err(task_scheduler::Error::Stopped)) => WorkerEvent::Released,
-                        Ok(Err(error)) => WorkerEvent::Failed(error.to_string()),
+                        Ok(Err(task_scheduler::Error::Stopped)) => WorkerEvent::Released(task_id),
+                        Ok(Err(error)) => {
+                            #[cfg(test)]
+                            {
+                                let hook = execute_failure_hooks().lock().unwrap().remove(&task_id);
+                                if let Some(hook) = hook {
+                                    hook();
+                                }
+                            }
+                            let message = error.to_string();
+                            shared.stop_for_failure(message.clone());
+                            WorkerEvent::Failed(task_id, message)
+                        }
                         Err(payload) => {
                             crate::extension::discard_panic_payload(payload);
-                            WorkerEvent::Failed("task handler panicked".into())
+                            let message = "task handler panicked".to_string();
+                            shared.stop_for_failure(message.clone());
+                            WorkerEvent::Failed(task_id, message)
                         }
                     };
                     #[cfg(test)]
-                    if matches!(event, WorkerEvent::Released) {
+                    if matches!(event, WorkerEvent::Released(_)) {
                         let hook = after_execute_hooks().lock().unwrap().remove(&task_id);
                         if let Some(hook) = hook {
                             hook();
@@ -1357,6 +1411,7 @@ impl Shared {
             shared: self.clone(),
         };
         let mut active = 0usize;
+        let mut active_ids = std::collections::HashSet::new();
         let mut maintenance: Vec<task_scheduler::PendingMaintenance> = Vec::new();
         let mut maintenance_cursor = 0usize;
         loop {
@@ -1369,6 +1424,7 @@ impl Shared {
             let mut progressed = false;
             while let Some(event) = pool.inbox.pop_front() {
                 active = active.saturating_sub(1);
+                active_ids.remove(&event.task_id());
                 match event {
                     WorkerEvent::Completed(completed) => {
                         let result = match self.scheduler.lock() {
@@ -1385,8 +1441,8 @@ impl Shared {
                             self.stop_for_failure(error);
                         }
                     }
-                    WorkerEvent::Released => (),
-                    WorkerEvent::Failed(error) => self.stop_for_failure(error),
+                    WorkerEvent::Released(_) => (),
+                    WorkerEvent::Failed(_, error) => self.stop_for_failure(error),
                 }
                 self.notify_work();
                 progressed = true;
@@ -1403,6 +1459,22 @@ impl Shared {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty();
+            if stopped
+                && active == 0
+                && has_pending
+                && self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(task_scheduler::PendingSettlement::waits_for_writer)
+            {
+                // BEGIN IMMEDIATE definitely did not start. Preserve every
+                // pending candidate and its lease for the caller instead of
+                // making shutdown depend on an external writer releasing.
+                self.cleanup_stop.cancel();
+                break;
+            }
             // Once a worker reports an indeterminate failure, retain every
             // pending lease for shutdown/reconciliation instead of settling it.
             if has_pending && !failed {
@@ -1528,10 +1600,12 @@ impl Shared {
                 match reservation {
                     Ok(task_scheduler::TickReservation::Invocation(job)) => {
                         active += 1;
+                        active_ids.insert(job.task_id());
                         if let Err(mpsc::SendError(job)) =
                             pool.jobs.as_ref().expect("pool open").send(job)
                         {
                             active -= 1;
+                            active_ids.remove(&job.task_id());
                             self.stop_for_failure("task worker pool disconnected".into());
                             if job.unhooked_cancellation().is_some() {
                                 drop(job);
@@ -1579,6 +1653,32 @@ impl Shared {
                     }
                     Ok(task_scheduler::TickReservation::Progress(value)) => progressed |= value,
                     Err(task_scheduler::Error::Busy) => (),
+                    Err(task_scheduler::Error::Poisoned) if active > 0 => {
+                        // A failed executor drops its lease before it can send
+                        // its error. Defer only when an executor has actually
+                        // released a lease whose event is still in flight;
+                        // unrelated poison must still stop live workers.
+                        let released = self
+                            .scheduler
+                            .lock()
+                            .ok()
+                            .and_then(|scheduler| scheduler.has_released_worker(&active_ids).ok())
+                            .unwrap_or(false);
+                        if released {
+                            #[cfg(test)]
+                            {
+                                let hook = deferred_poison_hooks()
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&(Arc::as_ptr(&self.owner) as usize));
+                                if let Some(hook) = hook {
+                                    hook();
+                                }
+                            }
+                        } else {
+                            fail_cleanup(self, task_scheduler::Error::Poisoned.to_string());
+                        }
+                    }
                     Err(task_scheduler::Error::Stopped)
                         if active > 0
                             || self

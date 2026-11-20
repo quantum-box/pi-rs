@@ -1992,11 +1992,15 @@ pub struct CompletedInvocation {
     lease: InvocationLease,
     receipt_capture: bool,
     abort_definition: Option<Arc<()>>,
+    writer_busy: bool,
     // Pin the exact host registration until receipt persistence or abandonment.
     _identity_lease: Option<crate::nested_identity::IdentityLease>,
 }
 
 impl CompletedInvocation {
+    pub(crate) fn mark_writer_busy(&mut self) {
+        self.writer_busy = true;
+    }
     /// Read a marked handler's retained outcome when receipt capture failed.
     /// This is evidence for reconciliation, not a retry authorization.
     pub fn retained_tool_outcome(&self) -> Option<pi_rs_core::Outcome> {
@@ -2268,6 +2272,7 @@ pub struct PreparedSettlement {
     graph_version: u64,
     attempts: usize,
     commit_uncertain: bool,
+    writer_busy: bool,
 }
 
 /// Owned settlement state at an invocation or prepared transaction boundary.
@@ -2326,6 +2331,16 @@ impl std::fmt::Debug for PendingSettlement {
 }
 
 impl PendingSettlement {
+    /// The last commit could not start a write transaction. The exact
+    /// candidate and lease remain owned and can be returned on shutdown.
+    pub(crate) fn waits_for_writer(&self) -> bool {
+        match self {
+            Self::Unprepared(completed) => completed.writer_busy,
+            Self::Prepared { settlement, .. } => settlement.writer_busy,
+            Self::Failure { settlement, .. } => settlement.writer_busy,
+            Self::PreparationConflict { .. } => false,
+        }
+    }
     // Distinguish durable ownership uncertainty from a temporarily busy poll
     // fence during graceful driver shutdown. This only observes the graph;
     // the returned settlement retains its lease and is always revalidated.
@@ -2662,6 +2677,7 @@ pub struct FailureSettlement {
     check_pending: bool,
     attempt: usize,
     candidate: Option<FailureCandidate>,
+    writer_busy: bool,
 }
 
 struct FailureCandidate {
@@ -5730,6 +5746,7 @@ impl DetachedInvocation {
             receipt_capture: false,
             abort_definition: self.abort_definition,
             _identity_lease: None,
+            writer_busy: false,
         })
     }
 
@@ -6174,6 +6191,7 @@ impl DetachedInvocation {
             receipt_capture: capture_enabled,
             abort_definition,
             _identity_lease: identity_lease,
+            writer_busy: false,
         })
     }
 }
@@ -6683,6 +6701,14 @@ impl Scheduler {
     pub(crate) fn cleanup_registry(&self) -> &Registry {
         &self.registry
     }
+
+    /// Snapshot live leases without requiring an unpoisoned scheduler. The
+    /// driver uses it only to identify a released executor whose event has not
+    /// yet reached the coordinator.
+    pub(crate) fn has_released_worker(&self, active: &HashSet<Uuid>) -> Result<bool, Error> {
+        let state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
+        Ok(active.iter().any(|id| !state.attempts.contains(id)))
+    }
 }
 impl Scheduler {
     fn make_invocation(
@@ -6766,6 +6792,7 @@ impl Scheduler {
         }
         if let Err(error) = completed.capture_marked_receipt() {
             if error.pre_transaction_busy() {
+                completed.writer_busy = true;
                 return Err(SettlementError::Pending {
                     completed: Box::new(completed),
                 });
@@ -6775,6 +6802,7 @@ impl Scheduler {
                 completed: Box::new(completed),
             });
         }
+        completed.writer_busy = false;
         let multiple = match self.live_invocations.lock() {
             Ok(state) => state.attempts.len() > 1,
             Err(_) => {
@@ -6935,6 +6963,7 @@ impl Scheduler {
             receipt_capture,
             abort_definition,
             _identity_lease: _,
+            writer_busy: _,
         } = completed;
         let mut reported_handler_failure = false;
         let mut deferred = None;
@@ -7517,6 +7546,7 @@ impl Scheduler {
                             receipt_capture,
                             abort_definition,
                             _identity_lease: None,
+                            writer_busy: false,
                         })),
                     });
                 }
@@ -7547,6 +7577,7 @@ impl Scheduler {
                             receipt_capture,
                             abort_definition,
                             _identity_lease: None,
+                            writer_busy: false,
                         }),
                     }
                 }
@@ -7601,6 +7632,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    writer_busy: true,
                 }),
             });
         }
@@ -7633,6 +7665,7 @@ impl Scheduler {
                         receipt_capture,
                         abort_definition,
                         _identity_lease: None,
+                        writer_busy: false,
                     }),
                 });
             }
@@ -7662,6 +7695,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    writer_busy: false,
                 }),
             });
         }
@@ -7684,6 +7718,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    writer_busy: false,
                 })),
             });
         }
@@ -7734,6 +7769,7 @@ impl Scheduler {
         }
         if let Err(error) = completed.capture_marked_receipt() {
             if error.pre_transaction_busy() {
+                completed.writer_busy = true;
                 return Err(SettlementError::Pending {
                     completed: Box::new(completed),
                 });
@@ -7743,6 +7779,7 @@ impl Scheduler {
                 completed: Box::new(completed),
             });
         }
+        completed.writer_busy = false;
         let fence = self.failure_fence.clone();
         let guard = match fence.try_lock() {
             Ok(guard) => guard,
@@ -8279,6 +8316,7 @@ impl Scheduler {
                         check_pending: true,
                         attempt: 0,
                         candidate: None,
+                        writer_busy: false,
                     });
                 }
                 self.commit_failure_settlement(failure.as_mut().unwrap(), || {})?;
@@ -12966,6 +13004,7 @@ impl Scheduler {
             graph_version: success_graph_version,
             attempts: 0,
             commit_uncertain: false,
+            writer_busy: false,
         };
         let result = self.commit_prepared_settlement(
             &mut prepared,
@@ -13038,8 +13077,10 @@ impl Scheduler {
                 // BEGIN IMMEDIATE failed before a transaction existed. Keep the
                 // exact candidate and lease; the next attempt revalidates them.
                 prepared.commit_uncertain = false;
+                prepared.writer_busy = true;
                 return Err(Error::Busy);
             }
+            prepared.writer_busy = false;
             let Err(crate::document::Error::Store(durable_store::Error::Conflict { ref key })) =
                 result
             else {
@@ -13481,6 +13522,7 @@ impl Scheduler {
             check_pending: true,
             attempt: 0,
             candidate: None,
+            writer_busy: false,
         };
         match self.commit_failure_settlement(&mut settlement, || {}) {
             Ok(()) => drop(gate),
@@ -13561,6 +13603,7 @@ impl Scheduler {
             check_pending,
             attempt: 0,
             candidate: None,
+            writer_busy: false,
         };
         self.commit_failure_settlement(&mut settlement, before_commit)
     }
@@ -13656,6 +13699,7 @@ impl Scheduler {
                 ],
                 candidate.graph_version,
             );
+            settlement.writer_busy = false;
             #[cfg(test)]
             if commit.is_ok() && self.inject_failure_commit_error == 2 {
                 return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
@@ -13701,6 +13745,7 @@ impl Scheduler {
                     continue;
                 }
                 Err(durable_store::Error::WriteLockBusy(_)) => {
+                    settlement.writer_busy = true;
                     #[cfg(feature = "test-hooks")]
                     hook_fence_test_hook::run(settlement.running.task.id(), "failure-busy");
                     return Err(Error::Busy);
@@ -15150,7 +15195,7 @@ mod tests {
                 Ok(Step::Succeed(json!(null)))
             }
         }
-        for scenario in ["commit", "conflict", "panic", "drop"] {
+        for scenario in ["commit", "conflict", "panic", "drop", "writer_shutdown"] {
             let dir = tempfile::tempdir().unwrap();
             let mut harness = Harness::open_paused(
                 dir.path().join("db"),
@@ -15194,11 +15239,11 @@ mod tests {
             .registered("guarded-writer".into(), false);
             let (pending_entered, pending_ready) = mpsc::channel();
             let (pending_release, pending_proceed) = mpsc::channel();
-            if scenario == "drop" {
+            if scenario == "drop" || scenario == "writer_shutdown" {
                 crate::task_driver::after_pending_enqueue_for_test(writer.id(), move || {
                     pending_entered.send(()).unwrap();
                     pending_proceed
-                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .recv_timeout(std::time::Duration::from_secs(20))
                         .unwrap();
                 });
             }
@@ -15252,7 +15297,64 @@ mod tests {
                     )
                     .unwrap();
             }
+            let locked = if scenario == "writer_shutdown" {
+                let db = rusqlite::Connection::open(dir.path().join("db")).unwrap();
+                db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                Some(db)
+            } else {
+                None
+            };
             release.send(()).unwrap();
+            if scenario == "writer_shutdown" {
+                pending_ready
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .unwrap();
+                assert!(gate.try_start().is_none());
+                driver.stop_worker_for_test();
+                pending_release.send(()).unwrap();
+                let (done, completed) = mpsc::channel();
+                let shutdown =
+                    std::thread::spawn(move || done.send(driver.shutdown_with_pending()).unwrap());
+                let report = match completed.recv_timeout(std::time::Duration::from_secs(3)) {
+                    Ok(report) => report.unwrap(),
+                    Err(error) => {
+                        locked.unwrap().execute_batch("COMMIT").unwrap();
+                        let _ = completed.recv_timeout(std::time::Duration::from_secs(15));
+                        shutdown.join().unwrap();
+                        panic!("shutdown waited for an unrelated writer: {error}");
+                    }
+                };
+                shutdown.join().unwrap();
+                assert!(report.failure().is_none());
+                let pending = report
+                    .pending()
+                    .iter()
+                    .find(|pending| pending.waits_for_writer())
+                    .expect("writer-busy candidate must be returned");
+                assert!(matches!(
+                    pending.candidate_task().map(Task::state),
+                    Some(TaskState::Succeeded(_))
+                ));
+                assert!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .is_empty(),
+                    "pre-transaction busy must not publish staged input"
+                );
+                assert!(
+                    gate.try_start().is_none(),
+                    "retained settlement lost its gate"
+                );
+                locked.unwrap().execute_batch("COMMIT").unwrap();
+                drop(report);
+                assert!(
+                    gate.try_start().is_some(),
+                    "dropping returned settlement retained its gate"
+                );
+                continue;
+            }
             if scenario == "drop" {
                 pending_ready
                     .recv_timeout(std::time::Duration::from_secs(10))
@@ -15309,6 +15411,52 @@ mod tests {
             assert!(gate.try_start().is_some(), "commit retained its gate");
             driver.shutdown().unwrap();
         }
+    }
+
+    #[test]
+    fn unrelated_scheduler_poison_stops_a_live_executor() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let (started, ready) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        let proceed = std::sync::Mutex::new(proceed);
+        let mut registry = Registry::default();
+        registry.register("poison-live", true, move |_: &Task| {
+            started.send(()).unwrap();
+            proceed
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            Ok(Step::Succeed(json!(null)))
+        });
+        let scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            cp("test"),
+            3,
+        )
+        .unwrap()
+        .registered("poison-live".into(), true);
+        scheduler.submit(&task).unwrap();
+        let poisoned = scheduler.poisoned.clone();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        poisoned.store(true, std::sync::atomic::Ordering::Release);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while driver.get(task.id()).is_ok() {
+            if std::time::Instant::now() >= until {
+                release.send(()).unwrap();
+                let _ = driver.shutdown_with_pending();
+                panic!("unrelated poison did not stop the live driver");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        release.send(()).unwrap();
+        let _ = driver.shutdown_with_pending().unwrap();
     }
 
     #[test]
@@ -18149,6 +18297,7 @@ mod tests {
             graph_version: 0,
             attempts: 0,
             commit_uncertain: false,
+            writer_busy: false,
         };
         let pending = PendingSettlement::Prepared { lease, settlement };
         assert!(matches!(
@@ -18650,6 +18799,7 @@ mod tests {
                         check_pending: true,
                         attempt: 0,
                         candidate: None,
+                        writer_busy: false,
                     };
                     scheduler.try_resume_pending(PendingSettlement::Failure { lease, settlement })
                 } else {
@@ -20531,6 +20681,7 @@ mod tests {
             check_pending: true,
             attempt: 0,
             candidate: None,
+            writer_busy: false,
         };
         let result = scheduler.commit_failure_settlement(&mut settlement, || {
             scheduler
@@ -22930,6 +23081,7 @@ mod tests {
                 graph_version: boundary,
                 attempts: 0,
                 commit_uncertain: false,
+                writer_busy: false,
             };
             let child = task(2, TaskOwner::Task(root.id()), "child", false, 3);
             scheduler.ts().save(&[Save::Create(&child)]).unwrap();
@@ -23067,6 +23219,7 @@ mod tests {
             graph_version: owner.store().put_version().unwrap(),
             attempts: 0,
             commit_uncertain: false,
+            writer_busy: false,
         };
         assert!(
             matches!(prepared.revalidate(&scheduler, &owner, &gate).unwrap(), PreparedRevalidation::PendingAbort(id) if id == child.id())
