@@ -8189,6 +8189,25 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         batch.mutations.push(marker);
         store.commit(&batch.checks, &batch.mutations).unwrap();
         let running = tasks.load(child).unwrap().unwrap();
+        let marked_root = tasks.load(root.task.id()).unwrap().unwrap();
+        let identity_leases = crate::task_scheduler::owned_child_cleanup_identity_leases(
+            &registry,
+            &marked_root.task,
+            &running.task,
+        )
+        .unwrap();
+        assert_eq!(identity_leases.len(), 2);
+        let mut changed_identity = serde_json::to_value(&running.task).unwrap();
+        changed_identity["kind"] = json!("different-registration");
+        let changed_identity: crate::task::Task = serde_json::from_value(changed_identity).unwrap();
+        assert!(
+            crate::task_scheduler::owned_child_cleanup_identity_leases(
+                &registry,
+                &marked_root.task,
+                &changed_identity
+            )
+            .is_err()
+        );
         let checks = harness
             .checkpointable_owned_child_admission_checks(&running.task, &registry)
             .unwrap();
@@ -8218,6 +8237,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 .checkpointable_owned_child_admission_checks(&running.task, &registry)
                 .is_err()
         );
+        drop(identity_leases);
         let modified = store.get(&binding_key).unwrap().unwrap();
         store
             .commit(

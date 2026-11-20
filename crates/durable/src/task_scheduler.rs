@@ -18358,6 +18358,48 @@ pub(crate) fn authenticated_woken_terminal_descendants(
     Ok((uncertain, checks, leases))
 }
 
+/// Pin both registrations' live identities. The caller must hold the registry
+/// lease and selection gate, authenticate the graph/bindings and retain these
+/// leases through the checked operation. This does not authorize a callback.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn owned_child_cleanup_identity_leases(
+    registry: &Registry,
+    root: &Task,
+    child: &Task,
+) -> Result<Vec<crate::nested_identity::IdentityLease>, Error> {
+    let mut leases = Vec::with_capacity(2);
+    for (task, woken_root) in [(root, true), (child, false)] {
+        let registration = task
+            .kind()
+            .and_then(|kind| registry.entries.get(kind))
+            .ok_or(Error::Registration)?;
+        if task.replay_safe()
+            || !task.abort_requested()
+            || registration.replay_safe
+            || registration.version != task.definition_version()
+            || registration.conversation_checkpointable.is_none()
+            || !registration.handler.conversation_cancel_dispatch_enabled()
+            || (woken_root && !registration.handler.conversation_woken_cancel_enabled())
+            || registration
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &registration.handler))
+        {
+            return Err(Error::Ownership);
+        }
+        let lease = registration
+            .handler
+            .conversation_cleanup_identity_lease()
+            .map_err(|failure| match failure {
+                crate::nested_identity::LeaseFailure::Busy => Error::Busy,
+                crate::nested_identity::LeaseFailure::Mismatch => Error::Ownership,
+            })?;
+        leases.push(lease);
+    }
+    Ok(leases)
+}
+
 /// The terminal marker must have been committed with the cancelled root and
 /// the caller must retain its registration and identity through publication.
 pub(crate) fn authenticated_parked_terminal_descendants(
