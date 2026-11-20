@@ -1654,10 +1654,32 @@ async fn exercise_conversation_park_claim(case: &str) {
         let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
         if matches!(
             case,
-            "selection_hook_marker_conflict"
-                | "selection_hook_snapshot_conflict"
-                | "selection_hook_memo_conflict"
+            "selection_hook_marker_conflict" | "selection_hook_snapshot_conflict"
         ) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while after_calls.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let report = driver.shutdown_with_pending().unwrap();
+            let known = report
+                .pending()
+                .iter()
+                .filter_map(|p| p.completed())
+                .filter_map(|c| c.known_conversation_cancel())
+                .next()
+                .expect("known result retained");
+            assert!(known.after_result().is_some());
+            assert!(known.has_snapshot_check());
+            assert!(known.identity().is_some());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+            assert!(store.get(key.as_bytes()).unwrap().is_none());
+            return;
+        }
+        if case == "selection_hook_memo_conflict" {
             tokio::time::timeout(Duration::from_secs(10), async {
                 while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
