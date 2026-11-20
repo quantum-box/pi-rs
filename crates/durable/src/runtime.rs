@@ -14805,6 +14805,81 @@ impl Harness {
         .map(|result| result.expect("woken graph has a fixed root").0)
     }
 
+    /// Caller holds the discovered conversation controls and a registry lease.
+    /// Revalidate the wake, selection and identity under the task gate and keep
+    /// those guards until the owned graph and wake transition commit together.
+    #[allow(dead_code)]
+    pub(crate) fn authenticated_scoped_woken_abort_graph(
+        &mut self,
+        expected: &crate::task_store::StoredTask,
+        registry: &crate::task_scheduler::Registry,
+        targets: &[Uuid],
+    ) -> Result<Vec<Uuid>, Error> {
+        let owner = self.owner.clone();
+        let gate = match owner.task_gate().try_lock() {
+            Ok(gate) => gate,
+            Err(durable_store::controls::PollGateError::Busy) => {
+                return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
+            }
+            Err(durable_store::controls::PollGateError::Poisoned) => return Err(Error::Failed),
+            Err(durable_store::controls::PollGateError::Reentrant) => {
+                return Err(Error::ReentrantAbort);
+            }
+        };
+        let selection_gate = self.checkpointable_extension_gate();
+        let _selection = selection_gate.lock().map_err(|_| Error::Failed)?;
+        let handler = registry
+            .conversation_receipt_handler(&expected.task)
+            .ok_or_else(|| Error::Invalid("woken registration changed".into()))?;
+        if !handler.conversation_woken_cancel_enabled() {
+            return Err(Error::Invalid("woken cancellation disabled".into()));
+        }
+        let _identity =
+            handler
+                .conversation_cleanup_identity_lease()
+                .map_err(|error| match error {
+                    crate::nested_identity::LeaseFailure::Busy => {
+                        Error::TaskScheduler(crate::task_scheduler::Error::Busy)
+                    }
+                    crate::nested_identity::LeaseFailure::Mismatch => {
+                        Error::Invalid("woken identity changed".into())
+                    }
+                })?;
+        let store = owner.store();
+        let graph = crate::ownership_edge::CleanupGraph::load(store)
+            .map_err(|error| Error::Invalid(format!("woken ownership graph: {error}")))?;
+        if graph.uncertain_task(expected.task.id()) {
+            return Err(Error::Invalid("uncertain woken ownership graph".into()));
+        }
+        let boundary = store.put_version()?;
+        let (attempt, mut checks) =
+            crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
+                store,
+                &expected.task,
+                boundary,
+            )
+            .map_err(Error::Invalid)?;
+        if expected.task.attempt_id() != Some(attempt) {
+            return Err(Error::Invalid("woken attempt changed".into()));
+        }
+        checks.extend(self.checkpointable_conversation_checks(&expected.task, registry)?);
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            None,
+            Some(expected.task.id()),
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some((false, targets)),
+            None,
+            Some((expected, &checks)),
+            || {},
+        )
+        .map(|result| result.expect("woken graph has a fixed root").0)
+    }
+
     // Discovery is read-only; commit repeats the graph scan under the task
     // gate and refuses any conversation outside the acquired scope.
     fn scoped_direct_abort(

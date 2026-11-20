@@ -7552,7 +7552,7 @@ impl DurableAsyncTool for WokenAnyFixture {
     }
 }
 
-fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_driver::Driver) {
+fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extension::Registry) {
     use crate::async_task_tool::{
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel,
         register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel,
@@ -7704,6 +7704,11 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
         max_turns: 4,
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
+    (options, registry, extensions)
+}
+
+fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_driver::Driver) {
+    let (options, registry, extensions) = build_woken_any(path);
     let scheduler = Scheduler::open_with_extensions(path, options, extensions).unwrap();
     let driver = scheduler.start_tasks(registry).unwrap();
     (scheduler, driver)
@@ -7882,15 +7887,7 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
     child.kill().unwrap();
     child.wait().unwrap();
     let path = dir.path().join("db");
-    let options = Options {
-        model: Arc::new(ModelStub {
-            arguments: "{}".into(),
-        }),
-        tools: vec![],
-        restart_limit: 4,
-        max_turns: 4,
-        uncertain_policy: UncertainPolicy::RequireReconciliation,
-    };
+    let (options, registry, _extensions) = build_woken_any(&path);
     let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
     let conversation = harness
         .create_conversation(Config {
@@ -7960,7 +7957,7 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         root
     );
     harness
-        .scoped_woken_abort_graph(&root, &proof, &[conversation])
+        .authenticated_scoped_woken_abort_graph(&root, &registry, &[conversation])
         .unwrap();
     assert!(harness.conversation(conversation).unwrap().abort_requested);
     let recovered = crate::task_store::TaskStore::new(&store)
