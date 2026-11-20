@@ -3314,6 +3314,8 @@ fn checkpointable_root_binding_key(task: Uuid) -> Vec<u8> {
 }
 
 struct TaskResultFence {
+    // Mutable host identity remains pinned until the conversation save commits.
+    _cancel_identity: Option<crate::nested_identity::IdentityLease>,
     rich: Option<crate::extension::ToolBlockResult>,
     evidence: Vec<Check>,
     task: crate::task::Task,
@@ -11762,7 +11764,56 @@ impl Harness {
                 "checkpointable cleanup attempt unavailable".into(),
             ));
         }
-        self.checkpointable_conversation_checks_inner(task, registry, true, false)
+        let crate::task::TaskOwner::Conversation(id) = task.owner() else {
+            unreachable!()
+        };
+        let entry = self
+            .owner
+            .store()
+            .get(&Self::key(*id))?
+            .ok_or(Error::NotFound)?;
+        let conversation: Conversation = serde_json::from_slice(&entry.value)?;
+        if let Phase::TaskPending { ref identity, .. } = conversation.phase
+            && let Some(identity) = identity
+                .as_ref()
+                .filter(|identity| identity.has_conversation_hooks())
+            && self
+                .tools
+                .get(identity.tool_name())
+                .and_then(|registered| crate::task_tool::lookup(&registered.tool))
+                .is_none_or(|adapter| adapter.identity().as_ref() != Some(identity))
+        {
+            return Err(Error::Invalid(
+                "selected cancel root must be a Harness tool".into(),
+            ));
+        }
+        if let Phase::TaskPending {
+            ref calls,
+            index,
+            ref identity,
+            ..
+        } = conversation.phase
+            && identity
+                .as_ref()
+                .is_some_and(crate::task_tool::Identity::has_conversation_hooks)
+            && calls.get(index).is_some_and(|call| {
+                conversation
+                    .tool_filters
+                    .output_schemas
+                    .contains_key(&call.name)
+            })
+        {
+            return Err(Error::Invalid(
+                "selected cancel after output schema is unsupported".into(),
+            ));
+        }
+        let mut checks =
+            self.checkpointable_conversation_checks_inner(task, registry, true, false)?;
+        checks.push(Check {
+            key: Self::key(*id),
+            expected: Expected::Version(entry.version),
+        });
+        Ok(checks)
     }
 
     /// Provisional conversation and root checks for a stopped cleanup. These
@@ -11988,8 +12039,10 @@ impl Harness {
             .ok_or_else(|| Error::Invalid("missing terminal marker".into()))?;
         let marker: crate::task_scheduler::ConversationCancelTerminalMarker =
             serde_json::from_slice(&marker_entry.value)?;
-        if marker.version != 1
-            || marker.claim_id != claim.claim_id
+        if !matches!(
+            (marker.version, marker.receipt_version),
+            (1, None) | (2, Some(_))
+        ) || marker.claim_id != claim.claim_id
             || marker.attempt != claim.attempt
             || marker.running_task_version == 0
             || marker.terminal_task != task.task
@@ -12019,6 +12072,9 @@ impl Harness {
             .into_bytes();
         let entry = store.get(&key)?;
         let receipt = if let Some(entry) = entry {
+            if marker.version == 2 && marker.receipt_version != Some(entry.version) {
+                return Err(Error::Invalid("terminal receipt version changed".into()));
+            }
             let receipt: crate::task_scheduler::ConversationCancelReceipt =
                 serde_json::from_slice(&entry.value)?;
             crate::task_scheduler::validate_conversation_cancel_receipt(&receipt, &claim)
@@ -12029,6 +12085,9 @@ impl Harness {
             });
             Some(receipt)
         } else {
+            if marker.version == 2 {
+                return Err(Error::Invalid("terminal receipt missing".into()));
+            }
             checks.push(Check {
                 key,
                 expected: Expected::Missing,
@@ -15636,6 +15695,7 @@ impl Harness {
         };
         let mut rich_result = None;
         let mut result_evidence = Vec::new();
+        let mut cancel_identity = None;
         let outcome = match child.task.state() {
             crate::task::TaskState::Succeeded(value)
                 if child.task.kind() == Some(crate::foreground_subagent::KIND)
@@ -15725,6 +15785,133 @@ impl Harness {
             // from an interrupted effect. Do not turn uncertainty into a known result.
             crate::task::TaskState::Failed(reason) => Some(Outcome::Unknown(reason.clone())),
             crate::task::TaskState::Cancelled
+                if identity.is_checkpointable()
+                    && !identity.replay_safe
+                    && identity.has_conversation_hooks()
+                    && self
+                        .tools
+                        .get(identity.tool_name())
+                        .and_then(|registered| crate::task_tool::lookup(&registered.tool))
+                        .is_some_and(|adapter| {
+                            adapter.handler().conversation_cancel_dispatch_enabled()
+                        }) =>
+            {
+                let store = self.owner.store();
+                let boundary = store.put_version()?;
+                let adapter = self
+                    .tools
+                    .get(identity.tool_name())
+                    .and_then(|registered| crate::task_tool::lookup(&registered.tool))
+                    .ok_or_else(|| Error::Invalid("cancel adapter missing".into()))?;
+                if adapter.identity().as_ref() != Some(identity) {
+                    return Err(Error::Invalid("cancel adapter changed".into()));
+                }
+                let handler = adapter.handler();
+                if !handler.conversation_cancel_dispatch_enabled() {
+                    return Err(Error::Invalid("hooked cancel dispatch not enabled".into()));
+                }
+                cancel_identity = Some(
+                    handler
+                        .conversation_cleanup_identity_lease()
+                        .map_err(|_| Error::Invalid("cancel identity unavailable".into()))?,
+                );
+                let marker_key = crate::task_scheduler::conversation_cancel_terminal_key(task);
+                let marker_entry = store
+                    .get(&marker_key)?
+                    .ok_or_else(|| Error::Invalid("missing cancel terminal evidence".into()))?;
+                let marker: crate::task_scheduler::ConversationCancelTerminalMarker =
+                    serde_json::from_slice(&marker_entry.value)?;
+                if marker.version != 2
+                    || marker.terminal_task != child.task
+                    || marker.running_task_version == 0
+                    || store.commit_for_version(&crate::task_store::key(task), child.version)?
+                        != store.commit_for_version(&marker_key, marker_entry.version)?
+                    || store
+                        .commit_for_version(&marker_key, marker_entry.version)?
+                        .is_none()
+                {
+                    return Err(Error::Invalid("cancel terminal evidence mismatch".into()));
+                }
+                let (claim, claim_check) = crate::task_scheduler::read_conversation_cancel_claim(
+                    store,
+                    task,
+                    marker.attempt,
+                    marker.claim_id,
+                )
+                .map_err(Error::Invalid)?
+                .ok_or_else(|| Error::Invalid("cancel claim missing".into()))?;
+                if claim.checkpoint != *child.task.checkpoint()
+                    || Some(claim.kind.as_str()) != child.task.kind()
+                    || claim.definition_version != child.task.definition_version()
+                {
+                    return Err(Error::Invalid("cancel claim changed".into()));
+                }
+                let receipt_key =
+                    format!("durable/replay-safe-async/{task}/conversation-park-cancel-receipt")
+                        .into_bytes();
+                let entry = store
+                    .get(&receipt_key)?
+                    .ok_or_else(|| Error::Invalid("cancel receipt missing".into()))?;
+                if marker.receipt_version != Some(entry.version) {
+                    return Err(Error::Invalid(
+                        "cancel receipt version changed; reconciliation required".into(),
+                    ));
+                }
+                let receipt: crate::task_scheduler::ConversationCancelReceipt =
+                    serde_json::from_slice(&entry.value)?;
+                crate::task_scheduler::validate_conversation_cancel_receipt(&receipt, &claim)
+                    .map_err(Error::Invalid)?;
+                if receipt.version != 2 {
+                    return Err(Error::Invalid("cancel after result missing".into()));
+                }
+                let value = receipt
+                    .after_result
+                    .ok_or_else(|| Error::Invalid("cancel after result missing".into()))?;
+                let crate::async_task_tool::DurableTaskResult::Rich {
+                    task_content_v1: result,
+                } = serde_json::from_value(value)
+                    .map_err(|_| Error::Invalid("invalid cancel after result".into()))?
+                else {
+                    return Err(Error::Invalid("invalid cancel after result".into()));
+                };
+                result_evidence.push(claim_check);
+                result_evidence.push(Check {
+                    key: marker_key,
+                    expected: Expected::Version(marker_entry.version),
+                });
+                result_evidence.push(Check {
+                    key: receipt_key,
+                    expected: Expected::Version(entry.version),
+                });
+                result_evidence.extend(
+                    crate::async_task_tool::unsafe_park_proof::cancel_checks(
+                        store,
+                        &child.task,
+                        boundary,
+                    )
+                    .map_err(Error::Invalid)?,
+                );
+                let descendants = crate::task_store::TaskStore::new(store)
+                    .list()
+                    .map_err(|e| Error::Invalid(format!("cancel descendants: {e}")))?;
+                let (uncertain, descendant_checks) =
+                    crate::task_scheduler::unsafe_descendant_reconciliation(
+                        store,
+                        task,
+                        &descendants,
+                        boundary,
+                    )
+                    .map_err(|e| Error::Invalid(format!("cancel descendants: {e}")))?;
+                if uncertain.is_some() {
+                    return Err(Error::Invalid(
+                        "unsafe descendant requires reconciliation".into(),
+                    ));
+                }
+                result_evidence.extend(descendant_checks);
+                rich_result = Some(result);
+                Some(Outcome::Succeeded(String::new()))
+            }
+            crate::task::TaskState::Cancelled
                 if identity.is_checkpointable() && !identity.replay_safe =>
             {
                 Some(Outcome::Unknown(
@@ -15738,6 +15925,7 @@ impl Harness {
             (
                 outcome,
                 TaskResultFence {
+                    _cancel_identity: cancel_identity,
                     rich: rich_result,
                     evidence: result_evidence,
                     task: child.task.clone(),

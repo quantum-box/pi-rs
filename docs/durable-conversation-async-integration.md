@@ -1,6 +1,6 @@
 # Conversation-owned checkpointable async tools: integration design
 
-Status: explicitly registered replay-safe conversation-owned checkpointable Tools support either no hook or an ordered selection of identified replay-safe hooks. Unhooked unsafe checkpointable conversation task trees are supported through a separate explicit opt-in. Selected replay-safe hooks are also available for unsafe Tools through a separate explicit registration. Task-owned conversations and cancellation APIs for external jobs are unsupported and fail closed. Generic conversation TaskTools continue to use the existing path.
+Status: explicitly registered replay-safe conversation-owned checkpointable Tools support either no hook or an ordered selection of identified replay-safe hooks. Unhooked unsafe checkpointable conversation task trees are supported through a separate explicit opt-in. Selected replay-safe hooks are also available for unsafe Tools through a separate explicit registration. Explicit at-most-once external cancellation is supported for confirmed parked conversation roots, including an opt-in for selected hooks; see [cancellation limits](durable-conversation-cancel-design.md). Task-owned conversations, nested cancellation callbacks and woken conversation cancellation remain unsupported and fail closed. Generic conversation TaskTools continue to use the existing path.
 
 ## Reference and current boundary
 

@@ -22,8 +22,8 @@ redispatch the same claim. A process interruption recovers the original claim
 and matching markers into a reconciliation-required terminal task. The callback
 is bounded to 30 seconds and must cooperate with cancellation and avoid detached
 work. Direct Store writes outside the public mutation APIs are a trusted-host
-boundary. Nested cancel callbacks, selected hooks and woken cancellation remain
-unsupported by this opt-in.
+boundary. Nested cancel callbacks and woken cancellation remain unsupported by
+this opt-in.
 
 `register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel`
 records a selected-hook identity and a cancel identity in one definition. It
@@ -31,22 +31,37 @@ does not enable callback dispatch. Aborting a parked call still requires
 reconciliation; in particular, this registration does not yet authorize the
 callback or run the conversation after hook on abort.
 
-The claim, start-marker and receipt transactions now hold the selection gate
+`register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel`
+is a separate explicit opt-in for a conversation root with selected replay-safe
+hooks. Its definition identity differs from the registration-only form; hosts
+must retain the original registration for existing parked tasks. Abort cleanup
+waits for owned children before invoking the callback and fences unresolved
+unsafe descendant evidence at claim, receipt, settlement and publication. The selected after hook
+runs with the committed conversation snapshot and prepared arguments. It may
+not use memo storage during abort cleanup: attempting that, a hook error or a
+timeout, or a conflict saving the after result, retains a confirmed callback
+receipt when it can be safely committed and requires reconciliation for the
+incomplete after result. Hook output schemas on this
+abort path are not supported. Nested child callbacks and woken cancellation are
+not enabled by this registration. Result publication currently requires the
+root adapter in the Harness tool list; an extension-only tool is rejected before
+callback dispatch.
+
+The claim, start-marker and receipt transactions hold the selection gate
 from validation through commit. A per-name, nonblocking selection start lease
 is acquired before the claim and is wired to release after the callback's first
 poll. Selected registry updates return busy during that lease; updates to other
-names remain independent. The selected-hook registration still disables
-callback dispatch: the new lease has not yet been validated by the complete
-hooked callback and process-recovery test matrix. A test-only dispatch exercises
-the real driver's claim, start marker, first poll and receipt. Killing the
-process immediately before or during the first poll recovers as unknown without
-another dispatch; a late pending outcome remains available for reconciliation.
-These tests do not enable the public registration or prove after-hook settlement.
-
-A confirmed cancel receipt must also be linked to replay-safe after-hook evidence and the
-conversation's terminal result; a crash or unknown callback result cannot be
-converted to a successful abort or cause a second callback. The registration
-and claim tests do not establish that property and must not be used to enable dispatch.
+names remain independent. The version 2 receipt contains both the confirmed
+callback result and bounded after output in one checked write; the terminal
+marker is committed with the task transition. The after hook's conversation
+snapshot version is checked in the receipt transaction. Conversation publication checks
+the claim, marker, receipt, park evidence and current identity. A process killed
+before or during the first poll remains unknown without another dispatch. A
+committed after receipt can be recovered after a process stop only when those
+checks still hold; a late pending outcome remains available for reconciliation.
+Version 1 receipts continue to represent callback-only evidence. Older runtimes
+that do not understand version 2 cannot safely publish its after result; keep
+the upgraded runtime or reconcile the task before downgrading.
 
 `DurableParkCancel::cancel_scoped` supplies an explicit callback scope. When a
 callback uses a joined Tokio task, it must pass the scope into that task and

@@ -364,6 +364,9 @@ pub(crate) struct Identity {
     conversation_selection: Option<crate::extension::StableExtensionSelection>,
 }
 impl Identity {
+    pub(crate) fn tool_name(&self) -> &str {
+        &self.spec.name
+    }
     pub(crate) fn has_conversation_hooks(&self) -> bool {
         self.conversation_hooks
     }

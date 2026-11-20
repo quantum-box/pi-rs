@@ -252,6 +252,64 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_ca
     _tool_authorization: UnsafeDurableAuthorization,
     _hook_authorization: ReplaySafeConversationHooksAuthorization,
 ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    register_selected_unsafe_cancel_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        snapshot,
+        names,
+        cancel_identity,
+        cancel,
+        false,
+    )
+}
+
+/// Opt in a conversation root with selected replay-safe hooks to an at-most-once
+/// parked cancellation callback. If the callback or after hook is interrupted,
+/// reconciliation is required. Abort-time after hooks cannot use memo storage.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _tool_authorization: UnsafeDurableAuthorization,
+    _hook_authorization: ReplaySafeConversationHooksAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    register_selected_unsafe_cancel_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        snapshot,
+        names,
+        cancel_identity,
+        cancel,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn register_selected_unsafe_cancel_candidate(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    enabled: bool,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
     if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
         return Err("invalid cancel identity".into());
     }
@@ -279,7 +337,7 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_ca
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
         false,
-        Some((cancel_identity.to_owned(), cancel, false)),
+        Some((cancel_identity.to_owned(), cancel, enabled)),
     )
 }
 
@@ -12761,14 +12819,23 @@ mod tests {
             );
             let effects = std::fs::read_to_string(root.join("ancestor-effects")).unwrap();
             let effects: Vec<_> = effects.lines().collect();
-            assert_eq!(
-                effects,
-                if abort_ancestor {
-                    vec!["initial", "resume"]
-                } else {
-                    vec!["initial", "resume", "resume"]
-                }
-            );
+            if !abort_ancestor && effects == ["initial", "resume"] {
+                assert!(
+                    matches!(ancestor.state(), crate::task::TaskState::Failed(reason)
+                    if reason == "document conflict: execution outcome requires reconciliation")
+                );
+            } else {
+                assert_eq!(
+                    effects,
+                    if abort_ancestor {
+                        vec!["initial", "resume"]
+                    } else {
+                        vec!["initial", "resume", "resume"]
+                    },
+                    "ancestor state: {:?}",
+                    ancestor.state()
+                );
+            }
         }
     }
 

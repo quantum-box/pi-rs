@@ -276,6 +276,8 @@ pub(crate) struct ConversationCancelReceipt {
     pub version: u32,
     pub claim: ConversationCancelClaim,
     pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_result: Option<Value>,
 }
 
 /// Check the immutable claim before treating the receipt as evidence. The
@@ -286,7 +288,14 @@ pub(crate) fn validate_conversation_cancel_receipt(
     receipt: &ConversationCancelReceipt,
     claim: &ConversationCancelClaim,
 ) -> Result<(), String> {
-    if receipt.version != 1
+    let valid_version = match (receipt.version, &receipt.after_result) {
+        (1, None) => true,
+        (2, Some(after)) if receipt.result == "callback returned" => {
+            crate::async_task_tool::validate_aborted_after_result(after).is_ok()
+        }
+        _ => false,
+    };
+    if !valid_version
         || receipt.claim != *claim
         || claim.version != 2
         || claim.claim_id.is_nil()
@@ -311,6 +320,8 @@ pub(crate) struct ConversationCancelTerminalMarker {
     pub attempt: Uuid,
     pub running_task_version: u64,
     pub terminal_task: Task,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_version: Option<u64>,
 }
 pub(crate) fn conversation_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-terminal").into_bytes()
@@ -1676,6 +1687,21 @@ fn conversation_receipt_saved_hooks() -> &'static BoundaryHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn conversation_receipt_before_commit_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_receipt_before_commit(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    conversation_receipt_before_commit_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 pub(crate) fn on_conversation_receipt_saved(id: Uuid, hook: impl FnOnce() + Send + 'static) {
     conversation_receipt_saved_hooks()
         .lock()
@@ -1691,6 +1717,21 @@ pub(crate) fn report_conversation_receipt_saved(id: Uuid) {
 fn conversation_settlement_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
     HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+fn conversation_after_settlement_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_cancel_after_settlement(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    conversation_after_settlement_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
 }
 #[cfg(test)]
 pub(crate) fn on_conversation_cancel_settlement(id: Uuid, hook: impl FnOnce() + Send + 'static) {
@@ -1712,20 +1753,6 @@ pub(crate) fn enable_test_conversation_start(id: Uuid) {
 #[cfg(test)]
 pub(crate) fn take_test_conversation_start(id: Uuid) -> bool {
     test_start_tasks().lock().unwrap().remove(&id)
-}
-
-#[cfg(test)]
-fn test_selected_dispatch_tasks() -> &'static Mutex<HashSet<Uuid>> {
-    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
-    TASKS.get_or_init(Default::default)
-}
-#[cfg(test)]
-pub(crate) fn enable_test_selected_dispatch(id: Uuid) {
-    test_selected_dispatch_tasks().lock().unwrap().insert(id);
-}
-#[cfg(test)]
-pub(crate) fn take_test_selected_dispatch(id: Uuid) -> bool {
-    test_selected_dispatch_tasks().lock().unwrap().remove(&id)
 }
 
 #[cfg(test)]
@@ -2959,6 +2986,17 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
         checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
             owner.store(),
             &current.task,
@@ -3161,6 +3199,17 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
         checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
             owner.store(),
             &current.task,
@@ -3281,6 +3330,7 @@ impl AdmissionHandle<'_> {
             identity_lease,
             expected_identity,
             None,
+            None,
         )
     }
 
@@ -3301,7 +3351,56 @@ impl AdmissionHandle<'_> {
             identity_lease,
             expected_identity,
             Some(marker),
+            None,
         )
+    }
+
+    pub(crate) fn store_conversation_cancel_receipt_and_after(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        snapshot_check: &durable_store::Check,
+    ) -> Result<(), String> {
+        if receipt.version != 2 || receipt.after_result.is_none() {
+            return Err("missing cancel after evidence".into());
+        }
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            Some(marker),
+            Some(snapshot_check),
+        )
+    }
+
+    pub(crate) fn conversation_cancel_hook_snapshot(
+        &self,
+    ) -> Result<(Value, durable_store::Check), String> {
+        let TaskOwner::Conversation(id) = self.running.task.owner() else {
+            return Err("cancel hook requires root conversation".into());
+        };
+        let key = crate::runtime::Harness::key(*id);
+        let entry = self
+            .lease
+            .attachment
+            .owner
+            .store()
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing conversation")?;
+        let snapshot = serde_json::from_slice(&entry.value)
+            .map_err(|e| format!("invalid conversation snapshot: {e}"))?;
+        Ok((
+            snapshot,
+            durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(entry.version),
+            },
+        ))
     }
 
     fn store_conversation_cancel_receipt_inner(
@@ -3311,6 +3410,7 @@ impl AdmissionHandle<'_> {
         identity_lease: &crate::nested_identity::IdentityLease,
         expected_identity: &str,
         marker: Option<&[u8]>,
+        snapshot_check: Option<&durable_store::Check>,
     ) -> Result<(), String> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
@@ -3378,6 +3478,30 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
+        if let Some(check) = snapshot_check {
+            let TaskOwner::Conversation(id) = current.task.owner() else {
+                return Err("cancel snapshot owner changed".into());
+            };
+            if check.key != crate::runtime::Harness::key(*id)
+                || !matches!(check.expected, durable_store::Expected::Version(_))
+            {
+                return Err("invalid cancel snapshot fence".into());
+            }
+            checks.push(check.clone());
+        } else if receipt.version == 2 {
+            return Err("missing cancel snapshot fence".into());
+        }
         checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
             owner.store(),
             &current.task,
@@ -3458,6 +3582,11 @@ impl AdmissionHandle<'_> {
             mutations.extend(conversation_finish.mutations);
             mutations.extend(task_finish.mutations);
         }
+        #[cfg(test)]
+        invoke_boundary(
+            conversation_receipt_before_commit_hooks(),
+            current.task.id(),
+        );
         owner
             .store()
             .commit_with_prefix_put_fence(
@@ -7355,6 +7484,22 @@ impl Scheduler {
                             return Err(Error::Registration);
                         }
                         if reg.handler.conversation_cancel_dispatch_enabled() {
+                            let selected_hooks = reg
+                                .conversation_checkpointable
+                                .as_ref()
+                                .is_some_and(|(_, _, selection)| selection.is_some());
+                            let selection_gate = selected_hooks
+                                .then(|| {
+                                    self.validator
+                                        .as_ref()
+                                        .map(|h| h.checkpointable_extension_gate())
+                                })
+                                .flatten();
+                            let _selection = selection_gate
+                                .as_ref()
+                                .map(|gate| gate.lock())
+                                .transpose()
+                                .map_err(|_| Error::Poisoned)?;
                             let _identity = reg
                                 .handler
                                 .conversation_cleanup_identity_lease()
@@ -7389,6 +7534,7 @@ impl Scheduler {
                                 || claim.checkpoint != *running.task.checkpoint()
                                 || receipt.result != "callback returned"
                                 || running.task.replay_safe()
+                                || selected_hooks != (receipt.version == 2)
                             {
                                 return Err(Error::Ownership);
                             }
@@ -7427,6 +7573,7 @@ impl Scheduler {
                                     attempt: claim.attempt,
                                     running_task_version: running.version,
                                     terminal_task: next.task.clone(),
+                                    receipt_version: None,
                                 };
                                 let terminal_key =
                                     conversation_cancel_terminal_key(running.task.id());
@@ -7453,6 +7600,18 @@ impl Scheduler {
                             if has_live_owned(store, running.task.id(), &self.ts().list()?)? {
                                 return Err(Error::Ownership);
                             }
+                            let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+                                store,
+                                running.task.id(),
+                                &self.ts().list()?,
+                                boundary,
+                            )?;
+                            if uncertain.is_some() {
+                                return Err(Error::Handler(
+                                    "unsafe descendant requires reconciliation".into(),
+                                ));
+                            }
+                            checks.extend(descendant_checks);
                             let mut next = running.clone();
                             next.task.cancel().map_err(Error::Transition)?;
                             let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
@@ -7462,6 +7621,27 @@ impl Scheduler {
                                 key: receipt_key,
                                 expected: durable_store::Expected::Version(entry.version),
                             });
+                            if selected_hooks {
+                                let terminal_key =
+                                    conversation_cancel_terminal_key(running.task.id());
+                                let terminal = ConversationCancelTerminalMarker {
+                                    version: 2,
+                                    claim_id: claim.claim_id,
+                                    attempt: claim.attempt,
+                                    running_task_version: running.version,
+                                    terminal_task: next.task.clone(),
+                                    receipt_version: Some(entry.version),
+                                };
+                                batch.checks.push(durable_store::Check {
+                                    key: terminal_key.clone(),
+                                    expected: durable_store::Expected::Missing,
+                                });
+                                batch.mutations.push(durable_store::Mutation::Put {
+                                    key: terminal_key,
+                                    value: serde_json::to_vec(&terminal)
+                                        .map_err(|e| Error::Handler(e.to_string()))?,
+                                });
+                            }
                             #[cfg(test)]
                             invoke_boundary(conversation_settlement_hooks(), running.task.id());
                             store
@@ -7480,6 +7660,11 @@ impl Scheduler {
                                     },
                                 )
                                 .map_err(task_store::Error::from)?;
+                            #[cfg(test)]
+                            invoke_boundary(
+                                conversation_after_settlement_hooks(),
+                                running.task.id(),
+                            );
                         } else {
                             let entry = self
                                 .ts()
@@ -7560,6 +7745,7 @@ impl Scheduler {
                                 attempt: claim.attempt,
                                 running_task_version: running.version,
                                 terminal_task: next.task.clone(),
+                                receipt_version: None,
                             };
                             let key = conversation_cancel_terminal_key(running.task.id());
                             let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
@@ -9969,19 +10155,111 @@ impl Scheduler {
                                 "conversation terminal claim mismatch".into(),
                             ));
                         }
+                        // A versioned after receipt certifies that both the callback
+                        // and the replay-safe after hook returned. It can be used
+                        // only while the original registration, identity, owner,
+                        // park proof, and graph still match the same transaction.
+                        let receipt_key = format!(
+                            "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+                            item.task.id()
+                        )
+                        .into_bytes();
+                        let receipt_entry =
+                            store.get(&receipt_key).map_err(task_store::Error::from)?;
+                        let selection_gate = receipt_entry.as_ref().and_then(|_| {
+                            self.validator
+                                .as_ref()
+                                .map(|h| h.checkpointable_extension_gate())
+                        });
+                        let _selection = selection_gate
+                            .as_ref()
+                            .map(|gate| gate.lock())
+                            .transpose()
+                            .map_err(|_| Error::Poisoned)?;
+                        let mut recovered_checks = Vec::new();
+                        let mut _recovered_identity = None;
+                        let mut recovered_after = false;
+                        if let (Some(receipt_entry), Ok(reg), Some(harness)) = (
+                            &receipt_entry,
+                            self.registered(&item.task),
+                            self.validator.as_ref(),
+                        ) && reg.handler.conversation_cancel_dispatch_enabled()
+                            && reg
+                                .conversation_checkpointable
+                                .as_ref()
+                                .is_some_and(|(_, _, selection)| selection.is_some())
+                            && let Ok(receipt) = serde_json::from_slice::<ConversationCancelReceipt>(
+                                &receipt_entry.value,
+                            )
+                            && receipt.version == 2
+                            && validate_conversation_cancel_receipt(&receipt, &claim).is_ok()
+                        {
+                            match reg.handler.conversation_cleanup_identity_lease() {
+                                Ok(identity) => {
+                                    let owner_checks = harness
+                                        .checkpointable_cancel_conversation_checks(
+                                            &item.task,
+                                            &self.registry,
+                                        );
+                                    let park_checks =
+                                        crate::async_task_tool::unsafe_park_proof::cancel_checks(
+                                            store,
+                                            &item.task,
+                                            recovery_graph_version,
+                                        );
+                                    if let (Ok(owner_checks), Ok(park_checks)) =
+                                        (owner_checks, park_checks)
+                                        && !has_live_owned(
+                                            store,
+                                            item.task.id(),
+                                            &self.ts().list()?,
+                                        )?
+                                    {
+                                        let (uncertain, descendant_checks) =
+                                            unsafe_descendant_reconciliation(
+                                                store,
+                                                item.task.id(),
+                                                &self.ts().list()?,
+                                                recovery_graph_version,
+                                            )?;
+                                        if uncertain.is_none() {
+                                            recovered_checks.extend(owner_checks);
+                                            recovered_checks.extend(park_checks);
+                                            recovered_checks.extend(descendant_checks);
+                                            _recovered_identity = Some(identity);
+                                            recovered_after = true;
+                                        }
+                                    }
+                                }
+                                Err(crate::nested_identity::LeaseFailure::Busy) => {
+                                    self.deferred_recovery.extend(deferred);
+                                    self.deferred_recovery.insert(item.task.id());
+                                    return Ok(());
+                                }
+                                Err(_) => (),
+                            }
+                        }
                         let mut next = item.clone();
-                        next.task
-                            .fail(
+                        if recovered_after {
+                            next.task.cancel().map_err(Error::Transition)?;
+                        } else {
+                            next.task.fail(
                                 "interrupted conversation cancel claim; reconciliation required"
                                     .into(),
                             )
                             .map_err(Error::Transition)?;
+                        }
                         let marker = ConversationCancelTerminalMarker {
-                            version: 1,
+                            version: if recovered_after { 2 } else { 1 },
                             claim_id: claim.claim_id,
                             attempt: claim.attempt,
                             running_task_version: item.version,
                             terminal_task: next.task.clone(),
+                            receipt_version: if recovered_after {
+                                receipt_entry.as_ref().map(|entry| entry.version)
+                            } else {
+                                None
+                            },
                         };
                         let marker_key = conversation_cancel_terminal_key(item.task.id());
                         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
@@ -10003,8 +10281,24 @@ impl Scheduler {
                             .get(&conversation_marker_key)
                             .map_err(task_store::Error::from)?;
                         match (task_start, conversation_start) {
-                            (None, None) => (),
+                            (None, None) => {
+                                if recovered_after {
+                                    batch.checks.push(durable_store::Check {
+                                        key: task_marker_key.clone(),
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                    batch.checks.push(durable_store::Check {
+                                        key: conversation_marker_key.clone(),
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                            }
                             (Some(task_start), Some(conversation_start)) => {
+                                if recovered_after {
+                                    return Err(Error::Handler(
+                                        "completed receipt has live start markers".into(),
+                                    ));
+                                }
                                 let expected = serde_json::to_vec(&serde_json::json!({
                                     "version": 1, "claim_id": claim.claim_id,
                                     "task": claim.task, "attempt": claim.attempt,
@@ -10052,6 +10346,15 @@ impl Scheduler {
                                 expected: durable_store::Expected::Missing,
                             },
                         ]);
+                        batch.checks.push(durable_store::Check {
+                            key: receipt_key,
+                            expected: receipt_entry
+                                .as_ref()
+                                .map_or(durable_store::Expected::Missing, |entry| {
+                                    durable_store::Expected::Version(entry.version)
+                                }),
+                        });
+                        batch.checks.extend(recovered_checks);
                         batch.mutations.push(durable_store::Mutation::Put {
                             key: marker_key,
                             value: serde_json::to_vec(&marker)
@@ -10068,7 +10371,7 @@ impl Scheduler {
                             }
                         }
                         #[allow(unused_mut)]
-                        let mut commit = if independent_only {
+                        let mut commit = if independent_only || recovered_after {
                             store.commit_with_prefix_put_fence(
                                 &batch.checks,
                                 &batch.mutations,
@@ -14201,7 +14504,7 @@ fn has_unmarked_nested(parent: Uuid, tasks: &[task_store::StoredTask]) -> bool {
 // A held success was decided while descendants still ran. Never publish it if
 // any unsafe descendant ended without a resolved task outcome. The evidence
 // namespace is fenced alongside the graph commit, including absent intents.
-fn unsafe_descendant_reconciliation(
+pub(crate) fn unsafe_descendant_reconciliation(
     store: &durable_store::Store,
     parent: Uuid,
     tasks: &[task_store::StoredTask],
@@ -29937,6 +30240,7 @@ mod conversation_cancel_claim_schema_tests {
             version: 1,
             claim: claim.clone(),
             result: "test".into(),
+            after_result: None,
         };
         assert!(validate_conversation_cancel_receipt(&receipt, &claim).is_ok());
         for index in 0..5 {
@@ -29953,7 +30257,27 @@ mod conversation_cancel_claim_schema_tests {
         let mut invalid = receipt.clone();
         invalid.version = 2;
         assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
+        let after = crate::async_task_tool::DurableTaskResult::Rich {
+            task_content_v1: crate::extension::ToolBlockResult {
+                output: vec![json!({"type":"text","text":"cancelled"})],
+                diagnostics: vec![crate::runtime::ToolDiagnostic {
+                    severity: crate::runtime::DiagnosticSeverity::Error,
+                    code: Some("aborted".into()),
+                    message: "Tool was aborted".into(),
+                }],
+                extra: [("isError".into(), json!(true))].into_iter().collect(),
+            },
+        };
+        invalid.result = "callback returned".into();
+        invalid.after_result = Some(serde_json::to_value(after).unwrap());
+        assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_ok());
+        let roundtrip: ConversationCancelReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert_eq!(roundtrip, invalid);
+        invalid.after_result = Some(json!({"forged":true}));
+        assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
         invalid.version = 1;
+        invalid.after_result = None;
         invalid.result = "x".repeat(65537);
         assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
     }

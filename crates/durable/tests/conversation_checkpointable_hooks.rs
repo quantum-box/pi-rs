@@ -211,6 +211,45 @@ impl DurableParkCancel for CancelCounter {
     }
 }
 
+struct CancelHooks {
+    before: Arc<AtomicUsize>,
+    after: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Hook for CancelHooks {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Context<'_>,
+    ) -> Result<BeforeTool, String> {
+        if call.name == "root" {
+            self.before.fetch_add(1, Ordering::SeqCst);
+            return Ok(BeforeTool::Rewrite(
+                json!({"before":"prepared", "prepared_by_hook":true}),
+            ));
+        }
+        Ok(BeforeTool::Pass)
+    }
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name == "root" {
+            assert_eq!(call.arguments["before"], "prepared");
+            self.after.fetch_add(1, Ordering::SeqCst);
+            return Ok(Some(json!("public cancel after")));
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn selected_hook_public_cancel_reaches_conversation() {
+    exercise_selected_hook_cancel_registration("enabled").await;
+}
+
 #[tokio::test]
 async fn selected_hook_cancel_registration_parks_and_remains_fail_closed() {
     exercise_selected_hook_cancel_registration("unchanged").await;
@@ -233,16 +272,24 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     let after = Arc::new(AtomicUsize::new(0));
     let executions = Arc::new(AtomicUsize::new(0));
     let cancellations = Arc::new(AtomicUsize::new(0));
+    let hook: Arc<dyn Hook> = if change == "enabled" {
+        Arc::new(CancelHooks {
+            before: before.clone(),
+            after: after.clone(),
+        })
+    } else {
+        Arc::new(OneHook {
+            before: before.clone(),
+            after: after.clone(),
+            gate: None,
+        })
+    };
     let mut extensions = pi_rs_durable::extension::Registry::default();
     extensions
         .install_identified(
             Extension {
                 name: "policy".into(),
-                hooks: vec![Arc::new(OneHook {
-                    before: before.clone(),
-                    after,
-                    gate: None,
-                })],
+                hooks: vec![hook],
                 ..Default::default()
             },
             ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()]).unwrap(),
@@ -271,7 +318,15 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     let identity_tool: Arc<dyn Tool> = tool.clone();
     let identity =
         pi_rs_durable::nested_identity::register(&identity_tool, Some("backend".into())).unwrap();
-    let root = register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel(
+    let root = if change == "enabled" {
+        pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
+            &mut registry, tool, "root", 1, vec![leaf.clone()], &snapshot, &names, "cancel-v1",
+            Arc::new(CancelCounter(cancellations.clone())),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+        )
+    } else {
+        register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel(
         &mut registry,
         tool,
         "root",
@@ -283,8 +338,8 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
         Arc::new(CancelCounter(cancellations.clone())),
         UnsafeDurableAuthorization::interruption_requires_reconciliation(),
         ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
-    )
-    .unwrap();
+        )
+    }.unwrap();
     let options = Options {
         model: Arc::new(ModelStub),
         tools: vec![root.register(), leaf.register()],
@@ -356,13 +411,26 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     })
     .await
     .unwrap();
-    assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        cancellations.load(Ordering::SeqCst),
+        usize::from(change == "enabled")
+    );
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     let claim = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
     assert_eq!(
         store.get(claim.as_bytes()).unwrap().is_none(),
-        change != "unchanged"
+        change != "unchanged" && change != "enabled"
     );
+    if change == "enabled" {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let c = scheduler.conversation(conversation).unwrap();
+                if c.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content.contains("public cancel after"))) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+    }
     let report = driver.shutdown_with_pending().unwrap();
     assert!(report.pending().is_empty());
     let _ = scheduler.shutdown().await;

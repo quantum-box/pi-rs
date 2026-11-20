@@ -1004,6 +1004,67 @@ impl Host<'_, '_> {
 }
 
 impl Executor {
+    fn conversation_cancel_after_result(
+        &self,
+        task: &Task,
+        arguments: serde_json::Value,
+        snapshot: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.bounded_hook_arguments(&arguments)?;
+        let gate = crate::runtime::ToolDiagnostic {
+            severity: crate::runtime::DiagnosticSeverity::Error,
+            code: Some("aborted".into()),
+            message: "Tool was aborted".into(),
+        };
+        let initial = crate::extension::ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text","text":"Tool was aborted"})],
+            diagnostics: vec![gate.clone()],
+            extra: [("isError".into(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        };
+        let memo = AbortMemo(std::sync::atomic::AtomicBool::new(false));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let result = runtime.block_on(async {
+            let call = crate::extension::ToolCall {
+                name: self.identity.spec.name.clone(),
+                arguments,
+            };
+            let ctx = crate::extension::Context {
+                snapshot: &snapshot,
+                memo: &memo,
+            };
+            let hooks = self.hook_registry()?;
+            let (result, reports) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                hooks.after_tool_blocks(
+                    &call,
+                    initial,
+                    matches!(task.owner(), crate::task::TaskOwner::Task(_)),
+                    &ctx,
+                ),
+            )
+            .await
+            .map_err(|_| "abort hook timed out".to_owned())??;
+            if !reports.is_empty() {
+                return Err("abort hook failed".to_owned());
+            }
+            Ok(result)
+        })?;
+        if memo.0.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("abort hook used unavailable memo".into());
+        }
+        validate_content_hook_result(&result, Some(&gate), false)?;
+        let value = serde_json::to_value(DurableTaskResult::Rich {
+            task_content_v1: result,
+        })
+        .map_err(|e| e.to_string())?;
+        super::validate_aborted_after_result(&value)?;
+        Ok(value)
+    }
     fn validate_hook_arguments(&self, args: &serde_json::Value) -> Result<(), String> {
         if !args.is_object()
             || serde_json::to_vec(args).map_err(|e| e.to_string())?.len() > 60 * 1024
@@ -1727,6 +1788,7 @@ impl Handler for Executor {
                         version: 1,
                         claim: _claim.clone(),
                         result: "test evidence only".into(),
+                        after_result: None,
                     };
                     // A substituted marker must not write a receipt or remove either marker.
                     if admission
@@ -1782,6 +1844,7 @@ impl Handler for Executor {
                     version: 1,
                     claim: _claim.clone(),
                     result: "test evidence only".into(),
+                    after_result: None,
                 };
                 if admission
                     .read_live_conversation_cancel_receipt(
@@ -1835,11 +1898,7 @@ impl Handler for Executor {
                     return Err("foreign attempt accepted".into());
                 }
             }
-            #[cfg(test)]
-            let test_dispatch = crate::task_scheduler::take_test_selected_dispatch(task.id());
-            #[cfg(not(test))]
-            let test_dispatch = false;
-            if !enabled && !test_dispatch {
+            if !enabled {
                 return Err(
                     "conversation cancel callback is not enabled; reconciliation required".into(),
                 );
@@ -1858,6 +1917,7 @@ impl Handler for Executor {
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
+            let after_arguments = stored.arguments.clone();
             let start = admission.conversation_callback_start_lease()?;
             let marker_result = admission.record_conversation_start_markers(
                 self,
@@ -1916,24 +1976,95 @@ impl Handler for Executor {
                 )?;
                 return Err("conversation cancel outcome unknown; reconciliation required".into());
             }
+            let (after_result, snapshot_check) = if self.block_results {
+                let after =
+                    admission
+                        .conversation_cancel_hook_snapshot()
+                        .and_then(|(snapshot, check)| {
+                            self.conversation_cancel_after_result(task, after_arguments, snapshot)
+                                .map(|result| (result, check))
+                        });
+                match after {
+                    Ok((result, check)) => (Some(result), Some(check)),
+                    Err(error) => {
+                        let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                            version: 1,
+                            claim: _claim.clone(),
+                            result: "callback returned".into(),
+                            after_result: None,
+                        };
+                        if admission
+                            .store_conversation_cancel_receipt_and_retire(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                            )
+                            .is_err()
+                        {
+                            admission.retire_conversation_cancel_unknown(
+                                &_claim,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                            )?;
+                        }
+                        return Err(format!(
+                            "conversation cancel after hook incomplete; reconciliation required: {error}"
+                        ));
+                    }
+                }
+            } else {
+                (None, None)
+            };
             let receipt = crate::task_scheduler::ConversationCancelReceipt {
-                version: 1,
+                version: if after_result.is_some() { 2 } else { 1 },
                 claim: _claim,
                 result: "callback returned".into(),
+                after_result,
             };
-            if let Err(error) = admission.store_conversation_cancel_receipt_and_retire(
-                self,
-                &receipt,
-                &_identity_lease,
-                expected,
-                &marker,
-            ) {
-                admission.retire_conversation_cancel_unknown(
-                    &receipt.claim,
+            let saved = match snapshot_check.as_ref() {
+                Some(check) => admission.store_conversation_cancel_receipt_and_after(
+                    self,
+                    &receipt,
                     &_identity_lease,
                     expected,
                     &marker,
-                )?;
+                    check,
+                ),
+                None => admission.store_conversation_cancel_receipt_and_retire(
+                    self,
+                    &receipt,
+                    &_identity_lease,
+                    expected,
+                    &marker,
+                ),
+            };
+            if let Err(error) = saved {
+                let known_callback = crate::task_scheduler::ConversationCancelReceipt {
+                    version: 1,
+                    claim: receipt.claim.clone(),
+                    result: "callback returned".into(),
+                    after_result: None,
+                };
+                if admission
+                    .store_conversation_cancel_receipt_and_retire(
+                        self,
+                        &known_callback,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )
+                    .is_err()
+                {
+                    admission.retire_conversation_cancel_unknown(
+                        &receipt.claim,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
+                }
                 return Err(format!(
                     "conversation cancel result requires reconciliation: {error}"
                 ));
