@@ -341,6 +341,68 @@ mod tests {
         assert_ne!(version(&store, &revision), Some(before_input));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn v1_migration_fences_existing_v1_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.sqlite");
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .create_scalar_function(
+                "pi_graph_protocol",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                |_| Ok(1i64),
+            )
+            .unwrap();
+        legacy.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;
+            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=1));
+            INSERT INTO durable_graph_protocol VALUES(1,1);
+            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;").unwrap();
+        let (_canonical, lock) = crate::owner::acquire_owner_lock(&path).unwrap();
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::MigrationOwnerUnavailable(_))
+        ));
+        let version: i64 = legacy
+            .query_row(
+                "SELECT version FROM durable_graph_protocol WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 1);
+        drop(lock);
+        let store = Store::open(&path).unwrap();
+        let version: i64 = legacy
+            .query_row(
+                "SELECT version FROM durable_graph_protocol WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert!(legacy
+            .execute(
+                "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,1)",
+                rusqlite::params![b"old".as_slice(), b"value".as_slice()]
+            )
+            .is_err());
+        let id = next_uuid();
+        store
+            .commit(
+                &[],
+                &[put(
+                    task_key(id),
+                    task(id, json!({"Conversation":next_uuid()})),
+                )],
+            )
+            .unwrap();
+        assert!(store.get(&task_structure_revision(id)).unwrap().is_some());
+    }
+
     #[test]
     fn missing_guard_rejects_reopen_without_repairing_schema() {
         let dir = tempfile::tempdir().unwrap();
@@ -364,7 +426,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unknown.sqlite");
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE durable_graph_protocol(id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_graph_protocol VALUES(1,2);").unwrap();
+        conn.execute_batch("CREATE TABLE durable_graph_protocol(id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_graph_protocol VALUES(1,3);").unwrap();
         drop(conn);
         assert!(matches!(
             Store::open(&path),
@@ -386,7 +448,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[cfg(unix)]

@@ -216,14 +216,24 @@ impl Store {
         let path = path.as_ref();
         #[cfg(all(feature = "experimental-graph-revision", unix))]
         {
-            let protected = if path.exists() {
+            let version = if path.exists() {
                 let conn =
                     Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_protocol')", [], |row| row.get(0))?
+                let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_protocol')", [], |row| row.get(0))?;
+                if protected {
+                    conn.query_row(
+                        "SELECT version FROM durable_graph_protocol WHERE id=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                } else {
+                    None
+                }
             } else {
-                false
+                None
             };
-            if !protected {
+            if version.is_none() || version == Some(1) {
                 let (db, _lock) = owner::acquire_owner_lock(path)
                     .map_err(|error| Error::MigrationOwnerUnavailable(error.to_string()))?;
                 return Self::initialize(Connection::open(db)?, true, true);
@@ -245,7 +255,7 @@ impl Store {
         {
             let active = graph_protocol_active.clone();
             conn.create_scalar_function(
-                "pi_graph_protocol",
+                "pi_graph_protocol_v2",
                 0,
                 rusqlite::functions::FunctionFlags::SQLITE_UTF8,
                 move |_| Ok(i64::from(active.load(std::sync::atomic::Ordering::Acquire))),
@@ -262,6 +272,8 @@ impl Store {
             return Err(Error::IncompatibleGraphProtocol);
         }
         #[cfg(feature = "experimental-graph-revision")]
+        let mut migrate_v1 = false;
+        #[cfg(feature = "experimental-graph-revision")]
         if protected {
             let version: Option<i64> = conn
                 .query_row(
@@ -270,9 +282,17 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if version != Some(1) {
+            if !matches!(version, Some(1 | 2))
+                || (version == Some(1) && disk && !_migration_authorized)
+            {
                 return Err(Error::IncompatibleGraphProtocol);
             }
+            migrate_v1 = version == Some(1);
+            let guard_name = if migrate_v1 {
+                "pi_graph_protocol() != 1"
+            } else {
+                "pi_graph_protocol_v2() != 1"
+            };
             for (name, action) in [
                 ("durable_graph_protocol_insert", "INSERT"),
                 ("durable_graph_protocol_update", "UPDATE"),
@@ -282,7 +302,7 @@ impl Store {
                 let expected = format!("BEFORE {action} ON durable_store_entries");
                 if !sql.as_deref().is_some_and(|sql| {
                     sql.contains(&expected)
-                        && sql.contains("pi_graph_protocol() != 1")
+                        && sql.contains(guard_name)
                         && sql.contains("RAISE(ABORT, 'graph protocol required')")
                 }) {
                     return Err(Error::IncompatibleGraphProtocol);
@@ -342,16 +362,17 @@ impl Store {
             INSERT OR IGNORE INTO durable_document_commit_meta SELECT 1, (SELECT revision FROM durable_document_history_meta WHERE id=1), (SELECT sequence FROM durable_commit_meta WHERE id=1);
             COMMIT;")?;
         #[cfg(feature = "experimental-graph-revision")]
-        if !protected {
+        if !protected || migrate_v1 {
             conn.execute_batch("BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=1));
-            INSERT OR IGNORE INTO durable_graph_protocol(id,version) VALUES(1,1);
             DROP TRIGGER IF EXISTS durable_graph_protocol_insert;
             DROP TRIGGER IF EXISTS durable_graph_protocol_update;
             DROP TRIGGER IF EXISTS durable_graph_protocol_delete;
-            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
-            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
-            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            DROP TABLE IF EXISTS durable_graph_protocol;
+            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=2));
+            INSERT INTO durable_graph_protocol(id,version) VALUES(1,2);
+            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
             COMMIT;")?;
         }
         let sequence = conn.query_row(
