@@ -6036,13 +6036,16 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let busy_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if mode == "busy" {
         let writer_path = path.clone();
+        let busy_ready = busy_ready.clone();
         crate::task_scheduler::on_conversation_receipt_before_commit(root.task.id(), move || {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let conn = rusqlite::Connection::open(writer_path).unwrap();
                 conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                busy_ready.store(true, Ordering::SeqCst);
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_secs(6));
                 conn.execute_batch("ROLLBACK").unwrap();
@@ -6070,7 +6073,38 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 .unwrap();
         });
     }
+    let busy_store = durable_store::Store::open(&path).unwrap();
     let driver = scheduler.start_tasks(registry).unwrap();
+    if mode == "busy" {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !busy_ready.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let store = &busy_store;
+        assert!(
+            store
+                .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                    root.task.id()
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(format!("durable/task-callback-start/{}", root.task.id()).as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(format!("runtime/conversation-callback-start/{conversation}").as_bytes())
+                .unwrap()
+                .is_some()
+        );
+    }
     if mode == "stale" {
         tokio::time::timeout(Duration::from_secs(10), async {
             while after_calls.load(Ordering::SeqCst) == 0 {
@@ -6112,6 +6146,28 @@ async fn exercise_selected_woken_receipt(mode: &str) {
     assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
     assert_eq!(after_calls.load(Ordering::SeqCst), 1);
     let store = durable_store::Store::open(&path).unwrap();
+    if mode == "busy" {
+        assert!(
+            store
+                .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                    root.task.id()
+                ))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(format!("durable/task-callback-start/{}", root.task.id()).as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(format!("runtime/conversation-callback-start/{conversation}").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
     let terminal = store
         .get(&crate::task_scheduler::woken_conversation_terminal_key(
             root.task.id(),
