@@ -215,6 +215,7 @@ struct CancelHooks {
     before: Arc<AtomicUsize>,
     after: Arc<AtomicUsize>,
     identity: Arc<std::sync::Mutex<Option<pi_rs_durable::nested_identity::IdentityHandle>>>,
+    invalid: u8,
 }
 #[async_trait]
 impl Hook for CancelHooks {
@@ -267,6 +268,54 @@ impl Hook for CancelHooks {
                     .await?,
                 "saved"
             );
+            if self.invalid != 0 {
+                let invalid_key = "k".repeat(4097);
+                let error = match self.invalid {
+                    1 => ctx.memo.get("").await,
+                    2 => ctx.memo.get(&invalid_key).await,
+                    _ => ctx
+                        .memo
+                        .get_or_insert("oversize", json!("v".repeat(65535)))
+                        .await
+                        .map(Some),
+                };
+                assert!(error.is_err());
+                assert!(
+                    ctx.memo
+                        .get_or_insert("after-invalid", json!("not saved"))
+                        .await
+                        .is_err()
+                );
+                self.after.fetch_add(1, Ordering::SeqCst);
+                return Ok(Some(json!("must not publish")));
+            }
+            let runtime = tokio::runtime::Handle::current();
+            let barrier = std::sync::Barrier::new(2);
+            let (first, second) = std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    barrier.wait();
+                    runtime.block_on(ctx.memo.get_or_insert("concurrent", json!("first")))
+                });
+                let second = scope.spawn(|| {
+                    barrier.wait();
+                    runtime.block_on(ctx.memo.get_or_insert("concurrent", json!("second")))
+                });
+                (first.join().unwrap(), second.join().unwrap())
+            });
+            assert_eq!(first?, second?);
+            let max_key = "k".repeat(4096);
+            let max_value = "v".repeat(65534); // JSON string uses 65536 bytes.
+            assert_eq!(
+                ctx.memo.get_or_insert(&max_key, json!(max_value)).await?,
+                json!(max_value)
+            );
+            // An existing value wins without serializing a replacement.
+            assert_eq!(
+                ctx.memo
+                    .get_or_insert("cancel-after", json!("v".repeat(65535)))
+                    .await?,
+                json!("saved")
+            );
             self.after.fetch_add(1, Ordering::SeqCst);
             return Ok(Some(json!("public cancel after")));
         }
@@ -277,6 +326,13 @@ impl Hook for CancelHooks {
 #[tokio::test]
 async fn selected_hook_public_cancel_reaches_conversation() {
     exercise_selected_hook_cancel_registration("enabled").await;
+}
+
+#[tokio::test]
+async fn selected_abort_memo_invalid_key_and_value_fail_closed() {
+    for change in ["invalid-empty", "invalid-key", "invalid-value"] {
+        exercise_selected_hook_cancel_registration(change).await;
+    }
 }
 
 #[tokio::test]
@@ -302,11 +358,18 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     let executions = Arc::new(AtomicUsize::new(0));
     let cancellations = Arc::new(AtomicUsize::new(0));
     let hook_identity = Arc::new(std::sync::Mutex::new(None));
-    let hook: Arc<dyn Hook> = if change == "enabled" {
+    let enabled = change == "enabled" || change.starts_with("invalid-");
+    let hook: Arc<dyn Hook> = if enabled {
         Arc::new(CancelHooks {
             before: before.clone(),
             after: after.clone(),
             identity: hook_identity.clone(),
+            invalid: match change {
+                "invalid-empty" => 1,
+                "invalid-key" => 2,
+                "invalid-value" => 3,
+                _ => 0,
+            },
         })
     } else {
         Arc::new(OneHook {
@@ -350,7 +413,7 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     let identity =
         pi_rs_durable::nested_identity::register(&identity_tool, Some("backend".into())).unwrap();
     *hook_identity.lock().unwrap() = Some(identity.clone());
-    let root = if change == "enabled" {
+    let root = if enabled {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
             &mut registry, tool, "root", 1, vec![leaf.clone()], &snapshot, &names, "cancel-v1",
             Arc::new(CancelCounter(cancellations.clone())),
@@ -443,16 +506,23 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     })
     .await
     .unwrap();
-    assert_eq!(
-        cancellations.load(Ordering::SeqCst),
-        usize::from(change == "enabled")
-    );
+    assert_eq!(cancellations.load(Ordering::SeqCst), usize::from(enabled));
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     let claim = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
     assert_eq!(
         store.get(claim.as_bytes()).unwrap().is_none(),
-        change != "unchanged" && change != "enabled"
+        change != "unchanged" && !enabled
     );
+    if change.starts_with("invalid-") {
+        let state = tasks.load(root_id).unwrap().unwrap();
+        assert!(
+            matches!(state.task.state(), pi_rs_durable::task::TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+        let key = format!("runtime/extension-memo/{root_id}/after-invalid");
+        assert!(store.get(key.as_bytes()).unwrap().is_none());
+        assert!(!scheduler.conversation(conversation).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content.contains("must not publish"))));
+    }
     if change == "enabled" {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
