@@ -128,6 +128,12 @@ pub(crate) fn affected(
 ) -> Result<Vec<Vec<u8>>, Error> {
     let mut overlay = Overlay::new();
     for mutation in mutations {
+        let key = match mutation {
+            Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+        };
+        if !key.starts_with(TASK) && !key.starts_with(EDGE) && !key.starts_with(CONVERSATION) {
+            continue;
+        }
         match mutation {
             Mutation::Put { key, value } => {
                 overlay.insert(key.clone(), Some(value.clone()));
@@ -191,7 +197,7 @@ pub(crate) fn affected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Expected, Store};
+    use crate::Store;
     use serde_json::json;
 
     fn next_uuid() -> Uuid {
@@ -206,6 +212,36 @@ mod tests {
     }
     fn version(store: &Store, key: &[u8]) -> Option<u64> {
         store.get(key).unwrap().map(|entry| entry.version)
+    }
+
+    #[test]
+    fn unknown_protocol_version_rejects_before_schema_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE durable_graph_protocol(id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_graph_protocol VALUES(1,2);").unwrap();
+        drop(conn);
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::IncompatibleGraphProtocol)
+        ));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='durable_store_entries'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM durable_graph_protocol WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
     }
 
     #[test]
@@ -300,6 +336,5 @@ mod tests {
             .commit(&[], &[put(task_key(c), b"invalid".to_vec())])
             .unwrap();
         assert_ne!(version(&store, &global_revision()), before);
-        assert!(matches!(Expected::Missing, Expected::Missing));
     }
 }

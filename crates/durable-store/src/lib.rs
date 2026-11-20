@@ -2037,6 +2037,29 @@ mod document_history_tests {
         ));
     }
 
+    #[cfg(not(feature = "experimental-graph-revision"))]
+    #[test]
+    fn disabled_runtime_rejects_protected_database_before_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protected.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE durable_graph_protocol(id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_graph_protocol VALUES(1,1);").unwrap();
+        drop(conn);
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::IncompatibleGraphProtocol)
+        ));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='durable_store_entries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "incompatible open must not migrate the database");
+    }
+
     #[test]
     fn prefix_put_fence_is_atomic_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
