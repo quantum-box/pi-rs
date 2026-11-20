@@ -11757,7 +11757,14 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<Vec<Check>, Error> {
-        self.checkpointable_conversation_checks_inner(task, registry, false, false, false)
+        self.checkpointable_conversation_checks_inner(
+            task,
+            registry,
+            false,
+            false,
+            false,
+            &Default::default(),
+        )
     }
 
     // Provisional evidence only: callers must include it in the same checked
@@ -11780,9 +11787,14 @@ impl Harness {
             unreachable!()
         };
         let mut checks = self.checkpointable_cancel_root_capability_checks(*id)?;
-        checks.extend(
-            self.checkpointable_conversation_checks_inner(task, registry, true, false, false)?,
-        );
+        checks.extend(self.checkpointable_conversation_checks_inner(
+            task,
+            registry,
+            true,
+            false,
+            false,
+            &Default::default(),
+        )?);
         Ok(checks)
     }
 
@@ -11796,7 +11808,7 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<(Uuid, Vec<Check>), Error> {
-        self.checkpointable_nested_cancel_checks_inner(task, registry, false)
+        self.checkpointable_nested_cancel_checks_inner(task, registry, false, &Default::default())
     }
 
     /// Provisional root binding for an already-cancelled nested child. The
@@ -11807,7 +11819,23 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<(Uuid, Vec<Check>), Error> {
-        self.checkpointable_nested_cancel_checks_inner(task, registry, true)
+        self.checkpointable_nested_cancel_checks_inner(task, registry, true, &Default::default())
+    }
+
+    /// The caller must retain the checks and identity leases proving each
+    /// allowed terminal ancestor in the same final transaction.
+    pub(crate) fn checkpointable_nested_cancel_result_checks_with_ancestors(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+        authenticated_ancestors: &std::collections::HashSet<Uuid>,
+    ) -> Result<(Uuid, Vec<Check>), Error> {
+        self.checkpointable_nested_cancel_checks_inner(
+            task,
+            registry,
+            true,
+            authenticated_ancestors,
+        )
     }
 
     fn checkpointable_nested_cancel_checks_inner(
@@ -11815,6 +11843,7 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
         terminal: bool,
+        authenticated_ancestors: &std::collections::HashSet<Uuid>,
     ) -> Result<(Uuid, Vec<Check>), Error> {
         if !task.abort_requested()
             || task.state()
@@ -11852,9 +11881,14 @@ impl Harness {
         };
         let mut checks = self.checkpointable_cancel_root_capability_checks(conversation)?;
         checks.extend(ancestry_checks);
-        checks.extend(
-            self.checkpointable_conversation_checks_inner(task, registry, true, false, terminal)?,
-        );
+        checks.extend(self.checkpointable_conversation_checks_inner(
+            task,
+            registry,
+            true,
+            false,
+            terminal,
+            authenticated_ancestors,
+        )?);
         Ok((conversation, checks))
     }
 
@@ -11903,7 +11937,14 @@ impl Harness {
                 "checkpointable recovery task unavailable".into(),
             ));
         }
-        self.checkpointable_conversation_checks_inner(task, registry, true, true, false)
+        self.checkpointable_conversation_checks_inner(
+            task,
+            registry,
+            true,
+            true,
+            false,
+            &Default::default(),
+        )
     }
 
     fn checkpointable_conversation_checks_inner(
@@ -11913,6 +11954,7 @@ impl Harness {
         cleanup: bool,
         allow_failed_root: bool,
         allow_cancelled_child: bool,
+        authenticated_ancestors: &std::collections::HashSet<Uuid>,
     ) -> Result<Vec<Check>, Error> {
         let store = self.owner.store();
         let tasks = crate::task_store::TaskStore::new(store);
@@ -11936,7 +11978,10 @@ impl Harness {
                         && ((allow_failed_root
                             && matches!(stored.task.state(), crate::task::TaskState::Failed(_)))
                             || (allow_cancelled_child
-                                && stored.task.state() == &crate::task::TaskState::Cancelled))))
+                                && stored.task.state() == &crate::task::TaskState::Cancelled)))
+                    && !(next != task.id()
+                        && stored.task.state() == &crate::task::TaskState::Cancelled
+                        && authenticated_ancestors.contains(&next)))
                 || (stored.task.is_completing()
                     && !(stored.task.retains_task_children_on_success()
                         && matches!(stored.task.state(), crate::task::TaskState::Completing(_))))

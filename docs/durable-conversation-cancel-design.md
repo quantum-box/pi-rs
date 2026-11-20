@@ -14,7 +14,10 @@ root and its registered nested children, including selected replay-safe hooks.
 The child claim commits its exact ancestry and signal revisions; first poll is
 fenced by conversation, selection and task markers. Callback receipt and marker
 retirement commit together. Parent cancellation validates the child's committed
-terminal evidence and holds its identity lease through settlement. Busy identity
+terminal evidence and holds its identity lease through settlement. For multiple
+unsafe cancelled levels, a terminal ancestor is accepted only after its own
+terminal evidence and identity lease have been included in that same parent
+settlement; replaced or late evidence blocks the parent callback. Busy identity
 leases defer reservation while unrelated graphs continue. A killed callback is
 not repeated and requires reconciliation; recovery retires its exact markers.
 Nested callback self-wait uses the explicit callback scope, including across
