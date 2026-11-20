@@ -33,6 +33,13 @@ prepared arguments and fence joined outcomes. They do not authorize a callback:
 conversation owner, registration, abort and claim/receipt evidence must still
 be joined to the same transaction.
 
+The experimental v3 woken claim is not dispatched. If such a claim is left by
+a stopped cleanup attempt, recovery fails the original task for reconciliation
+and atomically retires only matching task and conversation start markers. A
+missing, incomplete or foreign marker pair cannot authorize a new callback;
+claim and any receipt remain available as evidence. This recovery does not
+establish that an external cancellation ran or make the Tool outcome known.
+
 ## Opt-in first-poll dispatch
 
 `register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel`

@@ -10754,12 +10754,18 @@ impl Scheduler {
                     false
                 };
                 let claim_root = abort_root
-                    && self
+                    && (self
                         .ts()
                         .store()
                         .get(&conversation_cancel_claim_key(item.task.id()))
                         .map_err(task_store::Error::from)?
-                        .is_some();
+                        .is_some()
+                        || self
+                            .ts()
+                            .store()
+                            .get(&woken_conversation_claim_key(item.task.id()))
+                            .map_err(task_store::Error::from)?
+                            .is_some());
                 if independent_only
                     && (!(abort_root || self.independent_root_safe(&self.owner(), &item.task)?)
                         || excluded.iter().copied().any(|intent| {
@@ -10844,6 +10850,141 @@ impl Scheduler {
                     // running record and its marker in one transaction instead.
                     let owner = self.owner();
                     let store = owner.store();
+                    // A v3 woken claim belongs to this cleanup attempt. A
+                    // process loss is never authorization to invoke it again.
+                    // Preserve any receipt as evidence, fail closed, and retire
+                    // only the exact pair of markers in the same transaction.
+                    let woken_key = woken_conversation_claim_key(item.task.id());
+                    if let Some(entry) = store.get(&woken_key).map_err(task_store::Error::from)? {
+                        let claim: WokenConversationCancelClaim =
+                            serde_json::from_slice(&entry.value)
+                                .map_err(|e| Error::Handler(e.to_string()))?;
+                        let TaskOwner::Conversation(conversation) = item.task.owner() else {
+                            return Err(Error::Handler("woken claim owner changed".into()));
+                        };
+                        if claim.version != 3
+                            || claim.claim_id.is_nil()
+                            || claim.task != item.task.id()
+                            || claim.conversation != *conversation
+                            || claim.conversation.is_nil()
+                            || claim.kind.is_empty()
+                            || Some(claim.kind.as_str()) != item.task.kind()
+                            || claim.definition_version == 0
+                            || claim.definition_version != item.task.definition_version()
+                            || claim.cleanup_attempt.is_nil()
+                            || claim.cleanup_lease.is_nil()
+                            || claim.woken_attempt.is_nil()
+                            || claim.woken_attempt == claim.cleanup_attempt
+                            || item.task.attempt_id() != Some(claim.cleanup_attempt)
+                            || item.task.woken_interrupted_attempt() != Some(claim.woken_attempt)
+                            || item.task.replay_safe()
+                            || claim.checkpoint != *item.task.checkpoint()
+                            || claim.checkpoint.phase != "replay-safe-async-wait"
+                        {
+                            return Err(Error::Handler("interrupted woken claim mismatch".into()));
+                        }
+                        let old_key = conversation_cancel_claim_key(item.task.id());
+                        if store
+                            .get(&old_key)
+                            .map_err(task_store::Error::from)?
+                            .is_some()
+                        {
+                            return Err(Error::Handler("conflicting cancel claims".into()));
+                        }
+                        let task_key =
+                            format!("durable/task-callback-start/{}", item.task.id()).into_bytes();
+                        let conversation_key =
+                            format!("runtime/conversation-callback-start/{conversation}")
+                                .into_bytes();
+                        let task_marker = store.get(&task_key).map_err(task_store::Error::from)?;
+                        let conversation_marker = store
+                            .get(&conversation_key)
+                            .map_err(task_store::Error::from)?;
+                        let mut next = item.clone();
+                        next.task.fail("interrupted woken conversation cancel claim; reconciliation required".into())
+                            .map_err(Error::Transition)?;
+                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        batch
+                            .checks
+                            .retain(|check| check.key != task_key && check.key != conversation_key);
+                        match (task_marker, conversation_marker) {
+                            (None, None) => {
+                                for key in [task_key, conversation_key] {
+                                    batch.checks.push(durable_store::Check {
+                                        key,
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                            }
+                            (Some(task_marker), Some(conversation_marker)) => {
+                                let expected = serde_json::to_vec(&serde_json::json!({
+                                    "version": 3, "claim_id": claim.claim_id, "task": claim.task,
+                                    "woken_attempt": claim.woken_attempt, "attempt": claim.cleanup_attempt,
+                                    "lease": claim.cleanup_lease, "policy": claim.policy,
+                                })).map_err(|e| Error::Handler(e.to_string()))?;
+                                if task_marker.value != expected
+                                    || conversation_marker.value != expected
+                                {
+                                    return Err(Error::Handler(
+                                        "interrupted woken marker mismatch".into(),
+                                    ));
+                                }
+                                for (key, marker) in [
+                                    (task_key, task_marker),
+                                    (conversation_key, conversation_marker),
+                                ] {
+                                    batch.checks.push(durable_store::Check {
+                                        key: key.clone(),
+                                        expected: durable_store::Expected::Version(marker.version),
+                                    });
+                                    batch
+                                        .mutations
+                                        .push(durable_store::Mutation::Delete { key });
+                                }
+                            }
+                            _ => {
+                                return Err(Error::Handler(
+                                    "incomplete interrupted woken markers".into(),
+                                ));
+                            }
+                        }
+                        batch.checks.extend([
+                            durable_store::Check {
+                                key: woken_key,
+                                expected: durable_store::Expected::Version(entry.version),
+                            },
+                            durable_store::Check {
+                                key: old_key,
+                                expected: durable_store::Expected::Missing,
+                            },
+                        ]);
+                        match store.commit_with_prefix_put_fence(
+                            &batch.checks,
+                            &batch.mutations,
+                            &[
+                                task_store::PREFIX,
+                                crate::ownership_edge::PREFIX,
+                                b"runtime/conversation/",
+                            ],
+                            recovery_graph_version,
+                        ) {
+                            Ok(()) => {
+                                self.deferred_recovery.extend(deferred);
+                                continue 'scan;
+                            }
+                            Err(durable_store::Error::Conflict { .. }) => {
+                                self.deferred_recovery.extend(deferred);
+                                self.deferred_recovery.insert(item.task.id());
+                                return Ok(());
+                            }
+                            Err(durable_store::Error::WriteLockBusy(_)) => {
+                                self.deferred_recovery.extend(deferred);
+                                self.deferred_recovery.insert(item.task.id());
+                                return Err(Error::Busy);
+                            }
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    }
                     let claim_key = conversation_cancel_claim_key(item.task.id());
                     if let Some(entry) = store.get(&claim_key).map_err(task_store::Error::from)? {
                         let claim: ConversationCancelClaim =
@@ -30930,6 +31071,122 @@ mod conversation_cancel_claim_schema_tests {
     use crate::async_task_tool::ConversationCancelPolicy;
     use crate::task::Checkpoint;
     use serde_json::json;
+
+    #[test]
+    fn interrupted_woken_claim_recovery_fails_closed_and_retires_only_exact_markers() {
+        for mode in ["no_markers", "markers", "mismatch", "incomplete"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let make_registry = || {
+                let mut registry = Registry::default();
+                registry.register("work", false, |_: &Task| {
+                    Ok(Step::Succeed(json!("must not run")))
+                });
+                registry
+            };
+            let scheduler = Scheduler::open(&path, make_registry()).unwrap();
+            let conversation = Uuid::new_v4();
+            let mut task = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "replay-safe-async-wait".into(),
+                    data: json!({"job": "remote"}),
+                },
+                4,
+            )
+            .unwrap()
+            .registered("work".into(), false);
+            scheduler.submit(&task).unwrap();
+            let tasks = scheduler.ts();
+            let original = tasks.load(task.id()).unwrap().unwrap();
+            task.start_attempt(Uuid::new_v4()).unwrap();
+            task.recover_interrupted_woken_for_cleanup().unwrap();
+            task.start_attempt(Uuid::new_v4()).unwrap();
+            tasks
+                .update(&original, |next| {
+                    *next = task.clone();
+                    Ok(())
+                })
+                .unwrap();
+            let claim = WokenConversationCancelClaim {
+                version: 3,
+                claim_id: Uuid::new_v4(),
+                task: task.id(),
+                conversation,
+                kind: "work".into(),
+                definition_version: 1,
+                cleanup_attempt: task.attempt_id().unwrap(),
+                cleanup_lease: Uuid::new_v4(),
+                woken_attempt: task.woken_interrupted_attempt().unwrap(),
+                checkpoint: task.checkpoint().clone(),
+                policy: ConversationCancelPolicy::AtMostOnce,
+            };
+            let marker = serde_json::to_vec(&json!({
+                "version": 3, "claim_id": claim.claim_id, "task": claim.task,
+                "woken_attempt": claim.woken_attempt, "attempt": claim.cleanup_attempt,
+                "lease": claim.cleanup_lease, "policy": claim.policy,
+            }))
+            .unwrap();
+            let claim_key = woken_conversation_claim_key(task.id());
+            let task_key = format!("durable/task-callback-start/{}", task.id()).into_bytes();
+            let conversation_key =
+                format!("runtime/conversation-callback-start/{conversation}").into_bytes();
+            let receipt_key = format!(
+                "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                task.id()
+            )
+            .into_bytes();
+            let mut mutations = vec![
+                durable_store::Mutation::Put {
+                    key: claim_key.clone(),
+                    value: serde_json::to_vec(&claim).unwrap(),
+                },
+                durable_store::Mutation::Put {
+                    key: receipt_key.clone(),
+                    value: b"retained evidence".to_vec(),
+                },
+            ];
+            if mode != "no_markers" {
+                mutations.push(durable_store::Mutation::Put {
+                    key: task_key.clone(),
+                    value: marker.clone(),
+                });
+                if mode != "incomplete" {
+                    mutations.push(durable_store::Mutation::Put {
+                        key: conversation_key.clone(),
+                        value: if mode == "mismatch" {
+                            b"foreign".to_vec()
+                        } else {
+                            marker
+                        },
+                    });
+                }
+            }
+            scheduler.owner().store().commit(&[], &mutations).unwrap();
+            drop(scheduler);
+            let reopened = Scheduler::open(&path, make_registry());
+            if matches!(mode, "mismatch" | "incomplete") {
+                assert!(reopened.is_err(), "{mode} must not retire markers");
+                let store = durable_store::Store::open(&path).unwrap();
+                assert!(store.get(&task_key).unwrap().is_some());
+            } else {
+                let scheduler = reopened.unwrap();
+                let current = scheduler.get(task.id()).unwrap().unwrap();
+                assert!(
+                    matches!(current.state(), TaskState::Failed(message) if message.contains("reconciliation"))
+                );
+                let store = scheduler.owner();
+                assert!(store.store().get(&task_key).unwrap().is_none());
+                assert!(store.store().get(&conversation_key).unwrap().is_none());
+                assert!(store.store().get(&claim_key).unwrap().is_some());
+                assert_eq!(
+                    store.store().get(&receipt_key).unwrap().unwrap().value,
+                    b"retained evidence"
+                );
+            }
+        }
+    }
 
     #[test]
     fn receipt_requires_exact_claim_and_supported_schema() {
