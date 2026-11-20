@@ -717,7 +717,30 @@ mod owned_reservation_validation_tests {
             key: child_key,
             value: serde_json::to_vec(&child_task).unwrap(),
         };
-        writes.push(Mutation::Delete { key: edge_key });
+        writes.push(Mutation::Delete {
+            key: edge_key.clone(),
+        });
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        writes.pop();
+        drop(tx);
+        drop(connection);
+        let edge_entry = store.get(&edge_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: edge_key.clone(),
+                    expected: Expected::Version(edge_entry.version),
+                }],
+                &[Mutation::Put {
+                    key: edge_key,
+                    value: edge_entry.value,
+                }],
+            )
+            .unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         assert!(validate_owned_child_reservation(&tx, &writes).is_err());
     }
 
