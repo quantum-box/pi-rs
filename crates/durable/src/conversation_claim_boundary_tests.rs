@@ -8153,6 +8153,15 @@ async fn selected_woken_unsafe_child_keeps_after_through_settlement_and_reopen()
 
 #[tokio::test]
 async fn interrupted_woken_owned_conversation_is_marked_by_driver_before_refusal() {
+    exercise_woken_owned_coordinator(false).await;
+}
+
+#[tokio::test]
+async fn invalid_woken_owned_proof_does_not_stop_independent_work() {
+    exercise_woken_owned_coordinator(true).await;
+}
+
+async fn exercise_woken_owned_coordinator(invalid_proof: bool) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
     let mut process = Command::new(std::env::current_exe().unwrap())
@@ -8212,40 +8221,73 @@ async fn interrupted_woken_owned_conversation_is_marked_by_driver_before_refusal
         .prepare_create(&edge)
         .unwrap();
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    if invalid_proof {
+        let current = crate::task_store::TaskStore::new(&store)
+            .load(root.task.id())
+            .unwrap()
+            .unwrap();
+        let (_, checks) = crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
+            &store,
+            &current.task,
+            store.put_version().unwrap(),
+        )
+        .unwrap();
+        let key = checks
+            .iter()
+            .find(|check| matches!(check.expected, durable_store::Expected::Version(_)))
+            .unwrap()
+            .key
+            .clone();
+        let entry = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: entry.value,
+                }],
+            )
+            .unwrap();
+    }
     drop(store);
     drop(harness);
     let conflict_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = conflict_observed.clone();
     let writer_path = path.clone();
     let parent = root.task.id();
-    crate::task_scheduler::before_woken_recovery_commit_for_test(parent, move || {
-        use std::sync::atomic::Ordering;
-        let store = durable_store::Store::open(writer_path).unwrap();
-        let child = crate::task::Task::new(
-            uuid::Uuid::new_v4(),
-            crate::task::TaskOwner::Task(parent),
-            crate::task::Checkpoint {
-                phase: "initial".into(),
-                data: json!({}),
-            },
-            3,
-        )
-        .unwrap();
-        let key = crate::task_store::key(child.id());
-        store
-            .commit(
-                &[durable_store::Check {
-                    key: key.clone(),
-                    expected: durable_store::Expected::Missing,
-                }],
-                &[durable_store::Mutation::Put {
-                    key,
-                    value: serde_json::to_vec(&child).unwrap(),
-                }],
+    if !invalid_proof {
+        crate::task_scheduler::before_woken_recovery_commit_for_test(parent, move || {
+            use std::sync::atomic::Ordering;
+            let store = durable_store::Store::open(writer_path).unwrap();
+            let child = crate::task::Task::new(
+                uuid::Uuid::new_v4(),
+                crate::task::TaskOwner::Task(parent),
+                crate::task::Checkpoint {
+                    phase: "initial".into(),
+                    data: json!({}),
+                },
+                3,
             )
             .unwrap();
-        observed.store(true, Ordering::SeqCst);
-    });
+            let key = crate::task_store::key(child.id());
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&child).unwrap(),
+                    }],
+                )
+                .unwrap();
+            observed.store(true, Ordering::SeqCst);
+        });
+    }
     let (scheduler, driver) = start_woken_any_scheduler(&path);
     tokio::time::timeout(Duration::from_secs(15), async {
         while !scheduler
@@ -8258,13 +8300,19 @@ async fn interrupted_woken_owned_conversation_is_marked_by_driver_before_refusal
     })
     .await
     .unwrap();
-    assert!(conflict_observed.load(std::sync::atomic::Ordering::SeqCst));
     let recovered = driver.get(root.task.id()).unwrap().unwrap();
-    assert!(recovered.abort_requested());
-    assert_eq!(
-        recovered.woken_interrupted_attempt(),
-        root.task.attempt_id()
-    );
+    if invalid_proof {
+        assert!(
+            matches!(recovered.state(), TaskState::CompletingFailed(reason) | TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+    } else {
+        assert!(conflict_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(recovered.abort_requested());
+        assert_eq!(
+            recovered.woken_interrupted_attempt(),
+            root.task.attempt_id()
+        );
+    }
     assert!(!dir.path().join("parent-cancel").exists());
     let independent = crate::task::Task::new(
         uuid::Uuid::new_v4(),

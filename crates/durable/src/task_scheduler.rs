@@ -2327,6 +2327,50 @@ impl PendingMaintenance {
                     ) {
                         Ok(affected) => Ok(affected),
                         Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                        Err(crate::runtime::Error::Invalid(reason)) => {
+                            // Invalid wake or binding cannot authorize the callback.
+                            // Hold failure locally so ordinary graph maintenance
+                            // drains owned work without stopping unrelated roots.
+                            let _task_gate =
+                                owner.task_gate().try_lock().map_err(|error| match error {
+                                    durable_store::controls::PollGateError::Busy => Error::Busy,
+                                    _ => Error::Poisoned,
+                                })?;
+                            let store = owner.store();
+                            let boundary = store.put_version().map_err(task_store::Error::from)?;
+                            let tasks = TaskStore::new(store);
+                            let latest = tasks.load(id)?.ok_or(Error::Ownership)?;
+                            if latest != current
+                                || latest.task.state() != &TaskState::Running
+                                || latest.task.abort_requested()
+                            {
+                                return Err(Error::Busy);
+                            }
+                            let mut next = latest.clone();
+                            next.task
+                                .hold_failure(format!(
+                                    "interrupted woken execution requires reconciliation: {reason}"
+                                ))
+                                .map_err(Error::Transition)?;
+                            let batch = tasks.prepare_save(&[Save::Update(&next)])?;
+                            match store.commit_with_prefix_put_fence(
+                                &batch.checks,
+                                &batch.mutations,
+                                &[
+                                    task_store::PREFIX,
+                                    crate::ownership_edge::PREFIX,
+                                    b"runtime/conversation/",
+                                ],
+                                boundary,
+                            ) {
+                                Ok(()) => Ok(Vec::new()),
+                                Err(
+                                    durable_store::Error::Conflict { .. }
+                                    | durable_store::Error::WriteLockBusy(_),
+                                ) => Err(Error::Busy),
+                                Err(error) => Err(task_store::Error::from(error).into()),
+                            }
+                        }
                         Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
                         Err(error) => Err(Error::Handler(format!("woken graph abort: {error}"))),
                     };
