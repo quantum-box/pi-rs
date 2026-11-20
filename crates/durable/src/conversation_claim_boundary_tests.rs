@@ -8112,6 +8112,34 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool) {
         .unwrap()
         .unwrap();
     assert!(start_commit < receipt_commit);
+    let checks = harness
+        .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+        .unwrap();
+    store.commit(&checks, &[]).unwrap();
+    // Even a byte-identical replacement changes the edge authority.
+    let edge_key = crate::ownership_edge::edge_key(conversation);
+    let edge = store.get(&edge_key).unwrap().unwrap();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: edge_key.clone(),
+                expected: durable_store::Expected::Version(edge.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: edge_key,
+                value: edge.value,
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.commit(&checks, &[]),
+        Err(durable_store::Error::Conflict { .. })
+    ));
+    assert!(
+        harness
+            .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+            .is_err()
+    );
     drop(store);
     drop(harness);
     let options = Options {
