@@ -7254,7 +7254,14 @@ async fn exercise_nested_parent_receipt_recovery(mode: &str, child_cut: bool) {
         scheduler.schedule(conversation);
         scheduler.wait(conversation).await.unwrap();
         let state = scheduler.conversation(conversation).unwrap();
-        assert!(format!("{state:?}").contains("after cancel"), "{state:?}");
+        if child_cut {
+            assert!(
+                format!("{state:?}").contains("Tool was aborted"),
+                "{state:?}"
+            );
+        } else {
+            assert!(format!("{state:?}").contains("after cancel"), "{state:?}");
+        }
     }
     let _ = driver.shutdown_with_pending().unwrap();
     let _ = scheduler.shutdown().await;
