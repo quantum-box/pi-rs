@@ -4208,7 +4208,7 @@ async fn woken_driver_start_marker_kill_worker() {
 #[tokio::test]
 async fn woken_driver_claim_and_start_markers_survive_process_kill() {
     use std::process::{Command, Stdio};
-    for mode in ["start", "callback", "receipt"] {
+    for mode in ["start", "callback", "receipt", "memo"] {
         let dir = tempfile::tempdir().unwrap();
         let mut wake = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -4261,6 +4261,9 @@ async fn woken_driver_claim_and_start_markers_survive_process_kill() {
         if mode == "callback" {
             command.env("PI_TEST_WOKEN_HOLD_CALLBACK", "1");
         }
+        if mode == "memo" {
+            command.env("PI_TEST_WOKEN_MEMO", "1");
+        }
         let mut start = command.spawn().unwrap();
         let ready = match mode {
             "start" => "woken-start",
@@ -4289,7 +4292,7 @@ async fn woken_driver_claim_and_start_markers_survive_process_kill() {
             root.task.id()
         )
         .into_bytes();
-        if mode == "receipt" {
+        if mode == "receipt" || mode == "memo" {
             assert!(store.get(&task_key).unwrap().is_none());
             assert!(store.get(&conversation_key).unwrap().is_none());
             assert!(store.get(&receipt_key).unwrap().is_some());
@@ -4324,8 +4327,20 @@ async fn woken_driver_claim_and_start_markers_survive_process_kill() {
         assert!(store.get(&conversation_key).unwrap().is_none());
         assert_eq!(
             store.get(&receipt_key).unwrap().is_some(),
-            mode == "receipt"
+            mode == "receipt" || mode == "memo"
         );
+        if mode == "memo" {
+            let key = format!("runtime/extension-memo/{}/woken-test", root.task.id());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&store.get(key.as_bytes()).unwrap().unwrap().value)
+                    .unwrap(),
+                json!("saved")
+            );
+            let receipt: crate::task_scheduler::WokenConversationCancelReceipt =
+                serde_json::from_slice(&store.get(&receipt_key).unwrap().unwrap().value).unwrap();
+            assert_eq!(receipt.version, 2);
+            assert!(receipt.after_result.is_some());
+        }
         assert_eq!(dir.path().join("woken-callback").exists(), mode != "start");
         assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
     }

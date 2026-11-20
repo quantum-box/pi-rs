@@ -870,10 +870,15 @@ impl crate::extension::Memo for AbortMemo {
     }
 }
 
+#[allow(dead_code)] // The woken after path remains disabled until terminal publication is fenced.
+enum ConversationAbortClaim<'a> {
+    Parked(&'a crate::task_scheduler::ConversationCancelClaim),
+    Woken(&'a crate::task_scheduler::WokenConversationCancelClaim),
+}
 struct ConversationAbortMemo<'a, 'b> {
     admission: &'a AdmissionHandle<'b>,
     handler: &'a dyn Handler,
-    claim: &'a crate::task_scheduler::ConversationCancelClaim,
+    claim: ConversationAbortClaim<'a>,
     identity: &'a crate::nested_identity::IdentityLease,
     expected_identity: &'a str,
     marker: &'a [u8],
@@ -890,16 +895,30 @@ impl ConversationAbortMemo<'_, '_> {
         if *failed {
             return Err("abort memo unavailable after failure".into());
         }
-        let result = self.admission.conversation_cancel_hook_memo(
-            self.handler,
-            self.claim,
-            self.identity,
-            self.expected_identity,
-            self.marker,
-            self.snapshot,
-            key,
-            value,
-        );
+        let result = match self.claim {
+            ConversationAbortClaim::Parked(claim) => self.admission.conversation_cancel_hook_memo(
+                self.handler,
+                claim,
+                self.identity,
+                self.expected_identity,
+                self.marker,
+                self.snapshot,
+                key,
+                value,
+            ),
+            ConversationAbortClaim::Woken(claim) => {
+                self.admission.woken_conversation_cancel_hook_memo(
+                    self.handler,
+                    claim,
+                    self.identity,
+                    self.expected_identity,
+                    self.marker,
+                    self.snapshot,
+                    key,
+                    value,
+                )
+            }
+        };
         if result.is_err() {
             *failed = true;
         }
@@ -1900,18 +1919,67 @@ impl Handler for Executor {
                                 .map_err(|_| "woken callback timeout")?
                             },
                         ))?;
+                    let (after_result, check) = if std::env::var_os("PI_TEST_WOKEN_MEMO").is_some()
+                    {
+                        let (_snapshot, check) = admission.conversation_cancel_hook_snapshot()?;
+                        let memo = ConversationAbortMemo {
+                            admission,
+                            handler: self,
+                            claim: ConversationAbortClaim::Woken(&claim),
+                            identity: &_identity_lease,
+                            expected_identity: expected,
+                            marker: &marker,
+                            snapshot: &check,
+                            failed: Mutex::new(false),
+                        };
+                        assert_eq!(
+                            memo.access("woken-test", Some(serde_json::json!("saved")))?,
+                            Some(serde_json::json!("saved"))
+                        );
+                        let result = DurableTaskResult::Rich {
+                            task_content_v1: crate::extension::ToolBlockResult {
+                                output: vec![serde_json::json!({"type":"text","text":"after"})],
+                                diagnostics: vec![crate::runtime::ToolDiagnostic {
+                                    severity: crate::runtime::DiagnosticSeverity::Error,
+                                    code: Some("aborted".into()),
+                                    message: "Tool was aborted".into(),
+                                }],
+                                extra: [("isError".into(), serde_json::json!(true))]
+                                    .into_iter()
+                                    .collect(),
+                            },
+                        };
+                        (
+                            Some(serde_json::to_value(result).map_err(|e| e.to_string())?),
+                            Some(check),
+                        )
+                    } else {
+                        (None, None)
+                    };
                     let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
-                        version: 1,
+                        version: if after_result.is_some() { 2 } else { 1 },
                         claim: claim.clone(),
                         result: "callback returned".into(),
+                        after_result,
                     };
-                    admission.store_woken_conversation_cancel_receipt(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )?;
+                    if let Some(check) = check.as_ref() {
+                        admission.store_woken_conversation_cancel_receipt_and_after(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                            check,
+                        )?;
+                    } else {
+                        admission.store_woken_conversation_cancel_receipt(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )?;
+                    }
                     std::fs::write(
                         std::path::Path::new(&dir).join("woken-receipt.tmp"),
                         b"saved",
@@ -1946,6 +2014,7 @@ impl Handler for Executor {
                         "unsupported woken cancel checkpoint; reconciliation required".into(),
                     );
                 }
+                let after_arguments = stored.arguments.clone();
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -2010,21 +2079,59 @@ impl Handler for Executor {
                         "woken cancellation outcome unknown; reconciliation required".into(),
                     );
                 }
+                let after = if self.block_results {
+                    admission
+                        .conversation_cancel_hook_snapshot()
+                        .and_then(|(snapshot, check)| {
+                            let memo = ConversationAbortMemo {
+                                admission,
+                                handler: self,
+                                claim: ConversationAbortClaim::Woken(&claim),
+                                identity: &_identity_lease,
+                                expected_identity: expected,
+                                marker: &marker,
+                                snapshot: &check,
+                                failed: Mutex::new(false),
+                            };
+                            self.conversation_cancel_after_result(
+                                task,
+                                after_arguments,
+                                snapshot,
+                                &memo,
+                            )
+                            .map(|result| (result, check))
+                        })
+                } else {
+                    Err("no selected after".into())
+                };
+                let (after_result, snapshot) = match after {
+                    Ok((result, check)) => (Some(result), Some(check)),
+                    Err(_) => (None, None),
+                };
                 let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
-                    version: 1,
+                    version: if after_result.is_some() { 2 } else { 1 },
                     claim: claim.clone(),
                     result: "callback returned".into(),
+                    after_result,
                 };
-                if admission
-                    .store_woken_conversation_cancel_receipt(
+                let saved = match snapshot.as_ref() {
+                    Some(check) => admission.store_woken_conversation_cancel_receipt_and_after(
                         self,
                         &receipt,
                         &_identity_lease,
                         expected,
                         &marker,
-                    )
-                    .is_err()
-                {
+                        check,
+                    ),
+                    None => admission.store_woken_conversation_cancel_receipt(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    ),
+                };
+                if saved.is_err() {
                     admission.retire_woken_conversation_cancel_unknown(
                         &claim,
                         &_identity_lease,
@@ -2268,7 +2375,7 @@ impl Handler for Executor {
                             let memo = ConversationAbortMemo {
                                 admission,
                                 handler: self,
-                                claim: &_claim,
+                                claim: ConversationAbortClaim::Parked(&_claim),
                                 identity: &_identity_lease,
                                 expected_identity: expected,
                                 marker: &marker,

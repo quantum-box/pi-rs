@@ -340,6 +340,35 @@ pub(crate) fn register_selected_unsafe_cancel_candidate(
     cancel: Arc<dyn DurableParkCancel>,
     enabled: bool,
 ) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    register_selected_unsafe_woken_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        snapshot,
+        names,
+        cancel_identity,
+        cancel,
+        enabled,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_selected_unsafe_woken_candidate(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    enabled: bool,
+    woken: bool,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
     if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
         return Err("invalid cancel identity".into());
     }
@@ -367,7 +396,7 @@ pub(crate) fn register_selected_unsafe_cancel_candidate(
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
         false,
-        Some((cancel_identity.to_owned(), cancel, enabled, false)),
+        Some((cancel_identity.to_owned(), cancel, enabled, woken)),
     )
 }
 

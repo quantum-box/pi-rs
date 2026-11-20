@@ -396,6 +396,8 @@ pub(crate) struct WokenConversationCancelReceipt {
     pub version: u32,
     pub claim: WokenConversationCancelClaim,
     pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_result: Option<Value>,
 }
 
 /// Signal revisions observed by the claim transaction. Missing legacy evidence
@@ -4226,6 +4228,83 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: &[u8],
     ) -> Result<(), String> {
+        self.store_woken_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            marker,
+            None,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn store_woken_conversation_cancel_receipt_and_after(
+        &self,
+        handler: &dyn Handler,
+        receipt: &WokenConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        snapshot: &durable_store::Check,
+    ) -> Result<(), String> {
+        self.store_woken_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            marker,
+            Some(snapshot),
+            None,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn woken_conversation_cancel_hook_memo(
+        &self,
+        handler: &dyn Handler,
+        claim: &WokenConversationCancelClaim,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        snapshot: &durable_store::Check,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<Option<Value>, String> {
+        if key.is_empty() || key.len() > 4096 {
+            return Err("invalid memo key".into());
+        }
+        let receipt = WokenConversationCancelReceipt {
+            version: 1,
+            claim: claim.clone(),
+            result: "callback returned".into(),
+            after_result: None,
+        };
+        self.store_woken_conversation_cancel_receipt_inner(
+            handler,
+            &receipt,
+            identity_lease,
+            expected_identity,
+            marker,
+            Some(snapshot),
+            Some((key, value)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_woken_conversation_cancel_receipt_inner(
+        &self,
+        handler: &dyn Handler,
+        receipt: &WokenConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        snapshot: Option<&durable_store::Check>,
+        memo: Option<(&str, Option<Value>)>,
+    ) -> Result<Option<Value>, String> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
         }
@@ -4303,8 +4382,22 @@ impl AdmissionHandle<'_> {
             return Err("unsafe descendant requires reconciliation".into());
         }
         checks.extend(descendant_checks);
-        if receipt.version != 1 || receipt.result.len() > 65536 {
+        if receipt.result != "callback returned"
+            || !matches!(
+                (receipt.version, receipt.after_result.as_ref()),
+                (1, None) | (2, Some(_))
+            )
+        {
             return Err("invalid woken cleanup receipt".into());
+        }
+        if let Some(after) = receipt.after_result.as_ref() {
+            if snapshot.is_none() {
+                return Err("missing after snapshot".into());
+            }
+            crate::async_task_tool::validate_aborted_after_result(after)?;
+        }
+        if let Some(snapshot) = snapshot {
+            checks.push(snapshot.clone());
         }
         let claim = &receipt.claim;
         checks.extend(woken_conversation_claim_checks(
@@ -4320,6 +4413,9 @@ impl AdmissionHandle<'_> {
         )
         .into_bytes();
         let existing = owner.store().get(&key).map_err(|e| e.to_string())?;
+        if memo.is_some() && (existing.is_some() || snapshot.is_none()) {
+            return Err("invalid woken memo state".into());
+        }
         let expected = if let Some(ref entry) = existing {
             let saved: WokenConversationCancelReceipt =
                 serde_json::from_slice(&entry.value).map_err(|_| "invalid receipt")?;
@@ -4334,7 +4430,7 @@ impl AdmissionHandle<'_> {
             key: key.clone(),
             expected,
         });
-        let mut mutations = if existing.is_none() {
+        let mut mutations = if existing.is_none() && memo.is_none() {
             vec![durable_store::Mutation::Put {
                 key,
                 value: serde_json::to_vec(receipt).map_err(|e| e.to_string())?,
@@ -4374,9 +4470,43 @@ impl AdmissionHandle<'_> {
             .map_err(|e| e.to_string())?;
             checks.extend(conversation_finish.checks);
             checks.extend(task_finish.checks);
-            mutations.extend(conversation_finish.mutations);
-            mutations.extend(task_finish.mutations);
+            if memo.is_none() {
+                mutations.extend(conversation_finish.mutations);
+                mutations.extend(task_finish.mutations);
+            }
         }
+        let memo_result = if let Some((memo_key, value)) = memo {
+            let key =
+                format!("runtime/extension-memo/{}/{}", current.task.id(), memo_key).into_bytes();
+            let entry = owner.store().get(&key).map_err(|e| e.to_string())?;
+            checks.push(durable_store::Check {
+                key: key.clone(),
+                expected: entry
+                    .as_ref()
+                    .map_or(durable_store::Expected::Missing, |e| {
+                        durable_store::Expected::Version(e.version)
+                    }),
+            });
+            match (entry, value) {
+                (Some(entry), _) => {
+                    Some(serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?)
+                }
+                (None, Some(value)) => {
+                    let encoded = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+                    if encoded.len() > 65536 {
+                        return Err("memo value exceeds 64 KiB".into());
+                    }
+                    mutations.push(durable_store::Mutation::Put {
+                        key,
+                        value: encoded,
+                    });
+                    Some(value)
+                }
+                (None, None) => None,
+            }
+        } else {
+            None
+        };
         owner
             .store()
             .commit_with_prefix_put_fence(
@@ -4390,7 +4520,7 @@ impl AdmissionHandle<'_> {
                 boundary,
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(memo_result)
     }
 
     /// Preserve an uncertain callback outcome and release its exact markers.
