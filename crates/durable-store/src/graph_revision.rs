@@ -244,6 +244,25 @@ mod tests {
         assert_eq!(version, 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn migration_requires_exclusive_scheduler_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned.sqlite");
+        let (_canonical, old_lock) = crate::owner::acquire_owner_lock(&path).unwrap();
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::MigrationOwnerUnavailable(_))
+        ));
+        assert!(
+            !path.exists(),
+            "failed migration must not create the database"
+        );
+        drop(old_lock);
+        let store = Store::open(&path).unwrap();
+        assert!(store.get(&global_revision()).unwrap().is_none());
+    }
+
     #[test]
     fn persisted_protocol_fences_legacy_connections_and_reopens() {
         let dir = tempfile::tempdir().unwrap();

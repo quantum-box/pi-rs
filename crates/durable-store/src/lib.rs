@@ -114,6 +114,7 @@ pub enum Error {
     VersionExhausted,
     InvalidSnapshot,
     IncompatibleGraphProtocol,
+    MigrationOwnerUnavailable(String),
     DocumentFrameTooLarge,
 }
 impl fmt::Display for Error {
@@ -124,6 +125,10 @@ impl fmt::Display for Error {
             Self::WriteLockBusy(e) => write!(f, "writer lock unavailable before transaction: {e}"),
             Self::LockPoisoned => write!(f, "store lock poisoned"),
             Self::VersionExhausted => write!(f, "store version exhausted"),
+            Self::MigrationOwnerUnavailable(reason) => write!(
+                f,
+                "graph protocol migration requires exclusive ownership: {reason}"
+            ),
             Self::IncompatibleGraphProtocol => write!(
                 f,
                 "durable graph protocol is incompatible with this runtime"
@@ -205,12 +210,35 @@ impl CommitUpdates {
 }
 impl Store {
     pub fn memory() -> Result<Self, Error> {
-        Self::initialize(Connection::open_in_memory()?, false)
+        Self::initialize(Connection::open_in_memory()?, false, true)
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::initialize(Connection::open(path)?, true)
+        let path = path.as_ref();
+        #[cfg(all(feature = "experimental-graph-revision", unix))]
+        {
+            let protected = if path.exists() {
+                let conn =
+                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_protocol')", [], |row| row.get(0))?
+            } else {
+                false
+            };
+            if !protected {
+                let (db, _lock) = owner::acquire_owner_lock(path)
+                    .map_err(|error| Error::MigrationOwnerUnavailable(error.to_string()))?;
+                return Self::initialize(Connection::open(db)?, true, true);
+            }
+        }
+        Self::initialize(Connection::open(path)?, true, false)
     }
-    fn initialize(conn: Connection, disk: bool) -> Result<Self, Error> {
+    pub(crate) fn open_owned(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::initialize(Connection::open(path)?, true, true)
+    }
+    fn initialize(
+        conn: Connection,
+        disk: bool,
+        _migration_authorized: bool,
+    ) -> Result<Self, Error> {
         #[cfg(feature = "experimental-graph-revision")]
         let graph_protocol_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(feature = "experimental-graph-revision")]
@@ -227,6 +255,10 @@ impl Store {
         let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_protocol')", [], |row| row.get(0))?;
         #[cfg(not(feature = "experimental-graph-revision"))]
         if protected {
+            return Err(Error::IncompatibleGraphProtocol);
+        }
+        #[cfg(feature = "experimental-graph-revision")]
+        if disk && !protected && !_migration_authorized {
             return Err(Error::IncompatibleGraphProtocol);
         }
         #[cfg(feature = "experimental-graph-revision")]
