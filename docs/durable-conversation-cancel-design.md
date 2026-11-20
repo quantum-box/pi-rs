@@ -17,8 +17,14 @@ retirement commit together. Parent cancellation validates the child's committed
 terminal evidence and holds its identity lease through settlement. For multiple
 unsafe cancelled levels, a terminal ancestor is accepted only after its own
 terminal evidence and identity lease have been included in that same parent
-settlement; replaced or late evidence blocks the parent callback. Busy identity
-leases defer reservation while unrelated graphs continue. A killed callback is
+settlement; replaced or late evidence blocks the parent callback. A nested receipt
+and its exact marker retirement are bound by a same-commit retirement record.
+If the process stops after that receipt but before terminal settlement, recovery
+rechecks the registration, identity, ancestry, park, selected snapshot and late
+outcomes before saving the terminal evidence without replaying the callback.
+Older nested receipts without a retirement record require reconciliation; they
+cannot be upgraded automatically. Busy identity leases defer reservation while
+unrelated graphs continue. A killed callback is
 not repeated and requires reconciliation; recovery retires its exact markers.
 Nested callback self-wait uses the explicit callback scope, including across
 joined tasks. Hosts must keep their registrations and identities stable.
