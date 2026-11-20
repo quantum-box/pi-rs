@@ -148,10 +148,12 @@ to run. Indeterminate commits also remain unresolved rather than being treated
 as uncommitted.
 
 Interrupted-woken cancellation drains foreground task descendants before the
-parent callback. Foreground owned conversations are not yet supported by this
-path: recovery and callback authorization fail closed when one is present.
-Atomic graph marking, conversation-edge authentication and child-conversation
-terminal evidence are not yet connected to production recovery.
+parent callback. When a foreground owned conversation is present, driver
+recovery atomically preserves the wake and marks the foreground graph for abort.
+The parent callback remains disabled for this case: conversation-edge and
+child-conversation terminal evidence are not yet authenticated. Invalid wake
+or binding evidence holds the root in failure for reconciliation while normal
+graph cleanup proceeds.
 
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.
