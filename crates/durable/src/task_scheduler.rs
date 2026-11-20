@@ -94,6 +94,17 @@ pub trait Handler: Send + Sync {
     ) -> Result<Step, String> {
         self.run(task)
     }
+    /// Return a completed abort or a known result retained for later receipt publication.
+    #[doc(hidden)]
+    fn run_abort_with_retained_result(
+        &self,
+        task: &Task,
+        admission: &AdmissionHandle<'_>,
+        cancellation: Option<&pi_rs_core::CancellationToken>,
+    ) -> Result<AbortRun, String> {
+        self.run_abort_with_admission(task, admission, cancellation)
+            .map(AbortRun::Step)
+    }
     /// The default preserves existing handlers. A cancellation-aware adapter
     /// must join its own executor before returning.
     fn run_with_cancellation(
@@ -139,6 +150,14 @@ pub enum Step {
     },
     Succeed(Value),
     Fail(String),
+}
+
+/// Internal abort completion transported without discarding its known result.
+#[doc(hidden)]
+pub enum AbortRun {
+    Step(Step),
+    KnownConversationCancel(KnownConversationCancel),
+    KnownWokenCancel(KnownWokenCancel),
 }
 
 pub(crate) const UNSAFE_ANCESTOR_BUSY: &str = "checkpointable unsafe ancestor is not parked";
@@ -241,7 +260,7 @@ fn abort_intent_key(id: Uuid, attempt: Uuid) -> Vec<u8> {
 /// of authorization only; it is not evidence that a callback ran.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ConversationCancelClaim {
+pub struct ConversationCancelClaim {
     pub version: u32,
     pub claim_id: Uuid,
     pub task: Uuid,
@@ -567,6 +586,160 @@ pub(crate) fn woken_terminal_after_checks(
         },
     ]);
     Ok((result, checks))
+}
+
+/// Whether receipt publication definitely did not commit or has an
+/// uncertain outcome. An uncertain commit must never be retried blindly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnownCancelCommitState {
+    NotCommitted,
+    Busy,
+    Stale,
+    Uncertain,
+}
+
+struct KnownCancelAttachment {
+    handler: Arc<dyn Handler>,
+    harness: Option<Mutex<crate::runtime::Harness>>,
+}
+
+/// Identity, marker and original execution attachment remain owned by the
+/// pending result. None of this evidence authorizes a retry by itself.
+#[derive(Clone)]
+pub struct KnownConversationCancel {
+    claim: ConversationCancelClaim,
+    result: String,
+    marker: Vec<u8>,
+    commit_state: KnownCancelCommitState,
+    identity: Option<Arc<crate::nested_identity::IdentityLease>>,
+    attachment: Option<Arc<KnownCancelAttachment>>,
+    receipt: Option<ConversationCancelReceipt>,
+    snapshot_check: Option<durable_store::Check>,
+    nested: bool,
+}
+impl std::fmt::Debug for KnownConversationCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KnownConversationCancel")
+            .field("claim", &self.claim)
+            .field("result", &self.result)
+            .field("marker", &self.marker)
+            .field("commit_state", &self.commit_state)
+            .field("identity_retained", &self.identity.is_some())
+            .field("handler_retained", &self.attachment.is_some())
+            .finish()
+    }
+}
+impl KnownConversationCancel {
+    pub(crate) fn from_receipt(
+        receipt: ConversationCancelReceipt,
+        marker: Vec<u8>,
+        identity: crate::nested_identity::IdentityLease,
+        snapshot_check: durable_store::Check,
+        nested: bool,
+        commit_state: KnownCancelCommitState,
+    ) -> Self {
+        Self {
+            claim: receipt.claim.clone(),
+            result: receipt.result.clone(),
+            marker,
+            commit_state,
+            identity: Some(Arc::new(identity)),
+            attachment: None,
+            receipt: Some(receipt),
+            snapshot_check: Some(snapshot_check),
+            nested,
+        }
+    }
+    pub fn after_result(&self) -> Option<&Value> {
+        self.receipt.as_ref().and_then(|r| r.after_result.as_ref())
+    }
+    pub fn has_snapshot_check(&self) -> bool {
+        self.snapshot_check.is_some()
+    }
+    pub fn is_nested(&self) -> bool {
+        self.nested
+    }
+    /// The original immutable claim; this is evidence and grants no authority.
+    pub fn claim(&self) -> &ConversationCancelClaim {
+        &self.claim
+    }
+    pub fn claim_id(&self) -> Uuid {
+        self.claim.claim_id
+    }
+    pub fn attempt_id(&self) -> Uuid {
+        self.claim.attempt
+    }
+    pub fn lease_id(&self) -> Uuid {
+        self.claim.lease
+    }
+    pub fn result(&self) -> &str {
+        &self.result
+    }
+    pub fn marker(&self) -> &[u8] {
+        &self.marker
+    }
+    pub fn commit_state(&self) -> KnownCancelCommitState {
+        self.commit_state
+    }
+    pub fn identity(&self) -> Option<&str> {
+        self.identity
+            .as_ref()
+            .and_then(|identity| identity.as_ref().as_deref())
+    }
+    pub fn has_harness_attachment(&self) -> bool {
+        self.attachment
+            .as_ref()
+            .is_some_and(|attachment| attachment.harness.is_some())
+    }
+    pub fn handler(&self) -> Option<&dyn Handler> {
+        self.attachment
+            .as_ref()
+            .map(|attachment| attachment.handler.as_ref())
+    }
+    pub fn has_handler(&self) -> bool {
+        self.handler().is_some()
+    }
+}
+
+/// Known woken cleanup evidence; the interrupted Tool outcome remains unknown.
+#[derive(Clone)]
+pub struct KnownWokenCancel {
+    receipt: WokenConversationCancelReceipt,
+    snapshot: durable_store::Check,
+    marker: Vec<u8>,
+    identity: Arc<crate::nested_identity::IdentityLease>,
+    attachment: Option<Arc<KnownCancelAttachment>>,
+    commit_state: KnownCancelCommitState,
+}
+impl KnownWokenCancel {
+    pub(crate) fn new(
+        receipt: WokenConversationCancelReceipt,
+        snapshot: durable_store::Check,
+        marker: Vec<u8>,
+        identity: crate::nested_identity::IdentityLease,
+        commit_state: KnownCancelCommitState,
+    ) -> Self {
+        Self {
+            receipt,
+            snapshot,
+            marker,
+            identity: Arc::new(identity),
+            attachment: None,
+            commit_state,
+        }
+    }
+    pub fn after_result(&self) -> Option<&Value> {
+        self.receipt.after_result.as_ref()
+    }
+    pub fn commit_state(&self) -> KnownCancelCommitState {
+        self.commit_state
+    }
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_ref().as_deref()
+    }
+    pub fn has_snapshot_check(&self) -> bool {
+        matches!(self.snapshot.expected, durable_store::Expected::Version(_))
+    }
 }
 
 /// Signal revisions observed by the claim transaction. Missing legacy evidence
@@ -2697,6 +2870,8 @@ enum InvocationResult {
         Box<crate::document::DetachedTaskDocuments>,
     ),
     Abort(Option<String>),
+    KnownConversationCancel(KnownConversationCancel),
+    KnownWokenCancel(KnownWokenCancel),
 }
 
 /// Completed handler output, still fenced by its exclusive reservation.
@@ -3050,7 +3225,12 @@ impl PendingSettlement {
     /// candidate and lease remain owned and can be returned on shutdown.
     pub(crate) fn waits_for_writer(&self) -> bool {
         match self {
-            Self::Unprepared(completed) => completed.writer_busy,
+            Self::Unprepared(completed) => {
+                completed.writer_busy
+                    || completed
+                        .known_cancel_state()
+                        .is_some_and(|state| state == KnownCancelCommitState::Busy)
+            }
             Self::Prepared { settlement, .. } => settlement.writer_busy,
             Self::Failure { settlement, .. } => settlement.writer_busy,
             Self::PreparationConflict { .. } => false,
@@ -3060,6 +3240,13 @@ impl PendingSettlement {
     // fence during graceful driver shutdown. This only observes the graph;
     // the returned settlement retains its lease and is always revalidated.
     pub(crate) fn waits_for_uncertain_graph(&self, include_background: bool) -> bool {
+        if self.completed().is_some_and(|value| {
+            value
+                .known_cancel_state()
+                .is_some_and(|state| state != KnownCancelCommitState::Busy)
+        }) {
+            return true;
+        }
         let owner = &self.lease().attachment.owner;
         let Ok(_gate) = owner.task_gate().lock() else {
             return false;
@@ -3190,6 +3377,12 @@ impl PendingSettlement {
         }
         if !Arc::ptr_eq(owner, &harness.owner) {
             return Err(Error::Ownership);
+        }
+        if self
+            .completed()
+            .is_some_and(|value| value.known_cancel_state().is_some())
+        {
+            return Ok(false);
         }
         let targets = match harness.scoped_abort_graph(Some(lease.id), None, None, None) {
             Ok(Some(targets)) => targets,
@@ -3478,6 +3671,24 @@ impl CompletedInvocation {
             _ => None,
         }
     }
+    /// A completed callback result held without retry authorization.
+    pub fn known_woken_cancel(&self) -> Option<&KnownWokenCancel> {
+        match &self.result {
+            InvocationResult::KnownWokenCancel(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub(crate) fn known_cancel_state(&self) -> Option<KnownCancelCommitState> {
+        self.known_conversation_cancel()
+            .map(|v| v.commit_state)
+            .or_else(|| self.known_woken_cancel().map(|v| v.commit_state))
+    }
+    pub fn known_conversation_cancel(&self) -> Option<&KnownConversationCancel> {
+        match &self.result {
+            InvocationResult::KnownConversationCancel(value) => Some(value),
+            _ => None,
+        }
+    }
     pub fn task_id(&self) -> Uuid {
         self.running.task.id()
     }
@@ -3571,6 +3782,48 @@ impl AdmissionHandle<'_> {
             .transpose()
     }
 
+    #[cfg(test)]
+    pub(crate) fn synthetic_known_conversation_cancel(
+        &self,
+        result: &str,
+    ) -> KnownConversationCancel {
+        let task = &self.running.task;
+        KnownConversationCancel {
+            claim: ConversationCancelClaim {
+                version: 2,
+                claim_id: Uuid::new_v4(),
+                task: task.id(),
+                kind: task.kind().unwrap().to_owned(),
+                definition_version: task.definition_version(),
+                attempt: task.attempt_id().unwrap(),
+                lease: self.lease.token,
+                checkpoint: task.checkpoint().clone(),
+                policy: crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+            },
+            result: result.to_owned(),
+            marker: Vec::new(),
+            commit_state: KnownCancelCommitState::NotCommitted,
+            identity: None,
+            attachment: None,
+            receipt: None,
+            snapshot_check: None,
+            nested: false,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn synthetic_known_cancel_with_attachment(
+        &self,
+        result: &str,
+        marker: Vec<u8>,
+        identity: crate::nested_identity::IdentityLease,
+        commit_state: KnownCancelCommitState,
+    ) -> KnownConversationCancel {
+        let mut pending = self.synthetic_known_conversation_cancel(result);
+        pending.marker = marker;
+        pending.identity = Some(Arc::new(identity));
+        pending.commit_state = commit_state;
+        pending
+    }
     /// Acquire the root's nonblocking start lease before marker commit and
     /// retain it through the callback's first poll.
     pub(crate) fn conversation_callback_start_lease(
@@ -4564,6 +4817,7 @@ impl AdmissionHandle<'_> {
             false,
         )
         .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     /// Save the successful callback receipt and retire both exact start markers
@@ -4588,6 +4842,7 @@ impl AdmissionHandle<'_> {
             false,
         )
         .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     pub(crate) fn store_conversation_cancel_receipt_and_after(
@@ -4598,7 +4853,7 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: &[u8],
         snapshot_check: &durable_store::Check,
-    ) -> Result<(), String> {
+    ) -> Result<(), HookFenceError> {
         if receipt.version != 2 || receipt.after_result.is_none() {
             return Err("missing cancel after evidence".into());
         }
@@ -4705,6 +4960,7 @@ impl AdmissionHandle<'_> {
             Some((key, value)),
             nested,
         )
+        .map_err(|e| e.to_string())
     }
 
     /// Compose a nested callback receipt with retirement of all exact
@@ -4729,6 +4985,7 @@ impl AdmissionHandle<'_> {
             true,
         )
         .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     #[allow(dead_code)]
@@ -4740,7 +4997,7 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: &[u8],
         snapshot_check: &durable_store::Check,
-    ) -> Result<(), String> {
+    ) -> Result<(), HookFenceError> {
         if receipt.version != 2 || receipt.after_result.is_none() {
             return Err("missing cancel after evidence".into());
         }
@@ -4767,7 +5024,7 @@ impl AdmissionHandle<'_> {
         snapshot_check: Option<&durable_store::Check>,
         memo: Option<(&str, Option<Value>)>,
         nested: bool,
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<Option<Value>, HookFenceError> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
         }
@@ -5031,7 +5288,11 @@ impl AdmissionHandle<'_> {
                 ],
                 boundary,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                durable_store::Error::WriteLockBusy(_) => HookFenceError::WriteLockBusy,
+                durable_store::Error::Conflict { .. } => HookFenceError::Conflict,
+                other => HookFenceError::Other(other.to_string()),
+            })?;
         Ok(memo_result)
     }
 
@@ -5056,6 +5317,7 @@ impl AdmissionHandle<'_> {
             None,
         )
         .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     #[allow(dead_code)]
@@ -5067,7 +5329,7 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: &[u8],
         snapshot: &durable_store::Check,
-    ) -> Result<(), String> {
+    ) -> Result<(), HookFenceError> {
         self.store_woken_conversation_cancel_receipt_inner(
             handler,
             receipt,
@@ -5111,6 +5373,7 @@ impl AdmissionHandle<'_> {
             Some(snapshot),
             Some((key, value)),
         )
+        .map_err(|e| e.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5123,7 +5386,7 @@ impl AdmissionHandle<'_> {
         marker: &[u8],
         snapshot: Option<&durable_store::Check>,
         memo: Option<(&str, Option<Value>)>,
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<Option<Value>, HookFenceError> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
         }
@@ -5305,6 +5568,8 @@ impl AdmissionHandle<'_> {
                 mutations.extend(task_finish.mutations);
             }
         }
+        #[cfg(test)]
+        let receipt_commit = memo.is_none();
         let memo_result = if let Some((memo_key, value)) = memo {
             let key =
                 format!("runtime/extension-memo/{}/{}", current.task.id(), memo_key).into_bytes();
@@ -5337,6 +5602,13 @@ impl AdmissionHandle<'_> {
         } else {
             None
         };
+        #[cfg(test)]
+        if receipt_commit {
+            invoke_boundary(
+                conversation_receipt_before_commit_hooks(),
+                current.task.id(),
+            );
+        }
         owner
             .store()
             .commit_with_prefix_put_fence(
@@ -5349,7 +5621,11 @@ impl AdmissionHandle<'_> {
                 ],
                 boundary,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                durable_store::Error::WriteLockBusy(_) => HookFenceError::WriteLockBusy,
+                durable_store::Error::Conflict { .. } => HookFenceError::Conflict,
+                other => HookFenceError::Other(other.to_string()),
+            })?;
         Ok(memo_result)
     }
 
@@ -8181,23 +8457,64 @@ impl DetachedInvocation {
                     standalone: validator.is_none(),
                     validator: validator.as_ref(),
                 };
-                handler.run_abort_with_admission(
+                handler.run_abort_with_retained_result(
                     &running.task,
                     &admission,
                     unhooked_cancellation.as_ref(),
                 )
             }));
-            let outcome = match result {
-                Ok(Ok(Step::Succeed(_))) => None,
-                Ok(Ok(Step::Fail(reason))) => Some(reason),
-                Ok(Ok(_)) => Some("abort handler must return Succeed or Fail".into()),
-                Ok(Err(reason)) => Some(format!("abort handler failed: {reason}")),
-                Err(payload) => {
-                    crate::extension::discard_panic_payload(payload);
-                    Some("abort handler panicked".into())
+            if let Ok(Ok(AbortRun::KnownConversationCancel(value))) = &result
+                && (value.claim.version != 2
+                    || value.claim.claim_id.is_nil()
+                    || value.claim.task != running.task.id()
+                    || Some(value.claim.kind.as_str()) != running.task.kind()
+                    || value.claim.definition_version != running.task.definition_version()
+                    || Some(value.claim.attempt) != running.task.attempt_id()
+                    || value.claim.lease != lease.token
+                    || value.claim.checkpoint != *running.task.checkpoint())
+            {
+                return Err(Error::Ownership);
+            }
+            if let Ok(Ok(AbortRun::KnownWokenCancel(value))) = &result {
+                let claim = &value.receipt.claim;
+                if claim.version != 3
+                    || claim.claim_id.is_nil()
+                    || claim.task != running.task.id()
+                    || Some(claim.kind.as_str()) != running.task.kind()
+                    || claim.definition_version != running.task.definition_version()
+                    || Some(claim.cleanup_attempt) != running.task.attempt_id()
+                    || claim.cleanup_lease != lease.token
+                    || claim.checkpoint != *running.task.checkpoint()
+                {
+                    return Err(Error::Ownership);
                 }
-            };
-            InvocationResult::Abort(outcome)
+            }
+            match result {
+                Ok(Ok(AbortRun::KnownWokenCancel(mut value))) => {
+                    value.attachment = Some(Arc::new(KnownCancelAttachment {
+                        handler: handler.clone(),
+                        harness: validator.map(Mutex::new),
+                    }));
+                    InvocationResult::KnownWokenCancel(value)
+                }
+                Ok(Ok(AbortRun::KnownConversationCancel(mut value))) => {
+                    value.attachment = Some(Arc::new(KnownCancelAttachment {
+                        handler: handler.clone(),
+                        harness: validator.map(Mutex::new),
+                    }));
+                    InvocationResult::KnownConversationCancel(value)
+                }
+                result => InvocationResult::Abort(match result {
+                    Ok(Ok(AbortRun::Step(Step::Succeed(_)))) => None,
+                    Ok(Ok(AbortRun::Step(Step::Fail(reason)))) => Some(reason),
+                    Ok(Ok(_)) => Some("abort handler must return Succeed or Fail".into()),
+                    Ok(Err(reason)) => Some(format!("abort handler failed: {reason}")),
+                    Err(payload) => {
+                        crate::extension::discard_panic_payload(payload);
+                        Some("abort handler panicked".into())
+                    }
+                }),
+            }
         } else {
             let owner = &lease.attachment.owner;
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
@@ -8294,7 +8611,9 @@ impl DetachedInvocation {
             let _fence = lease.failure_fence.lock().map_err(|_| Error::Poisoned)?;
             let mut state = lease.state.lock().map_err(|_| Error::Poisoned)?;
             let abort_intent = match &result {
-                InvocationResult::Abort(_) => true,
+                InvocationResult::Abort(_)
+                | InvocationResult::KnownConversationCancel(_)
+                | InvocationResult::KnownWokenCancel(_) => true,
                 InvocationResult::Handler(_, documents)
                     if documents.task_input_storage.is_some() =>
                 {
@@ -8954,6 +9273,19 @@ impl Scheduler {
         completed: CompletedInvocation,
         nonblocking_abort: bool,
     ) -> Result<bool, SettlementError> {
+        if completed.known_cancel_state().is_some() {
+            if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+                || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+            {
+                return Err(SettlementError::Rejected {
+                    error: Error::Ownership,
+                    completed: Box::new(completed),
+                });
+            }
+            return Err(SettlementError::Pending {
+                completed: Box::new(completed),
+            });
+        }
         if completed.receipt_capture {
             return Err(SettlementError::Rejected {
                 error: Error::Handler("tool receipt capture is required before settlement".into()),
@@ -9103,6 +9435,8 @@ impl Scheduler {
         let mut reported_handler_failure = false;
         let mut deferred = None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match result {
+            InvocationResult::KnownConversationCancel(_)
+            | InvocationResult::KnownWokenCancel(_) => Err(Error::Ownership),
             InvocationResult::Handler(result, documents) => self.settle_handler_result(
                 running,
                 result,
@@ -10219,6 +10553,19 @@ impl Scheduler {
         &mut self,
         mut completed: CompletedInvocation,
     ) -> Result<bool, SettlementError> {
+        if completed.known_cancel_state().is_some() {
+            if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+                || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+            {
+                return Err(SettlementError::Rejected {
+                    error: Error::Ownership,
+                    completed: Box::new(completed),
+                });
+            }
+            return Err(SettlementError::Pending {
+                completed: Box::new(completed),
+            });
+        }
         if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
             || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
         {
@@ -10431,12 +10778,144 @@ impl Scheduler {
 
     /// Resume an owned pending state after cleanup. The checked transaction is
     /// revalidated under the task gate before its first resumed commit.
+    fn retry_known_cancel(&self, completed: &mut CompletedInvocation) {
+        if let Some(known) = completed.known_woken_cancel().cloned() {
+            if known.commit_state != KnownCancelCommitState::Busy
+                || !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+                || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+            {
+                return;
+            }
+            let Some(attachment) = &known.attachment else {
+                return;
+            };
+            let Some(expected) = known.identity.as_ref().as_deref() else {
+                return;
+            };
+            let Some(harness) = &attachment.harness else {
+                return;
+            };
+            let Ok(harness) = harness.try_lock() else {
+                return;
+            };
+            let admission = AdmissionHandle {
+                running: &completed.running,
+                lease: &completed.lease,
+                abort: true,
+                definitions: &self.wake_reader.definitions,
+                activity: &self.activity,
+                standalone: false,
+                validator: Some(&harness),
+            };
+            let result = admission.store_woken_conversation_cancel_receipt_and_after(
+                attachment.handler.as_ref(),
+                &known.receipt,
+                &known.identity,
+                expected,
+                &known.marker,
+                &known.snapshot,
+            );
+            match result {
+                Ok(()) => {
+                    completed.result = InvocationResult::Abort(Some(
+                        "interrupted woken execution; reconciliation required".into(),
+                    ))
+                }
+                Err(error) => {
+                    if let InvocationResult::KnownWokenCancel(ref mut pending) = completed.result {
+                        pending.commit_state = match error {
+                            HookFenceError::WriteLockBusy => KnownCancelCommitState::Busy,
+                            HookFenceError::Conflict => KnownCancelCommitState::Stale,
+                            HookFenceError::Other(_) => KnownCancelCommitState::Uncertain,
+                        };
+                    }
+                }
+            }
+            return;
+        }
+        let Some(known) = completed.known_conversation_cancel().cloned() else {
+            return;
+        };
+        if known.commit_state != KnownCancelCommitState::Busy
+            || !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+            || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+        {
+            return;
+        }
+        let (Some(receipt), Some(snapshot), Some(identity), Some(attachment)) = (
+            &known.receipt,
+            &known.snapshot_check,
+            &known.identity,
+            &known.attachment,
+        ) else {
+            return;
+        };
+        let Some(expected) = identity.as_ref().as_deref() else {
+            return;
+        };
+        let Some(harness) = &attachment.harness else {
+            return;
+        };
+        let Ok(harness) = harness.try_lock() else {
+            return;
+        };
+        let admission = AdmissionHandle {
+            running: &completed.running,
+            lease: &completed.lease,
+            abort: true,
+            definitions: &self.wake_reader.definitions,
+            activity: &self.activity,
+            standalone: false,
+            validator: Some(&harness),
+        };
+        let result = if known.nested {
+            admission.store_nested_conversation_cancel_receipt_and_after(
+                attachment.handler.as_ref(),
+                receipt,
+                identity,
+                expected,
+                &known.marker,
+                snapshot,
+            )
+        } else {
+            admission.store_conversation_cancel_receipt_and_after(
+                attachment.handler.as_ref(),
+                receipt,
+                identity,
+                expected,
+                &known.marker,
+                snapshot,
+            )
+        };
+        match result {
+            Ok(()) => completed.result = InvocationResult::Abort(None),
+            Err(error) => {
+                if let InvocationResult::KnownConversationCancel(ref mut pending) = completed.result
+                {
+                    pending.commit_state = match error {
+                        HookFenceError::WriteLockBusy => KnownCancelCommitState::Busy,
+                        HookFenceError::Conflict => KnownCancelCommitState::Stale,
+                        HookFenceError::Other(_) => KnownCancelCommitState::Uncertain,
+                    };
+                }
+            }
+        }
+    }
+
     pub fn try_resume_pending(
         &mut self,
         pending: PendingSettlement,
     ) -> Result<bool, SettlementError> {
         let (mut lease, mut settlement) = match pending {
-            PendingSettlement::Unprepared(completed) => {
+            PendingSettlement::Unprepared(mut completed) => {
+                if completed.known_cancel_state().is_some() {
+                    self.retry_known_cancel(&mut completed);
+                    if completed.known_cancel_state().is_some() {
+                        return Err(SettlementError::Pending {
+                            completed: Box::new(completed),
+                        });
+                    }
+                }
                 return self.try_settle_invocation(completed);
             }
             PendingSettlement::Prepared { lease, settlement } => (lease, settlement),

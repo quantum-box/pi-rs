@@ -1823,79 +1823,241 @@ impl Handler for Executor {
     fn run(&self, _: &Task) -> Result<Step, String> {
         Err("driver reservation required".into())
     }
-    fn run_abort_with_admission(
+    fn run_abort_with_retained_result(
         &self,
         task: &Task,
         admission: &AdmissionHandle<'_>,
         _cancellation: Option<&pi_rs_core::CancellationToken>,
-    ) -> Result<Step, String> {
-        if task.holds_restart_cleanup() {
-            return self.run_with_restart_cleanup(task, admission);
-        }
-        if admission.is_conversation_checkpointable() && self._conversation_cancel.is_some() {
-            let identity_tool: Arc<dyn Tool> = self.tool.clone();
-            let expected = self
-                .conversation_identity
-                .as_deref()
-                .ok_or("missing conversation cancel identity")?;
-            let _identity_lease = crate::nested_identity::checked_lease(&identity_tool, expected)
-                .map_err(
-                |_| "conversation cancel identity unavailable; reconciliation required",
-            )?;
-            if !self
-                .identity
-                .matches(self.tool.as_ref(), &self.implementation, self.version)
-            {
-                return Err("conversation cancel tool identity changed".into());
+    ) -> Result<crate::task_scheduler::AbortRun, String> {
+        let mut retained = None;
+        let result = (|| -> Result<Step, String> {
+            if task.holds_restart_cleanup() {
+                return self.run_with_restart_cleanup(task, admission);
             }
-            let (_, cancel, enabled, woken) = self
-                ._conversation_cancel
-                .as_ref()
-                .ok_or("missing cancel registration")?;
-            let selection_start = admission.conversation_selection_start_lease(self)?;
-            #[cfg(test)]
-            if task.woken_interrupted_attempt().is_some()
-                && std::env::var_os("PI_TEST_WOKEN_REAL").is_none()
-                && let Some(dir) = std::env::var_os("PI_TEST_WOKEN_START_DIR")
-            {
-                let claim = admission.record_conversation_woken_claim(
-                    self,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                )?;
-                let start = admission.conversation_callback_start_lease()?;
-                let marker = admission.record_woken_conversation_start_markers(
-                    self,
-                    &claim,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                )?;
-                std::fs::write(std::path::Path::new(&dir).join("woken-start.tmp"), &marker)
+            if admission.is_conversation_checkpointable() && self._conversation_cancel.is_some() {
+                let identity_tool: Arc<dyn Tool> = self.tool.clone();
+                let expected = self
+                    .conversation_identity
+                    .as_deref()
+                    .ok_or("missing conversation cancel identity")?;
+                let _identity_lease =
+                    crate::nested_identity::checked_lease(&identity_tool, expected).map_err(
+                        |_| "conversation cancel identity unavailable; reconciliation required",
+                    )?;
+                if !self
+                    .identity
+                    .matches(self.tool.as_ref(), &self.implementation, self.version)
+                {
+                    return Err("conversation cancel tool identity changed".into());
+                }
+                let (_, cancel, enabled, woken) = self
+                    ._conversation_cancel
+                    .as_ref()
+                    .ok_or("missing cancel registration")?;
+                let selection_start = admission.conversation_selection_start_lease(self)?;
+                #[cfg(test)]
+                if task.woken_interrupted_attempt().is_some()
+                    && std::env::var_os("PI_TEST_WOKEN_REAL").is_none()
+                    && let Some(dir) = std::env::var_os("PI_TEST_WOKEN_START_DIR")
+                {
+                    let claim = admission.record_conversation_woken_claim(
+                        self,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )?;
+                    let start = admission.conversation_callback_start_lease()?;
+                    let marker = admission.record_woken_conversation_start_markers(
+                        self,
+                        &claim,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )?;
+                    std::fs::write(std::path::Path::new(&dir).join("woken-start.tmp"), &marker)
+                        .map_err(|e| e.to_string())?;
+                    std::fs::rename(
+                        std::path::Path::new(&dir).join("woken-start.tmp"),
+                        std::path::Path::new(&dir).join("woken-start"),
+                    )
                     .map_err(|e| e.to_string())?;
-                std::fs::rename(
-                    std::path::Path::new(&dir).join("woken-start.tmp"),
-                    std::path::Path::new(&dir).join("woken-start"),
-                )
-                .map_err(|e| e.to_string())?;
-                if std::env::var_os("PI_TEST_WOKEN_DISPATCH").is_some() {
+                    if std::env::var_os("PI_TEST_WOKEN_DISPATCH").is_some() {
+                        let stored: ParkCheckpoint =
+                            serde_json::from_value(task.checkpoint().data.clone())
+                                .map_err(|_| "invalid woken cancel checkpoint")?;
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        let cancellation = pi_rs_core::CancellationToken::new();
+                        let result =
+                            runtime.block_on(durable_store::controls::with_callback_context(
+                                claim.conversation,
+                                task.id(),
+                                marker.clone(),
+                                async {
+                                    let scope = durable_store::controls::CallbackScope::current()
+                                        .ok_or("missing callback scope")?;
+                                    let future = cancel.cancel_scoped(
+                                        stored.arguments,
+                                        stored.checkpoint,
+                                        ToolContext {
+                                            operation_id: task.id(),
+                                            cancellation: cancellation.clone(),
+                                        },
+                                        scope,
+                                    );
+                                    let mut future = std::pin::pin!(future);
+                                    let mut leases = Some((start, selection_start));
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        std::future::poll_fn(|cx| match leases.take() {
+                                            Some((lease, Some(selection))) => {
+                                                selection.poll_first(lease, future.as_mut(), cx)
+                                            }
+                                            Some((lease, None)) => {
+                                                lease.poll_first(future.as_mut(), cx)
+                                            }
+                                            None => future.as_mut().poll(cx),
+                                        }),
+                                    )
+                                    .await
+                                    .map_err(|_| "woken callback timeout")?
+                                },
+                            ))?;
+                        let (after_result, check) = if std::env::var_os("PI_TEST_WOKEN_MEMO")
+                            .is_some()
+                        {
+                            let (_snapshot, check) =
+                                admission.conversation_cancel_hook_snapshot()?;
+                            let memo = ConversationAbortMemo {
+                                admission,
+                                handler: self,
+                                claim: ConversationAbortClaim::Woken(&claim),
+                                nested: false,
+                                identity: &_identity_lease,
+                                expected_identity: expected,
+                                marker: &marker,
+                                snapshot: &check,
+                                failed: Mutex::new(false),
+                            };
+                            assert_eq!(
+                                memo.access("woken-test", Some(serde_json::json!("saved")))?,
+                                Some(serde_json::json!("saved"))
+                            );
+                            let result = DurableTaskResult::Rich {
+                                task_content_v1: crate::extension::ToolBlockResult {
+                                    output: vec![serde_json::json!({"type":"text","text":"after"})],
+                                    diagnostics: vec![crate::runtime::ToolDiagnostic {
+                                        severity: crate::runtime::DiagnosticSeverity::Error,
+                                        code: Some("aborted".into()),
+                                        message: "Tool was aborted".into(),
+                                    }],
+                                    extra: [("isError".into(), serde_json::json!(true))]
+                                        .into_iter()
+                                        .collect(),
+                                },
+                            };
+                            (
+                                Some(serde_json::to_value(result).map_err(|e| e.to_string())?),
+                                Some(check),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
+                            version: if after_result.is_some() { 2 } else { 1 },
+                            claim: claim.clone(),
+                            result: "callback returned".into(),
+                            snapshot_version: check.as_ref().and_then(|c| match c.expected {
+                                durable_store::Expected::Version(v) => Some(v),
+                                _ => None,
+                            }),
+                            after_result,
+                        };
+                        if let Some(check) = check.as_ref() {
+                            admission
+                                .store_woken_conversation_cancel_receipt_and_after(
+                                    self,
+                                    &receipt,
+                                    &_identity_lease,
+                                    expected,
+                                    &marker,
+                                    check,
+                                )
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            admission.store_woken_conversation_cancel_receipt(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                            )?;
+                        }
+                        std::fs::write(
+                            std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                            b"saved",
+                        )
+                        .map_err(|e| e.to_string())?;
+                        std::fs::rename(
+                            std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                            std::path::Path::new(&dir).join("woken-receipt"),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        std::hint::black_box(result);
+                    } else {
+                        let _leases = (start, selection_start);
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                if *woken && task.woken_interrupted_attempt().is_some() {
                     let stored: ParkCheckpoint =
                         serde_json::from_value(task.checkpoint().data.clone())
                             .map_err(|_| "invalid woken cancel checkpoint")?;
+                    if stored.version != 2
+                        || stored.park_attempt.is_none()
+                        || !stored.arguments.is_object()
+                        || !jsonschema::validator_for(&self.identity.spec.parameters)
+                            .is_ok_and(|schema| schema.is_valid(&stored.arguments))
+                    {
+                        return Err(
+                            "unsupported woken cancel checkpoint; reconciliation required".into(),
+                        );
+                    }
+                    let after_arguments = stored.arguments.clone();
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .map_err(|e| e.to_string())?;
+                    let claim = admission.record_conversation_woken_claim(
+                        self,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )?;
+                    let start = admission.conversation_callback_start_lease()?;
+                    let marker = admission.record_woken_conversation_start_markers(
+                        self,
+                        &claim,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )?;
                     let cancellation = pi_rs_core::CancellationToken::new();
-                    let result =
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         runtime.block_on(durable_store::controls::with_callback_context(
                             claim.conversation,
                             task.id(),
                             marker.clone(),
                             async {
                                 let scope = durable_store::controls::CallbackScope::current()
-                                    .ok_or("missing callback scope")?;
+                                    .expect("callback scope installed");
                                 let future = cancel.cancel_scoped(
                                     stored.arguments,
                                     stored.checkpoint,
@@ -1920,68 +2082,270 @@ impl Handler for Executor {
                                     }),
                                 )
                                 .await
-                                .map_err(|_| "woken callback timeout")?
                             },
-                        ))?;
-                    let (after_result, check) = if std::env::var_os("PI_TEST_WOKEN_MEMO").is_some()
-                    {
-                        let (_snapshot, check) = admission.conversation_cancel_hook_snapshot()?;
-                        let memo = ConversationAbortMemo {
-                            admission,
-                            handler: self,
-                            claim: ConversationAbortClaim::Woken(&claim),
-                            nested: false,
-                            identity: &_identity_lease,
-                            expected_identity: expected,
-                            marker: &marker,
-                            snapshot: &check,
-                            failed: Mutex::new(false),
-                        };
-                        assert_eq!(
-                            memo.access("woken-test", Some(serde_json::json!("saved")))?,
-                            Some(serde_json::json!("saved"))
+                        ))
+                    }));
+                    cancellation.cancel();
+                    if !matches!(result, Ok(Ok(Ok(())))) {
+                        admission.retire_woken_conversation_cancel_unknown(
+                            &claim,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )?;
+                        return Err(
+                            "woken cancellation outcome unknown; reconciliation required".into(),
                         );
-                        let result = DurableTaskResult::Rich {
-                            task_content_v1: crate::extension::ToolBlockResult {
-                                output: vec![serde_json::json!({"type":"text","text":"after"})],
-                                diagnostics: vec![crate::runtime::ToolDiagnostic {
-                                    severity: crate::runtime::DiagnosticSeverity::Error,
-                                    code: Some("aborted".into()),
-                                    message: "Tool was aborted".into(),
-                                }],
-                                extra: [("isError".into(), serde_json::json!(true))]
-                                    .into_iter()
-                                    .collect(),
+                    }
+                    let after = if self.block_results {
+                        admission.conversation_cancel_hook_snapshot().and_then(
+                            |(snapshot, check)| {
+                                let memo = ConversationAbortMemo {
+                                    admission,
+                                    handler: self,
+                                    claim: ConversationAbortClaim::Woken(&claim),
+                                    nested: false,
+                                    identity: &_identity_lease,
+                                    expected_identity: expected,
+                                    marker: &marker,
+                                    snapshot: &check,
+                                    failed: Mutex::new(false),
+                                };
+                                self.conversation_cancel_after_result(
+                                    task,
+                                    after_arguments,
+                                    snapshot,
+                                    &memo,
+                                )
+                                .map(|result| (result, check))
                             },
-                        };
-                        (
-                            Some(serde_json::to_value(result).map_err(|e| e.to_string())?),
-                            Some(check),
                         )
                     } else {
-                        (None, None)
+                        Err("no selected after".into())
+                    };
+                    let (after_result, snapshot) = match after {
+                        Ok((result, check)) => (Some(result), Some(check)),
+                        Err(_) => (None, None),
                     };
                     let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
                         version: if after_result.is_some() { 2 } else { 1 },
                         claim: claim.clone(),
                         result: "callback returned".into(),
-                        snapshot_version: check.as_ref().and_then(|c| match c.expected {
+                        snapshot_version: snapshot.as_ref().and_then(|c| match c.expected {
                             durable_store::Expected::Version(v) => Some(v),
                             _ => None,
                         }),
                         after_result,
                     };
-                    if let Some(check) = check.as_ref() {
-                        admission.store_woken_conversation_cancel_receipt_and_after(
+                    let saved = match snapshot.as_ref() {
+                        Some(check) => admission.store_woken_conversation_cancel_receipt_and_after(
                             self,
                             &receipt,
                             &_identity_lease,
                             expected,
                             &marker,
                             check,
+                        ),
+                        None => admission
+                            .store_woken_conversation_cancel_receipt(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                            )
+                            .map_err(crate::task_scheduler::HookFenceError::Other),
+                    };
+                    if let Err(error) = saved {
+                        if let Some(snapshot) = snapshot {
+                            let state = match error {
+                                crate::task_scheduler::HookFenceError::WriteLockBusy => {
+                                    crate::task_scheduler::KnownCancelCommitState::Busy
+                                }
+                                crate::task_scheduler::HookFenceError::Conflict => {
+                                    crate::task_scheduler::KnownCancelCommitState::Stale
+                                }
+                                _ => crate::task_scheduler::KnownCancelCommitState::Uncertain,
+                            };
+                            retained = Some(crate::task_scheduler::AbortRun::KnownWokenCancel(
+                                crate::task_scheduler::KnownWokenCancel::new(
+                                    receipt,
+                                    snapshot,
+                                    marker,
+                                    _identity_lease,
+                                    state,
+                                ),
+                            ));
+                            return Ok(Step::Succeed(serde_json::Value::Null));
+                        }
+                        admission.retire_woken_conversation_cancel_unknown(
+                            &claim,
+                            &_identity_lease,
+                            expected,
+                            &marker,
                         )?;
+                        return Err(
+                            "woken cancellation receipt uncertain; reconciliation required".into(),
+                        );
+                    }
+                    #[cfg(test)]
+                    if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT") {
+                        std::fs::write(
+                            std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                            b"saved",
+                        )
+                        .map_err(|e| e.to_string())?;
+                        std::fs::rename(
+                            std::path::Path::new(&dir).join("woken-receipt.tmp"),
+                            std::path::Path::new(&dir).join("woken-receipt"),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    // Cleanup does not turn the interrupted Tool's outcome into a
+                    // known result. Preserve the receipt for reconciliation.
+                    return Err("interrupted woken execution; reconciliation required".into());
+                }
+                #[cfg(test)]
+                if crate::task_scheduler::take_test_nested_claim(task.id()) {
+                    let claim = admission.record_nested_conversation_park_claim(
+                        self,
+                        cancel.conversation_cancel_policy(),
+                        &_identity_lease,
+                        expected,
+                    )?;
+                    let real_callback = crate::task_scheduler::take_test_nested_callback(task.id());
+                    let start = if real_callback {
+                        Some(admission.nested_conversation_callback_start_lease()?)
                     } else {
-                        admission.store_woken_conversation_cancel_receipt(
+                        None
+                    };
+                    let marker = admission.record_nested_conversation_start_markers(
+                        self,
+                        claim.claim_id,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )?;
+                    let mut after_arguments = None;
+                    let result = if let Some((conversation, start)) = start {
+                        let stored: ParkCheckpoint =
+                            serde_json::from_value(task.checkpoint().data.clone())
+                                .map_err(|_| "invalid park")?;
+                        after_arguments = Some(stored.arguments.clone());
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        let cancellation = pi_rs_core::CancellationToken::new();
+                        rt.block_on(durable_store::controls::with_callback_context(
+                            conversation,
+                            task.id(),
+                            marker.clone(),
+                            async {
+                                let scope = durable_store::controls::CallbackScope::current()
+                                    .ok_or("missing scope")?;
+                                let future = cancel.cancel_scoped(
+                                    stored.arguments,
+                                    stored.checkpoint,
+                                    ToolContext {
+                                        operation_id: task.id(),
+                                        cancellation,
+                                    },
+                                    scope,
+                                );
+                                let mut future = std::pin::pin!(future);
+                                let mut lease = Some((start, selection_start));
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    std::future::poll_fn(|cx| match lease.take() {
+                                        Some((lease, Some(selection))) => {
+                                            selection.poll_first(lease, future.as_mut(), cx)
+                                        }
+                                        Some((lease, None)) => {
+                                            lease.poll_first(future.as_mut(), cx)
+                                        }
+                                        None => future.as_mut().poll(cx),
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| "callback timed out")?
+                            },
+                        ))?;
+                        "callback returned"
+                    } else {
+                        "test evidence only"
+                    };
+                    let (after_result, snapshot_check) = if self.block_results && real_callback {
+                        let (snapshot, check) =
+                            admission.nested_conversation_cancel_hook_snapshot()?;
+                        let memo = ConversationAbortMemo {
+                            admission,
+                            handler: self,
+                            claim: ConversationAbortClaim::Parked(&claim),
+                            identity: &_identity_lease,
+                            expected_identity: expected,
+                            marker: &marker,
+                            snapshot: &check,
+                            nested: true,
+                            failed: Mutex::new(false),
+                        };
+                        let result = self.conversation_cancel_after_result(
+                            task,
+                            after_arguments.ok_or("missing arguments")?,
+                            snapshot,
+                            &memo,
+                        )?;
+                        (Some(result), Some(check))
+                    } else {
+                        (None, None)
+                    };
+                    let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                        version: if after_result.is_some() { 2 } else { 1 },
+                        claim,
+                        result: result.into(),
+                        after_result,
+                    };
+                    if let Some(check) = snapshot_check.as_ref() {
+                        if admission
+                            .store_nested_conversation_cancel_receipt_and_after(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                b"wrong-marker",
+                                check,
+                            )
+                            .is_ok()
+                        {
+                            return Err("substituted nested marker accepted".into());
+                        }
+                        admission
+                            .store_nested_conversation_cancel_receipt_and_after(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                                check,
+                            )
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        if admission
+                            .store_nested_conversation_cancel_receipt_and_retire(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                b"wrong-marker",
+                            )
+                            .is_ok()
+                        {
+                            return Err("substituted nested marker accepted".into());
+                        }
+                        admission.store_nested_conversation_cancel_receipt_and_retire(
                             self,
                             &receipt,
                             &_identity_lease,
@@ -1989,63 +2353,206 @@ impl Handler for Executor {
                             &marker,
                         )?;
                     }
-                    std::fs::write(
-                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
-                        b"saved",
-                    )
-                    .map_err(|e| e.to_string())?;
-                    std::fs::rename(
-                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
-                        std::path::Path::new(&dir).join("woken-receipt"),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    std::hint::black_box(result);
+                    if crate::task_scheduler::take_test_nested_success(task.id()) {
+                        return Ok(Step::Succeed(serde_json::Value::Null));
+                    }
+                    return Err("nested claim probe complete; reconciliation required".into());
+                }
+                let nested = matches!(task.owner(), crate::task::TaskOwner::Task(_));
+                let _claim = if nested {
+                    admission.record_nested_conversation_park_claim(
+                        self,
+                        cancel.conversation_cancel_policy(),
+                        &_identity_lease,
+                        expected,
+                    )?
                 } else {
-                    let _leases = (start, selection_start);
-                    loop {
-                        std::thread::park();
+                    admission
+                        .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?
+                };
+                #[cfg(test)]
+                if crate::task_scheduler::take_test_conversation_start(task.id()) {
+                    let result = admission.record_conversation_start_markers(
+                        self,
+                        _claim.claim_id,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    );
+                    if crate::task_scheduler::take_test_conversation_finish(task.id()) {
+                        let marker = result?;
+                        let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                            version: 1,
+                            claim: _claim.clone(),
+                            result: "test evidence only".into(),
+                            after_result: None,
+                        };
+                        // A substituted marker must not write a receipt or remove either marker.
+                        if admission
+                            .store_conversation_cancel_receipt_and_retire(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                b"substituted",
+                            )
+                            .is_ok()
+                        {
+                            return Err("substituted marker accepted".into());
+                        }
+                        let finish = admission.store_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        );
+                        crate::task_scheduler::report_conversation_start_result(task.id());
+                        finish?;
+                        return Err("test receipt evidence only; callback remains disabled".into());
+                    }
+                    crate::task_scheduler::report_conversation_start_result(task.id());
+                    result?;
+                    if admission
+                        .record_conversation_start_markers(
+                            self,
+                            _claim.claim_id,
+                            &_identity_lease,
+                            expected,
+                            cancel.conversation_cancel_policy(),
+                        )
+                        .is_ok()
+                    {
+                        return Err("duplicate start markers accepted".into());
+                    }
+                    return Err("test start evidence only; callback remains disabled".into());
+                }
+                #[cfg(test)]
+                if crate::task_scheduler::take_test_conversation_receipt(task.id()) {
+                    // A successful claim is single-use even when the same live
+                    // attempt tries to acquire it again before any callback runs.
+                    if admission
+                        .record_conversation_park_claim(self, cancel.conversation_cancel_policy())
+                        .is_ok()
+                    {
+                        return Err("duplicate conversation cancel claim accepted".into());
+                    }
+                    let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                        version: 1,
+                        claim: _claim.clone(),
+                        result: "test evidence only".into(),
+                        after_result: None,
+                    };
+                    if admission
+                        .read_live_conversation_cancel_receipt(
+                            self,
+                            _claim.claim_id,
+                            &_identity_lease,
+                            expected,
+                        )?
+                        .is_some()
+                    {
+                        return Err("unexpected pre-existing receipt".into());
+                    }
+                    admission.store_conversation_cancel_receipt(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                    )?;
+                    admission.store_conversation_cancel_receipt(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                    )?;
+                    if admission.read_live_conversation_cancel_receipt(
+                        self,
+                        _claim.claim_id,
+                        &_identity_lease,
+                        expected,
+                    )? != Some(receipt.clone())
+                    {
+                        return Err("receipt read mismatch".into());
+                    }
+                    if admission
+                        .read_live_conversation_cancel_receipt(
+                            self,
+                            uuid::Uuid::new_v4(),
+                            &_identity_lease,
+                            expected,
+                        )
+                        .is_ok()
+                    {
+                        return Err("foreign claim accepted".into());
+                    }
+                    let mut foreign = receipt.clone();
+                    foreign.claim.attempt = uuid::Uuid::new_v4();
+                    if admission
+                        .store_conversation_cancel_receipt(
+                            self,
+                            &foreign,
+                            &_identity_lease,
+                            expected,
+                        )
+                        .is_ok()
+                    {
+                        return Err("foreign attempt accepted".into());
                     }
                 }
-                loop {
-                    std::thread::park();
+                if !enabled {
+                    return Err(
+                        "conversation cancel callback is not enabled; reconciliation required"
+                            .into(),
+                    );
                 }
-            }
-            if *woken && task.woken_interrupted_attempt().is_some() {
                 let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
-                    .map_err(|_| "invalid woken cancel checkpoint")?;
+                    .map_err(|_| "invalid parked cancel checkpoint")?;
                 if stored.version != 2
                     || stored.park_attempt.is_none()
                     || !stored.arguments.is_object()
                     || !jsonschema::validator_for(&self.identity.spec.parameters)
                         .is_ok_and(|schema| schema.is_valid(&stored.arguments))
                 {
-                    return Err(
-                        "unsupported woken cancel checkpoint; reconciliation required".into(),
-                    );
+                    return Err("unsupported parked cancel checkpoint".into());
                 }
-                let after_arguments = stored.arguments.clone();
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())?;
-                let claim = admission.record_conversation_woken_claim(
-                    self,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                )?;
-                let start = admission.conversation_callback_start_lease()?;
-                let marker = admission.record_woken_conversation_start_markers(
-                    self,
-                    &claim,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                )?;
+                let after_arguments = stored.arguments.clone();
+                let (conversation, start) = if nested {
+                    admission.nested_conversation_callback_start_lease()?
+                } else {
+                    let crate::task::TaskOwner::Conversation(id) = task.owner() else {
+                        unreachable!()
+                    };
+                    (*id, admission.conversation_callback_start_lease()?)
+                };
+                let marker_result = if nested {
+                    admission.record_nested_conversation_start_markers(
+                        self,
+                        _claim.claim_id,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )
+                } else {
+                    admission.record_conversation_start_markers(
+                        self,
+                        _claim.claim_id,
+                        &_identity_lease,
+                        expected,
+                        cancel.conversation_cancel_policy(),
+                    )
+                };
+                #[cfg(test)]
+                crate::task_scheduler::report_conversation_start_result(task.id());
+                let marker = marker_result?;
                 let cancellation = pi_rs_core::CancellationToken::new();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(durable_store::controls::with_callback_context(
-                        claim.conversation,
+                        conversation,
                         task.id(),
                         marker.clone(),
                         async {
@@ -2061,10 +2568,10 @@ impl Handler for Executor {
                                 scope,
                             );
                             let mut future = std::pin::pin!(future);
-                            let mut leases = Some((start, selection_start));
+                            let mut start = Some((start, selection_start));
                             tokio::time::timeout(
                                 std::time::Duration::from_secs(30),
-                                std::future::poll_fn(|cx| match leases.take() {
+                                std::future::poll_fn(|cx| match start.take() {
                                     Some((lease, Some(selection))) => {
                                         selection.poll_first(lease, future.as_mut(), cx)
                                     }
@@ -2078,767 +2585,288 @@ impl Handler for Executor {
                 }));
                 cancellation.cancel();
                 if !matches!(result, Ok(Ok(Ok(())))) {
-                    admission.retire_woken_conversation_cancel_unknown(
-                        &claim,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )?;
-                    return Err(
-                        "woken cancellation outcome unknown; reconciliation required".into(),
-                    );
-                }
-                let after = if self.block_results {
-                    admission
-                        .conversation_cancel_hook_snapshot()
-                        .and_then(|(snapshot, check)| {
-                            let memo = ConversationAbortMemo {
-                                admission,
-                                handler: self,
-                                claim: ConversationAbortClaim::Woken(&claim),
-                                nested: false,
-                                identity: &_identity_lease,
-                                expected_identity: expected,
-                                marker: &marker,
-                                snapshot: &check,
-                                failed: Mutex::new(false),
-                            };
-                            self.conversation_cancel_after_result(
-                                task,
-                                after_arguments,
-                                snapshot,
-                                &memo,
-                            )
-                            .map(|result| (result, check))
-                        })
-                } else {
-                    Err("no selected after".into())
-                };
-                let (after_result, snapshot) = match after {
-                    Ok((result, check)) => (Some(result), Some(check)),
-                    Err(_) => (None, None),
-                };
-                let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
-                    version: if after_result.is_some() { 2 } else { 1 },
-                    claim: claim.clone(),
-                    result: "callback returned".into(),
-                    snapshot_version: snapshot.as_ref().and_then(|c| match c.expected {
-                        durable_store::Expected::Version(v) => Some(v),
-                        _ => None,
-                    }),
-                    after_result,
-                };
-                let saved = match snapshot.as_ref() {
-                    Some(check) => admission.store_woken_conversation_cancel_receipt_and_after(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                        check,
-                    ),
-                    None => admission.store_woken_conversation_cancel_receipt(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    ),
-                };
-                if saved.is_err() {
-                    admission.retire_woken_conversation_cancel_unknown(
-                        &claim,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )?;
-                    return Err(
-                        "woken cancellation receipt uncertain; reconciliation required".into(),
-                    );
-                }
-                #[cfg(test)]
-                if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT") {
-                    std::fs::write(
-                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
-                        b"saved",
-                    )
-                    .map_err(|e| e.to_string())?;
-                    std::fs::rename(
-                        std::path::Path::new(&dir).join("woken-receipt.tmp"),
-                        std::path::Path::new(&dir).join("woken-receipt"),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    loop {
-                        std::thread::park();
-                    }
-                }
-                // Cleanup does not turn the interrupted Tool's outcome into a
-                // known result. Preserve the receipt for reconciliation.
-                return Err("interrupted woken execution; reconciliation required".into());
-            }
-            #[cfg(test)]
-            if crate::task_scheduler::take_test_nested_claim(task.id()) {
-                let claim = admission.record_nested_conversation_park_claim(
-                    self,
-                    cancel.conversation_cancel_policy(),
-                    &_identity_lease,
-                    expected,
-                )?;
-                let real_callback = crate::task_scheduler::take_test_nested_callback(task.id());
-                let start = if real_callback {
-                    Some(admission.nested_conversation_callback_start_lease()?)
-                } else {
-                    None
-                };
-                let marker = admission.record_nested_conversation_start_markers(
-                    self,
-                    claim.claim_id,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                )?;
-                let mut after_arguments = None;
-                let result = if let Some((conversation, start)) = start {
-                    let stored: ParkCheckpoint =
-                        serde_json::from_value(task.checkpoint().data.clone())
-                            .map_err(|_| "invalid park")?;
-                    after_arguments = Some(stored.arguments.clone());
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    let cancellation = pi_rs_core::CancellationToken::new();
-                    rt.block_on(durable_store::controls::with_callback_context(
-                        conversation,
-                        task.id(),
-                        marker.clone(),
-                        async {
-                            let scope = durable_store::controls::CallbackScope::current()
-                                .ok_or("missing scope")?;
-                            let future = cancel.cancel_scoped(
-                                stored.arguments,
-                                stored.checkpoint,
-                                ToolContext {
-                                    operation_id: task.id(),
-                                    cancellation,
-                                },
-                                scope,
-                            );
-                            let mut future = std::pin::pin!(future);
-                            let mut lease = Some((start, selection_start));
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                std::future::poll_fn(|cx| match lease.take() {
-                                    Some((lease, Some(selection))) => {
-                                        selection.poll_first(lease, future.as_mut(), cx)
-                                    }
-                                    Some((lease, None)) => lease.poll_first(future.as_mut(), cx),
-                                    None => future.as_mut().poll(cx),
-                                }),
-                            )
-                            .await
-                            .map_err(|_| "callback timed out")?
-                        },
-                    ))?;
-                    "callback returned"
-                } else {
-                    "test evidence only"
-                };
-                let (after_result, snapshot_check) = if self.block_results && real_callback {
-                    let (snapshot, check) = admission.nested_conversation_cancel_hook_snapshot()?;
-                    let memo = ConversationAbortMemo {
-                        admission,
-                        handler: self,
-                        claim: ConversationAbortClaim::Parked(&claim),
-                        identity: &_identity_lease,
-                        expected_identity: expected,
-                        marker: &marker,
-                        snapshot: &check,
-                        nested: true,
-                        failed: Mutex::new(false),
-                    };
-                    let result = self.conversation_cancel_after_result(
-                        task,
-                        after_arguments.ok_or("missing arguments")?,
-                        snapshot,
-                        &memo,
-                    )?;
-                    (Some(result), Some(check))
-                } else {
-                    (None, None)
-                };
-                let receipt = crate::task_scheduler::ConversationCancelReceipt {
-                    version: if after_result.is_some() { 2 } else { 1 },
-                    claim,
-                    result: result.into(),
-                    after_result,
-                };
-                if let Some(check) = snapshot_check.as_ref() {
-                    if admission
-                        .store_nested_conversation_cancel_receipt_and_after(
-                            self,
-                            &receipt,
-                            &_identity_lease,
-                            expected,
-                            b"wrong-marker",
-                            check,
-                        )
-                        .is_ok()
-                    {
-                        return Err("substituted nested marker accepted".into());
-                    }
-                    admission.store_nested_conversation_cancel_receipt_and_after(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                        check,
-                    )?;
-                } else {
-                    if admission
-                        .store_nested_conversation_cancel_receipt_and_retire(
-                            self,
-                            &receipt,
-                            &_identity_lease,
-                            expected,
-                            b"wrong-marker",
-                        )
-                        .is_ok()
-                    {
-                        return Err("substituted nested marker accepted".into());
-                    }
-                    admission.store_nested_conversation_cancel_receipt_and_retire(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )?;
-                }
-                if crate::task_scheduler::take_test_nested_success(task.id()) {
-                    return Ok(Step::Succeed(serde_json::Value::Null));
-                }
-                return Err("nested claim probe complete; reconciliation required".into());
-            }
-            let nested = matches!(task.owner(), crate::task::TaskOwner::Task(_));
-            let _claim = if nested {
-                admission.record_nested_conversation_park_claim(
-                    self,
-                    cancel.conversation_cancel_policy(),
-                    &_identity_lease,
-                    expected,
-                )?
-            } else {
-                admission
-                    .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?
-            };
-            #[cfg(test)]
-            if crate::task_scheduler::take_test_conversation_start(task.id()) {
-                let result = admission.record_conversation_start_markers(
-                    self,
-                    _claim.claim_id,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                );
-                if crate::task_scheduler::take_test_conversation_finish(task.id()) {
-                    let marker = result?;
-                    let receipt = crate::task_scheduler::ConversationCancelReceipt {
-                        version: 1,
-                        claim: _claim.clone(),
-                        result: "test evidence only".into(),
-                        after_result: None,
-                    };
-                    // A substituted marker must not write a receipt or remove either marker.
-                    if admission
-                        .store_conversation_cancel_receipt_and_retire(
-                            self,
-                            &receipt,
-                            &_identity_lease,
-                            expected,
-                            b"substituted",
-                        )
-                        .is_ok()
-                    {
-                        return Err("substituted marker accepted".into());
-                    }
-                    let finish = admission.store_conversation_cancel_receipt_and_retire(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    );
-                    crate::task_scheduler::report_conversation_start_result(task.id());
-                    finish?;
-                    return Err("test receipt evidence only; callback remains disabled".into());
-                }
-                crate::task_scheduler::report_conversation_start_result(task.id());
-                result?;
-                if admission
-                    .record_conversation_start_markers(
-                        self,
-                        _claim.claim_id,
-                        &_identity_lease,
-                        expected,
-                        cancel.conversation_cancel_policy(),
-                    )
-                    .is_ok()
-                {
-                    return Err("duplicate start markers accepted".into());
-                }
-                return Err("test start evidence only; callback remains disabled".into());
-            }
-            #[cfg(test)]
-            if crate::task_scheduler::take_test_conversation_receipt(task.id()) {
-                // A successful claim is single-use even when the same live
-                // attempt tries to acquire it again before any callback runs.
-                if admission
-                    .record_conversation_park_claim(self, cancel.conversation_cancel_policy())
-                    .is_ok()
-                {
-                    return Err("duplicate conversation cancel claim accepted".into());
-                }
-                let receipt = crate::task_scheduler::ConversationCancelReceipt {
-                    version: 1,
-                    claim: _claim.clone(),
-                    result: "test evidence only".into(),
-                    after_result: None,
-                };
-                if admission
-                    .read_live_conversation_cancel_receipt(
-                        self,
-                        _claim.claim_id,
-                        &_identity_lease,
-                        expected,
-                    )?
-                    .is_some()
-                {
-                    return Err("unexpected pre-existing receipt".into());
-                }
-                admission.store_conversation_cancel_receipt(
-                    self,
-                    &receipt,
-                    &_identity_lease,
-                    expected,
-                )?;
-                admission.store_conversation_cancel_receipt(
-                    self,
-                    &receipt,
-                    &_identity_lease,
-                    expected,
-                )?;
-                if admission.read_live_conversation_cancel_receipt(
-                    self,
-                    _claim.claim_id,
-                    &_identity_lease,
-                    expected,
-                )? != Some(receipt.clone())
-                {
-                    return Err("receipt read mismatch".into());
-                }
-                if admission
-                    .read_live_conversation_cancel_receipt(
-                        self,
-                        uuid::Uuid::new_v4(),
-                        &_identity_lease,
-                        expected,
-                    )
-                    .is_ok()
-                {
-                    return Err("foreign claim accepted".into());
-                }
-                let mut foreign = receipt.clone();
-                foreign.claim.attempt = uuid::Uuid::new_v4();
-                if admission
-                    .store_conversation_cancel_receipt(self, &foreign, &_identity_lease, expected)
-                    .is_ok()
-                {
-                    return Err("foreign attempt accepted".into());
-                }
-            }
-            if !enabled {
-                return Err(
-                    "conversation cancel callback is not enabled; reconciliation required".into(),
-                );
-            }
-            let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
-                .map_err(|_| "invalid parked cancel checkpoint")?;
-            if stored.version != 2
-                || stored.park_attempt.is_none()
-                || !stored.arguments.is_object()
-                || !jsonschema::validator_for(&self.identity.spec.parameters)
-                    .is_ok_and(|schema| schema.is_valid(&stored.arguments))
-            {
-                return Err("unsupported parked cancel checkpoint".into());
-            }
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let after_arguments = stored.arguments.clone();
-            let (conversation, start) = if nested {
-                admission.nested_conversation_callback_start_lease()?
-            } else {
-                let crate::task::TaskOwner::Conversation(id) = task.owner() else {
-                    unreachable!()
-                };
-                (*id, admission.conversation_callback_start_lease()?)
-            };
-            let marker_result = if nested {
-                admission.record_nested_conversation_start_markers(
-                    self,
-                    _claim.claim_id,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                )
-            } else {
-                admission.record_conversation_start_markers(
-                    self,
-                    _claim.claim_id,
-                    &_identity_lease,
-                    expected,
-                    cancel.conversation_cancel_policy(),
-                )
-            };
-            #[cfg(test)]
-            crate::task_scheduler::report_conversation_start_result(task.id());
-            let marker = marker_result?;
-            let cancellation = pi_rs_core::CancellationToken::new();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(durable_store::controls::with_callback_context(
-                    conversation,
-                    task.id(),
-                    marker.clone(),
-                    async {
-                        let scope = durable_store::controls::CallbackScope::current()
-                            .expect("callback scope installed");
-                        let future = cancel.cancel_scoped(
-                            stored.arguments,
-                            stored.checkpoint,
-                            ToolContext {
-                                operation_id: task.id(),
-                                cancellation: cancellation.clone(),
-                            },
-                            scope,
-                        );
-                        let mut future = std::pin::pin!(future);
-                        let mut start = Some((start, selection_start));
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            std::future::poll_fn(|cx| match start.take() {
-                                Some((lease, Some(selection))) => {
-                                    selection.poll_first(lease, future.as_mut(), cx)
-                                }
-                                Some((lease, None)) => lease.poll_first(future.as_mut(), cx),
-                                None => future.as_mut().poll(cx),
-                            }),
-                        )
-                        .await
-                    },
-                ))
-            }));
-            cancellation.cancel();
-            if !matches!(result, Ok(Ok(Ok(())))) {
-                if nested {
-                    admission.retire_nested_conversation_cancel_unknown(
-                        &_claim,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )?;
-                } else {
-                    admission.retire_conversation_cancel_unknown(
-                        &_claim,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )?;
-                }
-                return Err("conversation cancel outcome unknown; reconciliation required".into());
-            }
-            let (after_result, snapshot_check) = if self.block_results {
-                let after = (if nested {
-                    admission.nested_conversation_cancel_hook_snapshot()
-                } else {
-                    admission.conversation_cancel_hook_snapshot()
-                })
-                .and_then(|(snapshot, check)| {
-                    let memo = ConversationAbortMemo {
-                        admission,
-                        handler: self,
-                        claim: ConversationAbortClaim::Parked(&_claim),
-                        identity: &_identity_lease,
-                        expected_identity: expected,
-                        marker: &marker,
-                        snapshot: &check,
-                        nested,
-                        failed: Mutex::new(false),
-                    };
-                    self.conversation_cancel_after_result(task, after_arguments, snapshot, &memo)
-                        .map(|result| (result, check))
-                });
-                match after {
-                    Ok((result, check)) => (Some(result), Some(check)),
-                    Err(error) => {
-                        let receipt = crate::task_scheduler::ConversationCancelReceipt {
-                            version: 1,
-                            claim: _claim.clone(),
-                            result: "callback returned".into(),
-                            after_result: None,
-                        };
-                        let saved = if nested {
-                            admission.store_nested_conversation_cancel_receipt_and_retire(
-                                self,
-                                &receipt,
-                                &_identity_lease,
-                                expected,
-                                &marker,
-                            )
-                        } else {
-                            admission.store_conversation_cancel_receipt_and_retire(
-                                self,
-                                &receipt,
-                                &_identity_lease,
-                                expected,
-                                &marker,
-                            )
-                        };
-                        if saved.is_err() {
-                            if nested {
-                                admission.retire_nested_conversation_cancel_unknown(
-                                    &_claim,
-                                    &_identity_lease,
-                                    expected,
-                                    &marker,
-                                )?;
-                            } else {
-                                admission.retire_conversation_cancel_unknown(
-                                    &_claim,
-                                    &_identity_lease,
-                                    expected,
-                                    &marker,
-                                )?;
-                            }
-                        }
-                        return Err(format!(
-                            "conversation cancel after hook incomplete; reconciliation required: {error}"
-                        ));
-                    }
-                }
-            } else {
-                (None, None)
-            };
-            let receipt = crate::task_scheduler::ConversationCancelReceipt {
-                version: if after_result.is_some() { 2 } else { 1 },
-                claim: _claim,
-                result: "callback returned".into(),
-                after_result,
-            };
-            let saved = match (nested, snapshot_check.as_ref()) {
-                (true, Some(check)) => admission
-                    .store_nested_conversation_cancel_receipt_and_after(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                        check,
-                    ),
-                (false, Some(check)) => admission.store_conversation_cancel_receipt_and_after(
-                    self,
-                    &receipt,
-                    &_identity_lease,
-                    expected,
-                    &marker,
-                    check,
-                ),
-                (true, None) => admission.store_nested_conversation_cancel_receipt_and_retire(
-                    self,
-                    &receipt,
-                    &_identity_lease,
-                    expected,
-                    &marker,
-                ),
-                (false, None) => admission.store_conversation_cancel_receipt_and_retire(
-                    self,
-                    &receipt,
-                    &_identity_lease,
-                    expected,
-                    &marker,
-                ),
-            };
-            if let Err(error) = saved {
-                let known_callback = crate::task_scheduler::ConversationCancelReceipt {
-                    version: 1,
-                    claim: receipt.claim.clone(),
-                    result: "callback returned".into(),
-                    after_result: None,
-                };
-                let known = if nested {
-                    admission.store_nested_conversation_cancel_receipt_and_retire(
-                        self,
-                        &known_callback,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )
-                } else {
-                    admission.store_conversation_cancel_receipt_and_retire(
-                        self,
-                        &known_callback,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    )
-                };
-                if known.is_err() {
                     if nested {
                         admission.retire_nested_conversation_cancel_unknown(
-                            &receipt.claim,
+                            &_claim,
                             &_identity_lease,
                             expected,
                             &marker,
                         )?;
                     } else {
                         admission.retire_conversation_cancel_unknown(
-                            &receipt.claim,
+                            &_claim,
                             &_identity_lease,
                             expected,
                             &marker,
                         )?;
                     }
+                    return Err(
+                        "conversation cancel outcome unknown; reconciliation required".into(),
+                    );
                 }
-                return Err(format!(
-                    "conversation cancel result requires reconciliation: {error}"
-                ));
+                let (after_result, snapshot_check) = if self.block_results {
+                    let after = (if nested {
+                        admission.nested_conversation_cancel_hook_snapshot()
+                    } else {
+                        admission.conversation_cancel_hook_snapshot()
+                    })
+                    .and_then(|(snapshot, check)| {
+                        let memo = ConversationAbortMemo {
+                            admission,
+                            handler: self,
+                            claim: ConversationAbortClaim::Parked(&_claim),
+                            identity: &_identity_lease,
+                            expected_identity: expected,
+                            marker: &marker,
+                            snapshot: &check,
+                            nested,
+                            failed: Mutex::new(false),
+                        };
+                        self.conversation_cancel_after_result(
+                            task,
+                            after_arguments,
+                            snapshot,
+                            &memo,
+                        )
+                        .map(|result| (result, check))
+                    });
+                    match after {
+                        Ok((result, check)) => (Some(result), Some(check)),
+                        Err(error) => {
+                            let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                                version: 1,
+                                claim: _claim.clone(),
+                                result: "callback returned".into(),
+                                after_result: None,
+                            };
+                            let saved = if nested {
+                                admission.store_nested_conversation_cancel_receipt_and_retire(
+                                    self,
+                                    &receipt,
+                                    &_identity_lease,
+                                    expected,
+                                    &marker,
+                                )
+                            } else {
+                                admission.store_conversation_cancel_receipt_and_retire(
+                                    self,
+                                    &receipt,
+                                    &_identity_lease,
+                                    expected,
+                                    &marker,
+                                )
+                            };
+                            if saved.is_err() {
+                                if nested {
+                                    admission.retire_nested_conversation_cancel_unknown(
+                                        &_claim,
+                                        &_identity_lease,
+                                        expected,
+                                        &marker,
+                                    )?;
+                                } else {
+                                    admission.retire_conversation_cancel_unknown(
+                                        &_claim,
+                                        &_identity_lease,
+                                        expected,
+                                        &marker,
+                                    )?;
+                                }
+                            }
+                            return Err(format!(
+                                "conversation cancel after hook incomplete; reconciliation required: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                let receipt = crate::task_scheduler::ConversationCancelReceipt {
+                    version: if after_result.is_some() { 2 } else { 1 },
+                    claim: _claim,
+                    result: "callback returned".into(),
+                    after_result,
+                };
+                let saved = match (nested, snapshot_check.as_ref()) {
+                    (true, Some(check)) => admission
+                        .store_nested_conversation_cancel_receipt_and_after(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                            check,
+                        ),
+                    (false, Some(check)) => admission.store_conversation_cancel_receipt_and_after(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                        check,
+                    ),
+                    (true, None) => admission
+                        .store_nested_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )
+                        .map_err(crate::task_scheduler::HookFenceError::Other),
+                    (false, None) => admission
+                        .store_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )
+                        .map_err(crate::task_scheduler::HookFenceError::Other),
+                };
+                if let Err(error) = saved {
+                    if let Some(check) = snapshot_check {
+                        retained = Some(crate::task_scheduler::AbortRun::KnownConversationCancel(
+                            crate::task_scheduler::KnownConversationCancel::from_receipt(
+                                receipt,
+                                marker,
+                                _identity_lease,
+                                check,
+                                nested,
+                                match error {
+                                    crate::task_scheduler::HookFenceError::WriteLockBusy => {
+                                        crate::task_scheduler::KnownCancelCommitState::Busy
+                                    }
+                                    crate::task_scheduler::HookFenceError::Conflict => {
+                                        crate::task_scheduler::KnownCancelCommitState::Stale
+                                    }
+                                    _ => crate::task_scheduler::KnownCancelCommitState::Uncertain,
+                                },
+                            ),
+                        ));
+                        return Ok(Step::Succeed(serde_json::Value::Null));
+                    }
+                    let known_callback = crate::task_scheduler::ConversationCancelReceipt {
+                        version: 1,
+                        claim: receipt.claim.clone(),
+                        result: "callback returned".into(),
+                        after_result: None,
+                    };
+                    let known = if nested {
+                        admission.store_nested_conversation_cancel_receipt_and_retire(
+                            self,
+                            &known_callback,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )
+                    } else {
+                        admission.store_conversation_cancel_receipt_and_retire(
+                            self,
+                            &known_callback,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )
+                    };
+                    if known.is_err() {
+                        if nested {
+                            admission.retire_nested_conversation_cancel_unknown(
+                                &receipt.claim,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                            )?;
+                        } else {
+                            admission.retire_conversation_cancel_unknown(
+                                &receipt.claim,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                            )?;
+                        }
+                    }
+                    return Err(format!(
+                        "conversation cancel result requires reconciliation: {error}"
+                    ));
+                }
+                #[cfg(test)]
+                crate::task_scheduler::report_conversation_receipt_saved(task.id());
+                return Ok(Step::Succeed(serde_json::Value::Null));
             }
-            #[cfg(test)]
-            crate::task_scheduler::report_conversation_receipt_saved(task.id());
-            return Ok(Step::Succeed(serde_json::Value::Null));
-        }
-        if !self.replay_safe
-            && self.park_cancel.is_some()
-            && task.checkpoint().phase != "replay-safe-async-wait"
-        {
-            return Err("unsafe execution is not a proven park; reconciliation required".into());
-        }
-        if !self.block_results
-            || !self
-                .identity
-                .matches(self.tool.as_ref(), &self.implementation, self.version)
-        {
-            return Err("abort hook identity changed".into());
-        }
-        if let Some(value) = admission.abort_hook_receipt(self, None)? {
-            super::validate_aborted_after_result(&value)?;
-            return Ok(Step::Succeed(serde_json::Value::Null));
-        }
-        if let Some((cancel, retry)) = &self.park_cancel
-            && task.checkpoint().phase == "replay-safe-async-wait"
-        {
-            // The host serializes every Tool and callback configuration change
-            // through this nonblocking identity lease. It is held through the
-            // bounded callback, not across any scheduler or store lock.
-            let identity_tool: Arc<dyn Tool> = self.tool.clone();
-            let _identity_lease = match &self.woken_identity {
-                Some(expected) => Some(
-                    crate::nested_identity::checked_lease(&identity_tool, expected).map_err(
-                        |_| "woken cancel identity unavailable; reconciliation required",
-                    )?,
-                ),
-                None => None,
-            };
-            if self.woken_identity.is_some()
-                && !self
+            if !self.replay_safe
+                && self.park_cancel.is_some()
+                && task.checkpoint().phase != "replay-safe-async-wait"
+            {
+                return Err(
+                    "unsafe execution is not a proven park; reconciliation required".into(),
+                );
+            }
+            if !self.block_results
+                || !self
                     .identity
                     .matches(self.tool.as_ref(), &self.implementation, self.version)
             {
-                return Err("woken cancel tool identity changed".into());
+                return Err("abort hook identity changed".into());
             }
-            let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
-                .map_err(|_| "invalid parked cancel checkpoint")?;
-            if stored.version != 2
-                || stored.park_attempt.is_none()
-                || !stored.arguments.is_object()
-                || !jsonschema::validator_for(&self.identity.spec.parameters)
-                    .is_ok_and(|schema| schema.is_valid(&stored.arguments))
+            if let Some(value) = admission.abort_hook_receipt(self, None)? {
+                super::validate_aborted_after_result(&value)?;
+                return Ok(Step::Succeed(serde_json::Value::Null));
+            }
+            if let Some((cancel, retry)) = &self.park_cancel
+                && task.checkpoint().phase == "replay-safe-async-wait"
             {
-                return Err("unsupported parked cancel checkpoint".into());
-            }
-            let decision = admission.park_cancel_claim(self, false, *retry)?;
-            if !self.replay_safe && decision == crate::task_scheduler::ParkCancelDecision::Uncertain
-            {
-                return Err("unsafe cancel outcome uncertain; reconciliation required".into());
-            }
-            if decision == crate::task_scheduler::ParkCancelDecision::Invoke {
-                #[cfg(test)]
-                if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_SPEC_BARRIER") {
-                    let dir = std::path::PathBuf::from(dir);
-                    std::fs::write(dir.join("spec-barrier"), b"yes").map_err(|e| e.to_string())?;
-                    while !dir.join("spec-release").exists() {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                }
-                #[cfg(test)]
-                if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_CLAIM") {
-                    std::fs::write(std::path::PathBuf::from(dir).join("cancel-claimed"), b"yes")
-                        .map_err(|e| e.to_string())?;
-                    loop {
-                        std::thread::park();
-                    }
-                }
-                if !self
-                    .identity
-                    .matches(self.tool.as_ref(), &self.implementation, self.version)
-                {
-                    return Err("cancel tool identity changed before dispatch".into());
-                }
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                let cancellation = pi_rs_core::CancellationToken::new();
-                let result = runtime.block_on(async {
-                    admission.verify_park_cancel_dispatch(self, *retry)?;
-                    if !self.identity.matches(
+                // The host serializes every Tool and callback configuration change
+                // through this nonblocking identity lease. It is held through the
+                // bounded callback, not across any scheduler or store lock.
+                let identity_tool: Arc<dyn Tool> = self.tool.clone();
+                let _identity_lease = match &self.woken_identity {
+                    Some(expected) => Some(
+                        crate::nested_identity::checked_lease(&identity_tool, expected).map_err(
+                            |_| "woken cancel identity unavailable; reconciliation required",
+                        )?,
+                    ),
+                    None => None,
+                };
+                if self.woken_identity.is_some()
+                    && !self.identity.matches(
                         self.tool.as_ref(),
                         &self.implementation,
                         self.version,
-                    ) {
-                        return Err("cancel tool identity changed before dispatch".to_string());
-                    }
+                    )
+                {
+                    return Err("woken cancel tool identity changed".into());
+                }
+                let stored: ParkCheckpoint = serde_json::from_value(task.checkpoint().data.clone())
+                    .map_err(|_| "invalid parked cancel checkpoint")?;
+                if stored.version != 2
+                    || stored.park_attempt.is_none()
+                    || !stored.arguments.is_object()
+                    || !jsonschema::validator_for(&self.identity.spec.parameters)
+                        .is_ok_and(|schema| schema.is_valid(&stored.arguments))
+                {
+                    return Err("unsupported parked cancel checkpoint".into());
+                }
+                let decision = admission.park_cancel_claim(self, false, *retry)?;
+                if !self.replay_safe
+                    && decision == crate::task_scheduler::ParkCancelDecision::Uncertain
+                {
+                    return Err("unsafe cancel outcome uncertain; reconciliation required".into());
+                }
+                if decision == crate::task_scheduler::ParkCancelDecision::Invoke {
                     #[cfg(test)]
-                    {
-                        let hook = cancel_dispatch_hooks().lock().unwrap().remove(&task.id());
-                        if let Some(hook) = hook {
-                            hook();
+                    if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_SPEC_BARRIER") {
+                        let dir = std::path::PathBuf::from(dir);
+                        std::fs::write(dir.join("spec-barrier"), b"yes")
+                            .map_err(|e| e.to_string())?;
+                        while !dir.join("spec-release").exists() {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
                         }
                     }
-                    Ok::<_, String>(
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            cancel.cancel(
-                                stored.arguments,
-                                stored.checkpoint,
-                                ToolContext {
-                                    operation_id: task.id(),
-                                    cancellation: cancellation.clone(),
-                                },
-                            ),
-                        )
-                        .await,
-                    )
-                })?;
-                cancellation.cancel();
-                if matches!(result, Ok(Ok(()))) {
-                    admission.park_cancel_claim(self, true, *retry)?;
                     #[cfg(test)]
-                    if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_RETURN") {
+                    if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_CLAIM") {
                         std::fs::write(
-                            std::path::PathBuf::from(dir).join("cancel-returned"),
+                            std::path::PathBuf::from(dir).join("cancel-claimed"),
                             b"yes",
                         )
                         .map_err(|e| e.to_string())?;
@@ -2846,103 +2874,168 @@ impl Handler for Executor {
                             std::thread::park();
                         }
                     }
-                } else if !self.replay_safe {
-                    return Err("unsafe cancel outcome uncertain; reconciliation required".into());
+                    if !self.identity.matches(
+                        self.tool.as_ref(),
+                        &self.implementation,
+                        self.version,
+                    ) {
+                        return Err("cancel tool identity changed before dispatch".into());
+                    }
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let cancellation = pi_rs_core::CancellationToken::new();
+                    let result = runtime.block_on(async {
+                        admission.verify_park_cancel_dispatch(self, *retry)?;
+                        if !self.identity.matches(
+                            self.tool.as_ref(),
+                            &self.implementation,
+                            self.version,
+                        ) {
+                            return Err("cancel tool identity changed before dispatch".to_string());
+                        }
+                        #[cfg(test)]
+                        {
+                            let hook = cancel_dispatch_hooks().lock().unwrap().remove(&task.id());
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                        }
+                        Ok::<_, String>(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                cancel.cancel(
+                                    stored.arguments,
+                                    stored.checkpoint,
+                                    ToolContext {
+                                        operation_id: task.id(),
+                                        cancellation: cancellation.clone(),
+                                    },
+                                ),
+                            )
+                            .await,
+                        )
+                    })?;
+                    cancellation.cancel();
+                    if matches!(result, Ok(Ok(()))) {
+                        admission.park_cancel_claim(self, true, *retry)?;
+                        #[cfg(test)]
+                        if let Some(dir) = std::env::var_os("PI_TEST_PARK_CANCEL_AFTER_RETURN") {
+                            std::fs::write(
+                                std::path::PathBuf::from(dir).join("cancel-returned"),
+                                b"yes",
+                            )
+                            .map_err(|e| e.to_string())?;
+                            loop {
+                                std::thread::park();
+                            }
+                        }
+                    } else if !self.replay_safe {
+                        return Err(
+                            "unsafe cancel outcome uncertain; reconciliation required".into()
+                        );
+                    }
                 }
             }
-        }
-        let args = match task.checkpoint().phase.as_str() {
-            "initial" | "replay-safe-async-hook-gate" => task.input().clone(),
-            "replay-safe-async-prepared" | "replay-safe-async-after" => {
-                serde_json::from_value::<HookCheckpoint>(task.checkpoint().data.clone())
-                    .map_err(|_| "invalid hook checkpoint")?
-                    .arguments
-            }
-            "replay-safe-async-wait" => {
-                serde_json::from_value::<ParkCheckpoint>(task.checkpoint().data.clone())
-                    .map_err(|_| "invalid park checkpoint")?
-                    .arguments
-            }
-            _ => return Err("unsupported abort checkpoint".into()),
-        };
-        self.bounded_hook_arguments(&args)?;
-        let gate = crate::runtime::ToolDiagnostic {
-            severity: crate::runtime::DiagnosticSeverity::Error,
-            code: Some("aborted".into()),
-            message: "Tool was aborted".into(),
-        };
-        let initial = crate::extension::ToolBlockResult {
-            output: vec![serde_json::json!({"type":"text","text":"Tool was aborted"})],
-            diagnostics: vec![gate.clone()],
-            extra: [("isError".into(), serde_json::json!(true))]
-                .into_iter()
-                .collect(),
-        };
-        let memo = AbortMemo(std::sync::atomic::AtomicBool::new(false));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let result = rt.block_on(async {
-            let call = crate::extension::ToolCall {
-                name: self.identity.spec.name.clone(),
-                arguments: args,
+            let args = match task.checkpoint().phase.as_str() {
+                "initial" | "replay-safe-async-hook-gate" => task.input().clone(),
+                "replay-safe-async-prepared" | "replay-safe-async-after" => {
+                    serde_json::from_value::<HookCheckpoint>(task.checkpoint().data.clone())
+                        .map_err(|_| "invalid hook checkpoint")?
+                        .arguments
+                }
+                "replay-safe-async-wait" => {
+                    serde_json::from_value::<ParkCheckpoint>(task.checkpoint().data.clone())
+                        .map_err(|_| "invalid park checkpoint")?
+                        .arguments
+                }
+                _ => return Err("unsupported abort checkpoint".into()),
             };
-            let snapshot = serde_json::Value::Null;
-            let ctx = crate::extension::Context {
-                snapshot: &snapshot,
-                memo: &memo,
+            self.bounded_hook_arguments(&args)?;
+            let gate = crate::runtime::ToolDiagnostic {
+                severity: crate::runtime::DiagnosticSeverity::Error,
+                code: Some("aborted".into()),
+                message: "Tool was aborted".into(),
             };
-            let (value, reports) = self
-                .hook_registry()?
-                .after_tool_blocks(
-                    &call,
-                    initial,
-                    matches!(task.owner(), crate::task::TaskOwner::Task(_)),
-                    &ctx,
-                )
-                .await?;
-            if !reports.is_empty() {
-                return Err("abort hook failed".to_string());
-            }
-            Ok(value)
-        })?;
-        if memo.0.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("abort hook used unavailable memo".into());
-        }
-        validate_content_hook_result(&result, Some(&gate), false)?;
-        let value = serde_json::to_value(DurableTaskResult::Rich {
-            task_content_v1: result,
-        })
-        .map_err(|e| e.to_string())?;
-        super::validate_aborted_after_result(&value)?;
-        #[cfg(test)]
-        if let Some(dir) = std::env::var_os("PI_TEST_ABORT_STALE_LEASE") {
-            if !admission.test_abort_stale_lease(self, &value) {
-                return Err("stale lease accepted".into());
-            }
-            std::fs::write(std::path::PathBuf::from(dir).join("stale-rejected"), b"yes")
+            let initial = crate::extension::ToolBlockResult {
+                output: vec![serde_json::json!({"type":"text","text":"Tool was aborted"})],
+                diagnostics: vec![gate.clone()],
+                extra: [("isError".into(), serde_json::json!(true))]
+                    .into_iter()
+                    .collect(),
+            };
+            let memo = AbortMemo(std::sync::atomic::AtomicBool::new(false));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .map_err(|e| e.to_string())?;
-        }
-        if !self
-            .identity
-            .matches(self.tool.as_ref(), &self.implementation, self.version)
-        {
-            return Err("abort hook identity changed during execution".into());
-        }
-        admission.abort_hook_receipt(self, Some(&value))?;
-        #[cfg(test)]
-        if let Some(dir) = std::env::var_os("PI_TEST_ABORT_AFTER_RECEIPT") {
-            std::fs::write(
-                std::path::PathBuf::from(dir).join("abort-receipt"),
-                b"ready",
-            )
-            .unwrap();
-            loop {
-                std::thread::park();
+            let result = rt.block_on(async {
+                let call = crate::extension::ToolCall {
+                    name: self.identity.spec.name.clone(),
+                    arguments: args,
+                };
+                let snapshot = serde_json::Value::Null;
+                let ctx = crate::extension::Context {
+                    snapshot: &snapshot,
+                    memo: &memo,
+                };
+                let (value, reports) = self
+                    .hook_registry()?
+                    .after_tool_blocks(
+                        &call,
+                        initial,
+                        matches!(task.owner(), crate::task::TaskOwner::Task(_)),
+                        &ctx,
+                    )
+                    .await?;
+                if !reports.is_empty() {
+                    return Err("abort hook failed".to_string());
+                }
+                Ok(value)
+            })?;
+            if memo.0.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("abort hook used unavailable memo".into());
             }
+            validate_content_hook_result(&result, Some(&gate), false)?;
+            let value = serde_json::to_value(DurableTaskResult::Rich {
+                task_content_v1: result,
+            })
+            .map_err(|e| e.to_string())?;
+            super::validate_aborted_after_result(&value)?;
+            #[cfg(test)]
+            if let Some(dir) = std::env::var_os("PI_TEST_ABORT_STALE_LEASE") {
+                if !admission.test_abort_stale_lease(self, &value) {
+                    return Err("stale lease accepted".into());
+                }
+                std::fs::write(std::path::PathBuf::from(dir).join("stale-rejected"), b"yes")
+                    .map_err(|e| e.to_string())?;
+            }
+            if !self
+                .identity
+                .matches(self.tool.as_ref(), &self.implementation, self.version)
+            {
+                return Err("abort hook identity changed during execution".into());
+            }
+            admission.abort_hook_receipt(self, Some(&value))?;
+            #[cfg(test)]
+            if let Some(dir) = std::env::var_os("PI_TEST_ABORT_AFTER_RECEIPT") {
+                std::fs::write(
+                    std::path::PathBuf::from(dir).join("abort-receipt"),
+                    b"ready",
+                )
+                .unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            Ok(Step::Succeed(serde_json::Value::Null))
+        })();
+        if let Some(known) = retained {
+            Ok(known)
+        } else {
+            result.map(crate::task_scheduler::AbortRun::Step)
         }
-        Ok(Step::Succeed(serde_json::Value::Null))
     }
     fn run_with_admission_and_cancellation(
         &self,
