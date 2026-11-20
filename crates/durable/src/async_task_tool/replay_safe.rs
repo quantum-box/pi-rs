@@ -1976,14 +1976,16 @@ impl Handler for Executor {
                             after_result,
                         };
                         if let Some(check) = check.as_ref() {
-                            admission.store_woken_conversation_cancel_receipt_and_after(
-                                self,
-                                &receipt,
-                                &_identity_lease,
-                                expected,
-                                &marker,
-                                check,
-                            )?;
+                            admission
+                                .store_woken_conversation_cancel_receipt_and_after(
+                                    self,
+                                    &receipt,
+                                    &_identity_lease,
+                                    expected,
+                                    &marker,
+                                    check,
+                                )
+                                .map_err(|e| e.to_string())?;
                         } else {
                             admission.store_woken_conversation_cancel_receipt(
                                 self,
@@ -2144,15 +2146,38 @@ impl Handler for Executor {
                             &marker,
                             check,
                         ),
-                        None => admission.store_woken_conversation_cancel_receipt(
-                            self,
-                            &receipt,
-                            &_identity_lease,
-                            expected,
-                            &marker,
-                        ),
+                        None => admission
+                            .store_woken_conversation_cancel_receipt(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                            )
+                            .map_err(crate::task_scheduler::HookFenceError::Other),
                     };
-                    if saved.is_err() {
+                    if let Err(error) = saved {
+                        if let Some(snapshot) = snapshot {
+                            let state = match error {
+                                crate::task_scheduler::HookFenceError::WriteLockBusy => {
+                                    crate::task_scheduler::KnownCancelCommitState::Busy
+                                }
+                                crate::task_scheduler::HookFenceError::Conflict => {
+                                    crate::task_scheduler::KnownCancelCommitState::Stale
+                                }
+                                _ => crate::task_scheduler::KnownCancelCommitState::Uncertain,
+                            };
+                            retained = Some(crate::task_scheduler::AbortRun::KnownWokenCancel(
+                                crate::task_scheduler::KnownWokenCancel::new(
+                                    receipt,
+                                    snapshot,
+                                    marker,
+                                    _identity_lease,
+                                    state,
+                                ),
+                            ));
+                            return Ok(Step::Succeed(serde_json::Value::Null));
+                        }
                         admission.retire_woken_conversation_cancel_unknown(
                             &claim,
                             &_identity_lease,
@@ -2701,7 +2726,7 @@ impl Handler for Executor {
                 };
                 if let Err(error) = saved {
                     if let Some(check) = snapshot_check {
-                        retained = Some(
+                        retained = Some(crate::task_scheduler::AbortRun::KnownConversationCancel(
                             crate::task_scheduler::KnownConversationCancel::from_receipt(
                                 receipt,
                                 marker,
@@ -2718,7 +2743,7 @@ impl Handler for Executor {
                                     _ => crate::task_scheduler::KnownCancelCommitState::Uncertain,
                                 },
                             ),
-                        );
+                        ));
                         return Ok(Step::Succeed(serde_json::Value::Null));
                     }
                     let known_callback = crate::task_scheduler::ConversationCancelReceipt {
@@ -3007,9 +3032,7 @@ impl Handler for Executor {
             Ok(Step::Succeed(serde_json::Value::Null))
         })();
         if let Some(known) = retained {
-            Ok(crate::task_scheduler::AbortRun::KnownConversationCancel(
-                known,
-            ))
+            Ok(known)
         } else {
             result.map(crate::task_scheduler::AbortRun::Step)
         }

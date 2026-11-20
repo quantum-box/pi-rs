@@ -1875,9 +1875,9 @@ impl Shared {
             }
         }
         if pending.completed().is_some_and(|value| {
-            value.known_conversation_cancel().is_some_and(|known| {
-                known.commit_state() != task_scheduler::KnownCancelCommitState::Busy
-            })
+            value
+                .known_cancel_state()
+                .is_some_and(|state| state != task_scheduler::KnownCancelCommitState::Busy)
         }) {
             self.pending
                 .lock()

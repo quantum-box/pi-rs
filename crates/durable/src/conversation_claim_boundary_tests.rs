@@ -5859,6 +5859,20 @@ async fn selected_woken_original_worker() {
 
 #[tokio::test]
 async fn selected_woken_after_is_retained_without_resolving_uncertain_effect() {
+    exercise_selected_woken_receipt("normal").await;
+}
+
+#[tokio::test]
+async fn selected_woken_receipt_retries_busy_without_reinvoking_callback() {
+    exercise_selected_woken_receipt("busy").await;
+}
+
+#[tokio::test]
+async fn selected_woken_conflicting_snapshot_retains_known_result() {
+    exercise_selected_woken_receipt("stale").await;
+}
+
+async fn exercise_selected_woken_receipt(mode: &str) {
     use crate::async_task_tool::DurableParkCancel;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5965,7 +5979,68 @@ async fn selected_woken_after_is_retained_without_resolving_uncertain_effect() {
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    if mode == "busy" {
+        let writer_path = path.clone();
+        crate::task_scheduler::on_conversation_receipt_before_commit(root.task.id(), move || {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(writer_path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(6));
+                conn.execute_batch("ROLLBACK").unwrap();
+            });
+            ready_rx.recv().unwrap();
+        });
+    }
+    if mode == "stale" {
+        let writer_path = path.clone();
+        crate::task_scheduler::on_conversation_receipt_before_commit(root.task.id(), move || {
+            let writer = durable_store::Store::open(writer_path).unwrap();
+            let key = format!("runtime/conversation/{conversation}").into_bytes();
+            let entry = writer.get(&key).unwrap().unwrap();
+            writer
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: entry.value,
+                    }],
+                )
+                .unwrap();
+        });
+    }
     let driver = scheduler.start_tasks(registry).unwrap();
+    if mode == "stale" {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while after_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        let known = report
+            .pending()
+            .iter()
+            .filter_map(|p| p.completed())
+            .filter_map(|c| c.known_woken_cancel())
+            .next()
+            .expect("known woken result retained");
+        assert_eq!(
+            known.commit_state(),
+            crate::task_scheduler::KnownCancelCommitState::Stale
+        );
+        assert!(known.after_result().is_some());
+        assert!(known.has_snapshot_check());
+        assert!(known.identity().is_some());
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let current = driver.get(root.task.id()).unwrap().unwrap();
