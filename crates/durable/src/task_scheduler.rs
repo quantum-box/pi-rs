@@ -811,8 +811,7 @@ pub(crate) fn nested_cancel_terminal_checks(
         .conversation_checkpointable
         .as_ref()
         .ok_or(Error::Registration)?;
-    if !validate()
-        || reg.replay_safe
+    if reg.replay_safe
         || reg.version != task.task.definition_version()
         || !reg.handler.conversation_cancel_dispatch_enabled()
     {
@@ -825,6 +824,11 @@ pub(crate) fn nested_cancel_terminal_checks(
                 crate::nested_identity::LeaseFailure::Busy => Error::Busy,
                 crate::nested_identity::LeaseFailure::Mismatch => Error::Ownership,
             })?;
+    // Tool configuration can change while the writer owns the identity. Only
+    // inspect it under the lease, so a temporary mismatch is reported as Busy.
+    if !validate() {
+        return Err(Error::Registration);
+    }
     let (conversation, ancestry, mut checks, ancestry_version) =
         task_store::read_nested_cancel_claim_ancestry(store, task.task.id(), claim.claim_id)?;
     validate_nested_cancel_terminal_evidence(
@@ -12113,8 +12117,7 @@ impl Scheduler {
         let Some((identity, validate, _)) = &reg.conversation_checkpointable else {
             return Ok(false);
         };
-        if !validate()
-            || !reg.handler.conversation_cancel_dispatch_enabled()
+        if !reg.handler.conversation_cancel_dispatch_enabled()
             || reg.replay_safe
             || reg.version != item.task.definition_version()
         {
@@ -12137,6 +12140,9 @@ impl Scheduler {
             Err(crate::nested_identity::LeaseFailure::Busy) => return Err(Error::Busy),
             Err(crate::nested_identity::LeaseFailure::Mismatch) => return Ok(false),
         };
+        if !validate() {
+            return Ok(false);
+        }
         let owner = self.owner();
         let store = owner.store();
         let Ok((conversation, mut checks)) =
@@ -17756,14 +17762,7 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
             if !has_intent {
                 continue;
             }
-            if item.task.state() == &TaskState::Cancelled
-                && let Ok((conversation, binding_checks)) = harness
-                    .checkpointable_nested_cancel_result_checks_with_ancestors(
-                        &item.task,
-                        registry,
-                        &authenticated_ancestors,
-                    )
-            {
+            if item.task.state() == &TaskState::Cancelled {
                 match nested_cancel_terminal_checks(
                     store,
                     item,
@@ -17772,20 +17771,30 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
                     active_parent_marker,
                 ) {
                     Ok((terminal_checks, lease)) => {
-                        let key = nested_cancel_terminal_key(item.task.id());
-                        let evidence_entry = store
-                            .get(&key)
-                            .map_err(task_store::Error::from)?
-                            .ok_or(Error::Ownership)?;
-                        let evidence: NestedCancelTerminalEvidence =
-                            serde_json::from_slice(&evidence_entry.value)
-                                .map_err(|e| Error::Handler(e.to_string()))?;
-                        if evidence.conversation == conversation {
-                            checks.extend(binding_checks);
-                            checks.extend(terminal_checks);
-                            leases.push(lease);
-                            authenticated_ancestors.insert(item.task.id());
-                            continue;
+                        // Hold the child's identity while the Harness reads its
+                        // registration and checks the complete owner chain.
+                        if let Ok((conversation, binding_checks)) = harness
+                            .checkpointable_nested_cancel_result_checks_with_ancestors(
+                                &item.task,
+                                registry,
+                                &authenticated_ancestors,
+                            )
+                        {
+                            let key = nested_cancel_terminal_key(item.task.id());
+                            let evidence_entry = store
+                                .get(&key)
+                                .map_err(task_store::Error::from)?
+                                .ok_or(Error::Ownership)?;
+                            let evidence: NestedCancelTerminalEvidence =
+                                serde_json::from_slice(&evidence_entry.value)
+                                    .map_err(|e| Error::Handler(e.to_string()))?;
+                            if evidence.conversation == conversation {
+                                checks.extend(binding_checks);
+                                checks.extend(terminal_checks);
+                                leases.push(lease);
+                                authenticated_ancestors.insert(item.task.id());
+                                continue;
+                            }
                         }
                     }
                     Err(Error::Busy) => return Err(Error::Busy),
