@@ -173,6 +173,141 @@ struct WokenOwnedChildReservation {
     running: crate::task::Task,
 }
 
+/// Reservation evidence only. Callers must also authenticate the pending
+/// conversation binding, park claim, selected registration and identity lease.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn woken_owned_child_reservation_checks(
+    store: &durable_store::Store,
+    child: &crate::task_store::StoredTask,
+) -> Result<(Uuid, Vec<Check>), Error> {
+    let crate::task::TaskOwner::Conversation(conversation) = child.task.owner() else {
+        return Err(Error::Invalid("owned child owner missing".into()));
+    };
+    let edge_key = crate::ownership_edge::edge_key(*conversation);
+    let edge_entry = store.get(&edge_key)?.ok_or(Error::NotFound)?;
+    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+        return Err(Error::Invalid("owned child is not foreground".into()));
+    }
+    let root = edge.edge.task;
+    let graph_key = woken_owned_graph_key(root);
+    let graph_entry = store.get(&graph_key)?.ok_or(Error::NotFound)?;
+    let graph: WokenOwnedGraphEvidence = serde_json::from_slice(&graph_entry.value)?;
+    let structure = graph
+        .structure
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("owned structure missing".into()))?;
+    let marked_edge = graph
+        .edges
+        .iter()
+        .find(|marked| marked.edge.child == *conversation)
+        .ok_or(Error::NotFound)?;
+    if graph.version != 1
+        || graph.root != root
+        || marked_edge.edge != edge.edge
+        || marked_edge.edge_version != edge.version
+    {
+        return Err(Error::Invalid("owned child edge changed".into()));
+    }
+    let marker_key = format!(
+        "runtime/woken-owned-child-reservation/v1/{root}/{}",
+        child.task.id()
+    )
+    .into_bytes();
+    let marker_entry = store.get(&marker_key)?.ok_or(Error::NotFound)?;
+    let marker: WokenOwnedChildReservation = serde_json::from_slice(&marker_entry.value)?;
+    if marker.version != 1
+        || marker.root != root
+        || marker.child != child.task.id()
+        || marker.graph_version != graph_entry.version
+        || marker.running != child.task
+        || child.task.state() != &crate::task::TaskState::Running
+        || !child.task.abort_requested()
+    {
+        return Err(Error::Invalid("owned child reservation changed".into()));
+    }
+    let task_key = crate::task_store::key(child.task.id());
+    let marker_commit = store
+        .commit_for_version(&marker_key, marker_entry.version)?
+        .ok_or(Error::NotFound)?;
+    if store.commit_for_version(&task_key, child.version)? != Some(marker_commit) {
+        return Err(Error::Invalid("child reservation was not atomic".into()));
+    }
+    let root_key = crate::task_store::key(root);
+    let root_task = crate::task_store::TaskStore::new(store)
+        .load(root)
+        .map_err(|e| Error::Invalid(e.to_string()))?
+        .ok_or(Error::NotFound)?;
+    let graph_commit = store
+        .commit_for_version(&graph_key, graph_entry.version)?
+        .ok_or(Error::NotFound)?;
+    let root_before = store
+        .commit_for_version(&root_key, graph.root_before_version)?
+        .ok_or(Error::NotFound)?;
+    if store.commit_for_version(&root_key, root_task.version)? != Some(graph_commit)
+        || store.next_commit_for_key(&root_key, root_before)? != Some(graph_commit)
+        || root_task.task.state() != &crate::task::TaskState::Ready
+        || !root_task.task.abort_requested()
+        || root_task.task.woken_interrupted_attempt() != Some(graph.interrupted_attempt)
+    {
+        return Err(Error::Invalid("owned graph root changed".into()));
+    }
+    let revision_key = durable_store::graph_revision::task_structure_revision(root);
+    let before_revision = structure
+        .root_revision
+        .ok_or_else(|| Error::Invalid("owned revision missing".into()))?;
+    let before_commit = store
+        .commit_for_version(&revision_key, before_revision)?
+        .ok_or(Error::NotFound)?;
+    let revision = store.get(&revision_key)?.ok_or(Error::NotFound)?;
+    if store.next_commit_for_key(&revision_key, before_commit)? != Some(marker_commit)
+        || store.commit_for_version(&revision_key, revision.version)? != Some(marker_commit)
+    {
+        return Err(Error::Invalid("owned child revision changed".into()));
+    }
+    let global_key = durable_store::graph_revision::global_structure_revision();
+    if store.get(&global_key)?.map(|entry| entry.version) != structure.global_revision {
+        return Err(Error::Invalid("global structure changed".into()));
+    }
+    let global_expected = structure.global_revision.map_or(
+        Expected::MissingUnchangedSince(structure.boundary),
+        Expected::Version,
+    );
+    let checks = vec![
+        Check {
+            key: edge_key,
+            expected: Expected::Version(edge_entry.version),
+        },
+        Check {
+            key: graph_key,
+            expected: Expected::Version(graph_entry.version),
+        },
+        Check {
+            key: marker_key,
+            expected: Expected::Version(marker_entry.version),
+        },
+        Check {
+            key: root_key,
+            expected: Expected::Version(root_task.version),
+        },
+        Check {
+            key: task_key,
+            expected: Expected::Version(child.version),
+        },
+        Check {
+            key: revision_key,
+            expected: Expected::Version(revision.version),
+        },
+        Check {
+            key: global_key,
+            expected: global_expected,
+        },
+    ];
+    Ok((root, checks))
+}
+
 #[cfg(feature = "experimental-graph-revision")]
 pub(crate) fn prepare_woken_owned_child_reservation(
     store: &durable_store::Store,

@@ -7626,12 +7626,20 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
         ))
     );
     #[cfg(feature = "experimental-graph-revision")]
-    assert!(registry.register_with_abort(
-        "owned-abort-child",
-        true,
-        |_: &crate::task::Task| Ok(crate::task_scheduler::Step::Succeed(json!("unused"))),
-        |_: &crate::task::Task| Ok(crate::task_scheduler::Step::Succeed(json!("cancelled"))),
-    ));
+    {
+        let hold_path = dir.join("hold-owned-child");
+        assert!(registry.register_with_abort(
+            "owned-abort-child",
+            true,
+            |_: &crate::task::Task| Ok(crate::task_scheduler::Step::Succeed(json!("unused"))),
+            move |_: &crate::task::Task| {
+                while hold_path.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(crate::task_scheduler::Step::Succeed(json!("cancelled")))
+            },
+        ));
+    }
     let mut extra = Vec::new();
     let register_safe = |registry: &mut Registry, name: &'static str| {
         let tool = Arc::new(WokenAnyFixture {
@@ -8086,6 +8094,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     #[cfg(feature = "experimental-graph-revision")]
     if graph_aba == 8 {
         let child = unsafe_owned.unwrap();
+        std::fs::write(dir.path().join("hold-owned-child"), b"hold").unwrap();
         drop(store);
         drop(harness);
         let mut worker = Command::new(std::env::current_exe().unwrap())
@@ -8128,6 +8137,37 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         worker.wait().unwrap();
         let store = durable_store::Store::open(&path).unwrap();
         let entry = store.get(marker.as_bytes()).unwrap().unwrap();
+        let child_record = crate::task_store::TaskStore::new(&store)
+            .load(child)
+            .unwrap()
+            .unwrap();
+        let (owned_root, checks) =
+            crate::runtime::woken_owned_child_reservation_checks(&store, &child_record).unwrap();
+        assert_eq!(owned_root, root.task.id());
+        store.commit(&checks, &[]).unwrap();
+        let other = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(uuid::Uuid::new_v4()),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("owned-independent".into(), true);
+        store
+            .commit(
+                &[],
+                &[durable_store::Mutation::Put {
+                    key: crate::task_store::key(other.id()),
+                    value: serde_json::to_vec(&other).unwrap(),
+                }],
+            )
+            .unwrap();
+        let (_, checks) =
+            crate::runtime::woken_owned_child_reservation_checks(&store, &child_record).unwrap();
+        store.commit(&checks, &[]).unwrap();
         let graph = store
             .get(&crate::runtime::woken_owned_graph_key(root.task.id()))
             .unwrap()
@@ -8147,6 +8187,27 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             store
                 .next_commit_for_key(&revision_key, prior_commit)
                 .unwrap()
+        );
+        let edge_key = crate::ownership_edge::edge_key(conversation);
+        let edge = store.get(&edge_key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: edge_key.clone(),
+                    expected: durable_store::Expected::Version(edge.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: edge_key,
+                    value: edge.value,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            crate::runtime::woken_owned_child_reservation_checks(&store, &child_record).is_err()
         );
         return;
     }
