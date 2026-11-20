@@ -1721,7 +1721,7 @@ fn signal_task_prefix(task_id: Uuid) -> Vec<u8> {
     key
 }
 
-fn callback_start_key(task_id: Uuid) -> Vec<u8> {
+pub(crate) fn callback_start_key(task_id: Uuid) -> Vec<u8> {
     format!("durable/task-callback-start/{task_id}").into_bytes()
 }
 

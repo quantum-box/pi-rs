@@ -56,6 +56,27 @@ pub(crate) struct Shared {
     subscription: Mutex<Option<Receiver<()>>>,
 }
 
+impl Shared {
+    /// Keep registry replacement excluded while a cleanup transaction checks
+    /// the selected definition. Never wait for either lock from cleanup.
+    pub(crate) fn with_cleanup_registry<T>(
+        &self,
+        f: impl FnOnce(&task_scheduler::Registry) -> Result<T, crate::runtime::Error>,
+    ) -> Result<T, crate::runtime::Error> {
+        fn lock_error<T>(error: std::sync::TryLockError<T>) -> crate::runtime::Error {
+            match error {
+                std::sync::TryLockError::WouldBlock => crate::runtime::Error::TaskPublicationBusy,
+                std::sync::TryLockError::Poisoned(_) => crate::runtime::Error::Failed,
+            }
+        }
+        let _registry = self.registry_gate.try_lock().map_err(lock_error)?;
+        let scheduler = self.scheduler.try_lock().map_err(lock_error)?;
+        let registry = scheduler.cleanup_registry().clone();
+        drop(scheduler);
+        f(&registry)
+    }
+}
+
 // A dropped Driver has no return channel. Keep its unresolved leases available
 // for explicit recovery rather than discarding replay-unsafe outcomes.
 static ABANDONED_PENDING: std::sync::OnceLock<Mutex<Vec<task_scheduler::PendingSettlement>>> =
@@ -122,6 +143,15 @@ pub struct Driver {
     cleanup: Option<JoinHandle<()>>,
 }
 impl Driver {
+    #[cfg(test)]
+    pub(crate) fn take_pending_for_test(
+        &self,
+        id: Uuid,
+    ) -> Option<task_scheduler::PendingSettlement> {
+        let mut pending = self.shared.pending.lock().unwrap();
+        let index = pending.iter().position(|item| item.task_id() == id)?;
+        Some(pending.remove(index))
+    }
     #[cfg(test)]
     pub(crate) fn settle_for_test(
         &self,
@@ -2409,24 +2439,15 @@ mod tests {
             let child = Task::new(child_id, TaskOwner::Task(parent_id), cp.clone(), 3)
                 .unwrap()
                 .registered("work".into(), true);
-            let mut related = Task::new(
-                fixture_id(3),
-                TaskOwner::Task(parent_id),
-                cp.clone(),
-                3,
-            )
-            .unwrap()
-            .registered("work".into(), true);
+            let mut related = Task::new(fixture_id(3), TaskOwner::Task(parent_id), cp.clone(), 3)
+                .unwrap()
+                .registered("work".into(), true);
             related.start().unwrap();
             related.wait(WaitFor::Signal("related".into())).unwrap();
-            let mut related_held = Task::new(
-                fixture_id(4),
-                TaskOwner::Task(parent_id),
-                cp.clone(),
-                3,
-            )
-            .unwrap()
-            .registered("work".into(), true);
+            let mut related_held =
+                Task::new(fixture_id(4), TaskOwner::Task(parent_id), cp.clone(), 3)
+                    .unwrap()
+                    .registered("work".into(), true);
             related_held.start().unwrap();
             related_held.hold_success(json!("related held")).unwrap();
             tasks
@@ -2451,14 +2472,10 @@ mod tests {
             .unwrap()
             .registered("work".into(), true);
             second.start().unwrap();
-            let second_child = Task::new(
-                fixture_id(6),
-                TaskOwner::Task(second.id()),
-                cp.clone(),
-                3,
-            )
-            .unwrap()
-            .registered("work".into(), true);
+            let second_child =
+                Task::new(fixture_id(6), TaskOwner::Task(second.id()), cp.clone(), 3)
+                    .unwrap()
+                    .registered("work".into(), true);
             tasks
                 .save(&[Save::Create(&second), Save::Create(&second_child)])
                 .unwrap();
@@ -2722,21 +2739,11 @@ mod tests {
             TaskState::CompletingFailed(_)
         ));
         assert!(matches!(
-            tasks
-                .load(fixture_id(5))
-                .unwrap()
-                .unwrap()
-                .task
-                .state(),
+            tasks.load(fixture_id(5)).unwrap().unwrap().task.state(),
             TaskState::CompletingFailed(_)
         ));
         assert!(matches!(
-            tasks
-                .load(fixture_id(4))
-                .unwrap()
-                .unwrap()
-                .task
-                .state(),
+            tasks.load(fixture_id(4)).unwrap().unwrap().task.state(),
             TaskState::Completing(_)
         ));
         assert!(
@@ -2748,12 +2755,7 @@ mod tests {
                 .abort_requested()
         );
         assert!(matches!(
-            tasks
-                .load(fixture_id(3))
-                .unwrap()
-                .unwrap()
-                .task
-                .state(),
+            tasks.load(fixture_id(3)).unwrap().unwrap().task.state(),
             TaskState::Waiting(_)
         ));
         let (writer_busy_tx, writer_busy_rx) = mpsc::channel();
@@ -2773,13 +2775,10 @@ mod tests {
                 locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 writer_handle_tx.send(writer).unwrap();
             });
-            crate::task_scheduler::on_maintenance_write_busy_for_test(
-                fixture_id(5),
-                move || {
-                    writer_busy_tx.send(()).unwrap();
-                    unlock_tx.send(()).unwrap();
-                },
-            );
+            crate::task_scheduler::on_maintenance_write_busy_for_test(fixture_id(5), move || {
+                writer_busy_tx.send(()).unwrap();
+                unlock_tx.send(()).unwrap();
+            });
         }
         let (overlap_tx, overlap_rx) = mpsc::channel();
         if merge_graphs {
@@ -2851,12 +2850,7 @@ mod tests {
             crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
         } else if hold_first {
             let until = Instant::now() + Duration::from_secs(10);
-            while !driver
-                .get(fixture_id(5))
-                .unwrap()
-                .unwrap()
-                .is_terminal()
-            {
+            while !driver.get(fixture_id(5)).unwrap().unwrap().is_terminal() {
                 assert!(
                     Instant::now() < until,
                     "later independent maintenance was starved"
@@ -2871,11 +2865,7 @@ mod tests {
         }
         let until = Instant::now() + Duration::from_secs(10);
         while !driver.get(parent_id).unwrap().unwrap().is_terminal()
-            || !driver
-                .get(fixture_id(5))
-                .unwrap()
-                .unwrap()
-                .is_terminal()
+            || !driver.get(fixture_id(5)).unwrap().unwrap().is_terminal()
         {
             assert!(Instant::now() < until, "maintenance did not settle");
             thread::sleep(Duration::from_millis(5));

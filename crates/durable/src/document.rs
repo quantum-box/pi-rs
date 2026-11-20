@@ -2222,6 +2222,9 @@ pub struct StagedApplicationEntries<'a> {
 }
 
 impl DetachedTaskDocuments {
+    pub(crate) fn task_input_conversation(&self) -> Option<uuid::Uuid> {
+        self.task_input.as_ref().map(|intent| intent.conversation)
+    }
     pub fn reservation(&self) -> &crate::task_store::StoredTask {
         &self.reservation
     }

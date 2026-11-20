@@ -224,7 +224,7 @@ async fn exercise_conversation_park_claim(case: &str) {
                     )
                     .unwrap();
             }
-            if self.1 == "dispatch_hold" {
+            if self.1 == "dispatch_hold" || self.1 == "dispatch_hold_cleanup" {
                 while !self.2.with_extension("release").exists() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
@@ -718,7 +718,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         scheduler.shutdown().await.unwrap();
         return;
     }
-    if case == "dispatch_hold" {
+    if case == "dispatch_hold" || case == "dispatch_hold_cleanup" {
         let other = scheduler
             .create_conversation(Config {
                 model: "test".into(),
@@ -726,7 +726,13 @@ async fn exercise_conversation_park_claim(case: &str) {
                 max_output_tokens: 100,
             })
             .unwrap();
-        scheduler.abort_task(root_id).unwrap();
+        let cleanup_ready = Arc::new(tokio::sync::Semaphore::new(0));
+        if case == "dispatch_hold_cleanup" {
+            crate::runtime::on_callback_cleanup_committed(conversation, cleanup_ready.clone());
+            scheduler.abort(conversation).unwrap();
+        } else {
+            scheduler.abort_task(root_id).unwrap();
+        }
         tokio::time::timeout(Duration::from_secs(10), async {
             while calls.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -734,6 +740,39 @@ async fn exercise_conversation_park_claim(case: &str) {
         })
         .await
         .unwrap();
+        if case == "dispatch_hold_cleanup" {
+            tokio::time::timeout(Duration::from_secs(10), cleanup_ready.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+        }
+        let same_signal = crate::conversation_signal::Signal::new(
+            uuid::Uuid::new_v4(),
+            conversation,
+            "blocked-by-callback".into(),
+            json!(1),
+        );
+        assert!(matches!(
+            scheduler.send_signal(&same_signal),
+            Err(crate::runtime::Error::TaskPublicationBusy)
+        ));
+        let modes = crate::runtime::QueueModes::default();
+        if case == "dispatch_hold" {
+            assert!(matches!(
+                scheduler.set_queue_modes(conversation, modes),
+                Err(crate::runtime::Error::TaskPublicationBusy)
+            ));
+            assert!(matches!(
+                scheduler.reset_with_blocks(
+                    conversation,
+                    None,
+                    vec![vec![json!({"type":"text","text":"held"})]]
+                ),
+                Err(crate::runtime::Error::TaskPublicationBusy)
+            ));
+        }
+        scheduler.set_queue_modes(other, modes).unwrap();
         let signal = crate::conversation_signal::Signal::new(
             uuid::Uuid::new_v4(),
             other,
@@ -750,6 +789,16 @@ async fn exercise_conversation_park_claim(case: &str) {
         })
         .await
         .unwrap();
+        if case == "dispatch_hold" {
+            scheduler.set_queue_modes(conversation, modes).unwrap();
+            scheduler
+                .reset_with_blocks(
+                    conversation,
+                    None,
+                    vec![vec![json!({"type":"text","text":"released"})]],
+                )
+                .unwrap();
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         tokio::time::timeout(Duration::from_secs(10), async {
             while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
@@ -1743,6 +1792,11 @@ async fn conversation_cancel_settles_while_independent_maintenance_is_pending() 
 #[tokio::test]
 async fn conversation_cancel_pending_callback_does_not_block_other_graph() {
     exercise_conversation_park_claim("dispatch_hold").await;
+}
+
+#[tokio::test]
+async fn conversation_abort_cleanup_claim_is_fenced_during_callback() {
+    exercise_conversation_park_claim("dispatch_hold_cleanup").await;
 }
 
 #[tokio::test]

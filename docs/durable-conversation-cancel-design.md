@@ -33,6 +33,14 @@ self-wait. Without the scope, use a cancellation token or an explicit timeout
 for retrying operations, and join every spawned task before returning. The
 30-second callback timeout cannot preempt blocking work or join detached tasks.
 
+Conversation saves acquire a shared mutation lease and check the durable start
+marker in the same checked commit. A task-input admission moves that lease to
+its prepared settlement, retaining it through retries until commit or disposal.
+While a callback marker exists, the internal abort-cleanup reservation checks
+the original claim, attempt, owner, definition identity and both markers in one
+transaction. External cleanup work is deferred while the unsafe checkpointable
+root remains live. Direct writes to the store remain outside these API fences.
+
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.
 

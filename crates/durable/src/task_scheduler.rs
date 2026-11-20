@@ -2255,6 +2255,9 @@ impl TaskNotificationAssembly {
 
 pub struct PreparedSettlement {
     attachment: Arc<Attachment>,
+    // Own start leases for staged conversation writes through commit,
+    // retry, or disposal of the prepared settlement.
+    _start_leases: Vec<durable_store::controls::MutationLease>,
     transaction: crate::document::Transaction,
     notifications: Option<TaskNotificationAssembly>,
     running: task_store::StoredTask,
@@ -6658,6 +6661,8 @@ pub struct Scheduler {
     #[cfg(test)]
     inject_post_commit_error: bool,
     #[cfg(test)]
+    inject_commit_busy_once: bool,
+    #[cfg(test)]
     inject_preparation_error: u8,
     #[cfg(test)]
     inject_failure_commit_error: u8,
@@ -6672,6 +6677,12 @@ pub struct Scheduler {
     #[cfg(test)]
     yielded_prepared: Option<PreparedSettlement>,
     activity: crate::worker_activity::WorkerActivity,
+}
+
+impl Scheduler {
+    pub(crate) fn cleanup_registry(&self) -> &Registry {
+        &self.registry
+    }
 }
 impl Scheduler {
     fn make_invocation(
@@ -9208,6 +9219,8 @@ impl Scheduler {
             inject_batch_prepare_conflict: false,
             #[cfg(test)]
             inject_post_commit_error: false,
+            #[cfg(test)]
+            inject_commit_busy_once: false,
             #[cfg(test)]
             inject_preparation_error: 0,
             #[cfg(test)]
@@ -12305,6 +12318,28 @@ impl Scheduler {
                 .store(false, std::sync::atomic::Ordering::Release);
             return Ok(true);
         }
+        let mut staged_start_leases = Vec::new();
+        if let Some(conversation) = documents.task_input_conversation() {
+            let gate = owner.conversation_controls().start_gate(conversation);
+            let start_lease = gate.try_enter();
+            let busy = start_lease.is_none()
+                || owner
+                    .store()
+                    .get(&crate::conversation_signal::callback_start_key(
+                        conversation,
+                    ))
+                    .map_err(task_store::Error::from)?
+                    .is_some();
+            if busy {
+                *deferred = Some(DeferredSettlement::Unprepared(
+                    original_running,
+                    result,
+                    documents,
+                ));
+                return Err(Error::Busy);
+            }
+            staged_start_leases.push(start_lease.expect("checked above"));
+        }
         let step = match result {
             Ok(step) => step,
             Err(reason) if running.task.is_task_tool() => {
@@ -12623,7 +12658,9 @@ impl Scheduler {
                         "task input requires an attached harness".into(),
                     )
                 })?;
-                let mut batch = harness.prepare_task_input(intent)?;
+                let staged_input = harness.prepare_task_input(intent)?;
+                let mut batch = staged_input.batch;
+                staged_start_leases.extend(staged_input.start_leases);
                 let mut ancestry = crate::task_store::OwnedBatch {
                     checks: intent.ancestry_checks.clone(),
                     mutations: Vec::new(),
@@ -12918,6 +12955,7 @@ impl Scheduler {
         let _ = wait_graph_fence;
         let mut prepared = PreparedSettlement {
             attachment: self.attachment.clone(),
+            _start_leases: staged_start_leases,
             transaction,
             notifications,
             running,
@@ -12972,6 +13010,20 @@ impl Scheduler {
             }
             #[cfg(feature = "test-hooks")]
             hook_fence_test_hook::run(prepared.running.task.id(), "settlement");
+            #[cfg(test)]
+            let result = if std::mem::take(&mut self.inject_commit_busy_once) {
+                Err(crate::document::Error::Store(
+                    durable_store::Error::WriteLockBusy(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        None,
+                    )),
+                ))
+            } else {
+                prepared
+                    .transaction
+                    .commit_task_graph(owner.store(), prepared.graph_version)
+            };
+            #[cfg(not(test))]
             let result = prepared
                 .transaction
                 .commit_task_graph(owner.store(), prepared.graph_version);
@@ -15066,6 +15118,197 @@ mod tests {
             .admit_task_tool_child(&child, "key", json!({"x":1}))
             .unwrap();
         assert_eq!(scheduler.ts().list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn staged_task_input_holds_start_gate_until_driver_commit() {
+        use crate::document::TaskDocuments;
+        use crate::runtime::{Config, Harness, Options};
+        use crate::task_driver::Driver;
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::mpsc;
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Writer;
+        impl Handler for Writer {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                docs.submit_write("guarded".into(), "app.note".into(), None, None)
+                    .map_err(|e| e.to_string())?;
+                Ok(Step::Succeed(json!(null)))
+            }
+        }
+        for scenario in ["commit", "conflict", "panic", "drop"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut harness = Harness::open_paused(
+                dir.path().join("db"),
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            let conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let other = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let controls = harness.owner.conversation_controls();
+            let gate = controls.get(conversation).callback_start;
+            let other_gate = controls.get(other).callback_start;
+            let mut registry = Registry::default();
+            registry.register("guarded-writer", false, Writer);
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            scheduler.inject_commit_busy_once = scenario == "drop";
+            let writer = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("writer"),
+                3,
+            )
+            .unwrap()
+            .registered("guarded-writer".into(), false);
+            let (pending_entered, pending_ready) = mpsc::channel();
+            let (pending_release, pending_proceed) = mpsc::channel();
+            if scenario == "drop" {
+                crate::task_driver::after_pending_enqueue_for_test(writer.id(), move || {
+                    pending_entered.send(()).unwrap();
+                    pending_proceed
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                });
+            }
+            let (entered, ready) = mpsc::channel();
+            let (release, proceed) = mpsc::channel();
+            let proceed = std::sync::Mutex::new(proceed);
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            scheduler.set_result_commit_hook(Arc::new(move |_, _| {
+                let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt != 0 && !(scenario == "conflict" && attempt == 1) {
+                    return;
+                }
+                entered.send(attempt).unwrap();
+                proceed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                assert_ne!(scenario, "panic", "injected settlement panic");
+            }));
+            let driver = Driver::start(scheduler);
+            driver.submit(&writer).unwrap();
+            assert_eq!(
+                ready
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap(),
+                0
+            );
+            assert!(
+                gate.try_start().is_none(),
+                "staged input released its gate before commit"
+            );
+            assert!(
+                other_gate.try_start().is_some(),
+                "unrelated conversation was blocked"
+            );
+            if scenario == "conflict" {
+                let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+                let key = crate::runtime::Harness::key(conversation);
+                let old = store.get(&key).unwrap().unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(old.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: old.value,
+                        }],
+                    )
+                    .unwrap();
+            }
+            release.send(()).unwrap();
+            if scenario == "drop" {
+                pending_ready
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                let pending = driver
+                    .take_pending_for_test(writer.id())
+                    .expect("missing retained settlement");
+                assert!(
+                    pending.candidate_task().is_some(),
+                    "prepared transaction was not retained"
+                );
+                assert!(
+                    gate.try_start().is_none(),
+                    "pending settlement lost its gate"
+                );
+                drop(pending);
+                assert!(
+                    gate.try_start().is_some(),
+                    "dropping settlement retained its gate"
+                );
+                pending_release.send(()).unwrap();
+                let _ = driver.shutdown_with_pending().unwrap();
+                continue;
+            }
+            if scenario == "conflict" {
+                assert_eq!(
+                    ready
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap(),
+                    1
+                );
+                assert!(gate.try_start().is_none(), "retry released its staged gate");
+                release.send(()).unwrap();
+            }
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            if scenario == "panic" {
+                while gate.try_start().is_none() {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "panic retained its start gate"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let _ = driver.shutdown_with_pending().unwrap();
+                continue;
+            }
+            loop {
+                if driver.get(writer.id()).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < until);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(gate.try_start().is_some(), "commit retained its gate");
+            driver.shutdown().unwrap();
+        }
     }
 
     #[test]
@@ -17895,6 +18138,7 @@ mod tests {
         } = b.execute().unwrap();
         let settlement = PreparedSettlement {
             attachment: second.attachment.clone(),
+            _start_leases: Vec::new(),
             transaction: crate::document::Transaction::new(),
             notifications: None,
             candidate: running.clone(),
@@ -22675,6 +22919,7 @@ mod tests {
                 .unwrap();
             let mut prepared = PreparedSettlement {
                 attachment: scheduler.attachment.clone(),
+                _start_leases: Vec::new(),
                 transaction,
                 notifications: None,
                 running: running.clone(),
@@ -22811,6 +23056,7 @@ mod tests {
             .unwrap();
         let mut prepared = PreparedSettlement {
             attachment: scheduler.attachment.clone(),
+            _start_leases: Vec::new(),
             transaction,
             notifications: None,
             running,
@@ -27847,12 +28093,20 @@ mod standalone_foreground_cleanup_tests {
             )
             .unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
-                while driver.has_pending_task(descendant.id()) {
+                loop {
+                    let current = driver.get(descendant.id()).unwrap().unwrap();
+                    if current.abort_requested() {
+                        break;
+                    }
+                    assert!(
+                        !current.is_terminal(),
+                        "result settled before abort was recorded"
+                    );
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .expect("repaired graph must release the result");
+            .expect("repaired graph must record abort");
             assert!(
                 driver
                     .get(descendant.id())

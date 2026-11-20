@@ -293,10 +293,23 @@ pub enum TargetFenceBusy {
 pub struct ConversationControls {
     root: CancellationToken,
     entries: Mutex<HashMap<Uuid, Control>>,
+    // Gate lookup never takes the controls registry and never holds this lock
+    // while acquiring any other lock. This is safe under task/poll gates.
+    start_gates: Mutex<HashMap<Uuid, std::sync::Weak<std::sync::atomic::AtomicUsize>>>,
     worker_errors: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 impl ConversationControls {
+    pub fn start_gate(&self, id: Uuid) -> CallbackStartGate {
+        let mut gates = self.start_gates.lock().unwrap_or_else(|e| e.into_inner());
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        if let Some(gate) = gates.get(&id).and_then(std::sync::Weak::upgrade) {
+            return CallbackStartGate(gate);
+        }
+        let gate = CallbackStartGate::default();
+        gates.insert(id, Arc::downgrade(&gate.0));
+        gate
+    }
     /// Failures are shared by all drivers attached to this store owner.
     pub fn worker_errors(&self) -> Arc<Mutex<HashMap<Uuid, String>>> {
         self.worker_errors.clone()
@@ -311,7 +324,7 @@ impl ConversationControls {
         entries
             .entry(id)
             .or_insert_with(|| Control {
-                callback_start: CallbackStartGate::default(),
+                callback_start: self.start_gate(id),
                 gate: Arc::new(PollGate::default()),
                 worker: Arc::new(tokio::sync::Mutex::new(())),
                 abort_execution: Arc::new(tokio::sync::Mutex::new(())),
@@ -506,6 +519,34 @@ mod tests {
         assert!(same.try_start().is_none());
         drop(callback);
         assert!(first.try_enter().is_some());
+    }
+
+    #[test]
+    fn independent_start_lookup_shares_gate_and_releases_after_panic() {
+        let controls = ConversationControls::default();
+        let id = Uuid::from_u128(71);
+        let gate = controls.start_gate(id);
+        controls.get(id);
+        let result = std::panic::catch_unwind(|| {
+            let _lease = gate.try_enter().unwrap();
+            assert!(controls.try_callback_start(id).unwrap().is_none());
+            panic!("test unwind");
+        });
+        assert!(result.is_err());
+        assert!(controls.try_callback_start(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn start_gate_lookup_does_not_acquire_controls_registry() {
+        let controls = ConversationControls::default();
+        let id = Uuid::from_u128(72);
+        let original = controls.get(id).callback_start;
+        let _registry = controls.entries.lock().unwrap();
+        let from_cache = controls.start_gate(id);
+        let mutation = from_cache.try_enter().unwrap();
+        assert!(original.try_start().is_none());
+        drop(mutation);
+        assert!(original.try_start().is_some());
     }
 
     #[test]

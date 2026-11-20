@@ -2493,7 +2493,8 @@ mod tests {
                     assert!(
                         error
                             .to_string()
-                            .contains("before-hook registration changed")
+                            .contains("before-hook registration changed"),
+                        "unexpected driver error: {error:?}"
                     );
                     break;
                 }

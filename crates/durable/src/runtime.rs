@@ -3273,6 +3273,21 @@ fn stopped_receipt_read_hooks() -> &'static StoppedReceiptReadHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn callback_cleanup_test_hooks()
+-> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_callback_cleanup_committed(id: Uuid, ready: Arc<tokio::sync::Semaphore>) {
+    callback_cleanup_test_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, ready);
+}
+#[cfg(test)]
 pub(crate) fn on_stopped_receipt_read_before_commit(
     id: Uuid,
     hook: impl FnOnce() + Send + 'static,
@@ -3309,8 +3324,21 @@ struct TaskResultFence {
 /// Prepared checks can become stale; a conflict requires preparing the entire batch again.
 pub(crate) struct PreparedConversationSave {
     owner: Arc<OwnedStore>,
+    start_leases: Vec<durable_store::controls::MutationLease>,
     pub(crate) checks: Vec<Check>,
     pub(crate) mutations: Vec<Mutation>,
+}
+
+pub(crate) struct StagedTaskInput {
+    pub(crate) batch: crate::task_store::OwnedBatch,
+    pub(crate) start_leases: Vec<durable_store::controls::MutationLease>,
+}
+
+impl std::ops::Deref for StagedTaskInput {
+    type Target = crate::task_store::OwnedBatch;
+    fn deref(&self) -> &Self::Target {
+        &self.batch
+    }
 }
 
 // A proof traversal may encounter the same earlier reset through several
@@ -3564,6 +3592,7 @@ impl PreparedConversationSave {
         }
         self.checks.extend(other.checks);
         self.mutations.extend(other.mutations);
+        self.start_leases.extend(other.start_leases);
         Ok(())
     }
 }
@@ -4495,7 +4524,7 @@ impl Harness {
     pub(crate) fn prepare_task_input(
         &self,
         intent: &crate::document::TaskInputIntent,
-    ) -> Result<crate::task_store::OwnedBatch, crate::document::Error> {
+    ) -> Result<StagedTaskInput, crate::document::Error> {
         use crate::document::Error as DError;
         // Keep all nested reset proofs obtained while hydrating and preparing
         // this candidate until their checks are attached to its task commit.
@@ -4576,9 +4605,12 @@ impl Harness {
                 expected: Expected::Version(version),
             }];
             merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
-            return Ok(crate::task_store::OwnedBatch {
-                checks,
-                mutations: vec![],
+            return Ok(StagedTaskInput {
+                batch: crate::task_store::OwnedBatch {
+                    checks,
+                    mutations: vec![],
+                },
+                start_leases: vec![],
             });
         }
         let prepared = match self.prepare_save(&state, Expected::Version(version)) {
@@ -4626,7 +4658,10 @@ impl Harness {
             key: wake_key,
             value: Vec::new(),
         });
-        Ok(crate::task_store::OwnedBatch { checks, mutations })
+        Ok(StagedTaskInput {
+            batch: crate::task_store::OwnedBatch { checks, mutations },
+            start_leases: prepared.start_leases,
+        })
     }
 }
 
@@ -6369,6 +6404,7 @@ impl Harness {
                 }
                 prepared.extend(PreparedConversationSave {
                     owner: self.owner.clone(),
+                    start_leases: Vec::new(),
                     checks: extra.checks,
                     mutations: extra.mutations,
                 })?;
@@ -6763,6 +6799,16 @@ impl Harness {
         {
             return Err(Error::Failed);
         }
+        let start_gate = self.owner.conversation_controls().start_gate(state.id);
+        let start_lease = start_gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
+        let callback_start =
+            crate::conversation_signal::clear_callback_start_check(self.owner.store(), state.id)
+                .map_err(|error| match error {
+                    crate::conversation_signal::Error::CallbackStartBusy => {
+                        Error::TaskPublicationBusy
+                    }
+                    other => Error::Signal(other),
+                })?;
         let mut state = state.clone();
         validate_pending_reset_blocks(&state)?;
         let key = Self::key(state.id);
@@ -7615,10 +7661,13 @@ impl Harness {
         if let Some(baseline) = reset_baseline {
             fork_value["_reset_baseline"] = baseline;
         }
-        let mut checks = vec![Check {
-            key: key.clone(),
-            expected: expected.clone(),
-        }];
+        let mut checks = vec![
+            callback_start,
+            Check {
+                key: key.clone(),
+                expected: expected.clone(),
+            },
+        ];
         // A task-owned foreground admission can reserve its settlement key.
         // Every later notification admission fences that reservation, including
         // ordinary submissions and application writes.
@@ -7930,6 +7979,7 @@ impl Harness {
         }
         Ok(PreparedConversationSave {
             owner: self.owner.clone(),
+            start_leases: vec![start_lease],
             checks,
             mutations,
         })
@@ -7952,6 +8002,7 @@ impl Harness {
     ) -> Result<PreparedConversationSave, Error> {
         let mut batch = PreparedConversationSave {
             owner: self.owner.clone(),
+            start_leases: Vec::new(),
             checks: Vec::new(),
             mutations: Vec::new(),
         };
@@ -8079,6 +8130,11 @@ impl Harness {
         };
         match result {
             Ok(()) => Ok(()),
+            Err(durable_store::Error::Conflict { key })
+                if key.starts_with(b"runtime/conversation-callback-start/") =>
+            {
+                Err(Error::TaskPublicationBusy)
+            }
             Err(
                 e
                 @ (durable_store::Error::Conflict { .. } | durable_store::Error::WriteLockBusy(_)),
@@ -13038,6 +13094,12 @@ impl Harness {
         ) -> Result<T, crate::document::Error>,
     ) -> Result<T, Error> {
         let (state, version) = self.load(id)?;
+        crate::conversation_signal::clear_callback_start_check(self.owner.store(), id).map_err(
+            |error| match error {
+                crate::conversation_signal::Error::CallbackStartBusy => Error::TaskPublicationBusy,
+                other => Error::Signal(other),
+            },
+        )?;
         if state.abort_requested {
             return Err(Error::Invalid("abort in progress".into()));
         }
@@ -13061,6 +13123,19 @@ impl Harness {
         )?;
         let result = change(&mut transaction)?;
         let (state, mut documents, changed, tasks, children) = transaction.into_parts()?;
+        let gate = owner.conversation_controls().start_gate(id);
+        let _start = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
+        let callback_check = crate::conversation_signal::clear_callback_start_check(
+            owner.store(),
+            id,
+        )
+        .map_err(|error| match error {
+            crate::conversation_signal::Error::CallbackStartBusy => Error::TaskPublicationBusy,
+            other => Error::Signal(other),
+        })?;
+        if !changed {
+            documents.checks.push(callback_check);
+        }
         if !changed && children.is_empty() {
             documents.checks.push(Check {
                 key: Self::key(id),
@@ -13133,6 +13208,12 @@ impl Harness {
         >,
     ) -> Result<T, Error> {
         let (state, version) = self.load(id)?;
+        crate::conversation_signal::clear_callback_start_check(self.owner.store(), id).map_err(
+            |error| match error {
+                crate::conversation_signal::Error::CallbackStartBusy => Error::TaskPublicationBusy,
+                other => Error::Signal(other),
+            },
+        )?;
         if state.abort_requested {
             return Err(Error::Invalid("abort in progress".into()));
         }
@@ -13156,6 +13237,19 @@ impl Harness {
         )?;
         let result = change(&mut transaction).await?;
         let (state, mut documents, changed, tasks, children) = transaction.into_parts()?;
+        let gate = owner.conversation_controls().start_gate(id);
+        let _start = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
+        let callback_check = crate::conversation_signal::clear_callback_start_check(
+            owner.store(),
+            id,
+        )
+        .map_err(|error| match error {
+            crate::conversation_signal::Error::CallbackStartBusy => Error::TaskPublicationBusy,
+            other => Error::Signal(other),
+        })?;
+        if !changed {
+            documents.checks.push(callback_check);
+        }
         if !changed && children.is_empty() {
             documents.checks.push(Check {
                 key: Self::key(id),
@@ -14763,6 +14857,7 @@ impl Harness {
             let mut batch = self.prepare_saves(&refs)?;
             batch.extend(PreparedConversationSave {
                 owner: owner.clone(),
+                start_leases: Vec::new(),
                 checks: summary_checks,
                 mutations: summary_mutations,
             })?;
@@ -15670,6 +15765,129 @@ impl Harness {
         self.settle_abort_protocol(c, version, cancel, false).await
     }
 
+    /// Authorize only the cleanup-attempt marker while a cancel callback owns
+    /// this conversation. The marker does not mutate the conversation or run
+    /// cleanup; every durable claim and identity check joins the same commit.
+    fn commit_abort_cleanup_start(
+        &self,
+        c: &Conversation,
+        checks: &[Check],
+        mutations: &[Mutation],
+    ) -> Result<bool, Error> {
+        let store = self.owner.store();
+        let marker_key = crate::conversation_signal::callback_start_key(c.id);
+        let Some(marker_entry) = store.get(&marker_key)? else {
+            let mut checks = checks.to_vec();
+            checks.push(Check {
+                key: marker_key,
+                expected: Expected::Missing,
+            });
+            store.commit(&checks, mutations)?;
+            return Ok(false);
+        };
+        if !c.abort_requested {
+            return Err(Error::Invalid(
+                "callback cleanup requires conversation abort".into(),
+            ));
+        }
+        let driver = self
+            .task_driver
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => Error::TaskPublicationBusy,
+                std::sync::TryLockError::Poisoned(_) => Error::Failed,
+            })?
+            .as_ref()
+            .and_then(|driver| driver.upgrade())
+            .ok_or_else(|| Error::Invalid("callback cleanup driver unavailable".into()))?;
+        driver.with_cleanup_registry(|registry| {
+            let boundary = store.put_version()?;
+            let marker: serde_json::Value = serde_json::from_slice(&marker_entry.value)?;
+            let parse = |field: &str| -> Result<Uuid, Error> {
+                serde_json::from_value(marker.get(field).cloned().unwrap_or_default())
+                    .map_err(|_| Error::Invalid("invalid callback cleanup marker".into()))
+            };
+            if marker.get("version").and_then(|value| value.as_u64()) != Some(1) {
+                return Err(Error::Invalid("unsupported callback cleanup marker".into()));
+            }
+            let (task_id, attempt, lease, claim_id) = (
+                parse("task")?,
+                parse("attempt")?,
+                parse("lease")?,
+                parse("claim_id")?,
+            );
+            let task = crate::task_store::TaskStore::new(store)
+                .load(task_id)
+                .map_err(|error| Error::Invalid(error.to_string()))?
+                .ok_or_else(|| Error::Invalid("callback cleanup task missing".into()))?;
+            if task.task.owner() != &crate::task::TaskOwner::Conversation(c.id)
+                || task.task.attempt_id() != Some(attempt)
+            {
+                return Err(Error::Invalid(
+                    "callback cleanup owner or attempt changed".into(),
+                ));
+            }
+            let handler = registry
+                .conversation_receipt_handler(&task.task)
+                .filter(|handler| handler.conversation_cancel_dispatch_enabled())
+                .ok_or_else(|| Error::Invalid("callback cleanup registration changed".into()))?;
+            let _identity = handler
+                .conversation_cleanup_identity_lease()
+                .map_err(|error| match error {
+                    crate::nested_identity::LeaseFailure::Busy => Error::TaskPublicationBusy,
+                    crate::nested_identity::LeaseFailure::Mismatch => {
+                        Error::Invalid("callback cleanup identity changed".into())
+                    }
+                })?;
+            let (claim, claim_check) = crate::task_scheduler::read_conversation_cancel_claim(
+                store, task_id, attempt, claim_id,
+            )
+            .map_err(Error::Invalid)?
+            .ok_or_else(|| Error::Invalid("callback cleanup claim missing".into()))?;
+            if claim.lease != lease
+                || claim.kind != task.task.kind().unwrap_or_default()
+                || claim.definition_version != task.task.definition_version()
+                || claim.checkpoint != *task.task.checkpoint()
+                || serde_json::to_value(claim.policy)? != marker["policy"]
+            {
+                return Err(Error::Invalid("callback cleanup claim mismatch".into()));
+            }
+            let task_marker_key = crate::task_store::callback_start_key(task_id);
+            let task_marker = store
+                .get(&task_marker_key)?
+                .filter(|entry| entry.value == marker_entry.value)
+                .ok_or_else(|| Error::Invalid("callback cleanup task marker mismatch".into()))?;
+            let mut all = checks.to_vec();
+            all.extend(self.checkpointable_cancel_conversation_checks(&task.task, registry)?);
+            all.extend(
+                crate::async_task_tool::unsafe_park_proof::cancel_checks(
+                    store, &task.task, boundary,
+                )
+                .map_err(Error::Invalid)?,
+            );
+            all.push(claim_check);
+            all.push(Check {
+                key: marker_key,
+                expected: Expected::Version(marker_entry.version),
+            });
+            all.push(Check {
+                key: task_marker_key,
+                expected: Expected::Version(task_marker.version),
+            });
+            store.commit_with_prefix_put_fence(
+                &all,
+                mutations,
+                &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                boundary,
+            )?;
+            #[cfg(test)]
+            if let Some(ready) = callback_cleanup_test_hooks().lock().unwrap().remove(&c.id) {
+                ready.add_permits(1);
+            }
+            Ok(true)
+        })
+    }
+
     async fn settle_abort_protocol(
         &mut self,
         c: Conversation,
@@ -15727,7 +15945,8 @@ impl Harness {
             attempt,
             ownerless_ephemeral: !force_durable && edge.is_none(),
         };
-        match store.commit(
+        let callback_active = match self.commit_abort_cleanup_start(
+            &c,
             &[
                 Check {
                     key: key.clone(),
@@ -15747,14 +15966,19 @@ impl Harness {
                 value: serde_json::to_vec(&marker)?,
             }],
         ) {
-            Ok(()) => (),
-            Err(durable_store::Error::Conflict { .. }) => return Ok(false),
-            Err(error) => return Err(error.into()),
-        }
+            Ok(callback_active) => callback_active,
+            Err(
+                Error::Storage(durable_store::Error::Conflict { .. }) | Error::TaskPublicationBusy,
+            ) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         drop(summary_guard);
-        let result = self
-            .settle_abort_inner(c, version, cancel, Some(attempt))
-            .await;
+        let result = if callback_active {
+            Ok(false)
+        } else {
+            self.settle_abort_inner(c, version, cancel, Some(attempt))
+                .await
+        };
         if result.is_ok() {
             let marker = store
                 .get(&key)?
@@ -15785,6 +16009,33 @@ impl Harness {
             (Some(marker), Some(attempt)) if cleanup_attempt_id(&marker.value) == Some(attempt) => {
             }
             _ => return Err(Error::Invalid("cleanup marker missing or changed".into())),
+        }
+        // A conversation-owned unsafe checkpointable root may start its
+        // cancel callback as soon as its children drain. Do not run summary
+        // callbacks or publish conversation cleanup while that root is live:
+        // the callback-start marker can be committed after the cleanup marker
+        // above. A terminal task cannot start a later callback.
+        if let Phase::TaskPending {
+            task,
+            identity: Some(identity),
+            ..
+        } = &c.phase
+            && identity.is_checkpointable()
+        {
+            let root = crate::task_store::TaskStore::new(self.owner.store())
+                .load(*task)
+                .map_err(|error| Error::Invalid(error.to_string()))?
+                .ok_or_else(|| Error::Invalid("checkpointable cleanup root missing".into()))?;
+            if !root.task.replay_safe()
+                && (!root.task.is_terminal()
+                    || self
+                        .owner
+                        .store()
+                        .get(&crate::conversation_signal::callback_start_key(c.id))?
+                        .is_some())
+            {
+                return Ok(false);
+            }
         }
         // Keep the conversation marked until all owned cleanup has finished.
         let summaries = crate::summary_store::SummaryStore::new(self.owner.store())
@@ -16471,6 +16722,7 @@ impl Harness {
             .map_err(|e| Error::Invalid(format!("summary: {e}")))?;
         batch.extend(PreparedConversationSave {
             owner,
+            start_leases: Vec::new(),
             checks,
             mutations,
         })?;
@@ -20514,6 +20766,7 @@ impl SummaryPlacementDriver {
                 .map_err(|e| self.summary_store_error(e))?;
             let mut batch = placement.unwrap_or_else(|| PreparedConversationSave {
                 owner: owner.clone(),
+                start_leases: Vec::new(),
                 checks: vec![Check {
                     key,
                     expected: observed,
@@ -20522,6 +20775,7 @@ impl SummaryPlacementDriver {
             });
             batch.extend(PreparedConversationSave {
                 owner,
+                start_leases: Vec::new(),
                 checks,
                 mutations,
             })?;
@@ -23676,6 +23930,30 @@ impl RuntimeOwner {
     }
 }
 
+// Only a task-pending unsafe root can own a conversation cancel marker. In
+// this phase the worker has not dispatched another external effect; abort
+// cleanup also waits for the live root before invoking external cleanup.
+fn callback_busy_retry_safe(worker: &Harness, id: Uuid) -> Result<bool, Error> {
+    let state = worker.conversation(id)?;
+    let Phase::TaskPending {
+        task,
+        identity: Some(identity),
+        ..
+    } = &state.phase
+    else {
+        return Ok(false);
+    };
+    if !identity.is_checkpointable() {
+        return Ok(false);
+    }
+    let root = crate::task_store::TaskStore::new(worker.owner.store())
+        .load(*task)
+        .map_err(|error| Error::Invalid(error.to_string()))?;
+    Ok(root.is_some_and(|root| {
+        !root.task.replay_safe() && root.task.owner() == &crate::task::TaskOwner::Conversation(id)
+    }))
+}
+
 /// Drive a conversation under its scheduler lock and cancellation fence.
 pub(crate) async fn drive_scheduled<'a>(
     worker: &mut Harness,
@@ -23727,24 +24005,37 @@ pub(crate) async fn drive_scheduled<'a>(
             false
         };
         identity_retry = false;
-        if !safe_identity_retry && let Err(error) = worker.recover_conversation(id) {
-            let _gate = worker
-                .execution_gate
-                .as_ref()
-                .unwrap()
-                .lock()
-                .map_err(|_| Error::Failed)?;
-            return if cancel.is_cancelled() {
-                Ok(())
-            } else {
-                Err(error)
-            };
-        }
         let mut identity_busy = false;
-        if let Err(error) = worker
-            .drive_until_wait(id, cancel, &mut identity_busy)
-            .await
-        {
+        let recovery = if safe_identity_retry {
+            Ok(())
+        } else {
+            worker.recover_conversation(id)
+        };
+        let driven = match recovery {
+            Ok(()) => {
+                worker
+                    .drive_until_wait(id, cancel, &mut identity_busy)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = driven {
+            if matches!(error, Error::TaskPublicationBusy) && callback_busy_retry_safe(worker, id)?
+            {
+                drop(guard.take());
+                activity.set(crate::worker_activity::WorkerPhase::Waiting);
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                }
+                *guard = Some(tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(()),
+                    guard = lock.lock() => guard,
+                });
+                activity.set(crate::worker_activity::WorkerPhase::Running);
+                continue;
+            }
             let _gate = worker
                 .execution_gate
                 .as_ref()
@@ -25192,6 +25483,7 @@ mod scheduler_tests {
         });
         let make = |expected, mutations| PreparedConversationSave {
             owner: owner.clone(),
+            start_leases: Vec::new(),
             checks: vec![Check {
                 key: key.clone(),
                 expected,
@@ -25460,6 +25752,117 @@ mod scheduler_tests {
             ));
         }
         scheduler.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn prepared_conversation_save_loses_to_callback_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let id = harness.create_conversation(config()).unwrap();
+        let (mut state, version) = harness.load(id).unwrap();
+        state.after_failed_run = AfterFailedRun::Continue;
+        let prepared = harness
+            .prepare_save(&state, Expected::Version(version))
+            .unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let start =
+            crate::conversation_signal::prepare_callback_start_signal_fence(&store, id, b"claim")
+                .unwrap();
+        store.commit(&start.checks, &start.mutations).unwrap();
+        assert!(matches!(
+            harness.commit_conversation_save(prepared),
+            Err(Error::TaskPublicationBusy)
+        ));
+        assert_ne!(
+            harness.conversation(id).unwrap().after_failed_run,
+            AfterFailedRun::Continue
+        );
+        let finish =
+            crate::conversation_signal::prepare_callback_finish_signal_fence(&store, id, b"claim")
+                .unwrap();
+        store.commit(&finish.checks, &finish.mutations).unwrap();
+        harness
+            .set_after_failed_run(id, AfterFailedRun::Continue)
+            .unwrap();
+        assert_eq!(
+            harness.conversation(id).unwrap().after_failed_run,
+            AfterFailedRun::Continue
+        );
+    }
+
+    #[test]
+    fn prepared_save_releases_start_gate_on_drop_conflict_and_unwind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let id = harness.create_conversation(config()).unwrap();
+        let gate = harness.owner.conversation_controls().get(id).callback_start;
+        let (state, version) = harness.load(id).unwrap();
+        let staged = harness
+            .prepare_save(&state, Expected::Version(version))
+            .unwrap();
+        assert!(gate.try_start().is_none());
+        drop(staged);
+        assert!(gate.try_start().is_some());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _staged = harness
+                .prepare_save(&state, Expected::Version(version))
+                .unwrap();
+            assert!(gate.try_start().is_none());
+            panic!("abort preparation");
+        }));
+        assert!(caught.is_err());
+        assert!(gate.try_start().is_some());
+        let staged = harness
+            .prepare_save(&state, Expected::Version(version))
+            .unwrap();
+        let store = durable_store::Store::open(path).unwrap();
+        let key = Harness::key(id);
+        let entry = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: entry.value,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            harness.commit_conversation_save(staged),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        assert!(gate.try_start().is_some());
+    }
+
+    #[tokio::test]
+    async fn session_transaction_callback_does_not_hold_start_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = harness.create_conversation(config()).unwrap();
+        let gate = harness.owner.conversation_controls().get(id).callback_start;
+        harness
+            .session_transaction(id, |_| {
+                assert!(gate.try_start().is_some());
+                Ok(())
+            })
+            .unwrap();
+        let async_gate = gate.clone();
+        harness
+            .session_transaction_async(id, move |_| {
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    assert!(async_gate.try_start().is_some());
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -26282,19 +26685,16 @@ mod scheduler_tests {
         let model = placement_model();
         let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
         let id = scheduler.create_conversation(config()).unwrap();
-        let gate = scheduler
-            .harness
-            .owner
-            .conversation_controls()
-            .get(id)
-            .callback_start;
-        let lease = gate.try_start().unwrap();
+        let control = scheduler.harness.owner.conversation_controls().get(id);
+        let worker = control.worker.lock().await;
+        let submission = scheduler.submit(id, None, "input".into()).unwrap();
+        let lease = control.callback_start.try_start().unwrap();
         let busy = Arc::new(Semaphore::new(0));
         placement_start_busy_hooks()
             .lock()
             .unwrap()
             .insert(id, busy.clone());
-        let submission = scheduler.submit(id, None, "input".into()).unwrap();
+        drop(worker);
         tokio::time::timeout(Duration::from_secs(5), busy.acquire())
             .await
             .unwrap()
