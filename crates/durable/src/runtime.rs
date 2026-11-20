@@ -133,6 +133,39 @@ pub(crate) fn woken_owned_graph_key(root: Uuid) -> Vec<u8> {
     format!("runtime/woken-owned-graph/v1/{root}").into_bytes()
 }
 
+/// Evidence committed with the completed owned conversation and retirement of
+/// its cleanup attempt. Consumers must additionally authenticate its graph.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OwnedCleanupReceipt {
+    pub version: u32,
+    pub conversation: Uuid,
+    pub attempt: Uuid,
+    pub marker_version: u64,
+    pub edge: crate::ownership_edge::Edge,
+    pub edge_version: u64,
+    pub started_conversation_version: u64,
+}
+pub(crate) fn owned_cleanup_receipt_key(conversation: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("runtime/owned-cleanup-receipt/v1/{conversation}/{attempt}").into_bytes()
+}
+
+#[cfg(test)]
+fn owned_cleanup_final_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn before_owned_cleanup_final_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    owned_cleanup_final_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CleanupAttempt {
     attempt: Uuid,
@@ -6073,7 +6106,17 @@ impl Harness {
         &mut self,
         state: &Conversation,
         expected: Expected,
+        fence: TaskResultFence,
+    ) -> Result<(), Error> {
+        self.save_with_task_result_and_extra(state, expected, fence, None)
+    }
+
+    fn save_with_task_result_and_extra(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
         mut fence: TaskResultFence,
+        extra: Option<&crate::task_store::OwnedBatch>,
     ) -> Result<(), Error> {
         for _ in 0..8 {
             #[cfg(test)]
@@ -6085,10 +6128,14 @@ impl Harness {
             let mut checks = vec![fence.check.clone()];
             checks.extend(fence.binding.clone());
             checks.extend(fence.evidence.clone());
-            let batch = crate::task_store::OwnedBatch {
+            let mut batch = crate::task_store::OwnedBatch {
                 checks,
                 mutations: vec![],
             };
+            if let Some(extra) = extra {
+                batch.checks.extend(extra.checks.clone());
+                batch.mutations.extend(extra.mutations.clone());
+            }
             match self.save_composed_locked(state, expected.clone(), None, &[], &[], Some(&batch)) {
                 Err(Error::Storage(durable_store::Error::Conflict { key }))
                     if key == fence.check.key =>
@@ -16585,6 +16632,7 @@ impl Harness {
         let edge_expected = edge
             .as_ref()
             .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+        let conversation_id = c.id;
         let key = owned_cleanup_key(c.id);
         if let Some(marker) = store.get(&key)? {
             let ephemeral = serde_json::from_slice::<CleanupAttempt>(&marker.value)
@@ -16652,9 +16700,18 @@ impl Harness {
                 .await
         };
         if result.is_ok() {
-            let marker = store
-                .get(&key)?
-                .ok_or_else(|| Error::Invalid("cleanup marker missing".into()))?;
+            let Some(marker) = store.get(&key)? else {
+                // A fully completed owned cleanup retires the marker together
+                // with its conversation and immutable receipt.
+                if matches!(result, Ok(true))
+                    && store
+                        .get(&owned_cleanup_receipt_key(conversation_id, attempt))?
+                        .is_some()
+                {
+                    return result;
+                }
+                return Err(Error::Invalid("cleanup marker missing".into()));
+            };
             if cleanup_attempt_id(&marker.value) != Some(attempt) {
                 return Err(Error::Invalid("cleanup marker changed".into()));
             }
@@ -17063,8 +17120,85 @@ impl Harness {
             c.abort_requested = false;
             finish_abort(&mut c);
         }
+        let cleanup_receipt = if !c.abort_requested && !matches!(c.phase, Phase::Blocked { .. }) {
+            if let Some(attempt) = cleanup_attempt {
+                let store = self.owner.store();
+                let edge_key = crate::ownership_edge::edge_key(c.id);
+                if let Some(edge_entry) = store.get(&edge_key)? {
+                    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+                        .map_err(|e| Error::Invalid(format!("ownership edge: {e}")))?;
+                    let marker_key = owned_cleanup_key(c.id);
+                    let marker = store
+                        .get(&marker_key)?
+                        .ok_or_else(|| Error::Invalid("cleanup marker missing".into()))?;
+                    if cleanup_attempt_id(&marker.value) != Some(attempt) {
+                        return Err(Error::Invalid("cleanup marker changed".into()));
+                    }
+                    let receipt_key = owned_cleanup_receipt_key(c.id, attempt);
+                    let receipt = OwnedCleanupReceipt {
+                        version: 1,
+                        conversation: c.id,
+                        attempt,
+                        marker_version: marker.version,
+                        edge: edge.edge,
+                        edge_version: edge_entry.version,
+                        started_conversation_version: version,
+                    };
+                    Some(crate::task_store::OwnedBatch {
+                        checks: vec![
+                            Check {
+                                key: marker_key.clone(),
+                                expected: Expected::Version(marker.version),
+                            },
+                            Check {
+                                key: edge_key,
+                                expected: Expected::Version(edge_entry.version),
+                            },
+                            Check {
+                                key: receipt_key.clone(),
+                                expected: Expected::Missing,
+                            },
+                        ],
+                        mutations: vec![
+                            Mutation::Delete { key: marker_key },
+                            Mutation::Put {
+                                key: receipt_key,
+                                value: serde_json::to_vec(&receipt)?,
+                            },
+                        ],
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if cleanup_receipt.is_some() {
+            let hook = owned_cleanup_final_hooks().lock().unwrap().remove(&c.id);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         if let Some(check) = task_result_check {
-            self.save_with_task_result_check(&c, Expected::Version(version), check)?;
+            self.save_with_task_result_and_extra(
+                &c,
+                Expected::Version(version),
+                check,
+                cleanup_receipt.as_ref(),
+            )?;
+        } else if let Some(receipt) = cleanup_receipt.as_ref() {
+            self.save_composed_locked(
+                &c,
+                Expected::Version(version),
+                None,
+                &[],
+                &[],
+                Some(receipt),
+            )?;
         } else {
             self.save(&c, Expected::Version(version))?;
         }

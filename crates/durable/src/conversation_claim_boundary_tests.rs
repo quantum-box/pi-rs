@@ -7869,6 +7869,15 @@ async fn live_woken_root_drains_any_loser_before_cancel() {
 
 #[tokio::test]
 async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_together() {
+    exercise_woken_owned_graph_receipt(false).await;
+}
+
+#[tokio::test]
+async fn owned_cleanup_receipt_conflict_preserves_abort_and_marker() {
+    exercise_woken_owned_graph_receipt(true).await;
+}
+
+async fn exercise_woken_owned_graph_receipt(conflict: bool) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -8015,6 +8024,94 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         Some(graph_commit)
     );
 
+    if conflict {
+        let path = path.clone();
+        crate::runtime::before_owned_cleanup_final_commit(conversation, move || {
+            let store = durable_store::Store::open(path).unwrap();
+            let key = crate::runtime::owned_cleanup_key(conversation);
+            let marker = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(marker.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: marker.value,
+                    }],
+                )
+                .unwrap();
+        });
+    }
+    let cleanup = harness
+        .drive_owned_cleanup_fenced(conversation, &pi_rs_core::CancellationToken::new())
+        .await;
+    if conflict {
+        assert!(cleanup.is_err());
+        assert!(harness.conversation(conversation).unwrap().abort_requested);
+        assert!(
+            store
+                .get(&crate::runtime::owned_cleanup_key(conversation))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .list(format!("runtime/owned-cleanup-receipt/v1/{conversation}/").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        drop(harness);
+        let (options, _, _) = build_woken_any(&path);
+        let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
+        assert!(reopened.conversation(conversation).unwrap().abort_requested);
+        assert!(
+            durable_store::Store::open(&path)
+                .unwrap()
+                .get(&crate::runtime::owned_cleanup_key(conversation))
+                .unwrap()
+                .is_some()
+        );
+        return;
+    }
+    cleanup.unwrap();
+    assert!(!harness.conversation(conversation).unwrap().abort_requested);
+    assert!(
+        store
+            .get(&crate::runtime::owned_cleanup_key(conversation))
+            .unwrap()
+            .is_none()
+    );
+    let prefix = format!("runtime/owned-cleanup-receipt/v1/{conversation}/");
+    let receipts = store.list(prefix.as_bytes()).unwrap();
+    assert_eq!(receipts.len(), 1);
+    let (receipt_key, receipt_entry) = &receipts[0];
+    let receipt: crate::runtime::OwnedCleanupReceipt =
+        serde_json::from_slice(&receipt_entry.value).unwrap();
+    assert_eq!(receipt.conversation, conversation);
+    assert_eq!(receipt.edge.child, conversation);
+    assert_eq!(receipt.edge.task, root.task.id());
+    let finished = store.get(&conversation_key).unwrap().unwrap();
+    let receipt_commit = store
+        .commit_for_version(receipt_key, receipt_entry.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_for_version(&conversation_key, finished.version)
+            .unwrap(),
+        Some(receipt_commit)
+    );
+    let start_commit = store
+        .commit_for_version(
+            &crate::runtime::owned_cleanup_key(conversation),
+            receipt.marker_version,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(start_commit < receipt_commit);
     drop(store);
     drop(harness);
     let options = Options {
@@ -8027,7 +8124,7 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
-    assert!(reopened.conversation(conversation).unwrap().abort_requested);
+    assert!(!reopened.conversation(conversation).unwrap().abort_requested);
     let store = durable_store::Store::open(&path).unwrap();
     let saved = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
