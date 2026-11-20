@@ -1194,6 +1194,9 @@ pub(crate) fn normalize_graph_checks(batch: &mut OwnedBatch) {
             || check.key.starts_with(crate::ownership_edge::PREFIX)
             || check.key.starts_with(b"durable/ownership-abort-fence/v1/")
             || check.key.starts_with(b"runtime/conversation/")
+            || check
+                .key
+                .starts_with(b"runtime/conversation-callback-start/")
             || check.key.starts_with(b"runtime/owned-cleanup-attempt/")
             || cancel_claim_key(&check.key);
         if graph && let Some(index) = seen.get(&check.key) {
@@ -1219,6 +1222,9 @@ pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut Owne
             && !other.key.starts_with(crate::ownership_edge::PREFIX)
             && !other.key.starts_with(b"durable/ownership-abort-fence/v1/")
             && !other.key.starts_with(b"runtime/conversation/")
+            && !other
+                .key
+                .starts_with(b"runtime/conversation-callback-start/")
             && !other.key.starts_with(b"runtime/owned-cleanup-attempt/")
             && !cancel_claim_key(&other.key)
         {
@@ -5393,6 +5399,7 @@ mod detached_task_documents_tests {
                 }
             }
         }
+        normalize_graph_checks(&mut graph);
         reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch).unwrap();
         transaction.append(graph).unwrap();

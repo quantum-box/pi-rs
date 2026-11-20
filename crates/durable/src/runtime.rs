@@ -34685,8 +34685,20 @@ mod scheduler_tests {
                 .registered("checkpointable-child".into(), false);
                 child.start_attempt(Uuid::new_v4()).unwrap();
                 child.request_abort().unwrap();
-                tasks
-                    .save(&[crate::task_store::Save::Create(&child)])
+                // Fixture models a child admitted before its ancestor abort.
+                let key = crate::task_store::key(child.id());
+                h.owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: key.clone(),
+                            expected: Expected::Missing,
+                        }],
+                        &[Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&child).unwrap(),
+                        }],
+                    )
                     .unwrap();
                 let (owner_conversation, nested_checks) = h
                     .checkpointable_nested_cancel_conversation_checks(&child, &registry)
@@ -34709,8 +34721,19 @@ mod scheduler_tests {
                 ended.start_attempt(Uuid::new_v4()).unwrap();
                 ended.request_abort().unwrap();
                 ended.cancel().unwrap();
-                tasks
-                    .save(&[crate::task_store::Save::Create(&ended)])
+                let key = crate::task_store::key(ended.id());
+                h.owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: key.clone(),
+                            expected: Expected::Missing,
+                        }],
+                        &[Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&ended).unwrap(),
+                        }],
+                    )
                     .unwrap();
                 let (result_conversation, result_checks) = h
                     .checkpointable_nested_cancel_result_checks(&ended, &registry)

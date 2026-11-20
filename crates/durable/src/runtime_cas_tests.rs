@@ -23,6 +23,39 @@ fn options() -> Options {
     }
 }
 
+// Model a batch prepared by a legacy writer before the stricter admission rule.
+fn legacy_child_batch(
+    store: &durable_store::Store,
+    owner: &crate::task::TaskOwner,
+    children: &[crate::task::Task],
+    host: Option<(&[u8], &[u8])>,
+) -> crate::task_store::OwnedBatch {
+    let mut checks = vec![crate::ownership_edge::abort_fence_check(store, owner).unwrap()];
+    let mut mutations = Vec::new();
+    for child in children {
+        let key = crate::task_store::key(child.id());
+        checks.push(Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        });
+        mutations.push(Mutation::Put {
+            key,
+            value: serde_json::to_vec(child).unwrap(),
+        });
+    }
+    if let Some((key, value)) = host {
+        checks.push(Check {
+            key: key.to_vec(),
+            expected: Expected::Missing,
+        });
+        mutations.push(Mutation::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+    crate::task_store::OwnedBatch { checks, mutations }
+}
+
 #[test]
 fn display_entry_forks_use_original_commit_and_reopen() {
     use crate::document::{Address, Documents, Transaction};
@@ -1812,22 +1845,12 @@ fn low_level_creation_committing_after_scan_retries_abort_and_survives_reopen() 
         let thread = std::thread::spawn(move || {
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let store = writer.subagent_store().unwrap();
-            let tasks = TaskStore::new(store);
-            let batch = if case == 3 {
-                tasks
-                    .prepare_owned_tasks(
-                        &owner,
-                        b"host/checkpoint",
-                        Expected::Missing,
-                        b"atomic",
-                        &children,
-                    )
-                    .unwrap()
-            } else {
-                tasks
-                    .prepare_save(&[Save::Create(&children[0]), Save::Create(&children[1])])
-                    .unwrap()
-            };
+            let batch = legacy_child_batch(
+                store,
+                &owner,
+                &children,
+                (case == 3).then_some((b"host/checkpoint".as_slice(), b"atomic".as_slice())),
+            );
             store.commit(&batch.checks, &batch.mutations).unwrap();
             done_tx.send(()).unwrap();
         });
@@ -1949,20 +1972,12 @@ fn prepared_low_level_children_are_fenced_after_abort_without_rewriting_owner() 
         let writer = h.worker();
         let thread = std::thread::spawn(move || {
             let store = writer.subagent_store().unwrap();
-            let tasks = TaskStore::new(store);
-            let batch = if case == 3 {
-                tasks
-                    .prepare_owned_tasks(
-                        &owner,
-                        b"host/checkpoint",
-                        Expected::Missing,
-                        b"new",
-                        &[child],
-                    )
-                    .unwrap()
-            } else {
-                tasks.prepare_save(&[Save::Create(&child)]).unwrap()
-            };
+            let batch = legacy_child_batch(
+                store,
+                &owner,
+                &[child],
+                (case == 3).then_some((b"host/checkpoint".as_slice(), b"new".as_slice())),
+            );
             ready_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             store.commit(&batch.checks, &batch.mutations)
@@ -2047,9 +2062,12 @@ fn prepared_ownership_fence_survives_reopen() {
     TaskStore::new(store)
         .save(&[Save::Create(&parent)])
         .unwrap();
-    let batch = TaskStore::new(store)
-        .prepare_save(&[Save::Create(&child)])
-        .unwrap();
+    let batch = legacy_child_batch(
+        store,
+        &TaskOwner::Task(parent.id()),
+        std::slice::from_ref(&child),
+        None,
+    );
     h.request_abort(conversation).unwrap();
     drop(h);
     let reopened = Harness::open_paused(&path, options()).unwrap();
@@ -2241,13 +2259,12 @@ fn background_inclusive_abort_fences_prepared_background_child() {
     .unwrap();
     let child_id = child.id();
     let writer = h.worker();
+    let background_id = background.id();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let thread = std::thread::spawn(move || {
         let store = writer.subagent_store().unwrap();
-        let batch = TaskStore::new(store)
-            .prepare_save(&[Save::Create(&child)])
-            .unwrap();
+        let batch = legacy_child_batch(store, &TaskOwner::Task(background_id), &[child], None);
         ready_tx.send(()).unwrap();
         release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         store.commit(&batch.checks, &batch.mutations)
