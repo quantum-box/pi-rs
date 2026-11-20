@@ -211,11 +211,9 @@ mod task_record {
     }
 }
 
-// Experimental protocol: validate the entire reservation write set under the
-// SQLite write lock. A verifier must not consume this evidence until every
-// writer is fenced by a protocol version requiring this validation.
+// Protocol v3 validates the entire reservation write set under the SQLite
+// write lock and prevents older writers from bypassing this validation.
 #[cfg(feature = "experimental-graph-revision")]
-#[allow(dead_code)]
 fn validate_owned_reservation(
     tx: &rusqlite::Transaction<'_>,
     mutations: &[Mutation],
@@ -301,6 +299,19 @@ fn validate_owned_reservation(
         return Err(fail());
     }
     let boundary = graph["structure"]["boundary"].as_u64().ok_or_else(fail)?;
+    let current: u64 = tx.query_row(
+        "SELECT version FROM durable_store_meta WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let legacy: u64 = tx.query_row(
+        "SELECT legacy_version FROM durable_commit_meta WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if boundary < legacy || boundary > current {
+        return Err(fail());
+    }
     for (key, field) in [
         (graph_revision::task_structure_revision(id), "root_revision"),
         (
@@ -425,7 +436,7 @@ mod owned_reservation_validation_tests {
         };
         assert!(validate_owned_reservation(&tx, &writes).is_err());
         writes[0] = Mutation::Put {
-            key: task_key,
+            key: task_key.clone(),
             value: serde_json::to_vec(&task).unwrap(),
         };
         writes[1] = Mutation::Put {
@@ -439,6 +450,18 @@ mod owned_reservation_validation_tests {
         writes.pop();
         drop(tx);
         drop(connection);
+        let mut mixed = writes.clone();
+        mixed.push(Mutation::Delete {
+            key: b"durable/task/other".to_vec(),
+        });
+        assert!(matches!(
+            store.commit(&[], &mixed),
+            Err(Error::Conflict { .. })
+        ));
+        assert_eq!(
+            store.get(&task_key).unwrap().unwrap().version,
+            ready_version
+        );
         let child = uuid::Uuid::from_u128(5);
         let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
         let child_value = json!({"id":child,"owner":{"Task":id},"checkpoint":{"phase":"initial","data":null},"state":"Ready","restarts":0,"restart_limit":4});
@@ -519,7 +542,7 @@ impl Store {
             } else {
                 None
             };
-            if version.is_none() || version == Some(1) {
+            if version.is_none() || matches!(version, Some(1 | 2)) {
                 let (db, _lock) = owner::acquire_owner_lock(path)
                     .map_err(|error| Error::MigrationOwnerUnavailable(error.to_string()))?;
                 return Self::initialize(Connection::open(db)?, true, true);
@@ -541,7 +564,7 @@ impl Store {
         {
             let active = graph_protocol_active.clone();
             conn.create_scalar_function(
-                "pi_graph_protocol_v2",
+                "pi_graph_protocol_v3",
                 0,
                 rusqlite::functions::FunctionFlags::SQLITE_UTF8,
                 move |_| Ok(i64::from(active.load(std::sync::atomic::Ordering::Acquire))),
@@ -558,7 +581,7 @@ impl Store {
             return Err(Error::IncompatibleGraphProtocol);
         }
         #[cfg(feature = "experimental-graph-revision")]
-        let mut migrate_v1 = false;
+        let mut migrate_old = false;
         #[cfg(feature = "experimental-graph-revision")]
         if protected {
             let version: Option<i64> = conn
@@ -568,16 +591,17 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if !matches!(version, Some(1 | 2))
-                || (version == Some(1) && disk && !_migration_authorized)
+            if !matches!(version, Some(1 | 2 | 3))
+                || (matches!(version, Some(1 | 2)) && disk && !_migration_authorized)
             {
                 return Err(Error::IncompatibleGraphProtocol);
             }
-            migrate_v1 = version == Some(1);
-            let guard_name = if migrate_v1 {
-                "pi_graph_protocol() != 1"
-            } else {
-                "pi_graph_protocol_v2() != 1"
+            migrate_old = matches!(version, Some(1 | 2));
+            let guard_name = match version {
+                Some(1) => "pi_graph_protocol() != 1",
+                Some(2) => "pi_graph_protocol_v2() != 1",
+                Some(3) => "pi_graph_protocol_v3() != 1",
+                _ => unreachable!(),
             };
             for (name, action) in [
                 ("durable_graph_protocol_insert", "INSERT"),
@@ -648,17 +672,28 @@ impl Store {
             INSERT OR IGNORE INTO durable_document_commit_meta SELECT 1, (SELECT revision FROM durable_document_history_meta WHERE id=1), (SELECT sequence FROM durable_commit_meta WHERE id=1);
             COMMIT;")?;
         #[cfg(feature = "experimental-graph-revision")]
-        if !protected || migrate_v1 {
-            conn.execute_batch("BEGIN IMMEDIATE;
+        if !protected || migrate_old {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let marker_prefix = b"runtime/woken-owned-reservation/v1/";
+            let old_marker: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE substr(key,1,?1)=?2)",
+                rusqlite::params![marker_prefix.len() as i64, marker_prefix],
+                |row| row.get(0),
+            )?;
+            if old_marker {
+                conn.execute_batch("ROLLBACK;")?;
+                return Err(Error::IncompatibleGraphProtocol);
+            }
+            conn.execute_batch("
             DROP TRIGGER IF EXISTS durable_graph_protocol_insert;
             DROP TRIGGER IF EXISTS durable_graph_protocol_update;
             DROP TRIGGER IF EXISTS durable_graph_protocol_delete;
             DROP TABLE IF EXISTS durable_graph_protocol;
-            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=2));
-            INSERT INTO durable_graph_protocol(id,version) VALUES(1,2);
-            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
-            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
-            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=3));
+            INSERT INTO durable_graph_protocol(id,version) VALUES(1,3);
+            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
             COMMIT;")?;
         }
         let sequence = conn.query_row(
@@ -1778,6 +1813,8 @@ impl Store {
                 }
                 _ => Error::Storage(error),
             })?;
+        #[cfg(feature = "experimental-graph-revision")]
+        validate_owned_reservation(&tx, mutations)?;
         if let Some((prefixes, boundary)) = prefix_fence {
             let current: u64 = tx.query_row(
                 "SELECT version FROM durable_store_meta WHERE id=1",

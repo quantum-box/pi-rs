@@ -419,7 +419,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert!(legacy
             .execute(
                 "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,1)",
@@ -437,6 +437,73 @@ mod tests {
             )
             .unwrap();
         assert!(store.get(&task_structure_revision(id)).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_migration_rejects_old_marker_and_fences_live_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.sqlite");
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .create_scalar_function(
+                "pi_graph_protocol_v2",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                |_| Ok(1i64),
+            )
+            .unwrap();
+        legacy.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;
+            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=2));
+            INSERT INTO durable_graph_protocol VALUES(1,2);
+            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v2() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;").unwrap();
+        let key = b"runtime/woken-owned-reservation/v1/forged";
+        legacy
+            .execute(
+                "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,1)",
+                rusqlite::params![key.as_slice(), b"forged".as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::IncompatibleGraphProtocol)
+        ));
+        assert_eq!(
+            legacy
+                .query_row(
+                    "SELECT version FROM durable_graph_protocol WHERE id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        legacy
+            .execute(
+                "DELETE FROM durable_store_entries WHERE key=?1",
+                [key.as_slice()],
+            )
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            legacy
+                .query_row(
+                    "SELECT version FROM durable_graph_protocol WHERE id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        assert!(legacy
+            .execute(
+                "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,1)",
+                rusqlite::params![b"old".as_slice(), b"value".as_slice()]
+            )
+            .is_err());
+        drop(store);
     }
 
     #[test]
@@ -462,7 +529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unknown.sqlite");
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE durable_graph_protocol(id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_graph_protocol VALUES(1,3);").unwrap();
+        conn.execute_batch("CREATE TABLE durable_graph_protocol(id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_graph_protocol VALUES(1,4);").unwrap();
         drop(conn);
         assert!(matches!(
             Store::open(&path),
@@ -484,7 +551,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[cfg(unix)]

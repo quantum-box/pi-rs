@@ -1176,7 +1176,7 @@ fn corrupt_legacy_owner_only_blocks_its_own_mutations() {
         let conn = rusqlite::Connection::open(&path).unwrap();
         #[cfg(feature = "experimental-graph-revision")]
         conn.create_scalar_function(
-            "pi_graph_protocol_v2",
+            "pi_graph_protocol_v3",
             0,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8,
             |_| Ok(1_i64),
