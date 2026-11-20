@@ -1134,7 +1134,19 @@ impl SelectionStartGates {
         &self,
         selection: &StableExtensionSelection,
     ) -> Result<SelectionStartLease, ()> {
-        let mut names: Vec<_> = selection.names().collect();
+        self.try_start_many(std::iter::once(selection))
+    }
+
+    /// Hold the union once: two nested conversations may select the same
+    /// extension and its start gate is deliberately non-reentrant.
+    pub(crate) fn try_start_many<'a>(
+        &self,
+        selections: impl IntoIterator<Item = &'a StableExtensionSelection>,
+    ) -> Result<SelectionStartLease, ()> {
+        let mut names: Vec<_> = selections
+            .into_iter()
+            .flat_map(|selection| selection.names())
+            .collect();
         names.sort_unstable();
         names.dedup();
         let mut gates = Vec::with_capacity(names.len());
@@ -1178,6 +1190,17 @@ mod selection_start_gate_tests {
                 ExtensionIdentity::new(1, "identity".into(), vec!["hook".into()]).unwrap(),
             )],
         }
+    }
+
+    #[test]
+    fn overlapping_selections_share_one_start_lease() {
+        let gates = SelectionStartGates::default();
+        let first = selection();
+        let second = selection();
+        let lease = gates.try_start_many([&first, &second]).unwrap();
+        assert!(gates.try_mutation("policy").is_err());
+        drop(lease);
+        assert!(gates.try_mutation("policy").is_ok());
     }
 
     #[test]
