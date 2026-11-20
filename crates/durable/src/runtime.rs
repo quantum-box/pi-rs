@@ -5513,6 +5513,15 @@ impl Harness {
             .try_start(selection)
             .map_err(|_| Error::TaskPublicationBusy)
     }
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_selection_start_many<'a>(
+        &self,
+        selections: impl IntoIterator<Item = &'a crate::extension::StableExtensionSelection>,
+    ) -> Result<crate::extension::SelectionStartLease, Error> {
+        self.extension_start_gates
+            .try_start_many(selections)
+            .map_err(|_| Error::TaskPublicationBusy)
+    }
     fn validate_checkpointable_selection(
         &self,
         c: &Conversation,
