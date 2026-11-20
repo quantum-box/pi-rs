@@ -482,6 +482,28 @@ mod owned_reservation_validation_tests {
             store.get(&task_key).unwrap().unwrap().version,
             ready_version
         );
+        let mut forged = writes.clone();
+        forged[0] = Mutation::Put {
+            key: task_key.clone(),
+            value: serde_json::to_vec(&forged_marker["running"]).unwrap(),
+        };
+        let marker_key = match &forged[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        forged[1] = Mutation::Put {
+            key: marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(matches!(
+            store.commit(&[], &forged),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(store.get(&marker_key).unwrap().is_none());
+        assert_eq!(
+            store.get(&task_key).unwrap().unwrap().version,
+            ready_version
+        );
         let child = uuid::Uuid::from_u128(5);
         let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
         let child_value = json!({"id":child,"owner":{"Task":id},"checkpoint":{"phase":"initial","data":null},"state":"Ready","restarts":0,"restart_limit":4});
