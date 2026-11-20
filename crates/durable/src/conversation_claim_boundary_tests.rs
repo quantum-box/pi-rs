@@ -7869,20 +7869,30 @@ async fn live_woken_root_drains_any_loser_before_cancel() {
 
 #[tokio::test]
 async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_together() {
-    exercise_woken_owned_graph_receipt(false, false).await;
+    exercise_woken_owned_graph_receipt(false, 0).await;
 }
 
 #[tokio::test]
 async fn owned_cleanup_receipt_conflict_preserves_abort_and_marker() {
-    exercise_woken_owned_graph_receipt(true, false).await;
+    exercise_woken_owned_graph_receipt(true, 0).await;
 }
 
 #[tokio::test]
 async fn owned_graph_child_aba_requires_scoped_revision() {
-    exercise_woken_owned_graph_receipt(false, true).await;
+    exercise_woken_owned_graph_receipt(false, 1).await;
 }
 
-async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: bool) {
+#[tokio::test]
+async fn owned_graph_terminal_resurrection_requires_scoped_revision() {
+    exercise_woken_owned_graph_receipt(false, 2).await;
+}
+
+#[tokio::test]
+async fn owned_graph_abort_clear_requires_scoped_revision() {
+    exercise_woken_owned_graph_receipt(false, 3).await;
+}
+
+async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -8163,7 +8173,42 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: bool) {
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .unwrap();
         store.commit(&checks, &[]).unwrap();
-        if graph_aba {
+        if graph_aba >= 2 {
+            let key = crate::task_store::key(child.task.id());
+            let original = store.get(&key).unwrap().unwrap();
+            let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
+            if graph_aba == 2 {
+                changed["state"] = json!("Running");
+            } else {
+                assert_eq!(changed["abort_requested"], json!(true));
+                changed["abort_requested"] = json!(false);
+            }
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(original.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&changed).unwrap(),
+                    }],
+                )
+                .unwrap();
+            let changed_entry = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(changed_entry.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: original.value,
+                    }],
+                )
+                .unwrap();
+        } else if graph_aba == 1 {
             let child = crate::task::Task::new(
                 uuid::Uuid::new_v4(),
                 crate::task::TaskOwner::Conversation(conversation),
