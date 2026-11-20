@@ -8,8 +8,9 @@ directly in each `prompts` directory and honors its ignore files, matching Pi.
 Nested or hidden prompt files can still be selected explicitly.
 The requested compatibility is equivalent functionality implemented in Rust.
 
-Markdown headings are separated from a following block by one blank line,
-without adding a trailing blank line after a final heading.
+Markdown headings are separated from a following block by one blank line. A
+final heading has a trailing blank line when the source contains a trailing
+Markdown space token, matching Pi.
 
 [Reference CLI](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/cli.md)
 · [Reference terminal](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/usage.md)
@@ -2038,6 +2039,17 @@ Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
 Consecutive paragraphs retain a single separating blank line, including inside
 block quotes; hard line breaks do not add paragraph spacing.
+Source-level blank blocks are retained after visible blocks and between link
+reference definitions. List items retain block separators and continuation
+indentation for code and quotes. A pinned Pi fixture checks these layouts,
+including duplicate definitions and narrow quotes. Inventory and rendering
+have native work limits; inputs that exceed them use the existing bounded
+renderer and can differ in spacing from Pi.
+Nested list spacing follows source block boundaries. Soft-wrapped source lines
+inside list items can differ from Pi in line breaks, indentation, and wrapping;
+some numbered nested lists and list-contained horizontal rules also differ.
+If nested-math scanning exceeds its resource limit, reference links may remain
+unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
 Inline and display LaTeX use a native port of the pinned Pi terminal renderer,
 including fractions, operators, scripts and matrix environments. Math can occur

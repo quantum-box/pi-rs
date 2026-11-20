@@ -3069,6 +3069,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "unicase",
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
