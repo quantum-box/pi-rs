@@ -8195,6 +8195,16 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                     }],
                 )
                 .unwrap();
+            let effect = format!("test/owned-aba-effect/{graph_aba}").into_bytes();
+            store
+                .commit(
+                    &[],
+                    &[durable_store::Mutation::Put {
+                        key: effect.clone(),
+                        value: b"executed".to_vec(),
+                    }],
+                )
+                .unwrap();
             let changed_entry = store.get(&key).unwrap().unwrap();
             store
                 .commit(
@@ -8208,6 +8218,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                     }],
                 )
                 .unwrap();
+            assert_eq!(store.get(&effect).unwrap().unwrap().value, b"executed");
         } else if graph_aba == 1 {
             let child = crate::task::Task::new(
                 uuid::Uuid::new_v4(),
