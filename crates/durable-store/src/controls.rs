@@ -79,6 +79,14 @@ pub fn callback_marker_for_task(id: Uuid) -> Option<Vec<u8>> {
         .flatten()
 }
 
+/// The active callback marker, including for an ancestor task protected by the
+/// same claim. The caller must compare it with that task's durable marker.
+pub fn current_callback_marker() -> Option<Vec<u8>> {
+    CALLBACK_CONTEXT
+        .try_with(|(_, _, marker)| marker.clone())
+        .ok()
+}
+
 thread_local! {
     static ACTIVE_CALLBACK_POLLS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }

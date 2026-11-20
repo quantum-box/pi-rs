@@ -1,5 +1,21 @@
 # Conversation-owned external cancellation: integration notes
 
+## Nested cancellation groundwork
+
+Nested callback dispatch remains disabled. The task store can atomically record
+an exact child-to-conversation-root ancestry together with matching callback
+markers and immutable ancestry evidence. Recovery can check that evidence and
+retire the same markers after a reopen. While markers exist, task writes and
+wakes on the marked chain are fenced and unrelated graphs can continue. Scoped
+callback reentry checks match the durable marker on an ancestor, including in a
+joined task given the callback scope.
+
+These primitives do not authorize a callback. A nested implementation must bind
+its claim, the complete ancestry evidence, active attempt and lease, registry
+and identity to one transaction, fence the conversation and owner graph through
+first poll, and settle callback evidence without redispatch. The driver tests
+exercise the marker foundation, not nested external cancellation.
+
 ## Opt-in first-poll dispatch
 
 `register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel`
