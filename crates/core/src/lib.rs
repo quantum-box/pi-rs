@@ -11,6 +11,9 @@ mod host_auth;
 mod journal;
 mod lifecycle;
 mod model_catalog;
+mod persistent_map;
+#[doc(hidden)]
+pub mod pi_import;
 mod resource;
 mod retry;
 mod runtime;
@@ -34,6 +37,7 @@ pub use lifecycle::{
     LifecycleMessage, ModelSelectSource, SessionShutdownReason, SessionStartReason,
     SessionSwitchReason, TreeDecision, TreePreparation, TreeSummary,
     notify as notify_extension_lifecycle,
+    notify_in_session as notify_extension_lifecycle_in_session,
 };
 pub use model_catalog::*;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};

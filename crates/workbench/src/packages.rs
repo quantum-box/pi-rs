@@ -13,6 +13,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{Cli, config, output};
 
+#[path = "package_diagnostic.rs"]
+mod package_diagnostic;
+
 #[derive(Clone, Subcommand)]
 pub enum PackageCommand {
     Install {
@@ -151,22 +154,14 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
         }
         PackageCommand::List => {
             let index = index()?;
-            let mut configured = declarations(args)?;
-            // Pi lists user packages before project packages, while resource
-            // resolution gives project packages precedence.
-            configured.sort_by_key(|entry| match entry.scope_order {
-                1 => 0,
-                0 => 1,
-                _ => 2,
-            });
-            for declaration in configured {
+            for (declaration, filtered) in configured_packages(args)? {
                 let installed = index
                     .get(&key(&declaration.source))
                     .cloned()
                     .map(serde_json::from_value::<Installed>)
                     .transpose()?;
                 output(
-                    json!({"type":"package","source":display_source(&declaration.source),"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
+                    json!({"type":"package","source":display_source(&declaration.source),"scope":if declaration.scope_order == 1 { "user" } else { "project" },"filtered":filtered,"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
                 );
             }
         }
@@ -177,8 +172,20 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
 
 pub async fn prepare(args: &Cli) -> Result<()> {
     let mut installed = index()?;
-    for declaration in declarations(args)? {
-        let cached = installed.contains_key(&key(&declaration.source));
+    let mut plan = resource_declarations(args, false)?;
+    plan.extend(resource_declarations(args, true)?);
+    for declaration in plan {
+        let cached = if remote(&declaration.source) {
+            installed.contains_key(&key(&declaration.source))
+        } else {
+            installed
+                .get(&key(&declaration.source))
+                .is_some_and(|value| {
+                    serde_json::from_value::<Installed>(value.clone())
+                        .map(|package| local_source_matches_cache(&package))
+                        .unwrap_or(true)
+                })
+        };
         if args.offline && remote(&declaration.source) {
             if !cached {
                 eprintln!(
@@ -212,75 +219,195 @@ pub fn transient_resources(args: &Cli) -> Result<PackageResources> {
     resources_for(args, true)
 }
 fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
-    let installed = index()?;
-    let mut result = PackageResources::default();
-    for declaration in declarations(args)?
-        .into_iter()
-        .filter(|entry| entry.transient == transient)
-    {
-        let Some(package) = installed.get(&key(&declaration.source)) else {
-            continue;
-        };
-        let package: Installed = serde_json::from_value(package.clone())?;
-        let Some(package) = revalidate_cached_package(package) else {
-            continue;
-        };
-        let upstream_package = !remote(&declaration.source)
-            && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
-        for (name, paths, target) in [
-            (
-                "extensions",
-                &package.resources.extensions,
-                &mut result.extensions,
+    resolve_package_resources(args, transient, false)
+}
+
+#[derive(PartialEq, Eq)]
+enum ResourceLocation {
+    WithinPackage(PathBuf),
+    BuiltExecutable(std::ffi::OsString),
+    External(PathBuf),
+}
+#[derive(Default)]
+struct ResourceSelections {
+    entries: Vec<(PathBuf, bool, String, ResourceLocation)>,
+}
+impl ResourceSelections {
+    fn insert(&mut self, path: &Path, enabled: bool, identity: &str, root: &Path, extension: bool) {
+        let relative = match path.strip_prefix(root) {
+            Ok(relative) => ResourceLocation::WithinPackage(relative.to_path_buf()),
+            Err(_) if extension => ResourceLocation::BuiltExecutable(
+                path.file_name().unwrap_or(path.as_os_str()).to_os_string(),
             ),
-            ("skills", &package.resources.skills, &mut result.skills),
-            ("prompts", &package.resources.prompts, &mut result.prompts),
-            ("themes", &package.resources.themes, &mut result.themes),
+            Err(_) => ResourceLocation::External(path.to_path_buf()),
+        };
+        if !self
+            .entries
+            .iter()
+            .any(|(existing, _, prior_identity, prior_relative)| {
+                existing == path || (prior_identity == identity && prior_relative == &relative)
+            })
+        {
+            self.entries
+                .push((path.to_path_buf(), enabled, identity.to_owned(), relative));
+        }
+    }
+    fn enabled(self) -> Vec<PathBuf> {
+        self.entries
+            .into_iter()
+            .filter_map(|(path, enabled, _, _)| enabled.then_some(path))
+            .collect()
+    }
+}
+
+fn resolve_package_resources(
+    args: &Cli,
+    transient: bool,
+    startup: bool,
+) -> Result<PackageResources> {
+    let installed = index()?;
+    let mut extensions = ResourceSelections::default();
+    let mut skills = ResourceSelections::default();
+    let mut prompts = ResourceSelections::default();
+    let mut themes = ResourceSelections::default();
+    for declaration in resource_declarations(args, transient)? {
+        let package = if startup {
+            startup_package(&declaration, &installed)?
+        } else {
+            installed
+                .get(&key(&declaration.source))
+                .map(|value| serde_json::from_value::<Installed>(value.clone()))
+                .transpose()?
+                .and_then(revalidate_cached_package)
+        };
+        let Some(package) = package else { continue };
+        let local = !remote(&declaration.source);
+        // Single-file native sources retain their existing handling; Pi loads
+        // such files directly and does not apply directory package filters.
+        let legacy = local && Path::new(&declaration.source).is_file();
+        if legacy {
+            let identity = source_identity(&declaration.source);
+            extensions.insert(
+                Path::new(&declaration.source),
+                true,
+                &identity,
+                &package.root,
+                true,
+            );
+            continue;
+        }
+        let pi_package =
+            !legacy && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
+        let identity = source_identity(&declaration.source);
+        for (name, paths, target) in [
+            ("extensions", &package.resources.extensions, &mut extensions),
+            ("skills", &package.resources.skills, &mut skills),
+            ("prompts", &package.resources.prompts, &mut prompts),
+            ("themes", &package.resources.themes, &mut themes),
         ] {
-            let filter = ResourceFilter::new(&declaration.value, name)?;
-            let inherited = declaration
-                .inherited
-                .as_ref()
-                .map(|value| ResourceFilter::new(value, name))
-                .transpose()?;
-            if inherited.is_some() || upstream_package {
-                for path in paths {
-                    let base = inherited
-                        .as_ref()
-                        .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
-                    if filter.includes_legacy(path, &package.root, base) && !target.contains(path) {
-                        target.push(path.clone());
-                    }
-                }
+            if startup && name != "themes" && paths.is_empty() && !pi_package {
                 continue;
             }
-            let evaluate = || -> Result<Vec<bool>> {
-                let base = match &inherited {
-                    Some(filter) => {
-                        filter.apply(paths, &package.root, &vec![false; paths.len()])?
-                    }
-                    None => vec![false; paths.len()],
+            let requested = declaration.value.get(name).and_then(Value::as_array);
+            let autoload = declaration.value["autoload"] != false;
+            let diagnostic = if pi_package
+                && name != "themes"
+                && (autoload || requested.is_some_and(|patterns| !patterns.is_empty()))
+            {
+                let kind = match name {
+                    "extensions" => package_diagnostic::Kind::Extension,
+                    "skills" => package_diagnostic::Kind::Skill,
+                    "prompts" => package_diagnostic::Kind::Prompt,
+                    _ => unreachable!(),
                 };
-                filter.apply(paths, &package.root, &base)
+                match package_diagnostic::candidates(&package.root, kind) {
+                    Ok(candidates) => candidates,
+                    Err(_) if local => break,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
             };
-            let enabled = match evaluate() {
-                Ok(enabled) => enabled,
-                Err(_) if !remote(&declaration.source) => break,
+            if name != "themes"
+                && paths.is_empty()
+                && (diagnostic.as_ref().is_some_and(Vec::is_empty)
+                    || (startup && diagnostic.is_none()))
+            {
+                continue;
+            }
+            let filter = match ResourceFilter::new(&declaration.value, name) {
+                Ok(filter) => filter,
+                Err(_) if local && pi_package => break,
                 Err(error) => return Err(error),
             };
-            for (path, enabled) in paths.iter().zip(enabled) {
-                if enabled && !target.contains(path) {
-                    target.push(path.clone());
+            if let Some(candidates) = diagnostic {
+                match filter.states(&candidates, &package.root, false) {
+                    Ok(_) => {}
+                    Err(_) if local => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            if startup && name != "themes" && paths.is_empty() {
+                continue;
+            }
+            let states = match filter.states(paths, &package.root, legacy) {
+                Ok(states) => states,
+                Err(_) if local => break,
+                Err(error) => return Err(error),
+            };
+            for (path, state) in paths.iter().zip(states) {
+                if let Some(enabled) = state {
+                    target.insert(
+                        path,
+                        enabled,
+                        &identity,
+                        &package.root,
+                        name == "extensions",
+                    );
                 }
             }
         }
     }
-    Ok(result)
+    Ok(PackageResources {
+        extensions: extensions.enabled(),
+        skills: skills.enabled(),
+        prompts: prompts.enabled(),
+        themes: themes.enabled(),
+    })
+}
+
+fn local_source_matches_cache(package: &Installed) -> bool {
+    let source = Path::new(&package.source);
+    if source.is_file() {
+        source.parent().is_some_and(|parent| {
+            dunce::simplified(&package.root) == dunce::simplified(parent)
+                && package
+                    .resources
+                    .extensions
+                    .iter()
+                    .any(|path| dunce::simplified(path) == dunce::simplified(source))
+        })
+    } else {
+        source.is_dir() && dunce::simplified(&package.root) == dunce::simplified(source)
+    }
 }
 
 fn revalidate_cached_package(mut package: Installed) -> Option<Installed> {
-    if !package.root.is_dir() || (!remote(&package.source) && !Path::new(&package.source).exists())
-    {
+    if !remote(&package.source) {
+        if !local_source_matches_cache(&package) {
+            return None;
+        }
+        let source = Path::new(&package.source);
+        if source.is_file() {
+            package.root = source.parent()?.to_path_buf();
+            package.resources = PackageResources {
+                extensions: vec![source.to_path_buf()],
+                ..PackageResources::default()
+            };
+            return Some(package);
+        }
+    }
+    if !package.root.is_dir() {
         return None;
     }
     let (manifest, pi_package) = local_startup_manifest(&package.root).ok()?;
@@ -316,156 +443,84 @@ fn revalidate_cached_package(mut package: Installed) -> Option<Installed> {
 /// their extensions. Unindexed local sources can be inspected directly; missing
 /// remote packages remain unavailable until normal package preparation.
 pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>> {
-    let installed = index()?;
-    let mut themes = Vec::new();
-    for declaration in declarations(args)?
-        .into_iter()
-        .filter(|entry| entry.transient == transient)
-    {
-        let local = !remote(&declaration.source);
-        let source_path = Path::new(&declaration.source);
-        let manifest_root = if local && source_path.is_file() {
-            installed
-                .get(&key(&declaration.source))
-                .and_then(|value| serde_json::from_value::<Installed>(value.clone()).ok())
-                .map(|package| package.root)
-                .unwrap_or_else(|| source_path.to_path_buf())
-        } else {
-            source_path.to_path_buf()
-        };
-        let upstream_package =
-            local && local_startup_manifest(&manifest_root).is_ok_and(|(_, upstream)| upstream);
-        let inspect_prior = local
-            && !upstream_package
-            && declaration.inherited.is_none()
-            && ["extensions", "skills", "prompts"].iter().any(|name| {
-                declaration
-                    .value
-                    .get(name)
-                    .and_then(Value::as_array)
-                    .is_some_and(|patterns| {
-                        patterns.iter().any(|pattern| {
-                            pattern.as_str().is_some_and(|pattern| {
-                                let pattern =
-                                    pattern.strip_prefix(['!', '+', '-']).unwrap_or(pattern);
-                                let pattern = pattern
-                                    .strip_prefix("./")
-                                    .or_else(|| pattern.strip_prefix(".\\"))
-                                    .unwrap_or(pattern);
-                                pattern.starts_with("file://")
-                                    && pi_rs_file_url::to_file_path(pattern).is_err()
-                            })
+    Ok(resolve_package_resources(args, transient, true)?.themes)
+}
+
+fn startup_package(
+    declaration: &Declaration,
+    installed: &serde_json::Map<String, Value>,
+) -> Result<Option<Installed>> {
+    let local = !remote(&declaration.source);
+    let inspect_prior = local
+        && declaration.inherited.is_none()
+        && ["extensions", "skills", "prompts"].iter().any(|name| {
+            declaration
+                .value
+                .get(name)
+                .and_then(Value::as_array)
+                .is_some_and(|patterns| {
+                    patterns.iter().any(|pattern| {
+                        pattern.as_str().is_some_and(|pattern| {
+                            let pattern = pattern.strip_prefix(['!', '+', '-']).unwrap_or(pattern);
+                            let pattern = pattern
+                                .strip_prefix("./")
+                                .or_else(|| pattern.strip_prefix(".\\"))
+                                .unwrap_or(pattern);
+                            pattern.starts_with("file://")
+                                && pi_rs_file_url::to_file_path(pattern).is_err()
                         })
                     })
-            });
-        let package = if !remote(&declaration.source) && !Path::new(&declaration.source).is_file() {
-            let root = PathBuf::from(&declaration.source);
-            if !root.is_dir() {
-                continue;
-            }
-            let manifest = match local_startup_manifest(&root) {
-                Ok((manifest, _)) => manifest,
-                Err(_) => continue,
+                })
+        });
+    let package = if !remote(&declaration.source) && !Path::new(&declaration.source).is_file() {
+        let root = PathBuf::from(&declaration.source);
+        if !root.is_dir() {
+            return Ok(None);
+        }
+        let manifest = match local_startup_manifest(&root) {
+            Ok((manifest, _)) => manifest,
+            Err(_) => return Ok(None),
+        };
+        let Ok(pi) = manifest_pi(&manifest) else {
+            return Ok(None);
+        };
+        let themes = match collect_package_themes(&root, pi) {
+            Ok(themes) => themes,
+            Err(_) => return Ok(None),
+        };
+        let resources = if inspect_prior {
+            let cached = installed
+                .get(&key(&declaration.source))
+                .and_then(|value| serde_json::from_value::<Installed>(value.clone()).ok())
+                .and_then(revalidate_cached_package);
+            let mut resources = match cached {
+                Some(package) => package.resources,
+                None => collect_package_resources(&root, pi, Vec::new()).unwrap_or_default(),
             };
-            let Ok(pi) = manifest_pi(&manifest) else {
-                continue;
-            };
-            let themes = match collect_package_themes(&root, pi) {
-                Ok(themes) => themes,
-                Err(_) => continue,
-            };
-            let resources = if inspect_prior {
-                let cached = installed
-                    .get(&key(&declaration.source))
-                    .and_then(|value| serde_json::from_value::<Installed>(value.clone()).ok())
-                    .and_then(revalidate_cached_package);
-                let mut resources = match cached {
-                    Some(package) => package.resources,
-                    None => collect_package_resources(&root, pi, Vec::new()).unwrap_or_default(),
-                };
-                resources.themes = themes;
-                resources
-            } else {
-                PackageResources {
-                    themes,
-                    ..PackageResources::default()
-                }
-            };
-            Installed {
-                source: declaration.source.clone(),
-                root,
-                version: None,
-                resources,
-            }
-        } else if let Some(value) = installed.get(&key(&declaration.source)) {
-            let package = serde_json::from_value::<Installed>(value.clone())?;
-            let Some(package) = revalidate_cached_package(package) else {
-                continue;
-            };
-            package
+            resources.themes = themes;
+            resources
         } else {
-            continue;
+            PackageResources {
+                themes,
+                ..PackageResources::default()
+            }
         };
-        if inspect_prior {
-            let prior = [
-                ("extensions", &package.resources.extensions),
-                ("skills", &package.resources.skills),
-                ("prompts", &package.resources.prompts),
-            ];
-            let mut failed = false;
-            for (name, paths) in prior {
-                let Ok(filter) = ResourceFilter::new(&declaration.value, name) else {
-                    continue;
-                };
-                if filter
-                    .apply(paths, &package.root, &vec![false; paths.len()])
-                    .is_err()
-                {
-                    failed = true;
-                    break;
-                }
-            }
-            if failed {
-                continue;
-            }
+        Installed {
+            source: declaration.source.clone(),
+            root,
+            version: None,
+            resources,
         }
-        let filter = ResourceFilter::new(&declaration.value, "themes")?;
-        let inherited = declaration
-            .inherited
-            .as_ref()
-            .map(|value| ResourceFilter::new(value, "themes"))
-            .transpose()?;
-        let paths = &package.resources.themes;
-        if inherited.is_some() || upstream_package {
-            for path in paths {
-                let base = inherited
-                    .as_ref()
-                    .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
-                if filter.includes_legacy(path, &package.root, base) && !themes.contains(path) {
-                    themes.push(path.clone());
-                }
-            }
-            continue;
-        }
-        let evaluate = || -> Result<Vec<bool>> {
-            let base = match &inherited {
-                Some(filter) => filter.apply(paths, &package.root, &vec![false; paths.len()])?,
-                None => vec![false; paths.len()],
-            };
-            filter.apply(paths, &package.root, &base)
+    } else if let Some(value) = installed.get(&key(&declaration.source)) {
+        let package = serde_json::from_value::<Installed>(value.clone())?;
+        let Some(package) = revalidate_cached_package(package) else {
+            return Ok(None);
         };
-        let enabled = match evaluate() {
-            Ok(enabled) => enabled,
-            Err(_) if !remote(&declaration.source) => continue,
-            Err(error) => return Err(error),
-        };
-        for (path, enabled) in paths.iter().zip(enabled) {
-            if enabled && !themes.contains(path) {
-                themes.push(path.clone());
-            }
-        }
-    }
-    Ok(themes)
+        package
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(package))
 }
 
 fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
@@ -748,6 +803,31 @@ impl ResourceFilter {
             })
     }
 
+    // Delta filters write only matched paths. Computing from both initial
+    // states distinguishes an untouched path from an explicit enable/disable.
+    fn states(&self, paths: &[PathBuf], root: &Path, legacy: bool) -> Result<Vec<Option<bool>>> {
+        let run = |initial: bool| -> Result<Vec<bool>> {
+            if legacy {
+                Ok(paths
+                    .iter()
+                    .map(|path| self.includes_legacy(path, root, initial))
+                    .collect())
+            } else {
+                self.apply(paths, root, &vec![initial; paths.len()])
+            }
+        };
+        let disabled = run(false)?;
+        if self.autoload {
+            return Ok(disabled.into_iter().map(Some).collect());
+        }
+        let enabled = run(true)?;
+        Ok(disabled
+            .into_iter()
+            .zip(enabled)
+            .map(|(a, b)| (a == b).then_some(a))
+            .collect())
+    }
+
     #[cfg(test)]
     fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
         Ok(self.apply(&[path.to_path_buf()], root, &[inherited])?[0])
@@ -954,15 +1034,19 @@ fn filter_home_dir() -> Option<PathBuf> {
 }
 
 fn normalize_filter_home(home: &Path, suffix: &str) -> PathBuf {
-    use std::path::Component;
     // Node's path.join does not let a later absolute component replace home.
     let joined = if home.as_os_str().is_empty() {
         suffix.to_owned()
     } else {
         format!("{}/{suffix}", home.to_string_lossy())
     };
+    normalize_filter_path(Path::new(&joined))
+}
+
+fn normalize_filter_path(path: &Path) -> PathBuf {
+    use std::path::Component;
     let mut result = PathBuf::new();
-    for component in Path::new(&joined).components() {
+    for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -1100,13 +1184,24 @@ fn configured_update_sources(args: &Cli) -> Result<Vec<String>> {
             args.workspace.join(".pi"),
         ));
     }
-    update_sources(&files)
+    update_sources_with_settings(&files, Some(&args.settings))
 }
 
+#[cfg(test)]
 fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
+    update_sources_with_settings(files, None)
+}
+
+fn update_sources_with_settings(
+    files: &[(PathBuf, PathBuf)],
+    settings: Option<&config::Settings>,
+) -> Result<Vec<String>> {
     let mut sources = Vec::new();
     for (file, base) in files {
-        let document = config::read_object(file)?;
+        let document = match settings.and_then(|settings| settings.stored_layer(base)) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(file)?,
+        };
         if let Some(packages) = document.get("packages") {
             for value in packages
                 .as_array()
@@ -1123,6 +1218,48 @@ fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
     }
     Ok(sources)
 }
+fn configured_packages(args: &Cli) -> Result<Vec<(Declaration, bool)>> {
+    let mut files = vec![(
+        config::agent_dir().join("settings.json"),
+        config::agent_dir(),
+        1,
+    )];
+    if args.trusted {
+        files.push((
+            args.workspace.join(".pi/settings.json"),
+            args.workspace.join(".pi"),
+            0,
+        ));
+    }
+    let mut result = Vec::new();
+    for (file, base, scope_order) in files {
+        let document = match args.settings.stored_layer(&base) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(&file)?,
+        };
+        if let Some(packages) = document.get("packages") {
+            for value in packages
+                .as_array()
+                .ok_or_else(|| Error::Config("packages must be an array".into()))?
+            {
+                let source = source_field(value)
+                    .ok_or_else(|| Error::Config("package needs a source".into()))?;
+                result.push((
+                    Declaration {
+                        source: normalize(source, &base)?,
+                        value: value.clone(),
+                        inherited: None,
+                        transient: false,
+                        scope_order,
+                    },
+                    value.is_object(),
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
     let mut global = BTreeMap::new();
@@ -1140,7 +1277,10 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
         ));
     }
     for (file, base, project) in files {
-        let document = config::read_object(&file)?;
+        let document = match args.settings.stored_layer(&base) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(&file)?,
+        };
         if let Some(packages) = document.get("packages") {
             for (position, value) in packages
                 .as_array()
@@ -1215,6 +1355,103 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
         .map(|(_, declaration)| declaration)
         .collect())
 }
+// Resource resolution retains project deltas and each corresponding user
+// declaration separately. Other package commands continue to use declarations().
+fn resource_declarations(args: &Cli, transient: bool) -> Result<Vec<Declaration>> {
+    if transient {
+        return Ok(declarations(args)?
+            .into_iter()
+            .filter(|entry| entry.transient)
+            .collect());
+    }
+    let agent = config::agent_dir();
+    let project = args.workspace.join(".pi");
+    let read = |base: &Path| -> Result<Vec<Declaration>> {
+        let settings = match args.settings.stored_layer(base) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(&base.join("settings.json"))?,
+        };
+        let Some(packages) = settings.get("packages") else {
+            return Ok(Vec::new());
+        };
+        packages
+            .as_array()
+            .ok_or_else(|| Error::Config("packages must be an array".into()))?
+            .iter()
+            .map(|value| {
+                let source = source_field(value)
+                    .ok_or_else(|| Error::Config("package needs a source".into()))?;
+                Ok(Declaration {
+                    source: normalize(source, base)?,
+                    value: value.clone(),
+                    inherited: None,
+                    transient: false,
+                    scope_order: 0,
+                })
+            })
+            .collect()
+    };
+    let transient_identities: std::collections::BTreeSet<_> = declarations(args)?
+        .into_iter()
+        .filter(|entry| entry.transient)
+        .map(|entry| source_identity(&entry.source))
+        .collect();
+    let users: Vec<_> = read(&agent)?
+        .into_iter()
+        .filter(|entry| !transient_identities.contains(&source_identity(&entry.source)))
+        .collect();
+    let projects = if args.trusted {
+        read(&project)?
+            .into_iter()
+            .filter(|entry| !transient_identities.contains(&source_identity(&entry.source)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let cached = index()?;
+    let mut plan: Vec<Declaration> = Vec::new();
+    let mut projects_by_identity = BTreeMap::new();
+    for mut entry in projects {
+        let identity = source_identity(&entry.source);
+        if entry.value["autoload"] == false {
+            let first = users
+                .iter()
+                .find(|user| source_identity(&user.source) == identity);
+            let available = users.iter().find(|user| {
+                source_identity(&user.source) == identity
+                    && cached
+                        .get(&key(&user.source))
+                        .and_then(|value| serde_json::from_value::<Installed>(value.clone()).ok())
+                        .and_then(revalidate_cached_package)
+                        .is_some()
+            });
+            if let Some(user) = available.or(first) {
+                entry.source = user.source.clone();
+            }
+        }
+        if let Some(index) = projects_by_identity.get(&identity) {
+            plan[*index] = entry;
+        } else {
+            projects_by_identity.insert(identity, plan.len());
+            plan.push(entry);
+        }
+    }
+    let mut user_only = std::collections::BTreeSet::new();
+    for mut entry in users {
+        let identity = source_identity(&entry.source);
+        if let Some(index) = projects_by_identity.get(&identity) {
+            if plan[*index].value["autoload"] != false {
+                continue;
+            }
+        } else if !user_only.insert(identity) {
+            continue;
+        }
+        entry.scope_order = 1;
+        plan.push(entry);
+    }
+    Ok(plan)
+}
+
 pub fn is_package_source(source: &str, workspace: &Path) -> bool {
     !super::resource_paths::named_extension(source)
         && normalize(source, workspace)
@@ -1426,6 +1663,25 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         }
     }
     let _lock = lock;
+    if !remote(source) && Path::new(source).is_file() {
+        let executable = PathBuf::from(source);
+        pi_rs_extensions::ExecutableExtension::load(&executable)?;
+        let root = executable.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let package = Installed {
+            source: source.into(),
+            root,
+            version: None,
+            resources: PackageResources {
+                extensions: vec![executable],
+                ..PackageResources::default()
+            },
+        };
+        config::update_object(&config::agent_dir().join("packages/index.json"), |index| {
+            index.insert(key(source), serde_json::to_value(&package)?);
+            Ok(())
+        })?;
+        return Ok(package);
+    }
     let generation = tempfile::Builder::new()
         .prefix("install-")
         .tempdir_in(&directory)?;
@@ -2314,6 +2570,59 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn worker_package_discovery_keeps_recovered_scope_after_disk_repair() {
+        use clap::Parser;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            project.join(".pi/settings.json"),
+            json!({"packages":["git:https://example.com/new.git"]}).to_string(),
+        )
+        .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.workspace = project.clone();
+        args.trusted = true;
+        for (worker, diagnostics) in [
+            (true, vec!["previous scope could not be read"]),
+            (false, vec![]),
+        ] {
+            args.worker_settings_stdin = worker;
+            args.settings = serde_json::from_value(json!({
+            "value":{},
+            "resource_layers":[[config::agent_dir(),{}],[project.join(".pi"),{"packages":["git:https://example.com/old.git"]}]],
+            "diagnostics":diagnostics,
+            "live_auto_retry":null,
+            "live_auto_compaction":null
+        })).unwrap();
+            let entries = declarations(&args).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(
+                entries[0].source.contains("old.git"),
+                "{}",
+                entries[0].source
+            );
+            let listing = configured_packages(&args).unwrap();
+            assert_eq!(listing.len(), 1);
+            assert!(
+                listing[0].0.source.contains("old.git"),
+                "{}",
+                listing[0].0.source
+            );
+            let layered = resource_declarations(&args, false).unwrap();
+            assert_eq!(layered.len(), 1);
+            assert!(
+                layered[0].source.contains("old.git"),
+                "{}",
+                layered[0].source
+            );
+            let sources = configured_update_sources(&args).unwrap();
+            assert_eq!(sources.len(), 1);
+            assert!(sources[0].contains("old.git"), "{sources:?}");
+        }
+    }
+
     // A private test subprocess: the child owns a connection until it exits,
     // letting the test observe that exact process without relying on PID reuse.
     #[test]
@@ -2358,7 +2667,8 @@ mod tests {
                 source: source.clone(),
                 root: PathBuf::from(&source),
                 version: None,
-                resources: collect_package_resources(&root, &json!({}), Vec::new()).unwrap(),
+                resources: collect_package_resources(Path::new(&source), &json!({}), Vec::new())
+                    .unwrap(),
             };
             index.insert(key(&source), serde_json::to_value(installed).unwrap());
             sources.push(source);
@@ -2374,6 +2684,8 @@ mod tests {
         let themes = startup_themes(&args, false).unwrap();
         assert_eq!(themes.len(), 1);
         assert!(themes[0].starts_with(&sources[1]));
+        std::fs::write(directory.join("first/package.json"), "{}").unwrap();
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
         std::fs::write(
             agent.join("packages/index.json"),
             Value::Object(index.clone()).to_string(),
@@ -2385,6 +2697,110 @@ mod tests {
         assert_eq!(resources.themes.len(), 1);
         assert!(resources.themes[0].starts_with(&sources[1]));
         assert_eq!(startup_themes(&args, false).unwrap(), themes);
+        // Pi-only prompts affect diagnostics without becoming native resources.
+        std::fs::write(
+            directory.join("first/package.json"),
+            json!({"pi":{
+                "prompts":["./prompts/*.md"], "themes":["themes"]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let resources = resources_for(&args, false).unwrap();
+        assert_eq!(resources.prompts.len(), 1);
+        assert_eq!(resources.themes.len(), 1);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        std::fs::remove_file(agent.join("packages/index.json")).unwrap();
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(index.clone()).to_string(),
+        )
+        .unwrap();
+        // Empty Pi candidates do not evaluate an unrelated invalid settings glob.
+        std::fs::remove_file(directory.join("first/prompts/demo.md")).unwrap();
+        std::fs::write(
+            directory.join("first/package.json"),
+            json!({"pi":{"prompts":[],"themes":["themes"]}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[
+                {"source":sources[0],"prompts":["["]}, {"source":sources[1]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 2);
+        let empty_remote = "git:https://example.com/empty/pkg#rev";
+        let mut empty_index = index.clone();
+        let mut empty_package: Installed =
+            serde_json::from_value(empty_index[&key(&sources[0])].clone()).unwrap();
+        empty_package.source = empty_remote.into();
+        empty_index.insert(
+            key(empty_remote),
+            serde_json::to_value(empty_package).unwrap(),
+        );
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(empty_index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":empty_remote,"prompts":["["]}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
+        std::fs::write(directory.join("first/prompts/demo.md"), "prompt").unwrap();
+        // Manifest overrides are evaluated before settings filters. Remote
+        // errors propagate, while local package errors stop only that package.
+        std::fs::write(
+            directory.join("first/package.json"),
+            json!({"pi":{
+                "prompts":["prompts/demo.md","!**","+file:///bad%2Fpath"], "themes":["themes"]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let remote = "git:https://example.com/diagnostic/pkg#rev";
+        let mut remote_index = index.clone();
+        let mut remote_package: Installed =
+            serde_json::from_value(remote_index[&key(&sources[0])].clone()).unwrap();
+        remote_package.source = remote.into();
+        remote_index.insert(key(remote), serde_json::to_value(remote_package).unwrap());
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(remote_index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":remote,"prompts":["["]}]}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            resources_for(&args, false)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("encoded")
+        );
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":sources[0],"prompts":["["]}, {"source":sources[1]}]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(index.clone()).to_string(),
+        )
+        .unwrap();
+        std::fs::remove_file(directory.join("first/package.json")).unwrap();
         // An error while evaluating themes preserves earlier prompt resources.
         let settings = json!({"packages": [
             {"source": sources[0], "themes": ["file:///bad%2Fpath"]},
@@ -2401,6 +2817,169 @@ mod tests {
         ]});
         std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        // Project deltas run before separate user declarations and reserve
+        // explicitly disabled paths while leaving others to user defaults.
+        std::fs::create_dir_all(directory.join(".pi")).unwrap();
+        std::fs::write(
+            directory.join(".pi/settings.json"),
+            json!({"packages":[
+                {"source":sources[0],"autoload":false,"prompts":["-prompts/demo.md"]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[
+                {"source":sources[0]}, {"source":sources[1]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        args.trusted = true;
+        assert_eq!(resources_for(&args, false).unwrap().prompts.len(), 1);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        // An error stops only the project declaration. The user declaration
+        // still contributes prompts and themes, after prior project skills.
+        std::fs::write(directory.join(".pi/settings.json"), json!({"packages":[
+            {"source":sources[0],"autoload":false,"skills":["+skills/demo"],"prompts":["file:///bad%2Fpath"]}
+        ]}).to_string()).unwrap();
+        let resources = resources_for(&args, false).unwrap();
+        assert_eq!(resources.skills.len(), 2);
+        assert_eq!(resources.prompts.len(), 2);
+        assert_eq!(resources.themes.len(), 2);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        // Both user declarations survive a project delta. The first user
+        // decision, including an explicit disable, takes precedence.
+        std::fs::write(
+            directory.join(".pi/settings.json"),
+            json!({"packages":[
+                {"source":sources[0],"autoload":false}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[
+                {"source":sources[0],"prompts":["!prompts/*.md"]},
+                {"source":sources[0],"prompts":["+prompts/demo.md"]},
+                {"source":sources[1]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().prompts.len(), 1);
+        // A project delta resolves against the first user source even when
+        // its own revision differs.
+        std::fs::write(
+            directory.join(".pi/settings.json"),
+            json!({"packages":[
+                {"source":"git:https://example.com/org/repo#project","autoload":false}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[
+                {"source":"git:https://example.com/org/repo#user"},
+                {"source":"git:https://example.com/org/repo#other"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let plan = resource_declarations(&args, false).unwrap();
+        assert_eq!(plan.len(), 3);
+        assert!(plan[0].source.ends_with("#user"));
+        assert!(plan[1].source.ends_with("#user"));
+        assert!(plan[2].source.ends_with("#other"));
+        // Different cached checkouts must not bypass the first checkout's
+        // project exclusion when Pi resolves them to one managed Git path.
+        let saved_index = std::fs::read(agent.join("packages/index.json")).unwrap();
+        let mut revision_index: serde_json::Map<String, Value> =
+            serde_json::from_slice(&saved_index).unwrap();
+        for (source, root) in [
+            ("git:https://example.com/org/repo#user", &sources[0]),
+            ("git:https://example.com/org/repo#other", &sources[1]),
+        ] {
+            let resources =
+                collect_package_resources(Path::new(root), &json!({}), Vec::new()).unwrap();
+            revision_index.insert(
+                key(source),
+                serde_json::to_value(Installed {
+                    source: source.into(),
+                    root: PathBuf::from(root),
+                    version: None,
+                    resources,
+                })
+                .unwrap(),
+            );
+        }
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(revision_index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(directory.join(".pi/settings.json"), json!({"packages":[
+            {"source":"git:https://example.com/org/repo#project","autoload":false,"prompts":["-prompts/demo.md"]}
+        ]}).to_string()).unwrap();
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        // If the first source is unavailable, the later source still works.
+        let mut later_only: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(agent.join("packages/index.json")).unwrap())
+                .unwrap();
+        later_only.remove(&key("git:https://example.com/org/repo#user"));
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(later_only).to_string(),
+        )
+        .unwrap();
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        args.offline = true;
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        args.offline = false;
+        let mut broken: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(agent.join("packages/index.json")).unwrap())
+                .unwrap();
+        let unavailable = Installed {
+            source: "git:https://example.com/org/repo#user".into(),
+            root: directory.join("deleted-checkout"),
+            version: None,
+            resources: PackageResources::default(),
+        };
+        broken.insert(
+            key(&unavailable.source),
+            serde_json::to_value(unavailable).unwrap(),
+        );
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(broken).to_string(),
+        )
+        .unwrap();
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        std::fs::write(agent.join("packages/index.json"), saved_index).unwrap();
+        // Temporary sources replace configured declarations with the same
+        // identity, including when their revisions differ.
+        args.extensions
+            .push("git:https://example.com/org/repo#cli".into());
+        assert!(resource_declarations(&args, false).unwrap().is_empty());
+        let transient = resource_declarations(&args, true).unwrap();
+        assert_eq!(transient.len(), 1);
+        assert!(transient[0].source.ends_with("#cli"));
+        args.extensions.clear();
+        args.trusted = false;
+        args.extensions.push(sources[0].clone());
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":sources[0]}]}).to_string(),
+        )
+        .unwrap();
+        assert!(resource_declarations(&args, false).unwrap().is_empty());
+        assert_eq!(resource_declarations(&args, true).unwrap().len(), 1);
+        args.extensions.clear();
+        args.trusted = false;
         // A prior matching pattern short-circuits the invalid URL.
         let settings = json!({"packages": [
             {"source": sources[0], "prompts": ["**", "file:///bad%2Fpath"]},
@@ -2428,7 +3007,7 @@ mod tests {
         std::fs::write(directory.join("first/prompts/demo.md"), "prompt").unwrap();
         assert_eq!(resources_for(&args, false).unwrap().themes.len(), 2);
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
-        // File sources use the cached package root for the upstream-manifest exclusion.
+        // A file source ignores its parent's manifest, resources and filters.
         let file_root = directory.join("file-source");
         std::fs::create_dir_all(file_root.join("themes")).unwrap();
         std::fs::write(file_root.join("themes/demo.json"), "{}").unwrap();
@@ -2459,16 +3038,184 @@ mod tests {
         .unwrap();
         std::fs::write(
             agent.join("settings.json"),
-            json!({"packages":[{"source":source,"themes":["-file:///bad%2Fpath"]}]}).to_string(),
+            json!({"packages":[{"source":source,"autoload":false,"extensions":["file:///bad%2Fpath"],"themes":["-file:///bad%2Fpath"]}]}).to_string(),
         )
         .unwrap();
-        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
-        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        // Old caches may contain only the parent's theme and never validated
+        // the selected file; they cannot activate it until re-prepared.
+        assert!(resources_for(&args, false).unwrap().extensions.is_empty());
+        assert!(startup_themes(&args, false).unwrap().is_empty());
+        let validated = Installed {
+            source: source.clone(),
+            root: PathBuf::from(&root),
+            version: None,
+            resources: PackageResources {
+                extensions: vec![PathBuf::from(&source)],
+                ..PackageResources::default()
+            },
+        };
+        let mut file_index = serde_json::Map::new();
+        file_index.insert(key(&source), serde_json::to_value(validated).unwrap());
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(file_index).to_string(),
+        )
+        .unwrap();
+        let file_resources = resources_for(&args, false).unwrap();
+        assert_eq!(file_resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(file_resources.themes.is_empty());
+        assert!(startup_themes(&args, false).unwrap().is_empty());
+        // Replacing the file with a directory does not load the old parent.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(resources_for(&args, false).unwrap().extensions.is_empty());
         std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
         // Without a cache and without candidates the URL is never evaluated.
         std::fs::remove_file(agent.join("packages/index.json")).unwrap();
         std::fs::remove_file(directory.join("first/prompts/demo.md")).unwrap();
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn selection_deduplicates_external_binaries_by_package_identity() {
+        let mut entries = ResourceSelections::default();
+        let first = Path::new("/cache/one/bin/tool");
+        let second = Path::new("/cache/two/bin/tool");
+        entries.insert(first, false, "cargo:example", Path::new("/src/one"), true);
+        entries.insert(second, true, "cargo:example", Path::new("/src/two"), true);
+        assert!(entries.enabled().is_empty());
+    }
+
+    #[test]
+    fn local_package_cache_requires_matching_source_kind_and_validated_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("source");
+        std::fs::write(&file, "fixture").unwrap();
+        let source = normalize(&file.to_string_lossy(), directory.path()).unwrap();
+        let mut package = Installed {
+            source: source.clone(),
+            root: Path::new(&source).parent().unwrap().to_path_buf(),
+            version: None,
+            resources: PackageResources::default(),
+        };
+        assert!(!local_source_matches_cache(&package));
+        package.resources.extensions.push(PathBuf::from(&source));
+        assert!(local_source_matches_cache(&package));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(!local_source_matches_cache(&package));
+        package.root = PathBuf::from(&source);
+        assert!(local_source_matches_cache(&package));
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, "fixture").unwrap();
+        assert!(!local_source_matches_cache(&package));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_file_install_ignores_parent_manifests_and_resources() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "PI_RS_SINGLE_FILE_TEST_DIR";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let temporary = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "packages::tests::single_file_install_ignores_parent_manifests_and_resources",
+                    "--nocapture",
+                ])
+                .env(CHILD, temporary.path())
+                .env("PI_RS_HOME", temporary.path().join("agent"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let root = directory.join("package");
+        std::fs::create_dir_all(root.join("themes")).unwrap();
+        std::fs::write(root.join("themes/sibling.json"), "{}").unwrap();
+        std::fs::write(root.join("pi-package.json"), "not json").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "not toml").unwrap();
+        let file = root.join("extension");
+        std::fs::write(&file, r#"#!/bin/sh
+cat >/dev/null
+touch "$PI_RS_HOME/validated"
+printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"commands":[],"tools":[]}}}'
+"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let source = normalize(&file.to_string_lossy(), &directory).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let package = runtime.block_on(install(&source, false)).unwrap();
+        assert_eq!(package.resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(package.resources.themes.is_empty());
+        assert!(package.resources.prompts.is_empty());
+        assert!(package.resources.skills.is_empty());
+        let mut old_cache = package.clone();
+        old_cache.resources.extensions.clear();
+        old_cache
+            .resources
+            .themes
+            .push(root.join("themes/sibling.json"));
+        let restored = revalidate_cached_package(package).unwrap();
+        assert_eq!(restored.resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(restored.resources.themes.is_empty());
+
+        use clap::Parser;
+        std::fs::write(
+            config::agent_dir().join("settings.json"),
+            json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        let mut args = Cli::parse_from(["pi", "--no-trust"]);
+        args.workspace = directory.clone();
+        std::fs::remove_file(config::agent_dir().join("validated")).unwrap();
+        config::update_object(&config::agent_dir().join("packages/index.json"), |index| {
+            index.insert(key(&source), serde_json::to_value(old_cache).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(config::agent_dir().join("validated").exists());
+        assert_eq!(
+            resources_for(&args, false).unwrap().extensions,
+            vec![PathBuf::from(&source)]
+        );
+        std::fs::remove_file(config::agent_dir().join("validated")).unwrap();
+        // A file replaced by a directory must be prepared as a new package.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(file.join("themes")).unwrap();
+        std::fs::write(file.join("themes/new.json"), "{}").unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        let resources = resources_for(&args, false).unwrap();
+        assert!(resources.extensions.is_empty());
+        assert_eq!(resources.themes.len(), 1);
+        // A directory replaced by an invalid executable cannot reuse its cache.
+        std::fs::remove_dir_all(&file).unwrap();
+        std::fs::write(&file, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(resources_for(&args, false).unwrap().extensions.is_empty());
+        // The next valid executable is revalidated before becoming available.
+        std::fs::write(&file, r#"#!/bin/sh
+cat >/dev/null
+touch "$PI_RS_HOME/validated"
+printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"commands":[],"tools":[]}}}'
+"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(config::agent_dir().join("validated").exists());
+        let resources = resources_for(&args, false).unwrap();
+        assert_eq!(resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(resources.themes.is_empty());
     }
 
     #[test]

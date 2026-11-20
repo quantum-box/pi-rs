@@ -1,0 +1,43 @@
+{
+  "name": "browser-preview",
+  "version": "1.0.0",
+  "description": "This experimental demo runs the pi-rs `AgentSession` as WebAssembly and a Qwen3 model in a browser Web Worker using WebGPU. Choose 0.6B (Transformers.js) or 1.7B (WebLLM). The model can request the side-effect-free `add_numbers` tool; pi executes the call in WASM and returns the result to the model. The UI shows the call and its result. Model output is displayed after generation completes.",
+  "main": "index.js",
+  "scripts": {
+    "build": "vite build",
+    "test": "node --test tachyon-gateway.test.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@streamdown/cjk": "^1.0.4",
+    "@streamdown/code": "^2.0.0",
+    "@streamdown/math": "^1.0.3",
+    "@streamdown/mermaid": "^1.0.3",
+    "ai": "^7.0.173",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "^1.73.0",
+    "nanoid": "^6.0.2",
+    "radix-ui": "^1.8.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "streamdown": "^2.7.1",
+    "tailwind-merge": "^3.7.0",
+    "use-stick-to-bottom": "^1.1.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "private": true
+}

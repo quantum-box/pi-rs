@@ -78,6 +78,8 @@ pub struct OpenAiResponses {
     explicit_cache_mode: bool,
     session_cache_key: Option<String>,
     session_affinity_format: Option<SessionAffinityFormat>,
+    prompt_cache_key_enabled: bool,
+    use_developer_role: bool,
 }
 
 impl OpenAiResponses {
@@ -162,6 +164,8 @@ impl OpenAiResponses {
             explicit_cache_mode: false,
             session_cache_key: None,
             session_affinity_format: None,
+            prompt_cache_key_enabled: true,
+            use_developer_role: false,
         })
     }
 
@@ -174,6 +178,13 @@ impl OpenAiResponses {
     pub fn with_cache_retention(mut self, retention: CacheRetention, explicit_mode: bool) -> Self {
         self.cache_retention = retention;
         self.explicit_cache_mode = explicit_mode;
+        self
+    }
+
+    /// Select whether model instructions use the developer role. Defaults to
+    /// the system role when model reasoning capability is not supplied.
+    pub fn with_developer_role(mut self, enabled: bool) -> Self {
+        self.use_developer_role = enabled;
         self
     }
 
@@ -235,6 +246,12 @@ impl OpenAiResponses {
         Ok(self)
     }
 
+    /// Enable or disable the automatic session-derived prompt cache key.
+    pub fn with_prompt_cache_key_enabled(mut self, enabled: bool) -> Self {
+        self.prompt_cache_key_enabled = enabled;
+        self
+    }
+
     /// Disable retention while preserving the model cache protocol.
     pub fn without_cache(mut self) -> Self {
         self.cache_retention = CacheRetention::None;
@@ -269,7 +286,8 @@ impl OpenAiResponses {
     }
 
     fn apply_cache(&self, body: &mut Value) {
-        if self.cache_retention != CacheRetention::None
+        if self.prompt_cache_key_enabled
+            && self.cache_retention != CacheRetention::None
             && let Some(key) = &self.session_cache_key
         {
             body.as_object_mut()
@@ -421,12 +439,17 @@ pub fn thinking_levels(model: &str) -> Vec<String> {
     levels.iter().map(|level| (*level).into()).collect()
 }
 
-fn payload(request: &ModelRequest, provider: &str, edited_scope: &str) -> Value {
+fn payload(
+    request: &ModelRequest,
+    provider: &str,
+    edited_scope: &str,
+    instruction_role: &str,
+) -> Value {
     let mut input = Vec::new();
     for message in &request.messages {
         match message {
             Message::System { content } => {
-                input.push(json!({"role":"developer", "content": content}))
+                input.push(json!({"role":instruction_role, "content": content}))
             }
             Message::User { content } => input.push(json!({"role":"user", "content": content})),
             Message::UserWithImages { content, images } => {
@@ -599,11 +622,25 @@ impl Model for OpenAiResponses {
         } else {
             base
         };
-        match self.session_affinity_format {
+        let base = match self.session_affinity_format {
             None => base,
             Some(format) => base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(base, format!("{format:?}")))
             }),
+        };
+        let base = if self.prompt_cache_key_enabled {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "prompt-cache-key-disabled"))
+            })
+        };
+        if self.use_developer_role {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "system-instruction-role"))
+            })
         }
     }
 
@@ -713,7 +750,16 @@ impl OpenAiResponses {
         let model = request.model.clone();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
-        let mut body = payload(&request, &self.provider, &edited_scope);
+        let mut body = payload(
+            &request,
+            &self.provider,
+            &edited_scope,
+            if self.use_developer_role {
+                "developer"
+            } else {
+                "system"
+            },
+        );
         let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
@@ -1548,11 +1594,11 @@ mod tests {
             max_output_tokens: 16,
         };
         assert_eq!(
-            payload(&request, "shared", &scope_a)["input"][0]["type"],
+            payload(&request, "shared", &scope_a, "developer")["input"][0]["type"],
             "reasoning"
         );
         assert!(
-            !payload(&request, "shared", &scope_b)
+            !payload(&request, "shared", &scope_b, "developer")
                 .to_string()
                 .contains("encrypted_content")
         );
@@ -1688,7 +1734,7 @@ mod tests {
 
     #[test]
     fn plan_payload_uses_stateless_stream_and_namespaced_tools() {
-        let body = payload(&request(), "openai-chatgpt", "openai-chatgpt");
+        let body = payload(&request(), "openai-chatgpt", "openai-chatgpt", "developer");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "developer");
@@ -1710,7 +1756,7 @@ mod tests {
             }],
             replay: None,
         });
-        let body = payload(&request, "openai", "openai");
+        let body = payload(&request, "openai", "openai", "developer");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "read");
         assert!(body["input"][2].get("namespace").is_none());
@@ -1724,7 +1770,7 @@ mod tests {
     fn tool_images_are_sent_as_images_not_base64_text() {
         let mut request = request();
         request.messages.push(Message::Tool { is_structured: Some(true), is_error: false, call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
-        let body = payload(&request, "openai-chatgpt", "openai-chatgpt");
+        let body = payload(&request, "openai-chatgpt", "openai-chatgpt", "developer");
         let output = &body["input"][2]["output"];
         assert_eq!(output[0]["type"], "input_text");
         assert!(!output[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
@@ -1745,12 +1791,12 @@ mod tests {
             is_structured: Some(false),
         });
         assert_eq!(
-            payload(&request, "openai", "openai")["input"][2]["output"],
+            payload(&request, "openai", "openai", "developer")["input"][2]["output"],
             text
         );
         request.messages[2] =
             serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
-        let output = &payload(&request, "openai", "openai")["input"][2]["output"];
+        let output = &payload(&request, "openai", "openai", "developer")["input"][2]["output"];
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(output[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
     }
@@ -1826,6 +1872,114 @@ mod tests {
         let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
         plan.without_cache().apply_cache(&mut body);
         assert_eq!(body, json!({}));
+    }
+
+    #[tokio::test]
+    async fn sdk_instruction_role_defaults_to_system_and_can_enable_developer() {
+        use std::io::{Read, Write};
+        for (developer, expected) in [
+            (None, "system"),
+            (Some(true), "developer"),
+            (Some(false), "system"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let model =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap();
+            let model = if let Some(enabled) = developer {
+                model.with_developer_role(enabled)
+            } else {
+                model
+            };
+            let mut req = request();
+            req.messages = vec![Message::System {
+                content: "rules".into(),
+            }];
+            let _ = model.stream(req).await;
+            assert_eq!(server.join().unwrap()["input"][0]["role"], expected);
+        }
+    }
+
+    #[test]
+    fn instruction_role_is_applied_and_changes_recovery_identity() {
+        let model =
+            OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
+        assert_ne!(
+            model.context_identity(),
+            model.clone().with_developer_role(true).context_identity()
+        );
+        assert_eq!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_developer_role(true)
+                .with_developer_role(false)
+                .context_identity()
+        );
+        let mut req = request();
+        req.messages = vec![
+            Message::System {
+                content: "rules".into(),
+            },
+            Message::User {
+                content: "hello".into(),
+            },
+        ];
+        let body = payload(&req, "openai", "openai", "system");
+        assert_eq!(body["input"][0]["role"], "system");
+        assert_eq!(body["input"][1]["role"], "user");
     }
 
     #[test]
@@ -1990,6 +2144,21 @@ mod tests {
         let model =
             OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
         let identity = format!("{}tail", "猫".repeat(64));
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .context_identity()
+        );
+        assert_eq!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .with_prompt_cache_key_enabled(true)
+                .context_identity()
+        );
         let mut body = json!({});
         model
             .clone()
@@ -2005,6 +2174,20 @@ mod tests {
         let mut body = json!({});
         model
             .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
+        let mut body = json!({"prompt_cache_key":"explicit"});
+        model
+            .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "explicit");
+        let mut body = json!({});
+        model
+            .clone()
             .with_session_cache_key("")
             .apply_cache(&mut body);
         assert!(body.get("prompt_cache_key").is_none());
@@ -2014,6 +2197,61 @@ mod tests {
             .without_cache()
             .apply_cache(&mut body);
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_prompt_cache_key_is_omitted_from_sdk_session_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut block = [0; 4096];
+            let end = loop {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let size: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + size {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            body
+        });
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_prompt_cache_key_enabled(false);
+        let _ = model
+            .stream_enriched_in_session_with_identity(
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                "external-session",
+                request(),
+            )
+            .await;
+        assert!(server.join().unwrap().get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]

@@ -35,12 +35,23 @@ pub(super) fn run(
     if session.working_directory().is_none() {
         session.set_working_directory(&args.workspace)?;
     }
-    super::backend::initialize_queue_modes(&mut session, &args)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, &mut args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
     drop(session);
+    let reported_settings = args.settings.diagnostics().to_vec();
     interactive::restore_workspace_cancellable(&mut args, &cancelled)?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -66,6 +77,9 @@ pub(super) fn run(
     let mut pending_compact: Option<Value> = None;
     let mut pending_queries: Vec<Value> = Vec::new();
     let mut pending_inputs: Vec<Value> = Vec::new();
+    let mut pending_modes: Vec<PendingMode> = Vec::new();
+    let mut shutdown_waiting = false;
+    let mut mode_worker_pid = None;
     let mut model_queries: Vec<(Value, mpsc::Receiver<Result<Value>>)> = Vec::new();
     let mut transition: Option<(Value, mpsc::Receiver<Result<Cli>>)> = None;
     let mut deferred = std::collections::VecDeque::<Value>::new();
@@ -90,13 +104,7 @@ pub(super) fn run(
                 };
                 if matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
                     let (pending, _) = transition.take().expect("pending transition");
-                    response(&pending, Ok(Some(json!({"cancelled":true}))))?;
-                    for queued in deferred.drain(..) {
-                        response(
-                            &queued,
-                            Err(Error::Config("session transition cancelled".into())),
-                        )?;
-                    }
+                    cancel_transition(&pending, &mut deferred, &mut shutdown_waiting, response)?;
                     if request["type"] == "shutdown" {
                         drop(worker.take());
                         response(&request, Ok(None))?;
@@ -161,7 +169,20 @@ pub(super) fn run(
             }
         }
         if let Some(active) = &mut worker {
-            for event in active.drain_events() {
+            if mode_worker_pid != Some(active.child.id()) {
+                if let Ok(session) = Session::snapshot(&args.session) {
+                    reconcile_worker_queue_modes(
+                        &session,
+                        &mut active.steering_mode,
+                        &mut active.follow_up_mode,
+                    );
+                }
+                mode_worker_pid = Some(active.child.id());
+            }
+            for mut event in active.drain_events() {
+                if mode_event(&mut pending_modes, active, &mut event) {
+                    continue;
+                }
                 acknowledge(&mut pending_queries, &event);
                 acknowledge(&mut pending_inputs, &event);
                 match event["type"].as_str() {
@@ -185,7 +206,10 @@ pub(super) fn run(
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
-                for event in finished.drain_events() {
+                for mut event in finished.drain_events() {
+                    if mode_event(&mut pending_modes, &mut finished, &mut event) {
+                        continue;
+                    }
                     acknowledge(&mut pending_queries, &event);
                     acknowledge(&mut pending_inputs, &event);
                     forward_event(
@@ -196,6 +220,14 @@ pub(super) fn run(
                         &mut pending_compact,
                         &mut stream,
                         &args,
+                    )?;
+                }
+                for pending in pending_modes.drain(..) {
+                    response(
+                        &pending.request,
+                        Err(Error::Config(
+                            "mode worker exited before acknowledging the request".into(),
+                        )),
                     )?;
                 }
                 for request in pending_queries.drain(..) {
@@ -250,14 +282,24 @@ pub(super) fn run(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        let request = if transition.is_none() && !deferred.is_empty() {
+        let from_deferred = transition.is_none()
+            && !pending_modes.iter().any(|pending| !pending.applied)
+            && (pending_modes.is_empty()
+                || !deferred
+                    .front()
+                    .is_some_and(|request| mode_waits_for_settings(request, &worker)))
+            && !deferred.is_empty();
+        let request = if from_deferred {
             deferred.pop_front().expect("deferred request")
         } else {
             let line = match receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok(line) => line?,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected)
-                    if model_queries.is_empty() && transition.is_none() && deferred.is_empty() =>
+                    if model_queries.is_empty()
+                        && transition.is_none()
+                        && deferred.is_empty()
+                        && pending_modes.is_empty() =>
                 {
                     break;
                 }
@@ -276,15 +318,46 @@ pub(super) fn run(
                 }
             }
         };
+        if shutdown_waiting
+            && !from_deferred
+            && !matches!(
+                request["type"].as_str(),
+                Some("abort" | "abort_bash" | "abort_retry" | "extension_ui_response")
+            )
+        {
+            response(
+                &request,
+                Err(Error::Config("worker is shutting down".into())),
+            )?;
+            continue;
+        }
+        if transition.is_none()
+            && (pending_modes.iter().any(|pending| !pending.applied)
+                || (mode_waits_for_settings(&request, &worker) && !pending_modes.is_empty())
+                || (!from_deferred && !deferred.is_empty()))
+            && !matches!(
+                request["type"].as_str(),
+                Some("abort" | "abort_bash" | "abort_retry" | "extension_ui_response")
+            )
+        {
+            if deferred.len() >= 256 {
+                response(
+                    &request,
+                    Err(Error::Config(
+                        "too many commands waiting for mode application".into(),
+                    )),
+                )?;
+            } else {
+                if request["type"] == "shutdown" {
+                    shutdown_waiting = true;
+                }
+                deferred.push_back(request);
+            }
+            continue;
+        }
         if transition.is_some() && matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
             let (pending, _) = transition.take().expect("pending transition");
-            response(&pending, Ok(Some(json!({"cancelled":true}))))?;
-            for queued in deferred.drain(..) {
-                response(
-                    &queued,
-                    Err(Error::Config("session transition cancelled".into())),
-                )?;
-            }
+            cancel_transition(&pending, &mut deferred, &mut shutdown_waiting, response)?;
             if request["type"] == "shutdown" {
                 drop(worker.take());
                 response(&request, Ok(None))?;
@@ -327,7 +400,7 @@ pub(super) fn run(
         }
         if request["type"] == "switch_session" || request["type"] == "new_session" {
             let prepared = (|| {
-                if !pending_inputs.is_empty() || busy(&worker) {
+                if !pending_inputs.is_empty() || !pending_modes.is_empty() || busy(&worker) {
                     return Err(Error::Config(
                         "wait for the current operation before switching sessions".into(),
                     ));
@@ -413,7 +486,8 @@ pub(super) fn run(
             }
             continue;
         }
-        if !pending_inputs.is_empty() && requires_idle(request["type"].as_str().unwrap_or_default())
+        if (!pending_inputs.is_empty() || !pending_modes.is_empty())
+            && requires_idle(request["type"].as_str().unwrap_or_default())
         {
             response(
                 &request,
@@ -454,18 +528,17 @@ pub(super) fn run(
                     } else {
                         pi_rs::InputKind::FollowUp
                     };
-                    json!({"type":"set_queue_mode","kind":kind,"mode":mode,"id":request.get("id")})
+                    let token = uuid::Uuid::new_v4().to_string();
+                    let control = json!({"type":"set_queue_mode","kind":kind,"mode":mode,"id":{"_rpc_mode_token":token}});
+                    Worker::control(&mut worker, &args, control)?;
+                    pending_modes.push(PendingMode {
+                        token,
+                        request: request.clone(),
+                        applied: false,
+                    });
+                    return Ok::<_, Error>(());
                 };
                 Worker::control(&mut worker, &args, control)?;
-                if command != "clear_queue" {
-                    let mode: pi_rs::QueueMode = serde_json::from_value(request["mode"].clone())?;
-                    let active = worker.as_mut().expect("control worker");
-                    if command == "set_steering_mode" {
-                        active.steering_mode = mode;
-                    } else {
-                        active.follow_up_mode = mode;
-                    }
-                }
                 Ok::<_, Error>(())
             })();
             if let Err(error) = result {
@@ -631,7 +704,7 @@ pub(super) fn run(
             && let Some(previous) = previous_records
             && let Ok(session) = Session::snapshot(&args.session)
         {
-            for entry in super::rpc_entries::changes(&session, previous) {
+            for entry in super::rpc_entries::changes(&session, previous)? {
                 emit(json!({"type":"entry_appended","entry":entry}))?;
             }
         }
@@ -654,6 +727,94 @@ pub(super) fn run(
     }
     drop(worker);
     Ok(())
+}
+
+struct PendingMode {
+    token: String,
+    request: Value,
+    applied: bool,
+}
+
+fn cancel_transition(
+    pending: &Value,
+    deferred: &mut std::collections::VecDeque<Value>,
+    shutdown_waiting: &mut bool,
+    mut respond: impl FnMut(&Value, Result<Option<Value>>) -> Result<()>,
+) -> Result<()> {
+    respond(pending, Ok(Some(json!({"cancelled":true}))))?;
+    for queued in deferred.drain(..) {
+        respond(
+            &queued,
+            Err(Error::Config("session transition cancelled".into())),
+        )?;
+    }
+    *shutdown_waiting = false;
+    Ok(())
+}
+
+// A fresh or legacy session may have no mode record for one or both kinds.
+// In that case Worker::start already resolved the configured fallback.
+fn reconcile_worker_queue_modes(
+    session: &Session,
+    steering: &mut pi_rs::QueueMode,
+    follow_up: &mut pi_rs::QueueMode,
+) {
+    for record in session.branch() {
+        if let pi_rs::Event::QueueModeSelected { kind, mode } = &record.event {
+            match kind {
+                pi_rs::InputKind::Steer => *steering = *mode,
+                pi_rs::InputKind::FollowUp => *follow_up = *mode,
+            }
+        }
+    }
+}
+
+fn mode_waits_for_settings(request: &Value, worker: &Option<Worker>) -> bool {
+    let command = request["type"].as_str().unwrap_or_default();
+    (requires_idle(command) && !(command == "set_session_name" && busy(worker)))
+        || matches!(
+            command,
+            "shutdown" | "set_auto_retry" | "set_auto_compaction"
+        )
+}
+
+// Worker identifiers are private and unique even when RPC ids are missing or repeated.
+fn mode_event(pending: &mut Vec<PendingMode>, worker: &mut Worker, event: &mut Value) -> bool {
+    let Some(token) = event
+        .get("id")
+        .and_then(|id| id.get("_rpc_mode_token"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(index) = pending.iter().position(|item| item.token == token) else {
+        return event["type"] == "internal_queue_mode_applied";
+    };
+    if event["type"] == "internal_queue_mode_applied" {
+        if let Ok(mode) = serde_json::from_value::<pi_rs::QueueMode>(event["mode"].clone()) {
+            if event["kind"] == "steer" {
+                worker.steering_mode = mode;
+            } else {
+                worker.follow_up_mode = mode;
+            }
+            pending[index].applied = true;
+        }
+        return true;
+    }
+    if event["type"] == "response"
+        && matches!(
+            event["command"].as_str(),
+            Some("set_steering_mode" | "set_follow_up_mode")
+        )
+    {
+        let request = pending.remove(index).request;
+        if let Some(id) = request.get("id") {
+            event["id"] = id.clone();
+        } else if let Some(object) = event.as_object_mut() {
+            object.remove("id");
+        }
+    }
+    false
 }
 
 fn acknowledge(pending: &mut Vec<Value>, event: &Value) {
@@ -744,6 +905,45 @@ mod jsonl_framing_tests {
     use std::io::BufReader;
 
     #[test]
+    fn unescaped_control_characters_use_v8_error_positions() {
+        for (input, expected) in [
+            (
+                "{\"x\":\"a\tb\"}",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "{\"x\":\"\u{1}\"}",
+                "Bad control character in string literal in JSON at position 6 (line 1 column 7)",
+            ),
+            (
+                "{\"x\":\"😀\rb\"}",
+                "Bad control character in string literal in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "{\"x\":\"\\q\t\"}",
+                "Bad escaped character in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\ud800\t\"",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\udc00\t\"",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"x\n\\q\"",
+                "Bad control character in string literal in JSON at position 2 (line 1 column 3)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        let error = parse_request("\"\\ud800\\q\t\"").unwrap_err().to_string();
+        assert!(!error.contains("Bad control character"), "{error}");
+    }
+
+    #[test]
     fn reads_lossy_utf8_with_lf_framing_and_final_cr() {
         let bytes =
             b"{\"id\":\"\xe3\x81\x82\xff\"}\r\n\n{\"id\":\"\xe2\x80\xa8\"}\n{\"id\":\"last\"}\r";
@@ -763,6 +963,119 @@ mod jsonl_framing_tests {
         );
         assert!(read_rpc_line(&mut input).unwrap().is_none());
     }
+    #[test]
+    fn minus_at_eof_uses_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":-", "position 6 (line 1 column 7)"),
+            ("[ -", "position 3 (line 1 column 4)"),
+            ("{\"😀\":-", "position 7 (line 1 column 8)"),
+            ("[\r\n -", "position 5 (line 2 column 3)"),
+            ("-", "position 1 (line 1 column 2)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("No number after minus sign in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            ("[1e-", "Exponent part is missing a number in JSON"),
+            ("{\"n\":1.", "Unterminated fractional number in JSON"),
+            ("[1,] -", "trailing comma"),
+            ("{\"bad\":,\"n\":-", "expected value"),
+            ("[01,-", "invalid number"),
+            ("[1e400,-", "number out of range"),
+            (r#"["\ud800",-"#, "unexpected end of hex escape"),
+            ("{\"n\":\"-", "Unterminated string in JSON"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            (r#"{"n":-2}"#, serde_json::json!({"n":-2})),
+            (r#"{"n":-2.5e-3}"#, serde_json::json!({"n":-0.0025})),
+            (r#"{"n":"-"}"#, serde_json::json!({"n":"-"})),
+        ] {
+            assert_eq!(parse_request(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn unfinished_fractions_at_eof_use_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":1.", "position 7 (line 1 column 8)"),
+            ("{\"😀\":-2.", "position 9 (line 1 column 10)"),
+            ("[0.", "position 3 (line 1 column 4)"),
+            ("[\r\n -12.", "position 8 (line 2 column 6)"),
+            ("1.", "position 2 (line 1 column 3)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Unterminated fractional number in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            ("[1,] 1.", "trailing comma"),
+            ("{\"bad\":,\"n\":1.", "expected value"),
+            ("[01.", "invalid number"),
+            ("[1e400,1.", "number out of range"),
+            (r#"["\ud800",1."#, "unexpected end of hex escape"),
+            ("{\"n\":\"1.", "Unterminated string in JSON"),
+            ("{\"n\":1.0", "EOF while parsing an object"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            (r#"{"n":1.0}"#, serde_json::json!({"n":1.0})),
+            (r#"{"n":-2.5e-3}"#, serde_json::json!({"n":-0.0025})),
+            (r#"{"n":"1."}"#, serde_json::json!({"n":"1."})),
+        ] {
+            assert_eq!(parse_request(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn unfinished_exponents_at_eof_use_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":1e", "position 7 (line 1 column 8)"),
+            ("{\"n\":1e+", "position 8 (line 1 column 9)"),
+            ("{\"n\":1e-", "position 8 (line 1 column 9)"),
+            ("{\"😀\":-2E-", "position 10 (line 1 column 11)"),
+            ("[\r\n 1e+", "position 7 (line 2 column 5)"),
+            ("[\r1E", "position 4 (line 2 column 3)"),
+            ("1e", "position 2 (line 1 column 3)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Exponent part is missing a number in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for input in [
+            "[1,] 1e",
+            r#"["\ud800",1e"#,
+            "[1e400,1e",
+            "{\"bad\":,\"n\":1e",
+            "{\"n\":\"1e",
+            "{\"n\":01e",
+            "{\"n\":1e2",
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                !error.contains("Exponent part is missing a number"),
+                "{input:?}: {error}"
+            );
+        }
+        for input in [r#"{"n":1e2}"#, r#"{"n":-2E-3}"#, r#"{"n":"1e+"}"#] {
+            assert!(parse_request(input).is_ok(), "{input:?}");
+        }
+    }
+
     #[test]
     fn truncated_json_reports_pi_eof_diagnostics() {
         for (input, expected) in [
@@ -865,14 +1178,9 @@ mod jsonl_framing_tests {
 
     #[test]
     fn incomplete_escape_does_not_hide_earlier_syntax_errors() {
-        for input in ["[false,] \"x\\u1", "\"x\n\\u1"] {
-            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
-            assert_eq!(
-                super::rpc_json_error(input, &error),
-                error.to_string(),
-                "{input:?}"
-            );
-        }
+        let input = "[false,] \"x\\u1";
+        let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(super::rpc_json_error(input, &error), error.to_string());
     }
 
     #[test]
@@ -913,7 +1221,7 @@ mod jsonl_framing_tests {
                 "{input:?}: {error}"
             );
         }
-        for input in ["[false,] \"x\\q\"", "\"x\n\\q\"", "\"\\uDC00\\x\""] {
+        for input in ["[false,] \"x\\q\"", "\"\\uDC00\\x\""] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
                 super::rpc_json_error(input, &error),
@@ -924,13 +1232,108 @@ mod jsonl_framing_tests {
     }
 
     #[test]
+    fn controls_after_surrogates_in_other_strings_match_v8() {
+        for (input, expected) in [
+            ("[\"\\ud800\",\"a\t\"]", "position 12 (line 1 column 13)"),
+            (
+                "{\"あ\":\"\\udc00\",\"x\":\"😺\r\"}",
+                "position 21 (line 1 column 22)",
+            ),
+            (
+                "[\"\\ud800\",\"\\ud83d\\ude00\",\"\t\"]",
+                "position 26 (line 1 column 27)",
+            ),
+            (
+                "[\"\\ud800\",\"\\\\ud800\t\"]",
+                "position 18 (line 1 column 19)",
+            ),
+            (
+                "[\"\\\\ud800\",\"\\udc00\",\"x\\\"y\t\"]",
+                "position 25 (line 1 column 26)",
+            ),
+            (
+                "{\r\n\"😀\":\"\\ud800\",\r\n\"other\":\"x\u{1}\"}",
+                "position 29 (line 3 column 11)",
+            ),
+            (
+                "[\"\\ud800\",\"\\udbff\\udfff\",\"\\udc00\",\"\t\"]",
+                "position 35 (line 1 column 36)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Bad control character"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        // A successful sanitized parse is diagnostic-only; the actual RPC
+        // request still rejects a lone surrogate and does not change values.
+        let input = r#"{"type":"\ud800"}"#;
+        let original = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(
+            super::rpc_json_error(input, &original),
+            original.to_string()
+        );
+        assert!(parse_request(input).is_err());
+        let valid = parse_request(r#"{"type":"\ud83d\ude00"}"#).unwrap();
+        assert_eq!(valid["type"], "😀");
+    }
+
+    #[test]
+    fn surrogate_retry_respects_first_error_and_resource_boundaries() {
+        for input in [
+            "[\"\\ud800\" false,\"\t\"]",
+            "[\"\\ud800\",\"\\q\",\"\t\"]",
+            "[\"\\ud800\",\"\\u12xz\",\"\t\"]",
+            "[\"\\ud800\",1e400,\"\t\"]",
+            "[\"\\ud800\",]",
+        ] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(
+                super::rpc_json_error(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
+        }
+        let deep = format!(
+            "[\"\\ud800\",{}0{},\"\t\"]",
+            "[".repeat(130),
+            "]".repeat(130)
+        );
+        let error = serde_json::from_str::<serde_json::Value>(&deep).unwrap_err();
+        assert_eq!(super::rpc_json_error(&deep, &error), error.to_string());
+        let prefix = "[\"\\ud800\",\"";
+        let suffix = "\t\"]";
+        for (size, mapped) in [
+            (super::SURROGATE_DIAGNOSTIC_LIMIT, true),
+            (super::SURROGATE_DIAGNOSTIC_LIMIT + 1, false),
+        ] {
+            let input = format!(
+                "{prefix}{}{suffix}",
+                "a".repeat(size - prefix.len() - suffix.len())
+            );
+            let error = serde_json::from_str::<serde_json::Value>(&input).unwrap_err();
+            let actual = super::rpc_json_error(&input, &error);
+            assert_eq!(
+                actual.contains("Bad control character"),
+                mapped,
+                "size={size}: {actual}"
+            );
+            if !mapped {
+                assert_eq!(actual, error.to_string());
+            }
+        }
+    }
+
+    #[test]
     fn surrogate_errors_do_not_hide_other_syntax_errors() {
         for input in [
             "\"\\uDC00\"",
             "\"\\uDC00\" trailing \"unfinished",
             "\"\\uDC00\\x",
             "\"\\uDC00\\u12",
-            "\"\\uDC00\n",
+            "[\"\\ud800\" false,\"\t\"]",
         ] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
@@ -944,10 +1347,10 @@ mod jsonl_framing_tests {
 
 fn parse_request(line: &str) -> Result<Value> {
     match serde_json::from_str(line) {
-        Ok(Value::Object(request)) => Ok(Value::Object(request)),
-        Ok(_) => Err(Error::Config(
+        Ok(Value::Null) => Err(Error::Config(
             "Failed to parse command: expected a JSON object".into(),
         )),
+        Ok(request) => Ok(request),
         Err(error) => Err(Error::Config(format!(
             "Failed to parse command: {}",
             rpc_json_error(line, &error)
@@ -959,6 +1362,76 @@ fn parse_request(line: &str) -> Result<Value> {
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
+    // V8 distinguishes unfinished numbers at EOF. Only project these errors
+    // when serde reached the end while parsing a value, so earlier errors and
+    // number-like suffixes inside strings retain their own diagnostics.
+    if error.is_eof()
+        && message.starts_with("EOF while parsing a value")
+        && serde_error_offset(line, error) == Some(line.len())
+    {
+        let bytes = line.as_bytes();
+        let exponent_end = if matches!(bytes.last(), Some(b'+' | b'-')) {
+            bytes.len().saturating_sub(1)
+        } else {
+            bytes.len()
+        };
+        let reason = if bytes.len() >= 2
+            && bytes[bytes.len() - 1] == b'.'
+            && bytes[bytes.len() - 2].is_ascii_digit()
+        {
+            Some("Unterminated fractional number in JSON")
+        } else if exponent_end >= 2
+            && matches!(bytes[exponent_end - 1], b'e' | b'E')
+            && bytes[exponent_end - 2].is_ascii_digit()
+        {
+            Some("Exponent part is missing a number in JSON")
+        } else if bytes.last() == Some(&b'-') {
+            Some("No number after minus sign in JSON")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let position = line.encode_utf16().count();
+            let row = line.bytes().filter(|byte| *byte == b'\r').count()
+                + line.bytes().filter(|byte| *byte == b'\n').count()
+                - line.matches("\r\n").count()
+                + 1;
+            let column = line
+                .rsplit(['\r', '\n'])
+                .next()
+                .unwrap_or_default()
+                .encode_utf16()
+                .count()
+                + 1;
+            return format!("{reason} at position {position} (line {row} column {column})");
+        }
+    }
+    if let Some((offset, start)) = json_string_control_offset(line)
+        && (message.starts_with("control character")
+            || ((message.starts_with("lone leading surrogate in hex escape")
+                || message.starts_with("unexpected end of hex escape"))
+                && invalid_json_escape(line).is_none()
+                && serde_error_offset(line, error)
+                    .is_some_and(|position| position >= start && position <= offset + 1))
+            || surrogate_retry_control(line, error, offset))
+    {
+        let prefix = &line[..offset];
+        let position = prefix.encode_utf16().count();
+        let row = prefix.bytes().filter(|byte| *byte == b'\r').count()
+            + prefix.bytes().filter(|byte| *byte == b'\n').count()
+            - prefix.matches("\r\n").count()
+            + 1;
+        let column = prefix
+            .rsplit(['\r', '\n'])
+            .next()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count()
+            + 1;
+        return format!(
+            "Bad control character in string literal in JSON at position {position} (line {row} column {column})"
+        );
+    }
     if (message.starts_with("invalid escape")
         || error.is_eof() && message.starts_with("EOF while parsing a string"))
         && let Some((reason, offset)) = invalid_json_escape(line)
@@ -1052,6 +1525,85 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+// This is only a diagnostic retry; it never changes the JSON parsed by the
+// caller. Cap both the copy and the second parse for untrusted RPC input.
+const SURROGATE_DIAGNOSTIC_LIMIT: usize = 1024 * 1024;
+
+fn surrogate_retry_control(line: &str, error: &serde_json::Error, offset: usize) -> bool {
+    let message = error.to_string();
+    if line.len() > SURROGATE_DIAGNOSTIC_LIMIT
+        || !(message.starts_with("lone leading surrogate in hex escape")
+            || message.starts_with("unexpected end of hex escape"))
+    {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let mut sanitized: Option<Vec<u8>> = None;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                in_string = !in_string;
+                i += 1;
+            }
+            b'\\' if in_string => {
+                if bytes.get(i + 1) == Some(&b'u')
+                    && let Some(hex) = bytes.get(i + 2..i + 6)
+                    && hex.iter().all(u8::is_ascii_hexdigit)
+                {
+                    let code = hex.iter().fold(0u16, |value, digit| {
+                        (value << 4) | u16::from((*digit as char).to_digit(16).unwrap() as u8)
+                    });
+                    if (0xD800..=0xDFFF).contains(&code) {
+                        let copy = sanitized.get_or_insert_with(|| bytes.to_vec());
+                        copy[i + 2..i + 6].copy_from_slice(b"FFFD");
+                    }
+                    i += 6;
+                } else {
+                    // Escaped backslashes and quotes must not start new escapes
+                    // or strings. Invalid escapes remain for serde to diagnose.
+                    i += 2;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(sanitized) = sanitized else {
+        return false;
+    };
+    let Err(retry) = serde_json::from_slice::<Value>(&sanitized) else {
+        return false;
+    };
+    retry.to_string().starts_with("control character")
+        && serde_error_offset(line, &retry) == Some(offset + 1)
+}
+
+fn serde_error_offset(line: &str, error: &serde_json::Error) -> Option<usize> {
+    let row = error.line().checked_sub(1)?;
+    let offset: usize = line.split_inclusive('\n').take(row).map(str::len).sum();
+    Some(offset.saturating_add(error.column()))
+}
+
+fn json_string_control_offset(line: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut escaped = false;
+    for (offset, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if start.is_some() && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            start = if start.is_some() { None } else { Some(offset) };
+        } else if let Some(start) = start
+            && character < ' '
+        {
+            return Some((offset, start));
+        }
+    }
+    None
 }
 
 // Locate the first malformed escape without interpreting subsequent text.
@@ -1294,13 +1846,15 @@ fn command_cancellable(
         }
         "fork" | "clone" => {
             let session = Session::open(&args.session)?;
+            let entries = super::rpc_entries::Entries::new(&session);
+            entries.ensure_valid()?;
             let (entry_id, position, target, text) = if name == "fork" {
                 let invalid = || Error::Config("Invalid entry ID for forking".into());
                 let entry = record_id(&request["entryId"]).map_err(|_| invalid())?;
-                if !super::rpc_entries::Entries::new(&session).is_user_message(entry) {
+                if !entries.is_user_message(entry) {
                     return Err(invalid());
                 }
-                let id = super::rpc_entries::editable_record(&session, entry);
+                let id = super::rpc_entries::editable_record(&session, entry)?;
                 let record = session
                     .records()
                     .iter()
@@ -1320,7 +1874,7 @@ fn command_cancellable(
                     _ => return Err(invalid()),
                 }
             } else {
-                if !super::rpc_entries::Entries::new(&session).has_leaf() {
+                if !entries.has_leaf() {
                     return Err(Error::Config(
                         "Cannot clone session: no current entry selected".into(),
                     ));
@@ -1469,7 +2023,7 @@ fn command_cancellable(
             let target = super::rpc_entries::editable_record(
                 session,
                 record_id(request.get("targetId").unwrap_or(&request["target"]))?,
-            );
+            )?;
             let replacement = request
                 .get("replacement")
                 .ok_or_else(|| Error::Config("replacement is required".into()))?;
@@ -1608,8 +2162,15 @@ pub(super) fn snapshot_response(
     match request["type"].as_str().unwrap_or_default() {
         "get_state" => {
             let pending = pending_request();
-            state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
-            state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
+            for record in session.branch() {
+                if let pi_rs::Event::QueueModeSelected { kind, mode } = &record.event {
+                    let key = match kind {
+                        pi_rs::InputKind::Steer => "steeringMode",
+                        pi_rs::InputKind::FollowUp => "followUpMode",
+                    };
+                    state[key] = json!(mode);
+                }
+            }
             state["sessionId"] = json!(session.external_session_id());
             if let Some(name) = session.name() {
                 state["sessionName"] = json!(name);
@@ -1625,6 +2186,14 @@ pub(super) fn snapshot_response(
             Ok(state)
         }
         "get_entries" => {
+            if let Some(since) = request.get("since")
+                && !since.is_string()
+            {
+                return Err(Error::Config(format!(
+                    "Entry not found: {}",
+                    js_command_string(since)?
+                )));
+            }
             let mut result =
                 super::rpc_entries::Entries::new(session).after(request.get("since"))?;
             if request["includeNative"] == true {
@@ -1634,14 +2203,20 @@ pub(super) fn snapshot_response(
             Ok(result)
         }
         "get_tree" => {
-            let mut result = super::rpc_entries::Entries::new(session).tree();
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            let mut result = entries.tree();
             if request["includeNative"] == true {
                 result["nativeTree"] = json!(session_tree(session));
                 result["nativeLeafId"] = json!(session.head().to_string());
             }
             Ok(result)
         }
-        "get_fork_messages" => Ok(super::rpc_entries::Entries::new(session).fork_messages()),
+        "get_fork_messages" => {
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            Ok(entries.fork_messages())
+        }
         "get_last_assistant_text" => Ok(super::rpc_messages::last_assistant_text(session)
             .map_or_else(|| json!({}), |text| json!({"text":text}))),
         "get_messages" => {
@@ -1657,7 +2232,9 @@ pub(super) fn snapshot_response(
         }
         "get_session_stats" => {
             let mut native = session.statistics();
-            super::rpc_entries::Entries::new(session).apply_message_counts(&mut native);
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            entries.apply_message_counts(&mut native);
             let operations = super::sessions::model_operation_usage(session.records());
             native.tokens.input = native.tokens.input.saturating_add(operations.input);
             native.tokens.output = native.tokens.output.saturating_add(operations.output);
@@ -2024,9 +2601,20 @@ fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>
 }
 
 fn session_name(request: &Value) -> Result<String> {
-    let name = request["name"]
-        .as_str()
-        .ok_or_else(|| Error::Config("name is required".into()))?;
+    let name = match request.get("name") {
+        None => {
+            return Err(Error::Config(
+                "Cannot read properties of undefined (reading 'trim')".into(),
+            ));
+        }
+        Some(Value::Null) => {
+            return Err(Error::Config(
+                "Cannot read properties of null (reading 'trim')".into(),
+            ));
+        }
+        Some(Value::String(name)) => name,
+        Some(_) => return Err(Error::Config("command.name.trim is not a function".into())),
+    };
     sessions::validate_name(name).map_err(Error::Config)
 }
 
@@ -2047,6 +2635,7 @@ fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
 }
 
 fn prepare_new_session_draft(args: &mut Cli) -> Result<()> {
+    args.settings.fork_worker_history();
     args.refresh_workspace_selection();
     args.session = if args.no_session {
         args.session
@@ -2063,11 +2652,16 @@ fn finish_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
     }
     let mut session = Session::open(&args.session)?;
     session.set_working_directory(&args.workspace)?;
-    super::backend::initialize_queue_modes(&mut session, args)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
     if let Some(parent) = parent {
         session.set_parent_session(parent)?;
     }
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     super::thinking::adjust(args);
     args.record_automatic_model_selection(&mut session)?;
     Ok(())
@@ -2085,8 +2679,12 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
     }
     drop(session);
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     next.session = path.to_path_buf();
     interactive::restore_workspace(&mut next)?;
+    for warning in next.settings.diagnostics() {
+        eprintln!("{warning}");
+    }
     *args = next;
     Ok(())
 }
@@ -2146,6 +2744,10 @@ fn forward_event(
 ) -> Result<()> {
     let event = extension_error_for_rpc(event);
     match event["type"].as_str() {
+        Some("warning") => {
+            eprintln!("{}", event["message"].as_str().unwrap_or_default());
+            Ok(())
+        }
         Some("response") if event["command"] == "get_commands" => emit_command_catalog(event),
         Some("response")
             if matches!(
@@ -2284,6 +2886,10 @@ fn forward_event(
 }
 
 fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
+    emit(response_value(request, result))
+}
+
+fn response_value(request: &Value, result: Result<Option<Value>>) -> Value {
     let mut value = json!({"type":"response","success":result.is_ok()});
     if let Some(command) = request.get("type") {
         value["command"] = command.clone();
@@ -2297,7 +2903,7 @@ fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
         Err(error) => value["error"] = json!(error.to_string()),
         _ => {}
     }
-    emit(value)
+    value
 }
 
 // The worker sends split UTF-16 units separately because JSON Value and Rust
@@ -2404,6 +3010,153 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn snapshot_state_uses_selected_modes_and_preserves_other_fallbacks() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let state = json!({"steeringMode":"all", "followUpMode":"one-at-a-time"});
+        let request = json!({"type":"get_state"});
+        let path = std::path::Path::new("session.jsonl");
+        let result = snapshot_response(&request, &session, path, None, state.clone()).unwrap();
+        assert_eq!(result["steeringMode"], "all");
+        assert_eq!(result["followUpMode"], "one-at-a-time");
+        session
+            .set_queue_mode(pi_rs::InputKind::Steer, pi_rs::QueueMode::OneAtATime)
+            .unwrap();
+        let result = snapshot_response(&request, &session, path, None, state).unwrap();
+        assert_eq!(result["steeringMode"], "one-at-a-time");
+        assert_eq!(result["followUpMode"], "one-at-a-time");
+    }
+
+    #[test]
+    fn cancelling_transition_responds_in_order_and_clears_deferred_shutdown() {
+        let pending = json!({"type":"new_session", "id":"new"});
+        let mut deferred = std::collections::VecDeque::from([
+            json!({"type":"get_state", "id":"state"}),
+            json!({"type":"shutdown", "id":"stop"}),
+            json!({"type":"prompt", "id":"prompt"}),
+        ]);
+        let mut shutdown_waiting = true;
+        let mut responses = Vec::new();
+        cancel_transition(
+            &pending,
+            &mut deferred,
+            &mut shutdown_waiting,
+            |request, result| {
+                responses.push(response_value(request, result));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            responses,
+            vec![
+                json!({"type":"response", "command":"new_session", "id":"new", "success":true, "data":{"cancelled":true}}),
+                json!({"type":"response", "command":"get_state", "id":"state", "success":false, "error":"session transition cancelled"}),
+                json!({"type":"response", "command":"shutdown", "id":"stop", "success":false, "error":"session transition cancelled"}),
+                json!({"type":"response", "command":"prompt", "id":"prompt", "success":false, "error":"session transition cancelled"}),
+            ]
+        );
+        assert!(deferred.is_empty());
+        assert!(!shutdown_waiting);
+    }
+
+    #[test]
+    fn worker_queue_mode_reconciliation_preserves_unselected_fallbacks() {
+        use pi_rs::{InputKind, QueueMode};
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut steering = QueueMode::OneAtATime;
+        let mut follow_up = QueueMode::OneAtATime;
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::OneAtATime, QueueMode::OneAtATime)
+        );
+
+        session
+            .set_queue_mode(InputKind::Steer, QueueMode::All)
+            .unwrap();
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::All, QueueMode::OneAtATime)
+        );
+
+        session
+            .set_queue_mode(InputKind::Steer, QueueMode::OneAtATime)
+            .unwrap();
+        session
+            .set_queue_mode(InputKind::FollowUp, QueueMode::All)
+            .unwrap();
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::OneAtATime, QueueMode::All)
+        );
+    }
+
+    #[test]
+    fn session_name_type_errors_match_pi() {
+        for (request, expected) in [
+            (
+                json!({}),
+                "Cannot read properties of undefined (reading 'trim')",
+            ),
+            (
+                json!({"name":null}),
+                "Cannot read properties of null (reading 'trim')",
+            ),
+            (json!({"name":42}), "command.name.trim is not a function"),
+            (json!({"name":false}), "command.name.trim is not a function"),
+            (json!({"name":[]}), "command.name.trim is not a function"),
+            (json!({"name":{}}), "command.name.trim is not a function"),
+            (
+                json!({"name":"  \u{feff}  "}),
+                "Session name cannot be empty",
+            ),
+        ] {
+            assert!(
+                matches!(session_name(&request), Err(Error::Config(message)) if message == expected)
+            );
+        }
+        assert_eq!(
+            session_name(&json!({"name":"  example  "})).unwrap(),
+            "example"
+        );
+    }
+
+    #[test]
+    fn get_entries_since_uses_strict_type_and_js_diagnostics() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), Vec::new(), None)
+            .unwrap();
+        let path = std::path::Path::new("session.jsonl");
+        let snapshot =
+            |request: Value| snapshot_response(&request, &session, path, None, json!({}));
+        let entries = snapshot(json!({"type":"get_entries"})).unwrap();
+        let id = entries["entries"][0]["id"].as_str().unwrap();
+        let numeric: u64 = id.parse().expect("native entry id is numeric");
+        assert!(snapshot(json!({"type":"get_entries","since":id})).is_ok());
+        for (value, expected) in [
+            (json!(numeric), format!("Entry not found: {numeric}")),
+            (Value::Null, "Entry not found: null".into()),
+            (
+                json!([1, null, [true, 2], {}]),
+                "Entry not found: 1,,true,2,[object Object]".into(),
+            ),
+            (json!({"x":1}), "Entry not found: [object Object]".into()),
+            (
+                json!({"toString":0}),
+                "Cannot convert object to primitive value".into(),
+            ),
+        ] {
+            assert!(
+                matches!(snapshot(json!({"type":"get_entries","since":value})), Err(Error::Config(message)) if message == expected)
+            );
+        }
+    }
 
     #[test]
     fn command_catalog_encodes_only_recorded_surrogates() {

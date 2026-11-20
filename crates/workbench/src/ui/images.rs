@@ -18,22 +18,25 @@ pub enum Protocol {
     Iterm2,
 }
 fn detect(get: impl Fn(&str) -> Option<String>) -> Option<Protocol> {
-    match get("PI_IMAGE_PROTOCOL").as_deref() {
+    match get("PI_IMAGE_PROTOCOL")
+        .map(|value| value.to_lowercase())
+        .as_deref()
+    {
         Some("kitty") => return Some(Protocol::Kitty),
         Some("iterm2") => return Some(Protocol::Iterm2),
         Some("none" | "0") => return None,
         _ => {}
     }
     let term = get("TERM").unwrap_or_default().to_lowercase();
-    if get("TMUX").is_some() || term.starts_with("tmux") || term.starts_with("screen") {
+    let present = |key| get(key).is_some_and(|value| !value.is_empty());
+    if present("TMUX") || term.starts_with("tmux") || term.starts_with("screen") {
         return None;
     }
     let program = get("TERM_PROGRAM").unwrap_or_default().to_lowercase();
     if matches!(
         program.as_str(),
         "kitty" | "ghostty" | "wezterm" | "warpterminal" | "herdr" | "rex"
-    ) || term.contains("kitty")
-        || term.contains("ghostty")
+    ) || term.contains("ghostty")
         || [
             "KITTY_WINDOW_ID",
             "GHOSTTY_RESOURCES_DIR",
@@ -42,12 +45,12 @@ fn detect(get: impl Fn(&str) -> Option<String>) -> Option<Protocol> {
             "WARP_TERMINAL_SESSION_UUID",
         ]
         .iter()
-        .any(|key| get(key).is_some())
+        .any(|key| present(key))
         || (program == "orca" && get("ORCA_IMAGE_PROTOCOL").as_deref() == Some("kitty"))
     {
         return Some(Protocol::Kitty);
     }
-    (program == "iterm.app" || get("ITERM_SESSION_ID").is_some()).then_some(Protocol::Iterm2)
+    (program == "iterm.app" || present("ITERM_SESSION_ID")).then_some(Protocol::Iterm2)
 }
 static NEXT_ID: LazyLock<AtomicU32> = LazyLock::new(|| {
     AtomicU32::new(
@@ -536,7 +539,30 @@ mod tests {
             from(&[("TMUX", "1"), ("PI_IMAGE_PROTOCOL", "kitty")]),
             Some(Protocol::Kitty)
         );
+        assert_eq!(
+            from(&[("PI_IMAGE_PROTOCOL", "KITTY")]),
+            Some(Protocol::Kitty)
+        );
+        assert_eq!(
+            from(&[("TERM", "xterm-kitty"), ("TERM_PROGRAM", "iTerm.app")]),
+            Some(Protocol::Iterm2)
+        );
+        assert_eq!(from(&[("TERM", "xterm-kitty")]), None);
         assert_eq!(from(&[("TERM_PROGRAM", "unknown")]), None);
+        for key in [
+            "KITTY_WINDOW_ID",
+            "GHOSTTY_RESOURCES_DIR",
+            "WEZTERM_PANE",
+            "WARP_SESSION_ID",
+            "WARP_TERMINAL_SESSION_UUID",
+            "ITERM_SESSION_ID",
+        ] {
+            assert_eq!(from(&[(key, "")]), None, "{key}");
+        }
+        assert_eq!(
+            from(&[("TMUX", ""), ("TERM_PROGRAM", "kitty")]),
+            Some(Protocol::Kitty)
+        );
     }
     #[test]
     fn sizing_and_transcoding_preserve_bounds_and_alpha() {

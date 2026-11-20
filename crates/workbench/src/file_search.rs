@@ -18,6 +18,10 @@ pub(super) struct Grep {
     context: u64,
 }
 impl Grep {
+    pub fn with_numeric_limit(mut self, limit: f64) -> Self {
+        self.output.numeric_limit = Some(limit.max(1.0));
+        self
+    }
     pub fn new(args: &Value, limit: usize) -> Result<Self> {
         let pattern = args["pattern"]
             .as_str()
@@ -104,7 +108,7 @@ impl Grep {
                 cancellation,
             )?;
         }
-        Ok(self.output.matches < self.output.limit)
+        Ok(!self.output.limit_reached())
     }
     pub fn finish(self) -> Outcome {
         let output = self.output;
@@ -114,12 +118,29 @@ impl Grep {
         let text = output.lines.join("\n");
         let mut details = Map::new();
         let mut notices = Vec::new();
-        if output.matches == output.limit {
-            details.insert("matchLimitReached".into(), json!(output.limit));
+        if output.limit_reached() {
+            let effective = output.numeric_limit.unwrap_or(output.limit as f64);
+            details.insert(
+                "matchLimitReached".into(),
+                output
+                    .numeric_limit
+                    .map_or_else(|| json!(output.limit), |n| json!(n)),
+            );
+            let mut first = ryu_js::Buffer::new();
+            let mut second = ryu_js::Buffer::new();
+            let (value, next) = if output.numeric_limit.is_some() {
+                (
+                    first.format(effective).to_owned(),
+                    second.format(effective * 2.0).to_owned(),
+                )
+            } else {
+                (
+                    output.limit.to_string(),
+                    output.limit.saturating_mul(2).to_string(),
+                )
+            };
             notices.push(format!(
-                "{} matches limit reached. Use limit={} for more, or refine pattern",
-                output.limit,
-                output.limit.saturating_mul(2)
+                "{value} matches limit reached. Use limit={next} for more, or refine pattern"
             ));
         }
         if output.total_bytes > MAX_BYTES as u64 {
@@ -171,11 +192,18 @@ struct Output {
     total_lines: u64,
     matches: usize,
     limit: usize,
+    numeric_limit: Option<f64>,
     long_lines: bool,
     kept_bytes: usize,
     prefix_full: bool,
 }
 impl Output {
+    fn limit_reached(&self) -> bool {
+        self.numeric_limit
+            .map_or(self.matches >= self.limit, |limit| {
+                (self.matches as f64) >= limit
+            })
+    }
     fn render(&mut self, display: &str, line: &ContextLine, matched: bool) {
         if self.prefix_full {
             return;
@@ -259,7 +287,7 @@ impl MatchSink<'_> {
             self.output
                 .line(self.display, &ContextLine::new(number, bytes), true);
         }
-        Ok(self.output.matches < self.output.limit)
+        Ok(!self.output.limit_reached())
     }
 }
 impl Sink for MatchSink<'_> {
@@ -616,6 +644,20 @@ fn render_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn numeric_limit_notices_use_javascript_number_formatting() {
+        let mut grep = Grep::new(&json!({"pattern":"match"}), 100)
+            .unwrap()
+            .with_numeric_limit(9_007_199_254_740_992.0);
+        grep.output.matches = 9_007_199_254_740_992;
+        grep.output.lines.push("fixture:1: match".into());
+        let output = grep.finish().tool_content();
+        assert!(
+            output.contains("9007199254740992 matches limit reached. Use limit=18014398509481984")
+        );
+    }
 
     #[test]
     fn single_line_patterns_follow_ripgrep_newline_rules() {
