@@ -122,7 +122,17 @@ pub(crate) struct WokenOwnedGraphEvidence {
     pub root_before_version: u64,
     pub tasks: Vec<crate::task::Task>,
     pub edges: Vec<WokenOwnedEdgeEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<WokenOwnedStructureEvidence>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenOwnedStructureEvidence {
+    pub boundary: u64,
+    pub root_revision: Option<u64>,
+    pub global_revision: Option<u64>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WokenOwnedEdgeEvidence {
@@ -12197,6 +12207,10 @@ impl Harness {
     /// Unsafe owned-conversation descendants also require separate terminal
     /// and identity authentication. Do not use this for callback dispatch.
     #[allow(dead_code)]
+    #[cfg_attr(
+        not(feature = "experimental-graph-revision"),
+        allow(unreachable_code, unused_variables)
+    )]
     pub(crate) fn replay_safe_woken_owned_cleanup_checks(
         &self,
         root: &crate::task_store::StoredTask,
@@ -12218,6 +12232,41 @@ impl Harness {
         {
             return Err(Error::Invalid("owned graph evidence changed".into()));
         }
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        return Err(Error::Invalid("owned graph revision is unavailable".into()));
+        #[cfg(feature = "experimental-graph-revision")]
+        let structure_checks = {
+            let structure = evidence
+                .structure
+                .as_ref()
+                .ok_or_else(|| Error::Invalid("owned graph revision missing".into()))?;
+            let mut checks = Vec::new();
+            for (key, version) in [
+                (
+                    durable_store::graph_revision::task_structure_revision(root.task.id()),
+                    structure.root_revision,
+                ),
+                (
+                    durable_store::graph_revision::global_structure_revision(),
+                    structure.global_revision,
+                ),
+            ] {
+                let current = store.get(&key)?.map(|entry| entry.version);
+                if current != version {
+                    return Err(Error::Invalid("owned graph structure changed".into()));
+                }
+                checks.push(Check {
+                    key,
+                    expected: version.map_or(
+                        Expected::MissingUnchangedSince(structure.boundary),
+                        Expected::Version,
+                    ),
+                });
+            }
+            checks
+        };
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        let structure_checks: Vec<Check> = Vec::new();
         let graph_commit = store
             .commit_for_version(&evidence_key, evidence_entry.version)?
             .ok_or_else(|| Error::Invalid("untracked graph evidence".into()))?;
@@ -12267,6 +12316,7 @@ impl Harness {
                 expected: Expected::Version(root.version),
             },
         ];
+        checks.extend(structure_checks);
         while let Some((task, through_conversation)) = tasks.pop() {
             if !seen_tasks.insert(task) {
                 return Err(Error::Invalid("owned graph cycle".into()));
@@ -15577,6 +15627,31 @@ impl Harness {
                 let mut graph_tasks: Vec<_> =
                     tasks.iter().map(|id| by_id[id].task.clone()).collect();
                 graph_tasks.sort_by_key(|task| task.id());
+                #[cfg(feature = "experimental-graph-revision")]
+                let structure = {
+                    let root_key =
+                        durable_store::graph_revision::task_structure_revision(root.task.id());
+                    let global_key = durable_store::graph_revision::global_structure_revision();
+                    let root_revision = store.get(&root_key)?.map(|entry| entry.version);
+                    let global_revision = store.get(&global_key)?.map(|entry| entry.version);
+                    for (key, version) in [(root_key, root_revision), (global_key, global_revision)]
+                    {
+                        batch.checks.push(Check {
+                            key,
+                            expected: version.map_or(
+                                Expected::MissingUnchangedSince(graph_version),
+                                Expected::Version,
+                            ),
+                        });
+                    }
+                    Some(WokenOwnedStructureEvidence {
+                        boundary: graph_version,
+                        root_revision,
+                        global_revision,
+                    })
+                };
+                #[cfg(not(feature = "experimental-graph-revision"))]
+                let structure = None;
                 let evidence = WokenOwnedGraphEvidence {
                     version: 1,
                     root: root.task.id(),
@@ -15587,6 +15662,7 @@ impl Harness {
                     root_before_version: root.version,
                     tasks: graph_tasks,
                     edges,
+                    structure,
                 };
                 let key = woken_owned_graph_key(root.task.id());
                 batch.checks.push(Check {

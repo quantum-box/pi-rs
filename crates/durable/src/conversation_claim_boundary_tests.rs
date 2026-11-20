@@ -7869,15 +7869,20 @@ async fn live_woken_root_drains_any_loser_before_cancel() {
 
 #[tokio::test]
 async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_together() {
-    exercise_woken_owned_graph_receipt(false).await;
+    exercise_woken_owned_graph_receipt(false, false).await;
 }
 
 #[tokio::test]
 async fn owned_cleanup_receipt_conflict_preserves_abort_and_marker() {
-    exercise_woken_owned_graph_receipt(true).await;
+    exercise_woken_owned_graph_receipt(true, false).await;
 }
 
-async fn exercise_woken_owned_graph_receipt(conflict: bool) {
+#[tokio::test]
+async fn owned_graph_child_aba_requires_scoped_revision() {
+    exercise_woken_owned_graph_receipt(false, true).await;
+}
+
+async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: bool) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -8112,34 +8117,116 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool) {
         .unwrap()
         .unwrap();
     assert!(start_commit < receipt_commit);
-    let checks = harness
-        .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
-        .unwrap();
-    store.commit(&checks, &[]).unwrap();
-    // Even a byte-identical replacement changes the edge authority.
-    let edge_key = crate::ownership_edge::edge_key(conversation);
-    let edge = store.get(&edge_key).unwrap().unwrap();
-    store
-        .commit(
-            &[durable_store::Check {
-                key: edge_key.clone(),
-                expected: durable_store::Expected::Version(edge.version),
-            }],
-            &[durable_store::Mutation::Put {
-                key: edge_key,
-                value: edge.value,
-            }],
-        )
-        .unwrap();
-    assert!(matches!(
-        store.commit(&checks, &[]),
-        Err(durable_store::Error::Conflict { .. })
-    ));
+    #[cfg(not(feature = "experimental-graph-revision"))]
     assert!(
         harness
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .is_err()
     );
+    #[cfg(feature = "experimental-graph-revision")]
+    {
+        // Normal cleanup state changes and a different graph must not
+        // invalidate this graph's structural revision.
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let child = tasks
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.task.owner() == &crate::task::TaskOwner::Task(root.task.id())
+                    && !item.task.is_terminal()
+            })
+            .unwrap();
+        tasks.update(&child, |task| task.cancel()).unwrap();
+        let unrelated = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let unrelated_task = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(unrelated),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        tasks
+            .save(&[crate::task_store::Save::Create(&unrelated_task)])
+            .unwrap();
+        let checks = harness
+            .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+            .unwrap();
+        store.commit(&checks, &[]).unwrap();
+        if graph_aba {
+            let child = crate::task::Task::new(
+                uuid::Uuid::new_v4(),
+                crate::task::TaskOwner::Conversation(conversation),
+                crate::task::Checkpoint {
+                    phase: "initial".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("legacy-child".into(), true);
+            let key = crate::task_store::key(child.id());
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&child).unwrap(),
+                    }],
+                )
+                .unwrap();
+            let entry = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Delete { key }],
+                )
+                .unwrap();
+        } else {
+            // Even a byte-identical replacement changes edge authority.
+            let edge_key = crate::ownership_edge::edge_key(conversation);
+            let edge = store.get(&edge_key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: edge_key.clone(),
+                        expected: durable_store::Expected::Version(edge.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: edge_key,
+                        value: edge.value,
+                    }],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            harness
+                .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+                .is_err()
+        );
+    }
+    #[cfg(not(feature = "experimental-graph-revision"))]
+    let _ = graph_aba;
     drop(store);
     drop(harness);
     let options = Options {
