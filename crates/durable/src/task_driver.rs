@@ -6071,6 +6071,367 @@ mod tests {
     }
 
     #[test]
+    fn ancestry_marker_defers_queued_wake_while_other_graph_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (other_tx, other_rx) = mpsc::channel();
+        let (root_tx, root_rx) = mpsc::channel();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("root", true, move |_: &Task| {
+            root_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        registry.register("other", true, move |_: &Task| {
+            other_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("other")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let conversation = Uuid::new_v4();
+        let root_id = Uuid::new_v4();
+        let leaf_id = Uuid::new_v4();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let mut root = Task::new(
+            root_id,
+            TaskOwner::Conversation(conversation),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("root".into(), true);
+        let mut leaf = Task::new(leaf_id, TaskOwner::Task(root_id), checkpoint.clone(), 3)
+            .unwrap()
+            .registered("root".into(), true);
+        for task in [&mut root, &mut leaf] {
+            task.start().unwrap();
+            task.wait(crate::task::WaitFor::Sleep {
+                until_millis: None,
+                signals: vec!["wake".into()],
+            })
+            .unwrap();
+        }
+        let other = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        let tasks = TaskStore::new(owner.store());
+        tasks
+            .save(&[
+                Save::Create(&root),
+                Save::Create(&leaf),
+                Save::Create(&other),
+            ])
+            .unwrap();
+        tasks
+            .send_signal(&Signal::new(
+                Uuid::new_v4(),
+                root_id,
+                "wake".into(),
+                json!(1),
+            ))
+            .unwrap();
+        let (chain, start) = task_store::prepare_callback_start_ancestry_fence(
+            owner.store(),
+            leaf_id,
+            conversation,
+            b"claim",
+        )
+        .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        other_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated graph did not run");
+        assert!(matches!(
+            driver.get(root_id).unwrap().unwrap().state(),
+            crate::task::TaskState::Waiting(_)
+        ));
+        assert!(root_rx.try_recv().is_err());
+        let finish =
+            task_store::prepare_callback_finish_ancestry_fence(owner.store(), &chain, b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        driver.shared.notify_work();
+        root_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("queued wake did not resume");
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    #[test]
+    fn ancestry_marker_kill_worker() {
+        let Some(dir) = std::env::var_os("PI_ANCESTRY_MARKER_KILL_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.join("db"), Default::default()).unwrap();
+        let owner = scheduler.owner();
+        let conversation = Uuid::from_u128(901);
+        let ids = [
+            Uuid::from_u128(902),
+            Uuid::from_u128(903),
+            Uuid::from_u128(904),
+        ];
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let mut root = Task::new(
+            ids[0],
+            TaskOwner::Conversation(conversation),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap();
+        let mut child = Task::new(ids[1], TaskOwner::Task(ids[0]), checkpoint.clone(), 3).unwrap();
+        let mut leaf = Task::new(ids[2], TaskOwner::Task(ids[1]), checkpoint, 3).unwrap();
+        for task in [&mut root, &mut child, &mut leaf] {
+            task.start().unwrap();
+            task.wait(crate::task::WaitFor::Sleep {
+                until_millis: None,
+                signals: vec!["wake".into()],
+            })
+            .unwrap();
+        }
+        TaskStore::new(owner.store())
+            .save(&[
+                Save::Create(&root),
+                Save::Create(&child),
+                Save::Create(&leaf),
+            ])
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        let (chain, batch) = task_store::prepare_callback_start_ancestry_fence(
+            owner.store(),
+            ids[2],
+            conversation,
+            b"persisted-claim",
+        )
+        .unwrap();
+        owner
+            .store()
+            .commit(&batch.checks, &batch.mutations)
+            .unwrap();
+        std::fs::write(dir.join("ready"), serde_json::to_vec(&chain).unwrap()).unwrap();
+        loop {
+            std::hint::black_box(&driver);
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn ancestry_markers_survive_process_kill_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "task_driver::tests::ancestry_marker_kill_worker"])
+            .env("PI_ANCESTRY_MARKER_KILL_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = dir.path().join("ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(child.try_wait().unwrap().is_none(), "marker worker exited");
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("marker worker timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let chain: Vec<Uuid> = serde_json::from_slice(&std::fs::read(ready).unwrap()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), Default::default()).unwrap();
+        let owner = scheduler.owner();
+        let driver = Driver::start(scheduler);
+        for &id in &chain {
+            assert!(matches!(
+                driver.signal(&Signal::new(Uuid::new_v4(), id, "wake".into(), json!(1))),
+                Err(Error::Task(task_scheduler::Error::Store(
+                    task_store::Error::CallbackStartBusy
+                )))
+            ));
+        }
+        let finish = task_store::prepare_callback_finish_ancestry_fence(
+            owner.store(),
+            &chain,
+            b"persisted-claim",
+        )
+        .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                chain[0],
+                "non-waking".into(),
+                json!(1),
+            ))
+            .unwrap();
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    #[test]
+    fn ancestry_start_markers_fence_driver_abort_and_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("waiting", true, |_: &Task| {
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let conversation = Uuid::new_v4();
+        let root_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let leaf_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let waiting = |id, parent| {
+            let mut task = Task::new(id, parent, checkpoint.clone(), 3)
+                .unwrap()
+                .registered("waiting".into(), true);
+            task.start().unwrap();
+            task.wait(crate::task::WaitFor::Sleep {
+                until_millis: None,
+                signals: vec!["wake".into()],
+            })
+            .unwrap();
+            task
+        };
+        let root = waiting(root_id, TaskOwner::Conversation(conversation));
+        let child = waiting(child_id, TaskOwner::Task(root_id));
+        let leaf = waiting(leaf_id, TaskOwner::Task(child_id));
+        let other = waiting(other_id, TaskOwner::Conversation(Uuid::new_v4()));
+        TaskStore::new(owner.store())
+            .save(&[
+                Save::Create(&root),
+                Save::Create(&child),
+                Save::Create(&leaf),
+                Save::Create(&other),
+            ])
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        let (chain, stale) = task_store::prepare_callback_start_ancestry_fence(
+            owner.store(),
+            leaf_id,
+            conversation,
+            b"claim",
+        )
+        .unwrap();
+        assert!(
+            task_store::prepare_callback_start_ancestry_fence(
+                owner.store(),
+                leaf_id,
+                Uuid::new_v4(),
+                b"claim"
+            )
+            .is_err()
+        );
+        assert_eq!(chain, vec![leaf_id, child_id, root_id]);
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                root_id,
+                "unrelated-signal".into(),
+                json!(1),
+            ))
+            .unwrap();
+        assert!(matches!(
+            owner.store().commit(&stale.checks, &stale.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        for id in &chain {
+            assert!(
+                owner
+                    .store()
+                    .get(&task_store::callback_start_key(*id))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let (chain, start) = task_store::prepare_callback_start_ancestry_fence(
+            owner.store(),
+            leaf_id,
+            conversation,
+            b"claim",
+        )
+        .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        for &id in &chain {
+            assert!(matches!(
+                driver.signal(&Signal::new(Uuid::new_v4(), id, "blocked".into(), json!(1))),
+                Err(Error::Task(task_scheduler::Error::Store(
+                    task_store::Error::CallbackStartBusy
+                )))
+            ));
+            assert!(matches!(
+                driver.request_abort(id),
+                Err(Error::Task(task_scheduler::Error::Busy))
+            ));
+        }
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                other_id,
+                "other".into(),
+                json!(1),
+            ))
+            .unwrap();
+        assert!(
+            task_store::prepare_callback_finish_ancestry_fence(owner.store(), &chain, b"other")
+                .is_err()
+        );
+        assert!(
+            task_store::prepare_callback_finish_ancestry_fence(
+                owner.store(),
+                &[leaf_id, leaf_id],
+                b"claim"
+            )
+            .is_err()
+        );
+        let finish =
+            task_store::prepare_callback_finish_ancestry_fence(owner.store(), &chain, b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                leaf_id,
+                "wake".into(),
+                json!(1),
+            ))
+            .unwrap();
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    #[test]
     fn task_start_marker_fences_driver_abort_until_retired() {
         let dir = tempfile::tempdir().unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();

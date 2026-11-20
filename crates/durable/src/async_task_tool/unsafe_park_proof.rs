@@ -421,12 +421,41 @@ pub(crate) fn cancel_checks_with_attempt(
     task: &Task,
     boundary: u64,
 ) -> Result<(Vec<Check>, Option<Uuid>), String> {
-    if task.checkpoint().phase != "replay-safe-async-wait" || task.replay_safe() {
-        return Err("unsafe cancel requires a committed park".into());
-    }
     let woken_enabled = task
         .kind()
         .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken."));
+    cancel_checks_with_policy(store, task, boundary, woken_enabled)
+}
+
+/// Capture evidence for one interrupted woken execution. This only proves the
+/// original park, prepared arguments and absence of a joined outcome; callers
+/// must separately authorize the registration, owner, abort and callback and
+/// commit all returned checks atomically. It never authorizes dispatch itself.
+pub(crate) fn woken_cancel_candidate_checks(
+    store: &Store,
+    task: &Task,
+    boundary: u64,
+) -> Result<(Uuid, Vec<Check>), String> {
+    if task.state() != &TaskState::Running || task.abort_requested() || task.replay_safe() {
+        return Err("invalid interrupted woken execution".into());
+    }
+    let expected = task.attempt_id().ok_or("missing woken attempt")?;
+    let (checks, target) = cancel_checks_with_policy(store, task, boundary, true)?;
+    if target != Some(expected) {
+        return Err("woken attempt does not match the interrupted task".into());
+    }
+    Ok((expected, checks))
+}
+
+fn cancel_checks_with_policy(
+    store: &Store,
+    task: &Task,
+    boundary: u64,
+    woken_enabled: bool,
+) -> Result<(Vec<Check>, Option<Uuid>), String> {
+    if task.checkpoint().phase != "replay-safe-async-wait" || task.replay_safe() {
+        return Err("unsafe cancel requires a committed park".into());
+    }
     let mut checks = park_checks(store, task, false, woken_enabled)?;
     let park_entry = store
         .get(&key(task.id()))

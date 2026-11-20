@@ -16495,6 +16495,81 @@ mod tests {
         );
     }
     #[test]
+    fn woken_cancel_candidate_late_receipt_invalidates_checked_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("woken-case"), b"yes").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("async_task_tool::tests::unsafe_woken_cancel_process_fixture")
+            .env("PI_UNSAFE_WOKEN_CANCEL_FIXTURE", root)
+            .env("PI_TEST_PARK_CANCEL_WAKE", root)
+            .spawn()
+            .unwrap();
+        wait_file(&root.join("wake-running"));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let id: Uuid = std::fs::read_to_string(root.join("task-id"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let running = crate::task_store::TaskStore::new(&store)
+            .load(id)
+            .unwrap()
+            .unwrap();
+        let (target, checks) = unsafe_park_proof::woken_cancel_candidate_checks(
+            &store,
+            &running.task,
+            store.put_version().unwrap(),
+        )
+        .unwrap();
+        let key = format!("durable/unsafe-park-async/{id}/{target}/intent/receipt").into_bytes();
+        let receipt = UnsafeDurableReceipt {
+            task_id: id,
+            attempt_id: target,
+            outcome: Outcome::Pending {
+                reference: "late-job".into(),
+            },
+        };
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Missing,
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&receipt).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            unsafe_park_proof::woken_cancel_candidate_checks(
+                &store,
+                &running.task,
+                store.put_version().unwrap()
+            )
+            .is_err()
+        );
+        drop(store);
+        let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
+        let driver = host.into_driver();
+        assert!(matches!(
+            wait_terminal(&driver, id).state(),
+            crate::task::TaskState::Failed(_)
+        ));
+        let _ = driver.shutdown_with_pending().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        assert!(read_unsafe_durable_receipts(&store, id).unwrap().iter().any(|value| matches!(&value.outcome, Outcome::Pending { reference } if reference == "late-job")));
+        assert!(!root.join("cancel-count").exists());
+    }
+
+    #[test]
     fn unsafe_woken_cancel_rejects_changed_attempt_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -16514,6 +16589,16 @@ mod tests {
             .parse()
             .unwrap();
         let store = durable_store::Store::open(root.join("db")).unwrap();
+        let running = crate::task_store::TaskStore::new(&store)
+            .load(id)
+            .unwrap()
+            .unwrap();
+        let boundary = store.put_version().unwrap();
+        let (target, checks) =
+            unsafe_park_proof::woken_cancel_candidate_checks(&store, &running.task, boundary)
+                .unwrap();
+        assert_eq!(Some(target), running.task.attempt_id());
+        store.commit(&checks, &[]).unwrap();
         let prefix = format!("durable/unsafe-park-async/{id}/");
         for (key, entry) in store.list(prefix.as_bytes()).unwrap() {
             if !key.ends_with(b"/intent") {
@@ -16537,6 +16622,18 @@ mod tests {
                 break;
             }
         }
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            unsafe_park_proof::woken_cancel_candidate_checks(
+                &store,
+                &running.task,
+                store.put_version().unwrap(),
+            )
+            .is_err()
+        );
         drop(store);
         let (host, _) = unsafe_park_cancel_host_inner(root, false, None, true);
         let driver = host.into_driver();

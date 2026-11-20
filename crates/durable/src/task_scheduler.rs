@@ -3284,12 +3284,16 @@ impl AdmissionHandle<'_> {
             &marker,
         )
         .map_err(|e| e.to_string())?;
-        let task_start = task_store::prepare_callback_start_task_fence(
+        let (ancestry, task_start) = task_store::prepare_callback_start_ancestry_fence(
             owner.store(),
             current.task.id(),
+            *conversation,
             &marker,
         )
         .map_err(|e| e.to_string())?;
+        if ancestry.as_slice() != [current.task.id()] {
+            return Err("nested conversation cancel is not enabled".into());
+        }
         checks.extend(conversation_start.checks);
         checks.extend(task_start.checks);
         let mut mutations = conversation_start.mutations;
@@ -3571,9 +3575,9 @@ impl AdmissionHandle<'_> {
                     marker,
                 )
                 .map_err(|e| e.to_string())?;
-            let task_finish = task_store::prepare_callback_finish_task_fence(
+            let task_finish = task_store::prepare_callback_finish_ancestry_fence(
                 owner.store(),
-                current.task.id(),
+                &[current.task.id()],
                 marker,
             )
             .map_err(|e| e.to_string())?;
@@ -3668,9 +3672,9 @@ impl AdmissionHandle<'_> {
             marker,
         )
         .map_err(|e| e.to_string())?;
-        let task_finish = task_store::prepare_callback_finish_task_fence(
+        let task_finish = task_store::prepare_callback_finish_ancestry_fence(
             owner.store(),
-            current.task.id(),
+            &[current.task.id()],
             marker,
         )
         .map_err(|e| e.to_string())?;
@@ -10660,12 +10664,12 @@ impl Scheduler {
                         continue;
                     }
                     let proof =
-                        crate::async_task_tool::unsafe_park_proof::cancel_checks_with_attempt(
+                        crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
                             owner.store(),
                             &item.task,
                             boundary,
                         );
-                    if let (Ok((mut checks, Some(target))), Ok(owner_checks)) =
+                    if let (Ok((target, mut checks)), Ok(owner_checks)) =
                         (proof, interrupted_owner_checks(owner.store(), &item.task))
                         && item.task.attempt_id() == Some(target)
                     {

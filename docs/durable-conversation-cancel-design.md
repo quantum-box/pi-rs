@@ -1,5 +1,38 @@
 # Conversation-owned external cancellation: integration notes
 
+## Nested and woken cancellation groundwork
+
+Upstream `origin/main` at `edfe6b2ef32283d31efc9e26db86fe48be19d3b2`
+uses the same ToolTask cancellation path for nested calls and for a woken
+execution interrupted after intent. It passes the last parked checkpoint and
+prepared arguments, disallows nested work from `cancel`, and runs abort or
+interruption after hooks where applicable. `packages/durable` is unchanged
+from the local `9cd49d2c00ac446f774b878d25923bdb3739dadd` reference.
+
+The task store can prepare callback-start markers for an exact child-to-root
+task ancestry in one checked batch. It checks each task version and signal
+revision; public task signals and aborts for the marked chain are fenced, while
+another graph can continue. The existing root callback uses the same machinery
+with a one-task chain. The returned ancestry is provisional evidence: a future
+child callback implementation must persist and validate the complete chain in
+the same claim, retain the conversation and identity start leases through first
+poll, and retire the exact recorded markers with its receipt. A finish batch
+does not independently authenticate a substituted subset of the chain.
+
+Nested callback dispatch remains disabled. In particular, a callback that
+reenters an ancestor via a separate async task needs scoped self-wait detection;
+marker recovery and an ancestor abort racing first poll also need complete
+coverage. Woken conversation cancellation remains disabled: the immutable claim
+and receipt must bind the interrupted wake attempt to its original park,
+prepared arguments and missing late outcome, and a successful cancel must not
+turn the interrupted Tool execution into a known successful result.
+
+Woken-cancel preparation exposes checked evidence for the exact running attempt
+and reuses it in standalone recovery. The checks bind the original park and
+prepared arguments and fence joined outcomes. They do not authorize a callback:
+conversation owner, registration, abort and claim/receipt evidence must still
+be joined to the same transaction.
+
 ## Opt-in first-poll dispatch
 
 `register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel`
