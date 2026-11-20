@@ -876,6 +876,7 @@ struct ConversationAbortMemo<'a, 'b> {
     expected_identity: &'a str,
     marker: &'a [u8],
     snapshot: &'a durable_store::Check,
+    nested: bool,
     failed: Mutex<bool>,
 }
 impl ConversationAbortMemo<'_, '_> {
@@ -897,6 +898,7 @@ impl ConversationAbortMemo<'_, '_> {
             self.snapshot,
             key,
             value,
+            self.nested,
         );
         if result.is_err() {
             *failed = true;
@@ -1843,10 +1845,12 @@ impl Handler for Executor {
                     expected,
                     cancel.conversation_cancel_policy(),
                 )?;
+                let mut after_arguments = None;
                 let result = if let Some((conversation, start)) = start {
                     let stored: ParkCheckpoint =
                         serde_json::from_value(task.checkpoint().data.clone())
                             .map_err(|_| "invalid park")?;
+                    after_arguments = Some(stored.arguments.clone());
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1869,11 +1873,14 @@ impl Handler for Executor {
                                 scope,
                             );
                             let mut future = std::pin::pin!(future);
-                            let mut lease = Some(start);
+                            let mut lease = Some((start, selection_start));
                             tokio::time::timeout(
                                 std::time::Duration::from_secs(10),
                                 std::future::poll_fn(|cx| match lease.take() {
-                                    Some(lease) => lease.poll_first(future.as_mut(), cx),
+                                    Some((lease, Some(selection))) => {
+                                        selection.poll_first(lease, future.as_mut(), cx)
+                                    }
+                                    Some((lease, None)) => lease.poll_first(future.as_mut(), cx),
                                     None => future.as_mut().poll(cx),
                                 }),
                             )
@@ -1885,31 +1892,81 @@ impl Handler for Executor {
                 } else {
                     "test evidence only"
                 };
+                let (after_result, snapshot_check) = if self.block_results && real_callback {
+                    let (snapshot, check) = admission.nested_conversation_cancel_hook_snapshot()?;
+                    let memo = ConversationAbortMemo {
+                        admission,
+                        handler: self,
+                        claim: &claim,
+                        identity: &_identity_lease,
+                        expected_identity: expected,
+                        marker: &marker,
+                        snapshot: &check,
+                        nested: true,
+                        failed: Mutex::new(false),
+                    };
+                    let result = self.conversation_cancel_after_result(
+                        task,
+                        after_arguments.ok_or("missing arguments")?,
+                        snapshot,
+                        &memo,
+                    )?;
+                    (Some(result), Some(check))
+                } else {
+                    (None, None)
+                };
                 let receipt = crate::task_scheduler::ConversationCancelReceipt {
-                    version: 1,
+                    version: if after_result.is_some() { 2 } else { 1 },
                     claim,
                     result: result.into(),
-                    after_result: None,
+                    after_result,
                 };
-                if admission
-                    .store_nested_conversation_cancel_receipt_and_retire(
+                if let Some(check) = snapshot_check.as_ref() {
+                    if admission
+                        .store_nested_conversation_cancel_receipt_and_after(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            b"wrong-marker",
+                            check,
+                        )
+                        .is_ok()
+                    {
+                        return Err("substituted nested marker accepted".into());
+                    }
+                    admission.store_nested_conversation_cancel_receipt_and_after(
                         self,
                         &receipt,
                         &_identity_lease,
                         expected,
-                        b"wrong-marker",
-                    )
-                    .is_ok()
-                {
-                    return Err("substituted nested marker accepted".into());
+                        &marker,
+                        check,
+                    )?;
+                } else {
+                    if admission
+                        .store_nested_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            b"wrong-marker",
+                        )
+                        .is_ok()
+                    {
+                        return Err("substituted nested marker accepted".into());
+                    }
+                    admission.store_nested_conversation_cancel_receipt_and_retire(
+                        self,
+                        &receipt,
+                        &_identity_lease,
+                        expected,
+                        &marker,
+                    )?;
                 }
-                admission.store_nested_conversation_cancel_receipt_and_retire(
-                    self,
-                    &receipt,
-                    &_identity_lease,
-                    expected,
-                    &marker,
-                )?;
+                if crate::task_scheduler::take_test_nested_success(task.id()) {
+                    return Ok(Step::Succeed(serde_json::Value::Null));
+                }
                 return Err("nested claim probe complete; reconciliation required".into());
             }
             let _claim = admission
@@ -2130,6 +2187,7 @@ impl Handler for Executor {
                                 expected_identity: expected,
                                 marker: &marker,
                                 snapshot: &check,
+                                nested: false,
                                 failed: Mutex::new(false),
                             };
                             self.conversation_cancel_after_result(

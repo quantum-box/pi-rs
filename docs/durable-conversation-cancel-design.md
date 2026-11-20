@@ -312,4 +312,9 @@ a process killed during callback leaves its claim and ancestor markers durable.
 On real-driver reopen, the original interrupted cleanup is failed for
 reconciliation and its authenticated markers are retired atomically; the
 callback is not rerun. This path is not enabled in production. In particular,
-nested success evidence, parent settlement and selected hooks remain unconnected.
+parent settlement does not yet consume a successful child. A test-only path
+commits the cancelled child and its terminal evidence together; a late Tool
+receipt arriving at settlement forces reconciliation. A selected-child test
+also pins selection through first poll and runs the replay-safe after hook with
+fenced memo before its version-2 receipt. These paths are not enabled in
+production.

@@ -385,6 +385,10 @@ fn validate_nested_cancel_terminal_evidence(
     validate_conversation_cancel_receipt(receipt, claim)
 }
 
+fn nested_cancel_terminal_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/nested-cancel-terminal-v1").into_bytes()
+}
+
 pub(crate) fn conversation_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-terminal").into_bytes()
 }
@@ -1815,6 +1819,20 @@ pub(crate) fn enable_test_nested_claim(id: Uuid) {
 #[cfg(test)]
 pub(crate) fn take_test_nested_claim(id: Uuid) -> bool {
     test_nested_claim_tasks().lock().unwrap().remove(&id)
+}
+
+#[cfg(test)]
+fn test_nested_success_tasks() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn enable_test_nested_success(id: Uuid) {
+    test_nested_success_tasks().lock().unwrap().insert(id);
+}
+#[cfg(test)]
+pub(crate) fn take_test_nested_success(id: Uuid) -> bool {
+    test_nested_success_tasks().lock().unwrap().remove(&id)
 }
 
 #[cfg(test)]
@@ -3634,6 +3652,39 @@ impl AdmissionHandle<'_> {
         ))
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn nested_conversation_cancel_hook_snapshot(
+        &self,
+    ) -> Result<(Value, durable_store::Check), String> {
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let (conversation, _) = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_nested_cancel_conversation_checks(
+                &self.running.task,
+                &definitions.registry,
+            )
+            .map_err(|e| e.to_string())?;
+        let key = crate::runtime::Harness::key(conversation);
+        let entry = self
+            .lease
+            .attachment
+            .owner
+            .store()
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing conversation")?;
+        let snapshot = serde_json::from_slice(&entry.value)
+            .map_err(|e| format!("invalid conversation snapshot: {e}"))?;
+        Ok((
+            snapshot,
+            durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(entry.version),
+            },
+        ))
+    }
+
     pub(crate) fn conversation_cancel_hook_memo(
         &self,
         handler: &dyn Handler,
@@ -3644,6 +3695,7 @@ impl AdmissionHandle<'_> {
         snapshot_check: &durable_store::Check,
         key: &str,
         value: Option<Value>,
+        nested: bool,
     ) -> Result<Option<Value>, String> {
         if key.is_empty() || key.len() > 4096 {
             return Err("invalid memo key".into());
@@ -3662,7 +3714,7 @@ impl AdmissionHandle<'_> {
             Some(marker),
             Some(snapshot_check),
             Some((key, value)),
-            false,
+            nested,
         )
     }
 
@@ -3684,6 +3736,32 @@ impl AdmissionHandle<'_> {
             expected_identity,
             Some(marker),
             None,
+            None,
+            true,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn store_nested_conversation_cancel_receipt_and_after(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        snapshot_check: &durable_store::Check,
+    ) -> Result<(), String> {
+        if receipt.version != 2 || receipt.after_result.is_none() {
+            return Err("missing cancel after evidence".into());
+        }
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            Some(marker),
+            Some(snapshot_check),
             None,
             true,
         )
@@ -7881,15 +7959,31 @@ impl Scheduler {
                             {
                                 return Err(Error::Ownership);
                             }
-                            let mut checks = self
-                                .validator
-                                .as_ref()
-                                .ok_or(Error::Ownership)?
-                                .checkpointable_cancel_conversation_checks(
-                                    &running.task,
-                                    &self.registry,
-                                )
-                                .map_err(|e| Error::Handler(e.to_string()))?;
+                            let harness = self.validator.as_ref().ok_or(Error::Ownership)?;
+                            let nested_conversation =
+                                if matches!(running.task.owner(), TaskOwner::Task(_)) {
+                                    Some(
+                                        harness
+                                            .checkpointable_nested_cancel_conversation_checks(
+                                                &running.task,
+                                                &self.registry,
+                                            )
+                                            .map_err(|e| Error::Handler(e.to_string()))?,
+                                    )
+                                } else {
+                                    None
+                                };
+                            let mut checks = if let Some((_, checks)) = nested_conversation.as_ref()
+                            {
+                                checks.clone()
+                            } else {
+                                harness
+                                    .checkpointable_cancel_conversation_checks(
+                                        &running.task,
+                                        &self.registry,
+                                    )
+                                    .map_err(|e| Error::Handler(e.to_string()))?
+                            };
                             let park_checks =
                                 crate::async_task_tool::unsafe_park_proof::cancel_checks(
                                     store,
@@ -7964,6 +8058,91 @@ impl Scheduler {
                                 key: receipt_key,
                                 expected: durable_store::Expected::Version(entry.version),
                             });
+                            if let Some((conversation, _)) = &nested_conversation {
+                                let (
+                                    saved_conversation,
+                                    ancestry,
+                                    ancestry_checks,
+                                    ancestry_version,
+                                ) = task_store::read_nested_cancel_claim_ancestry(
+                                    store,
+                                    running.task.id(),
+                                    claim.claim_id,
+                                )?;
+                                if *conversation != saved_conversation {
+                                    return Err(Error::Ownership);
+                                }
+                                let ancestry_key = format!(
+                                    "durable/task-callback-claim-ancestry/{}",
+                                    running.task.id()
+                                )
+                                .into_bytes();
+                                let claim_key = conversation_cancel_claim_key(running.task.id());
+                                let claim_entry = store
+                                    .get(&claim_key)
+                                    .map_err(task_store::Error::from)?
+                                    .ok_or(Error::Ownership)?;
+                                let claim_commit = store
+                                    .commit_for_version(&claim_key, claim_entry.version)
+                                    .map_err(task_store::Error::from)?;
+                                let ancestry_commit = store
+                                    .commit_for_version(&ancestry_key, ancestry_version)
+                                    .map_err(task_store::Error::from)?;
+                                if claim_commit.is_none() || claim_commit != ancestry_commit {
+                                    return Err(Error::Ownership);
+                                }
+                                batch.checks.extend(ancestry_checks);
+                                for id in &ancestry {
+                                    let key =
+                                        format!("durable/task-callback-start/{id}").into_bytes();
+                                    if store.get(&key).map_err(task_store::Error::from)?.is_some() {
+                                        return Err(Error::Ownership);
+                                    }
+                                    batch.checks.push(durable_store::Check {
+                                        key,
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                                let conversation_marker =
+                                    format!("runtime/conversation-callback-start/{conversation}")
+                                        .into_bytes();
+                                if store
+                                    .get(&conversation_marker)
+                                    .map_err(task_store::Error::from)?
+                                    .is_some()
+                                {
+                                    return Err(Error::Ownership);
+                                }
+                                batch.checks.push(durable_store::Check {
+                                    key: conversation_marker,
+                                    expected: durable_store::Expected::Missing,
+                                });
+                                let identity = reg
+                                    .conversation_checkpointable
+                                    .as_ref()
+                                    .ok_or(Error::Ownership)?
+                                    .0
+                                    .clone();
+                                let evidence = NestedCancelTerminalEvidence {
+                                    version: 1,
+                                    conversation: *conversation,
+                                    ancestry,
+                                    claim: claim.clone(),
+                                    identity,
+                                    receipt_version: entry.version,
+                                    terminal_task: next.task.clone(),
+                                };
+                                let evidence_key = nested_cancel_terminal_key(running.task.id());
+                                batch.checks.push(durable_store::Check {
+                                    key: evidence_key.clone(),
+                                    expected: durable_store::Expected::Missing,
+                                });
+                                batch.mutations.push(durable_store::Mutation::Put {
+                                    key: evidence_key,
+                                    value: serde_json::to_vec(&evidence)
+                                        .map_err(|e| Error::Handler(e.to_string()))?,
+                                });
+                            }
                             if selected_hooks {
                                 let terminal_key =
                                     conversation_cancel_terminal_key(running.task.id());
