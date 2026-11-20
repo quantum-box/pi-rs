@@ -668,7 +668,7 @@ mod owned_reservation_validation_tests {
             )
             .unwrap();
         let root_before = store.get(&root_key).unwrap().unwrap();
-        let child_before = store.get(&child_key).unwrap().unwrap();
+        let mut child_before = store.get(&child_key).unwrap().unwrap();
         let edge_version = store.get(&edge_key).unwrap().unwrap().version;
         let root_revision = store
             .get(&graph_revision::task_structure_revision(root))
@@ -700,6 +700,59 @@ mod owned_reservation_validation_tests {
             )
             .unwrap();
         let graph_version = store.get(&graph_key).unwrap().unwrap().version;
+        let mut changed_checkpoint = child_task.clone();
+        changed_checkpoint["checkpoint"]["data"] = json!({"substituted":true});
+        store
+            .commit(
+                &[Check {
+                    key: child_key.clone(),
+                    expected: Expected::Version(child_before.version),
+                }],
+                &[Mutation::Put {
+                    key: child_key.clone(),
+                    value: serde_json::to_vec(&changed_checkpoint).unwrap(),
+                }],
+            )
+            .unwrap();
+        let changed_entry = store.get(&child_key).unwrap().unwrap();
+        let mut bad_running = changed_checkpoint;
+        bad_running["state"] = json!("Running");
+        bad_running["attempt_id"] = json!(uuid::Uuid::from_u128(16));
+        bad_running
+            .as_object_mut()
+            .unwrap()
+            .remove("retired_attempt_id");
+        let bad_marker = json!({"version":1,"root":root,"child":child,"graph_version":graph_version,"ready_version":changed_entry.version,"running":bad_running});
+        assert!(matches!(
+            store.commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: child_key.clone(),
+                        value: serde_json::to_vec(&bad_running).unwrap()
+                    },
+                    Mutation::Put {
+                        key: marker_key.clone(),
+                        value: serde_json::to_vec(&bad_marker).unwrap()
+                    },
+                ]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(store.get(&marker_key).unwrap().is_none());
+        store
+            .commit(
+                &[Check {
+                    key: child_key.clone(),
+                    expected: Expected::Version(changed_entry.version),
+                }],
+                &[Mutation::Put {
+                    key: child_key.clone(),
+                    value: serde_json::to_vec(&child_task).unwrap(),
+                }],
+            )
+            .unwrap();
+        child_before = store.get(&child_key).unwrap().unwrap();
         child_task["state"] = json!("Running");
         child_task["attempt_id"] = json!(uuid::Uuid::from_u128(16));
         child_task
