@@ -51,7 +51,26 @@ impl crate::extension::Hook for ClaimPassHook {
             assert_eq!(call.arguments["before"], "prepared");
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.1 {
-                ctx.memo.get("abort-memo").await?;
+                assert_eq!(
+                    ctx.memo.get_or_insert("abort-memo", json!("saved")).await?,
+                    json!("saved")
+                );
+                if std::env::var("PI_SELECTED_CANCEL_CUT").ok().as_deref() == Some("after_memo") {
+                    let dir = std::path::PathBuf::from(
+                        std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
+                    );
+                    let store = durable_store::Store::open(dir.join("db")).unwrap();
+                    let (_, claim) = store
+                        .list(b"durable/replay-safe-async/")
+                        .unwrap()
+                        .into_iter()
+                        .find(|(key, _)| key.ends_with(b"/conversation-park-cancel-claim"))
+                        .unwrap();
+                    std::fs::write(dir.join("ready"), claim.value).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
             }
             return Ok(Some(json!("after cancel")));
         }
@@ -398,6 +417,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             | "selection_hook_marker_conflict"
             | "selection_hook_multilevel"
             | "selection_hook_after_memo"
+            | "selection_hook_memo_conflict"
             | "selection_hook_output_schema"
             | "selection_hook_snapshot_conflict"
             | "selection_hook_receipt_changed"
@@ -412,7 +432,12 @@ async fn exercise_conversation_park_claim(case: &str) {
                     name: "policy".into(),
                     hooks: vec![Arc::new(ClaimPassHook(
                         Some(after_calls.clone()),
-                        case == "selection_hook_after_memo",
+                        matches!(
+                            case,
+                            "selection_hook_after_memo"
+                                | "selection_hook_memo_conflict"
+                                | "selection_hook_kill"
+                        ),
                     ))],
                     ..Default::default()
                 },
@@ -646,6 +671,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             | "selection_hook_marker_conflict"
             | "selection_hook_multilevel"
             | "selection_hook_after_memo"
+            | "selection_hook_memo_conflict"
             | "selection_hook_snapshot_conflict"
             | "selection_hook_receipt_changed"
             | "selection_hook_conversation_abort"
@@ -701,10 +727,15 @@ async fn exercise_conversation_park_claim(case: &str) {
         });
         if matches!(
             case,
-            "selection_hook_marker_conflict" | "selection_hook_snapshot_conflict"
+            "selection_hook_marker_conflict"
+                | "selection_hook_snapshot_conflict"
+                | "selection_hook_memo_conflict"
         ) {
             let path = path.clone();
-            let snapshot_conflict = case == "selection_hook_snapshot_conflict";
+            let snapshot_conflict = matches!(
+                case,
+                "selection_hook_snapshot_conflict" | "selection_hook_memo_conflict"
+            );
             crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                 let writer = durable_store::Store::open(path).unwrap();
                 let key = if snapshot_conflict {
@@ -776,8 +807,8 @@ async fn exercise_conversation_park_claim(case: &str) {
         if matches!(
             case,
             "selection_hook_marker_conflict"
-                | "selection_hook_after_memo"
                 | "selection_hook_snapshot_conflict"
+                | "selection_hook_memo_conflict"
         ) {
             tokio::time::timeout(Duration::from_secs(10), async {
                 while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
@@ -790,6 +821,10 @@ async fn exercise_conversation_park_claim(case: &str) {
             let receipt: crate::task_scheduler::ConversationCancelReceipt =
                 serde_json::from_slice(&receipt.unwrap().value).unwrap();
             assert_eq!(receipt.version, 1);
+            if case == "selection_hook_memo_conflict" {
+                let memo_key = format!("runtime/extension-memo/{root_id}/abort-memo");
+                assert!(store.get(memo_key.as_bytes()).unwrap().is_none());
+            }
             assert_eq!(receipt.result, "callback returned");
             assert!(receipt.after_result.is_none());
             assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -842,6 +877,14 @@ async fn exercise_conversation_park_claim(case: &str) {
         assert!(observed.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+        if case == "selection_hook_after_memo" {
+            let memo_key = format!("runtime/extension-memo/{root_id}/abort-memo");
+            let memo = store.get(memo_key.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&memo.value).unwrap(),
+                json!("saved")
+            );
+        }
         let entry = store.get(key.as_bytes()).unwrap().unwrap();
         let receipt: crate::task_scheduler::ConversationCancelReceipt =
             serde_json::from_slice(&entry.value).unwrap();
@@ -2363,8 +2406,13 @@ async fn selected_hook_conversation_abort_publishes_after_result() {
 }
 
 #[tokio::test]
-async fn selected_hook_abort_memo_requires_reconciliation() {
+async fn selected_hook_abort_memo_is_persisted() {
     exercise_conversation_park_claim("selection_hook_after_memo").await;
+}
+
+#[tokio::test]
+async fn selected_hook_abort_memo_snapshot_conflict_fails_closed() {
+    exercise_conversation_park_claim("selection_hook_memo_conflict").await;
 }
 
 #[tokio::test]
@@ -2399,6 +2447,7 @@ async fn selected_hook_cancel_kill_reopens_with_fenced_result() {
         ("before", false),
         ("after", false),
         ("after", true),
+        ("after_memo", false),
         ("after_receipt", false),
         ("after_receipt", true),
     ] {
@@ -2441,6 +2490,14 @@ async fn selected_hook_cancel_kill_reopens_with_fenced_result() {
         child.wait().unwrap();
         let path = dir.path().join("db");
         let store = durable_store::Store::open(&path).unwrap();
+        if matches!(cut, "after_memo" | "after_receipt") {
+            let key = format!("runtime/extension-memo/{}/abort-memo", claim.task);
+            let memo = store.get(key.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&memo.value).unwrap(),
+                json!("saved")
+            );
+        }
         let prefix = format!("durable/unsafe-park-async/{}/", claim.task);
         let intents: Vec<_> = store
             .list(prefix.as_bytes())
