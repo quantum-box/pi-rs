@@ -5429,6 +5429,11 @@ impl Harness {
         ))
     }
     /// Atomically publish a new registry snapshot to subsequent execution phases.
+    #[cfg(test)]
+    pub(crate) fn set_extension_registry_for_test(&self, registry: crate::extension::Registry) {
+        *self.extensions.write().unwrap() = registry;
+    }
+
     pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
         let _mutation = self
             .extension_start_gates

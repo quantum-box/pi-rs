@@ -7937,9 +7937,24 @@ async fn owned_graph_driver_reserves_direct_conversation_child() {
     exercise_woken_owned_graph_receipt(false, 8).await;
 }
 
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_child_binding_requires_both_pending_conversations() {
+    exercise_woken_owned_graph_receipt(false, 9).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn selected_owned_child_binding_requires_both_pending_conversations() {
+    exercise_woken_owned_graph_receipt(false, 10).await;
+}
+
 async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
+    if graph_aba == 10 {
+        std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
+    }
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -7961,8 +7976,11 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     child.kill().unwrap();
     child.wait().unwrap();
     let path = dir.path().join("db");
-    let (options, registry, _extensions) = build_woken_any(&path);
+    let (options, registry, extensions) = build_woken_any(&path);
     let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    if graph_aba == 10 {
+        harness.set_extension_registry_for_test(extensions);
+    }
     let conversation = harness
         .create_conversation(Config {
             model: "test".into(),
@@ -8013,6 +8031,69 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .save(&[crate::task_store::Save::Create(&task)])
             .unwrap();
         Some(task.id())
+    } else {
+        None
+    };
+    #[cfg(feature = "experimental-graph-revision")]
+    let bound_child = if graph_aba == 9 || graph_aba == 10 {
+        let child = uuid::Uuid::new_v4();
+        let crate::task::TaskOwner::Conversation(parent_conversation) = root.task.owner() else {
+            panic!("missing parent conversation")
+        };
+        let parent_key = format!("runtime/conversation/{parent_conversation}").into_bytes();
+        let parent_snapshot: Value =
+            serde_json::from_slice(&store.get(&parent_key).unwrap().unwrap().value).unwrap();
+        let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+        let old = store.get(&conversation_key).unwrap().unwrap();
+        let mut cloned: Value = serde_json::from_slice(&old.value).unwrap();
+        cloned["phase"] = parent_snapshot["phase"].clone();
+        cloned["tool_attempt"] = parent_snapshot["tool_attempt"].clone();
+        cloned["extensions"] = parent_snapshot["extensions"].clone();
+        cloned["phase"]["TaskPending"]["task"] = json!(child);
+        cloned["phase"]["TaskPending"]["operation_id"] = json!(child);
+        cloned["tool_attempt"]["operation_id"] = json!(child);
+        let parent_binding_key =
+            format!("runtime/checkpointable-root-binding/v1/{}", root.task.id()).into_bytes();
+        let mut binding: Value =
+            serde_json::from_slice(&store.get(&parent_binding_key).unwrap().unwrap().value)
+                .unwrap();
+        binding["conversation"] = json!(conversation);
+        binding["task"] = json!(child);
+        binding["tool_attempt"]["operation_id"] = json!(child);
+        let binding_key = format!("runtime/checkpointable-root-binding/v1/{child}").into_bytes();
+        let mut task = serde_json::to_value(&root.task).unwrap();
+        task["id"] = json!(child);
+        task["owner"] = json!({"Conversation":conversation});
+        task["state"] = json!("Ready");
+        task.as_object_mut().unwrap().remove("attempt_id");
+        task.as_object_mut().unwrap().remove("retired_attempt_id");
+        task.as_object_mut()
+            .unwrap()
+            .remove("woken_interrupted_attempt");
+        let task_key = crate::task_store::key(child);
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: conversation_key.clone(),
+                    expected: durable_store::Expected::Version(old.version),
+                }],
+                &[
+                    durable_store::Mutation::Put {
+                        key: conversation_key,
+                        value: serde_json::to_vec(&cloned).unwrap(),
+                    },
+                    durable_store::Mutation::Put {
+                        key: binding_key,
+                        value: serde_json::to_vec(&binding).unwrap(),
+                    },
+                    durable_store::Mutation::Put {
+                        key: task_key,
+                        value: serde_json::to_vec(&task).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        Some(child)
     } else {
         None
     };
@@ -8091,6 +8172,139 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         tasks.update(&task, |task| task.cancel()).unwrap();
     }
     assert!(harness.conversation(conversation).unwrap().abort_requested);
+    #[cfg(feature = "experimental-graph-revision")]
+    if let Some(child) = bound_child {
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let ready = tasks.load(child).unwrap().unwrap();
+        let mut running = ready.clone();
+        running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
+        let (checks, marker) =
+            crate::runtime::prepare_woken_owned_child_reservation(&store, &ready, &running.task)
+                .unwrap()
+                .unwrap();
+        let mut batch = tasks
+            .prepare_save(&[crate::task_store::Save::Update(&running)])
+            .unwrap();
+        batch.checks.extend(checks);
+        batch.mutations.push(marker);
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        let running = tasks.load(child).unwrap().unwrap();
+        let checks = harness
+            .checkpointable_owned_child_admission_checks(&running.task, &registry)
+            .unwrap();
+        store.commit(&checks, &[]).unwrap();
+        let binding_key = format!("runtime/checkpointable-root-binding/v1/{child}").into_bytes();
+        let binding = store.get(&binding_key).unwrap().unwrap();
+        let mut bad: Value = serde_json::from_slice(&binding.value).unwrap();
+        bad["arguments"] = json!({"forged":true});
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: binding_key.clone(),
+                    expected: durable_store::Expected::Version(binding.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: binding_key.clone(),
+                    value: serde_json::to_vec(&bad).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            harness
+                .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                .is_err()
+        );
+        let modified = store.get(&binding_key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: binding_key.clone(),
+                    expected: durable_store::Expected::Version(modified.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: binding_key,
+                    value: binding.value,
+                }],
+            )
+            .unwrap();
+        let checks = harness
+            .checkpointable_owned_child_admission_checks(&running.task, &registry)
+            .unwrap();
+        let parent_key =
+            format!("runtime/checkpointable-root-binding/v1/{}", root.task.id()).into_bytes();
+        let parent = store.get(&parent_key).unwrap().unwrap();
+        let mut bad_parent: Value = serde_json::from_slice(&parent.value).unwrap();
+        bad_parent["arguments"] = json!({"forged":true});
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: parent_key.clone(),
+                    expected: durable_store::Expected::Version(parent.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: parent_key.clone(),
+                    value: serde_json::to_vec(&bad_parent).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            harness
+                .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                .is_err()
+        );
+        if graph_aba == 10 {
+            let modified = store.get(&parent_key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: parent_key.clone(),
+                        expected: durable_store::Expected::Version(modified.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: parent_key,
+                        value: parent.value,
+                    }],
+                )
+                .unwrap();
+            let checks = harness
+                .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                .unwrap();
+            let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+            let current = store.get(&conversation_key).unwrap().unwrap();
+            let mut changed: Value = serde_json::from_slice(&current.value).unwrap();
+            changed["extensions"] = json!([]);
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: conversation_key.clone(),
+                        expected: durable_store::Expected::Version(current.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: conversation_key,
+                        value: serde_json::to_vec(&changed).unwrap(),
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.commit(&checks, &[]),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(
+                harness
+                    .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                    .is_err()
+            );
+        }
+        return;
+    }
     #[cfg(feature = "experimental-graph-revision")]
     if graph_aba == 8 {
         let child = unsafe_owned.unwrap();
