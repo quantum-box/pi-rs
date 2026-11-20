@@ -8210,6 +8210,20 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .unwrap();
             drop(driver);
             drop(scheduler);
+            let store = durable_store::Store::open(&path).unwrap();
+            let entry = store.get(marker.as_bytes()).unwrap().unwrap();
+            let reservation: Value = serde_json::from_slice(&entry.value).unwrap();
+            let revision = durable_store::graph_revision::task_structure_revision(root.task.id());
+            let revision_entry = store.get(&revision).unwrap().unwrap();
+            assert_eq!(
+                store
+                    .commit_for_version(marker.as_bytes(), entry.version)
+                    .unwrap(),
+                store
+                    .commit_for_version(&revision, revision_entry.version)
+                    .unwrap(),
+            );
+            assert_eq!(reservation["running"]["id"], json!(root.task.id()));
             return;
         }
         let proof_root = if graph_aba == 4 || graph_aba == 5 {
