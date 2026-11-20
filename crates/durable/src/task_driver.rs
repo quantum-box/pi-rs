@@ -1908,11 +1908,10 @@ impl Shared {
                 hook();
             }
         }
-        if pending.completed().is_some_and(|value| {
-            value
-                .known_cancel_state()
-                .is_some_and(|state| state != task_scheduler::KnownCancelCommitState::Busy)
-        }) {
+        if pending
+            .completed()
+            .is_some_and(|value| value.known_cancel_state().is_some())
+        {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
