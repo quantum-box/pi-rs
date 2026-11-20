@@ -2136,6 +2136,7 @@ pub(crate) enum MaintenanceIntent {
     Nested(Uuid),
     Failed(Uuid),
     FailFast(Uuid),
+    Woken(Uuid),
 }
 
 /// A graph intent retained when a nonblocking reservation needs cleanup.
@@ -2144,6 +2145,7 @@ pub struct PendingMaintenance {
     fence: Arc<Mutex<()>>,
     state: Arc<Mutex<InvocationState>>,
     scheduler_poison: Arc<std::sync::atomic::AtomicBool>,
+    definitions: Arc<std::sync::RwLock<WakeDefinitions>>,
     intent: MaintenanceIntent,
     independent: bool,
 }
@@ -2171,7 +2173,8 @@ impl PendingMaintenance {
             .contains(&match self.intent {
                 MaintenanceIntent::Nested(id)
                 | MaintenanceIntent::Failed(id)
-                | MaintenanceIntent::FailFast(id) => id,
+                | MaintenanceIntent::FailFast(id)
+                | MaintenanceIntent::Woken(id) => id,
             })
         {
             return Ok(false);
@@ -2228,7 +2231,8 @@ impl PendingMaintenance {
                     let parent = match self.intent {
                         MaintenanceIntent::Nested(id)
                         | MaintenanceIntent::Failed(id)
-                        | MaintenanceIntent::FailFast(id) => id,
+                        | MaintenanceIntent::FailFast(id)
+                        | MaintenanceIntent::Woken(id) => id,
                     };
                     let mut roots = vec![parent];
                     roots.extend(fixed);
@@ -2258,7 +2262,8 @@ impl PendingMaintenance {
                         let parent = match *prior {
                             MaintenanceIntent::Nested(id)
                             | MaintenanceIntent::Failed(id)
-                            | MaintenanceIntent::FailFast(id) => id,
+                            | MaintenanceIntent::FailFast(id)
+                            | MaintenanceIntent::Woken(id) => id,
                         };
                         let mut roots = vec![parent];
                         roots.extend(fixed);
@@ -2278,7 +2283,8 @@ impl PendingMaintenance {
                                     .remove(&match self.intent {
                                         MaintenanceIntent::Nested(id)
                                         | MaintenanceIntent::Failed(id)
-                                        | MaintenanceIntent::FailFast(id) => id,
+                                        | MaintenanceIntent::FailFast(id)
+                                        | MaintenanceIntent::Woken(id) => id,
                                     })
                                 {
                                     hook();
@@ -2292,13 +2298,39 @@ impl PendingMaintenance {
                         &match self.intent {
                             MaintenanceIntent::Nested(id)
                             | MaintenanceIntent::Failed(id)
-                            | MaintenanceIntent::FailFast(id) => id,
+                            | MaintenanceIntent::FailFast(id)
+                            | MaintenanceIntent::Woken(id) => id,
                         },
                     ) {
                         hook();
                     }
                     Ok(())
                 };
+                if let MaintenanceIntent::Woken(id) = self.intent {
+                    guard()?;
+                    let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+                    if state.attempts.contains(&id) {
+                        return Err(Error::Busy);
+                    }
+                    drop(state);
+                    let definitions = self.definitions.try_read().map_err(|error| match error {
+                        std::sync::TryLockError::WouldBlock => Error::Busy,
+                        std::sync::TryLockError::Poisoned(_) => Error::Poisoned,
+                    })?;
+                    let current = TaskStore::new(owner.store())
+                        .load(id)?
+                        .ok_or(Error::Ownership)?;
+                    return match harness.authenticated_scoped_woken_abort_graph(
+                        &current,
+                        &definitions.registry,
+                        &targets,
+                    ) {
+                        Ok(affected) => Ok(affected),
+                        Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                        Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
+                        Err(error) => Err(Error::Handler(format!("woken graph abort: {error}"))),
+                    };
+                }
                 match harness.scoped_abort_graph(
                     None,
                     Some(self.intent),
@@ -2315,7 +2347,8 @@ impl PendingMaintenance {
                             .remove(&match self.intent {
                                 MaintenanceIntent::Nested(id)
                                 | MaintenanceIntent::Failed(id)
-                                | MaintenanceIntent::FailFast(id) => id,
+                                | MaintenanceIntent::FailFast(id)
+                                | MaintenanceIntent::Woken(id) => id,
                             })
                         {
                             hook();
@@ -11606,7 +11639,8 @@ impl Scheduler {
         let parent = match intent {
             MaintenanceIntent::Nested(id)
             | MaintenanceIntent::Failed(id)
-            | MaintenanceIntent::FailFast(id) => id,
+            | MaintenanceIntent::FailFast(id)
+            | MaintenanceIntent::Woken(id) => id,
         };
         let Ok(Some((fixed, nested))) = resolve_maintenance(&self.ts(), intent) else {
             return false;
@@ -14836,6 +14870,7 @@ impl Scheduler {
             fence: self.failure_fence.clone(),
             state: self.live_invocations.clone(),
             scheduler_poison: self.poisoned.clone(),
+            definitions: self.wake_reader.definitions.clone(),
             intent,
             independent,
         })
@@ -14912,6 +14947,62 @@ impl Scheduler {
                 {
                     self.unbound_cancel_roots.insert(task.id());
                     self.deferred_recovery.insert(task.id());
+                }
+            }
+        }
+        // Interrupted woken roots with foreground owned conversations require
+        // the scoped graph coordinator; inline recovery cannot mark a
+        // conversation and its inputs in the task-only transaction.
+        if nonblocking && allow_maintenance && self.validator.is_some() {
+            let active = self
+                .live_invocations
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .attempts
+                .clone();
+            for root in &self.unbound_cancel_roots {
+                let Some(record) = held_tasks.iter().find(|item| item.task.id() == *root) else {
+                    continue;
+                };
+                if active.contains(root)
+                    || record.task.state() != &TaskState::Running
+                    || record.task.abort_requested()
+                    || record.task.replay_safe()
+                    || !matches!(record.task.owner(), TaskOwner::Conversation(_))
+                    || record.task.checkpoint().phase != "replay-safe-async-wait"
+                    || !self
+                        .registered(&record.task)
+                        .is_ok_and(|reg| reg.handler.conversation_woken_cancel_enabled())
+                {
+                    continue;
+                }
+                let mut ids = HashSet::from([*root]);
+                loop {
+                    let before = ids.len();
+                    for item in &held_tasks {
+                        if !item.task.is_background()
+                            && let TaskOwner::Task(parent) = item.task.owner()
+                            && ids.contains(parent)
+                        {
+                            ids.insert(item.task.id());
+                        }
+                    }
+                    if ids.len() == before {
+                        break;
+                    }
+                }
+                if crate::ownership_edge::reject_foreground_children(owner.store(), ids)
+                    .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+                {
+                    if independent_only
+                        && excluded.iter().copied().any(|intent| {
+                            !self.separate_from_maintenance(&owner, &record.task, intent)
+                        })
+                    {
+                        continue;
+                    }
+                    return Ok(self
+                        .deferred_maintenance(MaintenanceIntent::Woken(*root), independent_only));
                 }
             }
         }
@@ -17991,7 +18082,8 @@ pub(crate) fn resolve_maintenance(
     let id = match intent {
         MaintenanceIntent::Nested(id)
         | MaintenanceIntent::Failed(id)
-        | MaintenanceIntent::FailFast(id) => id,
+        | MaintenanceIntent::FailFast(id)
+        | MaintenanceIntent::Woken(id) => id,
     };
     let Some(parent) = records.iter().find(|item| item.task.id() == id) else {
         return Ok(None);
@@ -18007,6 +18099,15 @@ pub(crate) fn resolve_maintenance(
                 && matches!(parent.task.state(), TaskState::CompletingFailed(_))
                 && !owned_graph_uncertain(ts.store(), id)?
                 && has_owned_work(ts.store(), id, &records, true)? =>
+        {
+            Ok(Some((Some(id), None)))
+        }
+        MaintenanceIntent::Woken(_)
+            if !parent.task.abort_requested()
+                && parent.task.state() == &TaskState::Running
+                && !parent.task.replay_safe()
+                && matches!(parent.task.owner(), TaskOwner::Conversation(_))
+                && parent.task.checkpoint().phase == "replay-safe-async-wait" =>
         {
             Ok(Some((Some(id), None)))
         }

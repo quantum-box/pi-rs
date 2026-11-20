@@ -7620,6 +7620,11 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
             .unwrap();
     }
     let mut registry = Registry::default();
+    assert!(
+        registry.register("owned-independent", true, |_: &crate::task::Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!("independent"))
+        ))
+    );
     let mut extra = Vec::new();
     let register_safe = |registry: &mut Registry, name: &'static str| {
         let tool = Arc::new(WokenAnyFixture {
@@ -8131,4 +8136,113 @@ async fn selected_woken_unsafe_child_keeps_after_through_settlement_and_reopen()
         assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
         scheduler.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn interrupted_woken_owned_conversation_is_marked_by_driver_before_refusal() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+        ])
+        .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("any-woken").exists() {
+            assert!(process.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let path = dir.path().join("db");
+    let (options, _, _) = build_woken_any(&path);
+    let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    let conversation = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let independent_conversation = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let root = crate::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| {
+            matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
+                && r.task.state() == &TaskState::Running
+        })
+        .unwrap();
+    let edge = crate::ownership_edge::Edge {
+        task: root.task.id(),
+        task_owner: root.task.owner().clone(),
+        child: conversation,
+        mode: crate::ownership_edge::Mode::Foreground,
+    };
+    let prepared = crate::ownership_edge::EdgeStore::new(&store)
+        .prepare_create(&edge)
+        .unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    drop(store);
+    drop(harness);
+    let (scheduler, driver) = start_woken_any_scheduler(&path);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !scheduler
+            .conversation(conversation)
+            .unwrap()
+            .abort_requested
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let recovered = driver.get(root.task.id()).unwrap().unwrap();
+    assert!(recovered.abort_requested());
+    assert_eq!(
+        recovered.woken_interrupted_attempt(),
+        root.task.attempt_id()
+    );
+    assert!(!dir.path().join("parent-cancel").exists());
+    let independent = crate::task::Task::new(
+        uuid::Uuid::new_v4(),
+        crate::task::TaskOwner::Conversation(independent_conversation),
+        crate::task::Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("owned-independent".into(), true);
+    driver.submit(&independent).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !driver.get(independent.id()).unwrap().unwrap().is_terminal() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        driver.get(independent.id()).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!("independent"))
+    );
+    assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    let _ = scheduler.shutdown().await;
 }
