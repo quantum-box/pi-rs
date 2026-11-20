@@ -230,6 +230,13 @@ async fn exercise_conversation_park_claim(case: &str) {
     let gate = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut registry = Registry::default();
+    registry.register(
+        "independent-maintenance",
+        true,
+        |_: &pi_rs_durable::task::Task| {
+            Ok(pi_rs_durable::task_scheduler::Step::Succeed(json!("done")))
+        },
+    );
     let leaf = register_conversation_replay_safe_durable_tool(
         &mut registry,
         Arc::new(AsyncTool {
@@ -459,6 +466,119 @@ async fn exercise_conversation_park_claim(case: &str) {
             ));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        return;
+    }
+    if case == "dispatch_maintenance" {
+        use pi_rs_durable::task::{Checkpoint, Task, TaskOwner};
+        let parent_id = uuid::Uuid::new_v4();
+        let mut parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(uuid::Uuid::new_v4()),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("independent-maintenance".into(), true);
+        parent.start().unwrap();
+        let child = Task::new(
+            uuid::Uuid::new_v4(),
+            TaskOwner::Task(parent_id),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("independent-maintenance".into(), true);
+        crate::task_scheduler::set_maintenance_busy_for_test(parent_id, true);
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+        crate::task_driver::on_maintenance_reserved_for_test(parent_id, move || {
+            reserved_tx.send(()).unwrap();
+        });
+        {
+            tasks
+                .save(&[
+                    pi_rs_durable::task_store::Save::Create(&parent),
+                    pi_rs_durable::task_store::Save::Create(&child),
+                ])
+                .unwrap();
+            tasks
+                .update(&tasks.load(parent_id).unwrap().unwrap(), |task| {
+                    task.hold_failure("held".into())
+                })
+                .unwrap();
+        }
+        let trigger_owner = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let trigger = Task::new(
+            uuid::Uuid::new_v4(),
+            TaskOwner::Conversation(trigger_owner),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("independent-maintenance".into(), true);
+        driver.submit(&trigger).unwrap();
+        reserved_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("maintenance not reserved");
+        let graph_changed = Arc::new(AtomicBool::new(false));
+        let graph_changed_hook = graph_changed.clone();
+        let graph_writer_path = path.clone();
+        crate::task_scheduler::on_conversation_cancel_settlement(root_id, move || {
+            let writer = durable_store::Store::open(graph_writer_path).unwrap();
+            let task = Task::new(
+                uuid::Uuid::new_v4(),
+                TaskOwner::Conversation(uuid::Uuid::new_v4()),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("independent-maintenance".into(), true);
+            pi_rs_durable::task_store::TaskStore::new(&writer)
+                .save(&[pi_rs_durable::task_store::Save::Create(&task)])
+                .unwrap();
+            graph_changed_hook.store(true, Ordering::SeqCst);
+        });
+        scheduler.abort_task(root_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            graph_changed.load(Ordering::SeqCst),
+            "settlement graph conflict was not exercised"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            tasks.load(parent_id).unwrap().unwrap().task.state(),
+            TaskState::CompletingFailed(_)
+        ));
+        crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(
+            report.failure().is_none(),
+            "driver failed: {:?}",
+            report.failure()
+        );
         return;
     }
     if case == "dispatch_hold" {
@@ -1151,6 +1271,7 @@ async fn exercise_conversation_park_claim(case: &str) {
         let _ = driver.shutdown_with_pending().unwrap();
         return;
     }
+    let is_owner = case == "owner";
     let is_reentrant = case == "reentrant";
     let is_late_receipt = case == "late_receipt";
     let reentrant_handle = identity_handle.clone();
@@ -1308,7 +1429,16 @@ async fn exercise_conversation_park_claim(case: &str) {
         assert!(receipts.iter().any(|receipt| matches!(&receipt.outcome, Outcome::Pending { reference } if reference == "remote-job")));
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let _ = driver.shutdown_with_pending().unwrap();
+    let report = driver.shutdown_with_pending().unwrap();
+    if is_owner {
+        assert!(
+            report
+                .pending()
+                .iter()
+                .any(|pending| pending.task_id() == root_id),
+            "changed task owner must retain the old outcome for reconciliation"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1419,6 +1549,11 @@ async fn conversation_cancel_signal_before_first_poll_prevents_dispatch() {
 #[tokio::test]
 async fn conversation_cancel_first_poll_fences_signal_and_identity_update() {
     exercise_conversation_park_claim("dispatch_guard").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_settles_while_independent_maintenance_is_pending() {
+    exercise_conversation_park_claim("dispatch_maintenance").await;
 }
 
 #[tokio::test]
@@ -2091,6 +2226,7 @@ fn claim_recovery_progresses_during_independent_maintenance() {
     let owner = task_scheduler.owner();
     let control = owner.conversation_controls().get(uuid::Uuid::new_v4());
     let poll = control.gate.lock().unwrap();
+    crate::task_scheduler::set_maintenance_busy_for_test(parent.id(), true);
     let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
     crate::task_driver::on_maintenance_reserved_for_test(parent.id(), move || {
         reserved_tx.send(()).unwrap()
@@ -2160,5 +2296,6 @@ fn claim_recovery_progresses_during_independent_maintenance() {
             .unwrap()
     );
     drop(poll);
+    crate::task_scheduler::set_maintenance_busy_for_test(parent.id(), false);
     assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
 }

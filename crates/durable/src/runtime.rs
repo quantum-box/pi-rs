@@ -14499,6 +14499,7 @@ impl Harness {
             None,
             None,
             Some(mode),
+            None,
             || {},
         )
     }

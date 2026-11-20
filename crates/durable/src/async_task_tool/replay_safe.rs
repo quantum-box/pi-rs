@@ -879,7 +879,7 @@ struct Executor {
     block_results: bool,
     unavailable: bool,
     park_cancel: Option<(Arc<dyn DurableParkCancel>, bool)>,
-    // Registered and identity-bound, but deliberately not dispatchable yet.
+    // Identity-bound callback and explicit dispatch opt-in.
     _conversation_cancel: Option<(String, Arc<dyn DurableParkCancel>, bool)>,
     conversation_identity: Option<String>,
     woken_identity: Option<String>,

@@ -2331,6 +2331,27 @@ impl PendingSettlement {
         let Ok(_gate) = owner.task_gate().lock() else {
             return false;
         };
+        // A replaced or removed reservation cannot become settleable by
+        // retrying the old lease. Keep it for reconciliation at shutdown.
+        let expected = match self {
+            Self::Unprepared(completed) => &completed.running.task,
+            Self::Prepared { settlement, .. } => &settlement.running.task,
+            Self::PreparationConflict { conflict, .. } => &conflict.running.task,
+            Self::Failure { settlement, .. } => &settlement.running.task,
+        };
+        match TaskStore::new(owner.store()).load(self.task_id()) {
+            Ok(None) => return true,
+            Ok(Some(current))
+                if current.task.owner() != expected.owner()
+                    || current.task.attempt_id() != expected.attempt_id()
+                    || current.task.kind() != expected.kind()
+                    || current.task.definition_version() != expected.definition_version()
+                    || current.task.input() != expected.input() =>
+            {
+                return true;
+            }
+            _ => (),
+        }
         matches!(
             pending_abort_root_excluding_self(
                 &TaskStore::new(owner.store()),
@@ -7343,7 +7364,11 @@ impl Scheduler {
                                         crate::ownership_edge::PREFIX,
                                         b"runtime/conversation/",
                                     ],
-                                    boundary,
+                                    if independent_abort {
+                                        boundary.min(ordering_graph_version)
+                                    } else {
+                                        boundary
+                                    },
                                 )
                                 .map_err(task_store::Error::from)?;
                         } else {
@@ -16431,7 +16456,10 @@ mod tests {
                     publication.test_set_published(a.id(), false);
                 }
 
-                assert!(pending.try_cleanup(&mut cleanup).unwrap());
+                assert!(
+                    pending.try_cleanup(&mut cleanup).unwrap(),
+                    "maintenance did not finish: {kind}, stale={stale}"
+                );
                 let a_marked = scheduler
                     .ts()
                     .load(a.id())

@@ -71,8 +71,9 @@ pub(crate) fn revision(id: Uuid) -> Vec<u8> {
 }
 
 // Hex encoding keeps arbitrary names unambiguous in the store keyspace.
-// Durable counterpart of the process-local start gate. A marker is held only
-// across callback first poll; a crash leaves evidence requiring reconciliation.
+// Durable counterpart of the process-local start gate. The marker spans the
+// first poll through receipt or unknown settlement; a crash leaves evidence
+// requiring reconciliation.
 fn callback_start_key(conversation: Uuid) -> Vec<u8> {
     format!("runtime/conversation-callback-start/{conversation}").into_bytes()
 }

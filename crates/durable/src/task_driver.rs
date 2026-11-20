@@ -2558,6 +2558,10 @@ mod tests {
             .unwrap();
         let control = owner.conversation_controls().get(Uuid::from_u128(999));
         let poll = control.gate.lock().unwrap();
+        // Both maintenance graphs lack conversation descendants. A scoped
+        // fence ignores the unrelated poll, so hold both reservations here.
+        crate::task_scheduler::set_maintenance_busy_for_test(parent_id, true);
+        crate::task_scheduler::set_maintenance_busy_for_test(Uuid::from_u128(5), true);
         let (reserved_tx, reserved_rx) = mpsc::channel();
         on_maintenance_reserved_for_test(parent_id, move || reserved_tx.send(()).unwrap());
         let (second_tx, second_rx) = mpsc::channel();
@@ -2789,6 +2793,10 @@ mod tests {
             }
         }
         drop(poll);
+        crate::task_scheduler::set_maintenance_busy_for_test(Uuid::from_u128(5), false);
+        if !hold_first {
+            crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
+        }
         if writer_busy {
             writer_busy_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -4300,6 +4308,7 @@ mod tests {
                 thread::yield_now();
             }
             let maintenance_parent_id = Uuid::from_u128(1000);
+            task_scheduler::set_maintenance_busy_for_test(maintenance_parent_id, true);
             let (maintenance_tx, maintenance_rx) = mpsc::channel();
             on_maintenance_reserved_for_test(maintenance_parent_id, move || {
                 maintenance_tx.send(()).unwrap()
@@ -4561,6 +4570,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap();
             drop(poll);
+            task_scheduler::set_maintenance_busy_for_test(maintenance_parent_id, false);
             drop(added_poll);
             drop(added_callback);
             replaced_rx
