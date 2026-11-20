@@ -235,6 +235,54 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks(
     )
 }
 
+/// Register selected replay-safe hooks and a parked-cancel identity together.
+/// This registration records the cancellation contract but does not dispatch
+/// the callback; interrupted cleanup remains subject to reconciliation.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _tool_authorization: UnsafeDurableAuthorization,
+    _hook_authorization: ReplaySafeConversationHooksAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+        return Err("invalid cancel identity".into());
+    }
+    let selection = snapshot
+        .stable_selection(names)
+        .ok_or("extension selection missing or unidentified")?;
+    if names.is_empty() || selection.hook_count() == 0 {
+        return Err("at least one selected hook is required".into());
+    }
+    let resolved = snapshot
+        .resolve_stable(names, &selection)
+        .ok_or("extension selection changed")?;
+    let registration = resolved
+        .registration_evidence()
+        .ok_or("invalid hook registration evidence")?;
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        Some((
+            selection,
+            registration,
+            Arc::new(SelectedBeforeHooks(resolved)),
+        )),
+        false,
+        Some((cancel_identity.to_owned(), cancel, false)),
+    )
+}
+
 /// Read joined unsafe outcomes retained even if abort won settlement. These
 /// records are reconciliation evidence and do not authorize re-execution.
 pub fn read_unsafe_durable_receipts(

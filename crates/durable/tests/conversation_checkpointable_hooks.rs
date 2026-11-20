@@ -6,11 +6,12 @@ use pi_rs_core::{
 };
 use pi_rs_durable::{
     async_task_tool::{
-        AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
-        DurableToolStep, DurableWait, ReplaySafeAuthorization,
+        AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableParkCancel, DurableTaskHost,
+        DurableToolResume, DurableToolStep, DurableWait, ReplaySafeAuthorization,
         ReplaySafeConversationHooksAuthorization, UnsafeDurableAuthorization,
         register_conversation_replay_safe_durable_tool_with_selected_hooks,
         register_conversation_unsafe_durable_tool_with_selected_hooks,
+        register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel,
     },
     extension::{BeforeTool, Context, Extension, ExtensionIdentity, Hook},
     recovery::UncertainPolicy,
@@ -172,6 +173,158 @@ struct Job {
     name: &'static str,
     child: Option<&'static str>,
     executions: Arc<AtomicUsize>,
+}
+
+struct PendingLeaf;
+#[async_trait]
+impl Tool for PendingLeaf {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "leaf".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for PendingLeaf {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        context: ToolContext,
+        _: DurableToolResume,
+        _: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        context.cancellation.cancelled().await;
+        Err("cancelled".into())
+    }
+}
+struct CancelCounter(Arc<AtomicUsize>);
+#[async_trait]
+impl DurableParkCancel for CancelCounter {
+    async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn selected_hook_cancel_registration_parks_and_remains_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let cancellations = Arc::new(AtomicUsize::new(0));
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install_identified(
+            Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(OneHook {
+                    before: before.clone(),
+                    after,
+                    gate: None,
+                })],
+                ..Default::default()
+            },
+            ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()]).unwrap(),
+        )
+        .unwrap();
+    let mut registry = Registry::default();
+    let snapshot = extensions.snapshot();
+    let names = vec!["policy".to_string()];
+    let leaf = register_conversation_replay_safe_durable_tool_with_selected_hooks(
+        &mut registry,
+        Arc::new(PendingLeaf),
+        "leaf",
+        1,
+        vec![],
+        &snapshot,
+        &names,
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    let tool = Arc::new(Job {
+        name: "root",
+        child: Some("leaf"),
+        executions: executions.clone(),
+    });
+    let identity_tool: Arc<dyn Tool> = tool.clone();
+    let _identity =
+        pi_rs_durable::nested_identity::register(&identity_tool, Some("backend".into())).unwrap();
+    let root = register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel(
+        &mut registry,
+        tool,
+        "root",
+        1,
+        vec![leaf.clone()],
+        &snapshot,
+        &names,
+        "cancel-v1",
+        Arc::new(CancelCounter(cancellations.clone())),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![root.register(), leaf.register()],
+        restart_limit: 5,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.select_extensions(conversation, names).unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
+    let root_id = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(record) = tasks.list().unwrap().into_iter().find(|record| {
+                record.task.owner() == &pi_rs_durable::task::TaskOwner::Conversation(conversation)
+                    && matches!(
+                        record.task.state(),
+                        pi_rs_durable::task::TaskState::Waiting(_)
+                    )
+            }) {
+                break record.task.id();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert!(before.load(Ordering::SeqCst) >= 1);
+    scheduler.abort_task(root_id).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if tasks.load(root_id).unwrap().unwrap().task.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    let report = driver.shutdown_with_pending().unwrap();
+    assert!(report.pending().is_empty());
+    let _ = scheduler.shutdown().await;
 }
 #[async_trait]
 impl Tool for Job {

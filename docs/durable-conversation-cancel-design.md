@@ -25,6 +25,12 @@ work. Direct Store writes outside the public mutation APIs are a trusted-host
 boundary. Nested cancel callbacks, selected hooks and woken cancellation remain
 unsupported by this opt-in.
 
+`register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel`
+records a selected-hook identity and a cancel identity in one definition. It
+does not enable callback dispatch. Aborting a parked call still requires
+reconciliation; in particular, this registration does not yet authorize the
+callback or run the conversation after hook on abort.
+
 `DurableParkCancel::cancel_scoped` supplies an explicit callback scope. When a
 callback uses a joined Tokio task, it must pass the scope into that task and
 run its work through `scope.scope(...)`; task-local state is not inherited by
