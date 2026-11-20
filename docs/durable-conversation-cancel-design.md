@@ -317,15 +317,15 @@ identity busy and reentrant update, callback failure and retry authorization,
 and process kill/reopen. Until these paths are implemented and verified, the
 existing standalone-only guards and conversation fail-closed behavior remain.
 
-## Nested cancellation branch status
+## Nested cancellation status
 
 This branch connects explicit at-most-once park cancellation for conversation-owned
 nested tools, including selected replay-safe hooks. Claim, marker, receipt and
 terminal evidence are checked against the full ancestry; parent claim and
 settlement authenticate the child evidence while holding selection and identity
 leases. Real-driver tests exercise unhooked and selected child-to-parent cancel,
-late outcome and signal conflicts, and callback kill/reopen. Parent receipt
-recovery with nested children and broader integration remain under validation.
+late outcome and signal conflicts, and callback kill/reopen. A selected parent's receipt survives process loss and recovers after checking
+the child evidence; a late child Tool result forces reconciliation.
 Woken cancellation remains unsupported. This branch does not solve durable
 publication fencing or the associated owner reacquisition race.
 
