@@ -10498,6 +10498,169 @@ impl Scheduler {
                                 "conversation terminal claim mismatch".into(),
                             ));
                         }
+                        if matches!(item.task.owner(), TaskOwner::Task(_)) {
+                            // A nested claim is never replayed after process loss.
+                            // Preserve any receipt and atomically fail the original
+                            // attempt while retiring only its authenticated markers.
+                            let (conversation, ancestry, ancestry_checks, ancestry_version) =
+                                task_store::read_nested_cancel_claim_ancestry(
+                                    store,
+                                    item.task.id(),
+                                    claim.claim_id,
+                                )?;
+                            let ancestry_key =
+                                format!("durable/task-callback-claim-ancestry/{}", item.task.id())
+                                    .into_bytes();
+                            let claim_commit = store
+                                .commit_for_version(&claim_key, entry.version)
+                                .map_err(task_store::Error::from)?;
+                            let ancestry_commit = store
+                                .commit_for_version(&ancestry_key, ancestry_version)
+                                .map_err(task_store::Error::from)?;
+                            if claim_commit.is_none() || claim_commit != ancestry_commit {
+                                return Err(Error::Handler(
+                                    "nested claim ancestry was not committed with claim".into(),
+                                ));
+                            }
+                            let receipt_key = format!(
+                                "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+                                item.task.id()
+                            )
+                            .into_bytes();
+                            let receipt =
+                                store.get(&receipt_key).map_err(task_store::Error::from)?;
+                            let marker_bytes = serde_json::to_vec(&serde_json::json!({
+                                "version": 1, "claim_id": claim.claim_id, "task": claim.task,
+                                "attempt": claim.attempt, "lease": claim.lease, "policy": claim.policy,
+                            })).map_err(|e| Error::Handler(e.to_string()))?;
+                            let task_marker_key =
+                                format!("durable/task-callback-start/{}", item.task.id())
+                                    .into_bytes();
+                            let task_marker = store
+                                .get(&task_marker_key)
+                                .map_err(task_store::Error::from)?;
+                            let conversation_marker_key =
+                                format!("runtime/conversation-callback-start/{conversation}")
+                                    .into_bytes();
+                            let conversation_marker = store
+                                .get(&conversation_marker_key)
+                                .map_err(task_store::Error::from)?;
+                            let mut next = item.clone();
+                            next.task
+                                .fail(
+                                    "interrupted nested cancel claim; reconciliation required"
+                                        .into(),
+                                )
+                                .map_err(Error::Transition)?;
+                            let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            batch.checks.extend(ancestry_checks);
+                            match (task_marker, conversation_marker) {
+                                (Some(task_marker), Some(conversation_marker)) => {
+                                    if task_marker.value != marker_bytes
+                                        || conversation_marker.value != marker_bytes
+                                        || receipt.is_some()
+                                    {
+                                        return Err(Error::Handler(
+                                            "interrupted nested marker mismatch".into(),
+                                        ));
+                                    }
+                                    let finish =
+                                        task_store::prepare_authenticated_callback_ancestry_finish(
+                                            store,
+                                            item.task.id(),
+                                            conversation,
+                                            &marker_bytes,
+                                        )?;
+                                    let conversation_finish = crate::conversation_signal::prepare_callback_finish_signal_fence(store, conversation, &marker_bytes).map_err(|e| Error::Handler(e.to_string()))?;
+                                    batch.checks.retain(|check| check.key != task_marker_key);
+                                    batch.checks.extend(finish.checks);
+                                    batch.checks.extend(conversation_finish.checks);
+                                    batch.mutations.extend(finish.mutations);
+                                    batch.mutations.extend(conversation_finish.mutations);
+                                }
+                                (None, None) => {
+                                    for id in ancestry {
+                                        let key = format!("durable/task-callback-start/{id}")
+                                            .into_bytes();
+                                        if store
+                                            .get(&key)
+                                            .map_err(task_store::Error::from)?
+                                            .is_some()
+                                        {
+                                            return Err(Error::Handler(
+                                                "partial nested marker chain".into(),
+                                            ));
+                                        }
+                                        batch.checks.push(durable_store::Check {
+                                            key,
+                                            expected: durable_store::Expected::Missing,
+                                        });
+                                    }
+                                    batch.checks.push(durable_store::Check {
+                                        key: conversation_marker_key,
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                                _ => {
+                                    return Err(Error::Handler(
+                                        "partial nested callback markers".into(),
+                                    ));
+                                }
+                            }
+                            let terminal_key = conversation_cancel_terminal_key(item.task.id());
+                            let terminal = ConversationCancelTerminalMarker {
+                                version: 1,
+                                claim_id: claim.claim_id,
+                                attempt: claim.attempt,
+                                running_task_version: item.version,
+                                terminal_task: next.task.clone(),
+                                receipt_version: None,
+                            };
+                            batch.checks.extend([
+                                durable_store::Check {
+                                    key: claim_key,
+                                    expected: durable_store::Expected::Version(entry.version),
+                                },
+                                durable_store::Check {
+                                    key: receipt_key,
+                                    expected: receipt
+                                        .as_ref()
+                                        .map_or(durable_store::Expected::Missing, |e| {
+                                            durable_store::Expected::Version(e.version)
+                                        }),
+                                },
+                                durable_store::Check {
+                                    key: terminal_key.clone(),
+                                    expected: durable_store::Expected::Missing,
+                                },
+                            ]);
+                            batch.mutations.push(durable_store::Mutation::Put {
+                                key: terminal_key,
+                                value: serde_json::to_vec(&terminal)
+                                    .map_err(|e| Error::Handler(e.to_string()))?,
+                            });
+                            match store.commit_with_prefix_put_fence(
+                                &batch.checks,
+                                &batch.mutations,
+                                &[
+                                    task_store::PREFIX,
+                                    crate::ownership_edge::PREFIX,
+                                    b"runtime/conversation/",
+                                ],
+                                recovery_graph_version,
+                            ) {
+                                Ok(()) => {
+                                    self.deferred_recovery.extend(deferred);
+                                    continue 'scan;
+                                }
+                                Err(durable_store::Error::Conflict { .. }) => {
+                                    self.deferred_recovery.extend(deferred);
+                                    self.deferred_recovery.insert(item.task.id());
+                                    return Ok(());
+                                }
+                                Err(error) => return Err(task_store::Error::from(error).into()),
+                            }
+                        }
                         // A versioned after receipt certifies that both the callback
                         // and the replay-safe after hook returned. It can be used
                         // only while the original registration, identity, owner,

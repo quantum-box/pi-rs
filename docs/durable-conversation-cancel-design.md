@@ -309,6 +309,7 @@ callback once under the conversation start lease, and saves its receipt while
 retiring the markers in one checked commit. Real-driver tests reject an
 ancestor signal or late Tool receipt arriving between claim and marker creation;
 a process killed during callback leaves its claim and ancestor markers durable.
-This path is not enabled in production. In particular, nested terminal evidence,
-parent settlement, selected hooks and recovery of a killed nested callback are
-not yet connected or verified.
+On real-driver reopen, the original interrupted cleanup is failed for
+reconciliation and its authenticated markers are retired atomically; the
+callback is not rerun. This path is not enabled in production. In particular,
+nested success evidence, parent settlement and selected hooks remain unconnected.

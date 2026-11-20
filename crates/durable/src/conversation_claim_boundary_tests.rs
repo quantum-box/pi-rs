@@ -3879,8 +3879,8 @@ async fn nested_callback_kill_worker() {
 }
 
 #[cfg(unix)]
-#[test]
-fn nested_callback_kill_preserves_claim_and_ancestor_markers() {
+#[tokio::test]
+async fn nested_callback_kill_preserves_claim_and_ancestor_markers() {
     let dir = tempfile::tempdir().unwrap();
     let mut process = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
@@ -3936,4 +3936,100 @@ fn nested_callback_kill_preserves_claim_and_ancestor_markers() {
             .unwrap()
             .is_none()
     );
+
+    let root = *root;
+    drop(store);
+    struct NeverCancel(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl crate::async_task_tool::DurableParkCancel for NeverCancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    let grandchild = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(AsyncTool {
+            name: "grandchild",
+            child: None,
+            gate: None,
+            early: false,
+        }),
+        "grandchild",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let leaf_tool = Arc::new(AsyncTool {
+        name: "leaf",
+        child: Some("grandchild"),
+        gate: None,
+        early: false,
+    });
+    let leaf_identity_tool: Arc<dyn Tool> = leaf_tool.clone();
+    let _leaf_identity =
+        pi_rs_durable::nested_identity::register(&leaf_identity_tool, Some("leaf-backend".into()))
+            .unwrap();
+    let leaf = crate::async_task_tool::register_conversation_unsafe_durable_tool_with_park_cancel(
+        &mut registry,
+        leaf_tool,
+        "leaf",
+        1,
+        vec![grandchild.clone()],
+        "cancel-v1",
+        Arc::new(NeverCancel(calls.clone())),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    let root_tool = Arc::new(AsyncTool {
+        name: "root",
+        child: Some("leaf"),
+        gate: None,
+        early: false,
+    });
+    let root_identity_tool: Arc<dyn Tool> = root_tool.clone();
+    let _root_identity =
+        pi_rs_durable::nested_identity::register(&root_identity_tool, Some("backend-v1".into()))
+            .unwrap();
+    let root_tool =
+        crate::async_task_tool::register_conversation_unsafe_durable_tool_with_park_cancel(
+            &mut registry,
+            root_tool,
+            "root",
+            1,
+            vec![leaf.clone()],
+            "cancel-v1",
+            Arc::new(NeverCancel(calls.clone())),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+        )
+        .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![root_tool.register(), leaf.register(), grandchild.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let item = crate::task_store::TaskStore::new(&store).load(task).unwrap().unwrap();
+            if item.task.is_terminal() {
+                assert!(matches!(item.task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")));
+                for id in [task, root] { assert!(store.get(format!("durable/task-callback-start/{id}").as_bytes()).unwrap().is_none()); }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let _ = driver.shutdown_with_pending().unwrap();
+    let _ = scheduler.shutdown().await;
 }

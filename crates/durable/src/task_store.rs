@@ -1965,6 +1965,56 @@ pub(crate) fn prepare_nested_cancel_claim_ancestry(
     })
 }
 
+/// Read and authenticate the stored nested claim ancestry for recovery. The
+/// caller must check the claim/sidecar commit identity and compose these checks
+/// with the terminal transition and any exact marker retirement.
+#[allow(dead_code)]
+pub(crate) fn read_nested_cancel_claim_ancestry(
+    store: &Store,
+    task: Uuid,
+    claim: Uuid,
+) -> Result<(Uuid, Vec<Uuid>, Vec<Check>, u64), Error> {
+    let key = nested_cancel_claim_ancestry_key(task);
+    let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
+    let evidence: NestedCancelClaimAncestry = serde_json::from_slice(&entry.value)?;
+    if evidence.version != 1
+        || evidence.task != task
+        || evidence.claim != claim
+        || claim.is_nil()
+        || evidence.conversation.is_nil()
+        || evidence.ancestry.len() < 2
+        || evidence.ancestry.len() > 1024
+    {
+        return Err(Error::InvalidKey);
+    }
+    let chain: Vec<_> = evidence.ancestry.iter().map(|item| item.task).collect();
+    let mut seen = std::collections::HashSet::new();
+    if chain.first() != Some(&task) || chain.iter().any(|id| id.is_nil() || !seen.insert(*id)) {
+        return Err(Error::InvalidKey);
+    }
+    let tasks = TaskStore::new(store);
+    let mut checks = vec![Check {
+        key,
+        expected: Expected::Version(entry.version),
+    }];
+    for (i, id) in chain.iter().enumerate() {
+        let record = tasks.load(*id)?.ok_or(Error::SignalTargetNotFound)?;
+        let expected_owner = chain
+            .get(i + 1)
+            .map_or(TaskOwner::Conversation(evidence.conversation), |parent| {
+                TaskOwner::Task(*parent)
+            });
+        if record.task.owner() != &expected_owner {
+            return Err(Error::InvalidKey);
+        }
+        checks.push(Check {
+            key: self::key(*id),
+            expected: Expected::Version(record.version),
+        });
+    }
+    Ok((evidence.conversation, chain, checks, entry.version))
+}
+
 /// Start the exact chain and recheck the immutable sidecar and every version
 /// observed at claim time. Compose with the live claim, park, identity and
 /// conversation marker checks in the same transaction before first poll.
