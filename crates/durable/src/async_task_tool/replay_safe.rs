@@ -2297,14 +2297,16 @@ impl Handler for Executor {
                         {
                             return Err("substituted nested marker accepted".into());
                         }
-                        admission.store_nested_conversation_cancel_receipt_and_after(
-                            self,
-                            &receipt,
-                            &_identity_lease,
-                            expected,
-                            &marker,
-                            check,
-                        )?;
+                        admission
+                            .store_nested_conversation_cancel_receipt_and_after(
+                                self,
+                                &receipt,
+                                &_identity_lease,
+                                expected,
+                                &marker,
+                                check,
+                            )
+                            .map_err(|e| e.to_string())?;
                     } else {
                         if admission
                             .store_nested_conversation_cancel_receipt_and_retire(
@@ -2678,20 +2680,24 @@ impl Handler for Executor {
                         &marker,
                         check,
                     ),
-                    (true, None) => admission.store_nested_conversation_cancel_receipt_and_retire(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    ),
-                    (false, None) => admission.store_conversation_cancel_receipt_and_retire(
-                        self,
-                        &receipt,
-                        &_identity_lease,
-                        expected,
-                        &marker,
-                    ),
+                    (true, None) => admission
+                        .store_nested_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )
+                        .map_err(crate::task_scheduler::HookFenceError::Other),
+                    (false, None) => admission
+                        .store_conversation_cancel_receipt_and_retire(
+                            self,
+                            &receipt,
+                            &_identity_lease,
+                            expected,
+                            &marker,
+                        )
+                        .map_err(crate::task_scheduler::HookFenceError::Other),
                 };
                 if let Err(error) = saved {
                     if let Some(check) = snapshot_check {
@@ -2702,6 +2708,15 @@ impl Handler for Executor {
                                 _identity_lease,
                                 check,
                                 nested,
+                                match error {
+                                    crate::task_scheduler::HookFenceError::WriteLockBusy => {
+                                        crate::task_scheduler::KnownCancelCommitState::Busy
+                                    }
+                                    crate::task_scheduler::HookFenceError::Conflict => {
+                                        crate::task_scheduler::KnownCancelCommitState::Stale
+                                    }
+                                    _ => crate::task_scheduler::KnownCancelCommitState::Uncertain,
+                                },
                             ),
                         );
                         return Ok(Step::Succeed(serde_json::Value::Null));

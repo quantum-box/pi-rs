@@ -592,6 +592,8 @@ pub(crate) fn woken_terminal_after_checks(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnownCancelCommitState {
     NotCommitted,
+    Busy,
+    Stale,
     Uncertain,
 }
 
@@ -633,12 +635,13 @@ impl KnownConversationCancel {
         identity: crate::nested_identity::IdentityLease,
         snapshot_check: durable_store::Check,
         nested: bool,
+        commit_state: KnownCancelCommitState,
     ) -> Self {
         Self {
             claim: receipt.claim.clone(),
             result: receipt.result.clone(),
             marker,
-            commit_state: KnownCancelCommitState::Uncertain,
+            commit_state,
             identity: Some(Arc::new(identity)),
             attachment: None,
             receipt: Some(receipt),
@@ -3115,7 +3118,12 @@ impl PendingSettlement {
     /// candidate and lease remain owned and can be returned on shutdown.
     pub(crate) fn waits_for_writer(&self) -> bool {
         match self {
-            Self::Unprepared(completed) => completed.writer_busy,
+            Self::Unprepared(completed) => {
+                completed.writer_busy
+                    || completed
+                        .known_conversation_cancel()
+                        .is_some_and(|known| known.commit_state == KnownCancelCommitState::Busy)
+            }
             Self::Prepared { settlement, .. } => settlement.writer_busy,
             Self::Failure { settlement, .. } => settlement.writer_busy,
             Self::PreparationConflict { .. } => false,
@@ -3125,10 +3133,11 @@ impl PendingSettlement {
     // fence during graceful driver shutdown. This only observes the graph;
     // the returned settlement retains its lease and is always revalidated.
     pub(crate) fn waits_for_uncertain_graph(&self, include_background: bool) -> bool {
-        if self
-            .completed()
-            .is_some_and(|value| value.known_conversation_cancel().is_some())
-        {
+        if self.completed().is_some_and(|value| {
+            value
+                .known_conversation_cancel()
+                .is_some_and(|known| known.commit_state != KnownCancelCommitState::Busy)
+        }) {
             return true;
         }
         let owner = &self.lease().attachment.owner;
@@ -4659,6 +4668,7 @@ impl AdmissionHandle<'_> {
             false,
         )
         .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     /// Save the successful callback receipt and retire both exact start markers
@@ -4683,6 +4693,7 @@ impl AdmissionHandle<'_> {
             false,
         )
         .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     pub(crate) fn store_conversation_cancel_receipt_and_after(
@@ -4693,7 +4704,7 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: &[u8],
         snapshot_check: &durable_store::Check,
-    ) -> Result<(), String> {
+    ) -> Result<(), HookFenceError> {
         if receipt.version != 2 || receipt.after_result.is_none() {
             return Err("missing cancel after evidence".into());
         }
@@ -4800,6 +4811,7 @@ impl AdmissionHandle<'_> {
             Some((key, value)),
             nested,
         )
+        .map_err(|e| e.to_string())
     }
 
     /// Compose a nested callback receipt with retirement of all exact
@@ -4824,6 +4836,7 @@ impl AdmissionHandle<'_> {
             true,
         )
         .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     #[allow(dead_code)]
@@ -4835,7 +4848,7 @@ impl AdmissionHandle<'_> {
         expected_identity: &str,
         marker: &[u8],
         snapshot_check: &durable_store::Check,
-    ) -> Result<(), String> {
+    ) -> Result<(), HookFenceError> {
         if receipt.version != 2 || receipt.after_result.is_none() {
             return Err("missing cancel after evidence".into());
         }
@@ -4862,7 +4875,7 @@ impl AdmissionHandle<'_> {
         snapshot_check: Option<&durable_store::Check>,
         memo: Option<(&str, Option<Value>)>,
         nested: bool,
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<Option<Value>, HookFenceError> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
         }
@@ -5109,7 +5122,11 @@ impl AdmissionHandle<'_> {
                 ],
                 boundary,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                durable_store::Error::WriteLockBusy(_) => HookFenceError::WriteLockBusy,
+                durable_store::Error::Conflict { .. } => HookFenceError::Conflict,
+                other => HookFenceError::Other(other.to_string()),
+            })?;
         Ok(memo_result)
     }
 
@@ -10543,12 +10560,90 @@ impl Scheduler {
 
     /// Resume an owned pending state after cleanup. The checked transaction is
     /// revalidated under the task gate before its first resumed commit.
+    fn retry_known_cancel(&self, completed: &mut CompletedInvocation) {
+        let Some(known) = completed.known_conversation_cancel().cloned() else {
+            return;
+        };
+        if known.commit_state != KnownCancelCommitState::Busy
+            || !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
+            || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
+        {
+            return;
+        }
+        let (Some(receipt), Some(snapshot), Some(identity), Some(attachment)) = (
+            &known.receipt,
+            &known.snapshot_check,
+            &known.identity,
+            &known.attachment,
+        ) else {
+            return;
+        };
+        let Some(expected) = identity.as_ref().as_deref() else {
+            return;
+        };
+        let Some(harness) = &attachment.harness else {
+            return;
+        };
+        let Ok(harness) = harness.try_lock() else {
+            return;
+        };
+        let admission = AdmissionHandle {
+            running: &completed.running,
+            lease: &completed.lease,
+            abort: true,
+            definitions: &self.wake_reader.definitions,
+            activity: &self.activity,
+            standalone: false,
+            validator: Some(&harness),
+        };
+        let result = if known.nested {
+            admission.store_nested_conversation_cancel_receipt_and_after(
+                attachment.handler.as_ref(),
+                receipt,
+                identity,
+                expected,
+                &known.marker,
+                snapshot,
+            )
+        } else {
+            admission.store_conversation_cancel_receipt_and_after(
+                attachment.handler.as_ref(),
+                receipt,
+                identity,
+                expected,
+                &known.marker,
+                snapshot,
+            )
+        };
+        match result {
+            Ok(()) => completed.result = InvocationResult::Abort(None),
+            Err(error) => {
+                if let InvocationResult::KnownConversationCancel(ref mut pending) = completed.result
+                {
+                    pending.commit_state = match error {
+                        HookFenceError::WriteLockBusy => KnownCancelCommitState::Busy,
+                        HookFenceError::Conflict => KnownCancelCommitState::Stale,
+                        HookFenceError::Other(_) => KnownCancelCommitState::Uncertain,
+                    };
+                }
+            }
+        }
+    }
+
     pub fn try_resume_pending(
         &mut self,
         pending: PendingSettlement,
     ) -> Result<bool, SettlementError> {
         let (mut lease, mut settlement) = match pending {
-            PendingSettlement::Unprepared(completed) => {
+            PendingSettlement::Unprepared(mut completed) => {
+                if completed.known_conversation_cancel().is_some() {
+                    self.retry_known_cancel(&mut completed);
+                    if completed.known_conversation_cancel().is_some() {
+                        return Err(SettlementError::Pending {
+                            completed: Box::new(completed),
+                        });
+                    }
+                }
                 return self.try_settle_invocation(completed);
             }
             PendingSettlement::Prepared { lease, settlement } => (lease, settlement),

@@ -482,6 +482,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             | "nested_claim_actual_selected_kill_parent"
             | "selection_hook_fence"
             | "selection_hook_test_dispatch"
+            | "selection_hook_writer_busy"
             | "selection_hook_kill"
             | "selection_hook_marker_conflict"
             | "selection_hook_multilevel"
@@ -1514,6 +1515,7 @@ async fn exercise_conversation_park_claim(case: &str) {
     if matches!(
         case,
         "selection_hook_test_dispatch"
+            | "selection_hook_writer_busy"
             | "selection_hook_output_schema"
             | "selection_hook_kill"
             | "selection_hook_marker_conflict"
@@ -1573,6 +1575,20 @@ async fn exercise_conversation_park_claim(case: &str) {
                 }
             }
         });
+        if case == "selection_hook_writer_busy" {
+            let path = path.clone();
+            crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(path).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    ready_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_secs(6));
+                    conn.execute_batch("ROLLBACK").unwrap();
+                });
+                ready_rx.recv().unwrap();
+            });
+        }
         if matches!(
             case,
             "selection_hook_marker_conflict"
@@ -1673,6 +1689,10 @@ async fn exercise_conversation_park_claim(case: &str) {
                 .expect("known result retained");
             assert!(known.after_result().is_some());
             assert!(known.has_snapshot_check());
+            assert_eq!(
+                known.commit_state(),
+                crate::task_scheduler::KnownCancelCommitState::Stale
+            );
             assert!(known.identity().is_some());
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(after_calls.load(Ordering::SeqCst), 1);
@@ -3262,6 +3282,11 @@ async fn selected_hook_cancel_claim_rejects_selection_change() {
 #[tokio::test]
 async fn selected_hook_callback_pins_selection_and_publishes_after_result() {
     exercise_conversation_park_claim("selection_hook_test_dispatch").await;
+}
+
+#[tokio::test]
+async fn selected_hook_cancel_retries_busy_receipt_without_reinvoking_hooks() {
+    exercise_conversation_park_claim("selection_hook_writer_busy").await;
 }
 
 #[tokio::test]

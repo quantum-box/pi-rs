@@ -1874,10 +1874,11 @@ impl Shared {
                 hook();
             }
         }
-        if pending
-            .completed()
-            .is_some_and(|value| value.known_conversation_cancel().is_some())
-        {
+        if pending.completed().is_some_and(|value| {
+            value.known_conversation_cancel().is_some_and(|known| {
+                known.commit_state() != task_scheduler::KnownCancelCommitState::Busy
+            })
+        }) {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
