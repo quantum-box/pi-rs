@@ -7584,6 +7584,25 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
             .unwrap(),
         root
     );
+    // A stale evidence check must not partially abort the graph.
+    let mut stale_proof = proof.clone();
+    stale_proof.push(durable_store::Check {
+        key: b"test/woken-stale".to_vec(),
+        expected: durable_store::Expected::Version(1),
+    });
+    assert!(
+        harness
+            .scoped_woken_abort_graph(&root, &stale_proof, &[conversation])
+            .is_err()
+    );
+    assert!(!harness.conversation(conversation).unwrap().abort_requested);
+    assert_eq!(
+        crate::task_store::TaskStore::new(&store)
+            .load(root.task.id())
+            .unwrap()
+            .unwrap(),
+        root
+    );
     harness
         .scoped_woken_abort_graph(&root, &proof, &[conversation])
         .unwrap();
