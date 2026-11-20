@@ -520,6 +520,7 @@ impl<'a> TaskStore<'a> {
         created: &std::collections::HashMap<Uuid, &Task>,
     ) -> Result<Vec<Check>, Error> {
         let mut checks = Vec::new();
+        let claim_boundary = self.store.put_version()?;
         let mut seen_tasks = std::collections::HashSet::from([task.id()]);
         let mut seen_conversations = std::collections::HashSet::new();
         let mut next = task.owner().clone();
@@ -540,6 +541,20 @@ impl<'a> TaskStore<'a> {
                     key: marker_key,
                     expected: Expected::Missing,
                 });
+                if let TaskOwner::Task(id) = &next {
+                    for key in [
+                        crate::task_scheduler::conversation_cancel_claim_key(*id),
+                        crate::task_scheduler::woken_conversation_claim_key(*id),
+                    ] {
+                        if self.store.get(&key)?.is_some() {
+                            return Err(Error::CallbackStartBusy);
+                        }
+                        checks.push(Check {
+                            key,
+                            expected: Expected::MissingUnchangedSince(claim_boundary),
+                        });
+                    }
+                }
             }
             match next {
                 TaskOwner::Task(id) => {
@@ -2362,6 +2377,24 @@ mod tests {
         store
             .commit(&[], &[Mutation::Delete { key: marker }])
             .unwrap();
+        let before_claim_aba = tasks.prepare_save(&[Save::Create(&child)]).unwrap();
+        let claim = crate::task_scheduler::conversation_cancel_claim_key(parent.id());
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: claim.clone(),
+                    value: b"claim".to_vec(),
+                }],
+            )
+            .unwrap();
+        store
+            .commit(&[], &[Mutation::Delete { key: claim }])
+            .unwrap();
+        assert!(matches!(
+            store.commit(&before_claim_aba.checks, &before_claim_aba.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
         let snapshot = tasks.load(parent.id()).unwrap().unwrap();
         tasks
             .update(&snapshot, |task| task.request_abort())

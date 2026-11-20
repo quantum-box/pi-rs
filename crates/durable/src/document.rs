@@ -1174,6 +1174,12 @@ fn merge_task_expected(a: &Expected, b: &Expected) -> Expected {
     }
 }
 
+fn cancel_claim_key(key: &[u8]) -> bool {
+    key.starts_with(b"durable/replay-safe-async/")
+        && (key.ends_with(b"/conversation-park-cancel-claim")
+            || key.ends_with(b"/conversation-woken-cancel-claim-v3"))
+}
+
 /// Preserve every independently observed graph fence in a single check.
 /// Incompatible snapshots must become a normal CAS conflict, not InvalidBatch.
 pub(crate) fn normalize_graph_checks(batch: &mut OwnedBatch) {
@@ -1188,7 +1194,8 @@ pub(crate) fn normalize_graph_checks(batch: &mut OwnedBatch) {
             || check.key.starts_with(crate::ownership_edge::PREFIX)
             || check.key.starts_with(b"durable/ownership-abort-fence/v1/")
             || check.key.starts_with(b"runtime/conversation/")
-            || check.key.starts_with(b"runtime/owned-cleanup-attempt/");
+            || check.key.starts_with(b"runtime/owned-cleanup-attempt/")
+            || cancel_claim_key(&check.key);
         if graph && let Some(index) = seen.get(&check.key) {
             let previous = &mut checks[*index].expected;
             *previous = merge_task_expected(previous, &check.expected);
@@ -1213,6 +1220,7 @@ pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut Owne
             && !other.key.starts_with(b"durable/ownership-abort-fence/v1/")
             && !other.key.starts_with(b"runtime/conversation/")
             && !other.key.starts_with(b"runtime/owned-cleanup-attempt/")
+            && !cancel_claim_key(&other.key)
         {
             continue;
         }
@@ -3898,6 +3906,39 @@ mod nested_entry_tests {
         )
         .unwrap();
         check();
+    }
+
+    #[test]
+    fn cancel_claim_checks_keep_earliest_absence_boundary() {
+        for suffix in [
+            "conversation-park-cancel-claim",
+            "conversation-woken-cancel-claim-v3",
+        ] {
+            let key =
+                format!("durable/replay-safe-async/00000000-0000-0000-0000-000000000001/{suffix}")
+                    .into_bytes();
+            let mut batch = OwnedBatch {
+                checks: vec![
+                    Check {
+                        key: key.clone(),
+                        expected: Expected::MissingUnchangedSince(9),
+                    },
+                    Check {
+                        key: key.clone(),
+                        expected: Expected::MissingUnchangedSince(4),
+                    },
+                ],
+                mutations: vec![],
+            };
+            normalize_graph_checks(&mut batch);
+            assert_eq!(
+                batch.checks,
+                vec![Check {
+                    key,
+                    expected: Expected::MissingUnchangedSince(4)
+                }]
+            );
+        }
     }
 
     #[test]

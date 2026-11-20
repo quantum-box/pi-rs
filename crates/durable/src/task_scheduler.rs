@@ -1120,7 +1120,7 @@ pub(crate) fn conversation_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-terminal").into_bytes()
 }
 
-fn conversation_cancel_claim_key(task: Uuid) -> Vec<u8> {
+pub(crate) fn conversation_cancel_claim_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-claim").into_bytes()
 }
 
