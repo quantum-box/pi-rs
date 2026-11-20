@@ -33,12 +33,19 @@ prepared arguments and fence joined outcomes. They do not authorize a callback:
 conversation owner, registration, abort and claim/receipt evidence must still
 be joined to the same transaction.
 
-The experimental v3 woken claim is not dispatched. If such a claim is left by
-a stopped cleanup attempt, recovery fails the original task for reconciliation
-and atomically retires only matching task and conversation start markers. A
-missing, incomplete or foreign marker pair cannot authorize a new callback;
-claim and any receipt remain available as evidence. This recovery does not
-establish that an external cancellation ran or make the Tool outcome known.
+`register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel`
+opts an unhooked conversation root into cancellation after a committed park or
+an interrupted wake. This changes the persisted registration identity. The
+woken path binds the original attempt, cleanup attempt, identity, conversation
+and park proof to claim, first poll and receipt; a late Tool result blocks
+receipt settlement and remains reconciliation evidence. The callback is polled
+at most once. A successful callback does not determine the interrupted Tool's
+outcome: the task fails for reconciliation and `abort_and_wait` can report
+pending cleanup. Roots with live owned work fail closed; child cancellation and
+selected hooks on this path are unsupported. After process loss recovery fails
+the original task for reconciliation and atomically retires only matching task
+and conversation start markers. Missing, incomplete or foreign marker pairs
+cannot authorize a new callback; the claim and any receipt remain available.
 
 ## Opt-in first-poll dispatch
 

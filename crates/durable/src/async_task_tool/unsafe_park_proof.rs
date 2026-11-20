@@ -447,6 +447,24 @@ pub(crate) fn woken_cancel_candidate_checks(
     Ok((expected, checks))
 }
 
+/// Capture the exact joined woken attempt after a live abort. This is only
+/// execution evidence; callers must fence the task and conversation binding.
+pub(crate) fn woken_live_abort_candidate_checks(
+    store: &Store,
+    task: &Task,
+    boundary: u64,
+) -> Result<Vec<Check>, String> {
+    if task.state() != &TaskState::Running || !task.abort_requested() || task.replay_safe() {
+        return Err("invalid live woken abort".into());
+    }
+    let attempt = task.attempt_id().ok_or("missing woken attempt")?;
+    let (checks, target) = cancel_checks_with_policy(store, task, boundary, true)?;
+    if target != Some(attempt) {
+        return Err("woken attempt changed".into());
+    }
+    Ok(checks)
+}
+
 /// Validate the prior wake for an already-reserved abort cleanup. This proves
 /// neither the current task version nor any conversation authorization.
 #[allow(dead_code)]

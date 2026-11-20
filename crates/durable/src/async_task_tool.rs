@@ -102,7 +102,7 @@ pub fn register_conversation_unsafe_durable_tool_with_park_cancel(
         children,
         None,
         false,
-        Some((cancel_identity.to_owned(), cancel, false)),
+        Some((cancel_identity.to_owned(), cancel, false, false)),
     )
 }
 
@@ -130,7 +130,37 @@ pub fn register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
         children,
         None,
         false,
-        Some((cancel_identity.to_owned(), cancel, true)),
+        Some((cancel_identity.to_owned(), cancel, true, false)),
+    )
+}
+
+/// Explicitly enable at-most-once external cancellation for an unhooked
+/// unsafe conversation Tool after a committed park or an interrupted wake.
+/// A stopped or uncertain callback and the interrupted Tool outcome require
+/// reconciliation. Existing parked records cannot change registration.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _authorization: UnsafeDurableAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+        return Err("invalid cancel identity".into());
+    }
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        None,
+        false,
+        Some((cancel_identity.to_owned(), cancel, true, true)),
     )
 }
 
@@ -337,7 +367,7 @@ pub(crate) fn register_selected_unsafe_cancel_candidate(
             Arc::new(SelectedBeforeHooks(resolved)),
         )),
         false,
-        Some((cancel_identity.to_owned(), cancel, enabled)),
+        Some((cancel_identity.to_owned(), cancel, enabled, false)),
     )
 }
 
