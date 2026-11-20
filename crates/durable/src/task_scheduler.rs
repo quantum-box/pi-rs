@@ -10608,9 +10608,11 @@ impl Scheduler {
                         && !record.task.is_terminal()
                         && record.task.checkpoint().phase == "replay-safe-async-wait"
                         && ((record.task.state() == &TaskState::Running
-                            && record.task.kind().is_some_and(|kind| {
+                            && (record.task.kind().is_some_and(|kind| {
                                 kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
-                            }))
+                            }) || (cfg!(test)
+                                && std::env::var_os("PI_TEST_WOKEN_START_DIR").is_some()
+                                && matches!(record.task.owner(), TaskOwner::Conversation(_)))))
                             || (record.task.abort_requested()
                                 && record.task.kind().is_some_and(|kind| {
                                     kind.starts_with("pi-rs.unsafe-park-async.v1.")
@@ -11466,6 +11468,105 @@ impl Scheduler {
                             {
                                 hook();
                             }
+                            return Ok(());
+                        }
+                        Err(error) => return Err(task_store::Error::from(error).into()),
+                    }
+                }
+                // Test the complete admission boundary before enabling woken
+                // conversation cancellation in production. Unbound schedulers
+                // defer this root until the Harness can authenticate it.
+                #[cfg(test)]
+                if std::env::var_os("PI_TEST_WOKEN_START_DIR").is_some()
+                    && !item.task.replay_safe()
+                    && !item.task.abort_requested()
+                    && matches!(item.task.owner(), TaskOwner::Conversation(_))
+                    && item.task.checkpoint().phase == "replay-safe-async-wait"
+                    && let (Some(harness), Ok(reg)) =
+                        (self.validator.as_ref(), self.registered(&item.task))
+                    && reg.conversation_checkpointable.is_some()
+                    && reg.handler.conversation_cancel_dispatch_enabled()
+                {
+                    let owner = self.owner();
+                    let selection_gate = harness.checkpointable_extension_gate();
+                    let _selection = selection_gate.lock().map_err(|_| Error::Poisoned)?;
+                    let _identity = reg
+                        .handler
+                        .conversation_cleanup_identity_lease()
+                        .map_err(|_| Error::Ownership)?;
+                    let boundary = owner
+                        .store()
+                        .put_version()
+                        .map_err(task_store::Error::from)?;
+                    let records = self.ts().list()?;
+                    if has_live_owned(owner.store(), item.task.id(), &records)? {
+                        continue;
+                    }
+                    let (target, mut checks) = match crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
+                        owner.store(), &item.task, boundary,
+                    ) {
+                        Ok(proof) => proof,
+                        Err(_) => {
+                            recovery_failure!("interrupted: execution outcome requires reconciliation".into());
+                            self.deferred_recovery.extend(deferred);
+                            continue 'scan;
+                        }
+                    };
+                    if item.task.attempt_id() != Some(target) {
+                        return Err(Error::Ownership);
+                    }
+                    checks.extend(
+                        harness
+                            .checkpointable_conversation_checks(&item.task, &self.registry)
+                            .map_err(|e| Error::Handler(e.to_string()))?,
+                    );
+                    let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+                        owner.store(),
+                        item.task.id(),
+                        &records,
+                        boundary,
+                    )?;
+                    if uncertain.is_some() {
+                        return Err(Error::Ownership);
+                    }
+                    checks.extend(descendant_checks);
+                    let mut next = item.clone();
+                    next.task
+                        .recover_interrupted_woken_for_cleanup()
+                        .map_err(Error::Transition)?;
+                    let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                    batch.checks.extend(checks);
+                    let (check, mutation) = crate::ownership_edge::prepare_abort_fence(
+                        owner.store(),
+                        &TaskOwner::Task(item.task.id()),
+                    )
+                    .map_err(task_store::Error::from)?;
+                    batch.checks.push(check);
+                    batch.mutations.push(mutation);
+                    if let Some(hook) = woken_recovery_hooks()
+                        .lock()
+                        .unwrap()
+                        .remove(&item.task.id())
+                    {
+                        hook();
+                    }
+                    match owner.store().commit_with_prefix_put_fence(
+                        &batch.checks,
+                        &batch.mutations,
+                        &[
+                            task_store::PREFIX,
+                            crate::ownership_edge::PREFIX,
+                            b"runtime/conversation/",
+                        ],
+                        boundary,
+                    ) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                            self.deferred_recovery.extend(deferred);
+                            continue 'scan;
+                        }
+                        Err(durable_store::Error::WriteLockBusy(_)) => {
+                            self.deferred_recovery.extend(deferred);
+                            self.deferred_recovery.insert(item.task.id());
                             return Ok(());
                         }
                         Err(error) => return Err(task_store::Error::from(error).into()),
