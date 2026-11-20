@@ -8194,7 +8194,17 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         if graph_aba == 6 {
             drop(store);
             drop(harness);
-            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            let mut worker = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+                ])
+                .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+                .env("PI_TEST_WOKEN_ANY_RESUME", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
             let marker = format!("runtime/woken-owned-reservation/v1/{}", root.task.id());
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
@@ -8202,14 +8212,15 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                     if store.get(marker.as_bytes()).unwrap().is_some() {
                         break;
                     }
+                    assert!(worker.try_wait().unwrap().is_none());
                     drop(store);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .unwrap();
-            drop(driver);
-            drop(scheduler);
+            worker.kill().unwrap();
+            worker.wait().unwrap();
             let store = durable_store::Store::open(&path).unwrap();
             let entry = store.get(marker.as_bytes()).unwrap().unwrap();
             let reservation: Value = serde_json::from_slice(&entry.value).unwrap();
