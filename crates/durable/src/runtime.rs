@@ -5255,9 +5255,14 @@ impl Harness {
                 "duplicate checkpointable tool result".into(),
             ));
         }
-        // An aborted result is host-generated rather than the Tool's own
-        // structured output. Discard it even for older saved receipts.
-        if task.state() == &crate::task::TaskState::Cancelled {
+        // An abort or interrupted-wake after result is host-generated, not
+        // the Tool's own structured output, even when the hook supplies one.
+        // A Failed woken task can reach this method only through the checked
+        // v3 terminal receipt path and remains blocked for reconciliation.
+        let host_generated = task.state() == &crate::task::TaskState::Cancelled
+            || (matches!(task.state(), crate::task::TaskState::Failed(_))
+                && task.woken_interrupted_attempt().is_some());
+        if host_generated {
             result.extra.remove("structuredOutput");
         }
         let attachments = result
@@ -5290,7 +5295,7 @@ impl Harness {
         // output channel. Remove only the provable projection if the original
         // structured value violates the currently configured schema.
         if let Some(schema) = c.tool_filters.output_schemas.get(&call.name)
-            && task.state() != &crate::task::TaskState::Cancelled
+            && !host_generated
         {
             if task.checkpoint().phase != "replay-safe-async-after" {
                 return Err(Error::Invalid("missing checkpointable raw result".into()));

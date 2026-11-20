@@ -1723,6 +1723,7 @@ impl Resolved {
         ctx: &Context<'_>,
         validate_initial: F,
         validate: G,
+        strip_structured: bool,
     ) -> Result<ToolBlockResult, String>
     where
         F: Fn(&ToolBlockResult) -> Result<(), String> + Sync,
@@ -1739,7 +1740,11 @@ impl Resolved {
                     .await
                     {
                         Ok(Some((value, _))) if value != input => {
-                            let candidate = Self::durable_result_blocks(value, &input, &result)?;
+                            let mut candidate =
+                                Self::durable_result_blocks(value, &input, &result)?;
+                            if strip_structured {
+                                candidate.extra.remove("structuredOutput");
+                            }
                             validate(&candidate)?;
                             result = candidate;
                         }
@@ -1751,7 +1756,10 @@ impl Resolved {
                 match protect(async { hook.after_tool_blocks(call, &result, nested, ctx).await })
                     .await
                 {
-                    Ok(Some(value)) => {
+                    Ok(Some(mut value)) => {
+                        if strip_structured {
+                            value.extra.remove("structuredOutput");
+                        }
                         validate(&value)?;
                         result = value;
                     }

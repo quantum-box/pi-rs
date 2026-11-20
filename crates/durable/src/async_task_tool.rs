@@ -1794,6 +1794,12 @@ impl crate::extension::Hook for SelectedBeforeHooks {
                 context,
                 |candidate| replay_safe::validate_content_hook_result(candidate, required, true),
                 |candidate| replay_safe::validate_content_hook_result(candidate, required, false),
+                required.is_some_and(|d| {
+                    matches!(
+                        d.code.as_deref(),
+                        Some("aborted" | "restart_limit" | "tool_unavailable" | "interrupted")
+                    )
+                }),
             )
             .await?;
         Ok((value != *result).then_some(value))
@@ -2200,7 +2206,7 @@ impl crate::task_scheduler::Handler for SealedExecutor {
                 _=cancellation.cancelled()=>Err("interrupted cleanup cancelled".to_string()),
                 result=selected.after_tool_blocks_checked(&call,initial,true,&ctx,
                     |candidate|replay_safe::validate_content_hook_result(candidate,Some(&gate),true),
-                    |candidate|replay_safe::validate_content_hook_result(candidate,Some(&gate),false))=>result,
+                    |candidate|replay_safe::validate_content_hook_result(candidate,Some(&gate),false), true)=>result,
             }
         })?;
         if memo.0.load(std::sync::atomic::Ordering::Acquire) {

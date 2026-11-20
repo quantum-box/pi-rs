@@ -87,6 +87,35 @@ impl crate::extension::Hook for ClaimPassHook {
         Ok(None)
     }
 }
+struct SchemaClaimHook(ClaimPassHook);
+#[async_trait]
+impl crate::extension::Hook for SchemaClaimHook {
+    async fn before_tool(
+        &self,
+        call: &crate::extension::ToolCall,
+        ctx: &crate::extension::Context<'_>,
+    ) -> Result<crate::extension::BeforeTool, String> {
+        self.0.before_tool(call, ctx).await
+    }
+    async fn after_tool_blocks(
+        &self,
+        call: &crate::extension::ToolCall,
+        result: &crate::extension::ToolBlockResult,
+        _nested: bool,
+        ctx: &crate::extension::Context<'_>,
+    ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+        let Some(value) = self.0.after_tool(call, &json!(null), ctx).await? else {
+            return Ok(None);
+        };
+        let mut result = result.clone();
+        result.output = vec![json!({"type":"text", "text": value.as_str().unwrap()})];
+        result
+            .extra
+            .insert("structuredOutput".into(), json!({"must":"be discarded"}));
+        Ok(Some(result))
+    }
+}
+
 #[async_trait]
 impl Model for ModelStub {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
@@ -439,6 +468,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             | "selection_hook_conversation_abort"
             | "selection_hook_woken"
             | "selection_hook_woken_live"
+            | "selection_hook_woken_schema"
     );
     let mut extensions = crate::extension::Registry::default();
     if selected {
@@ -446,17 +476,24 @@ async fn exercise_conversation_park_claim(case: &str) {
             .install_identified(
                 crate::extension::Extension {
                     name: "policy".into(),
-                    hooks: vec![Arc::new(ClaimPassHook(
-                        Some(after_calls.clone()),
-                        matches!(
-                            case,
-                            "selection_hook_after_memo"
-                                | "selection_hook_memo_conflict"
-                                | "selection_hook_kill"
-                                | "selection_hook_woken"
-                                | "selection_hook_woken_live"
-                        ),
-                    ))],
+                    hooks: vec![if case == "selection_hook_woken_schema" {
+                        Arc::new(SchemaClaimHook(ClaimPassHook(
+                            Some(after_calls.clone()),
+                            true,
+                        ))) as Arc<dyn crate::extension::Hook>
+                    } else {
+                        Arc::new(ClaimPassHook(
+                            Some(after_calls.clone()),
+                            matches!(
+                                case,
+                                "selection_hook_after_memo"
+                                    | "selection_hook_memo_conflict"
+                                    | "selection_hook_kill"
+                                    | "selection_hook_woken"
+                                    | "selection_hook_woken_live"
+                            ),
+                        ))
+                    }],
                     ..Default::default()
                 },
                 crate::extension::ExtensionIdentity::new(
@@ -519,7 +556,7 @@ async fn exercise_conversation_park_claim(case: &str) {
     let identity_handle =
         pi_rs_durable::nested_identity::register(&identity_tool, Some("backend-v1".into()))
             .unwrap();
-    let root = if matches!(case, "selection_hook_woken" | "selection_hook_woken_live") {
+    let root = if matches!(case, "selection_hook_woken" | "selection_hook_woken_live" | "selection_hook_woken_schema") {
         crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel(
             &mut registry, root_tool, "root", 1, vec![leaf.clone()], &snapshot, &selection_names,
             "cancel-v1", Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
@@ -587,7 +624,10 @@ async fn exercise_conversation_park_claim(case: &str) {
             .select_extensions(conversation, selection_names)
             .unwrap();
     }
-    if case == "selection_hook_output_schema" {
+    if matches!(
+        case,
+        "selection_hook_output_schema" | "selection_hook_woken_schema"
+    ) {
         scheduler
             .set_tool_output_schema(conversation, "root".into(), Some(json!({"type":"object"})))
             .unwrap();
@@ -608,7 +648,10 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
-    if matches!(case, "dispatch_woken_claim" | "selection_hook_woken") {
+    if matches!(
+        case,
+        "dispatch_woken_claim" | "selection_hook_woken" | "selection_hook_woken_schema"
+    ) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !gate.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5011,7 +5054,12 @@ async fn woken_cancel_shutdown_joins_callback_and_preserves_receipt() {
 #[tokio::test]
 async fn selected_woken_original_worker() {
     if std::env::var_os("PI_TEST_SELECTED_WOKEN_DIR").is_some() {
-        exercise_conversation_park_claim("selection_hook_woken").await;
+        let case = if std::env::var_os("PI_TEST_SELECTED_WOKEN_SCHEMA").is_some() {
+            "selection_hook_woken_schema"
+        } else {
+            "selection_hook_woken"
+        };
+        exercise_conversation_park_claim(case).await;
     }
 }
 
@@ -5193,10 +5241,18 @@ fn start_selected_woken_test_scheduler(
         .install_identified(
             crate::extension::Extension {
                 name: "policy".into(),
-                hooks: vec![Arc::new(ClaimPassHook(
-                    Some(Arc::new(AtomicUsize::new(0))),
-                    true,
-                ))],
+                hooks: vec![if std::env::var("PI_TEST_SELECTED_SCHEMA_RICH")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Arc::new(SchemaClaimHook(ClaimPassHook(
+                        Some(Arc::new(AtomicUsize::new(0))),
+                        true,
+                    ))) as Arc<dyn crate::extension::Hook>
+                } else {
+                    Arc::new(ClaimPassHook(Some(Arc::new(AtomicUsize::new(0))), true))
+                }],
                 ..Default::default()
             },
             crate::extension::ExtensionIdentity::new(1, fingerprint.into(), vec!["hook-v1".into()])
@@ -5252,9 +5308,10 @@ async fn selected_woken_resume_worker() {
 #[tokio::test]
 async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
     use std::process::{Command, Stdio};
-    for mode in ["normal", "late", "selection"] {
+    for mode in ["normal", "late", "selection", "schema"] {
         let dir = tempfile::tempdir().unwrap();
-        let mut wake = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "conversation_claim_boundary_tests::selected_woken_original_worker",
@@ -5263,9 +5320,11 @@ async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
             .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
             .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if mode == "schema" {
+            command.env("PI_TEST_SELECTED_WOKEN_SCHEMA", "1");
+        }
+        let mut wake = command.spawn().unwrap();
         tokio::time::timeout(Duration::from_secs(20), async {
             while !dir.path().join("wake").exists() {
                 assert!(wake.try_wait().unwrap().is_none());
@@ -5300,6 +5359,10 @@ async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
             .env("PI_TEST_SELECTED_RESUME_DIR", dir.path())
             .env("PI_TEST_SELECTED_RECORD_AFTER", dir.path())
             .env("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT", dir.path())
+            .env(
+                "PI_TEST_SELECTED_SCHEMA_RICH",
+                if mode == "schema" { "1" } else { "0" },
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -5394,6 +5457,10 @@ async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
         let state = scheduler.conversation(conversation).unwrap();
         let text = format!("{state:?}");
         assert!(text.contains("reconciliation"), "{text}");
+        if mode == "schema" {
+            assert_eq!(state.tool_results.len(), 1, "{text}");
+            assert!(state.tool_results[0].structured_output.is_none());
+        }
         assert_eq!(text.contains("after cancel"), mode != "late", "{text}");
         let store = durable_store::Store::open(&path).unwrap();
         assert_eq!(
