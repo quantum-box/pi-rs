@@ -11752,7 +11752,7 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<Vec<Check>, Error> {
-        self.checkpointable_conversation_checks_inner(task, registry, false, false)
+        self.checkpointable_conversation_checks_inner(task, registry, false, false, false)
     }
 
     // Provisional evidence only: callers must include it in the same checked
@@ -11774,10 +11774,90 @@ impl Harness {
         let crate::task::TaskOwner::Conversation(id) = task.owner() else {
             unreachable!()
         };
+        let mut checks = self.checkpointable_cancel_root_capability_checks(*id)?;
+        checks.extend(
+            self.checkpointable_conversation_checks_inner(task, registry, true, false, false)?,
+        );
+        Ok(checks)
+    }
+
+    /// Evidence for a nested cleanup attempt, not callback authorization. The
+    /// returned checks bind every foreground owner, the exact conversation
+    /// root and its selected registration. The caller must additionally fence
+    /// the cleanup lease, claim, park proof, ancestry markers and outcome.
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_nested_cancel_conversation_checks(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<(Uuid, Vec<Check>), Error> {
+        self.checkpointable_nested_cancel_checks_inner(task, registry, false)
+    }
+
+    /// Provisional root binding for an already-cancelled nested child. The
+    /// caller must separately authenticate its terminal claim and receipt.
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_nested_cancel_result_checks(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<(Uuid, Vec<Check>), Error> {
+        self.checkpointable_nested_cancel_checks_inner(task, registry, true)
+    }
+
+    fn checkpointable_nested_cancel_checks_inner(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+        terminal: bool,
+    ) -> Result<(Uuid, Vec<Check>), Error> {
+        if !task.abort_requested()
+            || task.state()
+                != if terminal {
+                    &crate::task::TaskState::Cancelled
+                } else {
+                    &crate::task::TaskState::Running
+                }
+            || !matches!(task.owner(), crate::task::TaskOwner::Task(_))
+        {
+            return Err(Error::Invalid("nested cleanup attempt unavailable".into()));
+        }
+        let tasks = crate::task_store::TaskStore::new(self.owner.store());
+        let mut current = task.id();
+        let mut seen = std::collections::HashSet::new();
+        let mut ancestry_checks = Vec::new();
+        let conversation = loop {
+            if !seen.insert(current) || seen.len() > 1024 {
+                return Err(Error::Invalid(
+                    "nested cleanup ownership cycle or depth".into(),
+                ));
+            }
+            let record = tasks
+                .load(current)
+                .map_err(|e| Error::Invalid(format!("task load: {e}")))?
+                .ok_or_else(|| Error::Invalid("nested cleanup owner missing".into()))?;
+            ancestry_checks.push(Check {
+                key: crate::task_store::key(current),
+                expected: Expected::Version(record.version),
+            });
+            match record.task.owner() {
+                crate::task::TaskOwner::Task(parent) => current = *parent,
+                crate::task::TaskOwner::Conversation(id) => break *id,
+            }
+        };
+        let mut checks = self.checkpointable_cancel_root_capability_checks(conversation)?;
+        checks.extend(ancestry_checks);
+        checks.extend(
+            self.checkpointable_conversation_checks_inner(task, registry, true, false, terminal)?,
+        );
+        Ok((conversation, checks))
+    }
+
+    fn checkpointable_cancel_root_capability_checks(&self, id: Uuid) -> Result<Vec<Check>, Error> {
         let entry = self
             .owner
             .store()
-            .get(&Self::key(*id))?
+            .get(&Self::key(id))?
             .ok_or(Error::NotFound)?;
         let conversation: Conversation = serde_json::from_slice(&entry.value)?;
         if let Phase::TaskPending { ref identity, .. } = conversation.phase
@@ -11794,13 +11874,10 @@ impl Harness {
                 "selected cancel root must be a Harness tool".into(),
             ));
         }
-        let mut checks =
-            self.checkpointable_conversation_checks_inner(task, registry, true, false)?;
-        checks.push(Check {
-            key: Self::key(*id),
+        Ok(vec![Check {
+            key: Self::key(id),
             expected: Expected::Version(entry.version),
-        });
-        Ok(checks)
+        }])
     }
 
     /// Provisional conversation and root checks for a stopped cleanup. These
@@ -11821,7 +11898,7 @@ impl Harness {
                 "checkpointable recovery task unavailable".into(),
             ));
         }
-        self.checkpointable_conversation_checks_inner(task, registry, true, true)
+        self.checkpointable_conversation_checks_inner(task, registry, true, true, false)
     }
 
     fn checkpointable_conversation_checks_inner(
@@ -11830,6 +11907,7 @@ impl Harness {
         registry: &crate::task_scheduler::Registry,
         cleanup: bool,
         allow_failed_root: bool,
+        allow_cancelled_child: bool,
     ) -> Result<Vec<Check>, Error> {
         let store = self.owner.store();
         let tasks = crate::task_store::TaskStore::new(store);
@@ -11849,9 +11927,11 @@ impl Harness {
                     && !registry.is_conversation_checkpointable_task(&stored.task))
                 || (!cleanup && stored.task.abort_requested())
                 || (stored.task.is_terminal()
-                    && !(allow_failed_root
-                        && next == task.id()
-                        && matches!(stored.task.state(), crate::task::TaskState::Failed(_))))
+                    && !(next == task.id()
+                        && ((allow_failed_root
+                            && matches!(stored.task.state(), crate::task::TaskState::Failed(_)))
+                            || (allow_cancelled_child
+                                && stored.task.state() == &crate::task::TaskState::Cancelled))))
                 || (stored.task.is_completing()
                     && !(stored.task.retains_task_children_on_success()
                         && matches!(stored.task.state(), crate::task::TaskState::Completing(_))))
@@ -34284,8 +34364,112 @@ mod scheduler_tests {
                     h.checkpointable_conversation_checks(&running.task, &registry)
                         .is_err()
                 );
+                let child_adapter = Arc::new(
+                    TaskTool::new(
+                        pi_rs_core::ToolSpec {
+                            name: "child".into(),
+                            description: "".into(),
+                            parameters: serde_json::json!({"type":"object"}),
+                        },
+                        "checkpointable-child",
+                        false,
+                        1,
+                        Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!(null)))),
+                    )
+                    .with_deferred_arguments(),
+                );
+                registry
+                    .register_conversation_checkpointable(&child_adapter, Arc::new(|| true), None)
+                    .unwrap();
+                let child_id = Uuid::new_v4();
+                let mut child = Task::new(
+                    child_id,
+                    crate::task::TaskOwner::Task(op),
+                    crate::task::Checkpoint {
+                        phase: "initial".into(),
+                        data: serde_json::json!(null),
+                    },
+                    5,
+                )
+                .unwrap()
+                .registered("checkpointable-child".into(), false);
+                child.start_attempt(Uuid::new_v4()).unwrap();
+                child.request_abort().unwrap();
+                tasks
+                    .save(&[crate::task_store::Save::Create(&child)])
+                    .unwrap();
+                let (owner_conversation, nested_checks) = h
+                    .checkpointable_nested_cancel_conversation_checks(&child, &registry)
+                    .unwrap();
+                assert_eq!(owner_conversation, id);
+                // A separate terminal child can be checked as a candidate
+                // result, but this is not itself receipt authorization.
+                let ended_id = Uuid::new_v4();
+                let mut ended = Task::new(
+                    ended_id,
+                    crate::task::TaskOwner::Task(op),
+                    crate::task::Checkpoint {
+                        phase: "initial".into(),
+                        data: serde_json::json!(null),
+                    },
+                    5,
+                )
+                .unwrap()
+                .registered("checkpointable-child".into(), false);
+                ended.start_attempt(Uuid::new_v4()).unwrap();
+                ended.request_abort().unwrap();
+                ended.cancel().unwrap();
+                tasks
+                    .save(&[crate::task_store::Save::Create(&ended)])
+                    .unwrap();
+                let (result_conversation, result_checks) = h
+                    .checkpointable_nested_cancel_result_checks(&ended, &registry)
+                    .unwrap();
+                assert_eq!(result_conversation, id);
+                h.owner.store().commit(&result_checks, &[]).unwrap();
+                assert!(
+                    h.checkpointable_nested_cancel_conversation_checks(&ended, &registry)
+                        .is_err()
+                );
+                let nested_authorized = format!("test/nested-authorized/{stage}/{op}").into_bytes();
+                h.owner
+                    .store()
+                    .commit(
+                        &nested_checks,
+                        &[Mutation::Put {
+                            key: nested_authorized.clone(),
+                            value: vec![1],
+                        }],
+                    )
+                    .unwrap();
+                assert!(h.owner.store().get(&nested_authorized).unwrap().is_some());
+                assert!(
+                    h.checkpointable_nested_cancel_conversation_checks(&running.task, &registry)
+                        .is_err()
+                );
+                // Even an apparently identical replacement of an ancestor is
+                // fenced; recovery must re-read the exact ownership graph.
+                tasks
+                    .save(&[crate::task_store::Save::Update(&running)])
+                    .unwrap();
+                let ancestor_output = format!("test/nested-ancestor/{stage}/{op}").into_bytes();
+                assert!(matches!(
+                    h.owner.store().commit(
+                        &nested_checks,
+                        &[Mutation::Put {
+                            key: ancestor_output.clone(),
+                            value: vec![1],
+                        }]
+                    ),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(h.owner.store().get(&ancestor_output).unwrap().is_none());
+                let running = tasks.load(op).unwrap().unwrap();
                 let checks = h
                     .checkpointable_cancel_conversation_checks(&running.task, &registry)
+                    .unwrap();
+                let (_, nested_checks) = h
+                    .checkpointable_nested_cancel_conversation_checks(&child, &registry)
                     .unwrap();
                 // The competing writer runs after all evidence reads and before
                 // the dependent intent or park batch reaches its commit.
@@ -34322,6 +34506,18 @@ mod scheduler_tests {
                     Err(durable_store::Error::Conflict { .. })
                 ));
                 assert!(h.owner.store().get(&output).unwrap().is_none());
+                let nested_output = format!("test/nested/{stage}/{op}").into_bytes();
+                assert!(matches!(
+                    h.owner.store().commit(
+                        &nested_checks,
+                        &[Mutation::Put {
+                            key: nested_output.clone(),
+                            value: vec![1],
+                        }]
+                    ),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(h.owner.store().get(&nested_output).unwrap().is_none());
                 if !abort {
                     assert!(
                         h.checkpointable_cancel_conversation_checks(&running.task, &registry)

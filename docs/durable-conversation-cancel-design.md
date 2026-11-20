@@ -324,3 +324,60 @@ late receipt races, replaced task/conversation/selection/attempt evidence,
 identity busy and reentrant update, callback failure and retry authorization,
 and process kill/reopen. Until these paths are implemented and verified, the
 existing standalone-only guards and conversation fail-closed behavior remain.
+
+## Nested cancellation branch status
+
+This branch connects explicit at-most-once park cancellation for conversation-owned
+nested tools, including selected replay-safe hooks. Claim, marker, receipt and
+terminal evidence are checked against the full ancestry; parent claim and
+settlement authenticate the child evidence while holding selection and identity
+leases. Real-driver tests exercise unhooked and selected child-to-parent cancel,
+late outcome and signal conflicts, and callback kill/reopen. Parent receipt
+recovery with nested children and broader integration remain under validation.
+Woken cancellation remains unsupported. This branch does not solve durable
+publication fencing or the associated owner reacquisition race.
+
+## Historical nested design notes
+
+The following notes describe earlier stages; the status above supersedes their
+statements that dispatch and parent evidence consumption are unconnected.
+
+The provisional nested cleanup conversation check walks and version-fences the
+exact task ancestry, then binds it to the pending root, selected registration,
+conversation snapshot and root capability restrictions. It is evidence for a
+future child claim transaction, not authorization to run a callback. The
+cleanup attempt and identity lease, park, signal revisions, claim, first-poll
+markers, callback receipt and parent settlement still require their own
+composed checks. Child callback dispatch remains disabled.
+
+A separate provisional nested-claim ancestry sidecar captures the full
+child-to-root chain and each task's version and signal revision. It can be
+composed with a claim and later checked while creating the authenticated start
+markers, so a signal or owner change between the claim and first poll causes a
+conflict. Its reopen and ancestor-signal race are tested, but neither the claim
+nor dispatch calls it yet; the sidecar alone does not authorize a callback.
+
+An experimental, test-only nested path now composes the child claim with the
+ancestry sidecar, creates the full marker chain, polls an unhooked cancellation
+callback once under the conversation start lease, and saves its receipt while
+retiring the markers in one checked commit. Real-driver tests reject an
+ancestor signal or late Tool receipt arriving between claim and marker creation;
+a process killed during callback leaves its claim and ancestor markers durable.
+On real-driver reopen, the original interrupted cleanup is failed for
+reconciliation and its authenticated markers are retired atomically; the
+callback is not rerun. This path is not enabled in production. In particular,
+parent settlement does not yet consume a successful child. A test-only path
+commits the cancelled child and its terminal evidence together; a late Tool
+receipt arriving at settlement forces reconciliation. A selected-child test
+also pins selection through first poll and runs the replay-safe after hook with
+fenced memo before its version-2 receipt. These paths are not enabled in
+production.
+
+The provisional nested-success reader checks the claim and ancestry sidecar
+were co-committed, marker creation preceded the callback receipt, and the
+receipt preceded the atomic task and terminal-evidence commit. It checks the
+park and late-outcome fence, registration identity, marker retirement and
+current ancestry, and returns a host identity lease plus store checks. A
+separate Harness check binds an already-cancelled child to the current root and
+selection. Neither check is wired into parent settlement; a caller must hold
+the selection gate and the returned identity lease through the parent commit.
