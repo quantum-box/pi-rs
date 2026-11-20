@@ -8651,7 +8651,7 @@ async fn exercise_woken_owned_coordinator(invalid_proof: bool) {
         crate::task_scheduler::before_woken_recovery_commit_for_test(parent, move || {
             use std::sync::atomic::Ordering;
             let store = durable_store::Store::open(writer_path).unwrap();
-            let child = crate::task::Task::new(
+            let mut child = crate::task::Task::new(
                 uuid::Uuid::new_v4(),
                 crate::task::TaskOwner::Task(parent),
                 crate::task::Checkpoint {
@@ -8662,6 +8662,7 @@ async fn exercise_woken_owned_coordinator(invalid_proof: bool) {
             )
             .unwrap()
             .registered("owned-independent".into(), true);
+            child.cancel().unwrap();
             let key = crate::task_store::key(child.id());
             store
                 .commit(

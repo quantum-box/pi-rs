@@ -16233,9 +16233,11 @@ impl Scheduler {
                         }
                         return Ok(TickReservation::Progress(false));
                     }
-                    let reason = self
-                        .blocked_reason(&snapshot.task)
-                        .ok_or(Error::Registration)?;
+                    let Some(reason) = self.blocked_reason(&snapshot.task) else {
+                        // A checked reservation may lose a race or be deferred by
+                        // owned-graph evidence while its registration remains valid.
+                        return Ok(TickReservation::Progress(false));
+                    };
                     let diagnostic = orphan_diagnostic(&reason);
                     let update = self.ts().update(snapshot, |t| {
                         t.start()?;
