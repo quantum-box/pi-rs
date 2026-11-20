@@ -161,6 +161,83 @@ fn woken_owned_reservation_key(root: Uuid) -> Vec<u8> {
     format!("runtime/woken-owned-reservation/v1/{root}").into_bytes()
 }
 
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedChildReservation {
+    version: u32,
+    root: Uuid,
+    child: Uuid,
+    graph_version: u64,
+    ready_version: u64,
+    running: crate::task::Task,
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn prepare_woken_owned_child_reservation(
+    store: &durable_store::Store,
+    ready: &crate::task_store::StoredTask,
+    running: &crate::task::Task,
+) -> Result<Option<(Vec<Check>, Mutation)>, Error> {
+    let crate::task::TaskOwner::Conversation(conversation) = ready.task.owner() else {
+        return Ok(None);
+    };
+    let edge_key = crate::ownership_edge::edge_key(*conversation);
+    let Some(edge_entry) = store.get(&edge_key)? else {
+        return Ok(None);
+    };
+    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+        return Ok(None);
+    }
+    let root = edge.edge.task;
+    let graph_key = woken_owned_graph_key(root);
+    let Some(graph_entry) = store.get(&graph_key)? else {
+        return Ok(None);
+    };
+    let graph: WokenOwnedGraphEvidence = serde_json::from_slice(&graph_entry.value)?;
+    if graph.version != 1
+        || graph.root != root
+        || !graph.tasks.iter().any(|task| task.id() == ready.task.id())
+    {
+        return Err(Error::Invalid("owned child graph mismatch".into()));
+    }
+    let key = format!(
+        "runtime/woken-owned-child-reservation/v1/{root}/{}",
+        ready.task.id()
+    )
+    .into_bytes();
+    let marker = WokenOwnedChildReservation {
+        version: 1,
+        root,
+        child: ready.task.id(),
+        graph_version: graph_entry.version,
+        ready_version: ready.version,
+        running: running.clone(),
+    };
+    Ok(Some((
+        vec![
+            Check {
+                key: graph_key,
+                expected: Expected::Version(graph_entry.version),
+            },
+            Check {
+                key: edge_key,
+                expected: Expected::Version(edge_entry.version),
+            },
+            Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            },
+        ],
+        Mutation::Put {
+            key,
+            value: serde_json::to_vec(&marker)?,
+        },
+    )))
+}
+
 // Read-only scheduling hint. The reservation transaction repeats every check;
 // stale or invalid evidence merely keeps this root out of the candidate set.
 #[cfg(feature = "experimental-graph-revision")]
@@ -168,9 +245,29 @@ pub(crate) fn woken_owned_reservation_may_start(
     store: &durable_store::Store,
     task: &crate::task::Task,
 ) -> Result<bool, Error> {
-    let Some(entry) = store.get(&woken_owned_graph_key(task.id()))? else {
-        return Ok(true);
-    };
+    let (entry, root, is_root) =
+        if let Some(entry) = store.get(&woken_owned_graph_key(task.id()))? {
+            (entry, task.id(), true)
+        } else {
+            let crate::task::TaskOwner::Conversation(conversation) = task.owner() else {
+                return Ok(true);
+            };
+            let edge_key = crate::ownership_edge::edge_key(*conversation);
+            let Some(edge_entry) = store.get(&edge_key)? else {
+                return Ok(true);
+            };
+            let Ok(edge) = crate::ownership_edge::decode(&edge_key, edge_entry) else {
+                return Ok(false);
+            };
+            if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+                return Ok(true);
+            }
+            let root = edge.edge.task;
+            let Some(entry) = store.get(&woken_owned_graph_key(root))? else {
+                return Ok(true);
+            };
+            (entry, root, false)
+        };
     let Ok(graph) = serde_json::from_slice::<WokenOwnedGraphEvidence>(&entry.value) else {
         return Ok(false);
     };
@@ -178,17 +275,26 @@ pub(crate) fn woken_owned_reservation_may_start(
         return Ok(false);
     };
     if graph.version != 1
-        || graph.root != task.id()
-        || task.woken_interrupted_attempt() != Some(graph.interrupted_attempt)
+        || graph.root != root
+        || (is_root && task.woken_interrupted_attempt() != Some(graph.interrupted_attempt))
+        || (!is_root && !graph.tasks.iter().any(|marked| marked.id() == task.id()))
         || store
-            .get(&woken_owned_reservation_key(task.id()))?
+            .get(&if is_root {
+                woken_owned_reservation_key(root)
+            } else {
+                format!(
+                    "runtime/woken-owned-child-reservation/v1/{root}/{}",
+                    task.id()
+                )
+                .into_bytes()
+            })?
             .is_some()
     {
         return Ok(false);
     }
     for (key, expected) in [
         (
-            durable_store::graph_revision::task_structure_revision(task.id()),
+            durable_store::graph_revision::task_structure_revision(root),
             structure.root_revision,
         ),
         (

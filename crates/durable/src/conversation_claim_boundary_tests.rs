@@ -7625,6 +7625,13 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
             crate::task_scheduler::Step::Succeed(json!("independent"))
         ))
     );
+    #[cfg(feature = "experimental-graph-revision")]
+    assert!(registry.register_with_abort(
+        "owned-abort-child",
+        true,
+        |_: &crate::task::Task| Ok(crate::task_scheduler::Step::Succeed(json!("unused"))),
+        |_: &crate::task::Task| Ok(crate::task_scheduler::Step::Succeed(json!("cancelled"))),
+    ));
     let mut extra = Vec::new();
     let register_safe = |registry: &mut Registry, name: &'static str| {
         let tool = Arc::new(WokenAnyFixture {
@@ -7916,6 +7923,12 @@ async fn owned_graph_rejects_unauthenticated_unsafe_conversation_child() {
     exercise_woken_owned_graph_receipt(false, 7).await;
 }
 
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_driver_reserves_direct_conversation_child() {
+    exercise_woken_owned_graph_receipt(false, 8).await;
+}
+
 async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
@@ -7968,7 +7981,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         .prepare_create(&edge)
         .unwrap();
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
-    let unsafe_owned = if graph_aba == 7 {
+    let unsafe_owned = if graph_aba == 7 || graph_aba == 8 {
         let task = crate::task::Task::new(
             uuid::Uuid::new_v4(),
             crate::task::TaskOwner::Conversation(conversation),
@@ -7979,7 +7992,15 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             3,
         )
         .unwrap()
-        .registered("unverified-owned-child".into(), false);
+        .registered(
+            if graph_aba == 7 {
+                "unverified-owned-child"
+            } else {
+                "owned-abort-child"
+            }
+            .into(),
+            graph_aba == 8,
+        );
         crate::task_store::TaskStore::new(&store)
             .save(&[crate::task_store::Save::Create(&task)])
             .unwrap();
@@ -7987,6 +8008,17 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     } else {
         None
     };
+    if graph_aba == 8 {
+        let tasks = crate::task_store::TaskStore::new(&store);
+        for child in tasks.list().unwrap().into_iter().filter(|child| {
+            child.task.owner() == &crate::task::TaskOwner::Task(root.task.id())
+                && !child.task.is_terminal()
+        }) {
+            tasks.update(&child, |task| task.request_abort()).unwrap();
+            let child = tasks.load(child.task.id()).unwrap().unwrap();
+            tasks.update(&child, |task| task.cancel()).unwrap();
+        }
+    }
     let root = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
         .unwrap()
@@ -8044,13 +8076,80 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     harness
         .authenticated_scoped_woken_abort_graph(&root, &registry, &[conversation])
         .unwrap();
-    if let Some(id) = unsafe_owned {
+    if let Some(id) = unsafe_owned.filter(|_| graph_aba == 7) {
         let tasks = crate::task_store::TaskStore::new(&store);
         let task = tasks.load(id).unwrap().unwrap();
         assert!(task.task.abort_requested());
         tasks.update(&task, |task| task.cancel()).unwrap();
     }
     assert!(harness.conversation(conversation).unwrap().abort_requested);
+    #[cfg(feature = "experimental-graph-revision")]
+    if graph_aba == 8 {
+        let child = unsafe_owned.unwrap();
+        drop(store);
+        drop(harness);
+        let mut worker = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+            ])
+            .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+            .env("PI_TEST_WOKEN_ANY_RESUME", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let marker = format!(
+            "runtime/woken-owned-child-reservation/v1/{}/{child}",
+            root.task.id()
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let store = durable_store::Store::open(&path).unwrap();
+                if store.get(marker.as_bytes()).unwrap().is_some() {
+                    break;
+                }
+                assert!(worker.try_wait().unwrap().is_none());
+                drop(store);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let _ = worker.kill();
+            let _ = worker.wait();
+            let store = durable_store::Store::open(&path).unwrap();
+            panic!(
+                "child marker missing: {:?}",
+                crate::task_store::TaskStore::new(&store).list().unwrap()
+            );
+        });
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let entry = store.get(marker.as_bytes()).unwrap().unwrap();
+        let graph = store
+            .get(&crate::runtime::woken_owned_graph_key(root.task.id()))
+            .unwrap()
+            .unwrap();
+        let graph: crate::runtime::WokenOwnedGraphEvidence =
+            serde_json::from_slice(&graph.value).unwrap();
+        let prior_version = graph.structure.unwrap().root_revision.unwrap();
+        let revision_key = durable_store::graph_revision::task_structure_revision(root.task.id());
+        let prior_commit = store
+            .commit_for_version(&revision_key, prior_version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_for_version(marker.as_bytes(), entry.version)
+                .unwrap(),
+            store
+                .next_commit_for_key(&revision_key, prior_commit)
+                .unwrap()
+        );
+        return;
+    }
     let recovered = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
         .unwrap()

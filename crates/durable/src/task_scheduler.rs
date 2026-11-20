@@ -12534,7 +12534,27 @@ impl Scheduler {
                 batch.checks.extend(checks);
                 batch.mutations.push(mutation);
             }
-            Ok(None) => (),
+            Ok(None) => match crate::runtime::prepare_woken_owned_child_reservation(
+                self.ts().store(),
+                snapshot,
+                &next.task,
+            ) {
+                Ok(Some((checks, mutation))) => {
+                    batch.checks.extend(checks);
+                    batch.mutations.push(mutation);
+                }
+                Ok(None) => (),
+                Err(crate::runtime::Error::Storage(error)) => {
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Err(task_store::Error::from(error).into());
+                }
+                Err(_) => {
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(false);
+                }
+            },
             Err(crate::runtime::Error::Storage(error)) => {
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
