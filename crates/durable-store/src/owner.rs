@@ -76,7 +76,7 @@ impl From<crate::Error> for OwnerError {
 pub struct OwnedStore {
     store: Store,
     _lock: OwnerLock,
-    task_gate: std::sync::Mutex<()>,
+    task_gate: crate::controls::PollGate,
     controls: crate::controls::ConversationControls,
     summary_fences: Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>,
 }
@@ -166,7 +166,7 @@ impl OwnedStore {
         Ok(Self {
             store,
             _lock: lock,
-            task_gate: std::sync::Mutex::new(()),
+            task_gate: crate::controls::PollGate::default(),
             controls: crate::controls::ConversationControls::default(),
             summary_fences: Mutex::new(HashMap::new()),
         })
@@ -180,7 +180,7 @@ impl OwnedStore {
     }
 
     /// Serializes task graph decisions without holding a lock during handlers.
-    pub fn task_gate(&self) -> &std::sync::Mutex<()> {
+    pub fn task_gate(&self) -> &crate::controls::PollGate {
         &self.task_gate
     }
 

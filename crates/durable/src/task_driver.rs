@@ -32,6 +32,8 @@ pub enum Error {
     UnknownTask(Uuid),
     #[error("task wait cancelled")]
     WaitCancelled,
+    #[error("callback cannot wait for its own task signal fence")]
+    ReentrantCallback,
     #[error("conversation runtime: {0}")]
     Runtime(#[from] crate::runtime::Error),
 }
@@ -52,6 +54,27 @@ pub(crate) struct Shared {
     unhooked_cancellations: Mutex<HashMap<(Uuid, Uuid), pi_rs_core::CancellationToken>>,
     notifications: Mutex<Option<SyncSender<()>>>,
     subscription: Mutex<Option<Receiver<()>>>,
+}
+
+impl Shared {
+    /// Keep registry replacement excluded while a cleanup transaction checks
+    /// the selected definition. Never wait for either lock from cleanup.
+    pub(crate) fn with_cleanup_registry<T>(
+        &self,
+        f: impl FnOnce(&task_scheduler::Registry) -> Result<T, crate::runtime::Error>,
+    ) -> Result<T, crate::runtime::Error> {
+        fn lock_error<T>(error: std::sync::TryLockError<T>) -> crate::runtime::Error {
+            match error {
+                std::sync::TryLockError::WouldBlock => crate::runtime::Error::TaskPublicationBusy,
+                std::sync::TryLockError::Poisoned(_) => crate::runtime::Error::Failed,
+            }
+        }
+        let _registry = self.registry_gate.try_lock().map_err(lock_error)?;
+        let scheduler = self.scheduler.try_lock().map_err(lock_error)?;
+        let registry = scheduler.cleanup_registry().clone();
+        drop(scheduler);
+        f(&registry)
+    }
 }
 
 // A dropped Driver has no return channel. Keep its unresolved leases available
@@ -120,6 +143,15 @@ pub struct Driver {
     cleanup: Option<JoinHandle<()>>,
 }
 impl Driver {
+    #[cfg(test)]
+    pub(crate) fn take_pending_for_test(
+        &self,
+        id: Uuid,
+    ) -> Option<task_scheduler::PendingSettlement> {
+        let mut pending = self.shared.pending.lock().unwrap();
+        let index = pending.iter().position(|item| item.task_id() == id)?;
+        Some(pending.remove(index))
+    }
     #[cfg(test)]
     pub(crate) fn settle_for_test(
         &self,
@@ -510,7 +542,7 @@ impl Driver {
                 let hook = abort_gate_hooks().lock().unwrap().remove(&id);
                 if let Some(hook) = hook {
                     match self.shared.owner.task_gate().try_lock() {
-                        Err(std::sync::TryLockError::WouldBlock) => {
+                        Err(durable_store::controls::PollGateError::Busy) => {
                             hook();
                             self.shared
                                 .owner
@@ -584,6 +616,39 @@ impl Driver {
         self.shared.notify_work();
         Ok(())
     }
+    /// Deliver a legacy signal, yielding while a callback-start marker owns
+    /// the task. Cancellation while retrying leaves the signal unqueued.
+    pub async fn signal_with_retry(
+        &self,
+        signal: &Signal,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<(), Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::WaitCancelled);
+        }
+        if task_store::reentrant_callback(self.shared.owner.store(), signal.task_id)
+            .map_err(task_scheduler::Error::from)?
+        {
+            return Err(Error::ReentrantCallback);
+        }
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            match self.signal(signal) {
+                Err(Error::Task(task_scheduler::Error::Store(
+                    task_store::Error::CallbackStartBusy,
+                ))) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Deliver a typed signal and wake the background scheduler when accepted.
     pub fn deliver_signal(
         &self,
@@ -607,6 +672,42 @@ impl Driver {
         }
         Ok(result)
     }
+    /// Deliver a typed signal, yielding while callback start owns the target.
+    /// No signal is written on a busy attempt; cancellation stops the retry.
+    pub async fn deliver_signal_with_retry(
+        &self,
+        task_id: Uuid,
+        token: &task_store::SignalToken,
+        key: &str,
+        value: serde_json::Value,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<task_store::SignalResult, Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::WaitCancelled);
+        }
+        if task_store::reentrant_callback(self.shared.owner.store(), task_id)
+            .map_err(task_scheduler::Error::from)?
+        {
+            return Err(Error::ReentrantCallback);
+        }
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            match self.deliver_signal(task_id, token, key, value.clone()) {
+                Err(Error::Task(task_scheduler::Error::Store(
+                    task_store::Error::CallbackStartBusy,
+                ))) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub fn get(&self, id: Uuid) -> Result<Option<Task>, Error> {
         let _state = self.check()?;
         Ok(TaskStore::new(self.shared.owner.store())
@@ -899,7 +1000,7 @@ fn fail_cleanup(shared: &Shared, error: String) {
             .reservation_stop
             .store(true, std::sync::atomic::Ordering::Release);
         if let Ok(mut state) = shared.state.lock() {
-            state.failure = Some(error);
+            state.failure.get_or_insert(error);
             state.stop = true;
             shared.wake.notify_all();
         }
@@ -911,9 +1012,18 @@ fn fail_cleanup(shared: &Shared, error: String) {
 }
 
 enum WorkerEvent {
-    Released,
+    Released(Uuid),
     Completed(Box<task_scheduler::CompletedInvocation>),
-    Failed(String),
+    Failed(Uuid, String),
+}
+
+impl WorkerEvent {
+    fn task_id(&self) -> Uuid {
+        match self {
+            Self::Released(id) | Self::Failed(id, _) => *id,
+            Self::Completed(completed) => completed.task_id(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -973,6 +1083,36 @@ pub(crate) fn after_execute_for_test(id: Uuid, hook: impl FnOnce() + Send + 'sta
         .lock()
         .unwrap()
         .insert(id, Box::new(hook));
+}
+
+#[cfg(test)]
+fn execute_failure_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_execute_failure_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    execute_failure_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+type DeferredPoisonHooks = Mutex<HashMap<usize, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn deferred_poison_hooks() -> &'static DeferredPoisonHooks {
+    static HOOKS: std::sync::OnceLock<DeferredPoisonHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_deferred_poison_for_test(
+    owner: &Arc<OwnedStore>,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    deferred_poison_hooks()
+        .lock()
+        .unwrap()
+        .insert(Arc::as_ptr(owner) as usize, Box::new(hook));
 }
 
 #[cfg(test)]
@@ -1039,8 +1179,8 @@ impl Drop for WorkerPool {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(task_scheduler::PendingSettlement::Unprepared(*completed)),
-                WorkerEvent::Released => (),
-                WorkerEvent::Failed(_) => failed = true,
+                WorkerEvent::Released(_) => (),
+                WorkerEvent::Failed(_, _) => failed = true,
             }
         }
         if failed {
@@ -1176,7 +1316,8 @@ impl Shared {
                             Ok(())
                         })();
                         if let Err(error) = registration {
-                            let _ = done.send(WorkerEvent::Failed(error));
+                            shared.stop_for_failure(error.clone());
+                            let _ = done.send(WorkerEvent::Failed(task_id, error));
                             break;
                         }
                     }
@@ -1197,12 +1338,13 @@ impl Shared {
                             Ok(()) => WorkerEvent::Completed(Box::new(completed)),
                             Err(error) if error.pre_transaction_busy() => {
                                 // The outcome and lease remain owned until receipt capture succeeds.
+                                completed.mark_writer_busy();
                                 shared
                                     .pending
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .push(task_scheduler::PendingSettlement::Unprepared(completed));
-                                WorkerEvent::Released
+                                WorkerEvent::Released(task_id)
                             }
                             Err(error) => {
                                 let message = format!("uncertain receipt capture: {error}");
@@ -1214,18 +1356,31 @@ impl Shared {
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .push(task_scheduler::PendingSettlement::Unprepared(completed));
-                                WorkerEvent::Failed(message)
+                                WorkerEvent::Failed(task_id, message)
                             }
                         },
-                        Ok(Err(task_scheduler::Error::Stopped)) => WorkerEvent::Released,
-                        Ok(Err(error)) => WorkerEvent::Failed(error.to_string()),
+                        Ok(Err(task_scheduler::Error::Stopped)) => WorkerEvent::Released(task_id),
+                        Ok(Err(error)) => {
+                            #[cfg(test)]
+                            {
+                                let hook = execute_failure_hooks().lock().unwrap().remove(&task_id);
+                                if let Some(hook) = hook {
+                                    hook();
+                                }
+                            }
+                            let message = error.to_string();
+                            shared.stop_for_failure(message.clone());
+                            WorkerEvent::Failed(task_id, message)
+                        }
                         Err(payload) => {
                             crate::extension::discard_panic_payload(payload);
-                            WorkerEvent::Failed("task handler panicked".into())
+                            let message = "task handler panicked".to_string();
+                            shared.stop_for_failure(message.clone());
+                            WorkerEvent::Failed(task_id, message)
                         }
                     };
                     #[cfg(test)]
-                    if matches!(event, WorkerEvent::Released) {
+                    if matches!(event, WorkerEvent::Released(_)) {
                         let hook = after_execute_hooks().lock().unwrap().remove(&task_id);
                         if let Some(hook) = hook {
                             hook();
@@ -1256,6 +1411,7 @@ impl Shared {
             shared: self.clone(),
         };
         let mut active = 0usize;
+        let mut active_ids = std::collections::HashSet::new();
         let mut maintenance: Vec<task_scheduler::PendingMaintenance> = Vec::new();
         let mut maintenance_cursor = 0usize;
         loop {
@@ -1268,6 +1424,7 @@ impl Shared {
             let mut progressed = false;
             while let Some(event) = pool.inbox.pop_front() {
                 active = active.saturating_sub(1);
+                active_ids.remove(&event.task_id());
                 match event {
                     WorkerEvent::Completed(completed) => {
                         let result = match self.scheduler.lock() {
@@ -1284,8 +1441,8 @@ impl Shared {
                             self.stop_for_failure(error);
                         }
                     }
-                    WorkerEvent::Released => (),
-                    WorkerEvent::Failed(error) => self.stop_for_failure(error),
+                    WorkerEvent::Released(_) => (),
+                    WorkerEvent::Failed(_, error) => self.stop_for_failure(error),
                 }
                 self.notify_work();
                 progressed = true;
@@ -1302,6 +1459,22 @@ impl Shared {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty();
+            if stopped
+                && active == 0
+                && has_pending
+                && self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(task_scheduler::PendingSettlement::waits_for_writer)
+            {
+                // BEGIN IMMEDIATE definitely did not start. Preserve every
+                // pending candidate and its lease for the caller instead of
+                // making shutdown depend on an external writer releasing.
+                self.cleanup_stop.cancel();
+                break;
+            }
             // Once a worker reports an indeterminate failure, retain every
             // pending lease for shutdown/reconciliation instead of settling it.
             if has_pending && !failed {
@@ -1427,10 +1600,12 @@ impl Shared {
                 match reservation {
                     Ok(task_scheduler::TickReservation::Invocation(job)) => {
                         active += 1;
+                        active_ids.insert(job.task_id());
                         if let Err(mpsc::SendError(job)) =
                             pool.jobs.as_ref().expect("pool open").send(job)
                         {
                             active -= 1;
+                            active_ids.remove(&job.task_id());
                             self.stop_for_failure("task worker pool disconnected".into());
                             if job.unhooked_cancellation().is_some() {
                                 drop(job);
@@ -1478,6 +1653,32 @@ impl Shared {
                     }
                     Ok(task_scheduler::TickReservation::Progress(value)) => progressed |= value,
                     Err(task_scheduler::Error::Busy) => (),
+                    Err(task_scheduler::Error::Poisoned) if active > 0 => {
+                        // A failed executor drops its lease before it can send
+                        // its error. Defer only when an executor has actually
+                        // released a lease whose event is still in flight;
+                        // unrelated poison must still stop live workers.
+                        let released = self
+                            .scheduler
+                            .lock()
+                            .ok()
+                            .and_then(|scheduler| scheduler.has_released_worker(&active_ids).ok())
+                            .unwrap_or(false);
+                        if released {
+                            #[cfg(test)]
+                            {
+                                let hook = deferred_poison_hooks()
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&(Arc::as_ptr(&self.owner) as usize));
+                                if let Some(hook) = hook {
+                                    hook();
+                                }
+                            }
+                        } else {
+                            fail_cleanup(self, task_scheduler::Error::Poisoned.to_string());
+                        }
+                    }
                     Err(task_scheduler::Error::Stopped)
                         if active > 0
                             || self
@@ -2262,6 +2463,14 @@ mod tests {
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         use std::time::{Duration, Instant};
+        // Hooks are process-global and keyed by task ID. Different fixtures
+        // must not share IDs when the test harness runs them concurrently;
+        // the path also keeps IDs stable across the kill/reopen child process.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        root.hash(&mut hasher);
+        let namespace = (u128::from(hasher.finish())) << 64;
+        let fixture_id = |id: u128| Uuid::from_u128(namespace | id);
         struct Stub;
         #[async_trait]
         impl Model for Stub {
@@ -2289,7 +2498,7 @@ mod tests {
                 })
                 .unwrap()
         } else {
-            Uuid::from_u128(200)
+            fixture_id(200)
         };
         let mut registry = task_scheduler::Registry::default();
         let abort_log = root.join("multi-abort-log");
@@ -2319,9 +2528,9 @@ mod tests {
             phase: "initial".into(),
             data: json!(null),
         };
-        let parent_id = Uuid::from_u128(1);
-        let child_id = Uuid::from_u128(2);
-        let owner_id = Uuid::from_u128(100);
+        let parent_id = fixture_id(1);
+        let child_id = fixture_id(2);
+        let owner_id = fixture_id(100);
         if !reopen {
             let mut parent = Task::new(parent_id, TaskOwner::Conversation(owner_id), cp.clone(), 3)
                 .unwrap()
@@ -2330,24 +2539,15 @@ mod tests {
             let child = Task::new(child_id, TaskOwner::Task(parent_id), cp.clone(), 3)
                 .unwrap()
                 .registered("work".into(), true);
-            let mut related = Task::new(
-                Uuid::from_u128(3),
-                TaskOwner::Task(parent_id),
-                cp.clone(),
-                3,
-            )
-            .unwrap()
-            .registered("work".into(), true);
+            let mut related = Task::new(fixture_id(3), TaskOwner::Task(parent_id), cp.clone(), 3)
+                .unwrap()
+                .registered("work".into(), true);
             related.start().unwrap();
             related.wait(WaitFor::Signal("related".into())).unwrap();
-            let mut related_held = Task::new(
-                Uuid::from_u128(4),
-                TaskOwner::Task(parent_id),
-                cp.clone(),
-                3,
-            )
-            .unwrap()
-            .registered("work".into(), true);
+            let mut related_held =
+                Task::new(fixture_id(4), TaskOwner::Task(parent_id), cp.clone(), 3)
+                    .unwrap()
+                    .registered("work".into(), true);
             related_held.start().unwrap();
             related_held.hold_success(json!("related held")).unwrap();
             tasks
@@ -2364,7 +2564,7 @@ mod tests {
                 })
                 .unwrap();
             let mut second = Task::new(
-                Uuid::from_u128(5),
+                fixture_id(5),
                 TaskOwner::Conversation(second_owner),
                 cp.clone(),
                 3,
@@ -2372,14 +2572,10 @@ mod tests {
             .unwrap()
             .registered("work".into(), true);
             second.start().unwrap();
-            let second_child = Task::new(
-                Uuid::from_u128(6),
-                TaskOwner::Task(second.id()),
-                cp.clone(),
-                3,
-            )
-            .unwrap()
-            .registered("work".into(), true);
+            let second_child =
+                Task::new(fixture_id(6), TaskOwner::Task(second.id()), cp.clone(), 3)
+                    .unwrap()
+                    .registered("work".into(), true);
             tasks
                 .save(&[Save::Create(&second), Save::Create(&second_child)])
                 .unwrap();
@@ -2399,8 +2595,8 @@ mod tests {
         }
         let offset = if reopen { 20 } else { 10 };
         let mut signal_task = Task::new(
-            Uuid::from_u128(offset),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 100)),
+            fixture_id(offset),
+            TaskOwner::Conversation(fixture_id(offset + 100)),
             cp.clone(),
             3,
         )
@@ -2409,8 +2605,8 @@ mod tests {
         signal_task.start().unwrap();
         signal_task.wait(WaitFor::Signal("go".into())).unwrap();
         let mut timer = Task::new(
-            Uuid::from_u128(offset + 1),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 101)),
+            fixture_id(offset + 1),
+            TaskOwner::Conversation(fixture_id(offset + 101)),
             cp.clone(),
             3,
         )
@@ -2423,8 +2619,8 @@ mod tests {
             ))
             .unwrap();
         let mut aborted = Task::new(
-            Uuid::from_u128(offset + 2),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 102)),
+            fixture_id(offset + 2),
+            TaskOwner::Conversation(fixture_id(offset + 102)),
             cp,
             3,
         )
@@ -2441,8 +2637,8 @@ mod tests {
             .unwrap();
         let cp = signal_task.checkpoint().clone();
         let mut ended = Task::new(
-            Uuid::from_u128(offset + 3),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 103)),
+            fixture_id(offset + 3),
+            TaskOwner::Conversation(fixture_id(offset + 103)),
             cp.clone(),
             3,
         )
@@ -2451,8 +2647,8 @@ mod tests {
         ended.start().unwrap();
         ended.succeed(json!("done")).unwrap();
         let mut dependent = Task::new(
-            Uuid::from_u128(offset + 4),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 104)),
+            fixture_id(offset + 4),
+            TaskOwner::Conversation(fixture_id(offset + 104)),
             cp,
             3,
         )
@@ -2460,14 +2656,14 @@ mod tests {
         .registered("work".into(), true);
         dependent.start().unwrap();
         dependent
-            .wait(WaitFor::TasksAny(vec![Uuid::from_u128(3), ended.id()]))
+            .wait(WaitFor::TasksAny(vec![fixture_id(3), ended.id()]))
             .unwrap();
         tasks
             .save(&[Save::Create(&ended), Save::Create(&dependent)])
             .unwrap();
         let mut ready_dependent = Task::new(
-            Uuid::from_u128(offset + 5),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 105)),
+            fixture_id(offset + 5),
+            TaskOwner::Conversation(fixture_id(offset + 105)),
             signal_task.checkpoint().clone(),
             3,
         )
@@ -2475,12 +2671,12 @@ mod tests {
         .registered("work".into(), true);
         ready_dependent.start().unwrap();
         ready_dependent
-            .wait(WaitFor::TasksAny(vec![Uuid::from_u128(3), ended.id()]))
+            .wait(WaitFor::TasksAny(vec![fixture_id(3), ended.id()]))
             .unwrap();
         tasks.save(&[Save::Create(&ready_dependent)]).unwrap();
         let mut held = Task::new(
-            Uuid::from_u128(offset + 6),
-            TaskOwner::Conversation(Uuid::from_u128(offset + 106)),
+            fixture_id(offset + 6),
+            TaskOwner::Conversation(fixture_id(offset + 106)),
             signal_task.checkpoint().clone(),
             3,
         )
@@ -2503,19 +2699,23 @@ mod tests {
                 json!(1),
             ))
             .unwrap();
-        let control = owner.conversation_controls().get(Uuid::from_u128(999));
+        let control = owner.conversation_controls().get(fixture_id(999));
         let poll = control.gate.lock().unwrap();
+        // Both maintenance graphs lack conversation descendants. A scoped
+        // fence ignores the unrelated poll, so hold both reservations here.
+        crate::task_scheduler::set_maintenance_busy_for_test(parent_id, true);
+        crate::task_scheduler::set_maintenance_busy_for_test(fixture_id(5), true);
         let (reserved_tx, reserved_rx) = mpsc::channel();
         on_maintenance_reserved_for_test(parent_id, move || reserved_tx.send(()).unwrap());
         let (second_tx, second_rx) = mpsc::channel();
-        on_maintenance_reserved_for_test(Uuid::from_u128(5), move || second_tx.send(()).unwrap());
+        on_maintenance_reserved_for_test(fixture_id(5), move || second_tx.send(()).unwrap());
         let (mutation_tx, mutation_rx) = mpsc::channel();
-        let edge_key = crate::ownership_edge::edge_key(Uuid::from_u128(offset + 100));
+        let edge_key = crate::ownership_edge::edge_key(fixture_id(offset + 100));
         if mutation {
             let edge = crate::ownership_edge::Edge {
                 task: parent_id,
                 task_owner: TaskOwner::Conversation(owner_id),
-                child: Uuid::from_u128(offset + 100),
+                child: fixture_id(offset + 100),
                 mode: crate::ownership_edge::Mode::Foreground,
             };
             let edge_key = edge_key.clone();
@@ -2639,21 +2839,11 @@ mod tests {
             TaskState::CompletingFailed(_)
         ));
         assert!(matches!(
-            tasks
-                .load(Uuid::from_u128(5))
-                .unwrap()
-                .unwrap()
-                .task
-                .state(),
+            tasks.load(fixture_id(5)).unwrap().unwrap().task.state(),
             TaskState::CompletingFailed(_)
         ));
         assert!(matches!(
-            tasks
-                .load(Uuid::from_u128(4))
-                .unwrap()
-                .unwrap()
-                .task
-                .state(),
+            tasks.load(fixture_id(4)).unwrap().unwrap().task.state(),
             TaskState::Completing(_)
         ));
         assert!(
@@ -2665,12 +2855,7 @@ mod tests {
                 .abort_requested()
         );
         assert!(matches!(
-            tasks
-                .load(Uuid::from_u128(3))
-                .unwrap()
-                .unwrap()
-                .task
-                .state(),
+            tasks.load(fixture_id(3)).unwrap().unwrap().task.state(),
             TaskState::Waiting(_)
         ));
         let (writer_busy_tx, writer_busy_rx) = mpsc::channel();
@@ -2678,7 +2863,7 @@ mod tests {
         if writer_busy {
             let (unlock_tx, unlock_rx) = mpsc::channel();
             let path = root.join("db");
-            crate::task_scheduler::on_maintenance_checked_for_test(Uuid::from_u128(5), move || {
+            crate::task_scheduler::on_maintenance_checked_for_test(fixture_id(5), move || {
                 let (locked_tx, locked_rx) = mpsc::channel();
                 let writer = thread::spawn(move || {
                     let db = rusqlite::Connection::open(path).unwrap();
@@ -2690,13 +2875,10 @@ mod tests {
                 locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 writer_handle_tx.send(writer).unwrap();
             });
-            crate::task_scheduler::on_maintenance_write_busy_for_test(
-                Uuid::from_u128(5),
-                move || {
-                    writer_busy_tx.send(()).unwrap();
-                    unlock_tx.send(()).unwrap();
-                },
-            );
+            crate::task_scheduler::on_maintenance_write_busy_for_test(fixture_id(5), move || {
+                writer_busy_tx.send(()).unwrap();
+                unlock_tx.send(()).unwrap();
+            });
         }
         let (overlap_tx, overlap_rx) = mpsc::channel();
         if merge_graphs {
@@ -2707,11 +2889,11 @@ mod tests {
                 mode: crate::ownership_edge::Mode::Foreground,
             };
             let key = crate::ownership_edge::edge_key(second_owner);
-            crate::task_scheduler::on_maintenance_overlap_for_test(Uuid::from_u128(5), move || {
+            crate::task_scheduler::on_maintenance_overlap_for_test(fixture_id(5), move || {
                 overlap_tx.send(()).unwrap()
             });
             let writer = owner.clone();
-            crate::task_scheduler::on_maintenance_checked_for_test(Uuid::from_u128(5), move || {
+            crate::task_scheduler::on_maintenance_checked_for_test(fixture_id(5), move || {
                 // Insert after independence was checked but before the abort
                 // transaction commits; the graph fence must force a retry.
                 writer
@@ -2736,6 +2918,10 @@ mod tests {
             }
         }
         drop(poll);
+        crate::task_scheduler::set_maintenance_busy_for_test(fixture_id(5), false);
+        if !hold_first {
+            crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
+        }
         if writer_busy {
             writer_busy_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -2751,12 +2937,12 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("merged graph was not serialized");
             assert!(matches!(
-                driver.get(Uuid::from_u128(5)).unwrap().unwrap().state(),
+                driver.get(fixture_id(5)).unwrap().unwrap().state(),
                 TaskState::CompletingFailed(_)
             ));
             assert!(
                 !driver
-                    .get(Uuid::from_u128(6))
+                    .get(fixture_id(6))
                     .unwrap()
                     .unwrap()
                     .abort_requested()
@@ -2764,12 +2950,7 @@ mod tests {
             crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
         } else if hold_first {
             let until = Instant::now() + Duration::from_secs(10);
-            while !driver
-                .get(Uuid::from_u128(5))
-                .unwrap()
-                .unwrap()
-                .is_terminal()
-            {
+            while !driver.get(fixture_id(5)).unwrap().unwrap().is_terminal() {
                 assert!(
                     Instant::now() < until,
                     "later independent maintenance was starved"
@@ -2784,20 +2965,16 @@ mod tests {
         }
         let until = Instant::now() + Duration::from_secs(10);
         while !driver.get(parent_id).unwrap().unwrap().is_terminal()
-            || !driver
-                .get(Uuid::from_u128(5))
-                .unwrap()
-                .unwrap()
-                .is_terminal()
+            || !driver.get(fixture_id(5)).unwrap().unwrap().is_terminal()
         {
             assert!(Instant::now() < until, "maintenance did not settle");
             thread::sleep(Duration::from_millis(5));
         }
-        let related = driver.get(Uuid::from_u128(3)).unwrap().unwrap();
+        let related = driver.get(fixture_id(3)).unwrap().unwrap();
         assert!(related.abort_requested());
         assert!(!matches!(related.state(), TaskState::Succeeded(_)));
         let log = std::fs::read_to_string(root.join("multi-abort-log")).unwrap();
-        for id in [child_id, Uuid::from_u128(6)] {
+        for id in [child_id, fixture_id(6)] {
             assert_eq!(
                 log.lines().filter(|line| *line == id.to_string()).count(),
                 1
@@ -4025,7 +4202,7 @@ mod tests {
     #[test]
     fn bounded_workers_progress_independent_root_during_busy_graph_cleanup() {
         use crate::document::{Address, Documents, TaskDocuments};
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         struct Stub;
@@ -4068,9 +4245,9 @@ mod tests {
                 Ok(task_scheduler::Step::Succeed(json!("discard")))
             }
         }
-        for mode in ["failfast", "tasktool"] {
+        for mode in ["failfast", "failfast-delete", "tasktool"] {
             let dir = tempfile::tempdir().unwrap();
-            let harness = Harness::open_paused(
+            let mut harness = Harness::open_paused(
                 dir.path().join("db"),
                 Options {
                     model: Arc::new(Stub),
@@ -4081,6 +4258,27 @@ mod tests {
                 },
             )
             .unwrap();
+            let nested_conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
+            let unrelated_conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
+            let added_conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
             let (entered_tx, entered_rx) = mpsc::channel();
             let (other_tx, other_rx) = mpsc::channel();
             let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -4123,7 +4321,7 @@ mod tests {
                 parent = parent.into_task_tool();
             }
             parent.start().unwrap();
-            if mode == "failfast" {
+            if mode != "tasktool" {
                 parent
                     .wait(WaitFor::TasksFailFast(vec![
                         Uuid::from_u128(2),
@@ -4165,14 +4363,36 @@ mod tests {
             tasks
                 .save(&[Save::Create(&parent), Save::Create(&a), Save::Create(&b)])
                 .unwrap();
+            let edge = crate::ownership_edge::Edge {
+                task: a.id(),
+                task_owner: a.owner().clone(),
+                child: nested_conversation,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                .prepare_create(&edge)
+                .unwrap();
+            owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+            if mode == "failfast-delete" {
+                let edge = crate::ownership_edge::Edge {
+                    task: a.id(),
+                    task_owner: a.owner().clone(),
+                    child: added_conversation,
+                    mode: crate::ownership_edge::Mode::Foreground,
+                };
+                let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                    .prepare_create(&edge)
+                    .unwrap();
+                owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+            }
             let driver = Arc::new(Driver::start_with_harness(scheduler, harness.worker()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             if mode == "tasktool" {
                 entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             }
-            let control = owner.conversation_controls().get(Uuid::from_u128(99));
-            let poll = control.gate.lock().unwrap();
-            if mode == "failfast" {
+            let control = owner.conversation_controls().get(nested_conversation);
+            let mut poll = Some(control.gate.lock().unwrap());
+            if mode != "tasktool" {
                 let current = tasks.load(b.id()).unwrap().unwrap();
                 tasks
                     .update(&current, |task| {
@@ -4204,6 +4424,7 @@ mod tests {
                 thread::yield_now();
             }
             let maintenance_parent_id = Uuid::from_u128(1000);
+            task_scheduler::set_maintenance_busy_for_test(maintenance_parent_id, true);
             let (maintenance_tx, maintenance_rx) = mpsc::channel();
             on_maintenance_reserved_for_test(maintenance_parent_id, move || {
                 maintenance_tx.send(()).unwrap()
@@ -4308,6 +4529,75 @@ mod tests {
                     .state(),
                 TaskState::CompletingFailed(_)
             ));
+            let added_control = owner.conversation_controls().get(added_conversation);
+            let mut added_callback = None;
+            let mut added_poll = None;
+            if mode == "failfast" {
+                let (discovered_tx, discovered_rx) = mpsc::channel();
+                let (continue_tx, continue_rx) = mpsc::channel();
+                let (retry_tx, retry_rx) = mpsc::channel();
+                task_scheduler::on_pending_graph_discovered(a.id(), move || {
+                    discovered_tx.send(()).unwrap();
+                    continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                task_scheduler::on_pending_graph_scope_retry(a.id(), move || {
+                    retry_tx.send(()).unwrap();
+                });
+                driver.shared.notify_work();
+                discovered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("pending graph was not discovered");
+                let edge = crate::ownership_edge::Edge {
+                    task: a.id(),
+                    task_owner: a.owner().clone(),
+                    child: added_conversation,
+                    mode: crate::ownership_edge::Mode::Foreground,
+                };
+                let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                    .prepare_create(&edge)
+                    .unwrap();
+                owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+                added_callback = Some(added_control.callback_start.try_start().unwrap());
+                added_poll = Some(added_control.gate.lock().unwrap());
+                drop(poll.take());
+                continue_tx.send(()).unwrap();
+                retry_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("new graph did not defer commit");
+                assert!(!tasks.load(a.id()).unwrap().unwrap().task.abort_requested());
+                assert!(
+                    !harness
+                        .conversation(added_conversation)
+                        .unwrap()
+                        .abort_requested
+                );
+            }
+            if mode == "failfast-delete" {
+                let (discovered_tx, discovered_rx) = mpsc::channel();
+                let (continue_tx, continue_rx) = mpsc::channel();
+                task_scheduler::on_pending_graph_discovered(a.id(), move || {
+                    discovered_tx.send(()).unwrap();
+                    continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                driver.shared.notify_work();
+                discovered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("pending graph was not discovered");
+                let key = crate::ownership_edge::edge_key(added_conversation);
+                let existing = owner.store().get(&key).unwrap().unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(existing.version),
+                        }],
+                        &[durable_store::Mutation::Delete { key }],
+                    )
+                    .unwrap();
+                continue_tx.send(()).unwrap();
+            }
+
             let replacing = driver.clone();
             let (replaced_tx, replaced_rx) = mpsc::channel();
             let replacement = thread::spawn(move || {
@@ -4369,12 +4659,56 @@ mod tests {
                 replaced_rx.recv_timeout(Duration::from_millis(100)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ));
+            let unrelated = owner.conversation_controls().get(unrelated_conversation);
+            let callback = unrelated.callback_start.try_start().unwrap();
+            let unrelated_poll = unrelated.gate.lock().unwrap();
+            let (callback_started, callback_entered) = mpsc::channel();
+            let callback_release = Arc::new((Mutex::new(false), Condvar::new()));
+            let callback_wait = callback_release.clone();
+            let callback_thread = thread::spawn(move || {
+                let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+                    callback_started.send(()).unwrap();
+                    let (lock, wake) = &*callback_wait;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    std::task::Poll::<()>::Pending
+                }));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    callback
+                        .poll_first(future.as_mut(), &mut context)
+                        .is_pending()
+                );
+            });
+            callback_entered
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
             drop(poll);
+            task_scheduler::set_maintenance_busy_for_test(maintenance_parent_id, false);
+            drop(added_poll);
+            drop(added_callback);
             replaced_rx
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .unwrap();
             replacement.join().unwrap();
+            drop(unrelated_poll);
+            {
+                let (lock, wake) = &*callback_release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+            }
+            callback_thread.join().unwrap();
+            if mode == "failfast-delete" {
+                assert!(
+                    !harness
+                        .conversation(added_conversation)
+                        .unwrap()
+                        .abort_requested
+                );
+            }
             let report = Arc::try_unwrap(driver)
                 .ok()
                 .unwrap()
@@ -4970,7 +5304,7 @@ mod tests {
 
     #[test]
     fn shutdown_waits_for_known_pending_abort_cleanup() {
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         struct Stub;
@@ -4981,7 +5315,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let harness = Harness::open_paused(
+        let mut harness = Harness::open_paused(
             dir.path().join("db"),
             Options {
                 model: Arc::new(Stub),
@@ -4992,6 +5326,13 @@ mod tests {
             },
         )
         .unwrap();
+        let nested_conversation = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 20,
+            })
+            .unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Mutex::new(release_rx);
@@ -5048,7 +5389,17 @@ mod tests {
                 Save::Create(&sibling),
             ])
             .unwrap();
-        let control = owner.conversation_controls().get(Uuid::from_u128(99));
+        let edge = crate::ownership_edge::Edge {
+            task: child.id(),
+            task_owner: child.owner().clone(),
+            child: nested_conversation,
+            mode: crate::ownership_edge::Mode::Foreground,
+        };
+        let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+            .prepare_create(&edge)
+            .unwrap();
+        owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+        let control = owner.conversation_controls().get(nested_conversation);
         let poll = control.gate.lock().unwrap();
         let driver = Driver::start_with_harness(scheduler, harness.worker());
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5717,6 +6068,421 @@ mod tests {
         notifying.join().unwrap();
         while rx.try_recv().is_ok() {}
         assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn task_start_marker_fences_driver_abort_until_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_with_abort(
+            "blocked",
+            true,
+            move |_: &Task| {
+                entered_tx.send(()).unwrap();
+                release.lock().unwrap().recv().unwrap();
+                Ok(task_scheduler::Step::Succeed(json!("done")))
+            },
+            |_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))),
+        );
+        let (other_tx, other_rx) = mpsc::channel();
+        registry.register("other", true, move |_: &Task| {
+            other_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("other")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("blocked".into(), true);
+        scheduler.submit(&task).unwrap();
+        let driver = Driver::start(scheduler);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        assert!(matches!(
+            driver.request_abort(task.id()),
+            Err(Error::Task(task_scheduler::Error::Busy))
+        ));
+        assert!(!driver.get(task.id()).unwrap().unwrap().abort_requested());
+        let other = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&other)])
+            .unwrap();
+        driver.shared.notify_work();
+        other_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        let stale_start =
+            task_store::prepare_callback_start_task_fence(owner.store(), task.id(), b"claim-2")
+                .unwrap();
+        driver.request_abort(task.id()).unwrap();
+        assert!(driver.get(task.id()).unwrap().unwrap().abort_requested());
+        assert!(matches!(
+            owner
+                .store()
+                .commit(&stale_start.checks, &stale_start.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        release_tx.send(()).unwrap();
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn callback_marker_racing_abort_reservation_does_not_poison_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let (other_tx, other_rx) = mpsc::channel();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("other", true, move |_: &Task| {
+            other_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("other")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let mut blocked = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("missing".into(), true);
+        blocked.request_abort().unwrap();
+        let other = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&blocked), Save::Create(&other)])
+            .unwrap();
+        let writer = owner.clone();
+        let id = blocked.id();
+        let (inserted_tx, inserted_rx) = mpsc::channel();
+        task_scheduler::on_reservation_before_update(id, move || {
+            let start = task_store::prepare_callback_start_task_fence(writer.store(), id, b"claim")
+                .unwrap();
+            writer
+                .store()
+                .commit(&start.checks, &start.mutations)
+                .unwrap();
+            inserted_tx.send(()).unwrap();
+        });
+        let driver = Driver::start(scheduler);
+        inserted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        other_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(driver.get(id).unwrap().unwrap().state(), &TaskState::Ready);
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), id, b"claim").unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(id).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_signal_retry_waits_for_marker_and_honors_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", true, |_: &Task| {
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let tasks = TaskStore::new(owner.store());
+        let token = task_store::SignalToken::new("answer", 1).unwrap();
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        tasks.save(&[Save::Create(&task)]).unwrap();
+        tasks
+            .reserve(&tasks.load(task.id()).unwrap().unwrap())
+            .unwrap();
+        tasks
+            .update(&tasks.load(task.id()).unwrap().unwrap(), |task| {
+                task.wait(WaitFor::TypedSignal(token.key("go").unwrap()))
+            })
+            .unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        let cancel = pi_rs_core::CancellationToken::new();
+        let mut cancelled = Box::pin(driver.deliver_signal_with_retry(
+            task.id(),
+            &token,
+            "cancelled",
+            json!(1),
+            &cancel,
+        ));
+        assert!(matches!(
+            futures_util::poll!(&mut cancelled),
+            std::task::Poll::Pending
+        ));
+        cancel.cancel();
+        assert!(matches!(cancelled.await, Err(Error::WaitCancelled)));
+        assert!(
+            tasks
+                .read_typed_signal_state(task.id(), &token, "cancelled")
+                .unwrap()
+                .is_none()
+        );
+        let live = pi_rs_core::CancellationToken::new();
+        let mut retry =
+            Box::pin(driver.deliver_signal_with_retry(task.id(), &token, "go", json!(2), &live));
+        assert!(matches!(
+            futures_util::poll!(&mut retry),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            tasks
+                .read_typed_signal_state(task.id(), &token, "go")
+                .unwrap()
+                .is_none()
+        );
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), task.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), &mut retry)
+                .await
+                .unwrap()
+                .unwrap(),
+            task_store::SignalResult::Delivered
+        );
+        drop(retry);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(task.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn task_start_marker_defers_ready_reservation_without_blocking_other_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", true, move |task: &Task| {
+            ran_tx.send(task.id()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        };
+        let target = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        let other = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&target), Save::Create(&other)])
+            .unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), target.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        task_store::on_callback_wake_blocked(target.id(), move || {
+            blocked_tx.send(()).unwrap();
+        });
+        let driver = Driver::start(scheduler);
+        blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            other.id()
+        );
+        assert_eq!(
+            driver.get(target.id()).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), target.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            target.id()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(target.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn task_start_marker_defers_signal_and_driver_wake_until_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = task_scheduler::Registry::default();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        registry.register("work", true, move |task: &Task| {
+            ran_tx.send(task.id()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let tasks = TaskStore::new(owner.store());
+        let checkpoint = Checkpoint {
+            phase: "waiting".into(),
+            data: json!({}),
+        };
+        let mut waiting = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        waiting.start().unwrap();
+        waiting.wait(WaitFor::Signal("wake".into())).unwrap();
+        let unrelated = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        tasks
+            .save(&[Save::Create(&waiting), Save::Create(&unrelated)])
+            .unwrap();
+        tasks
+            .send_signal(&Signal::new(
+                Uuid::new_v4(),
+                waiting.id(),
+                "wake".into(),
+                json!(1),
+            ))
+            .unwrap();
+        let start =
+            task_store::prepare_callback_start_task_fence(owner.store(), waiting.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&start.checks, &start.mutations)
+            .unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        task_store::on_callback_wake_blocked(waiting.id(), move || {
+            blocked_tx.send(()).unwrap();
+        });
+        let driver = Driver::start(scheduler);
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("driver did not evaluate waiting task");
+        assert!(matches!(
+            driver.get(waiting.id()).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ));
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            unrelated.id()
+        );
+        let extra = Signal::new(Uuid::new_v4(), waiting.id(), "later".into(), json!(2));
+        assert!(matches!(
+            driver.signal(&extra),
+            Err(Error::Task(task_scheduler::Error::Store(
+                task_store::Error::CallbackStartBusy
+            )))
+        ));
+        assert!(tasks.signal(waiting.id(), extra.id).unwrap().is_none());
+        let finish =
+            task_store::prepare_callback_finish_task_fence(owner.store(), waiting.id(), b"claim")
+                .unwrap();
+        owner
+            .store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            waiting.id()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.get(waiting.id()).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        driver.shutdown().unwrap();
     }
 
     #[test]

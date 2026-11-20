@@ -61,6 +61,10 @@ pub trait Handler: Send + Sync {
     fn requires_park_cancel_claim(&self) -> bool {
         false
     }
+    /// Whether this exact handler opted into conversation cancel dispatch.
+    fn conversation_cancel_dispatch_enabled(&self) -> bool {
+        false
+    }
     /// Lease the conversation cancellation definition during receipt recovery.
     fn conversation_cleanup_identity_lease(
         &self,
@@ -245,6 +249,25 @@ pub(crate) struct ConversationCancelClaim {
     pub policy: crate::async_task_tool::ConversationCancelPolicy,
 }
 
+/// Signal revisions observed by the claim transaction. Missing legacy evidence
+/// cannot authorize a callback-start transaction and requires reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationCancelSignalEvidence {
+    version: u32,
+    claim_id: Uuid,
+    conversation: Uuid,
+    task: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_version: Option<u64>,
+    conversation_revision: Option<u64>,
+    task_revision: Option<u64>,
+}
+
+fn conversation_cancel_signal_evidence_key(task: Uuid) -> Vec<u8> {
+    format!("durable/replay-safe-async/{task}/conversation-park-cancel-signals-v1").into_bytes()
+}
+
 /// A receipt binds a reported cancellation result to the complete claim. It
 /// does not itself establish that the callback was dispatched or completed.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -253,6 +276,8 @@ pub(crate) struct ConversationCancelReceipt {
     pub version: u32,
     pub claim: ConversationCancelClaim,
     pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_result: Option<Value>,
 }
 
 /// Check the immutable claim before treating the receipt as evidence. The
@@ -263,7 +288,14 @@ pub(crate) fn validate_conversation_cancel_receipt(
     receipt: &ConversationCancelReceipt,
     claim: &ConversationCancelClaim,
 ) -> Result<(), String> {
-    if receipt.version != 1
+    let valid_version = match (receipt.version, &receipt.after_result) {
+        (1, None) => true,
+        (2, Some(after)) if receipt.result == "callback returned" => {
+            crate::async_task_tool::validate_aborted_after_result(after).is_ok()
+        }
+        _ => false,
+    };
+    if !valid_version
         || receipt.claim != *claim
         || claim.version != 2
         || claim.claim_id.is_nil()
@@ -288,6 +320,8 @@ pub(crate) struct ConversationCancelTerminalMarker {
     pub attempt: Uuid,
     pub running_task_version: u64,
     pub terminal_task: Task,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_version: Option<u64>,
 }
 pub(crate) fn conversation_cancel_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-park-cancel-terminal").into_bytes()
@@ -1070,6 +1104,9 @@ fn pre_transaction_busy(error: &Error) -> bool {
 
 fn runtime_pre_transaction_busy(error: &crate::runtime::Error) -> bool {
     match error {
+        crate::runtime::Error::TaskPublicationBusy | crate::runtime::Error::CallbackStartBusy => {
+            true
+        }
         crate::runtime::Error::Storage(durable_store::Error::WriteLockBusy(_)) => true,
         crate::runtime::Error::TaskScheduler(error) => pre_transaction_busy(error),
         crate::runtime::Error::Document(crate::document::Error::Store(
@@ -1350,27 +1387,43 @@ impl PendingMaintenance {
         if !Arc::ptr_eq(owner, &harness.owner) {
             return Err(Error::Ownership);
         }
-        match owner.conversation_controls().try_fence(|| {
-            let _guard = match self.fence.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
-            };
+        let targets = match harness.scoped_abort_graph(None, Some(self.intent), None, None) {
+            Ok(Some(targets)) => targets,
+            Ok(None) => Vec::new(),
+            Err(error)
+                if runtime_pre_transaction_busy(&error)
+                    || matches!(error, crate::runtime::Error::TaskScheduler(Error::Busy)) =>
             {
-                let state = self.state.lock().map_err(|_| Error::Poisoned)?;
-                if state.poisoned
-                    || self
-                        .scheduler_poison
-                        .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    return Err(Error::Poisoned);
-                }
-                if state.handler_failed {
-                    return Err(Error::Busy);
-                }
+                return Ok(false);
             }
-            let guard =
-                || {
+            Err(error) => {
+                return Err(Error::Handler(format!(
+                    "maintenance graph discovery: {error}"
+                )));
+            }
+        };
+        match owner
+            .conversation_controls()
+            .try_fence_targets(&targets, || {
+                let _guard = match self.fence.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+                };
+                {
+                    let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+                    if state.poisoned
+                        || self
+                            .scheduler_poison
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return Err(Error::Poisoned);
+                    }
+                    if state.handler_failed {
+                        return Err(Error::Busy);
+                    }
+                }
+                let guard = || {
                     if !self.independent && earlier.is_empty() {
                         return Ok(());
                     }
@@ -1453,13 +1506,17 @@ impl PendingMaintenance {
                     }
                     Ok(())
                 };
-            match harness.abort_maintenance_checked(self.intent, guard) {
-                Ok(affected) => Ok(affected.unwrap_or_default()),
-                Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                Err(error) if runtime_pre_transaction_busy(&error) => {
-                    #[cfg(test)]
-                    if let Some(hook) =
-                        maintenance_write_busy_test_hooks()
+                match harness.scoped_abort_graph(
+                    None,
+                    Some(self.intent),
+                    Some(&targets),
+                    Some(&guard),
+                ) {
+                    Ok(affected) => Ok(affected.unwrap_or_default()),
+                    Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                    Err(error) if runtime_pre_transaction_busy(&error) => {
+                        #[cfg(test)]
+                        if let Some(hook) = maintenance_write_busy_test_hooks()
                             .lock()
                             .unwrap()
                             .remove(&match self.intent {
@@ -1467,17 +1524,17 @@ impl PendingMaintenance {
                                 | MaintenanceIntent::Failed(id)
                                 | MaintenanceIntent::FailFast(id) => id,
                             })
-                    {
-                        hook();
+                        {
+                            hook();
+                        }
+                        Err(Error::Busy)
                     }
-                    Err(Error::Busy)
+                    Err(error) => {
+                        self.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                        Err(Error::Handler(format!("maintenance abort: {error}")))
+                    }
                 }
-                Err(error) => {
-                    self.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
-                    Err(Error::Handler(format!("maintenance abort: {error}")))
-                }
-            }
-        }) {
+            }) {
             Ok(Some(_)) => Ok(true),
             Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => Ok(false),
             Err(durable_store::controls::FenceError::Poisoned) => Err(Error::Poisoned),
@@ -1552,6 +1609,166 @@ pub(crate) fn take_test_conversation_receipt(id: Uuid) -> bool {
 }
 #[cfg(test)]
 type BoundaryHooks = Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn graph_discovery_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_pending_graph_discovered(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    graph_discovery_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn graph_scope_retry_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_pending_graph_scope_retry(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    graph_scope_retry_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn invoke_boundary(hooks: &BoundaryHooks, id: Uuid) {
+    let hook = hooks.lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+#[cfg(test)]
+fn reservation_update_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_reservation_before_update(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    reservation_update_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn conversation_start_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_start_before_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_start_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn conversation_start_result_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_start_result(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_start_result_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+pub(crate) fn report_conversation_start_result(id: Uuid) {
+    conversation_start_hooks().lock().unwrap().remove(&id);
+    invoke_boundary(conversation_start_result_hooks(), id);
+}
+#[cfg(test)]
+fn conversation_receipt_saved_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+fn conversation_receipt_before_commit_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_receipt_before_commit(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    conversation_receipt_before_commit_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_receipt_saved(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_receipt_saved_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+pub(crate) fn report_conversation_receipt_saved(id: Uuid) {
+    invoke_boundary(conversation_receipt_saved_hooks(), id);
+}
+
+#[cfg(test)]
+fn conversation_settlement_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+fn conversation_after_settlement_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_cancel_after_settlement(
+    id: Uuid,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    conversation_after_settlement_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+pub(crate) fn on_conversation_cancel_settlement(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    conversation_settlement_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
+#[cfg(test)]
+fn test_start_tasks() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn enable_test_conversation_start(id: Uuid) {
+    test_start_tasks().lock().unwrap().insert(id);
+}
+#[cfg(test)]
+pub(crate) fn take_test_conversation_start(id: Uuid) -> bool {
+    test_start_tasks().lock().unwrap().remove(&id)
+}
+
+#[cfg(test)]
+fn test_finish_tasks() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn enable_test_conversation_finish(id: Uuid) {
+    test_finish_tasks().lock().unwrap().insert(id);
+}
+#[cfg(test)]
+pub(crate) fn take_test_conversation_finish(id: Uuid) -> bool {
+    test_finish_tasks().lock().unwrap().remove(&id)
+}
+
 #[cfg(test)]
 fn conversation_claim_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
@@ -1816,11 +2033,15 @@ pub struct CompletedInvocation {
     lease: InvocationLease,
     receipt_capture: bool,
     abort_definition: Option<Arc<()>>,
+    writer_busy: bool,
     // Pin the exact host registration until receipt persistence or abandonment.
     _identity_lease: Option<crate::nested_identity::IdentityLease>,
 }
 
 impl CompletedInvocation {
+    pub(crate) fn mark_writer_busy(&mut self) {
+        self.writer_busy = true;
+    }
     /// Read a marked handler's retained outcome when receipt capture failed.
     /// This is evidence for reconciliation, not a retry authorization.
     pub fn retained_tool_outcome(&self) -> Option<pi_rs_core::Outcome> {
@@ -2079,6 +2300,9 @@ impl TaskNotificationAssembly {
 
 pub struct PreparedSettlement {
     attachment: Arc<Attachment>,
+    // Own start leases for staged conversation writes through commit,
+    // retry, or disposal of the prepared settlement.
+    _start_leases: Vec<durable_store::controls::MutationLease>,
     transaction: crate::document::Transaction,
     notifications: Option<TaskNotificationAssembly>,
     running: task_store::StoredTask,
@@ -2089,6 +2313,7 @@ pub struct PreparedSettlement {
     graph_version: u64,
     attempts: usize,
     commit_uncertain: bool,
+    writer_busy: bool,
 }
 
 /// Owned settlement state at an invocation or prepared transaction boundary.
@@ -2147,6 +2372,16 @@ impl std::fmt::Debug for PendingSettlement {
 }
 
 impl PendingSettlement {
+    /// The last commit could not start a write transaction. The exact
+    /// candidate and lease remain owned and can be returned on shutdown.
+    pub(crate) fn waits_for_writer(&self) -> bool {
+        match self {
+            Self::Unprepared(completed) => completed.writer_busy,
+            Self::Prepared { settlement, .. } => settlement.writer_busy,
+            Self::Failure { settlement, .. } => settlement.writer_busy,
+            Self::PreparationConflict { .. } => false,
+        }
+    }
     // Distinguish durable ownership uncertainty from a temporarily busy poll
     // fence during graceful driver shutdown. This only observes the graph;
     // the returned settlement retains its lease and is always revalidated.
@@ -2155,6 +2390,27 @@ impl PendingSettlement {
         let Ok(_gate) = owner.task_gate().lock() else {
             return false;
         };
+        // A replaced or removed reservation cannot become settleable by
+        // retrying the old lease. Keep it for reconciliation at shutdown.
+        let expected = match self {
+            Self::Unprepared(completed) => &completed.running.task,
+            Self::Prepared { settlement, .. } => &settlement.running.task,
+            Self::PreparationConflict { conflict, .. } => &conflict.running.task,
+            Self::Failure { settlement, .. } => &settlement.running.task,
+        };
+        match TaskStore::new(owner.store()).load(self.task_id()) {
+            Ok(None) => return true,
+            Ok(Some(current))
+                if current.task.owner() != expected.owner()
+                    || current.task.attempt_id() != expected.attempt_id()
+                    || current.task.kind() != expected.kind()
+                    || current.task.definition_version() != expected.definition_version()
+                    || current.task.input() != expected.input() =>
+            {
+                return true;
+            }
+            _ => (),
+        }
         matches!(
             pending_abort_root_excluding_self(
                 &TaskStore::new(owner.store()),
@@ -2261,35 +2517,61 @@ impl PendingSettlement {
         if !Arc::ptr_eq(owner, &harness.owner) {
             return Err(Error::Ownership);
         }
-        let result = owner.conversation_controls().try_fence(|| {
-            let _failure = match lease.failure_fence.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
-            };
+        let targets = match harness.scoped_abort_graph(Some(lease.id), None, None, None) {
+            Ok(Some(targets)) => targets,
+            Ok(None) => Vec::new(),
+            Err(error)
+                if runtime_pre_transaction_busy(&error)
+                    || matches!(error, crate::runtime::Error::TaskScheduler(Error::Busy)) =>
             {
-                let state = lease.state.lock().map_err(|_| Error::Poisoned)?;
-                if state.poisoned
-                    || lease
-                        .scheduler_poison
-                        .load(std::sync::atomic::Ordering::Acquire)
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(Error::Handler(format!(
+                    "pending abort graph discovery: {error}"
+                )));
+            }
+        };
+        #[cfg(test)]
+        invoke_boundary(graph_discovery_hooks(), lease.id);
+        let result = owner
+            .conversation_controls()
+            .try_fence_targets(&targets, || {
+                let _failure = match lease.failure_fence.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+                };
                 {
-                    return Err(Error::Poisoned);
+                    let state = lease.state.lock().map_err(|_| Error::Poisoned)?;
+                    if state.poisoned
+                        || lease
+                            .scheduler_poison
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return Err(Error::Poisoned);
+                    }
+                    if state.handler_failed && !state.failed_handlers.contains(&lease.id) {
+                        return Err(Error::Busy);
+                    }
                 }
-                if state.handler_failed && !state.failed_handlers.contains(&lease.id) {
-                    return Err(Error::Busy);
+                match harness.scoped_abort_graph(Some(lease.id), None, Some(&targets), None) {
+                    Ok(affected) => Ok(affected.unwrap_or_default()),
+                    Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                    Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
+                    Err(error) => {
+                        lease.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                        Err(Error::Handler(format!("checked pending abort: {error}")))
+                    }
                 }
-            }
-            match harness.abort_pending_task_graph(lease.id) {
-                Ok(affected) => Ok(affected.unwrap_or_default()),
-                Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
-                Err(error) => {
-                    lease.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
-                    Err(Error::Handler(format!("checked pending abort: {error}")))
-                }
-            }
-        });
+            });
+        #[cfg(test)]
+        if matches!(
+            &result,
+            Err(durable_store::controls::FenceError::Commit(Error::Busy))
+        ) {
+            invoke_boundary(graph_scope_retry_hooks(), lease.id);
+        }
         match result {
             Ok(Some(_)) => Ok(true),
             Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => Ok(false),
@@ -2314,7 +2596,7 @@ impl PreparedSettlement {
         &mut self,
         scheduler: &Scheduler,
         owner: &Arc<OwnedStore>,
-        _gate: &std::sync::MutexGuard<'_, ()>,
+        _gate: &durable_store::controls::PollGateGuard<'_>,
     ) -> Result<PreparedRevalidation, Error> {
         self.graph_version = owner
             .store()
@@ -2436,6 +2718,7 @@ pub struct FailureSettlement {
     check_pending: bool,
     attempt: usize,
     candidate: Option<FailureCandidate>,
+    writer_busy: bool,
 }
 
 struct FailureCandidate {
@@ -2579,6 +2862,58 @@ impl DetachedInvocation {
 }
 
 impl AdmissionHandle<'_> {
+    /// Pin the registered hook names before claiming a callback. The claim
+    /// subsequently validates the exact persisted identities under this lease.
+    pub(crate) fn conversation_selection_start_lease(
+        &self,
+        handler: &dyn Handler,
+    ) -> Result<Option<crate::extension::SelectionStartLease>, String> {
+        let kind = self.running.task.kind().ok_or("missing definition")?;
+        let selection = {
+            let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+            let registration = definitions
+                .registry
+                .entries
+                .get(kind)
+                .ok_or("missing definition")?;
+            if !std::ptr::addr_eq(registration.handler.as_ref(), handler) {
+                return Err("conversation cancel registration changed".into());
+            }
+            registration
+                .conversation_checkpointable
+                .as_ref()
+                .ok_or("missing conversation registration")?
+                .2
+                .clone()
+        };
+        selection
+            .as_ref()
+            .map(|selection| {
+                self.validator
+                    .ok_or("missing harness")?
+                    .checkpointable_selection_start(selection)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+
+    /// Acquire the root's nonblocking start lease before marker commit and
+    /// retain it through the callback's first poll.
+    pub(crate) fn conversation_callback_start_lease(
+        &self,
+    ) -> Result<durable_store::controls::CallbackStartLease, String> {
+        let TaskOwner::Conversation(id) = self.running.task.owner() else {
+            return Err("conversation cancel requires a root task".into());
+        };
+        self.lease
+            .attachment
+            .owner
+            .conversation_controls()
+            .try_callback_start(*id)
+            .map_err(|e| format!("conversation callback start: {e:?}"))?
+            .ok_or_else(|| "conversation callback start busy; reconciliation required".into())
+    }
+
     /// Record a claim for a conversation-owned root park without dispatching
     /// the external callback. Every authorization is checked in one commit.
     pub(crate) fn record_conversation_park_claim(
@@ -2592,6 +2927,14 @@ impl AdmissionHandle<'_> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        // Selection must remain the one validated below until the claim commits.
+        // Follow the same task -> selection -> state order as the intent fence.
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let state = self.lease.state.lock().map_err(|e| e.to_string())?;
         let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
         let tasks = TaskStore::new(owner.store());
@@ -2643,11 +2986,65 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
         checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
             owner.store(),
             &current.task,
             boundary,
         )?);
+        let TaskOwner::Conversation(conversation) = current.task.owner() else {
+            return Err("conversation cancel root owner changed".into());
+        };
+        // Signal delivery may bypass the Harness gate. Fence both revisions in
+        // the claim transaction itself; this alone does not authorize callback
+        // dispatch after the claim commit.
+        let conversation_entry = owner
+            .store()
+            .get(&crate::runtime::Harness::key(*conversation))
+            .map_err(|e| e.to_string())?
+            .ok_or("missing claim conversation")?;
+        checks.push(durable_store::Check {
+            key: crate::runtime::Harness::key(*conversation),
+            expected: durable_store::Expected::Version(conversation_entry.version),
+        });
+        let conversation_revision = owner
+            .store()
+            .get(&crate::conversation_signal::revision(*conversation))
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.version);
+        let task_revision = owner
+            .store()
+            .get(&task_store::signal_revision_key(current.task.id()))
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.version);
+        for (key, version) in [
+            (
+                crate::conversation_signal::revision(*conversation),
+                conversation_revision,
+            ),
+            (
+                task_store::signal_revision_key(current.task.id()),
+                task_revision,
+            ),
+        ] {
+            checks.push(durable_store::Check {
+                key,
+                expected: version.map_or(
+                    durable_store::Expected::Missing,
+                    durable_store::Expected::Version,
+                ),
+            });
+        }
         let key = conversation_cancel_claim_key(current.task.id());
         checks.push(durable_store::Check {
             key: key.clone(),
@@ -2664,6 +3061,20 @@ impl AdmissionHandle<'_> {
             checkpoint: current.task.checkpoint().clone(),
             policy,
         };
+        let signal_evidence_key = conversation_cancel_signal_evidence_key(current.task.id());
+        checks.push(durable_store::Check {
+            key: signal_evidence_key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        let signal_evidence = ConversationCancelSignalEvidence {
+            version: 1,
+            claim_id: record.claim_id,
+            conversation: *conversation,
+            task: current.task.id(),
+            conversation_version: Some(conversation_entry.version),
+            conversation_revision,
+            task_revision,
+        };
         #[cfg(test)]
         if let Some(hook) = conversation_claim_hooks()
             .lock()
@@ -2676,10 +3087,16 @@ impl AdmissionHandle<'_> {
             .store()
             .commit_with_prefix_put_fence(
                 &checks,
-                &[durable_store::Mutation::Put {
-                    key,
-                    value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
-                }],
+                &[
+                    durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                    },
+                    durable_store::Mutation::Put {
+                        key: signal_evidence_key,
+                        value: serde_json::to_vec(&signal_evidence).map_err(|e| e.to_string())?,
+                    },
+                ],
                 &[
                     task_store::PREFIX,
                     crate::ownership_edge::PREFIX,
@@ -2700,6 +3117,202 @@ impl AdmissionHandle<'_> {
         Ok(record)
     }
 
+    /// Persist both signal-start markers against one live, identity-bound
+    /// conversation cancellation claim. This transaction is evidence only:
+    /// it does not grant callback execution or provide at-most-once dispatch.
+    #[allow(dead_code)]
+    pub(crate) fn record_conversation_start_markers(
+        &self,
+        handler: &dyn Handler,
+        claim_id: Uuid,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        policy: crate::async_task_tool::ConversationCancelPolicy,
+    ) -> Result<Vec<u8>, String> {
+        if identity_lease.as_deref() != Some(expected_identity)
+            || !self.abort
+            || self.standalone
+            || self.lease.retired
+        {
+            return Err("invalid conversation start lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale start attempt or live child".into());
+        }
+        let TaskOwner::Conversation(conversation) = current.task.owner() else {
+            return Err("start root owner changed".into());
+        };
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation start registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
+        checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
+            owner.store(),
+            &current.task,
+            boundary,
+        )?);
+        let (claim, claim_check) =
+            read_conversation_cancel_claim(owner.store(), current.task.id(), attempt, claim_id)?
+                .ok_or("missing claim")?;
+        if claim.lease != self.lease.token
+            || claim.policy != policy
+            || claim.checkpoint != *current.task.checkpoint()
+        {
+            return Err("conversation start claim mismatch".into());
+        }
+        checks.push(claim_check);
+        let evidence_key = conversation_cancel_signal_evidence_key(current.task.id());
+        let evidence_entry = owner
+            .store()
+            .get(&evidence_key)
+            .map_err(|e| e.to_string())?
+            .ok_or("legacy claim lacks signal evidence")?;
+        let evidence: ConversationCancelSignalEvidence =
+            serde_json::from_slice(&evidence_entry.value).map_err(|_| "invalid signal evidence")?;
+        if evidence.version != 1
+            || evidence.claim_id != claim_id
+            || evidence.conversation != *conversation
+            || evidence.task != current.task.id()
+        {
+            return Err("conversation start signal evidence mismatch".into());
+        }
+        checks.push(durable_store::Check {
+            key: evidence_key,
+            expected: durable_store::Expected::Version(evidence_entry.version),
+        });
+        let claim_conversation_version = evidence
+            .conversation_version
+            .ok_or("legacy claim lacks conversation version")?;
+        checks.push(durable_store::Check {
+            key: crate::runtime::Harness::key(*conversation),
+            expected: durable_store::Expected::Version(claim_conversation_version),
+        });
+        for (key, revision) in [
+            (
+                crate::conversation_signal::revision(*conversation),
+                evidence.conversation_revision,
+            ),
+            (
+                task_store::signal_revision_key(current.task.id()),
+                evidence.task_revision,
+            ),
+        ] {
+            checks.push(durable_store::Check {
+                key,
+                expected: revision.map_or(
+                    durable_store::Expected::Missing,
+                    durable_store::Expected::Version,
+                ),
+            });
+        }
+        let marker = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "claim_id": claim.claim_id,
+            "task": claim.task,
+            "attempt": claim.attempt,
+            "lease": claim.lease,
+            "policy": claim.policy,
+        }))
+        .map_err(|e| e.to_string())?;
+        let conversation_start = crate::conversation_signal::prepare_callback_start_signal_fence(
+            owner.store(),
+            *conversation,
+            &marker,
+        )
+        .map_err(|e| e.to_string())?;
+        let task_start = task_store::prepare_callback_start_task_fence(
+            owner.store(),
+            current.task.id(),
+            &marker,
+        )
+        .map_err(|e| e.to_string())?;
+        checks.extend(conversation_start.checks);
+        checks.extend(task_start.checks);
+        let mut mutations = conversation_start.mutations;
+        mutations.extend(task_start.mutations);
+        #[cfg(test)]
+        invoke_boundary(conversation_start_hooks(), current.task.id());
+        let result = owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &mutations,
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string());
+        result?;
+        Ok(marker)
+    }
+
     /// Persist test evidence while the original cleanup attempt and all of
     /// its conversation and park fences are still live. This does not dispatch
     /// a callback or establish that any external effect occurred.
@@ -2711,6 +3324,94 @@ impl AdmissionHandle<'_> {
         identity_lease: &crate::nested_identity::IdentityLease,
         expected_identity: &str,
     ) -> Result<(), String> {
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            None,
+            None,
+        )
+    }
+
+    /// Save the successful callback receipt and retire both exact start markers
+    /// in the same transaction; failed validation leaves every record intact.
+    #[allow(dead_code)]
+    pub(crate) fn store_conversation_cancel_receipt_and_retire(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+    ) -> Result<(), String> {
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            Some(marker),
+            None,
+        )
+    }
+
+    pub(crate) fn store_conversation_cancel_receipt_and_after(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+        snapshot_check: &durable_store::Check,
+    ) -> Result<(), String> {
+        if receipt.version != 2 || receipt.after_result.is_none() {
+            return Err("missing cancel after evidence".into());
+        }
+        self.store_conversation_cancel_receipt_inner(
+            handler,
+            receipt,
+            identity_lease,
+            expected_identity,
+            Some(marker),
+            Some(snapshot_check),
+        )
+    }
+
+    pub(crate) fn conversation_cancel_hook_snapshot(
+        &self,
+    ) -> Result<(Value, durable_store::Check), String> {
+        let TaskOwner::Conversation(id) = self.running.task.owner() else {
+            return Err("cancel hook requires root conversation".into());
+        };
+        let key = crate::runtime::Harness::key(*id);
+        let entry = self
+            .lease
+            .attachment
+            .owner
+            .store()
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing conversation")?;
+        let snapshot = serde_json::from_slice(&entry.value)
+            .map_err(|e| format!("invalid conversation snapshot: {e}"))?;
+        Ok((
+            snapshot,
+            durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(entry.version),
+            },
+        ))
+    }
+
+    fn store_conversation_cancel_receipt_inner(
+        &self,
+        handler: &dyn Handler,
+        receipt: &ConversationCancelReceipt,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: Option<&[u8]>,
+        snapshot_check: Option<&durable_store::Check>,
+    ) -> Result<(), String> {
         if identity_lease.as_deref() != Some(expected_identity) {
             return Err("conversation identity lease mismatch".into());
         }
@@ -2720,6 +3421,12 @@ impl AdmissionHandle<'_> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let state = self.lease.state.lock().map_err(|e| e.to_string())?;
         let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
         let tasks = TaskStore::new(owner.store());
@@ -2771,6 +3478,30 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
+        if let Some(check) = snapshot_check {
+            let TaskOwner::Conversation(id) = current.task.owner() else {
+                return Err("cancel snapshot owner changed".into());
+            };
+            if check.key != crate::runtime::Harness::key(*id)
+                || !matches!(check.expected, durable_store::Expected::Version(_))
+            {
+                return Err("invalid cancel snapshot fence".into());
+            }
+            checks.push(check.clone());
+        } else if receipt.version == 2 {
+            return Err("missing cancel snapshot fence".into());
+        }
         checks.extend(crate::async_task_tool::unsafe_park_proof::cancel_checks(
             owner.store(),
             &current.task,
@@ -2809,7 +3540,7 @@ impl AdmissionHandle<'_> {
             key: key.clone(),
             expected,
         });
-        let mutations = if existing.is_none() {
+        let mut mutations = if existing.is_none() {
             vec![durable_store::Mutation::Put {
                 key,
                 value: serde_json::to_vec(receipt).map_err(|e| e.to_string())?,
@@ -2817,6 +3548,45 @@ impl AdmissionHandle<'_> {
         } else {
             vec![]
         };
+        if let Some(marker) = marker {
+            let TaskOwner::Conversation(conversation) = current.task.owner() else {
+                return Err("receipt root owner changed".into());
+            };
+            let expected_marker = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "claim_id": claim.claim_id,
+                "task": claim.task,
+                "attempt": claim.attempt,
+                "lease": claim.lease,
+                "policy": claim.policy,
+            }))
+            .map_err(|e| e.to_string())?;
+            if marker != expected_marker {
+                return Err("receipt marker claim mismatch".into());
+            }
+            let conversation_finish =
+                crate::conversation_signal::prepare_callback_finish_signal_fence(
+                    owner.store(),
+                    *conversation,
+                    marker,
+                )
+                .map_err(|e| e.to_string())?;
+            let task_finish = task_store::prepare_callback_finish_task_fence(
+                owner.store(),
+                current.task.id(),
+                marker,
+            )
+            .map_err(|e| e.to_string())?;
+            checks.extend(conversation_finish.checks);
+            checks.extend(task_finish.checks);
+            mutations.extend(conversation_finish.mutations);
+            mutations.extend(task_finish.mutations);
+        }
+        #[cfg(test)]
+        invoke_boundary(
+            conversation_receipt_before_commit_hooks(),
+            current.task.id(),
+        );
         owner
             .store()
             .commit_with_prefix_put_fence(
@@ -2829,6 +3599,108 @@ impl AdmissionHandle<'_> {
                 ],
                 boundary,
             )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Preserve an uncertain callback outcome and release its exact markers.
+    /// This never certifies cancellation or grants another invocation.
+    pub(crate) fn retire_conversation_cancel_unknown(
+        &self,
+        claim: &ConversationCancelClaim,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        marker: &[u8],
+    ) -> Result<(), String> {
+        if identity_lease.as_deref() != Some(expected_identity)
+            || !self.abort
+            || self.standalone
+            || self.lease.retired
+        {
+            return Err("invalid uncertain callback lease".into());
+        }
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let current = TaskStore::new(owner.store())
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || !current.task.abort_requested()
+            || current.task.state() != &TaskState::Running
+        {
+            return Err("stale uncertain callback attempt".into());
+        }
+        let TaskOwner::Conversation(conversation) = current.task.owner() else {
+            return Err("uncertain callback owner changed".into());
+        };
+        let (saved, claim_check) = read_conversation_cancel_claim(
+            owner.store(),
+            current.task.id(),
+            attempt,
+            claim.claim_id,
+        )?
+        .ok_or("missing claim")?;
+        if saved != *claim || claim.lease != self.lease.token {
+            return Err("uncertain callback claim mismatch".into());
+        }
+        let expected = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "claim_id": claim.claim_id, "task": claim.task,
+            "attempt": claim.attempt, "lease": claim.lease, "policy": claim.policy,
+        }))
+        .map_err(|e| e.to_string())?;
+        if marker != expected {
+            return Err("uncertain callback marker mismatch".into());
+        }
+        let conversation_finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
+            owner.store(),
+            *conversation,
+            marker,
+        )
+        .map_err(|e| e.to_string())?;
+        let task_finish = task_store::prepare_callback_finish_task_fence(
+            owner.store(),
+            current.task.id(),
+            marker,
+        )
+        .map_err(|e| e.to_string())?;
+        let key = format!(
+            "durable/replay-safe-async/{}/conversation-park-cancel-unknown",
+            current.task.id()
+        )
+        .into_bytes();
+        let mut checks = vec![
+            claim_check,
+            durable_store::Check {
+                key: task_store::key(current.task.id()),
+                expected: durable_store::Expected::Version(current.version),
+            },
+            durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            },
+        ];
+        checks.extend(conversation_finish.checks);
+        checks.extend(task_finish.checks);
+        let mut mutations = conversation_finish.mutations;
+        mutations.extend(task_finish.mutations);
+        mutations.push(durable_store::Mutation::Put {
+            key,
+            value: serde_json::to_vec(claim).map_err(|e| e.to_string())?,
+        });
+        owner
+            .store()
+            .commit(&checks, &mutations)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -5072,6 +5944,7 @@ impl DetachedInvocation {
             receipt_capture: false,
             abort_definition: self.abort_definition,
             _identity_lease: None,
+            writer_busy: false,
         })
     }
 
@@ -5516,6 +6389,7 @@ impl DetachedInvocation {
             receipt_capture: capture_enabled,
             abort_definition,
             _identity_lease: identity_lease,
+            writer_busy: false,
         })
     }
 }
@@ -6003,6 +6877,8 @@ pub struct Scheduler {
     #[cfg(test)]
     inject_post_commit_error: bool,
     #[cfg(test)]
+    inject_commit_busy_once: bool,
+    #[cfg(test)]
     inject_preparation_error: u8,
     #[cfg(test)]
     inject_failure_commit_error: u8,
@@ -6017,6 +6893,20 @@ pub struct Scheduler {
     #[cfg(test)]
     yielded_prepared: Option<PreparedSettlement>,
     activity: crate::worker_activity::WorkerActivity,
+}
+
+impl Scheduler {
+    pub(crate) fn cleanup_registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// Snapshot live leases without requiring an unpoisoned scheduler. The
+    /// driver uses it only to identify a released executor whose event has not
+    /// yet reached the coordinator.
+    pub(crate) fn has_released_worker(&self, active: &HashSet<Uuid>) -> Result<bool, Error> {
+        let state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
+        Ok(active.iter().any(|id| !state.attempts.contains(id)))
+    }
 }
 impl Scheduler {
     fn make_invocation(
@@ -6100,6 +6990,7 @@ impl Scheduler {
         }
         if let Err(error) = completed.capture_marked_receipt() {
             if error.pre_transaction_busy() {
+                completed.writer_busy = true;
                 return Err(SettlementError::Pending {
                     completed: Box::new(completed),
                 });
@@ -6109,6 +7000,7 @@ impl Scheduler {
                 completed: Box::new(completed),
             });
         }
+        completed.writer_busy = false;
         let multiple = match self.live_invocations.lock() {
             Ok(state) => state.attempts.len() > 1,
             Err(_) => {
@@ -6253,6 +7145,12 @@ impl Scheduler {
                 .task
                 .kind()
                 .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken."));
+        let conversation_cancel_abort = matches!(completed.result, InvocationResult::Abort(None))
+            && self
+                .registered(&completed.running.task)
+                .is_ok_and(|registration| {
+                    registration.handler.conversation_cancel_dispatch_enabled()
+                });
         // The original invocation remains available if BEGIN IMMEDIATE fails
         // before any settlement transaction starts, including serial calls.
         let mut backup = Some((completed.running.clone(), completed.result.clone()));
@@ -6263,6 +7161,7 @@ impl Scheduler {
             receipt_capture,
             abort_definition,
             _identity_lease: _,
+            writer_busy: _,
         } = completed;
         let mut reported_handler_failure = false;
         let mut deferred = None;
@@ -6584,30 +7483,217 @@ impl Scheduler {
                         {
                             return Err(Error::Registration);
                         }
-                        let entry = self
-                            .ts()
-                            .store()
-                            .get(&abort_receipt_key(running.task.id()))
-                            .map_err(task_store::Error::from)?
+                        if reg.handler.conversation_cancel_dispatch_enabled() {
+                            let selected_hooks = reg
+                                .conversation_checkpointable
+                                .as_ref()
+                                .is_some_and(|(_, _, selection)| selection.is_some());
+                            let selection_gate = selected_hooks
+                                .then(|| {
+                                    self.validator
+                                        .as_ref()
+                                        .map(|h| h.checkpointable_extension_gate())
+                                })
+                                .flatten();
+                            let _selection = selection_gate
+                                .as_ref()
+                                .map(|gate| gate.lock())
+                                .transpose()
+                                .map_err(|_| Error::Poisoned)?;
+                            let _identity = reg
+                                .handler
+                                .conversation_cleanup_identity_lease()
+                                .map_err(|_| Error::Ownership)?;
+                            let task_store = self.ts();
+                            let store = task_store.store();
+                            let boundary = store.put_version().map_err(task_store::Error::from)?;
+                            let receipt_key = format!(
+                                "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+                                running.task.id()
+                            )
+                            .into_bytes();
+                            let entry = store
+                                .get(&receipt_key)
+                                .map_err(task_store::Error::from)?
+                                .ok_or(Error::Ownership)?;
+                            let receipt: ConversationCancelReceipt =
+                                serde_json::from_slice(&entry.value)
+                                    .map_err(|e| Error::Handler(e.to_string()))?;
+                            let attempt = running.task.attempt_id().ok_or(Error::Ownership)?;
+                            let (claim, claim_check) = read_conversation_cancel_claim(
+                                store,
+                                running.task.id(),
+                                attempt,
+                                receipt.claim.claim_id,
+                            )
+                            .map_err(Error::Handler)?
                             .ok_or(Error::Ownership)?;
-                        let (_, checks) = abort_receipt_evidence(
-                            self.ts().store(),
-                            &running.task,
-                            &entry,
-                            reg.handler.requires_park_cancel_claim(),
-                        )
-                        .map_err(Error::Handler)?;
-                        let mut next = running.clone();
-                        if running.task.woken_interrupted_attempt().is_some() {
-                            next.task
-                                .fail("interrupted woken execution; reconciliation required".into())
-                                .map_err(Error::Transition)?;
-                        } else {
+                            validate_conversation_cancel_receipt(&receipt, &claim)
+                                .map_err(Error::Handler)?;
+                            if claim.lease != lease.token
+                                || claim.checkpoint != *running.task.checkpoint()
+                                || receipt.result != "callback returned"
+                                || running.task.replay_safe()
+                                || selected_hooks != (receipt.version == 2)
+                            {
+                                return Err(Error::Ownership);
+                            }
+                            let mut checks = self
+                                .validator
+                                .as_ref()
+                                .ok_or(Error::Ownership)?
+                                .checkpointable_cancel_conversation_checks(
+                                    &running.task,
+                                    &self.registry,
+                                )
+                                .map_err(|e| Error::Handler(e.to_string()))?;
+                            let park_checks =
+                                crate::async_task_tool::unsafe_park_proof::cancel_checks(
+                                    store,
+                                    &running.task,
+                                    if independent_abort {
+                                        boundary.min(ordering_graph_version)
+                                    } else {
+                                        boundary
+                                    },
+                                );
+                            if let Err(reason) = park_checks.as_ref() {
+                                // A callback receipt cannot suppress later unsafe
+                                // outcome evidence. Persist a failed reconciliation
+                                // result, preserving both the receipt and evidence.
+                                let mut next = running.clone();
+                                next.task
+                                    .fail(format!(
+                                        "cancel settlement requires reconciliation: {reason}"
+                                    ))
+                                    .map_err(Error::Transition)?;
+                                let terminal = ConversationCancelTerminalMarker {
+                                    version: 1,
+                                    claim_id: claim.claim_id,
+                                    attempt: claim.attempt,
+                                    running_task_version: running.version,
+                                    terminal_task: next.task.clone(),
+                                    receipt_version: None,
+                                };
+                                let terminal_key =
+                                    conversation_cancel_terminal_key(running.task.id());
+                                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                                batch.checks.extend(checks);
+                                batch.checks.push(claim_check);
+                                batch.checks.push(durable_store::Check {
+                                    key: receipt_key,
+                                    expected: durable_store::Expected::Version(entry.version),
+                                });
+                                batch.checks.push(durable_store::Check {
+                                    key: terminal_key.clone(),
+                                    expected: durable_store::Expected::Missing,
+                                });
+                                batch.mutations.push(durable_store::Mutation::Put {
+                                    key: terminal_key,
+                                    value: serde_json::to_vec(&terminal)
+                                        .map_err(|e| Error::Handler(e.to_string()))?,
+                                });
+                                commit_abort(&batch)?;
+                                return Ok(true);
+                            }
+                            checks.extend(park_checks.map_err(Error::Handler)?);
+                            if has_live_owned(store, running.task.id(), &self.ts().list()?)? {
+                                return Err(Error::Ownership);
+                            }
+                            let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+                                store,
+                                running.task.id(),
+                                &self.ts().list()?,
+                                boundary,
+                            )?;
+                            if uncertain.is_some() {
+                                return Err(Error::Handler(
+                                    "unsafe descendant requires reconciliation".into(),
+                                ));
+                            }
+                            checks.extend(descendant_checks);
+                            let mut next = running.clone();
                             next.task.cancel().map_err(Error::Transition)?;
+                            let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            batch.checks.extend(checks);
+                            batch.checks.push(claim_check);
+                            batch.checks.push(durable_store::Check {
+                                key: receipt_key,
+                                expected: durable_store::Expected::Version(entry.version),
+                            });
+                            if selected_hooks {
+                                let terminal_key =
+                                    conversation_cancel_terminal_key(running.task.id());
+                                let terminal = ConversationCancelTerminalMarker {
+                                    version: 2,
+                                    claim_id: claim.claim_id,
+                                    attempt: claim.attempt,
+                                    running_task_version: running.version,
+                                    terminal_task: next.task.clone(),
+                                    receipt_version: Some(entry.version),
+                                };
+                                batch.checks.push(durable_store::Check {
+                                    key: terminal_key.clone(),
+                                    expected: durable_store::Expected::Missing,
+                                });
+                                batch.mutations.push(durable_store::Mutation::Put {
+                                    key: terminal_key,
+                                    value: serde_json::to_vec(&terminal)
+                                        .map_err(|e| Error::Handler(e.to_string()))?,
+                                });
+                            }
+                            #[cfg(test)]
+                            invoke_boundary(conversation_settlement_hooks(), running.task.id());
+                            store
+                                .commit_with_prefix_put_fence(
+                                    &batch.checks,
+                                    &batch.mutations,
+                                    &[
+                                        task_store::PREFIX,
+                                        crate::ownership_edge::PREFIX,
+                                        b"runtime/conversation/",
+                                    ],
+                                    if independent_abort {
+                                        boundary.min(ordering_graph_version)
+                                    } else {
+                                        boundary
+                                    },
+                                )
+                                .map_err(task_store::Error::from)?;
+                            #[cfg(test)]
+                            invoke_boundary(
+                                conversation_after_settlement_hooks(),
+                                running.task.id(),
+                            );
+                        } else {
+                            let entry = self
+                                .ts()
+                                .store()
+                                .get(&abort_receipt_key(running.task.id()))
+                                .map_err(task_store::Error::from)?
+                                .ok_or(Error::Ownership)?;
+                            let (_, checks) = abort_receipt_evidence(
+                                self.ts().store(),
+                                &running.task,
+                                &entry,
+                                reg.handler.requires_park_cancel_claim(),
+                            )
+                            .map_err(Error::Handler)?;
+                            let mut next = running.clone();
+                            if running.task.woken_interrupted_attempt().is_some() {
+                                next.task
+                                    .fail(
+                                        "interrupted woken execution; reconciliation required"
+                                            .into(),
+                                    )
+                                    .map_err(Error::Transition)?;
+                            } else {
+                                next.task.cancel().map_err(Error::Transition)?;
+                            }
+                            let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                            batch.checks.extend(checks);
+                            commit_abort(&batch)?;
                         }
-                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
-                        batch.checks.extend(checks);
-                        commit_abort(&batch)?;
                     }
                     None if independent_abort => {
                         let mut next = running.clone();
@@ -6659,6 +7745,7 @@ impl Scheduler {
                                 attempt: claim.attempt,
                                 running_task_version: running.version,
                                 terminal_task: next.task.clone(),
+                                receipt_version: None,
                             };
                             let key = conversation_cancel_terminal_key(running.task.id());
                             let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
@@ -6714,6 +7801,7 @@ impl Scheduler {
                             receipt_capture,
                             abort_definition,
                             _identity_lease: None,
+                            writer_busy: false,
                         })),
                     });
                 }
@@ -6744,6 +7832,7 @@ impl Scheduler {
                             receipt_capture,
                             abort_definition,
                             _identity_lease: None,
+                            writer_busy: false,
                         }),
                     }
                 }
@@ -6798,6 +7887,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    writer_busy: true,
                 }),
             });
         }
@@ -6830,6 +7920,7 @@ impl Scheduler {
                         receipt_capture,
                         abort_definition,
                         _identity_lease: None,
+                        writer_busy: false,
                     }),
                 });
             }
@@ -6844,7 +7935,10 @@ impl Scheduler {
                     durable_store::Error::Conflict { .. }
                 )))
         ) && backup.as_ref().is_some_and(|(running, _)| {
-            running.task.holds_interrupted_cleanup() || woken_abort || independent_abort
+            running.task.holds_interrupted_cleanup()
+                || woken_abort
+                || independent_abort
+                || conversation_cancel_abort
         }) {
             let (running, result) = backup.take().expect("checked above");
             drop(guard);
@@ -6856,6 +7950,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    writer_busy: false,
                 }),
             });
         }
@@ -6878,6 +7973,7 @@ impl Scheduler {
                     receipt_capture,
                     abort_definition,
                     _identity_lease: None,
+                    writer_busy: false,
                 })),
             });
         }
@@ -6928,6 +8024,7 @@ impl Scheduler {
         }
         if let Err(error) = completed.capture_marked_receipt() {
             if error.pre_transaction_busy() {
+                completed.writer_busy = true;
                 return Err(SettlementError::Pending {
                     completed: Box::new(completed),
                 });
@@ -6937,6 +8034,7 @@ impl Scheduler {
                 completed: Box::new(completed),
             });
         }
+        completed.writer_busy = false;
         let fence = self.failure_fence.clone();
         let guard = match fence.try_lock() {
             Ok(guard) => guard,
@@ -7055,32 +8153,53 @@ impl Scheduler {
             let state = self.live_invocations.clone();
             let scheduler_poison = self.poisoned.clone();
             let running = completed.task_id();
-            let result = owner.conversation_controls().try_fence(|| {
-                let _failure = match fence.try_lock() {
-                    Ok(guard) => guard,
-                    Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
-                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
-                };
+            let targets = match worker.scoped_abort_graph(Some(running), None, None, None) {
+                Ok(Some(targets)) => targets,
+                Ok(None) => Vec::new(),
+                Err(error)
+                    if runtime_pre_transaction_busy(&error)
+                        || matches!(error, crate::runtime::Error::TaskScheduler(Error::Busy)) =>
                 {
-                    let state = state.lock().map_err(|_| Error::Poisoned)?;
-                    if state.poisoned || scheduler_poison.load(std::sync::atomic::Ordering::Acquire)
+                    return Err(SettlementError::Pending {
+                        completed: Box::new(completed),
+                    });
+                }
+                Err(error) => {
+                    return Err(SettlementError::Rejected {
+                        error: Error::Handler(format!("pending abort graph discovery: {error}")),
+                        completed: Box::new(completed),
+                    });
+                }
+            };
+            let result = owner
+                .conversation_controls()
+                .try_fence_targets(&targets, || {
+                    let _failure = match fence.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                        Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+                    };
                     {
-                        return Err(Error::Poisoned);
+                        let state = state.lock().map_err(|_| Error::Poisoned)?;
+                        if state.poisoned
+                            || scheduler_poison.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            return Err(Error::Poisoned);
+                        }
+                        if state.handler_failed && !state.failed_handlers.contains(&running) {
+                            return Err(Error::Busy);
+                        }
                     }
-                    if state.handler_failed && !state.failed_handlers.contains(&running) {
-                        return Err(Error::Busy);
+                    match worker.scoped_abort_graph(Some(running), None, Some(&targets), None) {
+                        Ok(affected) => Ok(affected.unwrap_or_default()),
+                        Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                        Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
+                        Err(error) => {
+                            state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                            Err(Error::Handler(format!("checked pending abort: {error}")))
+                        }
                     }
-                }
-                match worker.abort_pending_task_graph(running) {
-                    Ok(affected) => Ok(affected.unwrap_or_default()),
-                    Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                    Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
-                    Err(error) => {
-                        state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
-                        Err(Error::Handler(format!("checked pending abort: {error}")))
-                    }
-                }
-            });
+                });
             match result {
                 Ok(Some(_)) => (),
                 Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => {
@@ -7452,6 +8571,7 @@ impl Scheduler {
                         check_pending: true,
                         attempt: 0,
                         candidate: None,
+                        writer_busy: false,
                     });
                 }
                 self.commit_failure_settlement(failure.as_mut().unwrap(), || {})?;
@@ -8393,6 +9513,8 @@ impl Scheduler {
             #[cfg(test)]
             inject_post_commit_error: false,
             #[cfg(test)]
+            inject_commit_busy_once: false,
+            #[cfg(test)]
             inject_preparation_error: 0,
             #[cfg(test)]
             inject_failure_commit_error: 0,
@@ -8465,7 +9587,7 @@ impl Scheduler {
         owner: &Arc<OwnedStore>,
         root: Uuid,
         running: Uuid,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
     ) -> Result<(), Error> {
         if let Some(harness) = self.validator.as_mut() {
             drop(gate);
@@ -9033,22 +10155,187 @@ impl Scheduler {
                                 "conversation terminal claim mismatch".into(),
                             ));
                         }
+                        // A versioned after receipt certifies that both the callback
+                        // and the replay-safe after hook returned. It can be used
+                        // only while the original registration, identity, owner,
+                        // park proof, and graph still match the same transaction.
+                        let receipt_key = format!(
+                            "durable/replay-safe-async/{}/conversation-park-cancel-receipt",
+                            item.task.id()
+                        )
+                        .into_bytes();
+                        let receipt_entry =
+                            store.get(&receipt_key).map_err(task_store::Error::from)?;
+                        let selection_gate = receipt_entry.as_ref().and_then(|_| {
+                            self.validator
+                                .as_ref()
+                                .map(|h| h.checkpointable_extension_gate())
+                        });
+                        let _selection = selection_gate
+                            .as_ref()
+                            .map(|gate| gate.lock())
+                            .transpose()
+                            .map_err(|_| Error::Poisoned)?;
+                        let mut recovered_checks = Vec::new();
+                        let mut _recovered_identity = None;
+                        let mut recovered_after = false;
+                        if let (Some(receipt_entry), Ok(reg), Some(harness)) = (
+                            &receipt_entry,
+                            self.registered(&item.task),
+                            self.validator.as_ref(),
+                        ) && reg.handler.conversation_cancel_dispatch_enabled()
+                            && reg
+                                .conversation_checkpointable
+                                .as_ref()
+                                .is_some_and(|(_, _, selection)| selection.is_some())
+                            && let Ok(receipt) = serde_json::from_slice::<ConversationCancelReceipt>(
+                                &receipt_entry.value,
+                            )
+                            && receipt.version == 2
+                            && validate_conversation_cancel_receipt(&receipt, &claim).is_ok()
+                        {
+                            match reg.handler.conversation_cleanup_identity_lease() {
+                                Ok(identity) => {
+                                    let owner_checks = harness
+                                        .checkpointable_cancel_conversation_checks(
+                                            &item.task,
+                                            &self.registry,
+                                        );
+                                    let park_checks =
+                                        crate::async_task_tool::unsafe_park_proof::cancel_checks(
+                                            store,
+                                            &item.task,
+                                            recovery_graph_version,
+                                        );
+                                    if let (Ok(owner_checks), Ok(park_checks)) =
+                                        (owner_checks, park_checks)
+                                        && !has_live_owned(
+                                            store,
+                                            item.task.id(),
+                                            &self.ts().list()?,
+                                        )?
+                                    {
+                                        let (uncertain, descendant_checks) =
+                                            unsafe_descendant_reconciliation(
+                                                store,
+                                                item.task.id(),
+                                                &self.ts().list()?,
+                                                recovery_graph_version,
+                                            )?;
+                                        if uncertain.is_none() {
+                                            recovered_checks.extend(owner_checks);
+                                            recovered_checks.extend(park_checks);
+                                            recovered_checks.extend(descendant_checks);
+                                            _recovered_identity = Some(identity);
+                                            recovered_after = true;
+                                        }
+                                    }
+                                }
+                                Err(crate::nested_identity::LeaseFailure::Busy) => {
+                                    self.deferred_recovery.extend(deferred);
+                                    self.deferred_recovery.insert(item.task.id());
+                                    return Ok(());
+                                }
+                                Err(_) => (),
+                            }
+                        }
                         let mut next = item.clone();
-                        next.task
-                            .fail(
+                        if recovered_after {
+                            next.task.cancel().map_err(Error::Transition)?;
+                        } else {
+                            next.task.fail(
                                 "interrupted conversation cancel claim; reconciliation required"
                                     .into(),
                             )
                             .map_err(Error::Transition)?;
+                        }
                         let marker = ConversationCancelTerminalMarker {
-                            version: 1,
+                            version: if recovered_after { 2 } else { 1 },
                             claim_id: claim.claim_id,
                             attempt: claim.attempt,
                             running_task_version: item.version,
                             terminal_task: next.task.clone(),
+                            receipt_version: if recovered_after {
+                                receipt_entry.as_ref().map(|entry| entry.version)
+                            } else {
+                                None
+                            },
                         };
                         let marker_key = conversation_cancel_terminal_key(item.task.id());
                         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        // A dead process may have committed both first-poll markers.
+                        // Retire only the exact markers belonging to this claim, in
+                        // the same transaction as the unknown terminal evidence.
+                        let TaskOwner::Conversation(conversation) = item.task.owner() else {
+                            return Err(Error::Handler("conversation claim owner changed".into()));
+                        };
+                        let task_marker_key =
+                            format!("durable/task-callback-start/{}", item.task.id()).into_bytes();
+                        let conversation_marker_key =
+                            format!("runtime/conversation-callback-start/{conversation}")
+                                .into_bytes();
+                        let task_start = store
+                            .get(&task_marker_key)
+                            .map_err(task_store::Error::from)?;
+                        let conversation_start = store
+                            .get(&conversation_marker_key)
+                            .map_err(task_store::Error::from)?;
+                        match (task_start, conversation_start) {
+                            (None, None) => {
+                                if recovered_after {
+                                    batch.checks.push(durable_store::Check {
+                                        key: task_marker_key.clone(),
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                    batch.checks.push(durable_store::Check {
+                                        key: conversation_marker_key.clone(),
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                            }
+                            (Some(task_start), Some(conversation_start)) => {
+                                if recovered_after {
+                                    return Err(Error::Handler(
+                                        "completed receipt has live start markers".into(),
+                                    ));
+                                }
+                                let expected = serde_json::to_vec(&serde_json::json!({
+                                    "version": 1, "claim_id": claim.claim_id,
+                                    "task": claim.task, "attempt": claim.attempt,
+                                    "lease": claim.lease, "policy": claim.policy,
+                                }))
+                                .map_err(|e| Error::Handler(e.to_string()))?;
+                                if task_start.value != expected
+                                    || conversation_start.value != expected
+                                {
+                                    return Err(Error::Handler(
+                                        "interrupted cancel marker mismatch".into(),
+                                    ));
+                                }
+                                batch.checks.retain(|check| check.key != task_marker_key);
+                                batch.checks.push(durable_store::Check {
+                                    key: task_marker_key.clone(),
+                                    expected: durable_store::Expected::Version(task_start.version),
+                                });
+                                batch.checks.push(durable_store::Check {
+                                    key: conversation_marker_key.clone(),
+                                    expected: durable_store::Expected::Version(
+                                        conversation_start.version,
+                                    ),
+                                });
+                                batch.mutations.push(durable_store::Mutation::Delete {
+                                    key: task_marker_key,
+                                });
+                                batch.mutations.push(durable_store::Mutation::Delete {
+                                    key: conversation_marker_key,
+                                });
+                            }
+                            _ => {
+                                return Err(Error::Handler(
+                                    "incomplete interrupted cancel markers".into(),
+                                ));
+                            }
+                        }
                         batch.checks.extend([
                             durable_store::Check {
                                 key: claim_key,
@@ -9059,6 +10346,15 @@ impl Scheduler {
                                 expected: durable_store::Expected::Missing,
                             },
                         ]);
+                        batch.checks.push(durable_store::Check {
+                            key: receipt_key,
+                            expected: receipt_entry
+                                .as_ref()
+                                .map_or(durable_store::Expected::Missing, |entry| {
+                                    durable_store::Expected::Version(entry.version)
+                                }),
+                        });
+                        batch.checks.extend(recovered_checks);
                         batch.mutations.push(durable_store::Mutation::Put {
                             key: marker_key,
                             value: serde_json::to_vec(&marker)
@@ -9075,7 +10371,7 @@ impl Scheduler {
                             }
                         }
                         #[allow(unused_mut)]
-                        let mut commit = if independent_only {
+                        let mut commit = if independent_only || recovered_after {
                             store.commit_with_prefix_put_fence(
                                 &batch.checks,
                                 &batch.mutations,
@@ -10008,6 +11304,25 @@ impl Scheduler {
         self.reserve_tick_inner(now, true, task_tool_child_only, false, true, &[], anchor)
     }
 
+    // Called while reservation holds the failure and task fences. A checked
+    // conflict or marker busy proves this update did not commit, so it is safe
+    // to clear the provisional poison and rescan rather than stop the driver.
+    fn reservation_update_committed(
+        &self,
+        result: Result<(), task_store::Error>,
+    ) -> Result<bool, Error> {
+        match result {
+            Ok(()) => Ok(true),
+            Err(task_store::Error::CallbackStartBusy)
+            | Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => {
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn try_reserve_independent_maintenance(
         &mut self,
         allow_maintenance: bool,
@@ -10107,8 +11422,25 @@ impl Scheduler {
                 }
             }
         }
-        let unbound_owned =
+        let mut unbound_owned =
             unbound_cancel_owned_tasks(owner.store(), &self.unbound_cancel_roots, &held_tasks)?;
+        let mut callback_roots = HashSet::new();
+        for record in &held_tasks {
+            match task_store::clear_callback_start_check(owner.store(), record.task.id()) {
+                Ok(_) => (),
+                Err(task_store::Error::CallbackStartBusy) => {
+                    #[cfg(test)]
+                    task_store::report_callback_wake_blocked(record.task.id());
+                    callback_roots.insert(record.task.id());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unbound_owned.extend(unbound_cancel_owned_tasks(
+            owner.store(),
+            &callback_roots,
+            &held_tasks,
+        )?);
         for snapshot in &held_tasks {
             if independent_only
                 && (!self.independent_root_safe(&owner, &snapshot.task)?
@@ -10725,6 +12057,14 @@ impl Scheduler {
                                 .load(std::sync::atomic::Ordering::SeqCst)
                         });
                         if stale_hook_gate(&snapshot.task, &self.registry, generation) {
+                            let callback_start = match task_store::clear_callback_start_check(
+                                owner.store(),
+                                snapshot.task.id(),
+                            ) {
+                                Ok(check) => check,
+                                Err(task_store::Error::CallbackStartBusy) => continue,
+                                Err(error) => return Err(error.into()),
+                            };
                             let deadline = match snapshot.task.state() {
                                 TaskState::Waiting(
                                     WaitFor::Sleep { until_millis, .. }
@@ -10762,6 +12102,7 @@ impl Scheduler {
                                     boundary,
                                 );
                             }
+                            batch.checks.push(callback_start);
                             batch.checks.push(durable_store::Check {
                                 key: revision_key,
                                 expected: revision
@@ -11136,8 +12477,10 @@ impl Scheduler {
                             .store(false, std::sync::atomic::Ordering::Release);
                         return Ok(TickReservation::Progress(progress));
                     }
-                    self.ts()
-                        .update(snapshot, |task| task.fail_abort_restart())?;
+                    let update = self.ts().update(snapshot, |task| task.fail_abort_restart());
+                    if !self.reservation_update_committed(update)? {
+                        return Ok(TickReservation::Progress(true));
+                    }
                 }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
@@ -11161,10 +12504,15 @@ impl Scheduler {
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(progress));
                 }
-                self.ts().update(snapshot, |t| {
+                #[cfg(test)]
+                invoke_boundary(reservation_update_hooks(), snapshot.task.id());
+                let update = self.ts().update(snapshot, |t| {
                     t.start()?;
                     t.fail(diagnostic)
-                })?;
+                });
+                if !self.reservation_update_committed(update)? {
+                    return Ok(TickReservation::Progress(true));
+                }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
                 return Ok(TickReservation::Progress(true));
@@ -11200,10 +12548,13 @@ impl Scheduler {
                         .blocked_reason(&snapshot.task)
                         .ok_or(Error::Registration)?;
                     let diagnostic = orphan_diagnostic(&reason);
-                    self.ts().update(snapshot, |t| {
+                    let update = self.ts().update(snapshot, |t| {
                         t.start()?;
                         t.fail(diagnostic)
-                    })?;
+                    });
+                    if !self.reservation_update_committed(update)? {
+                        return Ok(TickReservation::Progress(true));
+                    }
                     self.poisoned
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(true));
@@ -11237,10 +12588,13 @@ impl Scheduler {
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(progress));
                 }
-                self.ts().update(snapshot, |t| {
+                let update = self.ts().update(snapshot, |t| {
                     t.start()?;
                     t.fail("orphaned: missing abort handler or task definition".into())
-                })?;
+                });
+                if !self.reservation_update_committed(update)? {
+                    return Ok(TickReservation::Progress(true));
+                }
             }
             self.poisoned
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -11285,7 +12639,7 @@ impl Scheduler {
         result: Result<Step, String>,
         mut documents: crate::document::DetachedTaskDocuments,
         reported_handler_failure: &mut bool,
-        _gate: std::sync::MutexGuard<'_, ()>,
+        _gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         ordering_graph_version: u64,
         deferred: &mut Option<DeferredSettlement>,
@@ -11373,6 +12727,28 @@ impl Scheduler {
             self.poisoned
                 .store(false, std::sync::atomic::Ordering::Release);
             return Ok(true);
+        }
+        let mut staged_start_leases = Vec::new();
+        if let Some(conversation) = documents.task_input_conversation() {
+            let gate = owner.conversation_controls().start_gate(conversation);
+            let start_lease = gate.try_enter();
+            let busy = start_lease.is_none()
+                || owner
+                    .store()
+                    .get(&crate::conversation_signal::callback_start_key(
+                        conversation,
+                    ))
+                    .map_err(task_store::Error::from)?
+                    .is_some();
+            if busy {
+                *deferred = Some(DeferredSettlement::Unprepared(
+                    original_running,
+                    result,
+                    documents,
+                ));
+                return Err(Error::Busy);
+            }
+            staged_start_leases.push(start_lease.expect("checked above"));
         }
         let step = match result {
             Ok(step) => step,
@@ -11692,7 +13068,9 @@ impl Scheduler {
                         "task input requires an attached harness".into(),
                     )
                 })?;
-                let mut batch = harness.prepare_task_input(intent)?;
+                let staged_input = harness.prepare_task_input(intent)?;
+                let mut batch = staged_input.batch;
+                staged_start_leases.extend(staged_input.start_leases);
                 let mut ancestry = crate::task_store::OwnedBatch {
                     checks: intent.ancestry_checks.clone(),
                     mutations: Vec::new(),
@@ -11987,6 +13365,7 @@ impl Scheduler {
         let _ = wait_graph_fence;
         let mut prepared = PreparedSettlement {
             attachment: self.attachment.clone(),
+            _start_leases: staged_start_leases,
             transaction,
             notifications,
             running,
@@ -11997,6 +13376,7 @@ impl Scheduler {
             graph_version: success_graph_version,
             attempts: 0,
             commit_uncertain: false,
+            writer_busy: false,
         };
         let result = self.commit_prepared_settlement(
             &mut prepared,
@@ -12028,7 +13408,7 @@ impl Scheduler {
         &mut self,
         prepared: &mut PreparedSettlement,
         owner: &Arc<OwnedStore>,
-        _gate: std::sync::MutexGuard<'_, ()>,
+        _gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
@@ -12041,6 +13421,20 @@ impl Scheduler {
             }
             #[cfg(feature = "test-hooks")]
             hook_fence_test_hook::run(prepared.running.task.id(), "settlement");
+            #[cfg(test)]
+            let result = if std::mem::take(&mut self.inject_commit_busy_once) {
+                Err(crate::document::Error::Store(
+                    durable_store::Error::WriteLockBusy(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        None,
+                    )),
+                ))
+            } else {
+                prepared
+                    .transaction
+                    .commit_task_graph(owner.store(), prepared.graph_version)
+            };
+            #[cfg(not(test))]
             let result = prepared
                 .transaction
                 .commit_task_graph(owner.store(), prepared.graph_version);
@@ -12055,8 +13449,10 @@ impl Scheduler {
                 // BEGIN IMMEDIATE failed before a transaction existed. Keep the
                 // exact candidate and lease; the next attempt revalidates them.
                 prepared.commit_uncertain = false;
+                prepared.writer_busy = true;
                 return Err(Error::Busy);
             }
+            prepared.writer_busy = false;
             let Err(crate::document::Error::Store(durable_store::Error::Conflict { ref key })) =
                 result
             else {
@@ -12240,7 +13636,7 @@ impl Scheduler {
         &mut self,
         prepared: &mut PreparedSettlement,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
     ) -> Result<bool, Error> {
         match prepared.revalidate(self, owner, &gate)? {
             PreparedRevalidation::Ready => {
@@ -12287,15 +13683,25 @@ impl Scheduler {
         }
         let result = if let Some(harness) = self.validator.as_mut() {
             let owner = self.attachment.owner.clone();
-            owner
+            match owner
                 .conversation_controls()
                 .fence(|| harness.abort_owned_graph(None, Some(id)))
-                .map(|_| ())
-                .map_err(|e| Error::Handler(format!("foreground abort: {e:?}")))
+            {
+                Ok(_) => Ok(()),
+                Err(durable_store::controls::FenceError::Commit(error))
+                    if runtime_pre_transaction_busy(&error) =>
+                {
+                    Err(Error::Busy)
+                }
+                Err(error) => Err(Error::Handler(format!("foreground abort: {error:?}"))),
+            }
         } else {
             request_abort_subtree(&self.ts(), id)
         };
-        if result.is_err() && (self.validator.is_some() || matches!(result, Err(Error::Store(_)))) {
+        if result.is_err()
+            && !matches!(result, Err(Error::Busy))
+            && (self.validator.is_some() || matches!(result, Err(Error::Store(_))))
+        {
             self.poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
         }
@@ -12435,7 +13841,7 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
@@ -12455,7 +13861,7 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
@@ -12475,7 +13881,7 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
         completed: bool,
@@ -12488,6 +13894,7 @@ impl Scheduler {
             check_pending: true,
             attempt: 0,
             candidate: None,
+            writer_busy: false,
         };
         match self.commit_failure_settlement(&mut settlement, || {}) {
             Ok(()) => drop(gate),
@@ -12517,7 +13924,7 @@ impl Scheduler {
         &mut self,
         parent: &task_store::StoredTask,
         owner: &Arc<OwnedStore>,
-        gate: std::sync::MutexGuard<'_, ()>,
+        gate: durable_store::controls::PollGateGuard<'_>,
         nonblocking_abort: bool,
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
@@ -12568,6 +13975,7 @@ impl Scheduler {
             check_pending,
             attempt: 0,
             candidate: None,
+            writer_busy: false,
         };
         self.commit_failure_settlement(&mut settlement, before_commit)
     }
@@ -12663,6 +14071,7 @@ impl Scheduler {
                 ],
                 candidate.graph_version,
             );
+            settlement.writer_busy = false;
             #[cfg(test)]
             if commit.is_ok() && self.inject_failure_commit_error == 2 {
                 return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
@@ -12708,6 +14117,7 @@ impl Scheduler {
                     continue;
                 }
                 Err(durable_store::Error::WriteLockBusy(_)) => {
+                    settlement.writer_busy = true;
                     #[cfg(feature = "test-hooks")]
                     hook_fence_test_hook::run(settlement.running.task.id(), "failure-busy");
                     return Err(Error::Busy);
@@ -13094,7 +14504,7 @@ fn has_unmarked_nested(parent: Uuid, tasks: &[task_store::StoredTask]) -> bool {
 // A held success was decided while descendants still ran. Never publish it if
 // any unsafe descendant ended without a resolved task outcome. The evidence
 // namespace is fenced alongside the graph commit, including absent intents.
-fn unsafe_descendant_reconciliation(
+pub(crate) fn unsafe_descendant_reconciliation(
     store: &durable_store::Store,
     parent: Uuid,
     tasks: &[task_store::StoredTask],
@@ -13339,7 +14749,12 @@ fn request_abort_roots_with(
                 updates.push(next);
             }
         }
-        let mut batch = ts.prepare_save(&updates.iter().map(Save::Update).collect::<Vec<_>>())?;
+        let mut batch = match ts.prepare_save(&updates.iter().map(Save::Update).collect::<Vec<_>>())
+        {
+            Ok(batch) => batch,
+            Err(task_store::Error::CallbackStartBusy) => return Err(Error::Busy),
+            Err(error) => return Err(error.into()),
+        };
         for record in &records {
             if ids.contains(&record.task.id())
                 && (record.task.is_terminal() || record.task.abort_requested())
@@ -13354,6 +14769,11 @@ fn request_abort_roots_with(
             }
         }
         for task_id in &ids {
+            match task_store::clear_callback_start_check(ts.store(), *task_id) {
+                Ok(check) => batch.checks.push(check),
+                Err(task_store::Error::CallbackStartBusy) => return Err(Error::Busy),
+                Err(error) => return Err(error.into()),
+            }
             let (check, mutation) =
                 crate::ownership_edge::prepare_abort_fence(ts.store(), &TaskOwner::Task(*task_id))
                     .map_err(task_store::Error::from)?;
@@ -14118,6 +15538,300 @@ mod tests {
     }
 
     #[test]
+    fn staged_task_input_holds_start_gate_until_driver_commit() {
+        use crate::document::TaskDocuments;
+        use crate::runtime::{Config, Harness, Options};
+        use crate::task_driver::Driver;
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::mpsc;
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Writer;
+        impl Handler for Writer {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                docs.submit_write("guarded".into(), "app.note".into(), None, None)
+                    .map_err(|e| e.to_string())?;
+                Ok(Step::Succeed(json!(null)))
+            }
+        }
+        for scenario in ["commit", "conflict", "panic", "drop", "writer_shutdown"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut harness = Harness::open_paused(
+                dir.path().join("db"),
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            let conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let other = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let controls = harness.owner.conversation_controls();
+            let gate = controls.get(conversation).callback_start;
+            let other_gate = controls.get(other).callback_start;
+            let mut registry = Registry::default();
+            registry.register("guarded-writer", false, Writer);
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            scheduler.inject_commit_busy_once = scenario == "drop";
+            let writer = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("writer"),
+                3,
+            )
+            .unwrap()
+            .registered("guarded-writer".into(), false);
+            let (pending_entered, pending_ready) = mpsc::channel();
+            let (pending_release, pending_proceed) = mpsc::channel();
+            if scenario == "drop" || scenario == "writer_shutdown" {
+                crate::task_driver::after_pending_enqueue_for_test(writer.id(), move || {
+                    pending_entered.send(()).unwrap();
+                    pending_proceed
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .unwrap();
+                });
+            }
+            let (entered, ready) = mpsc::channel();
+            let (release, proceed) = mpsc::channel();
+            let proceed = std::sync::Mutex::new(proceed);
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            scheduler.set_result_commit_hook(Arc::new(move |_, _| {
+                let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt != 0 && !(scenario == "conflict" && attempt == 1) {
+                    return;
+                }
+                entered.send(attempt).unwrap();
+                proceed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                assert_ne!(scenario, "panic", "injected settlement panic");
+            }));
+            let driver = Driver::start(scheduler);
+            driver.submit(&writer).unwrap();
+            assert_eq!(
+                ready
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap(),
+                0
+            );
+            assert!(
+                gate.try_start().is_none(),
+                "staged input released its gate before commit"
+            );
+            assert!(
+                other_gate.try_start().is_some(),
+                "unrelated conversation was blocked"
+            );
+            if scenario == "conflict" {
+                let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+                let key = crate::runtime::Harness::key(conversation);
+                let old = store.get(&key).unwrap().unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(old.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: old.value,
+                        }],
+                    )
+                    .unwrap();
+            }
+            let locked = if scenario == "writer_shutdown" {
+                let db = rusqlite::Connection::open(dir.path().join("db")).unwrap();
+                db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                Some(db)
+            } else {
+                None
+            };
+            release.send(()).unwrap();
+            if scenario == "writer_shutdown" {
+                pending_ready
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .unwrap();
+                assert!(gate.try_start().is_none());
+                driver.stop_worker_for_test();
+                pending_release.send(()).unwrap();
+                let (done, completed) = mpsc::channel();
+                let shutdown =
+                    std::thread::spawn(move || done.send(driver.shutdown_with_pending()).unwrap());
+                let report = match completed.recv_timeout(std::time::Duration::from_secs(3)) {
+                    Ok(report) => report.unwrap(),
+                    Err(error) => {
+                        locked.unwrap().execute_batch("COMMIT").unwrap();
+                        let _ = completed.recv_timeout(std::time::Duration::from_secs(15));
+                        shutdown.join().unwrap();
+                        panic!("shutdown waited for an unrelated writer: {error}");
+                    }
+                };
+                shutdown.join().unwrap();
+                assert!(report.failure().is_none());
+                let pending = report
+                    .pending()
+                    .iter()
+                    .find(|pending| pending.waits_for_writer())
+                    .expect("writer-busy candidate must be returned");
+                assert!(matches!(
+                    pending.candidate_task().map(Task::state),
+                    Some(TaskState::Succeeded(_))
+                ));
+                assert!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .is_empty(),
+                    "pre-transaction busy must not publish staged input"
+                );
+                assert!(
+                    gate.try_start().is_none(),
+                    "retained settlement lost its gate"
+                );
+                locked.unwrap().execute_batch("COMMIT").unwrap();
+                drop(report);
+                assert!(
+                    gate.try_start().is_some(),
+                    "dropping returned settlement retained its gate"
+                );
+                continue;
+            }
+            if scenario == "drop" {
+                pending_ready
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                let pending = driver
+                    .take_pending_for_test(writer.id())
+                    .expect("missing retained settlement");
+                assert!(
+                    pending.candidate_task().is_some(),
+                    "prepared transaction was not retained"
+                );
+                assert!(
+                    gate.try_start().is_none(),
+                    "pending settlement lost its gate"
+                );
+                drop(pending);
+                assert!(
+                    gate.try_start().is_some(),
+                    "dropping settlement retained its gate"
+                );
+                pending_release.send(()).unwrap();
+                let _ = driver.shutdown_with_pending().unwrap();
+                continue;
+            }
+            if scenario == "conflict" {
+                assert_eq!(
+                    ready
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap(),
+                    1
+                );
+                assert!(gate.try_start().is_none(), "retry released its staged gate");
+                release.send(()).unwrap();
+            }
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            if scenario == "panic" {
+                while gate.try_start().is_none() {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "panic retained its start gate"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let _ = driver.shutdown_with_pending().unwrap();
+                continue;
+            }
+            loop {
+                if driver.get(writer.id()).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < until);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(gate.try_start().is_some(), "commit retained its gate");
+            driver.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn unrelated_scheduler_poison_stops_a_live_executor() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let (started, ready) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        let proceed = std::sync::Mutex::new(proceed);
+        let mut registry = Registry::default();
+        registry.register("poison-live", true, move |_: &Task| {
+            started.send(()).unwrap();
+            proceed
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            Ok(Step::Succeed(json!(null)))
+        });
+        let scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            cp("test"),
+            3,
+        )
+        .unwrap()
+        .registered("poison-live".into(), true);
+        scheduler.submit(&task).unwrap();
+        let poisoned = scheduler.poisoned.clone();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        poisoned.store(true, std::sync::atomic::Ordering::Release);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while driver.get(task.id()).is_ok() {
+            if std::time::Instant::now() >= until {
+                release.send(()).unwrap();
+                let _ = driver.shutdown_with_pending();
+                panic!("unrelated poison did not stop the live driver");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        release.send(()).unwrap();
+        let _ = driver.shutdown_with_pending().unwrap();
+    }
+
+    #[test]
     fn exhausted_notification_revision_conflicts_follow_replay_policy() {
         use crate::document::{Address, Documents, TaskDocuments};
         use crate::runtime::{
@@ -14866,6 +16580,161 @@ mod tests {
     }
 
     #[test]
+    fn scoped_abort_rediscovers_new_graph_before_commit() {
+        use crate::runtime::{Config, Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = Harness::open_paused(
+            dir.path().join("db"),
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let config = || Config {
+            model: "stub".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 20,
+        };
+        let first = harness.create_conversation(config()).unwrap();
+        let second = harness.create_conversation(config()).unwrap();
+        let scheduler = harness.attach_tasks(Registry::default()).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut running = task(2, TaskOwner::Task(parent.id()), "running", false, 3);
+        running.start().unwrap();
+        let mut failed = task(3, TaskOwner::Task(parent.id()), "failed", false, 3);
+        failed.start().unwrap();
+        failed.fail("failure".into()).unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&running),
+                Save::Create(&failed),
+            ])
+            .unwrap();
+        let owner = scheduler.owner();
+        let add_edge = |child| {
+            let edge = crate::ownership_edge::Edge {
+                task: running.id(),
+                task_owner: running.owner().clone(),
+                child,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let prepared = crate::ownership_edge::EdgeStore::new(owner.store())
+                .prepare_create(&edge)
+                .unwrap();
+            owner
+                .store()
+                .commit(&prepared.checks, &prepared.mutations)
+                .unwrap();
+        };
+        add_edge(first);
+        let initial = harness
+            .scoped_abort_graph(Some(running.id()), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(initial.contains(&first));
+        assert!(!initial.contains(&second));
+        add_edge(second);
+        let result = owner
+            .conversation_controls()
+            .try_fence_targets(&initial, || {
+                harness
+                    .scoped_abort_graph(Some(running.id()), None, Some(&initial), None)
+                    .map(|value| value.unwrap_or_default())
+            });
+        assert!(matches!(
+            result,
+            Err(durable_store::controls::FenceError::Commit(
+                crate::runtime::Error::TaskScheduler(Error::Busy)
+            ))
+        ));
+        assert!(
+            !scheduler
+                .ts()
+                .load(running.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(!harness.conversation(first).unwrap().abort_requested);
+        assert!(!harness.conversation(second).unwrap().abort_requested);
+        let targets = harness
+            .scoped_abort_graph(Some(running.id()), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(targets.contains(&first) && targets.contains(&second));
+        // A deleted edge may leave a conservative extra fence; the checked
+        // commit must not abort the detached conversation.
+        let key = crate::ownership_edge::edge_key(first);
+        let existing = owner.store().get(&key).unwrap().unwrap();
+        owner
+            .store()
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(existing.version),
+                }],
+                &[durable_store::Mutation::Delete { key }],
+            )
+            .unwrap();
+        let unrelated = harness.create_conversation(config()).unwrap();
+        let unrelated_control = owner.conversation_controls().get(unrelated);
+        let callback = unrelated_control.callback_start.try_start().unwrap();
+        let poll = unrelated_control.gate.lock().unwrap();
+        let result = owner
+            .conversation_controls()
+            .try_fence_targets(&targets, || {
+                harness
+                    .scoped_abort_graph(Some(running.id()), None, Some(&targets), None)
+                    .map(|v| v.unwrap_or_default())
+            })
+            .unwrap();
+        assert!(result.is_some());
+        assert!(
+            scheduler
+                .ts()
+                .load(running.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(!harness.conversation(first).unwrap().abort_requested);
+        assert!(harness.conversation(second).unwrap().abort_requested);
+        assert!(!harness.conversation(unrelated).unwrap().abort_requested);
+        drop(poll);
+        drop(callback);
+    }
+
+    #[test]
     fn checked_abort_rechecks_intent_under_task_gate() {
         use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
@@ -15013,7 +16882,7 @@ mod tests {
     #[test]
     fn deferred_nested_cleanup_marks_two_live_handlers_before_their_results() {
         use crate::document::{Address, Documents, TaskDocuments};
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         use std::sync::{Condvar, mpsc};
@@ -15062,7 +16931,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let harness = Harness::open_paused(
+        let mut harness = Harness::open_paused(
             dir.path().join("db"),
             Options {
                 model: Arc::new(Stub),
@@ -15073,6 +16942,13 @@ mod tests {
             },
         )
         .unwrap();
+        let nested = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 20,
+            })
+            .unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let mut registry = Registry::default();
@@ -15101,6 +16977,17 @@ mod tests {
             .ts()
             .save(&[Save::Create(&parent), Save::Create(&a), Save::Create(&b)])
             .unwrap();
+        let owner = scheduler.owner();
+        let edge = crate::ownership_edge::Edge {
+            task: a.id(),
+            task_owner: a.owner().clone(),
+            child: nested,
+            mode: crate::ownership_edge::Mode::Foreground,
+        };
+        let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+            .prepare_create(&edge)
+            .unwrap();
+        owner.store().commit(&edge.checks, &edge.mutations).unwrap();
         let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
         scheduler
             .ts()
@@ -15131,8 +17018,7 @@ mod tests {
                 task.hold_success(json!("parent"))
             })
             .unwrap();
-        let owner = scheduler.owner();
-        let control = owner.conversation_controls().get(Uuid::from_u128(99));
+        let control = owner.conversation_controls().get(nested);
         let poll = control.gate.lock().unwrap();
         let TickReservation::Maintenance(pending) = scheduler.try_reserve_tick(0).unwrap() else {
             panic!("maintenance")
@@ -15191,7 +17077,7 @@ mod tests {
 
     #[test]
     fn deferred_maintenance_rechecks_graph_and_allows_independent_progress() {
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         struct Stub;
@@ -15204,7 +17090,7 @@ mod tests {
         for kind in ["nested", "failed", "failfast"] {
             for stale in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
-                let harness = Harness::open_paused(
+                let mut harness = Harness::open_paused(
                     dir.path().join("db"),
                     Options {
                         model: Arc::new(Stub),
@@ -15215,6 +17101,13 @@ mod tests {
                     },
                 )
                 .unwrap();
+                let config = || Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                };
+                let nested_a = harness.create_conversation(config()).unwrap();
+                let nested_b = harness.create_conversation(config()).unwrap();
                 let mut registry = Registry::default();
                 registry.register("independent", false, |_: &Task| {
                     Ok(Step::Succeed(json!("independent")))
@@ -15261,6 +17154,19 @@ mod tests {
                         Save::Create(&generic),
                     ])
                     .unwrap();
+                let owner = scheduler.owner();
+                for (task, conversation) in [(&a, nested_a), (&b, nested_b)] {
+                    let edge = crate::ownership_edge::Edge {
+                        task: task.id(),
+                        task_owner: task.owner().clone(),
+                        child: conversation,
+                        mode: crate::ownership_edge::Mode::Foreground,
+                    };
+                    let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                        .prepare_create(&edge)
+                        .unwrap();
+                    owner.store().commit(&edge.checks, &edge.mutations).unwrap();
+                }
                 let parent_record = scheduler.ts().load(parent.id()).unwrap().unwrap();
                 scheduler
                     .ts()
@@ -15274,9 +17180,10 @@ mod tests {
                         ])),
                     })
                     .unwrap();
-                let owner = scheduler.owner();
-                let control = owner.conversation_controls().get(Uuid::from_u128(99));
-                let poll = control.gate.lock().unwrap();
+                let control_a = owner.conversation_controls().get(nested_a);
+                let control_b = owner.conversation_controls().get(nested_b);
+                let poll_a = control_a.gate.lock().unwrap();
+                let poll_b = control_b.gate.lock().unwrap();
                 let TickReservation::Maintenance(mut pending) =
                     scheduler.try_reserve_tick(0).unwrap()
                 else {
@@ -15332,7 +17239,8 @@ mod tests {
                         })
                         .unwrap();
                 }
-                drop(poll);
+                drop(poll_a);
+                drop(poll_b);
                 if !stale {
                     pending.independent = true;
                     assert!(
@@ -15372,7 +17280,11 @@ mod tests {
                     );
                     publication.test_set_published(a.id(), false);
                 }
-                assert!(pending.try_cleanup(&mut cleanup).unwrap());
+
+                assert!(
+                    pending.try_cleanup(&mut cleanup).unwrap(),
+                    "maintenance did not finish: {kind}, stale={stale}"
+                );
                 let a_marked = scheduler
                     .ts()
                     .load(a.id())
@@ -15422,7 +17334,7 @@ mod tests {
     #[test]
     fn pre_prepare_busy_returns_lease_and_independent_root_can_run() {
         use crate::document::{Address, Documents, TaskDocuments, Transaction};
-        use crate::runtime::{Harness, Options};
+        use crate::runtime::{Config, Harness, Options};
         use crate::task_store::{SignalResult, SignalToken};
         use async_trait::async_trait;
         use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
@@ -15488,7 +17400,7 @@ mod tests {
             "poison_prepared",
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let harness = Harness::open_paused(
+            let mut harness = Harness::open_paused(
                 dir.path().join("db"),
                 Options {
                     model: Arc::new(Stub),
@@ -15499,6 +17411,13 @@ mod tests {
                 },
             )
             .unwrap();
+            let nested = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
             let address = Address {
                 scope: "pending".into(),
                 name: "result".into(),
@@ -15557,14 +17476,24 @@ mod tests {
                     Save::Create(&receiver),
                 ])
                 .unwrap();
+            let owner = scheduler.owner();
+            let edge = crate::ownership_edge::Edge {
+                task: child.id(),
+                task_owner: child.owner().clone(),
+                child: nested,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let edge = crate::ownership_edge::EdgeStore::new(owner.store())
+                .prepare_create(&edge)
+                .unwrap();
+            owner.store().commit(&edge.checks, &edge.mutations).unwrap();
             let TickReservation::Invocation(child_invocation) = scheduler.reserve_tick(0).unwrap()
             else {
                 panic!("child")
             };
             assert_eq!(child_invocation.task_id(), child.id());
             let completed = child_invocation.execute().unwrap();
-            let owner = scheduler.owner();
-            let control = owner.conversation_controls().get(Uuid::from_u128(99));
+            let control = owner.conversation_controls().get(nested);
             let poll = control.gate.lock().unwrap();
             if timing.starts_with("prepare_conflict") || timing.starts_with("failure") {
                 let hook: CommitHook = Arc::new(move |attempt, store| {
@@ -15747,10 +17676,14 @@ mod tests {
                 assert_eq!(rewritten.task, current.task);
             }
             if timing.ends_with("_direct_abort") {
-                request_abort_subtree(&scheduler.ts(), child.id()).unwrap();
+                cleanup_worker
+                    .abort_owned_graph(None, Some(child.id()))
+                    .unwrap();
             }
             if timing.ends_with("_ancestor_abort") {
-                request_abort_subtree(&scheduler.ts(), parent.id()).unwrap();
+                cleanup_worker
+                    .abort_owned_graph(None, Some(parent.id()))
+                    .unwrap();
             }
             if timing.ends_with("_changed") {
                 let current = scheduler.ts().load(child.id()).unwrap().unwrap();
@@ -16725,6 +18658,7 @@ mod tests {
         } = b.execute().unwrap();
         let settlement = PreparedSettlement {
             attachment: second.attachment.clone(),
+            _start_leases: Vec::new(),
             transaction: crate::document::Transaction::new(),
             notifications: None,
             candidate: running.clone(),
@@ -16735,6 +18669,7 @@ mod tests {
             graph_version: 0,
             attempts: 0,
             commit_uncertain: false,
+            writer_busy: false,
         };
         let pending = PendingSettlement::Prepared { lease, settlement };
         assert!(matches!(
@@ -17236,6 +19171,7 @@ mod tests {
                         check_pending: true,
                         attempt: 0,
                         candidate: None,
+                        writer_busy: false,
                     };
                     scheduler.try_resume_pending(PendingSettlement::Failure { lease, settlement })
                 } else {
@@ -19117,6 +21053,7 @@ mod tests {
             check_pending: true,
             attempt: 0,
             candidate: None,
+            writer_busy: false,
         };
         let result = scheduler.commit_failure_settlement(&mut settlement, || {
             scheduler
@@ -19232,6 +21169,43 @@ mod tests {
             scheduler.get(root.id()).unwrap().unwrap().state(),
             &TaskState::Succeeded(json!("done"))
         );
+    }
+
+    #[test]
+    fn callback_marker_inserted_after_abort_scan_defers_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let ts = scheduler.ts();
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(100)),
+            "job",
+            true,
+            4,
+        );
+        ts.save(&[Save::Create(&root)]).unwrap();
+        let marker =
+            task_store::prepare_callback_start_task_fence(ts.store(), root.id(), b"claim").unwrap();
+        let mut injected = false;
+        let result = request_abort_subtree_with(&ts, root.id(), || {
+            if !injected {
+                ts.store()
+                    .commit(&marker.checks, &marker.mutations)
+                    .unwrap();
+                injected = true;
+            }
+        });
+        assert!(matches!(result, Err(Error::Busy)));
+        assert!(injected);
+        assert!(!ts.load(root.id()).unwrap().unwrap().task.abort_requested());
+        let finish =
+            task_store::prepare_callback_finish_task_fence(ts.store(), root.id(), b"claim")
+                .unwrap();
+        ts.store()
+            .commit(&finish.checks, &finish.mutations)
+            .unwrap();
+        request_abort_subtree(&ts, root.id()).unwrap();
+        assert!(ts.load(root.id()).unwrap().unwrap().task.abort_requested());
     }
 
     #[test]
@@ -21468,6 +23442,7 @@ mod tests {
                 .unwrap();
             let mut prepared = PreparedSettlement {
                 attachment: scheduler.attachment.clone(),
+                _start_leases: Vec::new(),
                 transaction,
                 notifications: None,
                 running: running.clone(),
@@ -21478,6 +23453,7 @@ mod tests {
                 graph_version: boundary,
                 attempts: 0,
                 commit_uncertain: false,
+                writer_busy: false,
             };
             let child = task(2, TaskOwner::Task(root.id()), "child", false, 3);
             scheduler.ts().save(&[Save::Create(&child)]).unwrap();
@@ -21604,6 +23580,7 @@ mod tests {
             .unwrap();
         let mut prepared = PreparedSettlement {
             attachment: scheduler.attachment.clone(),
+            _start_leases: Vec::new(),
             transaction,
             notifications: None,
             running,
@@ -21614,6 +23591,7 @@ mod tests {
             graph_version: owner.store().put_version().unwrap(),
             attempts: 0,
             commit_uncertain: false,
+            writer_busy: false,
         };
         assert!(
             matches!(prepared.revalidate(&scheduler, &owner, &gate).unwrap(), PreparedRevalidation::PendingAbort(id) if id == child.id())
@@ -28282,6 +30260,7 @@ mod conversation_cancel_claim_schema_tests {
             version: 1,
             claim: claim.clone(),
             result: "test".into(),
+            after_result: None,
         };
         assert!(validate_conversation_cancel_receipt(&receipt, &claim).is_ok());
         for index in 0..5 {
@@ -28298,7 +30277,27 @@ mod conversation_cancel_claim_schema_tests {
         let mut invalid = receipt.clone();
         invalid.version = 2;
         assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
+        let after = crate::async_task_tool::DurableTaskResult::Rich {
+            task_content_v1: crate::extension::ToolBlockResult {
+                output: vec![json!({"type":"text","text":"cancelled"})],
+                diagnostics: vec![crate::runtime::ToolDiagnostic {
+                    severity: crate::runtime::DiagnosticSeverity::Error,
+                    code: Some("aborted".into()),
+                    message: "Tool was aborted".into(),
+                }],
+                extra: [("isError".into(), json!(true))].into_iter().collect(),
+            },
+        };
+        invalid.result = "callback returned".into();
+        invalid.after_result = Some(serde_json::to_value(after).unwrap());
+        assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_ok());
+        let roundtrip: ConversationCancelReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert_eq!(roundtrip, invalid);
+        invalid.after_result = Some(json!({"forged":true}));
+        assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
         invalid.version = 1;
+        invalid.after_result = None;
         invalid.result = "x".repeat(65537);
         assert!(validate_conversation_cancel_receipt(&invalid, &claim).is_err());
     }

@@ -1,6 +1,97 @@
 # Conversation-owned external cancellation: integration notes
 
-Status: cancellation is not enabled. The scheduler defers conversation-owned
+## Opt-in first-poll dispatch
+
+`register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel`
+explicitly enables cancellation only for an unhooked, conversation-owned root
+with a confirmed park and no live owned children. The host identity must cover
+the Tool and cancel handler, and host updates must use its `IdentityHandle`.
+The original registration still does not dispatch callbacks and keeps its
+existing definition identity. Opting in changes the registered definition identity;
+previously parked tasks must retain their original registration and cannot be
+silently upgraded. Older claims lacking the claim-time conversation version fail
+closed and require reconciliation.
+
+The driver obtains a nonblocking target start lease before committing the
+identity-bound claim's conversation and task markers. It holds that lease
+through the callback's first poll, and releases it before subsequent polls.
+A successful callback receipt and exact marker retirement share one checked
+transaction. A callback error, panic, timeout or competing late Tool outcome
+is recorded as unknown and requires reconciliation; no subsequent attempt may
+redispatch the same claim. A process interruption recovers the original claim
+and matching markers into a reconciliation-required terminal task. The callback
+is bounded to 30 seconds and must cooperate with cancellation and avoid detached
+work. Direct Store writes outside the public mutation APIs are a trusted-host
+boundary. Nested cancel callbacks and woken cancellation remain unsupported by
+this opt-in.
+
+`register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel`
+records a selected-hook identity and a cancel identity in one definition. It
+does not enable callback dispatch. Aborting a parked call still requires
+reconciliation; in particular, this registration does not yet authorize the
+callback or run the conversation after hook on abort.
+
+`register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel`
+is a separate explicit opt-in for a conversation root with selected replay-safe
+hooks. Its definition identity differs from the registration-only form; hosts
+must retain the original registration for existing parked tasks. Abort cleanup
+waits for owned children before invoking the callback and fences unresolved
+unsafe descendant evidence at claim, receipt, settlement and publication. The selected after hook
+runs with the committed conversation snapshot and prepared arguments. It may
+not use memo storage during abort cleanup: attempting that, a hook error or a
+timeout, or a conflict saving the after result, retains a confirmed callback
+receipt when it can be safely committed and requires reconciliation for the
+incomplete after result. Hook output schemas on this
+abort path are not supported. Nested child callbacks and woken cancellation are
+not enabled by this registration. Result publication currently requires the
+root adapter in the Harness tool list; an extension-only tool is rejected before
+callback dispatch.
+
+The claim, start-marker and receipt transactions hold the selection gate
+from validation through commit. A per-name, nonblocking selection start lease
+is acquired before the claim and is wired to release after the callback's first
+poll. Selected registry updates return busy during that lease; updates to other
+names remain independent. The version 2 receipt contains both the confirmed
+callback result and bounded after output in one checked write; the terminal
+marker is committed with the task transition. The after hook's conversation
+snapshot version is checked in the receipt transaction. Conversation publication checks
+the claim, marker, receipt, park evidence and current identity. A process killed
+before or during the first poll remains unknown without another dispatch. A
+committed after receipt can be recovered after a process stop only when those
+checks still hold; a late pending outcome remains available for reconciliation.
+Version 1 receipts continue to represent callback-only evidence. Older runtimes
+that do not understand version 2 cannot safely publish its after result; keep
+the upgraded runtime or reconcile the task before downgrading.
+
+`DurableParkCancel::cancel_scoped` supplies an explicit callback scope. When a
+callback uses a joined Tokio task, it must pass the scope into that task and
+run its work through `scope.scope(...)`; task-local state is not inherited by
+`tokio::spawn`. This lets same-target retrying signal and abort operations reject
+self-wait. Without the scope, use a cancellation token or an explicit timeout
+for retrying operations, and join every spawned task before returning. The
+30-second callback timeout cannot preempt blocking work or join detached tasks.
+
+Conversation saves acquire a shared mutation lease and check the durable start
+marker in the same checked commit. A task-input admission moves that lease to
+its prepared settlement, retaining it through retries until commit or disposal.
+While a callback marker exists, the internal abort-cleanup reservation checks
+the original claim, attempt, owner, definition identity and both markers in one
+transaction. External cleanup work is deferred while the unsafe checkpointable
+root remains live. Direct writes to the store remain outside these API fences.
+
+If the store reports writer contention before a settlement transaction starts,
+driver shutdown returns the pending outcome and its lease for retry or
+reconciliation instead of waiting for the unrelated writer. This does not
+classify an indeterminate commit as uncommitted.
+
+The sections below describe the earlier stages; references to dispatch being
+disabled apply to those stages and to the original registration.
+
+## Historical design notes
+
+The remainder records the earlier, pre-dispatch design and its open questions.
+The opt-in status and limits above supersede statements below that dispatch is
+disabled. The scheduler defers conversation-owned
 interrupted wake or parked-abort recovery and its owned task graph until a
 Harness is bound; unrelated tasks continue. Binding triggers re-evaluation,
 which still uses the existing refusal for unsupported cancellation. Standalone cancel registrations must
@@ -48,6 +139,107 @@ attempt and running task version; the task and marker commit identities must
 match. Recovery remains limited to a failed, abort-marked unhooked root while
 the conversation retains its pending binding. It does not authorize callback
 dispatch or establish that a callback ran.
+
+The scheduled worker's Idle-to-ModelReady input placement now takes the
+callback-start gate without blocking. If it is busy, the uncommitted placement
+is discarded and the worker retries from durable state. Other save and direct
+Harness paths do not yet take this gate, so it does not authorize dispatch.
+
+The direct `Harness::reset` and `Harness::withdraw_submission` paths also try the gate before constructing or
+saving a reset, returning `TaskPublicationBusy` for the caller to retry. This
+is not an automatic retry. Other direct mutation APIs (input and write
+admission, session transactions, reset-with-blocks, abort and
+extension selection) and the general Harness save/commit paths have not been
+connected. Some of those compose task and document writes or use the blocking
+conversation fence; their lock ordering and retry owners still need separate
+verification before dispatch can be enabled.
+
+Mutation leases may overlap one another; the callback first-poll lease is
+exclusive against all of them. Durable transaction checks remain responsible
+for conflicts between concurrent mutations. This removes gate-induced Busy
+between ordinary mutations without authorizing callback dispatch.
+
+A nonblocking target-specific start lease can bracket exactly the first poll
+of a future without holding registry, task or poll mutexes. It is a primitive
+only: callback dispatch and most mutation paths do not yet use it. Existing
+`try_fence` still acquires all registered start gates and can defer unrelated
+graphs; blocking abort and signal delivery are not protected by this primitive.
+The task wake and signal revision must be checked before dispatch is enabled.
+
+Deferred task cleanup now discovers its foreground conversations, takes only
+those poll and start gates, and repeats graph discovery under the task gate
+before committing. A newly reached conversation causes a non-mutating retry;
+a removed edge permits a conservative extra fence. This applies only to the
+nonblocking task cleanup and settlement paths. Direct abort, signal delivery,
+and other blocking graph fences remain outside this change. The controls
+registry is still held through commit. These remaining boundaries must be
+addressed before the callback can be dispatched.
+
+Harness-mediated conversation signal delivery now takes the target mutation
+lease and checks its signal revision in the same transaction as the receipt.
+This excludes a callback first poll and allows independent conversations to
+progress. A durable signal-start marker protocol additionally makes public
+`Inbox` receipt writes and prepared wake commits check the absence of the
+marker in the same Store transaction, including writes from a separately opened
+Store. A marker-start candidate checks the conversation signal revision, and
+retirement checks the exact marker version and value. A marker surviving a
+crash blocks the target until reconciliation; it does not block another
+conversation. These helpers are not connected to callback dispatch and are
+not by themselves authorization to invoke it: the start transaction must also
+fence the claim, identity, task and task-signal revision, owner, abort, late
+outcome and selection. Public `Inbox` APIs must retain their returned checks;
+discarding them or writing directly through raw `Store` is outside the
+cooperating host trust boundary.
+A separate per-task durable marker protocol now fences the task record and
+signal revision at start, and makes public task signal delivery and task wake
+transactions check for marker absence. The scheduler leaves an affected waiting
+task parked and periodically retries after marker retirement. The start and
+retirement helpers still require the owning claim and graph checks; they are
+not connected to callback dispatch, and a root marker alone does not cover a
+nested task graph.
+
+Direct abort transactions now check marker absence for their discovered tasks
+and conversations; an existing marker makes abort return busy without writes,
+and a concurrent marker insertion forces transaction conflict and rescan.
+Deferred task cleanup retries this busy condition. The synchronous abort and
+signal APIs still expose busy to the caller. The async `abort_and_wait` paths,
+`Inbox::send_with_retry`, `Scheduler::send_signal_with_retry`, and the task
+`Driver` signal retry methods yield and retry marker busy; signal retries take
+cancellation tokens. Existing synchronous calls do not automatically retry.
+Generic public task save and update batches now also check marker absence;
+known pre-transaction conflicts defer reservation instead of poisoning the
+driver. The async `abort_and_wait` paths discover and fence only the reached
+conversation graph, repeat discovery under the task gate at commit, and yield
+and retry on busy. Explicit cancellation-token variants stop the wait; if
+cancellation occurs after the abort commit, it does not roll back that commit. The synchronous direct abort API still takes the legacy
+global poll fence; full graph marker coverage and the composed callback start
+transaction remain unconnected. Callback dispatch remains disabled until
+every boundary and retry path is complete.
+
+The pre-dispatch conversation cancel claim transaction checks the root task
+signal revision and conversation signal revision and stores a versioned sidecar
+with those observations. The separate start-marker transaction rechecks that
+sidecar, the live claim, attempt and identity lease, conversation and selection,
+park proof, late outcome, and child graph; it commits the conversation and task
+markers together. A public Inbox or task signal write after the claim makes the
+start transaction fail closed. Claims created by an older version without the
+sidecar require reconciliation and cannot create start markers.
+
+A test-only driver route exercises marker creation without polling a callback.
+An actual process-kill test reopens the Store and verifies that both markers
+remain equal and continue to block the corresponding Inbox and task signal.
+It does not establish callback execution or recovery after dispatch.
+
+The start markers are evidence and gate cooperating writes; they are not an
+execution claim. Their creation and retirement must not be used to dispatch or
+re-dispatch a callback. Callback dispatch and the at-most-once first-poll
+protocol remain disabled, and direct raw Store modifications remain outside
+the cooperating host trust boundary.
+
+The `Scheduler::schedule` worker also fences its ModelReady-to-ModelRunning
+save before model dispatch. Busy leaves the durable state unchanged and retries
+through the scheduled worker. This does not yet fence the general Harness save
+path, post-effect result saves, signal delivery, or blocking abort.
 
 A safe implementation needs all of the following before dispatch is enabled:
 

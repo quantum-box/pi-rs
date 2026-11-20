@@ -1057,6 +1057,7 @@ async fn public_abort_can_win_after_completion_or_placement_admission() {
             batch
                 .extend(PreparedConversationSave {
                     owner: scheduler.harness.owner.clone(),
+                    start_leases: Vec::new(),
                     checks,
                     mutations,
                 })
@@ -1430,6 +1431,7 @@ async fn staged_placement_loses_to_concurrent_conversation_commit() {
     batch
         .extend(PreparedConversationSave {
             owner,
+            start_leases: Vec::new(),
             checks,
             mutations,
         })

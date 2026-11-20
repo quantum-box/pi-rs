@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub(crate) const PREFIX: &[u8] = b"durable/task/";
+pub(crate) const CALLBACK_START_PREFIX: &[u8] = b"durable/task-callback-start/";
 const SIGNAL_PREFIX: &[u8] = b"durable/signal/";
 const SIGNAL_REVISION_PREFIX: &[u8] = b"durable/signal-revision/";
 const SUBMISSION_SETTLED_NAME: &str = "pi.submission-settled";
@@ -65,6 +66,8 @@ pub enum Error {
     SignalTargetNotFound,
     #[error("signal target is closed")]
     SignalTargetClosed,
+    #[error("callback start is temporarily fenced")]
+    CallbackStartBusy,
     #[error("invalid owner checkpoint key or child task")]
     InvalidOwnedBatch,
     #[error("task ownership cannot be changed")]
@@ -351,6 +354,29 @@ pub enum WakeResult {
     Woken { signal: Option<Signal> },
 }
 
+#[cfg(test)]
+type CallbackWakeHooks =
+    std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn callback_wake_hooks() -> &'static CallbackWakeHooks {
+    static HOOKS: std::sync::OnceLock<CallbackWakeHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_callback_wake_blocked(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    callback_wake_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+pub(crate) fn report_callback_wake_blocked(id: Uuid) {
+    let hook = callback_wake_hooks().lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub struct TaskStore<'a> {
     store: &'a Store,
 }
@@ -386,8 +412,22 @@ impl<'a> TaskStore<'a> {
     /// later writer, so it must not be used as proof of an exclusive reservation.
     pub fn save(&self, tasks: &[Save<'_>]) -> Result<(), Error> {
         let batch = self.prepare_save(tasks)?;
-        self.store.commit(&batch.checks, &batch.mutations)?;
-        Ok(())
+        match self.store.commit(&batch.checks, &batch.mutations) {
+            Ok(()) => Ok(()),
+            Err(error @ durable_store::Error::Conflict { .. }) => {
+                for save in tasks {
+                    let task = match save {
+                        Save::Create(task) => *task,
+                        Save::Update(stored) => &stored.task,
+                    };
+                    if self.store.get(&callback_start_key(task.id()))?.is_some() {
+                        return Err(Error::CallbackStartBusy);
+                    }
+                }
+                Err(error.into())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Prepare task writes for an atomic commit with other checked records.
@@ -439,6 +479,13 @@ impl<'a> TaskStore<'a> {
             if !seen.insert(key.clone()) {
                 return Err(Error::DuplicateTask);
             }
+            // An unconditional absence CAS keeps prepared task writes safe
+            // without introducing a pre-transaction error after a scheduler
+            // has marked an operation as indeterminate.
+            checks.push(Check {
+                key: callback_start_key(task.id()),
+                expected: Expected::Missing,
+            });
             checks.push(Check {
                 key: key.clone(),
                 expected,
@@ -690,6 +737,7 @@ impl<'a> TaskStore<'a> {
         let mut fresh = signal.clone();
         fresh.consumed = false;
         loop {
+            let callback_start = clear_callback_start_check(self.store, signal.task_id)?;
             let binding = self.foreground_binding_check(&fresh, None)?;
             if let Some(entry) = self.store.get(&k)? {
                 let old: Signal = serde_json::from_slice(&entry.value)?;
@@ -740,6 +788,7 @@ impl<'a> TaskStore<'a> {
                     // Validate the snapshot even for a no-op: the caller's ID
                     // may have been claimed while the key was being scanned.
                     let mut checks = vec![
+                        callback_start.clone(),
                         Check {
                             key: k.clone(),
                             expected: Expected::Missing,
@@ -765,6 +814,7 @@ impl<'a> TaskStore<'a> {
             }
             fresh.expired = fresh.typed_key().is_some_and(|key| matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if crate::runtime::wall_time_millis() >= *deadline && signals.contains(key)));
             let mut checks = vec![
+                callback_start,
                 Check {
                     key: revision_key,
                     expected: revision
@@ -906,6 +956,9 @@ impl<'a> TaskStore<'a> {
         if key_text.is_empty() {
             return Ok((SignalResult::Invalid, batch));
         }
+        batch
+            .checks
+            .push(clear_callback_start_check(self.store, task_id)?);
         let receipt_id = Uuid::new_v4();
         let mut signal = match Signal::new_typed(receipt_id, task_id, token, key_text, value) {
             Ok(signal) => signal,
@@ -1033,6 +1086,7 @@ impl<'a> TaskStore<'a> {
         now_millis: Option<i64>,
     ) -> Result<OwnedBatch, Error> {
         let snapshot = self.load(task_id)?.ok_or(Error::SignalTargetNotFound)?;
+        clear_callback_start_check(self.store, task_id)?;
         if snapshot.task.abort_requested() || snapshot.task.is_terminal() {
             return Err(Error::SignalTargetClosed);
         }
@@ -1308,10 +1362,22 @@ impl<'a> TaskStore<'a> {
             TaskState::Waiting(condition) => condition,
             _ => return Err(Error::NotWaiting),
         };
-        let mut checks = vec![Check {
-            key: key(snapshot.task.id()),
-            expected: Expected::Version(snapshot.version),
-        }];
+        let callback_start = match clear_callback_start_check(self.store, snapshot.task.id()) {
+            Ok(check) => check,
+            Err(Error::CallbackStartBusy) => {
+                #[cfg(test)]
+                report_callback_wake_blocked(snapshot.task.id());
+                return Ok(WakeResult::Pending);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut checks = vec![
+            callback_start,
+            Check {
+                key: key(snapshot.task.id()),
+                expected: Expected::Version(snapshot.version),
+            },
+        ];
         let mut mutations = Vec::new();
         let mut delivered = None;
         let mut ended_children = None;
@@ -1655,6 +1721,90 @@ fn signal_task_prefix(task_id: Uuid) -> Vec<u8> {
     key
 }
 
+pub(crate) fn callback_start_key(task_id: Uuid) -> Vec<u8> {
+    format!("durable/task-callback-start/{task_id}").into_bytes()
+}
+
+pub(crate) fn reentrant_callback(store: &Store, task: Uuid) -> Result<bool, Error> {
+    let Some(marker) = durable_store::controls::callback_marker_for_task(task) else {
+        return Ok(false);
+    };
+    Ok(store
+        .get(&callback_start_key(task))?
+        .is_some_and(|entry| entry.value == marker))
+}
+
+pub(crate) fn clear_callback_start_check(store: &Store, task_id: Uuid) -> Result<Check, Error> {
+    let key = callback_start_key(task_id);
+    if store.get(&key)?.is_some() {
+        return Err(Error::CallbackStartBusy);
+    }
+    Ok(Check {
+        key,
+        expected: Expected::Missing,
+    })
+}
+
+/// Only the task-signal portion of a callback-start transaction. The caller
+/// must atomically compose conversation, claim, owner, identity, abort, late
+/// outcome and graph checks; this batch alone never authorizes a callback.
+#[allow(dead_code)]
+pub(crate) fn prepare_callback_start_task_fence(
+    store: &Store,
+    task_id: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    if marker.is_empty() {
+        return Err(Error::InvalidKey);
+    }
+    let task = TaskStore::new(store)
+        .load(task_id)?
+        .ok_or(Error::SignalTargetNotFound)?;
+    let rev_key = signal_revision_key(task_id);
+    let revision = store.get(&rev_key)?;
+    Ok(OwnedBatch {
+        checks: vec![
+            Check {
+                key: key(task_id),
+                expected: Expected::Version(task.version),
+            },
+            Check {
+                key: callback_start_key(task_id),
+                expected: Expected::Missing,
+            },
+            Check {
+                key: rev_key,
+                expected: revision
+                    .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            },
+        ],
+        mutations: vec![Mutation::Put {
+            key: callback_start_key(task_id),
+            value: marker.to_vec(),
+        }],
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_callback_finish_task_fence(
+    store: &Store,
+    task_id: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    let key = callback_start_key(task_id);
+    let entry = store.get(&key)?.ok_or(Error::InvalidKey)?;
+    if marker.is_empty() || entry.value != marker {
+        return Err(Error::InvalidKey);
+    }
+    Ok(OwnedBatch {
+        checks: vec![Check {
+            key: key.clone(),
+            expected: Expected::Version(entry.version),
+        }],
+        mutations: vec![Mutation::Delete { key }],
+    })
+}
+
 pub(crate) fn signal_revision_key(task_id: Uuid) -> Vec<u8> {
     let mut key = SIGNAL_REVISION_PREFIX.to_vec();
     key.extend_from_slice(task_id.as_bytes());
@@ -1742,6 +1892,123 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn callback_start_fences_generic_task_save_and_update() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let target = task(1, 3);
+        let unrelated = task(2, 3);
+        ts.save(&[Save::Create(&target), Save::Create(&unrelated)])
+            .unwrap();
+        let mut candidate = ts.load(target.id()).unwrap().unwrap();
+        candidate.task.request_abort().unwrap();
+        let prepared = ts.prepare_save(&[Save::Update(&candidate)]).unwrap();
+        let start = prepare_callback_start_task_fence(&db, target.id(), b"claim").unwrap();
+        db.commit(&start.checks, &start.mutations).unwrap();
+        assert!(matches!(
+            db.commit(&prepared.checks, &prepared.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(matches!(
+            ts.update(&ts.load(target.id()).unwrap().unwrap(), |task| task
+                .request_abort()),
+            Err(Error::CallbackStartBusy)
+        ));
+        ts.update(&ts.load(unrelated.id()).unwrap().unwrap(), |task| {
+            task.request_abort()
+        })
+        .unwrap();
+        assert!(
+            !ts.load(target.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        let finish = prepare_callback_finish_task_fence(&db, target.id(), b"claim").unwrap();
+        db.commit(&finish.checks, &finish.mutations).unwrap();
+        ts.update(&ts.load(target.id()).unwrap().unwrap(), |task| {
+            task.request_abort()
+        })
+        .unwrap();
+        assert!(
+            ts.load(target.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+    }
+
+    #[test]
+    fn callback_start_fences_public_signal_and_wake_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Store::open(&path).unwrap();
+        let other = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&db);
+        let t = task(1, 3);
+        let unrelated = task(2, 3);
+        let token = SignalToken::new("answer", 1).unwrap();
+        ts.save(&[Save::Create(&t), Save::Create(&unrelated)])
+            .unwrap();
+        ts.reserve(&ts.load(t.id()).unwrap().unwrap()).unwrap();
+        ts.update(&ts.load(t.id()).unwrap().unwrap(), |task| {
+            task.wait(WaitFor::TypedSignal(token.key("k").unwrap()))
+        })
+        .unwrap();
+        let stale_start = prepare_callback_start_task_fence(&other, t.id(), b"claim-old").unwrap();
+        let legacy = Signal::new(Uuid::new_v4(), t.id(), "other".into(), json!(1));
+        ts.send_signal(&legacy).unwrap();
+        assert!(matches!(
+            other.commit(&stale_start.checks, &stale_start.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        let (_, prepared) = ts
+            .prepare_signal_at(t.id(), &token, "k", json!(2), || 0)
+            .unwrap();
+        let start = prepare_callback_start_task_fence(&other, t.id(), b"claim").unwrap();
+        other.commit(&start.checks, &start.mutations).unwrap();
+        assert!(matches!(
+            db.commit(&prepared.checks, &prepared.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(matches!(
+            ts.deliver_signal_at(t.id(), &token, "k", json!(2), 0),
+            Err(Error::CallbackStartBusy)
+        ));
+        assert!(matches!(
+            ts.send_signal(&Signal::new(Uuid::new_v4(), t.id(), "x".into(), json!(3))),
+            Err(Error::CallbackStartBusy)
+        ));
+        assert!(matches!(
+            ts.poll_wait(&ts.load(t.id()).unwrap().unwrap(), 0).unwrap(),
+            WakeResult::Pending
+        ));
+        ts.send_signal(&Signal::new(
+            Uuid::new_v4(),
+            unrelated.id(),
+            "other".into(),
+            json!(4),
+        ))
+        .unwrap();
+        assert!(matches!(
+            prepare_callback_finish_task_fence(&other, t.id(), b"other"),
+            Err(Error::InvalidKey)
+        ));
+        let finish = prepare_callback_finish_task_fence(&other, t.id(), b"claim").unwrap();
+        other.commit(&finish.checks, &finish.mutations).unwrap();
+        assert_eq!(
+            ts.deliver_signal_at(t.id(), &token, "k", json!(2), 0)
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        assert!(matches!(
+            ts.poll_wait(&ts.load(t.id()).unwrap().unwrap(), 0).unwrap(),
+            WakeResult::Woken { .. }
+        ));
     }
 
     #[test]

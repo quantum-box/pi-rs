@@ -1911,7 +1911,13 @@ async fn exercise_conversation_park_claim(replace_attempt: bool) {
             )
             .unwrap();
     }
-    scheduler.abort_task(root_id).unwrap();
+    let abort = scheduler.abort_task(root_id);
+    if let Err(error) = abort {
+        assert!(
+            replace_attempt && tasks.load(root_id).unwrap().unwrap().task.is_terminal(),
+            "abort failed before the changed-identity task became terminal: {error}"
+        );
+    }
     let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -1929,6 +1935,13 @@ async fn exercise_conversation_park_claim(replace_attempt: bool) {
         store.get(key.as_bytes()).unwrap().is_none(),
         replace_attempt
     );
+    if replace_attempt {
+        let state = tasks.load(root_id).unwrap().unwrap().task.state().clone();
+        assert!(
+            matches!(state, TaskState::Failed(_) | TaskState::Cancelled),
+            "changed identity must not succeed: {state:?}"
+        );
+    }
     if !replace_attempt {
         let entry = store.get(key.as_bytes()).unwrap().unwrap();
         let claim: Value = serde_json::from_slice(&entry.value).unwrap();

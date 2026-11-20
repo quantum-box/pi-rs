@@ -102,7 +102,35 @@ pub fn register_conversation_unsafe_durable_tool_with_park_cancel(
         children,
         None,
         false,
-        Some((cancel_identity.to_owned(), cancel)),
+        Some((cancel_identity.to_owned(), cancel, false)),
+    )
+}
+
+/// Explicitly enable at-most-once cancellation for a conversation-owned,
+/// unhooked unsafe root. An interrupted callback requires reconciliation.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _authorization: UnsafeDurableAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+        return Err("invalid cancel identity".into());
+    }
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        None,
+        false,
+        Some((cancel_identity.to_owned(), cancel, true)),
     )
 }
 
@@ -204,6 +232,112 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks(
         )),
         false,
         None,
+    )
+}
+
+/// Register selected replay-safe hooks and a parked-cancel identity together.
+/// This registration records the cancellation contract but does not dispatch
+/// the callback; interrupted cleanup remains subject to reconciliation.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _tool_authorization: UnsafeDurableAuthorization,
+    _hook_authorization: ReplaySafeConversationHooksAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    register_selected_unsafe_cancel_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        snapshot,
+        names,
+        cancel_identity,
+        cancel,
+        false,
+    )
+}
+
+/// Opt in a conversation root with selected replay-safe hooks to an at-most-once
+/// parked cancellation callback. If the callback or after hook is interrupted,
+/// reconciliation is required. Abort-time after hooks cannot use memo storage.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _tool_authorization: UnsafeDurableAuthorization,
+    _hook_authorization: ReplaySafeConversationHooksAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    register_selected_unsafe_cancel_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        snapshot,
+        names,
+        cancel_identity,
+        cancel,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn register_selected_unsafe_cancel_candidate(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    enabled: bool,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    if cancel_identity.is_empty() || cancel_identity.len() > 4096 {
+        return Err("invalid cancel identity".into());
+    }
+    let selection = snapshot
+        .stable_selection(names)
+        .ok_or("extension selection missing or unidentified")?;
+    if names.is_empty() || selection.hook_count() == 0 {
+        return Err("at least one selected hook is required".into());
+    }
+    let resolved = snapshot
+        .resolve_stable(names, &selection)
+        .ok_or("extension selection changed")?;
+    let registration = resolved
+        .registration_evidence()
+        .ok_or("invalid hook registration evidence")?;
+    replay_safe::register_conversation_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        Some((
+            selection,
+            registration,
+            Arc::new(SelectedBeforeHooks(resolved)),
+        )),
+        false,
+        Some((cancel_identity.to_owned(), cancel, enabled)),
     )
 }
 
@@ -670,6 +804,22 @@ pub trait DurableParkCancel: Send + Sync {
         checkpoint: serde_json::Value,
         context: pi_rs_core::ToolContext,
     ) -> Result<(), String>;
+
+    /// Conversation dispatch supplies a scope for joined child tasks. Pass it
+    /// to a spawned task and run the task's work through `scope.scope(...)` so
+    /// same-target control operations reject self-wait. Tokio does not inherit
+    /// task-local context automatically. Unscoped work must use a cancellation
+    /// token or an explicit timeout for any retrying control operation; all
+    /// spawned work must be joined before this callback returns.
+    async fn cancel_scoped(
+        &self,
+        arguments: serde_json::Value,
+        checkpoint: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+        _scope: durable_store::controls::CallbackScope,
+    ) -> Result<(), String> {
+        self.cancel(arguments, checkpoint, context).await
+    }
 }
 
 /// Callback execution evidence. Neither variant proves an external effect.
@@ -2440,8 +2590,41 @@ mod tests {
         assert!(scheduler.tick(0).unwrap());
         assert!(scheduler.tick(0).unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let child = crate::task_store::TaskStore::new(scheduler.owner().store())
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.task.checkpoint().phase == "sealed.execute.v1")
+            .expect("committed before-hook checkpoint")
+            .task
+            .id();
         drop(scheduler);
-        let driver = before_fixture_host(&path, tool, hook, "hook-v2").into_driver();
+        let scheduler = before_fixture_host(&path, tool, hook, "hook-v2").into_scheduler_for_test();
+        let owner = scheduler.owner();
+        let (failed, failure_ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        crate::task_driver::after_execute_failure_for_test(child, move || {
+            failed.send(()).unwrap();
+            proceed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        });
+        let (deferred, observed) = std::sync::mpsc::channel();
+        crate::task_driver::on_deferred_poison_for_test(&owner, move || {
+            deferred.send(()).unwrap();
+        });
+        let driver = crate::task_driver::Driver::start(scheduler);
+        failure_ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        observed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("coordinator did not encounter poisoned executor");
+        assert!(
+            driver.get(parent.id()).is_ok(),
+            "generic poison escaped before original failure"
+        );
+        release.send(()).unwrap();
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match driver.get(parent.id()) {
@@ -2449,7 +2632,8 @@ mod tests {
                     assert!(
                         error
                             .to_string()
-                            .contains("before-hook registration changed")
+                            .contains("before-hook registration changed"),
+                        "unexpected driver error: {error:?}"
                     );
                     break;
                 }
@@ -12635,14 +12819,23 @@ mod tests {
             );
             let effects = std::fs::read_to_string(root.join("ancestor-effects")).unwrap();
             let effects: Vec<_> = effects.lines().collect();
-            assert_eq!(
-                effects,
-                if abort_ancestor {
-                    vec!["initial", "resume"]
-                } else {
-                    vec!["initial", "resume", "resume"]
-                }
-            );
+            if !abort_ancestor && effects == ["initial", "resume"] {
+                assert!(
+                    matches!(ancestor.state(), crate::task::TaskState::Failed(reason)
+                    if reason == "document conflict: execution outcome requires reconciliation")
+                );
+            } else {
+                assert_eq!(
+                    effects,
+                    if abort_ancestor {
+                        vec!["initial", "resume"]
+                    } else {
+                        vec!["initial", "resume", "resume"]
+                    },
+                    "ancestor state: {:?}",
+                    ancestor.state()
+                );
+            }
         }
     }
 
