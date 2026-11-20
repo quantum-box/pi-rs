@@ -218,7 +218,8 @@ where
     }
     tokio::task::spawn_blocking(move || {
         let _chat_lock = chat_lock;
-        let _barrier = super::process::refresh_barrier()?;
+        let barrier = super::process::refresh_barrier()?;
+        let guard = super::process::guard_refresh_auth(barrier, guard);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -553,11 +554,12 @@ where
     tokio::task::spawn_blocking(move || {
         use std::sync::atomic::Ordering;
         let _chat_lock = chat_lock;
-        let Some(_barrier) =
+        let Some(barrier) =
             super::process::refresh_barrier_cancellable(|| state.load(Ordering::SeqCst) == 2)?
         else {
             return Err(Error::Cancelled);
         };
+        let guard = super::process::guard_refresh_auth(barrier, guard);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();

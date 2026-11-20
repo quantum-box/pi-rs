@@ -55,6 +55,32 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
+struct BoundedProcess {
+    child: Child,
+    master: Option<File>,
+}
+impl Drop for BoundedProcess {
+    fn drop(&mut self) {
+        drop(self.master.take());
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    if !std::thread::panicking() {
+                        panic!("terminal child did not exit after kill: {result:?}");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
     output_until_with_timeout(master, Duration::from_secs(10), predicate);
 }
@@ -168,7 +194,6 @@ fn initial_appearance_report_keeps_late_color_replies() {
         },
         0
     );
-    let mut master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
     let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
     assert_eq!(
@@ -185,27 +210,33 @@ fn initial_appearance_report_keeps_late_color_replies() {
             Ok(())
         });
     }
-    let _process = Process(
-        command
-            .current_dir(root.path())
-            .env("PI_RS_HOME", root.path().join("home"))
-            .env("TERM", "xterm-256color")
-            .env("COLORTERM", "truecolor")
-            .env_remove("NO_COLOR")
-            .args([
-                "--no-trust",
-                "--no-mcp",
-                "--offline",
-                "--use-theme",
-                "system",
-            ])
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
-            .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave))
-            .spawn()
-            .unwrap(),
-    );
-    output_until_with_timeout(&mut master, Duration::from_secs(30), |text| {
+    let child = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR")
+        .args([
+            "--no-trust",
+            "--no-mcp",
+            "--offline",
+            "--use-theme",
+            "system",
+        ])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    // The command retains copies of the slave descriptors. Drop them and let
+    // the PTY master close before the child guard waits, including on panic.
+    drop(command);
+    let mut process = BoundedProcess {
+        child,
+        master: Some(unsafe { File::from_raw_fd(master_fd) }),
+    };
+    let master = process.master.as_mut().unwrap();
+    output_until_with_timeout(master, Duration::from_secs(30), |text| {
         assert!(!text.contains("\x1b[38;2;"));
         text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
     });
@@ -231,7 +262,25 @@ fn initial_appearance_report_keeps_late_color_replies() {
         .unwrap();
     // Pi applies the accumulated late result when its query reaches DA1.
     master.write_all(b"\x1b[?1;2c").unwrap();
-    output_until(&mut master, |text| text.contains("\x1b[38;2;"));
+    output_until(master, |text| text.contains("\x1b[38;2;"));
+    master.write_all(b"\x04").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut drain = [0; 8192];
+        let _ = master.read(&mut drain);
+        if let Some(status) = process.child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "terminal child exited unsuccessfully: {status}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child failed to exit after Ctrl-D"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -401,6 +450,102 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
     output_until(&mut master, |text| {
         text.contains("automatic compaction is disabled")
     });
+}
+
+#[test]
+fn delayed_color_reply_does_not_type_tail_or_open_editor() {
+    use std::os::unix::fs::PermissionsExt;
+    fn wait_for(master: &mut File, expected: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        while Instant::now() < deadline {
+            match master.read(&mut buffer) {
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(error) => panic!("terminal read failed: {error}"),
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains(expected) {
+                return text.into_owned();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "terminal did not render {expected}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    let root = tempfile::tempdir().unwrap();
+    let editor = root.path().join("editor.sh");
+    let marker = root.path().join("editor-opened");
+    std::fs::write(&editor, b"#!/bin/sh\ntouch \"$PI_TEST_EDITOR_MARKER\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut process = BoundedProcess {
+        child: command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .env("EDITOR", &editor)
+            .env("PI_TEST_EDITOR_MARKER", &marker)
+            .env_remove("VISUAL")
+            .args(["--no-trust", "--no-mcp", "--offline"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+        master: Some(master),
+    };
+    let master = process.master.as_mut().unwrap();
+    wait_for(master, "Enter to send", Duration::from_secs(30));
+    master.write_all(b"\x1b]11;rgb:0000/").unwrap();
+    std::thread::sleep(Duration::from_millis(650));
+    master.write_all(b"0000/0000\x07typed-after-color").unwrap();
+    let text = wait_for(master, "typed-after-color", Duration::from_secs(10));
+    assert!(
+        !text.contains("0000/0000"),
+        "OSC tail reached the editor: {text}"
+    );
+    assert!(!marker.exists(), "OSC BEL opened the external editor");
 }
 
 #[test]
@@ -2593,6 +2738,227 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
         let _ = master.read(&mut output);
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn reload_preserves_broken_settings_in_restarted_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let skill = root.path().join("special/SKILL.md");
+    let previous = root.path().join("previous/SKILL.md");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+    std::fs::write(
+        &previous,
+        "---\nname: previous-fixture-skill\ndescription: previous-skill-description\n---\nbody",
+    )
+    .unwrap();
+    std::fs::write(
+        &skill,
+        "---\nname: special-fixture-skill\ndescription: unique-reload-skill-description\n---\nbody",
+    )
+    .unwrap();
+    let settings = home.join("settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::json!({"skills":[previous]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        br#"{"providers":{"ollama":{"models":[{"id":"test-fixture"}]}}}"#,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut requests = 0;
+        while Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            prepare_gate(&socket);
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut request = String::new();
+            if reader.read_line(&mut request).is_err() {
+                continue;
+            }
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if request.starts_with("GET ") {
+                let body = br#"{"data":[{"id":"test-fixture"}]}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                socket.write_all(body).unwrap();
+                continue;
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            sender
+                .send(String::from_utf8_lossy(&body).into_owned())
+                .unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+            requests += 1;
+            if requests == 2 {
+                return;
+            }
+        }
+    });
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--offline",
+                "--coding-tools",
+                "--provider",
+                "ollama",
+                "--model",
+                "test-fixture",
+                "--endpoint",
+                &endpoint,
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    fn wait_terminal(
+        master: &mut File,
+        label: &str,
+        initial: &str,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut output = initial.as_bytes().to_vec();
+        let mut buffer = [0; 8192];
+        loop {
+            match master.read(&mut buffer) {
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(error) => panic!("{label}: terminal read failed: {error}"),
+            }
+            let text = String::from_utf8_lossy(&output);
+            if predicate(&text) {
+                return text.into_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label}: timed out; terminal: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn wait_request(
+        master: &mut File,
+        receiver: &std::sync::mpsc::Receiver<String>,
+        label: &str,
+    ) -> (String, String) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut output = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            if let Ok(body) = receiver.try_recv() {
+                return (body, String::from_utf8_lossy(&output).into_owned());
+            }
+            match master.read(&mut buffer) {
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(error) => panic!("{label}: terminal read failed: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label}: timed out; terminal: {}",
+                String::from_utf8_lossy(&output)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    wait_terminal(&mut master, "startup", "", |text| {
+        text.contains("Enter to send")
+    });
+    std::fs::write(&settings, serde_json::json!({"skills":[skill]}).to_string()).unwrap();
+    master.write_all(b"first request\r").unwrap();
+    let (first, observed) = wait_request(&mut master, &receiver, "first request");
+    assert!(first.contains("unique-reload-skill-description"), "{first}");
+    let idle = |text: &str| {
+        let frame = text.rsplit("\x1b[?2026h").next().unwrap_or_default();
+        frame.contains("done") && frame.contains("\x1b[?2026l") && !frame.contains("Escで取消")
+    };
+    if !idle(&observed) {
+        wait_terminal(&mut master, "first response idle", &observed, idle);
+    }
+    std::fs::write(&settings, "{").unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    loop {
+        let output = wait_terminal(&mut master, "reload", "", |text| {
+            text.contains("Reloaded settings")
+                || text.contains("Wait for the shell command to finish")
+        });
+        if output.contains("Reloaded settings") {
+            break;
+        }
+        master.write_all(b"\r").unwrap();
+    }
+    master.write_all(b"hello\r").unwrap();
+    let (body, _) = wait_request(&mut master, &receiver, "second request");
+    assert!(body.contains("unique-reload-skill-description"), "{body}");
+    server.join().unwrap();
 }
 
 #[test]

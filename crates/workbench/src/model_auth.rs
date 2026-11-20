@@ -183,6 +183,13 @@ impl Keys {
             .into_iter()
             .flatten()
             .filter_map(|(name, entry)| {
+                // A pending Radius refresh is not an API key. Radius owns
+                // its recovery and presents it in the OAuth logout picker.
+                if name.eq_ignore_ascii_case("radius")
+                    && entry[super::radius_auth::REFRESH_PENDING].is_object()
+                {
+                    return None;
+                }
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";

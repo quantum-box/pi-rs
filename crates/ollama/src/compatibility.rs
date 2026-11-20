@@ -28,6 +28,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlay_merges_chat_template_arguments_by_key() {
+        let base: ChatCompatibility = serde_json::from_value(json!({
+            "chatTemplateArgs":{"enable_thinking":true,"shared":"base"}
+        }))
+        .unwrap();
+        let provider: ChatCompatibility = serde_json::from_value(json!({
+            "chatTemplateArgs":{"provider":1,"shared":"provider"}
+        }))
+        .unwrap();
+        let model: ChatCompatibility = serde_json::from_value(json!({
+            "chatTemplateArgs":{"model":2,"shared":"model"}
+        }))
+        .unwrap();
+        assert_eq!(
+            base.overlay(provider).overlay(model).chat_template_args,
+            json!({"enable_thinking":true,"provider":1,"model":2,"shared":"model"})
+                .as_object()
+                .cloned()
+        );
+    }
+
+    #[test]
     fn configured_thinking_budget_uses_selected_level_and_answer_room() {
         let provider: ChatCompatibility =
             serde_json::from_value(json!({"supportsThinkingTokenBudget":true})).unwrap();
@@ -181,8 +203,20 @@ enum ThinkingFormat {
 }
 
 impl ChatCompatibility {
+    /// Whether the configured model accepts the developer instruction role.
+    pub fn supports_developer_role(&self) -> Option<bool> {
+        self.supports_developer_role
+    }
+
     /// Model-specific values override the provider defaults field by field.
     pub fn overlay(self, model: Self) -> Self {
+        let chat_template_args = match (self.chat_template_args, model.chat_template_args) {
+            (Some(mut base), Some(newer)) => {
+                base.extend(newer);
+                Some(base)
+            }
+            (base, newer) => newer.or(base),
+        };
         Self {
             supports_store: model.supports_store.or(self.supports_store),
             supports_developer_role: model
@@ -205,7 +239,7 @@ impl ChatCompatibility {
             reasoning_field: model.reasoning_field.or(self.reasoning_field),
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),
-            chat_template_args: model.chat_template_args.or(self.chat_template_args),
+            chat_template_args,
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
             vllm_priority: model.vllm_priority.or(self.vllm_priority),
             supports_thinking_token_budget: model

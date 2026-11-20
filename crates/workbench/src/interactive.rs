@@ -591,6 +591,7 @@ enum LocalEditor {
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
+    AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -647,6 +648,7 @@ enum RemoteEvent {
     Notice(String),
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
+    AnthropicCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -1943,6 +1945,7 @@ impl View {
                 "Error › {}",
                 value["message"].as_str().unwrap_or_default()
             )),
+            Some("warning") => self.append(value["message"].as_str().unwrap_or_default()),
             Some("extension_error") => self.append(&format!(
                 "Extension {} ({}) · {}",
                 value["extension"].as_str().unwrap_or_default(),
@@ -3182,7 +3185,7 @@ fn slash(
             )?;
             drop(session);
             args.session = destination;
-            args.restore_session_model(&Session::open(&args.session)?);
+            args.restore_session_model(&Session::open(&args.session)?)?;
             view.restore(args)?;
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
@@ -3247,6 +3250,20 @@ fn slash(
         "/scoped-models" => {
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
+        }
+        "/login" if rest.eq_ignore_ascii_case("anthropic") => show_anthropic_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("anthropic browser") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::Browser,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic copy-code") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::CopyCode,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic api-key") => {
+            edit_provider_key(super::Provider::Anthropic, view)
         }
         "/login" if rest.eq_ignore_ascii_case("xai") => start_xai_login(view, &args.settings),
         "/login" if rest.eq_ignore_ascii_case("xai api-key") => {
@@ -3318,7 +3335,7 @@ fn slash(
                     .collect::<Vec<_>>();
                 if login
                     || radius_auth::Gateway::configured_with_settings(&args.settings)
-                        .and_then(|gateway| gateway.has_credential())
+                        .and_then(|gateway| gateway.has_stored_credential())
                         .unwrap_or(false)
                 {
                     items.push(Item {
@@ -3331,6 +3348,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "anthropic · Subscription OAuth".into(),
+                            selection: Selection::AnthropicMethods,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -3761,7 +3785,7 @@ fn slash(
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
             let mut session = Session::open(&args.session)?;
             session.checkout(id)?;
-            args.restore_session_model(&session);
+            args.restore_session_model(&session)?;
             drop(session);
             view.restore(args)?;
         }
@@ -4057,7 +4081,13 @@ pub(super) async fn run(
     {
         std::fs::create_dir_all(parent)?;
     }
+    let reported_settings = args.settings.diagnostics().to_vec();
     args = prepare_initial_session_async(args).await?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
@@ -4240,8 +4270,12 @@ pub(super) async fn run(
         if worker
             .as_ref()
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
+            && let Some(mut old) = worker.take()
         {
-            worker.take();
+            for warning in old.take_pending_warnings() {
+                view.append(&warning);
+                dirty = true;
+            }
         }
         if !is_busy(&worker)
             && let Some(pending) = &view.pending_thinking
@@ -4568,6 +4602,13 @@ pub(super) async fn run(
                     view.local_editor = Some((
                         LocalEditor::OpenRouterCode(Some(sender)),
                         crate::ui::dialog::Dialog::secret("OpenRouter code or redirect URL".into()),
+                    ));
+                    dirty = true;
+                }
+                Ok(RemoteEvent::AnthropicCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::AnthropicCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret("Anthropic code or redirect URL".into()),
                     ));
                     dirty = true;
                 }
@@ -5046,6 +5087,10 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
+                                LocalEditor::AnthropicCode(sender) => {
+                                    if let Some(sender) = sender.take() { let _ = sender.send(text); }
+                                    Ok(())
+                                }
                                 LocalEditor::BedrockChain => super::model_auth::save_bedrock_profile(None)
                                     .and_then(|()| super::model_auth::Keys::load())
                                     .map(|keys| { args.model_keys = keys; view.invalidate_model_catalog(); view.append("Using existing AWS credential chain for amazon-bedrock"); }),
@@ -5085,6 +5130,8 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
+                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                                interrupt_remote_task(&mut view);
                             }
                         }
                         None => view.local_editor = Some((editor, dialog)),
@@ -5818,7 +5865,10 @@ pub(super) async fn run(
                             view.ui_status.clear();
                             view.widgets.clear();
                             args.settings =
-                                crate::config::Settings::load(&args.workspace, args.trusted)?;
+                                args.settings.reload_latest(&args.workspace, args.trusted)?;
+                            for warning in args.settings.diagnostics() {
+                                view.append(warning);
+                            }
                             auth_reload =
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
@@ -6190,6 +6240,49 @@ fn show_radius_methods(view: &mut View) {
     ));
 }
 
+fn show_anthropic_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Sign in to Anthropic",
+        vec![
+            Item {
+                label: "Browser login".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::Browser),
+            },
+            Item {
+                label: "Copy code login (headless)".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::CopyCode),
+            },
+        ],
+    ));
+}
+
+fn start_anthropic_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::anthropic_auth::LoginMethod,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to Anthropic",
+        "Anthropic login cancelled",
+        move |sender| async move {
+            super::anthropic_auth::login(&settings, method, task_control, |url, manual| {
+                let _ = sender.send(RemoteEvent::Notice(format!(
+                    "Continue in your browser: {url}"
+                )));
+                let _ = sender.send(RemoteEvent::AnthropicCode(manual));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Anthropic".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_kimi_logout(view: &mut View) {
     view.remote_task = Some(RemoteTask::start(
         "Signing out of Kimi Code",
@@ -6371,6 +6464,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to Anthropic" {
+            "Anthropic sign-in is completing; waiting for the result"
         } else {
             "Meta sign-in is completing; waiting for the result"
         });
@@ -6380,7 +6475,13 @@ fn interrupt_remote_task(view: &mut View) {
 }
 
 fn clear_openrouter_editor(view: &mut View) {
-    if matches!(view.local_editor, Some((LocalEditor::OpenRouterCode(_), _))) {
+    if matches!(
+        view.local_editor,
+        Some((
+            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            _
+        ))
+    ) {
         view.local_editor = None;
     }
 }
@@ -6548,6 +6649,9 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
         });
     restore_workspace(args)?;
     view.restore(args)?;
+    for warning in args.settings.diagnostics() {
+        view.append(warning);
+    }
     if let Some(input) = input {
         view.editor.replace(input);
     }
@@ -7330,6 +7434,8 @@ fn select(
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
+        Selection::AnthropicMethods => show_anthropic_methods(view),
+        Selection::LoginAnthropic(method) => start_anthropic_login(view, &args.settings, method),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
         Selection::LoginChatGptNew => start_chatgpt_login(view, &args.settings, true, None),
         Selection::LoginChatGptAccount(id) => {
@@ -7482,7 +7588,10 @@ fn select(
             crate::config::save_trust(&args.workspace, decision)?;
             args.trusted = decision;
             args.trust_pending = false;
-            args.settings = crate::config::Settings::load(&args.workspace, decision)?;
+            args.settings = args.settings.reload_latest(&args.workspace, decision)?;
+            for warning in args.settings.diagnostics() {
+                view.append(warning);
+            }
             view.resources = super::resources::Resources::load(args)?;
             view.append(if decision {
                 "Project configuration trusted"
@@ -7571,6 +7680,7 @@ fn queued_transition_cancel(
 
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     next.session = path;
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
     if view.async_transitions {
@@ -7600,6 +7710,9 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
         initialize_session(&mut next)?;
     }
     view.restore(&next)?;
+    for warning in next.settings.diagnostics() {
+        view.append(warning);
+    }
     view.resources = resources;
     *args = next;
     if args.trust_pending {
@@ -7628,6 +7741,7 @@ pub(super) fn restore_workspace_cancellable(
 ) -> Result<()> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     std::thread::spawn(move || {
         let result = restore_workspace(&mut next).map(|()| next);
         let _ = sender.send(result);
@@ -7668,7 +7782,7 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     super::thinking::adjust(args);
     args.record_automatic_model_selection(&mut session)?;
     Ok(())
@@ -7696,9 +7810,9 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     )?;
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
-    args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
     args.refresh_workspace_selection();
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     drop(session);
     super::thinking::adjust(args);
     Ok(())

@@ -1689,6 +1689,60 @@ mod tests {
     }
 
     #[test]
+    fn missing_explicit_prompt_paths_do_not_hide_existing_templates() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("valid.md"), "available").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("missing-target.md", root.join("broken-link.md")).unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--no-skills", "--no-prompt-templates"]).unwrap();
+        args.workspace = root.to_owned();
+        args.prompt_template = vec![
+            "missing.md".into(),
+            "missing-directory".into(),
+            "broken-link.md".into(),
+            "missing-directory/../valid.md".into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.prompts["valid"].body, "available");
+        assert!(resources.warnings.is_empty(), "{:?}", resources.warnings);
+        std::fs::write(root.join("literal[1].md"), "literal").unwrap();
+        args.prompt_template = vec!["literal[1].md".into()];
+        assert_eq!(
+            Resources::load(&args).unwrap().prompts["literal[1]"].body,
+            "literal"
+        );
+        std::fs::create_dir(root.join("literal[dir]")).unwrap();
+        args.prompt_template = vec!["literal[dir]/../valid.md".into()];
+        #[cfg(windows)]
+        args.prompt_template
+            .insert(0, "literal[dir]/../missing.md".into());
+        assert_eq!(
+            Resources::load(&args).unwrap().prompts["valid"].body,
+            "available"
+        );
+        for pattern in [
+            "no-match-*.md",
+            "no-match-*/../valid.md",
+            "no-match-*/../.",
+            "[ab]/../valid.md",
+            "{a,b}/../.",
+            "missing/../*.md",
+        ] {
+            args.prompt_template = vec![pattern.into()];
+            assert!(
+                Resources::load(&args)
+                    .err()
+                    .unwrap_or_else(|| panic!("pattern {pattern:?} unexpectedly resolved"))
+                    .to_string()
+                    .contains("matched no files"),
+                "pattern {pattern:?} should not resolve"
+            );
+        }
+    }
+
+    #[test]
     fn discovered_prompt_precedes_explicit_prompt_with_same_name() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();

@@ -243,6 +243,9 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
     };
     args.trusted = super::config::project_trust(&args.workspace, explicit)?.unwrap_or(false);
     args.settings = super::config::Settings::load(&args.workspace, args.trusted)?;
+    for warning in args.settings.diagnostics() {
+        eprintln!("{warning}");
+    }
     if args.api_key.is_some() {
         return Err(Error::Config(
             "omit --api-key when resolving configured credentials".into(),

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use pi_rs::{Error, Event, Record, Result, Session};
 use serde_json::{Value, json};
 
-use super::rpc_messages::Projection;
+use super::rpc_messages::{MetadataSource, Projection};
 
 const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
@@ -28,6 +28,7 @@ struct Position {
 pub(super) struct Entries {
     values: Vec<Value>,
     leaf: Option<String>,
+    validation_error: Option<String>,
 }
 
 impl Entries {
@@ -73,7 +74,8 @@ impl Entries {
     }
 
     /// Whether Pi's compaction-aware, un-repaired projection has messages.
-    pub(super) fn has_session_context(&self) -> bool {
+    pub(super) fn has_session_context(&self) -> Result<bool> {
+        self.ensure_valid()?;
         let by_id: HashMap<_, _> = self
             .values
             .iter()
@@ -118,7 +120,7 @@ impl Entries {
                     .flatten()
             })
             .collect();
-        context.iter().any(|entry| {
+        Ok(context.iter().any(|entry| {
             let contributes = match entry["type"].as_str() {
                 Some("message" | "custom_message" | "compaction") => true,
                 Some("branch_summary") => entry["summary"]
@@ -132,23 +134,43 @@ impl Entries {
                     .and_then(|id| edits.get(id))
                     .copied()
                     .unwrap_or(false)
-        })
+        }))
     }
 
     pub(super) fn new(session: &Session) -> Self {
         let mut cursor = Cursor::default();
+        let counts = match session.validated_pi_conversion_counts() {
+            Ok(counts) => counts,
+            Err(error) => {
+                return Self {
+                    values: Vec::new(),
+                    leaf: None,
+                    validation_error: Some(error.to_string()),
+                };
+            }
+        };
+        cursor.set_verified_counts(&counts);
         let values = session
             .records()
             .iter()
-            .flat_map(|record| cursor.append(session.records(), record, Some(session), None))
+            .flat_map(|record| cursor.append(session.records(), record, Some(session), None, None))
             .collect();
         Self {
             values,
             leaf: wire_id(cursor.positions[session.head() as usize].visible),
+            validation_error: None,
+        }
+    }
+
+    pub(super) fn ensure_valid(&self) -> Result<()> {
+        match &self.validation_error {
+            Some(error) => Err(Error::Session(error.clone())),
+            None => Ok(()),
         }
     }
 
     pub(super) fn after(self, since: Option<&Value>) -> Result<Value> {
+        self.ensure_valid()?;
         let start = if let Some(since) = since {
             let id = since
                 .as_str()
@@ -192,6 +214,7 @@ impl Entries {
         context: Option<&super::sessions::ShareContext>,
         limit: usize,
     ) -> Result<Vec<u8>> {
+        self.ensure_valid()?;
         let by_id: HashMap<_, _> = self
             .values
             .iter()
@@ -388,6 +411,8 @@ pub(super) struct Cursor {
     positions: Vec<Position>,
     source_ids: HashMap<String, u64>,
     messages: Projection,
+    conversion_counts: HashMap<u64, u64>,
+    invalid: bool,
 }
 
 impl Default for Cursor {
@@ -396,18 +421,48 @@ impl Default for Cursor {
             positions: vec![Position::default()],
             source_ids: HashMap::new(),
             messages: Projection::default(),
+            conversion_counts: HashMap::new(),
+            invalid: false,
         }
     }
 }
 
 impl Cursor {
+    pub(super) fn set_verified_counts(&mut self, counts: &std::collections::BTreeMap<u64, u64>) {
+        self.conversion_counts = counts.iter().map(|(id, count)| (*id, *count)).collect();
+        self.invalid = false;
+    }
+    pub(super) fn set_verified_count(&mut self, id: u64, count: u64) {
+        self.conversion_counts.insert(id, count);
+        self.invalid = false;
+    }
+    pub(super) fn invalidate(&mut self) {
+        self.invalid = true;
+    }
+    pub(super) fn is_invalid(&self) -> bool {
+        self.invalid
+    }
+    pub(super) fn processed(&self) -> usize {
+        self.positions.len() - 1
+    }
     pub(super) fn advance(&mut self, records: &[Record]) {
+        if self.invalid {
+            return;
+        }
         for record in records.iter().skip(self.positions.len() - 1) {
-            self.append(records, record, None, None);
+            self.append(records, record, None, None, None);
         }
     }
 
-    pub(super) fn appended(&mut self, records: &[Record], metadata: Option<&Value>) -> Vec<Value> {
+    pub(super) fn appended(
+        &mut self,
+        records: &[Record],
+        metadata: Option<&Value>,
+        record_metadata: &std::collections::BTreeMap<u64, Value>,
+    ) -> Vec<Value> {
+        if self.invalid {
+            return Vec::new();
+        }
         let Some((record, prefix)) = records.split_last() else {
             return Vec::new();
         };
@@ -415,7 +470,7 @@ impl Cursor {
         if record.id as usize != self.positions.len() {
             return Vec::new();
         }
-        self.append(records, record, None, metadata)
+        self.append(records, record, None, metadata, Some(record_metadata))
     }
 
     fn append(
@@ -424,6 +479,7 @@ impl Cursor {
         record: &Record,
         session: Option<&Session>,
         live_metadata: Option<&Value>,
+        record_metadata: Option<&std::collections::BTreeMap<u64, Value>>,
     ) -> Vec<Value> {
         let mut entries = Vec::new();
         self.messages.record(record);
@@ -474,6 +530,10 @@ impl Cursor {
                 position.imported = None;
                 None
             }
+            Event::ModelFinished { .. } if pi_rs::is_aborted_turn_partial(records, record) => self
+                .messages
+                .aborted_partial(records, record)
+                .map(|message| json!({"type":"message", "message":message})),
             Event::CacheWarm {
                 metadata,
                 usage,
@@ -493,9 +553,14 @@ impl Cursor {
                 Some(entry)
             }
             // An imported source entry already includes the visible representation.
-            _ if parent
-                .imported
-                .is_some_and(|id| imported_conversion(records, id, record)) =>
+            _ if parent.imported.is_some_and(|id| {
+                let within_conversion = self
+                    .conversion_counts
+                    .get(&id)
+                    .copied()
+                    .is_none_or(|count| record.id > id && record.id - id <= count);
+                within_conversion && imported_conversion(records, id, record)
+            }) =>
             {
                 // A codemode source entry converts into both its original
                 // custom entry and a derived extension-state snapshot.
@@ -646,6 +711,7 @@ impl Cursor {
             Event::Compacted {
                 summary,
                 retain_from,
+                system_prompt,
                 ..
             } => {
                 let first = retain_from
@@ -655,6 +721,34 @@ impl Cursor {
                     "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
                     "tokensBefore":compaction_tokens(records, record, session)
                 });
+                if let Some(system) = system_prompt {
+                    let mut sections: Vec<Option<(String, Option<String>)>> = Vec::new();
+                    let mut section_indices = HashMap::new();
+                    for (name, value) in &system.sections {
+                        match (section_indices.get(name).copied(), value) {
+                            (Some(index), Some(value)) => {
+                                sections[index] = Some((name.clone(), Some(value.clone())))
+                            }
+                            (Some(index), None) => {
+                                sections[index] = None;
+                                section_indices.remove(name);
+                            }
+                            (None, Some(value)) => {
+                                section_indices.insert(name.clone(), sections.len());
+                                sections.push(Some((name.clone(), Some(value.clone()))));
+                            }
+                            (None, None) => {}
+                        }
+                    }
+                    let sections: Vec<_> = sections.into_iter().flatten().collect();
+                    entry["systemMessage"] = super::rpc_messages::system_value(
+                        record,
+                        &system.content,
+                        &sections,
+                        &system.tools,
+                        &[],
+                    );
+                }
                 if let Some(metadata) = live_metadata
                     .or_else(|| session.and_then(|session| session.record_metadata(record.id)))
                 {
@@ -739,7 +833,13 @@ impl Cursor {
             }
             _ => self
                 .messages
-                .raw_message(records, record)
+                .raw_message(
+                    records,
+                    record,
+                    session
+                        .map(MetadataSource::Session)
+                        .or_else(|| record_metadata.map(MetadataSource::Snapshot)),
+                )
                 .map(|message| json!({"type":"message","message":message})),
         };
         if let Some(entry) = entry {
@@ -819,17 +919,19 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
     )
 }
 
-pub(super) fn editable_record(session: &Session, id: u64) -> u64 {
+pub(super) fn editable_record(session: &Session, id: u64) -> Result<u64> {
+    let counts = session.validated_pi_conversion_counts()?;
     let Some(source) = session.records().get(id.saturating_sub(1) as usize) else {
-        return id;
+        return Ok(id);
     };
     let Event::SourceEntry { format, .. } = &source.event else {
-        return id;
+        return Ok(id);
     };
     if format != "pi" {
-        return id;
+        return Ok(id);
     }
-    session
+    let count = counts.get(&id).copied();
+    Ok(session
         .records()
         .iter()
         .skip(id as usize)
@@ -839,25 +941,27 @@ pub(super) fn editable_record(session: &Session, id: u64) -> u64 {
                 Event::SourceEntry { .. } | Event::Checkout { .. }
             ) && record.timestamp == source.timestamp
                 && record.run_id.is_none()
+                && count.is_none_or(|count| record.id - id <= count)
         })
         .find(|record| imported_conversion(session.records(), id, record))
-        .map_or(id, |record| record.id)
+        .map_or(id, |record| record.id))
 }
 
-pub(super) fn changes(session: &Session, previous: usize) -> Vec<Value> {
+pub(super) fn changes(session: &Session, previous: usize) -> Result<Vec<Value>> {
     let records = session.records();
     let Some((prefix, appended)) = records.split_at_checked(previous) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if appended.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut cursor = Cursor::default();
+    cursor.set_verified_counts(&session.validated_pi_conversion_counts()?);
     cursor.advance(prefix);
-    appended
+    Ok(appended
         .iter()
-        .flat_map(|record| cursor.append(records, record, Some(session), None))
-        .collect()
+        .flat_map(|record| cursor.append(records, record, Some(session), None, None))
+        .collect())
 }
 
 fn with_identity(mut entry: Value, id: &str, parent: Option<String>, record: &Record) -> Value {
@@ -892,6 +996,225 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn unsigned_anthropic_entries_and_share_preserve_layout_and_context() {
+        use super::*;
+        use pi_rs::{EnrichedModelEvent as E, ModelEvent};
+
+        struct Fixture;
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Fixture {
+            async fn stream(&self, _: pi_rs::ModelRequest) -> pi_rs::Result<pi_rs::ModelStream> {
+                unreachable!()
+            }
+
+            async fn stream_enriched_in_session_with_identity(
+                &self,
+                _: uuid::Uuid,
+                _: uuid::Uuid,
+                _: &str,
+                _: pi_rs::ModelRequest,
+            ) -> pi_rs::Result<pi_rs::EnrichedModelStream> {
+                let events = vec![
+                    E::Legacy(ModelEvent::Metadata(pi_rs::ModelMetadata {
+                        provider_api: Some(pi_rs::ModelApi::AnthropicMessages),
+                        ..Default::default()
+                    })),
+                    E::TextStart { index: 0 },
+                    E::TextDelta {
+                        index: 0,
+                        delta: "first".into(),
+                    },
+                    E::TextEnd {
+                        index: 0,
+                        content: "first".into(),
+                    },
+                    E::TextStart { index: 1 },
+                    E::TextDelta {
+                        index: 1,
+                        delta: "second".into(),
+                    },
+                    E::TextEnd {
+                        index: 1,
+                        content: "second".into(),
+                    },
+                    E::Legacy(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ];
+                Ok(Box::pin(futures_util::stream::iter(
+                    events.into_iter().map(Ok),
+                )))
+            }
+        }
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let registry = pi_rs::Registry::default();
+        let agent = pi_rs::Agent {
+            model: &Fixture,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+        agent
+            .run_with_events(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let finished = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::ModelFinished { .. }))
+            .unwrap()
+            .id;
+        let metadata = session.record_metadata(finished).unwrap().clone();
+        let before = session.conversation_at(session.head()).unwrap();
+        let entries = Entries::new(&session);
+        let projected = Entries::new(&session).after(None).unwrap();
+        let assistant = projected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["message"]["role"] == "assistant")
+            .unwrap();
+        let expected = json!([{"type":"text","text":"first"},{"type":"text","text":"second"}]);
+        assert_eq!(assistant["message"]["content"], expected);
+        let mut cursor = Cursor::default();
+        let mut completion_metadata = std::collections::BTreeMap::new();
+        let mut live_assistant = None;
+        for record in session.records() {
+            if let Some(metadata) = session.record_metadata(record.id) {
+                completion_metadata.insert(record.id, metadata.clone());
+            }
+            for entry in cursor.appended(
+                &session.records()[..record.id as usize],
+                session.record_metadata(record.id),
+                &completion_metadata,
+            ) {
+                if entry["message"]["role"] == "assistant" {
+                    live_assistant = Some(entry);
+                }
+            }
+        }
+        assert_eq!(live_assistant.as_ref(), Some(assistant));
+        let share = entries
+            .write_share_branch(&session, std::path::Path::new("."))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share.jsonl");
+        std::fs::write(&path, &share).unwrap();
+        let exported: Vec<Value> = share
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let shared = exported
+            .iter()
+            .find(|entry| entry["message"]["role"] == "assistant")
+            .unwrap();
+        assert_eq!(shared["message"], assistant["message"]);
+        let imported = super::super::session_import::read(&path).unwrap();
+        let (messages, _) = super::super::rpc_messages::snapshot(&imported);
+        let restored = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert_eq!(restored["content"], expected);
+        assert_eq!(imported.conversation_at(imported.head()).unwrap(), before);
+        assert_eq!(session.record_metadata(finished), Some(&metadata));
+        assert_eq!(session.conversation_at(session.head()).unwrap(), before);
+    }
+
+    #[test]
+    fn native_compaction_system_prompt_survives_pi_projection_and_import() {
+        use super::*;
+        let base = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let prompt = pi_rs::CompactedSystemPrompt {
+            content: "saved instructions".into(),
+            sections: vec![
+                ("first".into(), Some("old".into())),
+                ("rules".into(), Some("saved rules".into())),
+                ("first".into(), None),
+                ("first".into(), Some("new".into())),
+            ],
+            tools: vec![pi_rs::ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type":"object"}),
+            }],
+        };
+        let mut records = base.records().to_vec();
+        let id = records.len() as u64 + 1;
+        records.push(Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id,
+            parent: Some(id - 1),
+            event: Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: Some(Box::new(prompt.clone())),
+                retain_from: None,
+                tokens_before: Some(42),
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        });
+        let session = Session::from_records(records).unwrap();
+        let entries = Entries::new(&session).after(None).unwrap();
+        let projected = &entries["entries"][0]["systemMessage"];
+        assert_eq!(projected["role"], "system");
+        assert_eq!(
+            projected["sections"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["rules", "first"]
+        );
+        assert_eq!(projected["toolsAdded"][0]["name"], "read");
+        let share = Entries::new(&session)
+            .write_share_branch(&session, std::path::Path::new("."))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("share.jsonl");
+        std::fs::write(&path, share).unwrap();
+        let imported = super::super::session_import::read(&path).unwrap();
+        let restored = imported
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Compacted {
+                    system_prompt: Some(value),
+                    ..
+                } => Some(value.as_ref()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(restored.content, prompt.content);
+        assert_eq!(restored.tools, prompt.tools);
+        assert_eq!(
+            restored.sections,
+            [
+                ("rules".into(), Some("saved rules".into())),
+                ("first".into(), Some("new".into()))
+            ]
+        );
+        assert_eq!(
+            imported.effective_system_context("fallback", prompt.tools.clone()),
+            session.effective_system_context("fallback", prompt.tools.clone())
+        );
+    }
+
     #[test]
     fn live_compaction_entry_projects_supplied_metadata() {
         use super::*;
@@ -918,6 +1241,7 @@ mod tests {
         let entries = cursor.appended(
             &records,
             Some(&json!({"fromExtension":true,"details":{"origin":"hook"}})),
+            &Default::default(),
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["fromHook"], true);
@@ -926,8 +1250,206 @@ mod tests {
             json!({"fromExtension":true}),
             json!({"fromExtension":true,"details":null}),
         ] {
-            let entries = Cursor::default().appended(&records, Some(&metadata));
+            let entries =
+                Cursor::default().appended(&records, Some(&metadata), &Default::default());
             assert_eq!(entries[0].get("details"), metadata.get("details"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_aborted_partial_stays_out_of_next_model_request_after_import() {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+        struct Capture(Arc<Mutex<Vec<pi_rs::ModelRequest>>>);
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Capture {
+            async fn stream(
+                &self,
+                request: pi_rs::ModelRequest,
+            ) -> pi_rs::Result<pi_rs::ModelStream> {
+                self.0.lock().unwrap().push(request);
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(pi_rs::ModelEvent::Text("answer".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(pi_rs::Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        for edit in ["unchanged", "replace", "delete"] {
+            let mut original = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            original
+                .append_user_with_images("question".into(), vec![], None)
+                .unwrap();
+            let request_id = uuid::Uuid::new_v4();
+            let mut records = original.records().to_vec();
+            for event in [
+                Event::Assistant {
+                    content: "retained answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                },
+                Event::User {
+                    content: "pending question".into(),
+                    input_id: None,
+                },
+                Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 64,
+                    request_id: Some(request_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                },
+                Event::SourceEntry {
+                    format: "pi-rs:aborted-turn-partial".into(),
+                    entry: json!({"requestId":request_id}),
+                },
+                Event::ModelFinished {
+                    request_id,
+                    metadata: pi_rs::ModelMetadata::default(),
+                    usage: pi_rs::UsageReport::Unconfirmed,
+                    failure: Some(pi_rs::ModelFailure::Cancelled),
+                    partial: "partial sentinel".into(),
+                    reply: None,
+                },
+            ] {
+                let parent = records.last().unwrap();
+                records.push(Record {
+                    id: parent.id + 1,
+                    parent: Some(parent.id),
+                    version: parent.version,
+                    timestamp: None,
+                    run_id: None,
+                    event,
+                });
+            }
+            let mut original = Session::from_records(records).unwrap();
+            if edit != "unchanged" {
+                let target = original.head();
+                let replacement = (edit == "replace")
+                    .then(|| pi_rs::ContextContent::Text("edited sentinel".into()));
+                original.edit_context(target, replacement).unwrap();
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let body = Entries::new(&original)
+                .write_share_branch(&original, directory.path())
+                .unwrap();
+            let shared = directory.path().join("shared.jsonl");
+            std::fs::write(&shared, body).unwrap();
+            let mut imported = super::super::session_import::read(&shared).unwrap();
+            let visible = super::super::rpc_messages::snapshot(&imported).0;
+            let assistant = visible.iter().find(|message| {
+                message["role"] == "assistant" && message["stopReason"] == "aborted"
+            });
+            if edit == "delete" {
+                assert!(assistant.is_none());
+            } else {
+                let assistant = assistant.unwrap();
+                assert_eq!(assistant["stopReason"], "aborted");
+                assert_eq!(
+                    assistant["content"][0]["text"],
+                    if edit == "replace" {
+                        "edited sentinel"
+                    } else {
+                        "partial sentinel"
+                    }
+                );
+            }
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let model = Capture(captured.clone());
+            let mut registry = pi_rs::Registry::default();
+            registry
+                .register(Arc::new(pi_rs_review::ReviewContext))
+                .unwrap();
+            let agent = pi_rs::Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: pi_rs::Limits::default(),
+            };
+            let mut summary_session = Session::from_records(imported.records().to_vec()).unwrap();
+            agent
+                .summarize_branch(
+                    &mut summary_session,
+                    1,
+                    None,
+                    0,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            let summary_request = serde_json::to_string(&captured.lock().unwrap()[0]).unwrap();
+            assert!(summary_request.contains("question"));
+            assert!(summary_request.contains("retained answer"));
+            assert!(!summary_request.contains("partial sentinel"));
+            assert!(!summary_request.contains("edited sentinel"));
+            let mut review_parent = Session::from_records(imported.records().to_vec()).unwrap();
+            let mut review_child = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let review = pi_rs_review::Review {
+                task: "inspect",
+                from_record: None,
+                allowed_tools: Default::default(),
+                output_budget: 64,
+                timeout: std::time::Duration::from_secs(10),
+                resume: false,
+            };
+            review
+                .run(
+                    &agent,
+                    &mut review_parent,
+                    &mut review_child,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            let review_request = serde_json::to_string(&captured.lock().unwrap()[1]).unwrap();
+            assert!(review_request.contains("question"));
+            assert!(review_request.contains("retained answer"));
+            assert!(!review_request.contains("partial sentinel"));
+            assert!(!review_request.contains("edited sentinel"));
+            let mut resume_session = Session::from_records(imported.records().to_vec()).unwrap();
+            let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+            let resumed = agent
+                .run(
+                    &mut resume_session,
+                    None,
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(resumed, "answer");
+            let resume_request = serde_json::to_string(&captured.lock().unwrap()[2]).unwrap();
+            assert!(resume_request.contains("pending question"));
+            assert!(!resume_request.contains("partial sentinel"));
+            assert!(!resume_request.contains("edited sentinel"));
+            let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+            agent
+                .run(
+                    &mut imported,
+                    Some("next".into()),
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            let request = serde_json::to_string(&captured.lock().unwrap()[3]).unwrap();
+            assert!(!request.contains("partial sentinel"));
+            assert!(!request.contains("edited sentinel"));
         }
     }
 
@@ -1183,6 +1705,7 @@ mod tests {
                 json!({"id":"3","type":"message","message":{"role":"assistant","content":[]}}),
             ],
             leaf: Some("3".into()),
+            validation_error: None,
         };
         assert!(!entries.is_user_message(1));
         assert!(entries.is_user_message(2));
@@ -1308,7 +1831,12 @@ mod tests {
                 values
                     .push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
             }
-            let tree = Entries { values, leaf: None }.tree();
+            let tree = Entries {
+                values,
+                leaf: None,
+                validation_error: None,
+            }
+            .tree();
             let actual: Vec<_> = tree["tree"][0]["children"]
                 .as_array()
                 .unwrap()
@@ -1333,7 +1861,12 @@ mod tests {
             };
             values.push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
         }
-        let tree = Entries { values, leaf: None }.tree();
+        let tree = Entries {
+            values,
+            leaf: None,
+            validation_error: None,
+        }
+        .tree();
         let ids: Vec<_> = tree["tree"][0]["children"]
             .as_array()
             .unwrap()
@@ -1388,6 +1921,7 @@ mod tests {
                 json!({"id":"child","parentId":"orphan"}),
             ],
             leaf: Some("child".into()),
+            validation_error: None,
         };
         let tree = entries.tree();
         let roots = tree["tree"].as_array().unwrap();
@@ -1428,7 +1962,7 @@ mod tests {
         assert_eq!(tree["tree"][0]["children"][0]["label"], "bookmark");
         let target = entries[2]["id"].as_str().unwrap().parse().unwrap();
         assert!(matches!(
-            &session.records()[editable_record(&session, target) as usize - 1].event,
+            &session.records()[editable_record(&session, target).unwrap() as usize - 1].event,
             Event::User { content, .. } if content == "second branch"
         ));
         let share = Entries::new(&session)

@@ -2,6 +2,53 @@
 use std::path::Path;
 use std::process::Command;
 
+#[test]
+fn list_keeps_configured_entries_and_excludes_transient_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("agent");
+    let project = directory.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let source = "git:https://example.invalid/repo#v1";
+    let other = "git:https://example.invalid/other";
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"packages":[source, {"source":source,"prompts":[]}]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("settings.json"),
+        serde_json::json!({"packages":[source]}).to_string(),
+    )
+    .unwrap();
+    for (trust, expected) in [("--no-trust", 2), ("--trust", 3)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .args([trust, "-e", other, "list"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lines: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), expected);
+        assert!(lines.iter().all(|line| line["source"] == source));
+        assert_eq!(lines[0]["scope"], "user");
+        assert_eq!(lines[0]["filtered"], false);
+        assert_eq!(lines[1]["filtered"], true);
+        if expected == 3 {
+            assert_eq!(lines[2]["scope"], "project");
+        }
+    }
+}
+
 fn git(directory: &Path, args: &[&str]) -> String {
     let result = Command::new("git")
         .current_dir(directory)
@@ -396,8 +443,20 @@ fn invalid_remote_filters_follow_package_settings_order() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(lines[0]["source"], sources[1]);
-    assert_eq!(lines[1]["source"], sources[0]);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line["source"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![sources[1].as_str(), sources[0].as_str()]
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line["scope"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["user", "project"]
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(directory.path())
         .env("PI_RS_HOME", &home)
@@ -428,4 +487,110 @@ fn invalid_remote_filters_follow_package_settings_order() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("encoded"), "{stderr}");
+}
+
+#[test]
+fn project_delta_prepares_user_revision_when_cache_is_empty() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::create_dir(repo.join("prompts")).unwrap();
+    std::fs::write(repo.join("prompts/demo.md"), "fixture").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "fixture"]);
+    git(&repo, &["branch", "user-revision"]);
+    git(&repo, &["branch", "project-revision"]);
+    git(&repo, &["branch", "other-revision"]);
+    let home = directory.path().join("agent");
+    let project = directory.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let url = reqwest::Url::from_directory_path(&repo).unwrap();
+    let base = url.as_str().trim_end_matches('/');
+    let user = format!("git:{base}#user-revision");
+    let local = format!("git:{base}#project-revision");
+    let other = format!("git:{base}#other-revision");
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"packages":[{"source":user},{"source":other}]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(project.join("settings.json"), serde_json::json!({"packages":[{"source":local,"autoload":false,"prompts":["+prompts/demo.md"]}]}).to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("PI_OFFLINE")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("PI_RS_MODEL_TOKEN")
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--provider",
+            "google",
+            "--model",
+            "gemini-2.5-flash",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.join("packages/index.json"))
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr))),
+    )
+    .unwrap();
+    let sources: Vec<_> = index
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|entry| entry["source"].as_str())
+        .collect();
+    assert!(sources.contains(&user.as_str()), "{sources:?}");
+    assert!(!sources.contains(&local.as_str()), "{sources:?}");
+    assert!(sources.contains(&other.as_str()), "{sources:?}");
+
+    // A missing first revision must not prevent the next source from being prepared.
+    std::fs::remove_file(home.join("packages/index.json")).unwrap();
+    let missing = format!("git:{base}#missing-revision");
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"packages":[{"source":missing},{"source":other}]}).to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("PI_OFFLINE")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("PI_RS_MODEL_TOKEN")
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--provider",
+            "google",
+            "--model",
+            "gemini-2.5-flash",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.join("packages/index.json"))
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr))),
+    )
+    .unwrap();
+    let sources: Vec<_> = index
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|entry| entry["source"].as_str())
+        .collect();
+    assert!(sources.contains(&other.as_str()), "{sources:?}");
+    assert!(!sources.contains(&missing.as_str()), "{sources:?}");
 }
