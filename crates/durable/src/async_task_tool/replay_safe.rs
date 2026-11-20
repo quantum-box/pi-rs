@@ -1771,6 +1771,36 @@ impl Handler for Executor {
                 .as_ref()
                 .ok_or("missing cancel registration")?;
             let selection_start = admission.conversation_selection_start_lease(self)?;
+            #[cfg(test)]
+            if task.woken_interrupted_attempt().is_some()
+                && let Some(dir) = std::env::var_os("PI_TEST_WOKEN_START_DIR")
+            {
+                let claim = admission.record_conversation_woken_claim(
+                    self,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                let start = admission.conversation_callback_start_lease()?;
+                let marker = admission.record_woken_conversation_start_markers(
+                    self,
+                    &claim,
+                    &_identity_lease,
+                    expected,
+                    cancel.conversation_cancel_policy(),
+                )?;
+                std::fs::write(std::path::Path::new(&dir).join("woken-start.tmp"), &marker)
+                    .map_err(|e| e.to_string())?;
+                std::fs::rename(
+                    std::path::Path::new(&dir).join("woken-start.tmp"),
+                    std::path::Path::new(&dir).join("woken-start"),
+                )
+                .map_err(|e| e.to_string())?;
+                let _leases = (start, selection_start);
+                loop {
+                    std::thread::park();
+                }
+            }
             let _claim = admission
                 .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
             #[cfg(test)]
