@@ -5255,6 +5255,11 @@ impl Harness {
                 "duplicate checkpointable tool result".into(),
             ));
         }
+        // An aborted result is host-generated rather than the Tool's own
+        // structured output. Discard it even for older saved receipts.
+        if task.state() == &crate::task::TaskState::Cancelled {
+            result.extra.remove("structuredOutput");
+        }
         let attachments = result
             .extra
             .get("attachments")
@@ -5284,7 +5289,9 @@ impl Harness {
         // Unlike text authored by a hook, that projection is not an independent
         // output channel. Remove only the provable projection if the original
         // structured value violates the currently configured schema.
-        if let Some(schema) = c.tool_filters.output_schemas.get(&call.name) {
+        if let Some(schema) = c.tool_filters.output_schemas.get(&call.name)
+            && task.state() != &crate::task::TaskState::Cancelled
+        {
             if task.checkpoint().phase != "replay-safe-async-after" {
                 return Err(Error::Invalid("missing checkpointable raw result".into()));
             }
@@ -11785,26 +11792,6 @@ impl Harness {
         {
             return Err(Error::Invalid(
                 "selected cancel root must be a Harness tool".into(),
-            ));
-        }
-        if let Phase::TaskPending {
-            ref calls,
-            index,
-            ref identity,
-            ..
-        } = conversation.phase
-            && identity
-                .as_ref()
-                .is_some_and(crate::task_tool::Identity::has_conversation_hooks)
-            && calls.get(index).is_some_and(|call| {
-                conversation
-                    .tool_filters
-                    .output_schemas
-                    .contains_key(&call.name)
-            })
-        {
-            return Err(Error::Invalid(
-                "selected cancel after output schema is unsupported".into(),
             ));
         }
         let mut checks =

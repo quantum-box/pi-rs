@@ -43,8 +43,9 @@ claim, snapshot, and start markers. A failed memo operation, hook error or
 timeout, or a conflict saving the after result retains a confirmed callback
 receipt when it can be safely committed and requires reconciliation for the
 incomplete after result. A process interruption before the after result is saved
-still requires reconciliation; memo persistence does not authorize another callback. Hook output schemas on this
-abort path are not supported. Nested child callbacks and woken cancellation are
+still requires reconciliation; memo persistence does not authorize another callback. A configured output schema does not prevent this abort path; the host-generated
+abort result has no structured output. A hook that attempts to introduce structured
+output still fails closed. Nested child callbacks and woken cancellation are
 not enabled by this registration. Result publication currently requires the
 root adapter in the Harness tool list; an extension-only tool is rejected before
 callback dispatch. The abort hook currently receives a fresh `Tool was aborted`
