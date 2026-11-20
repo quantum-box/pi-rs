@@ -6128,6 +6128,27 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         assert!(known.after_result().is_some());
         assert!(known.has_snapshot_check());
         assert!(known.identity().is_some());
+        let store = durable_store::Store::open(&path).unwrap();
+        assert!(
+            store
+                .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                    root.task.id()
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(format!("durable/task-callback-start/{}", root.task.id()).as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(format!("runtime/conversation-callback-start/{conversation}").as_bytes())
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
         assert_eq!(after_calls.load(Ordering::SeqCst), 1);
         return;
