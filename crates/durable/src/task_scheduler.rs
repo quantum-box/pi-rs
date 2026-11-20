@@ -16766,6 +16766,9 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
     let mut checks = Vec::new();
     let mut leases = Vec::new();
     let mut unresolved = None;
+    // A terminal ancestor is usable only after its own evidence and identity
+    // lease have been retained for this same checked parent transaction.
+    let mut authenticated_ancestors = HashSet::new();
     while let Some(id) = pending.pop() {
         if !seen.insert(id) {
             return Err(Error::Ownership);
@@ -16801,8 +16804,12 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
                 continue;
             }
             if item.task.state() == &TaskState::Cancelled
-                && let Ok((conversation, binding_checks)) =
-                    harness.checkpointable_nested_cancel_result_checks(&item.task, registry)
+                && let Ok((conversation, binding_checks)) = harness
+                    .checkpointable_nested_cancel_result_checks_with_ancestors(
+                        &item.task,
+                        registry,
+                        &authenticated_ancestors,
+                    )
             {
                 match nested_cancel_terminal_checks(
                     store,
@@ -16824,6 +16831,7 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
                             checks.extend(binding_checks);
                             checks.extend(terminal_checks);
                             leases.push(lease);
+                            authenticated_ancestors.insert(item.task.id());
                             continue;
                         }
                     }
