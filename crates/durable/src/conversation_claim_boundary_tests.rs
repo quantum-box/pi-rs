@@ -553,6 +553,13 @@ async fn exercise_conversation_park_claim(case: &str) {
     .await
     .unwrap();
     if case == "dispatch_woken_claim" {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         gate.store(false, Ordering::SeqCst);
         std::future::pending::<()>().await;
         unreachable!();

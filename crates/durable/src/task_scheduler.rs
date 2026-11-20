@@ -3251,6 +3251,197 @@ impl AdmissionHandle<'_> {
         Ok(record)
     }
 
+    /// Prepare and commit a woken cleanup claim under the actual Harness,
+    /// identity and task leases. This is evidence only and does not dispatch.
+    /// Callers must retain both identity and selection leases until commit.
+    #[allow(dead_code)]
+    pub(crate) fn record_conversation_woken_claim(
+        &self,
+        handler: &dyn Handler,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        policy: crate::async_task_tool::ConversationCancelPolicy,
+    ) -> Result<WokenConversationCancelClaim, String> {
+        if identity_lease.as_deref() != Some(expected_identity)
+            || !self.abort
+            || self.standalone
+            || self.lease.retired
+        {
+            return Err("invalid conversation cleanup lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        // Selection must remain the one validated below until the claim commits.
+        // Follow the same task -> selection -> state order as the intent fence.
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale cleanup attempt or live child".into());
+        }
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation cancel registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
+        let (record, wake_checks) = prepare_woken_conversation_cancel_claim(
+            owner.store(),
+            &current.task,
+            self.lease.token,
+            policy,
+            boundary,
+        )?;
+        checks.extend(wake_checks);
+        let TaskOwner::Conversation(conversation) = current.task.owner() else {
+            return Err("conversation cancel root owner changed".into());
+        };
+        // Signal delivery may bypass the Harness gate. Fence both revisions in
+        // the claim transaction itself; this alone does not authorize callback
+        // dispatch after the claim commit.
+        let conversation_entry = owner
+            .store()
+            .get(&crate::runtime::Harness::key(*conversation))
+            .map_err(|e| e.to_string())?
+            .ok_or("missing claim conversation")?;
+        checks.push(durable_store::Check {
+            key: crate::runtime::Harness::key(*conversation),
+            expected: durable_store::Expected::Version(conversation_entry.version),
+        });
+        let conversation_revision = owner
+            .store()
+            .get(&crate::conversation_signal::revision(*conversation))
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.version);
+        let task_revision = owner
+            .store()
+            .get(&task_store::signal_revision_key(current.task.id()))
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.version);
+        for (key, version) in [
+            (
+                crate::conversation_signal::revision(*conversation),
+                conversation_revision,
+            ),
+            (
+                task_store::signal_revision_key(current.task.id()),
+                task_revision,
+            ),
+        ] {
+            checks.push(durable_store::Check {
+                key,
+                expected: version.map_or(
+                    durable_store::Expected::Missing,
+                    durable_store::Expected::Version,
+                ),
+            });
+        }
+        let key = woken_conversation_claim_key(current.task.id());
+        checks.push(durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        checks.push(durable_store::Check {
+            key: conversation_cancel_claim_key(current.task.id()),
+            expected: durable_store::Expected::Missing,
+        });
+        let signal_evidence_key = conversation_cancel_signal_evidence_key(current.task.id());
+        checks.push(durable_store::Check {
+            key: signal_evidence_key.clone(),
+            expected: durable_store::Expected::Missing,
+        });
+        let signal_evidence = ConversationCancelSignalEvidence {
+            version: 1,
+            claim_id: record.claim_id,
+            conversation: *conversation,
+            task: current.task.id(),
+            conversation_version: Some(conversation_entry.version),
+            conversation_revision,
+            task_revision,
+        };
+        let commit = owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &[
+                    durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                    },
+                    durable_store::Mutation::Put {
+                        key: signal_evidence_key,
+                        value: serde_json::to_vec(&signal_evidence).map_err(|e| e.to_string())?,
+                    },
+                ],
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string());
+        commit?;
+        Ok(record)
+    }
+
     /// Persist both signal-start markers against one live, identity-bound
     /// conversation cancellation claim. This transaction is evidence only:
     /// it does not grant callback execution or provide at-most-once dispatch.
@@ -3434,6 +3625,199 @@ impl AdmissionHandle<'_> {
         mutations.extend(task_start.mutations);
         #[cfg(test)]
         invoke_boundary(conversation_start_hooks(), current.task.id());
+        let result = owner
+            .store()
+            .commit_with_prefix_put_fence(
+                &checks,
+                &mutations,
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                boundary,
+            )
+            .map_err(|e| e.to_string());
+        result?;
+        Ok(marker)
+    }
+
+    /// Fence first poll against an exact persisted woken claim. This is not
+    /// yet called by dispatch: callback recovery and receipt remain unsupported.
+    #[allow(dead_code)]
+    pub(crate) fn record_woken_conversation_start_markers(
+        &self,
+        handler: &dyn Handler,
+        claim: &WokenConversationCancelClaim,
+        identity_lease: &crate::nested_identity::IdentityLease,
+        expected_identity: &str,
+        policy: crate::async_task_tool::ConversationCancelPolicy,
+    ) -> Result<Vec<u8>, String> {
+        if identity_lease.as_deref() != Some(expected_identity)
+            || !self.abort
+            || self.standalone
+            || self.lease.retired
+        {
+            return Err("invalid conversation start lease".into());
+        }
+        let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
+        let owner = &self.lease.attachment.owner;
+        let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let state = self.lease.state.lock().map_err(|e| e.to_string())?;
+        let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
+        let tasks = TaskStore::new(owner.store());
+        let current = tasks
+            .load(self.lease.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing task")?;
+        if state.poisoned
+            || state.handler_failed
+            || self
+                .lease
+                .scheduler_poison
+                .load(std::sync::atomic::Ordering::Acquire)
+            || state.leases.get(&self.lease.id) != Some(&(self.lease.token, Some(attempt)))
+            || !state.attempts.contains(&self.lease.id)
+            || current != *self.running
+            || current.task.state() != &TaskState::Running
+            || !current.task.abort_requested()
+            || current.task.replay_safe()
+            || has_live_owned(
+                owner.store(),
+                current.task.id(),
+                &tasks.list().map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            return Err("stale start attempt or live child".into());
+        }
+        let TaskOwner::Conversation(conversation) = current.task.owner() else {
+            return Err("start root owner changed".into());
+        };
+        let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+        let kind = current.task.kind().ok_or("missing definition")?;
+        let reg = definitions
+            .registry
+            .entries
+            .get(kind)
+            .ok_or("missing definition")?;
+        if reg.conversation_checkpointable.is_none()
+            || reg.replay_safe
+            || reg.version != current.task.definition_version()
+            || !std::ptr::addr_eq(reg.handler.as_ref(), handler)
+            || reg
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &reg.handler))
+        {
+            return Err("conversation start registration changed".into());
+        }
+        let mut checks = self
+            .validator
+            .ok_or("missing harness")?
+            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+            .map_err(|e| e.to_string())?;
+        let (uncertain, descendant_checks) = unsafe_descendant_reconciliation(
+            owner.store(),
+            current.task.id(),
+            &tasks.list().map_err(|e| e.to_string())?,
+            boundary,
+        )
+        .map_err(|e| e.to_string())?;
+        if uncertain.is_some() {
+            return Err("unsafe descendant requires reconciliation".into());
+        }
+        checks.extend(descendant_checks);
+        if claim.policy != policy {
+            return Err("woken start policy changed".into());
+        }
+        checks.extend(woken_conversation_claim_checks(
+            owner.store(),
+            &current.task,
+            claim,
+            self.lease.token,
+            boundary,
+        )?);
+        let evidence_key = conversation_cancel_signal_evidence_key(current.task.id());
+        let evidence_entry = owner
+            .store()
+            .get(&evidence_key)
+            .map_err(|e| e.to_string())?
+            .ok_or("legacy claim lacks signal evidence")?;
+        let evidence: ConversationCancelSignalEvidence =
+            serde_json::from_slice(&evidence_entry.value).map_err(|_| "invalid signal evidence")?;
+        if evidence.version != 1
+            || evidence.claim_id != claim.claim_id
+            || evidence.conversation != *conversation
+            || evidence.task != current.task.id()
+        {
+            return Err("conversation start signal evidence mismatch".into());
+        }
+        checks.push(durable_store::Check {
+            key: evidence_key,
+            expected: durable_store::Expected::Version(evidence_entry.version),
+        });
+        let claim_conversation_version = evidence
+            .conversation_version
+            .ok_or("legacy claim lacks conversation version")?;
+        checks.push(durable_store::Check {
+            key: crate::runtime::Harness::key(*conversation),
+            expected: durable_store::Expected::Version(claim_conversation_version),
+        });
+        for (key, revision) in [
+            (
+                crate::conversation_signal::revision(*conversation),
+                evidence.conversation_revision,
+            ),
+            (
+                task_store::signal_revision_key(current.task.id()),
+                evidence.task_revision,
+            ),
+        ] {
+            checks.push(durable_store::Check {
+                key,
+                expected: revision.map_or(
+                    durable_store::Expected::Missing,
+                    durable_store::Expected::Version,
+                ),
+            });
+        }
+        let marker = serde_json::to_vec(&serde_json::json!({
+            "version": 3,
+            "claim_id": claim.claim_id,
+            "task": claim.task,
+            "woken_attempt": claim.woken_attempt,
+            "attempt": claim.cleanup_attempt,
+            "lease": claim.cleanup_lease,
+            "policy": claim.policy,
+        }))
+        .map_err(|e| e.to_string())?;
+        let conversation_start = crate::conversation_signal::prepare_callback_start_signal_fence(
+            owner.store(),
+            *conversation,
+            &marker,
+        )
+        .map_err(|e| e.to_string())?;
+        let (ancestry, task_start) = task_store::prepare_callback_start_ancestry_fence(
+            owner.store(),
+            current.task.id(),
+            *conversation,
+            &marker,
+        )
+        .map_err(|e| e.to_string())?;
+        if ancestry.as_slice() != [current.task.id()] {
+            return Err("nested conversation cancel is not enabled".into());
+        }
+        checks.extend(conversation_start.checks);
+        checks.extend(task_start.checks);
+        let mut mutations = conversation_start.mutations;
+        mutations.extend(task_start.mutations);
         let result = owner
             .store()
             .commit_with_prefix_put_fence(
