@@ -15781,6 +15781,84 @@ impl Harness {
                     .map(str::to_owned)
                     .unwrap_or_else(|| value.to_string()),
             )),
+            // Woken cleanup may have a fenced supplemental after result, but
+            // it never makes the interrupted Tool outcome known.
+            crate::task::TaskState::Failed(reason)
+                if identity.is_checkpointable()
+                    && !identity.replay_safe
+                    && identity.has_conversation_hooks()
+                    && self
+                        .owner
+                        .store()
+                        .get(&crate::task_scheduler::woken_conversation_terminal_key(
+                            task,
+                        ))?
+                        .is_some() =>
+            {
+                let adapter = self
+                    .tools
+                    .get(identity.tool_name())
+                    .and_then(|registered| crate::task_tool::lookup(&registered.tool))
+                    .ok_or_else(|| Error::Invalid("woken cancel adapter missing".into()))?;
+                if adapter.identity().as_ref() != Some(identity)
+                    || !adapter.handler().conversation_woken_cancel_enabled()
+                {
+                    return Err(Error::Invalid("woken cancel adapter changed".into()));
+                }
+                let handler = adapter.handler();
+                cancel_identity = Some(
+                    handler
+                        .conversation_cleanup_identity_lease()
+                        .map_err(|_| Error::Invalid("woken cancel identity unavailable".into()))?,
+                );
+                let store = self.owner.store();
+                let boundary = store.put_version()?;
+                let (value, checks) =
+                    crate::task_scheduler::woken_terminal_after_checks(store, &child, boundary)
+                        .map_err(Error::Invalid)?;
+                let crate::async_task_tool::DurableTaskResult::Rich {
+                    task_content_v1: result,
+                } = serde_json::from_value(value)?
+                else {
+                    return Err(Error::Invalid("invalid woken after result".into()));
+                };
+                let descendants = crate::task_store::TaskStore::new(store)
+                    .list()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                let (uncertain, descendant_checks) =
+                    crate::task_scheduler::unsafe_descendant_reconciliation(
+                        store,
+                        task,
+                        &descendants,
+                        boundary,
+                    )
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                if uncertain.is_some() {
+                    return Err(Error::Invalid(
+                        "unsafe descendant requires reconciliation".into(),
+                    ));
+                }
+                // The eventual conversation save already checks this same key;
+                // avoid an overlapping prepared-save check while requiring the
+                // hook snapshot to match the currently loaded conversation.
+                let conversation_key = Self::key(conversation);
+                let current_version = store
+                    .get(&conversation_key)?
+                    .ok_or(Error::NotFound)?
+                    .version;
+                for check in checks {
+                    if check.key == conversation_key {
+                        if check.expected != Expected::Version(current_version) {
+                            return Err(Error::Invalid("woken hook snapshot changed".into()));
+                        }
+                    } else {
+                        result_evidence.push(check);
+                    }
+                }
+                result_evidence.extend(descendant_checks);
+                rich_result = Some(result);
+                Some(Outcome::Unknown(reason.clone()))
+            }
             // Generic task failures do not distinguish a handler-reported error
             // from an interrupted effect. Do not turn uncertainty into a known result.
             crate::task::TaskState::Failed(reason) => Some(Outcome::Unknown(reason.clone())),
@@ -16440,13 +16518,25 @@ impl Harness {
                         result,
                         &check.task,
                     )?;
-                    for i in index + 1..calls.len() {
-                        self.append_skipped_with_status(
-                            &mut c,
-                            &calls,
-                            i,
-                            "aborted before dispatch",
-                        )?;
+                    if let Outcome::Unknown(reason) = outcome {
+                        c.phase = Phase::Blocked {
+                            tool_panicked: false,
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            reason,
+                            arguments: Some(arguments),
+                        };
+                    } else {
+                        for i in index + 1..calls.len() {
+                            self.append_skipped_with_status(
+                                &mut c,
+                                &calls,
+                                i,
+                                "aborted before dispatch",
+                            )?;
+                        }
                     }
                 } else if let Outcome::Unknown(reason) = outcome {
                     c.phase = Phase::Blocked {
@@ -20361,16 +20451,36 @@ impl Harness {
                             &task_check.task,
                         )?;
                         c.pending_diagnostic_provenance = None;
-                        c.phase = Phase::Tools {
-                            turns,
-                            calls,
-                            index: index + 1,
+                        let blocked = if let Outcome::Unknown(ref reason) = outcome {
+                            Some(reason.clone())
+                        } else {
+                            None
+                        };
+                        c.phase = if let Some(reason) = blocked.as_ref() {
+                            Phase::Blocked {
+                                tool_panicked: false,
+                                turns,
+                                calls,
+                                index,
+                                operation_id,
+                                reason: reason.clone(),
+                                arguments: Some(arguments),
+                            }
+                        } else {
+                            Phase::Tools {
+                                turns,
+                                calls,
+                                index: index + 1,
+                            }
                         };
                         self.save_with_task_result_check(
                             &c,
                             Expected::Version(version),
                             task_check,
                         )?;
+                        if blocked.is_some() {
+                            return Ok(());
+                        }
                         continue;
                     }
                     c.phase = if let Outcome::Unknown(reason) = outcome {

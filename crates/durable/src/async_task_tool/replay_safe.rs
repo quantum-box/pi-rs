@@ -1771,7 +1771,6 @@ impl Handler for Executor {
         self._conversation_cancel
             .as_ref()
             .is_some_and(|(_, _, enabled, woken)| *enabled && *woken)
-            && !self.block_results
     }
     fn conversation_cleanup_identity_lease(
         &self,

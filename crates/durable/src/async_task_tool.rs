@@ -327,6 +327,39 @@ pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most
     )
 }
 
+/// Opt in an unsafe conversation root with selected replay-safe hooks to
+/// at-most-once cancellation after a parked or interrupted-woken execution.
+/// A woken Tool outcome remains uncertain even if cancellation and its after
+/// hook complete, and the conversation remains blocked for reconciliation.
+#[allow(clippy::too_many_arguments)]
+pub fn register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel(
+    registry: &mut crate::task_scheduler::Registry,
+    tool: Arc<dyn DurableAsyncTool>,
+    implementation: &str,
+    version: u32,
+    children: Vec<Arc<crate::task_tool::TaskTool>>,
+    snapshot: &crate::extension::Snapshot,
+    names: &[String],
+    cancel_identity: &str,
+    cancel: Arc<dyn DurableParkCancel>,
+    _tool_authorization: UnsafeDurableAuthorization,
+    _hook_authorization: ReplaySafeConversationHooksAuthorization,
+) -> Result<Arc<crate::task_tool::TaskTool>, String> {
+    register_selected_unsafe_woken_candidate(
+        registry,
+        tool,
+        implementation,
+        version,
+        children,
+        snapshot,
+        names,
+        cancel_identity,
+        cancel,
+        true,
+        true,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn register_selected_unsafe_cancel_candidate(
     registry: &mut crate::task_scheduler::Registry,

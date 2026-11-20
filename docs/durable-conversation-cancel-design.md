@@ -41,8 +41,16 @@ and park proof to claim, first poll and receipt; a late Tool result blocks
 receipt settlement and remains reconciliation evidence. The callback is polled
 at most once. A successful callback does not determine the interrupted Tool's
 outcome: the task fails for reconciliation and `abort_and_wait` can report
-pending cleanup. Roots with live owned work fail closed; child cancellation and
-selected hooks on this path are unsupported. After process loss recovery fails
+pending cleanup. Roots with live owned work fail closed; child cancellation remains unsupported.
+A separate `register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel`
+registration runs the replay-safe selected after hook with fenced memo and
+retains its rich result with the callback receipt and snapshot version. An
+atomic terminal marker binds it to the failed task. Publication rechecks the
+selected identity, snapshot, ownership, original wake and absence of late
+results; it appends the after output while retaining a Blocked conversation and
+the uncertain Tool outcome. A changed snapshot, selection or late result needs
+reconciliation. The current hook input uses the generic aborted diagnostic
+rather than upstream’s tool-specific interrupted diagnostic. After process loss recovery fails
 the original task for reconciliation and atomically retires only matching task
 and conversation start markers. Missing, incomplete or foreign marker pairs
 cannot authorize a new callback; the claim and any receipt remain available.
