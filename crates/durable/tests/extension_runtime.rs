@@ -2256,7 +2256,8 @@ async fn terminate_crash_worker() {
     std::fs::write(format!("{path}.release"), "").unwrap();
     for _ in 0..500 {
         if driver.get(child).unwrap().unwrap().is_terminal() {
-            std::fs::write(format!("{path}.ready"), id.to_string()).unwrap();
+            std::fs::write(format!("{path}.ready.tmp"), id.to_string()).unwrap();
+            std::fs::rename(format!("{path}.ready.tmp"), format!("{path}.ready")).unwrap();
             std::future::pending::<()>().await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
