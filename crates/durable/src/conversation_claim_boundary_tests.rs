@@ -230,6 +230,37 @@ impl DurableAsyncTool for AsyncTool {
         }
     }
 }
+struct MutableSpecTool {
+    inner: AsyncTool,
+    changed: Arc<std::sync::atomic::AtomicBool>,
+}
+#[async_trait]
+impl Tool for MutableSpecTool {
+    fn spec(&self) -> ToolSpec {
+        let mut spec = self.inner.spec();
+        if self.changed.load(std::sync::atomic::Ordering::SeqCst) {
+            spec.description = "updating".into();
+        }
+        spec
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        self.inner.invoke(args, context).await
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for MutableSpecTool {
+    async fn execute_durable(
+        &self,
+        args: Value,
+        context: ToolContext,
+        resume: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        self.inner
+            .execute_durable(args, context, resume, host)
+            .await
+    }
+}
 async fn exercise_conversation_park_claim(case: &str) {
     use pi_rs_durable::async_task_tool::{
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
@@ -612,12 +643,21 @@ async fn exercise_conversation_park_claim(case: &str) {
     } else {
         None
     };
-    let leaf_tool = Arc::new(AsyncTool {
+    let leaf_spec_changed = Arc::new(AtomicBool::new(false));
+    let leaf_base = AsyncTool {
         name: "leaf",
         child: multilevel.then_some("grandchild"),
         gate: if multilevel { None } else { Some(gate.clone()) },
         early: false,
-    });
+    };
+    let leaf_tool: Arc<dyn DurableAsyncTool> = if case == "nested_claim_actual_busy_spec" {
+        Arc::new(MutableSpecTool {
+            inner: leaf_base,
+            changed: leaf_spec_changed.clone(),
+        })
+    } else {
+        Arc::new(leaf_base)
+    };
     let leaf_identity_tool: Arc<dyn Tool> = leaf_tool.clone();
     let leaf_identity = if case.starts_with("nested_claim_") {
         Some(
@@ -637,7 +677,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
             crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
         )
-    } else if case == "nested_claim_success" || case == "nested_claim_success_late" || case == "nested_claim_parent" || case == "nested_claim_actual" || case == "nested_claim_actual_kill" || case == "nested_claim_actual_signal" || case == "nested_claim_actual_late" || case == "nested_claim_actual_busy" || case == "nested_claim_actual_selected_kill_parent" || case.starts_with("nested_claim_actual_deep") {
+    } else if case == "nested_claim_success" || case == "nested_claim_success_late" || case == "nested_claim_parent" || case == "nested_claim_actual" || case == "nested_claim_actual_kill" || case == "nested_claim_actual_signal" || case == "nested_claim_actual_late" || case.starts_with("nested_claim_actual_busy") || case == "nested_claim_actual_selected_kill_parent" || case.starts_with("nested_claim_actual_deep") {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
             &mut registry, leaf_tool, "leaf", 1, grandchild.clone().into_iter().collect(), "cancel-v1",
             Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), leaf_identity.clone().unwrap(), callback_scheduler.clone())),
@@ -699,7 +739,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
         )
-    } else if case.starts_with("dispatch_") || case == "nested_claim_parent" || case == "nested_claim_actual" || case == "nested_claim_actual_busy" || case == "nested_claim_actual_selected_kill_parent" || case.starts_with("nested_claim_actual_deep") {
+    } else if case.starts_with("dispatch_") || case == "nested_claim_parent" || case == "nested_claim_actual" || case.starts_with("nested_claim_actual_busy") || case == "nested_claim_actual_selected_kill_parent" || case.starts_with("nested_claim_actual_deep") {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
             &mut registry, root_tool, "root", 1, vec![leaf.clone()], "cancel-v1",
             Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
@@ -788,15 +828,17 @@ async fn exercise_conversation_park_claim(case: &str) {
             && case != "nested_claim_actual_kill"
             && case != "nested_claim_actual_signal"
             && case != "nested_claim_actual_late"
-            && case != "nested_claim_actual_busy"
+            && !case.starts_with("nested_claim_actual_busy")
             && !case.starts_with("nested_claim_actual_deep")
         {
             crate::task_scheduler::enable_test_nested_claim(child_id);
         }
         let (busy_tx, busy_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        if case == "nested_claim_actual_busy" {
+        if case.starts_with("nested_claim_actual_busy") {
             let identity = leaf_identity.as_ref().unwrap().clone();
+            let changed = leaf_spec_changed.clone();
+            let change_spec = case == "nested_claim_actual_busy_spec";
             crate::task_scheduler::on_nested_preflight_for_test(root_id, move || {
                 let (held_tx, held_rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
@@ -804,9 +846,15 @@ async fn exercise_conversation_park_claim(case: &str) {
                         .build()
                         .unwrap();
                     rt.block_on(identity.update(Some("leaf-backend".into()), || {
+                        if change_spec {
+                            changed.store(true, Ordering::SeqCst);
+                        }
                         held_tx.send(()).unwrap();
                         busy_tx.send(()).unwrap();
                         release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        if change_spec {
+                            changed.store(false, Ordering::SeqCst);
+                        }
                     }))
                     .unwrap();
                 });
@@ -1076,7 +1124,7 @@ async fn exercise_conversation_park_claim(case: &str) {
             || case == "nested_claim_actual"
             || case == "nested_claim_actual_selected"
             || case == "nested_claim_actual_selected_kill_parent"
-            || case == "nested_claim_actual_busy"
+            || case.starts_with("nested_claim_actual_busy")
             || case.starts_with("nested_claim_actual_deep")
         {
             scheduler.abort_task(root_id).unwrap();
@@ -1167,6 +1215,7 @@ async fn exercise_conversation_park_claim(case: &str) {
                 | "nested_claim_actual_selected"
                 | "nested_claim_actual_selected_kill_parent"
                 | "nested_claim_actual_busy"
+                | "nested_claim_actual_busy_spec"
                 | "nested_claim_actual_deep"
                 | "nested_claim_actual_deep_tamper"
                 | "nested_claim_actual_deep_late_tamper"
@@ -1182,10 +1231,10 @@ async fn exercise_conversation_park_claim(case: &str) {
             || case == "nested_claim_actual"
             || case == "nested_claim_actual_selected"
             || case == "nested_claim_actual_selected_kill_parent"
-            || case == "nested_claim_actual_busy"
+            || case.starts_with("nested_claim_actual_busy")
             || case.starts_with("nested_claim_actual_deep")
         {
-            if case == "nested_claim_actual_busy" {
+            if case.starts_with("nested_claim_actual_busy") {
                 busy_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 assert_eq!(
@@ -6988,6 +7037,11 @@ async fn exercise_nested_parent_receipt_recovery(mode: &str, child_cut: bool) {
     );
     let _ = driver.shutdown_with_pending().unwrap();
     let _ = scheduler.shutdown().await;
+}
+
+#[tokio::test]
+async fn nested_busy_identity_defers_even_during_spec_change() {
+    exercise_conversation_park_claim("nested_claim_actual_busy_spec").await;
 }
 
 #[tokio::test]
