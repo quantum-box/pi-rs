@@ -12202,8 +12202,8 @@ impl Harness {
         }
     }
     /// Provisional evidence for a drained owned graph containing only
-    /// replay-safe work across conversation edges. This is not authorization:
-    /// it cannot detect a raw child create/delete ABA after the graph mark.
+    /// replay-safe work across conversation edges. The scoped structural
+    /// revision is required to detect graph changes after the mark.
     /// Unsafe owned-conversation descendants also require separate terminal
     /// and identity authentication. Do not use this for callback dispatch.
     #[allow(dead_code)]

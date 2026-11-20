@@ -173,7 +173,24 @@ pub(crate) fn affected(
                 _ => true,
             }
         } else if key.starts_with(CONVERSATION) {
-            read(tx, key, None)?.is_some() != next.is_some()
+            let old = read(tx, key, None)?;
+            match (old.as_deref(), next) {
+                (Some(old), Some(next)) => {
+                    let id = std::str::from_utf8(&key[CONVERSATION.len()..])
+                        .ok()
+                        .and_then(|id| Uuid::parse_str(id).ok());
+                    let valid = |value: &[u8]| {
+                        serde_json::from_slice::<serde_json::Value>(value)
+                            .ok()
+                            .and_then(|value| uuid_field(&value, "id"))
+                            .filter(|actual| Some(*actual) == id)
+                            .is_some()
+                    };
+                    !valid(old) || !valid(next)
+                }
+                (None, None) => false,
+                _ => true,
+            }
         } else {
             false
         };
@@ -532,6 +549,31 @@ mod tests {
             .unwrap();
         assert_ne!(version(&store, &task_revision(a)), av2);
         assert_eq!(version(&store, &task_revision(b)), Some(bv));
+    }
+
+    #[test]
+    fn corrupt_conversation_identity_and_restore_advance_structure() {
+        let store = Store::memory().unwrap();
+        let id = next_uuid();
+        let key = format!("runtime/conversation/{id}").into_bytes();
+        let value = serde_json::to_vec(&json!({"id": id, "state": "ready"})).unwrap();
+        store
+            .commit(&[], &[put(key.clone(), value.clone())])
+            .unwrap();
+        // Use the public revision key shape rather than assuming a graph owner.
+        let revision = [
+            STRUCTURE,
+            conversation_revision(id).strip_prefix(REVISION).unwrap(),
+        ]
+        .concat();
+        let before = version(&store, &revision);
+        store
+            .commit(&[], &[put(key.clone(), b"invalid".to_vec())])
+            .unwrap();
+        let corrupt = version(&store, &revision);
+        assert_ne!(before, corrupt);
+        store.commit(&[], &[put(key, value)]).unwrap();
+        assert_ne!(corrupt, version(&store, &revision));
     }
 
     #[test]
