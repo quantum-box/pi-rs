@@ -345,6 +345,33 @@ async fn exercise_conversation_park_claim(case: &str) {
     let gate = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
     let callback_scheduler = Arc::new(std::sync::Mutex::new(None));
+    let selected = matches!(
+        case,
+        "selection_hook_fence" | "selection_hook_test_dispatch"
+    );
+    let mut extensions = crate::extension::Registry::default();
+    if selected {
+        struct PassHook;
+        #[async_trait]
+        impl crate::extension::Hook for PassHook {}
+        extensions
+            .install_identified(
+                crate::extension::Extension {
+                    name: "policy".into(),
+                    hooks: vec![Arc::new(PassHook)],
+                    ..Default::default()
+                },
+                crate::extension::ExtensionIdentity::new(
+                    1,
+                    "policy-v1".into(),
+                    vec!["hook-v1".into()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    let snapshot = extensions.snapshot();
+    let selection_names = vec!["policy".to_owned()];
     let mut registry = Registry::default();
     registry.register(
         "independent-maintenance",
@@ -353,19 +380,25 @@ async fn exercise_conversation_park_claim(case: &str) {
             Ok(pi_rs_durable::task_scheduler::Step::Succeed(json!("done")))
         },
     );
-    let leaf = register_conversation_replay_safe_durable_tool(
-        &mut registry,
-        Arc::new(AsyncTool {
-            name: "leaf",
-            child: None,
-            gate: Some(gate),
-            early: false,
-        }),
+    let leaf_tool = Arc::new(AsyncTool {
+        name: "leaf",
+        child: None,
+        gate: Some(gate),
+        early: false,
+    });
+    let leaf = if selected {
+        crate::async_task_tool::register_conversation_replay_safe_durable_tool_with_selected_hooks(
+            &mut registry, leaf_tool, "leaf", 1, vec![], &snapshot, &selection_names,
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+            crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+        )
+    } else { register_conversation_replay_safe_durable_tool(
+        &mut registry, leaf_tool,
         "leaf",
         1,
         vec![],
         ReplaySafeAuthorization::host_attests_replay_safe(),
-    )
+    ) }
     .unwrap();
     let root_tool = Arc::new(AsyncTool {
         name: "root",
@@ -377,7 +410,14 @@ async fn exercise_conversation_park_claim(case: &str) {
     let identity_handle =
         pi_rs_durable::nested_identity::register(&identity_tool, Some("backend-v1".into()))
             .unwrap();
-    let root = if case.starts_with("dispatch_") {
+    let root = if selected {
+        crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_park_cancel(
+            &mut registry, root_tool, "root", 1, vec![leaf.clone()], &snapshot, &selection_names,
+            "cancel-v1", Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
+            UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe(),
+        )
+    } else if case.starts_with("dispatch_") {
         pi_rs_durable::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
             &mut registry, root_tool, "root", 1, vec![leaf.clone()], "cancel-v1",
             Arc::new(Cancel(calls.clone(), case.to_owned(), path.clone(), identity_handle.clone(), callback_scheduler.clone())),
@@ -401,7 +441,7 @@ async fn exercise_conversation_park_claim(case: &str) {
     };
     let recovery_options = options.clone();
     let recovery_registry = registry.clone();
-    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
     let driver = scheduler.start_tasks(registry).unwrap();
     let conversation = scheduler
         .create_conversation(Config {
@@ -410,6 +450,11 @@ async fn exercise_conversation_park_claim(case: &str) {
             max_output_tokens: 100,
         })
         .unwrap();
+    if selected {
+        scheduler
+            .select_extensions(conversation, selection_names)
+            .unwrap();
+    }
     scheduler.submit(conversation, None, "work".into()).unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
@@ -426,6 +471,41 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
+    if case == "selection_hook_test_dispatch" {
+        let worker = scheduler.subagent_harness().worker();
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_hook = observed.clone();
+        crate::task_scheduler::on_conversation_start_result(root_id, move || {
+            assert!(matches!(
+                worker.install_extension(crate::extension::Extension {
+                    name: "policy".into(),
+                    ..Default::default()
+                }),
+                Err(crate::runtime::Error::TaskPublicationBusy)
+            ));
+            worker
+                .install_extension(crate::extension::Extension {
+                    name: "unrelated".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            observed_hook.store(true, Ordering::SeqCst);
+        });
+        crate::task_scheduler::enable_test_selected_dispatch(root_id);
+        scheduler.abort_task(root_id).unwrap();
+        let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.get(key.as_bytes()).unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observed.load(Ordering::SeqCst));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = driver.shutdown_with_pending().unwrap();
+        return;
+    }
     if case == "dispatch_signal_before" || case == "dispatch_abort_before" {
         let finished = Arc::new(AtomicBool::new(false));
         let finished_hook = finished.clone();
@@ -1464,6 +1544,11 @@ async fn exercise_conversation_park_claim(case: &str) {
     }
     let is_owner = case == "owner";
     let is_reentrant = case == "reentrant";
+    let is_hook_selection_fence = case == "selection_hook_fence";
+    let is_selection_fence = case == "selection_fence" || is_hook_selection_fence;
+    let selection_worker = is_selection_fence.then(|| scheduler.subagent_harness().worker());
+    let selection_updated = Arc::new(AtomicBool::new(false));
+    let selection_updated_hook = selection_updated.clone();
     let is_late_receipt = case == "late_receipt";
     let reentrant_handle = identity_handle.clone();
     let mutation_path = path.clone();
@@ -1476,6 +1561,41 @@ async fn exercise_conversation_park_claim(case: &str) {
     });
     let case = case.to_owned();
     crate::task_scheduler::on_conversation_claim_before_commit(root_id, move || {
+        if let Some(worker) = selection_worker {
+            let gate = worker.checkpointable_extension_gate();
+            assert!(matches!(
+                gate.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            if is_hook_selection_fence {
+                assert!(matches!(
+                    worker.install_extension(crate::extension::Extension {
+                        name: "policy".into(),
+                        ..Default::default()
+                    }),
+                    Err(crate::runtime::Error::TaskPublicationBusy)
+                ));
+                selection_updated_hook.store(true, Ordering::SeqCst);
+                reached_hook.store(true, Ordering::SeqCst);
+                return;
+            }
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+            let updated = selection_updated_hook.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                worker
+                    .install_extension(crate::extension::Extension {
+                        name: "claim-race".into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                updated.store(true, Ordering::SeqCst);
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(!selection_updated_hook.load(Ordering::SeqCst));
+            reached_hook.store(true, Ordering::SeqCst);
+            return;
+        }
         if case == "reentrant" {
             use futures_util::FutureExt;
             let applied = Arc::new(AtomicBool::new(false));
@@ -1613,7 +1733,19 @@ async fn exercise_conversation_park_claim(case: &str) {
     })
     .await
     .unwrap();
-    assert_eq!(store.get(key.as_bytes()).unwrap().is_some(), is_reentrant);
+    assert_eq!(
+        store.get(key.as_bytes()).unwrap().is_some(),
+        is_reentrant || is_selection_fence
+    );
+    if is_selection_fence {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !selection_updated.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     if is_late_receipt {
         let receipts =
             pi_rs_durable::async_task_tool::read_unsafe_durable_receipts(&store, root_id).unwrap();
@@ -1797,6 +1929,21 @@ async fn conversation_cancel_pending_callback_does_not_block_other_graph() {
 #[tokio::test]
 async fn conversation_abort_cleanup_claim_is_fenced_during_callback() {
     exercise_conversation_park_claim("dispatch_hold_cleanup").await;
+}
+
+#[tokio::test]
+async fn conversation_cancel_claim_keeps_selection_stable_through_commit() {
+    exercise_conversation_park_claim("selection_fence").await;
+}
+
+#[tokio::test]
+async fn selected_hook_cancel_claim_rejects_selection_change() {
+    exercise_conversation_park_claim("selection_hook_fence").await;
+}
+
+#[tokio::test]
+async fn selected_hook_test_callback_pins_selection_until_first_poll() {
+    exercise_conversation_park_claim("selection_hook_test_dispatch").await;
 }
 
 #[tokio::test]

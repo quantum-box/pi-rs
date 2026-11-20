@@ -1715,6 +1715,20 @@ pub(crate) fn take_test_conversation_start(id: Uuid) -> bool {
 }
 
 #[cfg(test)]
+fn test_selected_dispatch_tasks() -> &'static Mutex<HashSet<Uuid>> {
+    static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TASKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn enable_test_selected_dispatch(id: Uuid) {
+    test_selected_dispatch_tasks().lock().unwrap().insert(id);
+}
+#[cfg(test)]
+pub(crate) fn take_test_selected_dispatch(id: Uuid) -> bool {
+    test_selected_dispatch_tasks().lock().unwrap().remove(&id)
+}
+
+#[cfg(test)]
 fn test_finish_tasks() -> &'static Mutex<HashSet<Uuid>> {
     static TASKS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
     TASKS.get_or_init(Default::default)
@@ -2821,6 +2835,41 @@ impl DetachedInvocation {
 }
 
 impl AdmissionHandle<'_> {
+    /// Pin the registered hook names before claiming a callback. The claim
+    /// subsequently validates the exact persisted identities under this lease.
+    pub(crate) fn conversation_selection_start_lease(
+        &self,
+        handler: &dyn Handler,
+    ) -> Result<Option<crate::extension::SelectionStartLease>, String> {
+        let kind = self.running.task.kind().ok_or("missing definition")?;
+        let selection = {
+            let definitions = self.definitions.read().map_err(|e| e.to_string())?;
+            let registration = definitions
+                .registry
+                .entries
+                .get(kind)
+                .ok_or("missing definition")?;
+            if !std::ptr::addr_eq(registration.handler.as_ref(), handler) {
+                return Err("conversation cancel registration changed".into());
+            }
+            registration
+                .conversation_checkpointable
+                .as_ref()
+                .ok_or("missing conversation registration")?
+                .2
+                .clone()
+        };
+        selection
+            .as_ref()
+            .map(|selection| {
+                self.validator
+                    .ok_or("missing harness")?
+                    .checkpointable_selection_start(selection)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+
     /// Acquire the root's nonblocking start lease before marker commit and
     /// retain it through the callback's first poll.
     pub(crate) fn conversation_callback_start_lease(
@@ -2851,6 +2900,14 @@ impl AdmissionHandle<'_> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        // Selection must remain the one validated below until the claim commits.
+        // Follow the same task -> selection -> state order as the intent fence.
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let state = self.lease.state.lock().map_err(|e| e.to_string())?;
         let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
         let tasks = TaskStore::new(owner.store());
@@ -3044,6 +3101,12 @@ impl AdmissionHandle<'_> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let state = self.lease.state.lock().map_err(|e| e.to_string())?;
         let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
         let tasks = TaskStore::new(owner.store());
@@ -3258,6 +3321,12 @@ impl AdmissionHandle<'_> {
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|e| e.to_string())?;
+        let selection_gate = self.validator.map(|h| h.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let state = self.lease.state.lock().map_err(|e| e.to_string())?;
         let boundary = owner.store().put_version().map_err(|e| e.to_string())?;
         let tasks = TaskStore::new(owner.store());

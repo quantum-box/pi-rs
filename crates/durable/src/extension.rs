@@ -1072,11 +1072,157 @@ pub struct StableExtensionSelection {
     selected: Vec<(String, ExtensionIdentity)>,
 }
 impl StableExtensionSelection {
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.selected.iter().map(|(name, _)| name.as_str())
+    }
     pub(crate) fn hook_count(&self) -> usize {
         self.selected
             .iter()
             .map(|(_, identity)| identity.hooks.len())
             .sum()
+    }
+}
+
+/// Per-name gates are weakly retained so unsuccessful or removed registrations
+/// do not leave an unbounded registry. A lease retains the outer Arc as well
+/// as the gate's own internal state until the operation ends.
+#[derive(Default)]
+pub(crate) struct SelectionStartGates {
+    gates: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Weak<durable_store::controls::CallbackStartGate>,
+        >,
+    >,
+}
+
+pub(crate) struct SelectionMutationLease {
+    _lease: durable_store::controls::MutationLease,
+    _gate: std::sync::Arc<durable_store::controls::CallbackStartGate>,
+}
+
+pub(crate) struct SelectionStartLease {
+    leases: Vec<durable_store::controls::CallbackStartLease>,
+    _gates: Vec<std::sync::Arc<durable_store::controls::CallbackStartGate>>,
+}
+
+impl SelectionStartGates {
+    fn gate(
+        &self,
+        name: &str,
+    ) -> Result<std::sync::Arc<durable_store::controls::CallbackStartGate>, ()> {
+        let mut gates = self.gates.lock().map_err(|_| ())?;
+        if let Some(gate) = gates.get(name).and_then(std::sync::Weak::upgrade) {
+            return Ok(gate);
+        }
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        let gate = std::sync::Arc::new(durable_store::controls::CallbackStartGate::default());
+        gates.insert(name.to_owned(), std::sync::Arc::downgrade(&gate));
+        Ok(gate)
+    }
+
+    pub(crate) fn try_mutation(&self, name: &str) -> Result<SelectionMutationLease, ()> {
+        let gate = self.gate(name)?;
+        let lease = gate.try_enter().ok_or(())?;
+        Ok(SelectionMutationLease {
+            _gate: gate,
+            _lease: lease,
+        })
+    }
+
+    pub(crate) fn try_start(
+        &self,
+        selection: &StableExtensionSelection,
+    ) -> Result<SelectionStartLease, ()> {
+        let mut names: Vec<_> = selection.names().collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut gates = Vec::with_capacity(names.len());
+        let mut leases = Vec::with_capacity(names.len());
+        for name in names {
+            let gate = self.gate(name)?;
+            leases.push(gate.try_start().ok_or(())?);
+            gates.push(gate);
+        }
+        Ok(SelectionStartLease {
+            _gates: gates,
+            leases,
+        })
+    }
+}
+
+impl SelectionStartLease {
+    pub(crate) fn poll_first<F: std::future::Future + ?Sized>(
+        mut self,
+        conversation: durable_store::controls::CallbackStartLease,
+        future: std::pin::Pin<&mut F>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        self.leases.push(conversation);
+        durable_store::controls::CallbackStartLease::poll_first_many(
+            std::mem::take(&mut self.leases),
+            future,
+            context,
+        )
+    }
+}
+
+#[cfg(test)]
+mod selection_start_gate_tests {
+    use super::*;
+
+    fn selection() -> StableExtensionSelection {
+        StableExtensionSelection {
+            selected: vec![(
+                "policy".into(),
+                ExtensionIdentity::new(1, "identity".into(), vec!["hook".into()]).unwrap(),
+            )],
+        }
+    }
+
+    #[test]
+    fn start_excludes_only_selected_mutations_until_first_poll_returns() {
+        let gates = SelectionStartGates::default();
+        let mutation = gates.try_mutation("policy").unwrap();
+        assert!(gates.try_start(&selection()).is_err());
+        drop(mutation);
+        let selection = gates.try_start(&selection()).unwrap();
+        assert!(gates.try_mutation("policy").is_err());
+        let conversation = durable_store::controls::CallbackStartGate::default()
+            .try_start()
+            .unwrap();
+        let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+            assert!(gates.try_mutation("policy").is_err());
+            assert!(gates.try_mutation("other").is_ok());
+            std::task::Poll::<()>::Pending
+        }));
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            selection
+                .poll_first(conversation, future.as_mut(), &mut context)
+                .is_pending()
+        );
+        assert!(gates.try_mutation("policy").is_ok());
+    }
+
+    #[test]
+    fn panic_releases_all_start_leases() {
+        let gates = SelectionStartGates::default();
+        let selection = gates.try_start(&selection()).unwrap();
+        let conversation_gate = durable_store::controls::CallbackStartGate::default();
+        let conversation = conversation_gate.try_start().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut future = std::pin::pin!(std::future::poll_fn(|_| -> std::task::Poll<()> {
+                panic!("test")
+            }));
+            let waker = futures_util::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            selection.poll_first(conversation, future.as_mut(), &mut context)
+        }));
+        assert!(result.is_err());
+        assert!(gates.try_mutation("policy").is_ok());
+        assert!(conversation_gate.try_enter().is_some());
     }
 }
 impl Snapshot {

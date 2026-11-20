@@ -1709,6 +1709,7 @@ impl Handler for Executor {
                 ._conversation_cancel
                 .as_ref()
                 .ok_or("missing cancel registration")?;
+            let selection_start = admission.conversation_selection_start_lease(self)?;
             let _claim = admission
                 .record_conversation_park_claim(self, cancel.conversation_cancel_policy())?;
             #[cfg(test)]
@@ -1834,7 +1835,11 @@ impl Handler for Executor {
                     return Err("foreign attempt accepted".into());
                 }
             }
-            if !enabled {
+            #[cfg(test)]
+            let test_dispatch = crate::task_scheduler::take_test_selected_dispatch(task.id());
+            #[cfg(not(test))]
+            let test_dispatch = false;
+            if !enabled && !test_dispatch {
                 return Err(
                     "conversation cancel callback is not enabled; reconciliation required".into(),
                 );
@@ -1886,11 +1891,14 @@ impl Handler for Executor {
                             scope,
                         );
                         let mut future = std::pin::pin!(future);
-                        let mut start = Some(start);
+                        let mut start = Some((start, selection_start));
                         tokio::time::timeout(
                             std::time::Duration::from_secs(30),
                             std::future::poll_fn(|cx| match start.take() {
-                                Some(lease) => lease.poll_first(future.as_mut(), cx),
+                                Some((lease, Some(selection))) => {
+                                    selection.poll_first(lease, future.as_mut(), cx)
+                                }
+                                Some((lease, None)) => lease.poll_first(future.as_mut(), cx),
                                 None => future.as_mut().poll(cx),
                             }),
                         )

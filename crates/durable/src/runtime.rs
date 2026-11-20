@@ -3243,6 +3243,7 @@ pub struct Harness {
     summary_provider: Option<SummaryProviderIdentity>,
     extensions: Arc<std::sync::RwLock<crate::extension::Registry>>,
     extension_selection_gate: Arc<std::sync::Mutex<()>>,
+    extension_start_gates: Arc<crate::extension::SelectionStartGates>,
     extension_generation: Arc<std::sync::atomic::AtomicU64>,
     failed: bool,
     dirty: Arc<AtomicBool>,
@@ -4837,6 +4838,7 @@ impl Harness {
             summary_provider: None,
             extensions: Arc::new(std::sync::RwLock::new(crate::extension::Registry::default())),
             extension_selection_gate: Arc::new(std::sync::Mutex::new(())),
+            extension_start_gates: Arc::new(crate::extension::SelectionStartGates::default()),
             extension_generation: Arc::new(std::sync::atomic::AtomicU64::new(
                 uuid::Uuid::new_v4().as_u128() as u64,
             )),
@@ -4867,6 +4869,7 @@ impl Harness {
             summary_provider: self.summary_provider.clone(),
             extensions: self.extensions.clone(),
             extension_selection_gate: self.extension_selection_gate.clone(),
+            extension_start_gates: self.extension_start_gates.clone(),
             extension_generation: self.extension_generation.clone(),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
@@ -4985,6 +4988,10 @@ impl Harness {
     }
     /// Atomically publish a new registry snapshot to subsequent execution phases.
     pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
+        let _mutation = self
+            .extension_start_gates
+            .try_mutation(&extension.name)
+            .map_err(|_| Error::TaskPublicationBusy)?;
         let _selection = self
             .extension_selection_gate
             .lock()
@@ -5004,6 +5011,10 @@ impl Harness {
         extension: crate::extension::Extension,
         identity: crate::extension::ExtensionIdentity,
     ) -> Result<(), Error> {
+        let _mutation = self
+            .extension_start_gates
+            .try_mutation(&extension.name)
+            .map_err(|_| Error::TaskPublicationBusy)?;
         let _selection = self
             .extension_selection_gate
             .lock()
@@ -5017,6 +5028,10 @@ impl Harness {
         Ok(())
     }
     pub fn uninstall_extension(&self, name: &str) -> Result<(), Error> {
+        let _mutation = self
+            .extension_start_gates
+            .try_mutation(name)
+            .map_err(|_| Error::TaskPublicationBusy)?;
         let _selection = self
             .extension_selection_gate
             .lock()
@@ -5042,6 +5057,14 @@ impl Harness {
     }
     pub(crate) fn checkpointable_extension_gate(&self) -> Arc<std::sync::Mutex<()>> {
         self.extension_selection_gate.clone()
+    }
+    pub(crate) fn checkpointable_selection_start(
+        &self,
+        selection: &crate::extension::StableExtensionSelection,
+    ) -> Result<crate::extension::SelectionStartLease, Error> {
+        self.extension_start_gates
+            .try_start(selection)
+            .map_err(|_| Error::TaskPublicationBusy)
     }
     fn validate_checkpointable_selection(
         &self,

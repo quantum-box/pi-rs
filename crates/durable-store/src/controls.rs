@@ -158,6 +158,18 @@ impl CallbackStartGate {
     }
 }
 impl CallbackStartLease {
+    /// Hold all start leases for the same first poll, releasing them together.
+    pub fn poll_first_many<F: std::future::Future + ?Sized>(
+        leases: Vec<Self>,
+        future: std::pin::Pin<&mut F>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let _scopes: Vec<_> = leases
+            .iter()
+            .map(|lease| CallbackPollScope::enter(&lease.0))
+            .collect();
+        future.poll(context)
+    }
     /// Consume the exclusive lease around exactly one poll.
     pub fn poll_first<F: std::future::Future + ?Sized>(
         self,
