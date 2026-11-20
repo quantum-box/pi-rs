@@ -144,6 +144,94 @@ pub(crate) fn woken_owned_graph_key(root: Uuid) -> Vec<u8> {
     format!("runtime/woken-owned-graph/v1/{root}").into_bytes()
 }
 
+// A reservation is the one permitted change to the root's execution
+// revision after the graph mark. It is evidence, never authorization alone.
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedReservation {
+    version: u32,
+    graph_version: u64,
+    ready_version: u64,
+    running: crate::task::Task,
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+fn woken_owned_reservation_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-reservation/v1/{root}").into_bytes()
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn prepare_woken_owned_reservation(
+    store: &durable_store::Store,
+    ready: &crate::task_store::StoredTask,
+    running: &crate::task::Task,
+) -> Result<Option<(Vec<Check>, Mutation)>, Error> {
+    let graph_key = woken_owned_graph_key(ready.task.id());
+    let Some(entry) = store.get(&graph_key)? else {
+        return Ok(None);
+    };
+    let graph: WokenOwnedGraphEvidence = serde_json::from_slice(&entry.value)?;
+    let structure = graph
+        .structure
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("owned graph revision missing".into()))?;
+    if graph.version != 1
+        || graph.root != ready.task.id()
+        || ready.task.woken_interrupted_attempt() != Some(graph.interrupted_attempt)
+        || !ready.task.abort_requested()
+        || ready.task.state() != &crate::task::TaskState::Ready
+        || running.id() != ready.task.id()
+        || running.state() != &crate::task::TaskState::Running
+        || running.attempt_id().is_none()
+    {
+        return Err(Error::Invalid("invalid owned reservation".into()));
+    }
+    let mut expected = ready.task.clone();
+    expected
+        .start_attempt(running.attempt_id().unwrap())
+        .map_err(|e| Error::Invalid(format!("{e:?}")))?;
+    if expected != *running {
+        return Err(Error::Invalid("owned reservation changed task".into()));
+    }
+    let key = woken_owned_reservation_key(graph.root);
+    let mut checks = vec![
+        Check {
+            key: graph_key,
+            expected: Expected::Version(entry.version),
+        },
+        Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        },
+    ];
+    for (key, version) in [
+        (
+            durable_store::graph_revision::task_structure_revision(graph.root),
+            structure.root_revision,
+        ),
+        (
+            durable_store::graph_revision::global_structure_revision(),
+            structure.global_revision,
+        ),
+    ] {
+        checks.push(Check {
+            key,
+            expected: version.map_or(
+                Expected::MissingUnchangedSince(structure.boundary),
+                Expected::Version,
+            ),
+        });
+    }
+    let value = serde_json::to_vec(&WokenOwnedReservation {
+        version: 1,
+        graph_version: entry.version,
+        ready_version: ready.version,
+        running: running.clone(),
+    })?;
+    Ok(Some((checks, Mutation::Put { key, value })))
+}
+
 /// Evidence committed with the completed owned conversation and retirement of
 /// its cleanup attempt. Consumers must additionally authenticate its graph.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -12253,11 +12341,58 @@ impl Harness {
             ] {
                 let current = store.get(&key)?.map(|entry| entry.version);
                 if current != version {
-                    return Err(Error::Invalid("owned graph structure changed".into()));
+                    if key != durable_store::graph_revision::task_structure_revision(root.task.id())
+                    {
+                        return Err(Error::Invalid("owned graph structure changed".into()));
+                    }
+                    let reservation_key = woken_owned_reservation_key(root.task.id());
+                    let reservation_entry = store
+                        .get(&reservation_key)?
+                        .ok_or_else(|| Error::Invalid("owned reservation missing".into()))?;
+                    let reservation: WokenOwnedReservation =
+                        serde_json::from_slice(&reservation_entry.value)?;
+                    let commit = store
+                        .commit_for_version(&reservation_key, reservation_entry.version)?
+                        .ok_or_else(|| Error::Invalid("untracked owned reservation".into()))?;
+                    let graph_commit = store
+                        .commit_for_version(&evidence_key, evidence_entry.version)?
+                        .ok_or_else(|| Error::Invalid("untracked graph evidence".into()))?;
+                    let prior_revision = match version {
+                        Some(v) => store.commit_for_version(&key, v)?,
+                        None => None,
+                    };
+                    let reserved_attempt = reservation.running.attempt_id();
+                    if reservation.version != 1
+                        || reservation.graph_version != evidence_entry.version
+                        || reservation.running.id() != root.task.id()
+                        || reserved_attempt.is_none()
+                        || (root.task.attempt_id() != reserved_attempt
+                            && root.task.retired_attempt_id() != reserved_attempt)
+                        || store.next_commit_for_key(
+                            &crate::task_store::key(root.task.id()),
+                            graph_commit,
+                        )? != Some(commit)
+                        || store.commit_for_version(
+                            &crate::task_store::key(root.task.id()),
+                            reservation.ready_version,
+                        )? != Some(graph_commit)
+                        || prior_revision.is_none()
+                        || store.next_commit_for_key(&key, prior_revision.unwrap())? != Some(commit)
+                        || match current {
+                            Some(v) => store.commit_for_version(&key, v)?,
+                            None => None,
+                        } != Some(commit)
+                    {
+                        return Err(Error::Invalid("owned reservation revision changed".into()));
+                    }
+                    checks.push(Check {
+                        key: reservation_key,
+                        expected: Expected::Version(reservation_entry.version),
+                    });
                 }
                 checks.push(Check {
                     key,
-                    expected: version.map_or(
+                    expected: current.map_or(
                         Expected::MissingUnchangedSince(structure.boundary),
                         Expected::Version,
                     ),
