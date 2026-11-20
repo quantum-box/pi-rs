@@ -469,7 +469,9 @@ pub(crate) fn woken_after_candidate_checks(
     let result = receipt.after_result.ok_or("woken after result missing")?;
     crate::async_task_tool::validate_aborted_after_result(&result)?;
     let snapshot_key = crate::runtime::Harness::key(claim.conversation);
-    let snapshot_version = receipt.snapshot_version.unwrap();
+    let snapshot_version = receipt
+        .snapshot_version
+        .ok_or("woken after snapshot missing")?;
     if store
         .get(&snapshot_key)
         .map_err(|e| e.to_string())?

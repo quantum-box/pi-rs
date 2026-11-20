@@ -2189,6 +2189,8 @@ impl Handler for Executor {
                         );
                     }
                     #[cfg(test)]
+                    crate::task_scheduler::report_conversation_receipt_saved(task.id());
+                    #[cfg(test)]
                     if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT") {
                         std::fs::write(
                             std::path::Path::new(&dir).join("woken-receipt.tmp"),

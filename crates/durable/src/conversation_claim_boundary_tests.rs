@@ -5930,6 +5930,11 @@ async fn selected_woken_conflicting_snapshot_retains_known_result() {
     exercise_selected_woken_receipt("stale").await;
 }
 
+#[tokio::test]
+async fn selected_woken_missing_snapshot_fails_closed_during_settlement() {
+    exercise_selected_woken_receipt("missing_snapshot").await;
+}
+
 async fn exercise_selected_woken_receipt(mode: &str) {
     use crate::async_task_tool::DurableParkCancel;
     use std::process::{Command, Stdio};
@@ -6074,6 +6079,29 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 .unwrap();
         });
     }
+    if mode == "missing_snapshot" {
+        let writer_path = path.clone();
+        let task_id = root.task.id();
+        crate::task_scheduler::on_conversation_receipt_saved(task_id, move || {
+            let store = durable_store::Store::open(writer_path).unwrap();
+            let key = crate::task_scheduler::woken_conversation_receipt_key(task_id);
+            let entry = store.get(&key).unwrap().unwrap();
+            let mut receipt: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+            receipt.as_object_mut().unwrap().remove("snapshot_version");
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&receipt).unwrap(),
+                    }],
+                )
+                .unwrap();
+        });
+    }
     let busy_store = durable_store::Store::open(&path).unwrap();
     let driver = scheduler.start_tasks(registry).unwrap();
     if mode == "busy" {
@@ -6189,6 +6217,20 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 .unwrap()
                 .is_none()
         );
+    }
+    if mode == "missing_snapshot" {
+        assert!(
+            store
+                .get(&crate::task_scheduler::woken_conversation_terminal_key(
+                    root.task.id()
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        return;
     }
     let terminal = store
         .get(&crate::task_scheduler::woken_conversation_terminal_key(
@@ -6312,7 +6354,7 @@ async fn selected_woken_resume_worker() {
 #[tokio::test]
 async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
     use std::process::{Command, Stdio};
-    for mode in ["normal", "late", "selection", "schema"] {
+    for mode in ["normal", "late", "selection", "schema", "missing_snapshot"] {
         let dir = tempfile::tempdir().unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -6392,6 +6434,25 @@ async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
             std::fs::read(dir.path().join("selected-after-count")).unwrap(),
             b"x"
         );
+        if mode == "missing_snapshot" {
+            let store = durable_store::Store::open(&path).unwrap();
+            let key = crate::task_scheduler::woken_conversation_receipt_key(root.task.id());
+            let entry = store.get(&key).unwrap().unwrap();
+            let mut receipt: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+            receipt.as_object_mut().unwrap().remove("snapshot_version");
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&receipt).unwrap(),
+                    }],
+                )
+                .unwrap();
+        }
         if mode == "late" {
             let store = durable_store::Store::open(&path).unwrap();
             let key = format!(
@@ -6465,7 +6526,11 @@ async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
             assert_eq!(state.tool_results.len(), 1, "{text}");
             assert!(state.tool_results[0].structured_output.is_none());
         }
-        assert_eq!(text.contains("after cancel"), mode != "late", "{text}");
+        assert_eq!(
+            text.contains("after cancel"),
+            mode != "late" && mode != "missing_snapshot",
+            "{text}"
+        );
         let store = durable_store::Store::open(&path).unwrap();
         assert_eq!(
             store
@@ -6474,7 +6539,7 @@ async fn selected_woken_after_receipt_kill_reopens_blocked_with_result() {
                 ))
                 .unwrap()
                 .is_some(),
-            mode != "late"
+            mode != "late" && mode != "missing_snapshot"
         );
         assert_eq!(
             std::fs::read(dir.path().join("selected-cancel-count")).unwrap(),
