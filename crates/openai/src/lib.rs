@@ -12,12 +12,13 @@ use pi_rs_core::{
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
+const CODEX_DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
 #[derive(Debug)]
 enum RawStreamError {
@@ -85,6 +86,8 @@ pub struct OpenAiResponses {
     prompt_cache_key_enabled: bool,
     strict_tool_support: bool,
     use_developer_role: bool,
+    mid_conversation_system_models: BTreeMap<String, bool>,
+    mid_conversation_system_default: bool,
 }
 
 /// A Responses request whose wire tools and effective sampling are fixed.
@@ -325,12 +328,32 @@ impl OpenAiResponses {
             prompt_cache_key_enabled: true,
             strict_tool_support: false,
             use_developer_role: false,
+            mid_conversation_system_models: BTreeMap::new(),
+            mid_conversation_system_default: false,
         })
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
         self
+    }
+
+    /// Resolve per-model system updates on the client's current Responses route.
+    pub fn with_mid_conversation_system_policy(
+        mut self,
+        default: bool,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.mid_conversation_system_default = default;
+        self.mid_conversation_system_models = models;
+        self
+    }
+
+    fn supports_mid_conversation_system(&self, model: &str) -> bool {
+        self.mid_conversation_system_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.mid_conversation_system_default)
     }
 
     /// Set endpoint-wide strict JSON Schema tool support for this client.
@@ -626,6 +649,33 @@ pub fn codex_account_id(token: &str) -> Option<String> {
     .then(|| account.to_owned())
 }
 
+fn responses_transcript(
+    messages: &[Message],
+    supports_mid_conversation_system: bool,
+) -> impl Iterator<Item = Cow<'_, Message>> {
+    let leading = (!supports_mid_conversation_system)
+        .then(|| {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::System { content } if !content.is_empty() => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .filter(|content| !content.is_empty())
+        .map(|content| Cow::Owned(Message::System { content }));
+    leading.into_iter().chain(
+        messages
+            .iter()
+            .filter(move |message| {
+                supports_mid_conversation_system || !matches!(message, Message::System { .. })
+            })
+            .map(Cow::Borrowed),
+    )
+}
+
 #[cfg(test)]
 fn payload(
     request: &ModelRequest,
@@ -639,6 +689,7 @@ fn payload(
         edited_scope,
         instruction_role,
         pi_rs_core::ModelApi::OpenaiResponses,
+        false,
     )
 }
 
@@ -648,17 +699,21 @@ fn responses_payload(
     edited_scope: &str,
     instruction_role: &str,
     api: pi_rs_core::ModelApi,
+    supports_mid_conversation_system: bool,
 ) -> Value {
     let codex = api == pi_rs_core::ModelApi::OpenaiCodexResponses;
     let mut input = Vec::new();
-    let mut instructions = "You are a helpful assistant.";
-    for (index, message) in request.messages.iter().enumerate() {
-        match message {
+    let mut instructions = CODEX_DEFAULT_INSTRUCTIONS.to_owned();
+    for (index, message) in
+        responses_transcript(&request.messages, supports_mid_conversation_system).enumerate()
+    {
+        match message.as_ref() {
             Message::System { content } if codex && index == 0 => {
                 if !content.is_empty() {
-                    instructions = content;
+                    instructions.clone_from(content);
                 }
             }
+            Message::System { content } if content.is_empty() => {}
             Message::System { content } => {
                 input.push(json!({"role":instruction_role, "content": content}))
             }
@@ -881,7 +936,7 @@ impl Model for OpenAiResponses {
             if self.cache_retention == CacheRetention::Short || self.provider == "openai-chatgpt" {
                 pi_rs_core::protected_model_fingerprint(&(
                     headers,
-                    "openai-responses-v1",
+                    "openai-responses-v2",
                     self.endpoint.as_str(),
                     &self.provider,
                     &self.token,
@@ -891,7 +946,7 @@ impl Model for OpenAiResponses {
             } else {
                 pi_rs_core::protected_model_fingerprint(&(
                     headers,
-                    "openai-responses-v1",
+                    "openai-responses-v2",
                     self.endpoint.as_str(),
                     &self.provider,
                     &self.token,
@@ -950,6 +1005,20 @@ impl Model for OpenAiResponses {
                 pi_rs_core::protected_model_fingerprint(&(base, "system-instruction-role"))
             })
         };
+        let base = if !self.mid_conversation_system_default
+            && self.mid_conversation_system_models.is_empty()
+        {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "responses-system-messages-v1",
+                    self.mid_conversation_system_default,
+                    &self.mid_conversation_system_models,
+                ))
+            })
+        };
         if self.strict_tool_support {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(base, "strict-tools-enabled"))
@@ -957,6 +1026,33 @@ impl Model for OpenAiResponses {
         } else {
             base
         }
+    }
+
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let mut messages = responses_transcript(
+            &request.messages,
+            self.supports_mid_conversation_system(&request.model),
+        )
+        .peekable();
+        let codex_default = self.codex_account.is_some()
+            && !matches!(
+                messages.peek().map(Cow::as_ref),
+                Some(Message::System { content }) if !content.is_empty()
+            );
+        let default_instructions = codex_default.then(|| Message::System {
+            content: CODEX_DEFAULT_INSTRUCTIONS.into(),
+        });
+        let overhead = pi_rs_core::estimate_request_tokens(&ModelRequest {
+            model: request.model.clone(),
+            max_output_tokens: request.max_output_tokens,
+            messages: default_instructions.into_iter().collect(),
+            tools: request.tools.clone(),
+        });
+        messages.filter(|message| {
+            !matches!(message.as_ref(), Message::System { content } if content.is_empty())
+        }).fold(overhead, |tokens, message| {
+            tokens.saturating_add(self.estimate_message_tokens(request, message.as_ref()))
+        })
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -1172,6 +1268,7 @@ impl OpenAiResponses {
                 "system"
             },
             api,
+            self.supports_mid_conversation_system(&model),
         );
         if let Some(tools) = tools
             && !tools.is_empty()
@@ -1518,6 +1615,10 @@ mod tests {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["instructions"], "fixture system");
             assert_eq!(body["input"][0]["role"], "user");
+            assert_eq!(
+                body["input"][1],
+                json!({"role":"system","content":"fixture update"})
+            );
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
             assert_eq!(body["reasoning"], json!({"effort":"none"}));
             assert_eq!(body["tool_choice"], "auto");
@@ -1538,7 +1639,8 @@ mod tests {
             format!("e30.{payload}.fixture"),
             "openai-codex",
         )
-        .unwrap();
+        .unwrap()
+        .with_mid_conversation_system_policy(true, BTreeMap::new());
         let request = ModelRequest {
             model: "gpt-6.1-sol".into(),
             messages: vec![
@@ -1547,6 +1649,9 @@ mod tests {
                 },
                 Message::User {
                     content: "hello".into(),
+                },
+                Message::System {
+                    content: "fixture update".into(),
                 },
             ],
             tools: vec![],
@@ -1569,6 +1674,106 @@ mod tests {
             Some(Ok(ModelEvent::Complete { .. }))
         ));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn responses_and_codex_project_system_instructions_using_the_model_capability() {
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![
+                Message::System {
+                    content: "base instructions".into(),
+                },
+                Message::User {
+                    content: "first".into(),
+                },
+                Message::System { content: "".into() },
+                Message::System {
+                    content: "follow-up instruction".into(),
+                },
+                Message::User {
+                    content: "second".into(),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 64,
+        };
+        let make =
+            |api, support| responses_payload(&request, "openai", "", "developer", api, support);
+        let folded = make(pi_rs_core::ModelApi::OpenaiResponses, false);
+        assert_eq!(
+            folded["input"],
+            json!([
+                {"role":"developer","content":"base instructions\n\nfollow-up instruction"},
+                {"role":"user","content":"first"},
+                {"role":"user","content":"second"},
+            ])
+        );
+        let retained = make(pi_rs_core::ModelApi::OpenaiResponses, true);
+        assert_eq!(
+            retained["input"],
+            json!([
+                {"role":"developer","content":"base instructions"},
+                {"role":"user","content":"first"},
+                {"role":"developer","content":"follow-up instruction"},
+                {"role":"user","content":"second"},
+            ])
+        );
+        let codex_default = make(pi_rs_core::ModelApi::OpenaiCodexResponses, false);
+        assert_eq!(
+            codex_default["instructions"],
+            "base instructions\n\nfollow-up instruction"
+        );
+        assert_eq!(
+            codex_default["input"],
+            json!([
+                {"role":"user","content":"first"},
+                {"role":"user","content":"second"},
+            ])
+        );
+        let codex_enabled = make(pi_rs_core::ModelApi::OpenaiCodexResponses, true);
+        assert_eq!(codex_enabled["instructions"], "base instructions");
+        assert_eq!(
+            codex_enabled["input"],
+            json!([
+                {"role":"user","content":"first"},
+                {"role":"developer","content":"follow-up instruction"},
+                {"role":"user","content":"second"},
+            ])
+        );
+    }
+
+    #[test]
+    fn responses_request_estimates_count_the_projected_system_instructions() {
+        let baseline = OpenAiResponses::new_api(DEFAULT_ENDPOINT, "sk-fixture".into()).unwrap();
+        let native = baseline
+            .clone()
+            .with_mid_conversation_system_policy(false, BTreeMap::from([("fixture".into(), true)]));
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![
+                Message::User {
+                    content: "ask".into(),
+                },
+                Message::System {
+                    content: "1234".into(),
+                },
+                Message::System {
+                    content: "abcd".into(),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 64,
+        };
+        assert_eq!(native.estimate_request_tokens(&request), 3);
+        assert_eq!(baseline.estimate_request_tokens(&request), 4);
+        assert_ne!(baseline.context_identity(), native.context_identity());
+        let inherited = baseline
+            .clone()
+            .with_mid_conversation_system_policy(true, BTreeMap::from([("blocked".into(), false)]));
+        assert!(inherited.supports_mid_conversation_system("rewritten-unknown"));
+        assert!(!inherited.supports_mid_conversation_system("blocked"));
+        assert_eq!(inherited.estimate_request_tokens(&request), 3);
     }
 
     #[tokio::test]

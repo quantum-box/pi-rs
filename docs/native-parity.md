@@ -5270,6 +5270,14 @@ are unavailable, the standalone adapter defaults to `system`; SDK hosts can
 explicitly select the developer role. This is also the fallback for unknown
 workbench models, whose upstream capabilities cannot be inferred.
 
+Responses and Codex honor Pi's `supportsMidConvoSystemMessages` catalog
+setting and resolve overrides for the final request model. Compatible models
+keep later system instructions in place. Other models send one combined initial instruction.
+Codex sends the initial instruction in the top-level `instructions` field.
+Token estimates use the outgoing instruction text. Request fixtures covered
+both projections and the Codex wire payload. Live authenticated requests
+with later system instructions were unverified.
+
 ### Responses prompt cache key configuration
 
 Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
