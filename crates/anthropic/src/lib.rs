@@ -97,6 +97,7 @@ pub struct Anthropic {
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
     eager_tool_input_streaming: bool,
+    eager_tool_input_models: Arc<BTreeMap<String, bool>>,
     configured_thinking: Option<CatalogEntry>,
     configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
@@ -205,6 +206,7 @@ impl Anthropic {
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             eager_tool_input_streaming: true,
+            eager_tool_input_models: Arc::default(),
             configured_thinking: None,
             configured_thinking_is_fallback: false,
             allow_empty_signature: false,
@@ -218,8 +220,13 @@ impl Anthropic {
     }
 
     /// Use per-tool eager input streaming, or the legacy beta when disabled.
-    pub fn with_eager_tool_input_streaming(mut self, enabled: bool) -> Self {
+    pub fn with_eager_tool_input_streaming(
+        mut self,
+        enabled: bool,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
         self.eager_tool_input_streaming = enabled;
+        self.eager_tool_input_models = Arc::new(models);
         self
     }
 
@@ -514,11 +521,16 @@ impl Anthropic {
         request.headers(self.headers.clone())
     }
 
-    fn configure_tool_input_streaming(&self, body: &mut Value) -> bool {
+    fn configure_tool_input_streaming(&self, model: &str, body: &mut Value) -> bool {
         let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
             return false;
         };
-        if self.eager_tool_input_streaming {
+        let eager = self
+            .eager_tool_input_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.eager_tool_input_streaming);
+        if eager {
             for tool in tools {
                 tool["eager_input_streaming"] = json!(true);
             }
@@ -1634,10 +1646,15 @@ impl Model for Anthropic {
         } else {
             pi_rs_core::protected_model_fingerprint(&identity)
         }?;
-        let base = if self.eager_tool_input_streaming {
+        let base = if self.eager_tool_input_streaming && self.eager_tool_input_models.is_empty() {
             base
         } else {
-            pi_rs_core::protected_model_fingerprint(&(base, "legacy-tool-input-streaming"))?
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "tool-input-streaming",
+                self.eager_tool_input_streaming,
+                self.eager_tool_input_models.as_ref(),
+            ))?
         };
         let active_thinking = self
             .thinking_level
@@ -1869,7 +1886,8 @@ impl Anthropic {
         {
             body["tools"] = json!(tools);
         }
-        let legacy_tool_streaming = self.configure_tool_input_streaming(&mut body);
+        let legacy_tool_streaming =
+            self.configure_tool_input_streaming(&requested_model, &mut body);
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if self.oauth {
             prepare_oauth_request(&mut body, self.cache_retention);
@@ -3895,8 +3913,16 @@ mod tests {
     #[test]
     fn tool_input_streaming_uses_eager_flags_or_the_legacy_beta() {
         let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture").unwrap();
-        let legacy = base.clone().with_eager_tool_input_streaming(false);
+        let legacy = base
+            .clone()
+            .with_eager_tool_input_streaming(false, BTreeMap::new());
         assert_ne!(base.context_identity(), legacy.context_identity());
+        let routed = base
+            .clone()
+            .with_eager_tool_input_streaming(true, BTreeMap::from([("rewritten".into(), false)]));
+        let mut body = json!({"tools":[{"name":"read"}]});
+        assert!(routed.configure_tool_input_streaming("rewritten", &mut body));
+        assert!(body["tools"][0].get("eager_input_streaming").is_none());
 
         let explicit = legacy.clone().with_headers(
             [(
@@ -3923,7 +3949,7 @@ mod tests {
             ),
         ] {
             let mut body = json!({"tools":tools});
-            let legacy_streaming = client.configure_tool_input_streaming(&mut body);
+            let legacy_streaming = client.configure_tool_input_streaming("fixture", &mut body);
             let request = client
                 .authenticate(
                     client.client.post(DEFAULT_ENDPOINT),
