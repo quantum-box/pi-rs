@@ -1791,9 +1791,7 @@ impl Agent<'_> {
                     active.compaction_tokens(session).keep_recent_tokens,
                     1,
                 )?;
-                let model_summary_available =
-                    budget > 1 && next_request_index < active.limits.model_requests;
-                let summary_limit = if model_summary_available {
+                let summary_limit = if next_request_index < active.limits.model_requests {
                     active
                         .limits
                         .output_tokens_per_request
@@ -5135,7 +5133,10 @@ impl Agent<'_> {
             .extensions
             .iter()
             .any(|extension| extension.handles_before_summary_compaction());
-        if !has_pre_summary_hook && (limit == 0 || self.limits.model_requests == 0) {
+        let minimum_output_tokens = self.model.minimum_output_tokens().max(1);
+        let model_summary_available =
+            limit >= minimum_output_tokens && self.limits.model_requests > 0;
+        if !has_pre_summary_hook && !model_summary_available {
             return Err(Error::Budget);
         }
         let before = retention.boundary;
@@ -5234,7 +5235,7 @@ impl Agent<'_> {
             .await?;
             return Ok(Some((0, true)));
         }
-        if limit == 0 || self.limits.model_requests == 0 {
+        if !model_summary_available {
             if skip_without_model {
                 return Ok(None);
             }
@@ -5253,7 +5254,7 @@ impl Agent<'_> {
             )
             .await?;
         request.max_output_tokens = request.max_output_tokens.min(limit);
-        if request.max_output_tokens == 0 {
+        if request.max_output_tokens < minimum_output_tokens {
             return Err(Error::Budget);
         }
         request.tools.clear();
@@ -9013,10 +9014,16 @@ mod tree_tests {
     struct OverflowModel {
         calls: std::sync::atomic::AtomicUsize,
         always_fail: bool,
+        minimum_output_tokens: u32,
     }
     #[async_trait::async_trait]
     impl Model for OverflowModel {
+        fn minimum_output_tokens(&self) -> u32 {
+            self.minimum_output_tokens
+        }
+
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            assert!(request.max_output_tokens >= self.minimum_output_tokens);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 || self.always_fail {
                 return Err(Error::Model(
@@ -9037,7 +9044,14 @@ mod tree_tests {
     }
     #[tokio::test]
     async fn explicit_overflow_compacts_and_retries_once_without_exposing_failure() {
-        for (provide, always_fail) in [(true, false), (false, false), (true, true)] {
+        let default_budget = Limits::default().output_tokens_per_run;
+        for (provide, always_fail, minimum_output_tokens, run_budget) in [
+            (true, false, 1, default_budget),
+            (false, false, 1, default_budget),
+            (true, true, 1, default_budget),
+            (true, false, 16, 16),
+            (false, false, 16, 16),
+        ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut registry = Registry::default();
             registry
@@ -9049,6 +9063,7 @@ mod tree_tests {
             let model = OverflowModel {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 always_fail,
+                minimum_output_tokens,
             };
             let agent = Agent {
                 model: &model,
@@ -9059,6 +9074,7 @@ mod tree_tests {
                     model_requests: if provide { 2 } else { 3 },
                     context_window: Some(1000),
                     output_tokens_per_request: 16,
+                    output_tokens_per_run: run_budget,
                     compaction_tokens: Some(crate::CompactionTokens {
                         reserve_tokens: Some(0),
                         keep_recent_tokens: None,
@@ -9091,6 +9107,12 @@ mod tree_tests {
                     &mut |_| {},
                 )
                 .await;
+            if !provide && run_budget == 16 {
+                assert!(matches!(result, Err(Error::Budget)));
+                assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(seen.lock().unwrap().len(), 1);
+                continue;
+            }
             if always_fail {
                 assert!(result.is_err());
             } else {
@@ -9129,6 +9151,7 @@ mod tree_tests {
         let model = OverflowModel {
             calls: std::sync::atomic::AtomicUsize::new(0),
             always_fail: true,
+            minimum_output_tokens: 1,
         };
         let agent = Agent {
             model: &model,
@@ -10875,6 +10898,7 @@ mod tree_tests {
         let model = OverflowModel {
             calls: std::sync::atomic::AtomicUsize::new(0),
             always_fail: false,
+            minimum_output_tokens: 1,
         };
         let agent = Agent {
             model: &model,
