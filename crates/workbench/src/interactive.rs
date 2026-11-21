@@ -627,6 +627,7 @@ enum LocalEditor {
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
+    CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -684,6 +685,7 @@ enum RemoteEvent {
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
     AnthropicCode(tokio::sync::oneshot::Sender<String>),
+    CodexCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -3617,6 +3619,15 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login"
+            if rest.eq_ignore_ascii_case("openai-codex")
+                || rest.eq_ignore_ascii_case("openai-codex browser") =>
+        {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
         "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
             start_copilot_login(view, &args.settings)
         }
@@ -3656,6 +3667,20 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Browser authorization".into(),
+                            selection: Selection::LoginCodex,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Device authorization".into(),
+                            selection: Selection::LoginCodexDevice,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -4902,6 +4927,15 @@ pub(super) async fn run(
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::CodexCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::CodexCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret(
+                            "OpenAI Codex code or redirect URL".into(),
+                        ),
+                    ));
+                    dirty = true;
+                }
                 Ok(RemoteEvent::AnthropicCode(sender)) => {
                     view.local_editor = Some((
                         LocalEditor::AnthropicCode(Some(sender)),
@@ -5453,7 +5487,7 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
-                                LocalEditor::AnthropicCode(sender) => {
+                                LocalEditor::AnthropicCode(sender) | LocalEditor::CodexCode(sender) => {
                                     if let Some(sender) = sender.take() { let _ = sender.send(text); }
                                     Ok(())
                                 }
@@ -5498,7 +5532,10 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
-                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                            } else if matches!(
+                                editor,
+                                LocalEditor::AnthropicCode(_) | LocalEditor::CodexCode(_)
+                            ) {
                                 interrupt_remote_task(&mut view);
                             }
                         }
@@ -6697,6 +6734,41 @@ fn take_device_code_action(
     view.remote_task.as_mut()?.device_code.take()
 }
 
+fn start_codex_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::codex_auth::Method,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to OpenAI Codex",
+        "OpenAI Codex login cancelled",
+        move |sender| async move {
+            super::codex_auth::login(&settings, task_control, method, |notice| match notice {
+                super::codex_auth::Notice::Device { url, code } => {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_owned(),
+                        code,
+                    });
+                }
+                super::codex_auth::Notice::Browser(url, input) => {
+                    let _ = sender.send(RemoteEvent::Notice(format!(
+                        "Continue in your browser: {url}"
+                    )));
+                    let _ = sender.send(RemoteEvent::CodexCode(input));
+                }
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenAI Codex".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -6870,6 +6942,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to OpenAI Codex" {
+            "OpenAI Codex sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to GitHub Copilot" {
             "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
@@ -6886,7 +6960,9 @@ fn clear_openrouter_editor(view: &mut View) {
     if matches!(
         view.local_editor,
         Some((
-            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            LocalEditor::OpenRouterCode(_)
+                | LocalEditor::AnthropicCode(_)
+                | LocalEditor::CodexCode(_),
             _
         ))
     ) {
@@ -7806,6 +7882,12 @@ fn select(
                 },
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
+        }
+        Selection::LoginCodex => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        Selection::LoginCodexDevice => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
         Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),

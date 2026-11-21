@@ -32,6 +32,7 @@ pub(super) enum Adapter {
     ChatCompletions,
     OpenAiResponses,
     AzureResponses,
+    CodexResponses,
     Anthropic,
     Google,
     Bedrock,
@@ -44,6 +45,7 @@ impl Adapter {
             "openai-completions" => Some(Self::ChatCompletions),
             "openai-responses" => Some(Self::OpenAiResponses),
             "azure-openai-responses" => Some(Self::AzureResponses),
+            "openai-codex-responses" => Some(Self::CodexResponses),
             "anthropic-messages" => Some(Self::Anthropic),
             "google-generative-ai" => Some(Self::Google),
             "bedrock-converse-stream" => Some(Self::Bedrock),
@@ -57,6 +59,7 @@ impl Adapter {
             Self::ChatCompletions => "openai-completions",
             Self::OpenAiResponses => "openai-responses",
             Self::AzureResponses => "azure-openai-responses",
+            Self::CodexResponses => "openai-codex-responses",
             Self::Anthropic => "anthropic-messages",
             Self::Google => "google-generative-ai",
             Self::Bedrock => "bedrock-converse-stream",
@@ -175,6 +178,16 @@ impl Provider {
             })
         };
         match adapter {
+            Adapter::CodexResponses => {
+                let token = token.ok_or_else(|| {
+                    Error::Config("no Pi Codex OAuth credential for this endpoint".into())
+                })?;
+                Ok(Client::OpenAi(pi_rs::openai::OpenAiResponses::new_codex(
+                    endpoint,
+                    token,
+                    self.id(),
+                )?))
+            }
             Adapter::OpenAiResponses => {
                 let token = token.ok_or_else(missing_key)?;
                 Ok(Client::OpenAi(if self.id() == "openai-chatgpt" {
@@ -393,6 +406,21 @@ impl Deferred {
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
             ),
+            Some(Credential::Codex) => {
+                let settings = match &self.http_settings {
+                    Some(settings) => settings.clone(),
+                    None => super::config::Settings::load(&std::env::current_dir()?, false)?,
+                };
+                Some(
+                    super::codex_auth::access(
+                        auth_path,
+                        &settings,
+                        std::time::Duration::ZERO,
+                        false,
+                    )
+                    .await?,
+                )
+            }
             Some(Credential::Copilot) => {
                 let settings = match &self.http_settings {
                     Some(settings) => settings.clone(),
@@ -492,7 +520,10 @@ impl Client {
             Self::OpenAi(_) | Self::Ollama(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
-                Adapter::OpenAiResponses | Adapter::AzureResponses | Adapter::ChatCompletions
+                Adapter::OpenAiResponses
+                    | Adapter::AzureResponses
+                    | Adapter::CodexResponses
+                    | Adapter::ChatCompletions
             ),
             _ => false,
         }
@@ -505,7 +536,10 @@ impl Client {
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
-                    Adapter::OpenAiResponses | Adapter::AzureResponses | Adapter::ChatCompletions
+                    Adapter::OpenAiResponses
+                        | Adapter::AzureResponses
+                        | Adapter::CodexResponses
+                        | Adapter::ChatCompletions
                 ) =>
             {
                 return Box::pin(client.resolve().await?.with_final_strict_support(supported))
@@ -522,6 +556,7 @@ impl Client {
                 client.adapter,
                 Adapter::OpenAiResponses
                     | Adapter::AzureResponses
+                    | Adapter::CodexResponses
                     | Adapter::ChatCompletions
                     | Adapter::Google
                     | Adapter::Anthropic
@@ -923,6 +958,7 @@ impl Client {
                     client.adapter,
                     Adapter::OpenAiResponses
                         | Adapter::AzureResponses
+                        | Adapter::CodexResponses
                         | Adapter::ChatCompletions
                         | Adapter::Google
                         | Adapter::Anthropic
@@ -1289,6 +1325,12 @@ impl Client {
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
                 let azure = client.is_azure();
+                let adapter = if azure {
+                    Adapter::AzureResponses
+                } else {
+                    args.model_profiles
+                        .model_adapter(&args.provider, &args.model)
+                };
                 let client = if azure {
                     // Older Azure reasoning models use the service default
                     // when effort is omitted and reject the literal "none".
@@ -1326,13 +1368,7 @@ impl Client {
                     .unwrap_or_default();
                 let levels = metadata
                     .as_ref()
-                    .and_then(|model| {
-                        model.levels(if azure {
-                            Adapter::AzureResponses
-                        } else {
-                            Adapter::OpenAiResponses
-                        })
-                    })
+                    .and_then(|model| model.levels(adapter))
                     .unwrap_or_else(|| pi_rs::openai::thinking_levels(&args.model));
                 let thinking = if metadata
                     .as_ref()
@@ -1363,16 +1399,24 @@ impl Client {
                 let use_developer = metadata.as_ref().and_then(|model| model.reasoning)
                     == Some(true)
                     && supports_developer != Some(false);
+                let client = if adapter == Adapter::CodexResponses {
+                    let off = metadata.as_ref().map_or(Some("none"), |model| {
+                        if model.reasoning == Some(false) {
+                            None
+                        } else {
+                            model.mapped_effort("off").unwrap_or(Some("none"))
+                        }
+                    });
+                    client.with_codex_off_effort(off)
+                } else {
+                    client
+                };
                 let client = client
                     .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_strict_tool_support(args.model_profiles.responses_strict_tool_support(
                         &args.provider,
-                        if azure {
-                            Adapter::AzureResponses
-                        } else {
-                            Adapter::OpenAiResponses
-                        },
+                        adapter,
                         metadata.as_ref(),
                     ))
                     .with_prompt_cache_key_enabled(

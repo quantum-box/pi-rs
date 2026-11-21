@@ -133,6 +133,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({}),
     },
     Builtin {
+        id: "openai-codex",
+        endpoint: pi_rs::openai::CODEX_ENDPOINT,
+        env: "",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "opencode",
         endpoint: "https://opencode.ai/inference/openai/v1/chat/completions",
         env: "OPENCODE_API_KEY",
@@ -263,6 +269,7 @@ impl Builtin {
             adapter: match self.id {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
                 "azure" => Adapter::AzureResponses,
+                "openai-codex" => Adapter::CodexResponses,
                 "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
             },
@@ -276,11 +283,18 @@ impl Builtin {
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
             (_, "azure") => None,
+            (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
                 if !matches!(
                     id,
-                    "openai" | "xai" | "meta" | "minimax" | "minimax-cn" | "vercel-ai-gateway"
+                    "openai"
+                        | "xai"
+                        | "meta"
+                        | "openai-codex"
+                        | "minimax"
+                        | "minimax-cn"
+                        | "vercel-ai-gateway"
                 ) =>
             {
                 Some(self.endpoint)
