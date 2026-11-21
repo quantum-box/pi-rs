@@ -1897,6 +1897,12 @@ limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
 
 ### Text paging checkpoint
 
+Unrestricted local `read` accepts JavaScript numbers for `offset` and `limit`.
+Fractional values and negative slice endpoints select the same lines as Pi,
+and continuation notices use the original numeric bounds. Negative endpoints
+count lines and rewind the same file while keeping memory bounded. Scoped and
+injected read tools retain positive integer paging parameters.
+
 Text reads now scan files with bounded memory, including files larger than
 4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next
 `offset`, reject offsets beyond the file, and explain when a single line

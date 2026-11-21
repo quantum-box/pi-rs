@@ -1,12 +1,12 @@
 //! Streaming text pages with Pi's line and byte limits.
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek};
 use std::path::Path;
 
 use encoding_rs::{CoderResult, UTF_8};
 use pi_rs::{CancellationToken, Error, Outcome, Result};
 use serde_json::json;
 
-use super::tool_output::{Limit, MAX_BYTES, MAX_LINES, Truncation, format_size};
+use super::tool_output::{Limit, MAX_BYTES, MAX_LINES, Truncation, format_size, js_number};
 
 pub(super) fn read(
     path: &Path,
@@ -15,24 +15,101 @@ pub(super) fn read(
     limit: Option<usize>,
     cancellation: &CancellationToken,
 ) -> Result<Outcome> {
-    let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(Error::Config("expected a regular text file".into()));
-    }
-    read_from(
-        BufReader::new(file),
-        display_path,
+    read_from(open(path)?, display_path, offset, limit, cancellation)
+}
+
+pub(super) const PI_FRACTIONAL_OVERSIZE_LINE: &str = "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received undefined";
+
+struct PiPage {
+    offset: f64,
+    start: f64,
+    end: Option<f64>,
+    counted_lines: Option<usize>,
+}
+
+pub(super) fn read_pi(
+    path: &Path,
+    display_path: &str,
+    offset: f64,
+    limit: Option<f64>,
+    cancellation: &CancellationToken,
+) -> Result<Outcome> {
+    let mut reader = open(path)?;
+    let start = (offset - 1.0).max(0.0);
+    let end = limit.map(|limit| start + limit);
+    let mut counted_lines = None;
+    let start_index = start as usize;
+    let limit = if let Some(end) = end {
+        // Array.slice interprets negative integral end positions from EOF.
+        // Count raw newlines before decoding so the retained prefix stays bounded.
+        let end_index = if end <= -1.0 {
+            let total = count_lines(&mut reader, cancellation)?;
+            reader.rewind()?;
+            counted_lines = Some(total);
+            total.saturating_sub((-end) as usize)
+        } else {
+            end as usize
+        };
+        Some(end_index.saturating_sub(start_index))
+    } else {
+        None
+    };
+    let pi = PiPage {
         offset,
+        start,
+        end,
+        counted_lines,
+    };
+    read_page(
+        reader,
+        display_path,
+        start_index,
         limit,
+        Some(pi),
         cancellation,
     )
 }
 
+fn open(path: &Path) -> Result<BufReader<std::fs::File>> {
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular text file".into()));
+    }
+    Ok(BufReader::new(file))
+}
+
+fn count_lines(reader: &mut impl BufRead, cancellation: &CancellationToken) -> Result<usize> {
+    let mut lines = 1;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok(lines);
+        }
+        lines += bytes.iter().filter(|&&byte| byte == b'\n').count();
+        let length = bytes.len();
+        reader.consume(length);
+    }
+}
+
 pub(super) fn read_from(
+    reader: impl BufRead,
+    display_path: &str,
+    offset: usize,
+    limit: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<Outcome> {
+    read_page(reader, display_path, offset, limit, None, cancellation)
+}
+
+fn read_page(
     mut reader: impl BufRead,
     display_path: &str,
     offset: usize,
     limit: Option<usize>,
+    pi: Option<PiPage>,
     cancellation: &CancellationToken,
 ) -> Result<Outcome> {
     let mut buffer = Vec::new();
@@ -81,10 +158,20 @@ pub(super) fn read_from(
             break;
         }
     }
+    if let Some(counted_lines) = pi.as_ref().and_then(|page| page.counted_lines)
+        && file_lines != counted_lines
+    {
+        return Err(Error::Config(
+            "file changed while reading; read it again".into(),
+        ));
+    }
     if offset >= file_lines {
+        let requested = pi.as_ref().map_or_else(
+            || offset.saturating_add(1).to_string(),
+            |page| js_number(page.offset),
+        );
         return Err(Error::Config(format!(
-            "Offset {} is beyond end of file ({file_lines} lines total)",
-            offset.saturating_add(1)
+            "Offset {requested} is beyond end of file ({file_lines} lines total)"
         )));
     }
 
@@ -92,12 +179,26 @@ pub(super) fn read_from(
     let truncated = total_lines > MAX_LINES || input_bytes > MAX_BYTES;
     if !truncated {
         let mut output = head.join("\n");
-        let end = offset + input_lines;
-        if end < file_lines {
+        // Pi formats continuation from the original numeric bounds, not the
+        // integer indices used by Array.slice to select the displayed lines.
+        let continuation = if let Some(page) = &pi {
+            page.end.and_then(|end| {
+                let user_limited_lines = end.min(file_lines as f64) - page.start;
+                let after_page = page.start + user_limited_lines;
+                (after_page < file_lines as f64).then(|| {
+                    (
+                        js_number(file_lines as f64 - after_page),
+                        js_number(after_page + 1.0),
+                    )
+                })
+            })
+        } else {
+            let end = offset + input_lines;
+            (end < file_lines).then(|| ((file_lines - end).to_string(), (end + 1).to_string()))
+        };
+        if let Some((remaining, next_offset)) = continuation {
             output.push_str(&format!(
-                "\n\n[{} more lines in file. Use offset={} to continue.]",
-                file_lines - end,
-                end + 1
+                "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
             ));
         }
         return Ok(Outcome::Succeeded(output));
@@ -124,23 +225,34 @@ pub(super) fn read_from(
         max_lines: MAX_LINES as u64,
         max_bytes: MAX_BYTES,
     }});
-    let start = offset + 1;
+    let start = pi.as_ref().map_or_else(
+        || (offset + 1).to_string(),
+        |page| js_number(page.start + 1.0),
+    );
     let output = if first_line_exceeds_limit {
+        if pi.as_ref().is_some_and(|page| page.start.fract() != 0.0) {
+            return Err(Error::Config(PI_FRACTIONAL_OVERSIZE_LINE.into()));
+        }
         let display_path = shell_words::quote(display_path);
         format!(
             "[Line {start} is {}, exceeds 50.0KB limit. Use bash: sed -n '{start}p' {display_path} | head -c {MAX_BYTES}]",
             format_size(first_line_bytes as u64),
         )
     } else {
-        let end = offset + head.len();
+        let (end, next_offset) = if let Some(page) = &pi {
+            let end = (page.start + 1.0) + head.len() as f64 - 1.0;
+            (js_number(end), js_number(end + 1.0))
+        } else {
+            let end = offset + head.len();
+            (end.to_string(), (end + 1).to_string())
+        };
         let reason = if matches!(truncated_by, Limit::Bytes) {
             " (50.0KB limit)"
         } else {
             ""
         };
         format!(
-            "{content}\n\n[Showing lines {start}-{end} of {file_lines}{reason}. Use offset={} to continue.]",
-            end + 1
+            "{content}\n\n[Showing lines {start}-{end} of {file_lines}{reason}. Use offset={next_offset} to continue.]"
         )
     };
     Ok(Outcome::SucceededWithDetails { output, details })
