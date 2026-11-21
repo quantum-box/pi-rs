@@ -2821,9 +2821,23 @@ mod tests {
         })
         .unwrap();
         let azure = profiles.provider("azure").unwrap();
-        assert_eq!(profiles.model_ids(&azure).len(), 45);
+        assert_eq!(profiles.model_ids(&azure).len(), 48);
         assert_eq!(profiles.model_ids(&azure)[0], "chat-latest");
         assert_eq!(profiles.azure_api_version(), "preview");
+        let model = profiles.model(&azure, "gpt-6.2-sol").unwrap();
+        assert_eq!(model.context_window, Some(1_050_000));
+        let price = model.cost.unwrap();
+        for (tokens, rate) in [(272_000, 2.0), (272_001, 4.0)] {
+            let usage = pi_rs::Usage {
+                input_tokens: tokens,
+                output_tokens: 0,
+            };
+            let cost = price
+                .estimate(usage, &pi_rs::ModelMetadata::default())
+                .unwrap();
+            let expected = rate * tokens as f64 / 1_000_000.0;
+            assert!((cost.input.as_f64().unwrap() - expected).abs() < 1e-12);
+        }
         assert_eq!(
             profiles
                 .azure_deployments()
@@ -2838,6 +2852,11 @@ mod tests {
         for (model, adapter, endpoint) in [
             (
                 "o4-mini",
+                Adapter::AzureResponses,
+                "https://configured-account.openai.azure.com/openai/v1/responses",
+            ),
+            (
+                "gpt-6.2-sol",
                 Adapter::AzureResponses,
                 "https://configured-account.openai.azure.com/openai/v1/responses",
             ),
