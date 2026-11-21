@@ -417,19 +417,95 @@ impl Agent<'_> {
             .await
     }
 
-    /// Move queued input into a settled session before starting a queued continuation.
+    /// Move queued input into a settled session synchronously.
+    /// Use [Self::apply_queued_inputs_with_lifecycle] to run asynchronous user-message hooks.
     pub fn apply_queued_inputs(
         &self,
         session: &mut Session,
         observer: &mut Observer<'_>,
     ) -> Result<bool> {
-        if resumable_compaction_run(session).is_some() {
-            return Err(Error::Session(
-                "pending compaction recovery must be resumed before applying queued input".into(),
-            ));
+        ensure_queued_inputs_can_apply(session)?;
+        apply_inputs(session, true, observer)
+    }
+
+    /// Deliver queued input before starting a queued continuation, awaiting message hooks.
+    pub async fn apply_queued_inputs_with_lifecycle(
+        &self,
+        session: &mut Session,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        ensure_queued_inputs_can_apply(session)?;
+        self.deliver_inputs(session, true, cancel, observer).await
+    }
+
+    /// Append a validated multimodal prompt before a correlated run, awaiting message hooks.
+    /// The caller publishes the committed entry when its run observer is ready.
+    pub async fn append_prompt_with_images(
+        &self,
+        session: &mut Session,
+        content: String,
+        images: Vec<crate::ImageContent>,
+        input_id: Uuid,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
         }
         ensure_settled(session.operations())?;
-        apply_inputs(session, true, observer)
+        let event = Session::user_input_event(content, images, Some(input_id))?;
+        let event = self.edit_user_event(session, event, observer).await;
+        session.append(event)?;
+        Ok(())
+    }
+
+    async fn edit_user_event(
+        &self,
+        session: &mut Session,
+        event: Event,
+        observer: &mut Observer<'_>,
+    ) -> Event {
+        match crate::message_hooks::MessageHooks::for_session(
+            self.registry,
+            session,
+            self.limits.model_timeout,
+        ) {
+            Some(mut hooks) => {
+                let event = hooks.user(event).await;
+                hooks.report_errors(observer);
+                event
+            }
+            None => event,
+        }
+    }
+
+    async fn deliver_inputs(
+        &self,
+        session: &mut Session,
+        include_followups: bool,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        let mut accepted = false;
+        for event in pending_input_events(session, include_followups) {
+            if cancel.is_cancelled() {
+                if accepted {
+                    notify_queue(session, observer);
+                }
+                return Err(Error::Cancelled);
+            }
+            let mut event = event?;
+            if matches!(event, Event::User { .. } | Event::UserWithImages { .. }) {
+                event = self.edit_user_event(session, event, observer).await;
+            }
+            commit(session, event, observer)?;
+            accepted = true;
+        }
+        if accepted {
+            notify_queue(session, observer);
+        }
+        Ok(accepted)
     }
 
     /// A repeated initial submission never starts a second run. Passing no
@@ -1326,14 +1402,15 @@ impl Agent<'_> {
                 }
             }
             if let Some((id, content)) = input {
-                commit(
-                    session,
-                    Event::User {
-                        content,
-                        input_id: Some(id),
-                    },
-                    observer,
-                )?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                let event = Event::User {
+                    content,
+                    input_id: Some(id),
+                };
+                let event = self.edit_user_event(session, event, observer).await;
+                commit(session, event, observer)?;
             }
             // Only messages queued before this run's initial user entry belong to it.
             // This also covers image prompts and avoids consuming newly queued next-turn
@@ -1372,7 +1449,8 @@ impl Agent<'_> {
         let mut pending = pending_reply(session, run_id);
         queue_inputs(session, followups, observer)?;
         if pending.is_none() && !recovering_compaction {
-            apply_inputs(session, false, observer)?;
+            self.deliver_inputs(session, false, cancel, observer)
+                .await?;
         }
         let current_entries: std::collections::HashSet<_> = session
             .current_message_entries()
@@ -1416,7 +1494,7 @@ impl Agent<'_> {
             if recovering_compaction {
                 self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
             }
-            if !apply_inputs(session, true, observer)? {
+            if !self.deliver_inputs(session, true, cancel, observer).await? {
                 if !recovering_compaction {
                     self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
                 }
@@ -1431,7 +1509,7 @@ impl Agent<'_> {
                     | Event::CustomMessageDelivered { .. }
             ) && current_entries.contains(&record.id)
         }) {
-            apply_inputs(session, true, observer)?;
+            self.deliver_inputs(session, true, cancel, observer).await?;
         }
 
         let mut runtime_registry = self.registry.clone();
@@ -1702,7 +1780,9 @@ impl Agent<'_> {
                     allowance,
                 )
             } else {
-                apply_inputs(session, false, observer)?;
+                active
+                    .deliver_inputs(session, false, cancel, observer)
+                    .await?;
                 let max_output_tokens = active.limits.output_tokens_per_request.min(budget);
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
@@ -2188,17 +2268,23 @@ impl Agent<'_> {
                 if cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
-                if apply_inputs(session, false, observer)? {
+                let compact_agent = Agent {
+                    registry: &runtime_registry,
+                    system_prompt: &runtime_prompt,
+                    model: self.model,
+                    model_name: self.model_name,
+                    limits: self.limits.clone(),
+                };
+                if compact_agent
+                    .deliver_inputs(session, false, cancel, observer)
+                    .await?
+                {
                     continue;
                 }
-                if !apply_inputs(session, true, observer)? {
-                    let compact_agent = Agent {
-                        registry: &runtime_registry,
-                        system_prompt: &runtime_prompt,
-                        model: self.model,
-                        model_name: self.model_name,
-                        limits: self.limits.clone(),
-                    };
+                if !compact_agent
+                    .deliver_inputs(session, true, cancel, observer)
+                    .await?
+                {
                     compact_agent
                         .compact_silent_overflow(
                             session, run_id, &states, cancel, observer, followups,
@@ -7320,11 +7406,19 @@ fn apply_settled_after_turn(session: &mut Session, observer: &mut Observer<'_>) 
     Ok(())
 }
 
-fn apply_inputs(
-    session: &mut Session,
+fn ensure_queued_inputs_can_apply(session: &Session) -> Result<()> {
+    if resumable_compaction_run(session).is_some() {
+        return Err(Error::Session(
+            "pending compaction recovery must be resumed before applying queued input".into(),
+        ));
+    }
+    ensure_settled(session.operations())
+}
+
+fn pending_input_events(
+    session: &Session,
     include_followups: bool,
-    observer: &mut Observer<'_>,
-) -> Result<bool> {
+) -> impl Iterator<Item = Result<Event>> + use<> {
     enum Pending {
         User(QueuedMessage),
         Custom(crate::QueuedCustomMessage),
@@ -7352,24 +7446,25 @@ fn apply_inputs(
             _ => {}
         }
     }
-    let mut accepted = false;
+    let steer_mode = session.queue_mode(InputKind::Steer);
+    let followup_mode = session.queue_mode(InputKind::FollowUp);
     let mut seen = HashSet::new();
-    for message in pending {
+    pending.into_iter().filter_map(move |message| {
         let kind = match &message {
             Pending::User(message) => message.input.kind,
             Pending::Custom(message) => match message.delivery {
                 crate::CustomMessageDelivery::Steer => InputKind::Steer,
                 crate::CustomMessageDelivery::FollowUp => InputKind::FollowUp,
-                _ => continue,
+                _ => return None,
             },
         };
         if !include_followups && kind == InputKind::FollowUp {
-            continue;
+            return None;
         }
-        if session.queue_mode(kind) == crate::QueueMode::OneAtATime
-            && !seen.insert(kind == InputKind::Steer)
-        {
-            continue;
+        let steering = kind == InputKind::Steer;
+        let mode = if steering { steer_mode } else { followup_mode };
+        if mode == crate::QueueMode::OneAtATime && !seen.insert(steering) {
+            return None;
         }
         let event = match message {
             Pending::Custom(input) => Event::CustomMessageDelivered {
@@ -7377,7 +7472,9 @@ fn apply_inputs(
                 message: input.message,
             },
             Pending::User(message) => {
-                message.validate()?;
+                if let Err(error) = message.validate() {
+                    return Some(Err(error));
+                }
                 if message.images.is_empty() {
                     Event::User {
                         content: message.input.content,
@@ -7392,7 +7489,18 @@ fn apply_inputs(
                 }
             }
         };
-        commit(session, event, observer)?;
+        Some(Ok(event))
+    })
+}
+
+fn apply_inputs(
+    session: &mut Session,
+    include_followups: bool,
+    observer: &mut Observer<'_>,
+) -> Result<bool> {
+    let mut accepted = false;
+    for event in pending_input_events(session, include_followups) {
+        commit(session, event?, observer)?;
         accepted = true;
     }
     if accepted {

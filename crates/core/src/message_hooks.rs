@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::time::{Instant, timeout};
 use crate::{
-    Extension, ExtensionState, Message, Notification, Observer, Registry, Session, ToolCall,
+    Event, Extension, ExtensionState, Message, Notification, Observer, Registry, Session, ToolCall,
     ToolCallDelta,
 };
 
@@ -55,7 +55,7 @@ pub enum MessageStatus {
     Aborted,
 }
 
-/// Assistant messages observed by a native extension.
+/// User and assistant messages observed by a native extension.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -167,6 +167,85 @@ impl MessageHooks {
             },
         )
         .await;
+    }
+
+    pub(crate) async fn user(&mut self, mut event: Event) -> Event {
+        let (input_id, message) = match &event {
+            Event::User { content, input_id } => (
+                *input_id,
+                Message::User {
+                    content: content.clone(),
+                },
+            ),
+            Event::UserWithImages {
+                content,
+                images,
+                input_id,
+            } => (
+                *input_id,
+                Message::UserWithImages {
+                    content: content.clone(),
+                    images: images.clone(),
+                },
+            ),
+            _ => return event,
+        };
+        self.observe(
+            Phase::TerminalStart,
+            &MessageLifecycleEvent::Start {
+                message: message.clone(),
+            },
+        )
+        .await;
+        let mut end = MessageLifecycleEvent::End {
+            message,
+            status: MessageStatus::Complete,
+        };
+        for index in 0..self.handlers.len() {
+            let Some(replacement) = self.invoke(index, Phase::End, &end).await else {
+                continue;
+            };
+            let candidate = match (&event, &replacement) {
+                (Event::User { .. }, Message::User { content }) if !content.trim().is_empty() => {
+                    Event::User {
+                        content: content.clone(),
+                        input_id,
+                    }
+                }
+                (
+                    Event::UserWithImages { images, .. },
+                    Message::UserWithImages {
+                        content,
+                        images: updated,
+                    },
+                ) if images == updated => Event::UserWithImages {
+                    content: content.clone(),
+                    images: updated.clone(),
+                    input_id,
+                },
+                _ => {
+                    self.record_failure(index, Phase::End, "message_end must retain the user role and image attachments and leave a sendable message".into(), false);
+                    continue;
+                }
+            };
+            if serde_json::to_vec(&candidate)
+                .is_ok_and(|bytes| bytes.len() <= crate::journal::MAX_USER_EVENT_BYTES)
+            {
+                event = candidate;
+                end = MessageLifecycleEvent::End {
+                    message: replacement,
+                    status: MessageStatus::Complete,
+                };
+            } else {
+                self.record_failure(
+                    index,
+                    Phase::End,
+                    "message_end user text exceeds the input size limit".into(),
+                    false,
+                );
+            }
+        }
+        event
     }
 
     pub(crate) async fn update(&mut self, parts: &[String], update: AssistantMessageUpdate) {
@@ -359,10 +438,10 @@ mod tests {
         ) -> ExtensionResult<Option<Message>> {
             let mut log = self.log.lock().unwrap();
             match event {
-                MessageLifecycleEvent::Start { message } => {
-                    assert!(
-                        matches!(message, Message::Assistant { content, .. } if content.is_empty())
-                    );
+                MessageLifecycleEvent::Start {
+                    message: Message::Assistant { content, .. },
+                } => {
+                    assert!(content.is_empty());
                     log.push("start".into());
                 }
                 MessageLifecycleEvent::Update {
@@ -375,17 +454,14 @@ mod tests {
                     log.push(format!("extension:{delta}"));
                 }
                 MessageLifecycleEvent::End {
-                    message,
+                    message:
+                        Message::Assistant {
+                            content,
+                            calls,
+                            replay: None,
+                        },
                     status: MessageStatus::Complete,
                 } => {
-                    let Message::Assistant {
-                        content,
-                        calls,
-                        replay: None,
-                    } = message
-                    else {
-                        panic!("expected portable assistant message");
-                    };
                     log.push(format!("end:{content}"));
                     if self.id == "grow" {
                         return Ok(Some(assistant("replacement ".repeat(1024), calls.clone())));
@@ -655,7 +731,12 @@ mod tests {
                 event: &MessageLifecycleEvent,
                 _: Option<&ExtensionState>,
             ) -> ExtensionResult<Option<Message>> {
-                if matches!(event, MessageLifecycleEvent::Start { .. }) {
+                if matches!(
+                    event,
+                    MessageLifecycleEvent::Start {
+                        message: Message::Assistant { .. }
+                    }
+                ) {
                     std::future::pending().await
                 } else {
                     Ok(None)
@@ -679,14 +760,16 @@ mod tests {
                 _: Option<&ExtensionState>,
             ) -> ExtensionResult<Option<Message>> {
                 match event {
-                    MessageLifecycleEvent::Start { .. } => self.0.lock().unwrap().push("start"),
+                    MessageLifecycleEvent::Start {
+                        message: Message::Assistant { .. },
+                    } => self.0.lock().unwrap().push("start"),
                     MessageLifecycleEvent::End {
                         status: MessageStatus::Failed,
                         ..
                     } => {
                         self.0.lock().unwrap().push("failed");
                     }
-                    _ => panic!("unexpected event {event:?}"),
+                    _ => {}
                 }
                 Ok(None)
             }
@@ -820,6 +903,246 @@ mod tests {
         .await
         .unwrap();
         assert!(started.elapsed() < model_timeout);
+    }
+
+    #[tokio::test]
+    async fn native_user_message_hooks_edit_initial_and_queued_prompts_before_commit() {
+        struct UserHook(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait::async_trait]
+        impl Extension for UserHook {
+            fn id(&self) -> &str {
+                "user"
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                match event {
+                    MessageLifecycleEvent::Start {
+                        message: Message::User { content },
+                    } => {
+                        self.0.lock().unwrap().push(format!("start:{content}"));
+                        Ok(Some(Message::User {
+                            content: "ignored at start".into(),
+                        }))
+                    }
+                    MessageLifecycleEvent::End {
+                        message: Message::User { content },
+                        status: MessageStatus::Complete,
+                    } => {
+                        self.0.lock().unwrap().push(format!("end:{content}"));
+                        Ok(Some(Message::User {
+                            content: format!("{content}/edited"),
+                        }))
+                    }
+                    _ => Ok(None),
+                }
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(UserHook(log.clone()))).unwrap();
+        let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let run_id = uuid::Uuid::new_v4();
+        let followup_id = uuid::Uuid::new_v4();
+        let (tx, mut inputs) = tokio::sync::mpsc::channel(1);
+        tx.send(crate::QueuedInput {
+            id: followup_id,
+            kind: crate::InputKind::FollowUp,
+            content: "follow-up".into(),
+        })
+        .await
+        .unwrap();
+        let mut committed = Vec::new();
+        agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                Some("initial".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |notification| {
+                    if let Notification::Committed(record) = notification
+                        && let Event::User {
+                            content,
+                            input_id: Some(id),
+                        } = &record.event
+                    {
+                        log.lock().unwrap().push(format!("commit:{content}"));
+                        committed.push(*id);
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed, [run_id, followup_id]);
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "start:initial",
+                "end:initial",
+                "commit:initial/edited",
+                "start:follow-up",
+                "end:follow-up",
+                "commit:follow-up/edited",
+            ]
+        );
+        assert!(session.queued_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_user_message_cancellation_leaves_later_prompts_queued() {
+        struct StopDelivery(CancellationToken);
+
+        #[async_trait::async_trait]
+        impl Extension for StopDelivery {
+            fn id(&self) -> &str {
+                "stop-delivery"
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                if let MessageLifecycleEvent::Start {
+                    message: Message::User { content },
+                } = event
+                {
+                    assert_eq!(content, "first");
+                    self.0.cancel();
+                }
+                Ok(None)
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(StopDelivery(cancel.clone())))
+            .unwrap();
+        let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let first = crate::QueuedInput::from("first".to_owned());
+        let second = crate::QueuedInput::from("second".to_owned());
+        for input in [first.clone(), second.clone()] {
+            session.append(Event::InputQueued { input }).unwrap();
+        }
+        let delivery = agent
+            .apply_queued_inputs_with_lifecycle(&mut session, &cancel, &mut |_| {})
+            .await;
+        assert!(matches!(delivery, Err(crate::Error::Cancelled)));
+        assert_eq!(
+            session.queued_inputs(),
+            [crate::QueuedMessage::from(second)]
+        );
+        assert!(
+            matches!(&session.records().last().unwrap().event, Event::User { input_id: Some(id), .. } if *id == first.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_user_message_hooks_preserve_original_images_and_report_rejected_edits() {
+        struct ImageHook(&'static str);
+
+        #[async_trait::async_trait]
+        impl Extension for ImageHook {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                let MessageLifecycleEvent::End {
+                    message: Message::UserWithImages { content, images },
+                    status: MessageStatus::Complete,
+                } = event
+                else {
+                    return Ok(None);
+                };
+                assert_eq!(content, "original");
+                let images = if self.0 == "strip" {
+                    Vec::new()
+                } else {
+                    images.clone()
+                };
+                Ok(Some(Message::UserWithImages {
+                    content: "edited".into(),
+                    images,
+                }))
+            }
+        }
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ImageHook("strip"))).unwrap();
+        registry.register(Arc::new(ImageHook("edit"))).unwrap();
+        let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let image = crate::ImageContent {
+            mime_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        };
+        let id = uuid::Uuid::new_v4();
+        let mut errors = 0;
+        agent
+            .append_prompt_with_images(
+                &mut session,
+                "original".into(),
+                vec![image.clone()],
+                id,
+                &CancellationToken::new(),
+                &mut |notification| {
+                    if matches!(
+                        notification,
+                        Notification::ExtensionLifecycleError {
+                            event: "message_end",
+                            ..
+                        }
+                    ) {
+                        errors += 1;
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(errors, 1);
+        assert!(
+            matches!(&session.records().last().unwrap().event, Event::UserWithImages { content, input_id: Some(input_id), images } if content == "edited" && *input_id == id && images == &[image])
+        );
     }
 
     #[test]

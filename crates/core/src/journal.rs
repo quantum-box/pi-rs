@@ -670,6 +670,8 @@ pub struct Session {
     poisoned: bool,
 }
 
+pub(crate) const MAX_USER_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
 impl Session {
     pub fn supports_record_metadata(&self) -> bool {
         self.store.supports_record_metadata()
@@ -2195,6 +2197,16 @@ impl Session {
         input_id: Option<Uuid>,
     ) -> Result<()> {
         ensure_settled(self.operations())?;
+        let event = Self::user_input_event(content, images, input_id)?;
+        self.append(event)?;
+        Ok(())
+    }
+
+    pub(crate) fn user_input_event(
+        content: String,
+        images: Vec<crate::ImageContent>,
+        input_id: Option<Uuid>,
+    ) -> Result<Event> {
         if content.trim().is_empty() && images.is_empty() {
             return Err(Error::Config("empty user input".into()));
         }
@@ -2210,11 +2222,10 @@ impl Session {
                 input_id,
             }
         };
-        if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
+        if serde_json::to_vec(&event)?.len() > MAX_USER_EVENT_BYTES {
             return Err(Error::Config("user input exceeds size limit".into()));
         }
-        self.append(event)?;
-        Ok(())
+        Ok(event)
     }
 
     pub fn queued_custom_messages(&self) -> Vec<(u64, crate::QueuedCustomMessage)> {

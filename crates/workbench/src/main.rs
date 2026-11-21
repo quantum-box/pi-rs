@@ -2516,7 +2516,7 @@ async fn execute(
             if session.records().iter().any(|record| record.run_id == Some(run_id) || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)) {
                 return Err(Error::DuplicateRun(run_id));
             }
-            session.append_user_with_images(input.take().unwrap_or_default(), images, Some(run_id))?;
+            agent.append_prompt_with_images(&mut session, input.take().unwrap_or_default(), images, run_id, &cancel, &mut observer).await?;
             session.records().last()
         };
         if args.mode == Some(OutputMode::Json) {

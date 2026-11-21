@@ -1417,12 +1417,12 @@ pub trait Extension: Send + Sync {
         false
     }
 
-    /// Opt in to assistant message starts, streaming updates, and final messages.
+    /// Opt in to user and assistant message boundaries and assistant streaming updates.
     fn handles_message_lifecycle(&self) -> bool {
         false
     }
 
-    /// A completed message may be replaced with a message of the same role.
+    /// A completed message may be edited while retaining its role and associated data.
     async fn message_lifecycle(
         &self,
         _event: &crate::MessageLifecycleEvent,

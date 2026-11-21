@@ -4387,6 +4387,19 @@ edited text while billing retains measured usage. Failed and aborted
 attempts receive transient start and end notifications when needed. Executable extensions advertise
 `message_lifecycle_hook`. Summary requests stay outside the hook.
 
+User prompts emit `message_start` and `message_end` before delivery, including
+image prompts, steering and follow-ups in the SDK and Workbench. A
+`message_end` edit changes the text sent to the model and saved in the journal.
+Native edits retain the input ID, message role and validated attachments.
+Consuming a queued input and saving its final text share one journal record.
+If cancellation arrives during a message callback, that delivery can finish
+and subsequent inputs remain queued. An interruption before the journal
+append can replay callbacks for an undelivered input. Initial text callbacks
+run before the model turn starts. Multimodal prompts are staged before the
+correlated run and emit their callbacks at staging time.
+Rust hosts applying queued inputs outside a run can await
+`Agent::apply_queued_inputs_with_lifecycle` to dispatch these hooks.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
