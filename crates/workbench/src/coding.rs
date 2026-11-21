@@ -2407,20 +2407,6 @@ fn image_omission(mime: &str, reason: &str) -> Value {
     json!({"content":[{"type":"text", "text":format!("Read image file [{mime}]\n{reason}")}]})
 }
 
-fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'static>> {
-    let locale = locale
-        .split(['.', '@'])
-        .next()
-        .unwrap_or_default()
-        .replace('_', "-");
-    let locale = locale
-        .parse::<icu_locale_core::Locale>()
-        .map(icu_collator::CollatorPreferences::from)
-        .unwrap_or_default();
-    icu_collator::Collator::try_new(locale, Default::default())
-        .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
-}
-
 fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: bool) -> Error {
     #[cfg(unix)]
     if unrestricted && error.raw_os_error() == Some(libc::EACCES) {
@@ -2432,13 +2418,6 @@ fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: b
     #[cfg(not(unix))]
     let _ = (requested, unrestricted);
     Error::Config(format!("Cannot read directory: {error}"))
-}
-
-fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
-    ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .into_iter()
-        .find_map(&mut get)
-        .unwrap_or_default()
 }
 
 fn is_ecmascript_whitespace(character: char) -> bool {
@@ -3206,8 +3185,10 @@ impl CodingTool {
                 .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
             entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
-        let locale = directory_locale(|key| std::env::var(key).ok());
-        let collator = directory_collator(&locale)?;
+        let locale = crate::locale::select(|key| std::env::var(key).ok());
+        let collator = crate::locale::collator(&locale).map_err(|error| {
+            Error::Config(format!("Cannot initialize directory collation: {error}"))
+        })?;
         entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
         let mut listing = crate::tool_output::Listing::new();
         let mut result_count = 0usize;
@@ -6948,7 +6929,7 @@ mod tests {
     #[test]
     fn directory_collation_matches_pi_for_punctuation_and_local_accents() {
         let sort = |locale, mut names: Vec<&'static str>| {
-            let collator = directory_collator(locale).unwrap();
+            let collator = crate::locale::collator(locale).unwrap();
             names.sort_by(|left, right| {
                 collator.compare(&left.to_lowercase(), &right.to_lowercase())
             });
@@ -6978,7 +6959,7 @@ mod tests {
     #[test]
     fn directory_locale_uses_node_message_locale_precedence() {
         let select = |all: Option<&str>, messages: Option<&str>, lang: Option<&str>| {
-            directory_locale(|key| match key {
+            crate::locale::select(|key| match key {
                 "LC_ALL" => all.map(str::to_owned),
                 "LC_MESSAGES" => messages.map(str::to_owned),
                 "LANG" => lang.map(str::to_owned),
@@ -6996,7 +6977,8 @@ mod tests {
         assert_eq!(select(None, None, Some("en_US.UTF-8")), "en_US.UTF-8");
         assert_eq!(select(Some(""), Some("sv_SE.UTF-8"), None), "");
         let collator =
-            directory_collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8"))).unwrap();
+            crate::locale::collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")))
+                .unwrap();
         assert!(collator.compare("z", "ä").is_lt());
     }
 
