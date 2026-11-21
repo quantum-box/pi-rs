@@ -1,9 +1,11 @@
 //! Native extensions whose state follows the durable session branch.
 pub mod codemode;
+mod event_bus;
 mod exec;
 mod json_size;
 mod process;
 pub mod tool_search;
+pub use event_bus::{EventSubscription, ExtensionEventBus};
 pub use exec::{ExecOptions, ExecResult, exec_command};
 pub use process::{ExecutableExtension, extension_flag, serve_extension};
 use std::sync::Arc;
