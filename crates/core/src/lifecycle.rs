@@ -335,7 +335,28 @@ pub async fn notify(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) {
-    notify_inner(registry, event, states, timeout, observer, None, None).await;
+    notify_filtered(registry, event, states, timeout, observer, |_| true).await;
+}
+
+#[doc(hidden)]
+pub async fn notify_filtered(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    mut include: impl FnMut(&str) -> bool + Send,
+) {
+    notify_inner(
+        registry,
+        event,
+        states,
+        timeout,
+        (observer, &mut include),
+        None,
+        None,
+    )
+    .await;
 }
 
 pub(crate) async fn notify_with_host(
@@ -346,7 +367,16 @@ pub(crate) async fn notify_with_host(
     observer: &mut Observer<'_>,
     host: std::sync::Arc<dyn crate::ToolHost>,
 ) {
-    notify_inner(registry, event, states, timeout, observer, Some(host), None).await;
+    notify_inner(
+        registry,
+        event,
+        states,
+        timeout,
+        (observer, &mut |_| true),
+        Some(host),
+        None,
+    )
+    .await;
 }
 
 pub(crate) async fn notify_idle_with_host(
@@ -418,12 +448,13 @@ pub(crate) async fn notify_session_compaction_with_host(
         }
     };
     {
+        let mut include_all = |_: &str| true;
         let future = notify_inner(
             registry,
             event,
             &states,
             timeout,
-            &mut collect,
+            (&mut collect, &mut include_all),
             Some(host),
             compaction,
         );
@@ -577,7 +608,7 @@ async fn notify_inner(
     event: LifecycleEvent,
     states: &ExtensionStates,
     timeout: Duration,
-    observer: &mut Observer<'_>,
+    (observer, include): (&mut Observer<'_>, &mut (dyn FnMut(&str) -> bool + Send)),
     host: Option<std::sync::Arc<dyn crate::ToolHost>>,
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
@@ -612,6 +643,9 @@ async fn notify_inner(
             crate::sdk::scope_extension_callback(
                 host.as_ref().and_then(|host| host.callback_scope_owner()),
                 async {
+                    if !include(extension.id()) {
+                        return Ok(());
+                    }
                     match &host {
                         Some(host) => {
                             let scoped = crate::sdk::scope_callback_host(

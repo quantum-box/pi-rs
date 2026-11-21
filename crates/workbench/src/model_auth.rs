@@ -90,6 +90,13 @@ impl Credential {
     }
 
     pub async fn resolve(&self) -> Result<String> {
+        self.resolve_with_cleanup(None).await
+    }
+
+    pub(super) async fn resolve_with_cleanup(
+        &self,
+        cleanup: Option<&pi_rs_workbench::process_cleanup::Children>,
+    ) -> Result<String> {
         let value = match self {
             Self::Literal(value) | Self::Bearer(value) => return Ok(value.clone()),
             Self::BedrockProfile(_) | Self::BedrockChain => {
@@ -118,7 +125,7 @@ impl Credential {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::meta_auth::access(&settings, None, false).await;
             }
-            Self::Command(command) => resolve_command(command).await,
+            Self::Command(command) => resolve_command(command, cleanup).await,
             Self::StoredCommand(command) => {
                 let cell = STORED_COMMANDS
                     .lock()
@@ -126,15 +133,20 @@ impl Credential {
                     .entry(command.clone())
                     .or_default()
                     .clone();
-                cell.get_or_init(|| resolve_command(command)).await.clone()
+                cell.get_or_init(|| resolve_command(command, cleanup))
+                    .await
+                    .clone()
             }
         };
         value.map_err(|message| Error::Config(message.into()))
     }
 }
 
-async fn resolve_command(command: &str) -> CommandResult {
-    let value = pi_rs_workbench::mcp::resolve_value(command)
+async fn resolve_command(
+    command: &str,
+    cleanup: Option<&pi_rs_workbench::process_cleanup::Children>,
+) -> CommandResult {
+    let value = pi_rs_workbench::mcp::resolve_value_with_cleanup(command, cleanup)
         .await
         .map_err(|_| "Model credential command failed")?;
     if !valid_key(&value) {

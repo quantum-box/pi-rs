@@ -94,7 +94,7 @@ pub struct McpOAuthAddOptions {
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
-    Ok(configurations_with_project_scope(args, false)?.0)
+    Ok(configurations_with_project_scope(args, ConfigurationRead::Runtime)?.0)
 }
 
 type ScopedConfigurations = (
@@ -112,7 +112,18 @@ fn valid_server_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
 }
 
-fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedConfigurations> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigurationRead {
+    Runtime,
+    Share,
+    Report,
+}
+
+fn configurations_with_project_scope(
+    args: &Cli,
+    mode: ConfigurationRead,
+) -> Result<ScopedConfigurations> {
+    let validate_shape = mode != ConfigurationRead::Runtime;
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
         return Ok((
             BTreeMap::new(),
@@ -126,7 +137,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
     let user_path = config::agent_dir().join("mcp.json");
     let user = match config::read_object(&user_path) {
         Ok(user) => user,
-        Err(_) if strict => {
+        Err(_) if validate_shape => {
             configuration_errors.push(format!(
                 "{}: could not read or parse MCP configuration",
                 user_path.display()
@@ -135,7 +146,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
         }
         Err(error) => return Err(error),
     };
-    if strict
+    if validate_shape
         && user
             .get("mcpServers")
             .is_some_and(|value| !value.is_object())
@@ -150,7 +161,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    if strict {
+    if mode == ConfigurationRead::Report {
         servers.retain(|name, value| {
             if !valid_server_name(name) || report_server_config(value).is_none() {
                 configuration_errors.push(format!(
@@ -170,7 +181,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
         let project_path = args.workspace.join(".pi/mcp.json");
         let project = match config::read_object(&project_path) {
             Ok(project) => project,
-            Err(_) if strict => {
+            Err(_) if validate_shape => {
                 configuration_errors.push(format!(
                     "{}: could not read or parse MCP configuration",
                     project_path.display()
@@ -179,7 +190,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
             }
             Err(error) => return Err(error),
         };
-        if strict
+        if validate_shape
             && project
                 .get("mcpServers")
                 .is_some_and(|value| !value.is_object())
@@ -191,7 +202,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
         }
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
             let mut entries = entries.clone();
-            if strict {
+            if mode == ConfigurationRead::Report {
                 entries.retain(|name, entry| {
                     let full = ["command", "url", "type"]
                         .iter()
@@ -392,13 +403,14 @@ pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
 }
 
 pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtension>>> {
-    Ok(discover(args, report, false).await?.connected)
+    Ok(discover(args, report, false, None).await?.connected)
 }
 
 #[derive(Default)]
 pub(super) struct Discovery {
     pub connected: Vec<Arc<McpExtension>>,
     pub sign_in: Vec<PendingSignIn>,
+    pub skipped_disabled: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -408,11 +420,48 @@ pub(super) struct PendingSignIn {
     pub challenge: Option<String>,
 }
 
-pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Result<Discovery> {
+pub(super) async fn discover(
+    args: &Cli,
+    report: bool,
+    interactive: bool,
+    share_services: Option<&super::runtime::ShareServices<'_>>,
+) -> Result<Discovery> {
+    let require_complete = share_services.is_some();
+    let mode = if require_complete {
+        ConfigurationRead::Share
+    } else {
+        ConfigurationRead::Runtime
+    };
+    let (servers, _, _, _, configuration_errors) = configurations_with_project_scope(args, mode)?;
+    if !configuration_errors.is_empty() {
+        return Err(Error::Config(format!(
+            "Invalid MCP configuration for Radius share: {}",
+            configuration_errors.join("\n"),
+        )));
+    }
+    let mut discovery = Discovery::default();
+    let mut failed = false;
     let mut normalized = BTreeSet::new();
     let mut pending = Vec::new();
-    for (name, value) in configurations(args)? {
-        if !normalized.insert(name.replace('-', "_")) {
+    for (name, value) in servers {
+        let normalized_name = name.replace('-', "_");
+        if require_complete {
+            let id = format!("mcp-{normalized_name}");
+            if args.disable_extension.contains(&id) {
+                discovery.skipped_disabled.insert(id);
+                continue;
+            }
+            if value["enabled"] == false {
+                continue;
+            }
+            if !valid_server_name(&name) || report_server_config(&value).is_none() {
+                failed = true;
+                eprintln!("MCP {name}: invalid configuration");
+                continue;
+            }
+        }
+        if !normalized.insert(normalized_name) {
+            failed = true;
             if report {
                 output(
                     json!({"type":"mcp_server","name":name,"status":"invalid","error":"server name collides after normalization"}),
@@ -425,6 +474,7 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
         let config = match serde_json::from_value::<ServerConfig>(value) {
             Ok(config) => config,
             Err(error) => {
+                failed = true;
                 if report {
                     output(
                         json!({"type":"mcp_server","name":name,"status":"invalid","error":error.to_string()}),
@@ -443,11 +493,10 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
         }
         let args = args.clone();
         pending.push(async move {
-            let result = connect(&args, &name, &config).await;
+            let result = connect_for_discovery(&args, &name, &config, share_services).await;
             (name, config, result)
         });
     }
-    let mut discovery = Discovery::default();
     for (name, config, result) in futures_util::future::join_all(pending).await {
         match result {
             Ok(extension) => {
@@ -466,6 +515,7 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
                 });
             }
             Err(error) => {
+                failed = true;
                 if report {
                     output(
                         json!({"type":"mcp_server","name":name,"status":"error","error":error.to_string()}),
@@ -476,17 +526,37 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
             }
         }
     }
+    if require_complete && failed {
+        futures_util::future::join_all(discovery.connected.iter().map(|server| server.close()))
+            .await;
+        return Err(Error::Config(
+            "MCP discovery failed while preparing Radius share".into(),
+        ));
+    }
     Ok(discovery)
 }
 
 async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExtension> {
+    connect_for_discovery(args, name, server, None).await
+}
+
+async fn connect_for_discovery(
+    args: &Cli,
+    name: &str,
+    server: &ServerConfig,
+    share_services: Option<&super::runtime::ShareServices<'_>>,
+) -> Result<McpExtension> {
     use pi_rs_workbench::mcp::TokenResolver;
     let resolver: Option<TokenResolver> = server.auth.as_ref().map(|auth| {
         let args = args.clone();
         let provider = auth.provider.clone();
+        let share_refresh = share_services.map(|services| services.refresh.clone());
+        let cleanup = share_services.map(|services| services.processes.clone());
         Arc::new(move || {
             let mut args = args.clone();
             let provider = provider.clone();
+            let share_refresh = share_refresh.clone();
+            let cleanup = cleanup.clone();
             Box::pin(async move {
                 args.model_profiles = super::model_profiles::Profiles::load()?;
                 args.model_keys = super::model_auth::Keys::load_async().await?;
@@ -499,7 +569,7 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
                     args.model_profiles.endpoint(&provider)
                 };
                 let token = match args.model_credential_for(&provider, endpoint) {
-                    Some(source) => Some(source.resolve().await?),
+                    Some(source) => Some(source.resolve_with_cleanup(cleanup.as_ref()).await?),
                     None => None,
                 };
                 if token.is_some() || provider != super::Provider::Radius {
@@ -510,16 +580,21 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
                 if gateway.model_endpoint().as_str() != endpoint {
                     return Ok(None);
                 }
-                gateway.access(std::time::Duration::from_secs(60)).await
+                let min_validity = std::time::Duration::from_secs(60);
+                match share_refresh {
+                    Some(refresh) => refresh.access(gateway, min_validity).await,
+                    None => gateway.access(min_validity).await,
+                }
             }) as futures_util::future::BoxFuture<'static, Result<Option<String>>>
         }) as TokenResolver
     });
-    McpExtension::connect_with_proxy_hosts(
+    McpExtension::connect_with_owned_stdio(
         name,
         server,
         &args.workspace,
         resolver,
         Some(super::http_proxy::configured_mcp(&args.settings)?),
+        share_services.map(|services| &services.processes),
     )
     .await
 }
@@ -578,7 +653,7 @@ async fn list_json(args: &Cli) -> Result<()> {
 
     let mut errors = Vec::new();
     let (servers, project_definitions, project_overrides, order, config_errors) =
-        match configurations_with_project_scope(args, true) {
+        match configurations_with_project_scope(args, ConfigurationRead::Report) {
             Ok(configurations) => configurations,
             Err(error) => {
                 errors.push(error.to_string());
@@ -983,7 +1058,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     &scopes,
                     Some(&http_options),
                     deadline,
-                    &args.mcp_login_cancel,
+                    &args.command_cancel,
                     announce,
                 )
                 .await?;
@@ -996,7 +1071,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     &scopes,
                     Some(&http_options),
                     deadline,
-                    &args.mcp_login_cancel,
+                    &args.command_cancel,
                     announce,
                 )
                 .await?;
@@ -1009,7 +1084,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     &scopes,
                     Some(&http_options),
                     deadline,
-                    &args.mcp_login_cancel,
+                    &args.command_cancel,
                     announce,
                 )
                 .await?;
@@ -1044,7 +1119,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
         }
         McpCommand::Logout { name, local } => {
             let (servers, project_definitions, _, _, _) =
-                configurations_with_project_scope(args, false)?;
+                configurations_with_project_scope(args, ConfigurationRead::Runtime)?;
             if local && !project_definitions.contains(&name) {
                 return Err(Error::Config(format!(
                     "MCP server {name} is not configured in the trusted project"

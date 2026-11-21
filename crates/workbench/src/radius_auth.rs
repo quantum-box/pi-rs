@@ -1,9 +1,11 @@
 //! OAuth and endpoint-bound credential storage for the Radius gateway.
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use pi_rs::{Error, Result};
+use pi_rs::{CancellationToken, Error, Result};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -326,7 +328,39 @@ impl Gateway {
         require_minimum: bool,
         before_barrier: impl FnOnce() + Send + 'static,
     ) -> Result<Option<(String, String)>> {
-        let value = super::config::read_auth_object(&path).await?;
+        let admission = RefreshCancellation::default();
+        self.access_with_admission_at(
+            path,
+            min_validity,
+            require_minimum,
+            before_barrier,
+            admission.0.clone(),
+        )
+        .await
+    }
+
+    pub(super) async fn access_with_admission(
+        &self,
+        min_validity: Duration,
+        admission: Arc<RefreshAdmission>,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .access_with_admission_at(auth_path(), min_validity, false, || {}, admission)
+            .await?
+            .map(|(token, _)| token))
+    }
+
+    async fn access_with_admission_at(
+        &self,
+        path: PathBuf,
+        min_validity: Duration,
+        require_minimum: bool,
+        before_barrier: impl FnOnce() + Send + 'static,
+        admission: Arc<RefreshAdmission>,
+    ) -> Result<Option<(String, String)>> {
+        let value = admission
+            .until_cancelled(super::config::read_auth_object(&path))
+            .await?;
         let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };
@@ -337,8 +371,12 @@ impl Gateway {
         if credential.expires > now().saturating_add(min_validity) {
             return Ok(Some(credential.access()));
         }
-        let radius_guard = auth_lock_at(path.parent().expect("auth parent")).await?;
-        let guard = super::auth_lock::acquire_async(&path).await?;
+        let radius_guard = admission
+            .until_cancelled(auth_lock_at(path.parent().expect("auth parent")))
+            .await?;
+        let guard = admission
+            .until_cancelled(super::auth_lock::acquire_async(&path))
+            .await?;
         let value = super::config::read_object_unlocked(&path)?;
         let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
@@ -348,13 +386,11 @@ impl Gateway {
             return Ok(Some(credential.access()));
         }
         let gateway = self.clone();
-        let cancellation = RefreshCancellation::new();
-        let state = cancellation.0.clone();
         let previous = value["radius"].clone();
         tokio::task::spawn_blocking(move || {
             let _radius_guard = radius_guard;
             before_barrier();
-            let barrier = RefreshCancellation::enter(&state)?;
+            let barrier = admission.enter()?;
             let guard = super::process::guard_refresh_auth(barrier, guard);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -596,33 +632,68 @@ impl Gateway {
     }
 }
 
-// Dropping the caller cancels a queued exchange, but an admitted exchange
-// owns the refresh and its locks until the rotated credential is persisted.
-struct RefreshCancellation(std::sync::Arc<std::sync::atomic::AtomicU8>);
+// Cancellation and admission race on this state. Once admitted, the refresh
+// owns its locks through persistence even when its caller has been cancelled.
+#[derive(Default)]
+pub(super) struct RefreshAdmission {
+    state: AtomicU8,
+    cancelled: CancellationToken,
+}
 
-impl RefreshCancellation {
-    fn new() -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+impl RefreshAdmission {
+    const QUEUED: u8 = 0;
+    const ADMITTED: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    pub(super) fn cancel(&self) {
+        if self
+            .state
+            .compare_exchange(
+                Self::QUEUED,
+                Self::CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.cancelled.cancel();
+        }
     }
 
-    fn enter(state: &std::sync::atomic::AtomicU8) -> Result<super::process::RefreshBarrier> {
-        use std::sync::atomic::Ordering;
-        let barrier =
-            super::process::refresh_barrier_cancellable(|| state.load(Ordering::SeqCst) == 2)?
-                .ok_or(Error::Cancelled)?;
-        state
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+    async fn until_cancelled<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            _ = self.cancelled.cancelled() => Err(Error::Cancelled),
+            result = operation => result,
+        }
+    }
+
+    fn enter(&self) -> Result<super::process::RefreshBarrier> {
+        let barrier = super::process::refresh_barrier_cancellable(|| {
+            self.state.load(Ordering::SeqCst) == Self::CANCELLED
+        })?
+        .ok_or(Error::Cancelled)?;
+        self.state
+            .compare_exchange(
+                Self::QUEUED,
+                Self::ADMITTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .map_err(|_| Error::Cancelled)?;
         Ok(barrier)
     }
 }
 
+#[derive(Default)]
+struct RefreshCancellation(Arc<RefreshAdmission>);
+
 impl Drop for RefreshCancellation {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        let _ = self
-            .0
-            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
+        self.0.cancel();
     }
 }
 

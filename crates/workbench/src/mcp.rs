@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
+use crate::process_cleanup::Children;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -509,6 +510,19 @@ impl McpExtension {
         provider_token: Option<TokenResolver>,
         http_options: Option<HttpOptionsWithProxyHosts>,
     ) -> Result<Self> {
+        Self::connect_with_owned_stdio(name, config, workspace, provider_token, http_options, None)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn connect_with_owned_stdio(
+        name: &str,
+        config: &ServerConfig,
+        workspace: &Path,
+        provider_token: Option<TokenResolver>,
+        http_options: Option<HttpOptionsWithProxyHosts>,
+        owned_stdio: Option<&Children>,
+    ) -> Result<Self> {
         if name.is_empty()
             || !name
                 .bytes()
@@ -595,7 +609,7 @@ impl McpExtension {
                 identity.update([0]);
             }
             for (key, value) in &config.env {
-                let value = resolve_value(value).await?;
+                let value = resolve_value_with_cleanup(value, owned_stdio).await?;
                 identity.update(json!([key, value]).to_string());
                 process.env(key, value);
             }
@@ -608,14 +622,26 @@ impl McpExtension {
             );
             process.kill_on_drop(true);
             let wrapped = wrap_process(process);
-            let transport = TokioChildProcess::new(wrapped)?;
-            tokio::time::timeout(
-                timeout.min(Duration::from_secs(10)),
-                NativeClient::default().serve_with_lifecycle(transport, lifecycle),
-            )
-            .await
-            .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
-            .map_err(|error| Error::Config(format!("MCP {name} initialization failed: {error}")))?
+            let initialize = async {
+                let service = match owned_stdio {
+                    Some(owner) => {
+                        NativeClient::default()
+                            .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
+                            .await
+                    }
+                    None => {
+                        NativeClient::default()
+                            .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
+                            .await
+                    }
+                };
+                service.map_err(|error| {
+                    Error::Config(format!("MCP {name} initialization failed: {error}"))
+                })
+            };
+            tokio::time::timeout(timeout.min(Duration::from_secs(10)), initialize)
+                .await
+                .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))??
         } else if let Some(url) = &config.url {
             if config
                 .transport
@@ -640,7 +666,7 @@ impl McpExtension {
                 let name: reqwest_mcp::header::HeaderName = name
                     .parse()
                     .map_err(|_| Error::Config("invalid MCP header name".into()))?;
-                let resolved = resolve_value(value).await?;
+                let resolved = resolve_value_with_cleanup(value, owned_stdio).await?;
                 identity.update(json!([name.as_str(), resolved]).to_string());
                 let value = resolved
                     .parse()
@@ -1781,6 +1807,32 @@ impl Tool for McpTool {
         }
     }
 }
+fn owned_stdio_transport(
+    mut command: process_wrap::tokio::CommandWrap,
+    owner: &Children,
+) -> Result<
+    rmcp::transport::async_rw::AsyncRwTransport<
+        RoleClient,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStdin,
+    >,
+> {
+    use std::process::Stdio;
+    command
+        .command_mut()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let (_, (stdout, stdin)) = owner.spawn(command, |child| {
+        (
+            child.stdout().take().expect("piped MCP stdout"),
+            child.stdin().take().expect("piped MCP stdin"),
+        )
+    })?;
+    Ok(rmcp::transport::async_rw::AsyncRwTransport::new(
+        stdout, stdin,
+    ))
+}
+
 fn wrap_process(process: tokio::process::Command) -> process_wrap::tokio::CommandWrap {
     let mut wrapped = process_wrap::tokio::CommandWrap::from(process);
     #[cfg(unix)]
@@ -1818,6 +1870,11 @@ fn expand_home(value: &str) -> String {
         .unwrap_or_else(|| value.into())
 }
 pub async fn resolve_value(value: &str) -> Result<String> {
+    resolve_value_with_cleanup(value, None).await
+}
+
+#[doc(hidden)]
+pub async fn resolve_value_with_cleanup(value: &str, cleanup: Option<&Children>) -> Result<String> {
     if let Some(command) = value.strip_prefix('!') {
         let mut process = if cfg!(windows) {
             let mut command = tokio::process::Command::new("cmd");
@@ -1834,32 +1891,34 @@ pub async fn resolve_value(value: &str) -> Result<String> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        let mut child = wrap_process(process).spawn()?;
+        let local = Children::default();
+        let owner = cleanup.unwrap_or(&local);
+        let (process, stdout) = owner.spawn(wrap_process(process), |child| {
+            child.stdout().take().expect("piped credential output")
+        })?;
         let operation = async {
+            let limit = 64 * 1024;
             let mut output = Vec::new();
-            child
-                .stdout()
-                .take()
-                .expect("piped credential output")
-                .take(64 * 1024 + 1)
-                .read_to_end(&mut output)
-                .await?;
-            if output.len() > 64 * 1024 {
-                Box::into_pin(child.kill()).await?;
+            stdout.take(limit + 1).read_to_end(&mut output).await?;
+            if output.len() as u64 > limit {
                 return Err(Error::Config(
                     "credential command output exceeds limit".into(),
                 ));
             }
-            if !child.wait().await?.success() {
+            if !process.wait().await?.success() {
                 return Err(Error::Config("credential command failed".into()));
             }
             String::from_utf8(output)
                 .map(|value| value.trim().into())
                 .map_err(|_| Error::Config("credential command returned non-UTF-8".into()))
         };
-        return tokio::time::timeout(Duration::from_secs(10), operation)
+        let result = tokio::time::timeout(Duration::from_secs(10), operation)
             .await
-            .map_err(|_| Error::Config("credential command timed out".into()))?;
+            .unwrap_or_else(|_| Err(Error::Config("credential command timed out".into())));
+        let reaped = local.finish().await;
+        let output = result?;
+        reaped?;
+        return Ok(output);
     }
 
     let expression =

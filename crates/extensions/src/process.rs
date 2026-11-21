@@ -667,20 +667,42 @@ pub struct ExecutableExtension {
 }
 impl ExecutableExtension {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let executable = path.as_ref().canonicalize()?;
+        let endpoint = Self::describe_endpoint(path.as_ref())?;
+        let description =
+            call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
+        Self::from_description(endpoint, description)
+    }
+
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self> {
+        let endpoint = Self::describe_endpoint(path.as_ref())?;
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let (endpoint, description) = tokio::task::spawn_blocking(move || {
+            let description = call(&endpoint, ProtocolRequest::Describe, Some(&cancelled))
+                .map_err(Error::Config)?;
+            Ok::<_, Error>((endpoint, description))
+        })
+        .await
+        .map_err(|error| Error::Config(format!("native extension discovery failed: {error}")))??;
+        Self::from_description(endpoint, description)
+    }
+
+    fn describe_endpoint(path: &Path) -> Result<Endpoint> {
+        let executable = path.canonicalize()?;
         if !executable.is_file() {
             return Err(Error::Config("extension executable must be a file".into()));
         }
-        let endpoint = Endpoint {
+        Ok(Endpoint {
             path: executable,
             flags: None,
             pi_lifecycle_fields: false,
             compaction_overflow_reason_v1: false,
             text_result_v2: false,
             structured_text_result: false,
-        };
-        let description =
-            call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
+        })
+    }
+
+    fn from_description(endpoint: Endpoint, description: Description) -> Result<Self> {
         let mut extension = Self {
             endpoint,
             description,
@@ -2675,6 +2697,9 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
         return Err("native extension operation cancelled".into());
     }
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
+    if cancellation.is_cancelled() {
+        return Err("native extension operation cancelled".into());
+    }
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
     let (writer, writes) = std::sync::mpsc::sync_channel::<Value>(1);
@@ -2707,22 +2732,21 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             }
         }
     });
-    writer
-        .send(
-            serde_json::to_value(DuplexRequest {
-                request,
-                tools: host.tools(),
-                has_ui: host.has_ui(),
-                has_progress: host.supports_progress(),
-                has_custom_messages: host.supports_custom_messages(),
-                has_custom_entries: host.supports_custom_entries(),
-                has_custom_entry_read: host.supports_custom_entry_read(),
-                has_keyed_messages: host.supports_keyed_messages(),
-                has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
-            })
-            .map_err(|error| error.to_string())?,
-        )
-        .map_err(|_| "native extension input closed")?;
+    let send = |value| send_duplex_input(&writer, value, cancellation);
+    send(
+        serde_json::to_value(DuplexRequest {
+            request,
+            tools: host.tools(),
+            has_ui: host.has_ui(),
+            has_progress: host.supports_progress(),
+            has_custom_messages: host.supports_custom_messages(),
+            has_custom_entries: host.supports_custom_entries(),
+            has_custom_entry_read: host.supports_custom_entry_read(),
+            has_keyed_messages: host.supports_keyed_messages(),
+            has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
+        })
+        .map_err(|error| error.to_string())?,
+    )?;
     loop {
         if cancellation.is_cancelled() {
             return Err(
@@ -2741,9 +2765,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                         result = host.custom_entries(custom_type.as_deref()) => result,
                     }
                 });
-                writer
-                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::AppendEntry { entry })) => {
                 let response = runtime.block_on(async {
@@ -2753,9 +2775,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                         result = host.append_entry(entry) => result,
                     }
                 });
-                writer
-                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::SendMessage {
                 message,
@@ -2769,15 +2789,17 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                         result = async { match key { Some(key) => host.send_message_with_key(message, delivery, &key).await, None => host.send_message(message, delivery).await } } => result,
                     }
                 });
-                writer
-                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::Progress { partial_result })) => {
-                let response = runtime.block_on(host.report_progress(partial_result));
-                writer
-                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during progress notification".to_owned()),
+                        result = host.report_progress(partial_result) => result,
+                    }
+                });
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::CheckedCall { calls })) => {
                 if calls.len() > 4096 {
@@ -2805,9 +2827,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                     .into_iter()
                     .map(|result| endpoint.project_outcome(&result))
                     .collect();
-                writer
-                    .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                send(serde_json::to_value(results).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::Call { .. })) => unreachable!("call frames are prevalidated"),
             Ok(Ok(DuplexFrame::Ui { request })) => {
@@ -2818,9 +2838,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                         result = host.ui(request) => result,
                     }
                 });
-                writer
-                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::Complete { response })) => {
                 let result = serde_json::from_value(response?)
@@ -2833,6 +2851,28 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 return Err("native extension output closed".into());
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn send_duplex_input(
+    writer: &std::sync::mpsc::SyncSender<Value>,
+    mut value: Value,
+    cancellation: &CancellationToken,
+) -> ExtensionResult<()> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err("native extension operation cancelled while writing input".into());
+        }
+        match writer.try_send(value) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err("native extension input closed".into());
+            }
+            Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                value = pending;
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 }
@@ -3286,6 +3326,9 @@ fn call<T: serde::de::DeserializeOwned>(
         return Err("native extension operation cancelled".into());
     }
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err("native extension operation cancelled".into());
+    }
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
     let (writer, written) = std::sync::mpsc::sync_channel(1);
@@ -3302,6 +3345,7 @@ fn call<T: serde::de::DeserializeOwned>(
         let _ = reader.send(result);
     });
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut completed_write = false;
     let mut completed_read = None;
     let status = loop {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -3326,35 +3370,28 @@ fn call<T: serde::de::DeserializeOwned>(
             }
             completed_read = Some(bytes);
         }
-        if let Some(status) = child
-            .process
-            .try_wait()
-            .map_err(|error| error.to_string())?
+        if !completed_write && let Ok(result) = written.try_recv() {
+            result.map_err(|error| error.to_string())?;
+            completed_write = true;
+        }
+        // Keep the group leader's PID until both protocol pipes have finished.
+        // If a descendant is holding either pipe, cancellation must still be
+        // able to signal that owned process group.
+        if completed_write
+            && completed_read.is_some()
+            && let Some(status) = child
+                .process
+                .try_wait()
+                .map_err(|error| error.to_string())?
         {
+            child.finished = true;
             break status;
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    written
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "extension input writer timed out")?
-        .map_err(|error| error.to_string())?;
-    let bytes = match completed_read {
-        Some(bytes) => bytes,
-        None => read
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| "extension output reader timed out")?
-            .map_err(|error| error.to_string())?,
-    };
-    child.finished = true;
+    let bytes = completed_read.expect("response collected before waiting for exit");
     if !status.success() {
         return Err(format!("native extension exited with {status}"));
-    }
-    if bytes.len() as u64 > response_limit {
-        return Err(format!(
-            "native extension response exceeds {} MiB",
-            response_limit / (1024 * 1024)
-        ));
     }
     let envelope: Envelope = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension response: {error}"))?;
@@ -4171,11 +4208,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelled_extension_write_returns_with_a_full_queue() {
+        let (writer, _reader) = std::sync::mpsc::sync_channel(1);
+        writer.try_send(Value::Null).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = send_duplex_input(&writer, Value::Null, &cancellation).unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+    }
+
+    #[test]
     fn cancelled_extension_request_does_not_spawn_process() {
         let endpoint = Endpoint {
             path: std::env::temp_dir().join("pi-cancelled-extension-does-not-exist"),
             flags: None,
             pi_lifecycle_fields: false,
+            compaction_overflow_reason_v1: false,
             text_result_v2: false,
             structured_text_result: false,
         };

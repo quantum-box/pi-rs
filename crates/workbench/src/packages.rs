@@ -1,4 +1,5 @@
 //! Native Rust package installation and resource discovery.
+use pi_rs_workbench::process_cleanup::{Children, owns_kill_target};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -72,7 +73,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
     match command {
         PackageCommand::Install { source, local } => {
             let source = normalize(&source, &args.workspace)?;
-            install(&source, args.offline).await?;
+            install(&source, args.offline, None).await?;
             let settings = if local {
                 args.workspace.join(".pi/settings.json")
             } else {
@@ -147,7 +148,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     .as_ref()
                     .is_none_or(|requested| source_identity(requested) == source_identity(&source))
                 {
-                    install(&source, args.offline).await?;
+                    install(&source, args.offline, None).await?;
                     output(json!({"type":"package_updated","source":display_source(&source)}));
                 }
             }
@@ -171,6 +172,10 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
 }
 
 pub async fn prepare(args: &Cli) -> Result<()> {
+    prepare_with_cleanup(args, None).await
+}
+
+pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>) -> Result<()> {
     let mut installed = index()?;
     let mut plan = resource_declarations(args, false)?;
     plan.extend(resource_declarations(args, true)?);
@@ -200,11 +205,13 @@ pub async fn prepare(args: &Cli) -> Result<()> {
                 "Preparing native package {}",
                 display_source(&declaration.source)
             );
-            match install(&declaration.source, args.offline).await {
+            match install(&declaration.source, args.offline, cleanup).await {
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
-                Err(error) if declaration.transient && !cached => return Err(error),
+                Err(error) if cleanup.is_some() || (declaration.transient && !cached) => {
+                    return Err(error);
+                }
                 Err(error) => eprintln!("Package {}: {error}", display_source(&declaration.source)),
             }
         }
@@ -1633,7 +1640,7 @@ fn remote(source: &str) -> bool {
     source.starts_with("cargo:") || source.starts_with("git:")
 }
 
-async fn install(source: &str, offline: bool) -> Result<Installed> {
+async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Result<Installed> {
     if offline && remote(source) {
         return Err(Error::Config(format!(
             "cannot install package in offline mode: {}",
@@ -1665,7 +1672,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
     let _lock = lock;
     if !remote(source) && Path::new(source).is_file() {
         let executable = PathBuf::from(source);
-        pi_rs_extensions::ExecutableExtension::load(&executable)?;
+        pi_rs_extensions::ExecutableExtension::load_async(&executable).await?;
         let root = executable.parent().unwrap_or(Path::new(".")).to_path_buf();
         let package = Installed {
             source: source.into(),
@@ -1707,7 +1714,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         if let Some(version) = version {
             command.args(["--version", version]);
         }
-        let artifacts = run(command, source).await?;
+        let artifacts = run(command, source, cleanup).await?;
         root = artifacts
             .split(|byte| *byte == b'\n')
             .filter_map(|line| {
@@ -1746,20 +1753,20 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             command
                 .args(["clone", "--no-checkout", "--depth", "1", "--", url])
                 .arg(&root);
-            run(command, source).await?;
+            run(command, source, cleanup).await?;
         }
         let mut fetch = tokio::process::Command::new("git");
         fetch
             .arg("-C")
             .arg(&root)
             .args(["fetch", "--depth", "1", "--", "origin", reference]);
-        run(fetch, source).await?;
+        run(fetch, source, cleanup).await?;
         let mut checkout = tokio::process::Command::new("git");
         checkout
             .arg("-C")
             .arg(&root)
             .args(["reset", "--hard", "FETCH_HEAD"]);
-        run(checkout, source).await?;
+        run(checkout, source, cleanup).await?;
     }
     if root.is_file() {
         installed_binaries.push(root.clone());
@@ -1790,7 +1797,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
                 "--manifest-path",
             ])
             .arg(root.join("Cargo.toml"));
-        let metadata: Value = serde_json::from_slice(&run(metadata, source).await?)?;
+        let metadata: Value = serde_json::from_slice(&run(metadata, source, cleanup).await?)?;
         let expected_manifest = root.join("Cargo.toml").canonicalize()?;
         if let Some(package) = metadata["packages"].as_array().and_then(|packages| {
             packages.iter().find(|package| {
@@ -1826,7 +1833,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             if offline {
                 build.arg("--offline");
             }
-            let artifacts = run(build, source).await?;
+            let artifacts = run(build, source, cleanup).await?;
             for line in artifacts.split(|byte| *byte == b'\n') {
                 if let Ok(artifact) = serde_json::from_slice::<Value>(line)
                     && artifact["reason"] == "compiler-artifact"
@@ -1851,7 +1858,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
     let pi = manifest_pi(&manifest)?;
     let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
-        pi_rs_extensions::ExecutableExtension::load(executable.to_string_lossy().as_ref())?;
+        pi_rs_extensions::ExecutableExtension::load_async(executable).await?;
     }
     let retain_generation = root.starts_with(generation.path())
         || resources
@@ -2455,22 +2462,30 @@ fn package_command_failed(source: &str, status: &str, stderr: &[u8]) -> Error {
 
 // Tokio's kill-on-drop only terminates the direct child on Unix. Keep the
 // process-wrap child so cancellation also signals its still-live group.
-struct PackageChildGuard {
-    child: Box<dyn process_wrap::tokio::ChildWrapper>,
-    finished: bool,
+struct PackageChildGuard<'a> {
+    child: Option<Box<dyn process_wrap::tokio::ChildWrapper>>,
+    cleanup: Option<&'a Children>,
 }
 
-impl Drop for PackageChildGuard {
+impl Drop for PackageChildGuard<'_> {
     fn drop(&mut self) {
-        // Once the direct child has been reaped, its numeric process group ID
-        // can be reused. Do not signal that ID after ownership is lost.
-        if !self.finished && self.child.id().is_some() {
-            let _ = self.child.start_kill();
+        if let Some(mut child) = self.child.take()
+            && owns_kill_target(child.as_ref())
+        {
+            if let Some(cleanup) = self.cleanup {
+                cleanup.adopt(child);
+            } else {
+                let _ = child.start_kill();
+            }
         }
     }
 }
 
-async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u8>> {
+async fn run(
+    mut command: tokio::process::Command,
+    source: &str,
+    cleanup: Option<&Children>,
+) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2482,12 +2497,13 @@ async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u
     #[cfg(windows)]
     wrapped.wrap(process_wrap::tokio::JobObject);
     wrapped.wrap(process_wrap::tokio::KillOnDrop);
-    let mut child = PackageChildGuard {
-        child: wrapped.spawn()?,
-        finished: false,
+    let mut process = PackageChildGuard {
+        child: Some(wrapped.spawn()?),
+        cleanup,
     };
-    let stdout = child.child.stdout().take().expect("stdout");
-    let stderr = child.child.stderr().take().expect("stderr");
+    let child = process.child.as_mut().expect("owned child");
+    let stdout = child.stdout().take().expect("stdout");
+    let stderr = child.stderr().take().expect("stderr");
     let (status, (stdout, overflow), (stderr, _)) =
         tokio::time::timeout(Duration::from_secs(1200), async {
             // Keep the group leader unreaped until all inherited output pipes
@@ -2495,12 +2511,12 @@ async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u
             // reused while a descendant still holds either pipe.
             let (stdout, stderr) =
                 tokio::try_join!(capture(stdout, 8 * 1024 * 1024), capture(stderr, 64 * 1024))?;
-            let status = child.child.wait().await.map_err(Error::from)?;
+            let status = child.wait().await.map_err(Error::from)?;
             Ok::<_, Error>((status, stdout, stderr))
         })
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
-    child.finished = true;
+    process.child.take();
     if !status.success() {
         return Err(package_command_failed(source, &status.to_string(), &stderr));
     }
@@ -3154,7 +3170,7 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             .enable_all()
             .build()
             .unwrap();
-        let package = runtime.block_on(install(&source, false)).unwrap();
+        let package = runtime.block_on(install(&source, false, None)).unwrap();
         assert_eq!(package.resources.extensions, vec![PathBuf::from(&source)]);
         assert!(package.resources.themes.is_empty());
         assert!(package.resources.prompts.is_empty());
@@ -3276,7 +3292,7 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
                 "PI_PACKAGE_TEST_ADDRESS",
                 listener.local_addr().unwrap().to_string(),
             );
-        let task = tokio::spawn(run(command, "test"));
+        let task = tokio::spawn(run(command, "test", None));
         let _cleanup = AbortOnDrop(task.abort_handle());
         let (mut parent, parent_pid, mut child, child_pid) =
             tokio::time::timeout(Duration::from_secs(45), async {
@@ -4861,7 +4877,7 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
     #[tokio::test]
     async fn git_userinfo_keeps_safe_offline_diagnostic() {
         let source = "git:ssh://git@example.invalid/org/repo@stable";
-        let error = match install(source, true).await {
+        let error = match install(source, true, None).await {
             Ok(_) => panic!("offline install unexpectedly succeeded"),
             Err(error) => error.to_string(),
         };
@@ -4885,10 +4901,14 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             command
         };
         command.current_dir(std::env::temp_dir());
-        let error = run(command, "git:ssh://private-user@example.invalid/org/repo")
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = run(
+            command,
+            "git:ssh://private-user@example.invalid/org/repo",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("subprocess output redacted"), "{error}");
         assert!(!error.contains("private-user"), "{error}");
     }

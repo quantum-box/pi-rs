@@ -4013,8 +4013,11 @@ Radius again or explicitly log out. Never remove a lock held by a live process.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
-network request; this does not provide a separate refresh broker or a bounded
-standalone-share shutdown.
+network request. Standalone Radius share owns its refreshes in the CLI process
+during both MCP preparation and upload authorization. It seals queued work
+on interruption or when the phase ends, waits for admitted exchanges through
+their final write, and reports a failed write even if MCP reports a generic
+authentication error.
 The [pinned upstream OAuth resolver](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/ai/src/auth/resolve.ts)
 also completes and persists an admitted refresh despite caller cancellation.
 Upstream admits it under the credential-store lock and bounds the exchange to
@@ -4313,16 +4316,22 @@ its entry projection. If a request's journal entry and context are not yet
 paired, the upload proceeds without metadata. Refreshed runtime prompts and
 tool catalogs remain selected after the run settles; summary requests do not replace
 the active context. The metadata is not written to the journal, and the 128 MiB share limit includes
-it. Gist sharing continues to export HTML. Standalone `pi share` constructs an
-idle runtime and resolves the branch's effective context on an in-memory copy,
-without appending records to the source journal. Standalone preparation runs in
-the calling task and waits for configuration and discovery to finish; it has no
-metadata deadline, and synchronous filesystem operations cannot be interrupted
-until they return. This avoids abandoning a preparation worker after a timeout.
-An already-started credential refresh may finish to preserve rotated credentials.
-Standalone Radius sharing reports preparation errors before upload, including
-missing model credentials and pending project trust. Interactive Radius sharing
-can still upload when runtime metadata is unavailable.
+it. Gist sharing continues to export HTML. Standalone `pi share` builds an
+idle runtime against an in-memory copy of the source journal. It uses the
+branch's effective system prompt and the runtime's active tool catalog.
+Missing model credentials, pending project trust, enabled MCP discovery
+failures, and failed extension preparation stop the command before upload.
+Interactive Radius sharing can still upload when runtime metadata is
+unavailable.
+
+Standalone preparation has a 60-second deadline for runtime setup and
+discovery. Ctrl-C and the deadline stop preparation and prevent upload.
+Completed runtime setup is followed by session shutdown and connection
+cleanup. Active package commands, stdio MCP servers and MCP credential
+commands are terminated and reaped on interruption. On Unix, process-group
+cleanup covers descendants that remain in an active owned group. Native
+executable requests use process groups on Unix and Job Objects on Windows. Filesystem calls, owned process cleanup and admitted
+credential writes can extend the elapsed time past the preparation deadline.
 Idle journal reads run on a detached thread, while active shares use the in-memory
 snapshot; only one read can be outstanding. Journal preparation runs outside worker
 locks and validates the captured version before publication. Transient streaming
