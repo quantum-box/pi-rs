@@ -45,6 +45,8 @@ streamed reasoning and replay it as text before the answer for the same model.
 
 Gemini streaming retains the first nonempty, bounded response ID for the turn
 and reports it before completion so a handled interruption can record it.
+Gemini sends failed tool results in `functionResponse.response.error` and
+successful results in `functionResponse.response.output`, matching Pi.
 
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
@@ -136,7 +138,7 @@ with an optional thinking suffix applied to the selected models.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt and explicit-directory context resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted prompt, context, skill, template and theme resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Package and extension loading, model/auth factories and remaining Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -419,10 +421,18 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
-### OpenCode Zen classifiers
+### OpenCode Zen and Go
 
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
+
+OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
+using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+Completions or Responses route. Session requests include `x-opencode-session`
+unless configuration supplies the header explicitly. Endpointless saved keys
+apply to the official routes for the corresponding provider. Gemini prepared
+requests also accept an empty tool list. Live inference
+with a Zen or Go account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
@@ -479,9 +489,9 @@ form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
 
-RPC startup ignores ordinary positional messages, as Pi does; it accepts
-prompts through stdin. Both reject `@file` arguments in RPC mode, with
-different diagnostic wording.
+RPC startup ignores ordinary positional messages and accepts prompts through
+stdin. The root CLI rejects `@file` arguments in RPC mode before loading
+settings and prints Pi's diagnostic to stderr.
 
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
@@ -529,11 +539,12 @@ submitted while a turn is active cannot yet execute immediately. A normal model 
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
-`toolcall_start` includes the ID and tool name available at that point. Native
-does not yet expose Pi's top-level live usage in `message_update`; provider
-usage currently reaches the stream only on completion. Native retains the cumulative
-`message` and `partial` snapshots as extensions; unlike Pi's compact wire
-format, update size therefore grows with streamed content. Fragmented provider
+`toolcall_start` includes the ID and tool name available at that point.
+JSON and RPC `message_update` events include Pi's top-level `usage` object.
+Its counters start at zero and use the reported totals once the provider
+finishes. Providers that report usage incrementally in Pi can therefore expose
+nonzero counts earlier there. Native retains cumulative `message` and `partial`
+snapshots, which grow with streamed content. Fragmented provider
 IDs or names can be incomplete in `toolcall_start`; the final call is authoritative.
 Failed live assistant messages include a fixed `errorMessage` based on the
 native failure classification, including cancellation and retryable failures.
@@ -891,8 +902,10 @@ expanding a quoted prompt argument before the model request.
 
 `pi mcp list --json` emits one JSON document with server state, source,
 transport, tool names, per-tool exposure overrides, and resource capability.
-Invalid entries are reported in `errors`; enabled connection failures cause a
-nonzero exit. An invalid trusted project override currently fails the merged
+Invalid entries are reported in `errors`. Both forms of `pi mcp list` report
+a non-boolean `autoEnableCodemode` with its configuration file path, keep
+listing the servers, and exit with a failure status. Enabled connection
+failures also cause a nonzero exit. An invalid trusted project override currently fails the merged
 configuration as a whole, preserving pi-rs's existing override validation.
 Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
@@ -2239,7 +2252,10 @@ editor for implemented model defaults, resource lists, native packages, tool
 selection, trust defaults, terminal mode and codemode settings. Ctrl+S validates
 and saves, Escape discards the edit. Invalid values keep the editor open and
 show the failing settings path. The selected setting includes an explanatory
-hint below the searchable list. Unrecognized extension-owned keys survive
+hint below the searchable list. Values stay in the same column as the list
+is filtered. On narrow terminals, short rows can use less padding to keep
+their values visible. The selected row uses Pi's arrow and accent color, and other
+values use the muted theme color. Unrecognized extension-owned keys survive
 updates. Runtime/resource changes take effect on reload or the next startup,
 and theme changes apply immediately.
 
@@ -3072,6 +3088,8 @@ CLI's ignore-file behavior instead of unconditionally excluding `node_modules`
 and `.git`. Git ignore rules also apply outside repositories. Basename patterns
 use smart case; patterns containing a slash match full paths with the reference's
 implicit `**/` prefix. Results use forward slashes and sorted output.
+Unrestricted local `find` uses fd's diagnostics for missing or non-directory
+search roots and invalid glob patterns. Search-root validation comes first.
 
 Result and byte limits use the reference CLI's combined notices and complete-line
 50 KB cutoff. Tests cover directories, case-sensitive uppercase patterns,
@@ -5391,8 +5409,10 @@ fractions, exponents, and leading minus signs cut off at EOF. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
 For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
 control after a surrogate in another string if no other parse error occurs first.
-Other malformed JSON retains the native parser's diagnostics; full
-malformed-input parity remains open.
+Malformed object property names and separators, object trailing commas, missing
+array separators and trailing text after a complete JSON value also use Pi's
+position-aware wording. Other malformed records, including array trailing
+commas, retain the native parser's diagnostics.
 
 ### Shell execution transcript checkpoint
 
@@ -5617,3 +5637,23 @@ comparing effective routes. Unconfigured and override-only models must resolve
 to the selected route. When they do, they retain provider-default or
 Gemini-version inference. Standalone Google SDK capability overrides remain
 endpoint-wide.
+
+### Combined native SDK resource snapshots
+
+`pi_rs_workbench::resource_factory::ResourceFactory` loads system prompts,
+context files, skill metadata, prompt templates, and themes together using the
+host's current file and directory grants. The returned snapshot preserves the
+paths exposed by the individual loaders, including skill diagnostics, and
+a failed load leaves the previous snapshot and session usable. Grants require
+absolute paths without parent components and include symlink targets. Hosts
+should run the synchronous load off the UI thread.
+
+`ResourceSnapshot::apply` sets the system prompt on a host-owned
+`SessionBuilder`. With a custom preamble, it follows Pi v1.5.0's order and
+format for the addendum, project context, skills, and working directory. The
+host supplies the default preamble with any tool and documentation sections,
+chooses the skill reader based on its tool loadout, and handles template
+invocation and theme selection. This factory uses explicit grants. Pi's default
+loader also discovers settings and packages, loads extensions, and rebuilds
+the structured prompt during a session. Native hosts can explicitly apply a
+fresh prompt to an idle session with `AgentSession::set_system_prompt`.

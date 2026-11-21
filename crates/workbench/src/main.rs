@@ -1447,6 +1447,14 @@ async fn run_cli() -> i32 {
             }
         }
         args.thinking_explicit = args.thinking.is_some();
+        if args.command.is_none()
+            && args.mode == Some(OutputMode::Rpc)
+            && args.prompt.iter().any(|argument| argument.starts_with('@'))
+        {
+            eprintln!("Error: @file arguments are not supported in RPC mode");
+            cli_exit_code = 1;
+            return Ok(());
+        }
         if let Some(Command::Auth { command }) = args.command.as_ref() {
             if matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine) {
                 return Err(Error::Config(
