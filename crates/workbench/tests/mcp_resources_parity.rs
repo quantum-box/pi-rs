@@ -291,7 +291,11 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
             let Outcome::Structured { data, .. } = result else {
                 panic!("unexpected cursor page {result:?}")
             };
-            assert_eq!(data["nextCursor"], cursor);
+            if cursor.is_empty() {
+                assert!(data.get("nextCursor").is_none());
+            } else {
+                assert_eq!(data["nextCursor"], cursor);
+            }
             assert_eq!(
                 calls.lock().unwrap().last().unwrap().1.as_deref(),
                 Some(cursor)
