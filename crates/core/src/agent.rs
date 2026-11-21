@@ -409,7 +409,15 @@ impl Agent<'_> {
         session: &Session,
         run_id: Uuid,
     ) -> Result<()> {
-        for (id, usage, metadata) in durable_recovery_usage(session, run_id) {
+        self.settle_recorded_recovery(durable_recovery_usage(session, run_id))
+            .await
+    }
+
+    async fn settle_recorded_recovery(
+        &self,
+        records: Vec<(Uuid, UsageReport, ModelMetadata)>,
+    ) -> Result<()> {
+        for (id, usage, metadata) in records {
             self.settle_usage(id, &usage, &metadata).await?;
         }
         Ok(())
@@ -851,9 +859,8 @@ impl Agent<'_> {
             let activity_head = session.head();
             let resuming_failed_activity = recovered_failure.is_some();
             let start = if let Some(error) = recovered_failure.take() {
-                self.settle_recovery_before_hooks(session, run_id)
-                    .await
-                    .and(Err(error))
+                let records = durable_recovery_usage(session, run_id);
+                self.settle_recorded_recovery(records).await.and(Err(error))
             } else if prior_result.is_ok() && lifecycle {
                 let states = session.extension_states();
                 self.observe_active_lifecycle_with_inputs(
