@@ -1047,6 +1047,63 @@ struct CustomMessageRenderPending {
 struct ExtensionChrome {
     header: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
     footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
+    working: ExtensionWorkingStatus,
+}
+
+#[derive(Default)]
+struct ExtensionWorkingStatus {
+    message: Option<String>,
+    hidden: bool,
+    indicator: Option<pi_rs::WorkingIndicatorOptions>,
+    animation_started: Option<Instant>,
+}
+
+const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+impl ExtensionWorkingStatus {
+    fn interval(&self) -> Duration {
+        Duration::from_millis(
+            self.indicator
+                .as_ref()
+                .and_then(|options| options.interval_ms)
+                .filter(|interval| *interval != 0)
+                .unwrap_or(80),
+        )
+    }
+
+    fn frames(&self) -> Option<&[String]> {
+        self.indicator
+            .as_ref()
+            .and_then(|options| options.frames.as_deref())
+    }
+
+    fn frame(&self, now: Instant) -> &str {
+        let elapsed = now.saturating_duration_since(self.animation_started.unwrap_or(now));
+        let tick = elapsed.as_millis() / self.interval().as_millis();
+        if let Some(frames) = self.frames() {
+            if frames.is_empty() {
+                return "";
+            }
+            return &frames[(tick % frames.len() as u128) as usize];
+        }
+        WORKING_FRAMES[(tick % WORKING_FRAMES.len() as u128) as usize]
+    }
+
+    fn next_frame_wait(&self, now: Instant, last_frame: Instant) -> Option<Duration> {
+        let started = self.animation_started?;
+        if self.frames().is_some_and(|frames| frames.len() < 2) {
+            return None;
+        }
+        let interval = self.interval().as_millis();
+        let elapsed = now.saturating_duration_since(started).as_millis();
+        let drawn = last_frame.saturating_duration_since(started).as_millis();
+        if last_frame < started || drawn / interval != elapsed / interval {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_millis(
+            (interval - elapsed % interval) as u64,
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -1270,6 +1327,21 @@ impl View {
                 }
             }
             pi_rs::UiRequest::SetFooter { lines } => self.extension_chrome.footer = lines,
+            pi_rs::UiRequest::SetWorkingMessage { message } => {
+                self.extension_chrome.working.message = message;
+            }
+            pi_rs::UiRequest::SetWorkingVisible { visible } => {
+                let working = &mut self.extension_chrome.working;
+                let hidden = !visible;
+                if working.hidden != hidden {
+                    working.animation_started = None;
+                    working.hidden = hidden;
+                }
+            }
+            pi_rs::UiRequest::SetWorkingIndicator { options } => {
+                self.extension_chrome.working.indicator = options;
+                self.extension_chrome.working.animation_started = None;
+            }
             pi_rs::UiRequest::SetTitle { mut title } => {
                 title.retain(|character| !character.is_control());
                 self.pending_terminal_title = Some(title);
@@ -1292,7 +1364,12 @@ impl View {
     fn clear_extension_chrome(&mut self) -> bool {
         let header_changed = self.extension_chrome.header.take().is_some();
         self.regular.redraw |= header_changed;
-        self.extension_chrome.footer.take().is_some() || header_changed
+        let working = std::mem::take(&mut self.extension_chrome.working);
+        self.extension_chrome.footer.take().is_some()
+            || header_changed
+            || working.message.is_some()
+            || working.hidden
+            || working.indicator.is_some()
     }
 
     fn header_lines(
@@ -1408,6 +1485,106 @@ impl View {
             (None, None) if self.shell_running => "コマンド実行中",
             _ => "処理中",
         }
+    }
+
+    fn shows_agent_working_status(&self) -> bool {
+        !self.shell_running
+            && self.tree_navigation.is_none()
+            && !self.summarizing
+            && self.phase != Some("再試行待ち")
+    }
+
+    fn sync_working_animation(&mut self, busy: bool, now: Instant) {
+        let agent = self.shows_agent_working_status();
+        let working = &mut self.extension_chrome.working;
+        if busy && agent && !working.hidden && working.indicator.is_some() {
+            working.animation_started.get_or_insert(now);
+        } else {
+            working.animation_started = None;
+        }
+    }
+
+    fn working_status(&self, busy: bool, fullscreen: bool, now: Instant, width: usize) -> String {
+        if !busy {
+            return String::new();
+        }
+        let started = self.request_started.unwrap_or(now);
+        let elapsed = now.saturating_duration_since(started);
+        let working = &self.extension_chrome.working;
+        let agent = self.shows_agent_working_status();
+        if agent && working.hidden {
+            return String::new();
+        }
+        let message = if agent {
+            working
+                .message
+                .as_deref()
+                .unwrap_or_else(|| self.working_phase())
+        } else {
+            self.working_phase()
+        };
+        let frame = if agent && working.indicator.is_some() {
+            working.frame(now)
+        } else if fullscreen {
+            WORKING_FRAMES[(elapsed.as_millis() / 100 % WORKING_FRAMES.len() as u128) as usize]
+        } else {
+            ""
+        };
+        let separator = if frame.is_empty() { "" } else { " " };
+        let mut label = format!("{frame}{separator}{message}");
+        let suffix = format!("{:.1}s · Escで取消 ", elapsed.as_secs_f32());
+        if agent && (working.message.is_some() || working.indicator.is_some()) {
+            let suffix_width = UnicodeWidthStr::width(suffix.as_str());
+            if suffix_width > width {
+                return String::new();
+            }
+            let mut columns = width.saturating_sub(suffix_width + 1);
+            if columns == 0 {
+                return suffix;
+            }
+            if let Some((overflow, _)) = label.grapheme_indices(true).find(|(_, grapheme)| {
+                let size = UnicodeWidthStr::width(*grapheme);
+                if size > columns {
+                    return true;
+                }
+                columns -= size;
+                false
+            }) {
+                label.truncate(overflow);
+            }
+            if label.is_empty() {
+                return suffix;
+            }
+        }
+        format!("{label} {suffix}")
+    }
+
+    fn border_status(&self, busy: bool, fullscreen: bool, now: Instant, width: usize) -> String {
+        let mut other = self.draft_status();
+        other.push_str(&self.extension_status());
+        if fullscreen && let Some((message, _)) = &self.flash {
+            other.push_str(message);
+            other.push(' ');
+        }
+        let remaining = width.saturating_sub(UnicodeWidthStr::width(other.as_str()));
+        let working = self.working_status(busy, fullscreen, now, remaining);
+        format!("{working}{other}")
+    }
+
+    fn status_refresh_wait(
+        &self,
+        now: Instant,
+        last_frame: Instant,
+        frame_interval: Duration,
+    ) -> Duration {
+        let elapsed = now.saturating_duration_since(last_frame);
+        let normal = Duration::from_millis(100).saturating_sub(elapsed);
+        self.extension_chrome
+            .working
+            .next_frame_wait(now, last_frame)
+            .map_or(normal, |wait| {
+                normal.min(wait.max(frame_interval.saturating_sub(elapsed)))
+            })
     }
 
     fn draft_status(&self) -> String {
@@ -2823,29 +3000,7 @@ impl View {
             !cfg!(windows),
             synchronized_updates_supported(),
         )?;
-        let elapsed = self
-            .request_started
-            .map(|start| start.elapsed())
-            .unwrap_or_default();
-        let status = if busy {
-            let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            format!(
-                "{} {} {:.1}s · Escで取消 ",
-                spinner[(elapsed.as_millis() / 100) as usize % spinner.len()],
-                self.working_phase(),
-                elapsed.as_secs_f32()
-            )
-        } else {
-            String::new()
-        };
-        let status = format!(
-            "{status}{}{}{}",
-            self.draft_status(),
-            self.extension_status(),
-            self.flash
-                .as_ref()
-                .map_or(String::new(), |(message, _)| format!("{message} ")),
-        );
+        let status = self.border_status(busy, true, Instant::now(), width);
         queue!(out, Hide)?;
         self.graphics.clear_fullscreen_frame(&mut out)?;
         for (row, line) in header.iter().enumerate() {
@@ -3317,16 +3472,7 @@ impl View {
             )?;
             queue!(out, Print("\r\n"))?;
         }
-        let elapsed = self
-            .request_started
-            .map(|start| start.elapsed().as_secs_f32())
-            .unwrap_or_default();
-        let status = if busy {
-            format!("{} {elapsed:.1}s · Escで取消 ", self.working_phase())
-        } else {
-            String::new()
-        };
-        let status = format!("{status}{}{}", self.draft_status(), self.extension_status());
+        let status = self.border_status(busy, false, Instant::now(), width);
         Line::themed(
             &format!(
                 "{}{}",
@@ -5121,11 +5267,17 @@ pub(super) async fn run(
         if let Some(title) = view.pending_terminal_title.take() {
             execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
         }
+        let busy = is_busy(&worker);
+        let now = Instant::now();
+        view.sync_working_animation(busy, now);
+        let refresh_status = busy || view.remote_task.is_some() || view.pending_share.is_some();
         if (dirty && last_frame.elapsed() >= frame_interval)
-            || ((is_busy(&worker) || view.remote_task.is_some() || view.pending_share.is_some())
-                && last_frame.elapsed() >= Duration::from_millis(100))
+            || (refresh_status
+                && view
+                    .status_refresh_wait(now, last_frame, frame_interval)
+                    .is_zero())
         {
-            view.draw(&args, &theme, is_busy(&worker), &keys)?;
+            view.draw(&args, &theme, busy, &keys)?;
             dirty = false;
             last_frame = Instant::now();
         }
@@ -5146,6 +5298,11 @@ pub(super) async fn run(
             frame_interval.saturating_sub(last_frame.elapsed())
         } else {
             Duration::from_millis(40)
+        };
+        let input_wait = if refresh_status {
+            input_wait.min(view.status_refresh_wait(Instant::now(), last_frame, frame_interval))
+        } else {
+            input_wait
         };
         let picker_title = view.picker.as_ref().map(|picker| picker.title.as_str());
         let loading = picker_title == Some("Loading thinking levels");
@@ -11456,6 +11613,97 @@ exit {exit}
         assert!(output.contains("=== Agent messages (JSONL) ==="));
         assert!(output.contains("\"role\":\"user\""));
         assert!(output.contains("question"));
+    }
+
+    #[test]
+    fn extension_working_indicator_animates_hides_and_restores_in_both_modes() {
+        let id = uuid::Uuid::new_v4();
+        let mut view = View::default();
+        view.ui_request(&json!({"id":id, "method":"setWorkingMessage", "message":"Reading files"}))
+            .unwrap();
+        view.ui_request(&json!({
+            "id":id, "method":"setWorkingIndicator",
+            "options":{"intervalMs":150,"frames":["one", "two"]},
+        }))
+        .unwrap();
+
+        let started = Instant::now();
+        view.request_started = Some(started);
+        view.sync_working_animation(true, started);
+        for fullscreen in [false, true] {
+            let status = |millis| {
+                view.working_status(
+                    true,
+                    fullscreen,
+                    started + Duration::from_millis(millis),
+                    80,
+                )
+            };
+            assert!(status(0).starts_with("one Reading files "));
+            assert!(status(150).starts_with("two Reading files "));
+            assert!(status(300).starts_with("one Reading files "));
+            assert!(
+                view.working_status(false, fullscreen, started, 80)
+                    .is_empty()
+            );
+        }
+
+        let later = started + Duration::from_millis(160);
+        view.request_started = Some(later);
+        view.sync_working_animation(true, later);
+        assert!(
+            view.working_status(true, true, later, 80)
+                .starts_with("two ")
+        );
+        assert_eq!(
+            view.extension_chrome
+                .working
+                .next_frame_wait(later, started + Duration::from_millis(150)),
+            Some(Duration::from_millis(140))
+        );
+
+        view.ui_request(&json!({"id":id,"method":"setWorkingIndicator","options":{"frames":[]}}))
+            .unwrap();
+        assert!(
+            view.working_status(true, true, started, 80)
+                .starts_with("Reading files ")
+        );
+        view.ui_request(&json!({"id":id,"method":"setWorkingVisible","visible":false}))
+            .unwrap();
+        assert!(view.working_status(true, true, started, 80).is_empty());
+        view.phase = Some("再試行待ち");
+        assert!(
+            view.working_status(true, false, started, 80)
+                .starts_with("再試行待ち ")
+        );
+        view.phase = None;
+        view.shell_running = true;
+        assert!(
+            view.working_status(true, false, started, 80)
+                .starts_with("コマンド実行中 ")
+        );
+        view.shell_running = false;
+        view.ui_request(&json!({"id":id,"method":"setWorkingVisible","visible":true}))
+            .unwrap();
+        view.ui_request(&json!({"id":id,"method":"setWorkingMessage","message":"幅".repeat(128)}))
+            .unwrap();
+        view.ui_status
+            .insert("fixture".into(), "independent status".into());
+        for fullscreen in [false, true] {
+            let status = view.border_status(true, fullscreen, later, 48);
+            assert!(status.contains("Escで取消"));
+            assert!(status.contains("independent status"));
+            assert!(UnicodeWidthStr::width(status.as_str()) <= 48);
+        }
+        assert!(view.clear_extension_chrome());
+        assert!(
+            view.working_status(true, false, started, 80)
+                .starts_with("処理中 ")
+        );
+        assert!(
+            view.working_status(true, true, started, 80)
+                .starts_with("⠋ 処理中 ")
+        );
     }
 
     #[test]
