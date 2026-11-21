@@ -5358,6 +5358,17 @@ pub(super) async fn run(
                             );
                             view.picker = Some(picker);
                         }
+                        Input::SetTreeLabel(id, label) => {
+                            let result = Session::open(&args.session).and_then(|mut session| {
+                                session.set_label(id, (!label.is_empty()).then_some(label))?;
+                                picker.refresh_tree_labels(&session, id);
+                                Ok(())
+                            });
+                            if let Err(error) = result {
+                                picker.show_feedback(Err(error.to_string()));
+                            }
+                            view.picker = Some(picker);
+                        }
                         Input::UpdateModelScope { save } => {
                             if let Some((catalog, enabled)) = picker.model_scope() {
                                 let result = update_model_scope(
@@ -7468,13 +7479,6 @@ fn select(
                 view,
                 Some(worker),
             )?;
-        }
-        Selection::Label(id, label) => {
-            Session::open(&args.session)?.set_label(id, (!label.is_empty()).then_some(label))?;
-            slash("/tree", args, view, None)?;
-            if let Some(picker) = &mut view.picker {
-                picker.focus_record(id);
-            }
         }
         Selection::Checkout(id) => {
             if id == Session::open(&args.session)?.head() {

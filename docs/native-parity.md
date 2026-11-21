@@ -2450,7 +2450,7 @@ horizontally to keep the selected entry visible while retaining the selection
 gutter; clipping skips partially visible wide characters at either boundary
 while preserving theme styling.
 Searching includes records inside folded branches. Shift+L edits or removes a
-record label without changing its identity. Direct `/checkout` releases its
+record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
 journal lock before restoring the view.
 
 Unit tests and fullscreen/regular PTY fixtures cover branch navigation,

@@ -157,16 +157,7 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
             }
         };
         items.push(Item {
-            label: format!(
-                "{} {} {}{}",
-                record.id,
-                labels
-                    .get(&record.id)
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                description.heading,
-                description.body
-            ),
+            label: format!("{} {}{}", record.id, description.heading, description.body),
             selection: Selection::Checkout(record.id),
         });
         entries.insert(record.id, (record.parent, kind));
