@@ -255,6 +255,10 @@ impl Picker {
         }
     }
 
+    pub fn is_completion(&self) -> bool {
+        self.completion_limit.is_some()
+    }
+
     pub fn paste(&mut self, text: &str) {
         let tree_focus = self.tree_filter_focus();
         if self.title == "Settings" {

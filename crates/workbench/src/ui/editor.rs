@@ -1,11 +1,16 @@
 //! Grapheme-safe editor with line movement, a kill ring, and undo snapshots.
+use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::editor_layout::Layout;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+static PASTE_CTRL_LETTER: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\x1b\[([0-9]+);5u").expect("paste Ctrl-letter pattern"));
 
 const WORD_PUNCTUATION: &str = "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`";
 
@@ -98,15 +103,62 @@ fn word_boundary(text: &str, backward: bool) -> usize {
 }
 
 #[derive(Clone)]
+struct CollapsedPaste {
+    source: Range<usize>,
+    marker: String,
+}
+
+// Draft consumers use the original text. Only layout and navigation use markers.
+struct DraftDisplay<'a> {
+    text: Cow<'a, str>,
+    ranges: Vec<(Range<usize>, Range<usize>)>,
+}
+
+impl DraftDisplay<'_> {
+    fn display_offset(&self, original: usize) -> usize {
+        let mut source_end = 0;
+        let mut display_end = 0;
+        for (source, display) in &self.ranges {
+            if original < source.end {
+                break;
+            }
+            source_end = source.end;
+            display_end = display.end;
+        }
+        display_end + original - source_end
+    }
+
+    fn original_offset(&self, offset: usize, forward: bool) -> usize {
+        let mut source_end = 0;
+        let mut display_end = 0;
+        for (source, display) in &self.ranges {
+            if offset <= display.start {
+                break;
+            }
+            if offset < display.end {
+                return if forward { source.end } else { source.start };
+            }
+            source_end = source.end;
+            display_end = display.end;
+        }
+        source_end + offset - display_end
+    }
+}
+
+#[derive(Clone)]
 struct Snapshot {
     text: String,
     cursor: usize,
+    collapsed: Vec<CollapsedPaste>,
+    paste_count: usize,
 }
 #[derive(Default)]
 pub struct Editor {
     pub text: String,
     pub cursor: usize,
     undo: Vec<Snapshot>,
+    collapsed: Vec<CollapsedPaste>,
+    paste_count: usize,
     typing_word: bool,
     kills: Vec<String>,
     last_kill: bool,
@@ -120,6 +172,8 @@ impl Editor {
         self.undo.push(Snapshot {
             text: self.text.clone(),
             cursor: self.cursor,
+            collapsed: self.collapsed.clone(),
+            paste_count: self.paste_count,
         });
         if self.undo.len() > 100 {
             self.undo.remove(0);
@@ -134,23 +188,160 @@ impl Editor {
         self.remember();
         self.text = text;
         self.cursor = self.text.len();
+        self.collapsed.clear();
+        self.paste_count = 0;
     }
+
+    /// Keep source ranges attached to their original text as the draft changes.
+    fn edit(&mut self, range: Range<usize>, replacement: &str) {
+        let delta = replacement.len() as isize - range.len() as isize;
+        self.collapsed.retain_mut(|paste| {
+            if paste.source.start >= range.end {
+                paste.source.start = paste.source.start.saturating_add_signed(delta);
+                paste.source.end = paste.source.end.saturating_add_signed(delta);
+                true
+            } else {
+                paste.source.end <= range.start
+            }
+        });
+        self.text.replace_range(range, replacement);
+    }
+
+    fn display(&self) -> DraftDisplay<'_> {
+        let mut visible_pastes = self
+            .collapsed
+            .iter()
+            .filter(|paste| {
+                // A cursor moved programmatically into pasted text can edit it directly.
+                !(paste.source.start < self.cursor && self.cursor < paste.source.end)
+            })
+            .peekable();
+        if visible_pastes.peek().is_none() {
+            return DraftDisplay {
+                text: Cow::Borrowed(&self.text),
+                ranges: Vec::new(),
+            };
+        }
+        let mut text = String::new();
+        let mut ranges = Vec::new();
+        let mut previous_end = 0;
+        for paste in visible_pastes {
+            text.push_str(&self.text[previous_end..paste.source.start]);
+            let start = text.len();
+            text.push_str(&paste.marker);
+            ranges.push((paste.source.clone(), start..text.len()));
+            previous_end = paste.source.end;
+        }
+        text.push_str(&self.text[previous_end..]);
+        DraftDisplay {
+            text: Cow::Owned(text),
+            ranges,
+        }
+    }
+
+    pub fn completion_prefix(&self) -> Option<(usize, &str)> {
+        let boundary = self
+            .collapsed
+            .iter()
+            .rev()
+            .find(|paste| paste.source.end <= self.cursor)
+            .map_or(0, |paste| paste.source.end);
+        if boundary > 0 && boundary == self.cursor {
+            return None;
+        }
+        Some((boundary, &self.text[boundary..self.cursor]))
+    }
+
+    pub fn visible_neighbors(&self) -> (Option<char>, Option<char>) {
+        let before = self
+            .collapsed
+            .iter()
+            .find(|paste| paste.source.end == self.cursor)
+            .map_or_else(
+                || self.text[..self.cursor].chars().next_back(),
+                |paste| paste.marker.chars().next_back(),
+            );
+        let after = self
+            .collapsed
+            .iter()
+            .find(|paste| paste.source.start == self.cursor)
+            .map_or_else(
+                || self.text[self.cursor..].chars().next(),
+                |paste| paste.marker.chars().next(),
+            );
+        (before, after)
+    }
+
+    /// Paste at the current cursor as one undoable edit.
+    pub fn paste(&mut self, text: &str) {
+        // tmux can encode literal Ctrl-letter bytes inside bracketed paste.
+        let decoded = PASTE_CTRL_LETTER.replace_all(text, |capture: &regex::Captures<'_>| {
+            match capture[1].parse::<u8>() {
+                Ok(byte) if byte.is_ascii_alphabetic() => String::from(char::from(byte & 0x1f)),
+                _ => capture[0].to_owned(),
+            }
+        });
+        let normalized = decoded.replace("\r\n", "\n").replace('\r', "\n");
+        let mut text = super::render::clean(&normalized);
+        if text.starts_with(['/', '~', '.'])
+            && self
+                .visible_neighbors()
+                .0
+                .is_some_and(|previous| previous.is_ascii_alphanumeric() || previous == '_')
+        {
+            text.insert(0, ' ');
+        }
+        if text.is_empty() {
+            return;
+        }
+        let lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let chars = text.encode_utf16().count();
+        let start = self.cursor;
+        self.insert_clean(&text);
+        if lines > 10 || chars > 1000 {
+            self.paste_count += 1;
+            let count = self.paste_count;
+            let amount = if lines > 10 {
+                format!("+{lines} lines")
+            } else {
+                format!("{chars} chars")
+            };
+            let at = self
+                .collapsed
+                .partition_point(|paste| paste.source.start < start);
+            self.collapsed.insert(
+                at,
+                CollapsedPaste {
+                    source: start..self.cursor,
+                    marker: format!("[paste #{count} {amount}]"),
+                },
+            );
+        }
+    }
+
     pub fn insert(&mut self, text: &str) {
-        self.remember();
-        let text = super::render::clean(text);
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
+        self.insert_clean(&super::render::clean(text));
     }
+
+    fn insert_clean(&mut self, text: &str) {
+        self.replace_range(self.cursor..self.cursor, text);
+    }
+
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str) {
+        self.remember();
+        let cursor = range.start + text.len();
+        self.edit(range, text);
+        self.cursor = cursor;
+    }
+
     // Only transcript search retains U+0085 internally. Rendering remains
     // sanitized by Span; all other control characters stay excluded.
     pub(super) fn insert_search(&mut self, text: &str) {
-        self.remember();
         let text: String = text
             .chars()
             .filter(|character| !character.is_control() || *character == '\u{85}')
             .collect();
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
+        self.insert_clean(&text);
     }
     /// Insert a typed character, grouping consecutive typing as Pi does.
     /// Paste and programmatic insertion continue to use the atomic `insert`.
@@ -170,56 +361,74 @@ impl Editor {
             self.preferred_column = None;
             self.jump_forward = None;
         }
-        self.text.insert_str(self.cursor, &text);
+        self.edit(self.cursor..self.cursor, &text);
         self.cursor += text.len();
         self.typing_word = true;
     }
     pub fn left(&mut self) {
         self.typing_word = false;
-        self.cursor = self.text[..self.cursor]
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let next = display.text[..offset]
             .grapheme_indices(true)
             .next_back()
             .map_or(0, |(index, _)| index);
+        self.cursor = display.original_offset(next, false);
     }
     pub fn right(&mut self) {
         self.typing_word = false;
-        self.cursor += self.text[self.cursor..]
-            .graphemes(true)
-            .next()
-            .map_or(0, str::len);
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let next = offset
+            + display.text[offset..]
+                .graphemes(true)
+                .next()
+                .map_or(0, str::len);
+        self.cursor = display.original_offset(next, true);
     }
     pub fn line_start(&self) -> usize {
-        self.text[..self.cursor]
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let start = display.text[..offset]
             .rfind('\n')
-            .map_or(0, |index| index + 1)
+            .map_or(0, |index| index + 1);
+        display.original_offset(start, false)
     }
     fn line_end(&self) -> usize {
-        self.cursor
-            + self.text[self.cursor..]
-                .find('\n')
-                .unwrap_or(self.text.len() - self.cursor)
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let end = display.text[offset..]
+            .find('\n')
+            .map_or(display.text.len(), |index| offset + index);
+        display.original_offset(end, true)
     }
     fn word_left(&mut self) {
         self.typing_word = false;
-        let start = self.line_start();
-        if self.cursor == start {
-            if self.cursor > 0 {
-                self.cursor -= 1;
-            }
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let start = display.text[..offset]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let next = if offset == start {
+            offset.saturating_sub(1)
         } else {
-            self.cursor = start + word_boundary(&self.text[start..self.cursor], true);
-        }
+            start + word_boundary(&display.text[start..offset], true)
+        };
+        self.cursor = display.original_offset(next, false);
     }
     fn word_right(&mut self) {
         self.typing_word = false;
-        let end = self.line_end();
-        if self.cursor == end {
-            if self.cursor < self.text.len() {
-                self.cursor += 1;
-            }
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let end = display.text[offset..]
+            .find('\n')
+            .map_or(display.text.len(), |index| offset + index);
+        let next = if offset == end {
+            (end + 1).min(display.text.len())
         } else {
-            self.cursor += word_boundary(&self.text[self.cursor..end], false);
-        }
+            offset + word_boundary(&display.text[offset..end], false)
+        };
+        self.cursor = display.original_offset(next, true);
     }
     fn remove(&mut self, range: Range<usize>, kill: Option<bool>) {
         if range.is_empty() {
@@ -241,7 +450,7 @@ impl Editor {
             }
             self.last_kill = true;
         }
-        self.text.replace_range(range.clone(), "");
+        self.edit(range.clone(), "");
         self.cursor = range.start;
     }
     pub fn backspace(&mut self) {
@@ -261,6 +470,8 @@ impl Editor {
     pub fn take(&mut self) -> String {
         self.remember();
         self.cursor = 0;
+        self.collapsed.clear();
+        self.paste_count = 0;
         std::mem::take(&mut self.text)
     }
     /// Returns false at the first/last logical line so the caller can browse history.
@@ -300,18 +511,21 @@ impl Editor {
         true
     }
     pub fn visible_rows(&mut self, width: usize, height: usize) -> (Vec<String>, usize, usize) {
-        let layout = Layout::new(&self.text, width);
-        let row = layout.row(self.cursor);
-        let column = layout.column(&self.text, row, self.cursor).min(width - 1);
-        self.scroll_offset = self
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let layout = Layout::new(&display.text, width);
+        let row = layout.row(offset);
+        let column = layout.column(&display.text, row, offset).min(width - 1);
+        let scroll_offset = self
             .scroll_offset
             .clamp(row.saturating_sub(height - 1), row)
             .min(layout.len().saturating_sub(height));
         let lines = layout
-            .visible(&self.text, self.scroll_offset, height)
+            .visible(&display.text, scroll_offset, height)
             .map(str::to_owned)
             .collect();
-        (lines, row - self.scroll_offset, column)
+        self.scroll_offset = scroll_offset;
+        (lines, row - scroll_offset, column)
     }
 
     /// False at a viewport boundary, where the caller may switch to history navigation.
@@ -319,17 +533,20 @@ impl Editor {
         self.typing_word = false;
         self.last_kill = false;
         self.yank = None;
-        let layout = Layout::new(&self.text, width);
-        let row = layout.row(self.cursor);
+        let display = self.display();
+        let offset = display.display_offset(self.cursor);
+        let layout = Layout::new(&display.text, width);
+        let row = layout.row(offset);
         let target = row.saturating_add_signed(delta).min(layout.len() - 1);
         if row == target {
             return false;
         }
-        let column = *self
+        let column = self
             .preferred_column
-            .get_or_insert_with(|| layout.column(&self.text, row, self.cursor));
-        self.cursor = layout.cursor_at(&self.text, target, column);
-        self.yank = None;
+            .unwrap_or_else(|| layout.column(&display.text, row, offset));
+        let target = layout.cursor_at(&display.text, target, column);
+        self.cursor = display.original_offset(target, delta > 0);
+        self.preferred_column = Some(column);
         true
     }
 
@@ -361,14 +578,16 @@ impl Editor {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
-            let mut glyphs = self.text.grapheme_indices(true);
+            let display = self.display();
+            let cursor = display.display_offset(self.cursor);
+            let mut glyphs = display.text.grapheme_indices(true);
             let matched = if forward {
-                glyphs.find(|(offset, glyph)| *offset > self.cursor && glyph.contains(character))
+                glyphs.find(|(offset, glyph)| *offset > cursor && glyph.contains(character))
             } else {
-                glyphs.rfind(|(offset, glyph)| *offset < self.cursor && glyph.contains(character))
+                glyphs.rfind(|(offset, glyph)| *offset < cursor && glyph.contains(character))
             };
             if let Some((offset, _)) = matched {
-                self.cursor = offset;
+                self.cursor = display.original_offset(offset, forward);
             }
             self.preferred_column = None;
             self.yank = None;
@@ -378,11 +597,11 @@ impl Editor {
     }
 
     pub fn continued_line(&mut self) -> bool {
-        if !self.text[..self.cursor].ends_with('\\') {
+        if self.visible_neighbors().0 != Some('\\') {
             return false;
         }
         self.remember();
-        self.text.replace_range(self.cursor - 1..self.cursor, "\n");
+        self.edit(self.cursor - 1..self.cursor, "\n");
         true
     }
 
@@ -476,8 +695,9 @@ impl Editor {
                 if let Some((range, _)) = self.yank.take().filter(|_| self.kills.len() > 1) {
                     self.remember();
                     self.kills.rotate_left(1);
-                    self.text.replace_range(range.clone(), &self.kills[0]);
-                    self.cursor = range.start + self.kills[0].len();
+                    let replacement = self.kills[0].clone();
+                    self.edit(range.clone(), &replacement);
+                    self.cursor = range.start + replacement.len();
                     self.yank = Some((range.start..self.cursor, 0));
                 }
             }
@@ -485,6 +705,8 @@ impl Editor {
                 if let Some(snapshot) = self.undo.pop() {
                     self.text = snapshot.text;
                     self.cursor = snapshot.cursor;
+                    self.collapsed = snapshot.collapsed;
+                    self.paste_count = snapshot.paste_count;
                     self.yank = None;
                 }
             }
@@ -508,6 +730,100 @@ mod tests {
             assert!(!editor.action(""));
             editor.type_character(character);
         }
+    }
+
+    #[test]
+    fn paste_collapses_long_draft_visually_and_keeps_source_for_reads_and_submit() {
+        let mut editor = Editor::default();
+        editor.replace("左右".into());
+        editor.cursor = "左".len();
+        let paste = std::iter::repeat_n("私", 11)
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let normalized = paste.replace("\r\n", "\n");
+
+        editor.paste(&paste);
+        let (rows, _, column) = editor.visible_rows(80, 6);
+        assert_eq!(rows, ["左[paste #1 +11 lines]右"]);
+        assert_eq!(column, UnicodeWidthStr::width("左[paste #1 +11 lines]"));
+        assert_eq!(editor.text, format!("左{normalized}右"));
+        editor.left();
+        assert_eq!(editor.cursor, "左".len());
+        editor.right();
+        assert_eq!(editor.cursor, "左".len() + normalized.len());
+        assert_eq!(editor.take(), format!("左{normalized}右"));
+        assert!(editor.text.is_empty());
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.visible_rows(80, 6).0, ["左[paste #1 +11 lines]右"]);
+    }
+
+    #[test]
+    fn paste_tokens_survive_neighboring_edits_undo_and_literal_marker_text() {
+        let mut editor = Editor::default();
+        editor.replace("beforeafter".into());
+        editor.cursor = "before".len();
+        let paste = "🙂".repeat(501);
+        editor.paste(&paste);
+        let end = editor.cursor;
+        let marker = "[paste #1 1002 chars]";
+        assert_eq!(
+            editor.visible_rows(80, 6).0,
+            [format!("before{marker}after")]
+        );
+
+        editor.replace_range(0..6, "pre");
+        editor.left();
+        editor.insert(marker);
+        assert_eq!(
+            editor.visible_rows(80, 6).0,
+            [format!("pr{marker}e{marker}after")]
+        );
+        assert_eq!(editor.text, format!("pr{marker}e{paste}after"));
+
+        editor.action("tui.editor.undo");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.cursor, end);
+        editor.backspace();
+        assert_eq!(editor.text, "beforeafter");
+        editor.action("tui.editor.undo");
+        assert_eq!(
+            editor.visible_rows(80, 6).0,
+            [format!("before{marker}after")]
+        );
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.visible_rows(80, 6).0, ["beforeafter"]);
+    }
+
+    #[test]
+    fn paste_editing_uses_marker_boundaries_instead_of_hidden_characters() {
+        let mut editor = Editor::default();
+        editor.paste(&format!("{}\\", "z".repeat(1001)));
+        assert!(!editor.continued_line());
+        assert_eq!(editor.text.as_bytes().last(), Some(&b'\\'));
+
+        editor.cursor = 0;
+        assert!(editor.jump_key(
+            "tui.editor.jumpForward",
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)
+        ));
+        assert!(editor.jump_key("", KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)));
+        assert_eq!(editor.cursor, 0);
+
+        editor.right();
+        let paste_end = editor.cursor;
+        assert_eq!(editor.visible_neighbors().0, Some(']'));
+        editor.paste("/tmp");
+        assert_eq!(&editor.text[paste_end..], "/tmp");
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings_and_tabs_and_separates_paths() {
+        let mut editor = Editor::default();
+        editor.insert("see");
+        editor.paste("/tmp/file\r\t♡\r\nnext\x1b[106;5ulast\x1b");
+        assert_eq!(editor.text, "see /tmp/file\n    ♡\nnext\nlast");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "see");
     }
 
     #[test]
