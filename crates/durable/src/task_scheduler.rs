@@ -520,6 +520,278 @@ pub(crate) struct WokenConversationCancelTerminalMarker {
     pub receipt_version: u64,
 }
 #[allow(dead_code)]
+/// Durable manifest of all owned-conversation markers for one woken claim.
+/// This is provisional infrastructure: graph, identity, attempt, selection and
+/// the callback start leases must be authenticated by the caller's transaction.
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedCallbackMarkers {
+    version: u32,
+    root: Uuid,
+    claim_id: Uuid,
+    graph_version: u64,
+    marker: Vec<u8>,
+    conversations: Vec<Uuid>,
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedMarkerRetirement {
+    version: u32,
+    root: Uuid,
+    claim_id: Uuid,
+    manifest_version: u64,
+    graph_version: u64,
+}
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn woken_owned_marker_retirement_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-callback-retired/v1/{root}").into_bytes()
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn woken_owned_callback_markers_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-callback-markers/v1/{root}").into_bytes()
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn prepare_woken_owned_callback_start(
+    store: &durable_store::Store,
+    claim: &WokenConversationCancelClaim,
+    marker: &[u8],
+) -> Result<(Vec<Uuid>, task_store::OwnedBatch), String> {
+    if claim.version != 3 || claim.claim_id.is_nil() || marker.is_empty() {
+        return Err("invalid woken owned marker claim".into());
+    }
+    let graph_key = crate::runtime::woken_owned_graph_key(claim.task);
+    let graph_entry = store
+        .get(&graph_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing owned graph")?;
+    let graph: crate::runtime::WokenOwnedGraphEvidence =
+        serde_json::from_slice(&graph_entry.value).map_err(|e| e.to_string())?;
+    if graph.version != 1
+        || graph.root != claim.task
+        || graph.interrupted_attempt != claim.woken_attempt
+        || graph.edges.is_empty()
+    {
+        return Err("woken owned graph identity mismatch".into());
+    }
+    let mut conversations: Vec<_> = graph.edges.iter().map(|edge| edge.edge.child).collect();
+    conversations.sort_unstable();
+    if conversations
+        .iter()
+        .any(|id| id.is_nil() || *id == claim.conversation)
+        || conversations.windows(2).any(|pair| pair[0] == pair[1])
+        || graph
+            .edges
+            .iter()
+            .any(|edge| edge.edge.mode != crate::ownership_edge::Mode::Foreground)
+    {
+        return Err("invalid woken owned conversations".into());
+    }
+    let mut batch = task_store::OwnedBatch {
+        checks: vec![durable_store::Check {
+            key: graph_key,
+            expected: durable_store::Expected::Version(graph_entry.version),
+        }],
+        mutations: vec![],
+    };
+    for &id in &conversations {
+        let part =
+            crate::conversation_signal::prepare_callback_start_signal_fence(store, id, marker)
+                .map_err(|e| e.to_string())?;
+        batch.checks.extend(part.checks);
+        batch.mutations.extend(part.mutations);
+    }
+    let manifest = WokenOwnedCallbackMarkers {
+        version: 1,
+        root: claim.task,
+        claim_id: claim.claim_id,
+        graph_version: graph_entry.version,
+        marker: marker.to_vec(),
+        conversations: conversations.clone(),
+    };
+    let key = woken_owned_callback_markers_key(claim.task);
+    batch.checks.push(durable_store::Check {
+        key: key.clone(),
+        expected: durable_store::Expected::Missing,
+    });
+    batch.mutations.push(durable_store::Mutation::Put {
+        key,
+        value: serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
+    });
+    Ok((conversations, batch))
+}
+
+/// Retire exactly the persisted owned marker set. The caller must also fence
+/// its claim and receipt or unknown outcome in this same transaction.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn prepare_woken_owned_callback_finish(
+    store: &durable_store::Store,
+    claim: &WokenConversationCancelClaim,
+    marker: &[u8],
+) -> Result<task_store::OwnedBatch, String> {
+    let key = woken_owned_callback_markers_key(claim.task);
+    let entry = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing owned marker manifest")?;
+    let manifest: WokenOwnedCallbackMarkers =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    let graph_key = crate::runtime::woken_owned_graph_key(claim.task);
+    let graph = store
+        .get(&graph_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing owned graph")?;
+    let evidence: crate::runtime::WokenOwnedGraphEvidence =
+        serde_json::from_slice(&graph.value).map_err(|e| e.to_string())?;
+    let mut ids: Vec<_> = evidence.edges.iter().map(|edge| edge.edge.child).collect();
+    ids.sort_unstable();
+    if manifest.version != 1
+        || manifest.root != claim.task
+        || manifest.claim_id != claim.claim_id
+        || manifest.marker != marker
+        || manifest.graph_version != graph.version
+        || evidence.root != claim.task
+        || evidence.interrupted_attempt != claim.woken_attempt
+        || ids != manifest.conversations
+        || ids
+            .iter()
+            .any(|id| id.is_nil() || *id == claim.conversation)
+        || ids.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err("woken owned marker manifest mismatch".into());
+    }
+    let mut batch = task_store::OwnedBatch {
+        checks: vec![
+            durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(entry.version),
+            },
+            durable_store::Check {
+                key: graph_key,
+                expected: durable_store::Expected::Version(graph.version),
+            },
+        ],
+        mutations: vec![],
+    };
+    for id in ids {
+        let part =
+            crate::conversation_signal::prepare_callback_finish_signal_fence(store, id, marker)
+                .map_err(|e| e.to_string())?;
+        batch.checks.extend(part.checks);
+        batch.mutations.extend(part.mutations);
+    }
+    let retired_key = woken_owned_marker_retirement_key(claim.task);
+    batch.checks.push(durable_store::Check {
+        key: retired_key.clone(),
+        expected: durable_store::Expected::Missing,
+    });
+    let retired = WokenOwnedMarkerRetirement {
+        version: 1,
+        root: claim.task,
+        claim_id: claim.claim_id,
+        manifest_version: entry.version,
+        graph_version: graph.version,
+    };
+    batch.mutations.push(durable_store::Mutation::Put {
+        key: retired_key,
+        value: serde_json::to_vec(&retired).map_err(|e| e.to_string())?,
+    });
+    Ok(batch)
+}
+
+/// Prove receipt publication retired the complete immutable marker set in
+/// that very commit. A cleanup-only retirement is not a successful receipt.
+#[cfg(feature = "experimental-graph-revision")]
+fn woken_owned_retirement_checks(
+    store: &durable_store::Store,
+    claim: &WokenConversationCancelClaim,
+    receipt_version: u64,
+    boundary: u64,
+) -> Result<Vec<durable_store::Check>, String> {
+    let graph_key = crate::runtime::woken_owned_graph_key(claim.task);
+    if store
+        .first_commit_for_key(&graph_key)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        return Ok(vec![durable_store::Check {
+            key: graph_key,
+            expected: durable_store::Expected::MissingUnchangedSince(boundary),
+        }]);
+    }
+    let graph = store
+        .get(&graph_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("owned graph was removed")?;
+    let manifest_key = woken_owned_callback_markers_key(claim.task);
+    let entry = store
+        .get(&manifest_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("owned marker manifest missing")?;
+    let manifest: WokenOwnedCallbackMarkers =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    let retired_key = woken_owned_marker_retirement_key(claim.task);
+    let retired_entry = store
+        .get(&retired_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("owned marker retirement missing")?;
+    let retired: WokenOwnedMarkerRetirement =
+        serde_json::from_slice(&retired_entry.value).map_err(|e| e.to_string())?;
+    if manifest.version != 1
+        || manifest.root != claim.task
+        || manifest.claim_id != claim.claim_id
+        || manifest.graph_version != graph.version
+        || retired.version != 1
+        || retired.root != claim.task
+        || retired.claim_id != claim.claim_id
+        || retired.manifest_version != entry.version
+        || retired.graph_version != graph.version
+        || store
+            .commit_for_version(&retired_key, retired_entry.version)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        || store
+            .commit_for_version(&retired_key, retired_entry.version)
+            .map_err(|e| e.to_string())?
+            != store
+                .commit_for_version(&woken_conversation_receipt_key(claim.task), receipt_version)
+                .map_err(|e| e.to_string())?
+    {
+        return Err("owned marker retirement does not bind receipt".into());
+    }
+    let mut checks = vec![
+        durable_store::Check {
+            key: graph_key,
+            expected: durable_store::Expected::Version(graph.version),
+        },
+        durable_store::Check {
+            key: manifest_key,
+            expected: durable_store::Expected::Version(entry.version),
+        },
+        durable_store::Check {
+            key: retired_key,
+            expected: durable_store::Expected::Version(retired_entry.version),
+        },
+    ];
+    for id in manifest.conversations {
+        let key = crate::conversation_signal::callback_start_key(id);
+        if store.get(&key).map_err(|e| e.to_string())?.is_some() {
+            return Err("owned callback marker remains".into());
+        }
+        checks.push(durable_store::Check {
+            key,
+            expected: durable_store::Expected::MissingUnchangedSince(boundary),
+        });
+    }
+    Ok(checks)
+}
+
 pub(crate) fn woken_conversation_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-woken-cancel-terminal-v1").into_bytes()
 }
@@ -572,6 +844,13 @@ pub(crate) fn woken_after_candidate_checks(
         key,
         expected: durable_store::Expected::Version(entry.version),
     });
+    #[cfg(feature = "experimental-graph-revision")]
+    checks.extend(woken_owned_retirement_checks(
+        store,
+        claim,
+        entry.version,
+        boundary,
+    )?);
     Ok((result, entry.version, checks))
 }
 
@@ -671,6 +950,13 @@ pub(crate) fn woken_terminal_after_checks(
             expected: durable_store::Expected::Version(version),
         },
     ]);
+    #[cfg(feature = "experimental-graph-revision")]
+    checks.extend(woken_owned_retirement_checks(
+        store,
+        &claim,
+        receipt_entry.version,
+        boundary,
+    )?);
     Ok((result, checks))
 }
 
@@ -2228,6 +2514,7 @@ pub(crate) enum MaintenanceIntent {
     Nested(Uuid),
     Failed(Uuid),
     FailFast(Uuid),
+    Woken(Uuid),
 }
 
 /// A graph intent retained when a nonblocking reservation needs cleanup.
@@ -2236,6 +2523,7 @@ pub struct PendingMaintenance {
     fence: Arc<Mutex<()>>,
     state: Arc<Mutex<InvocationState>>,
     scheduler_poison: Arc<std::sync::atomic::AtomicBool>,
+    definitions: Arc<std::sync::RwLock<WakeDefinitions>>,
     intent: MaintenanceIntent,
     independent: bool,
 }
@@ -2263,7 +2551,8 @@ impl PendingMaintenance {
             .contains(&match self.intent {
                 MaintenanceIntent::Nested(id)
                 | MaintenanceIntent::Failed(id)
-                | MaintenanceIntent::FailFast(id) => id,
+                | MaintenanceIntent::FailFast(id)
+                | MaintenanceIntent::Woken(id) => id,
             })
         {
             return Ok(false);
@@ -2320,7 +2609,8 @@ impl PendingMaintenance {
                     let parent = match self.intent {
                         MaintenanceIntent::Nested(id)
                         | MaintenanceIntent::Failed(id)
-                        | MaintenanceIntent::FailFast(id) => id,
+                        | MaintenanceIntent::FailFast(id)
+                        | MaintenanceIntent::Woken(id) => id,
                     };
                     let mut roots = vec![parent];
                     roots.extend(fixed);
@@ -2350,7 +2640,8 @@ impl PendingMaintenance {
                         let parent = match *prior {
                             MaintenanceIntent::Nested(id)
                             | MaintenanceIntent::Failed(id)
-                            | MaintenanceIntent::FailFast(id) => id,
+                            | MaintenanceIntent::FailFast(id)
+                            | MaintenanceIntent::Woken(id) => id,
                         };
                         let mut roots = vec![parent];
                         roots.extend(fixed);
@@ -2370,7 +2661,8 @@ impl PendingMaintenance {
                                     .remove(&match self.intent {
                                         MaintenanceIntent::Nested(id)
                                         | MaintenanceIntent::Failed(id)
-                                        | MaintenanceIntent::FailFast(id) => id,
+                                        | MaintenanceIntent::FailFast(id)
+                                        | MaintenanceIntent::Woken(id) => id,
                                     })
                                 {
                                     hook();
@@ -2384,13 +2676,83 @@ impl PendingMaintenance {
                         &match self.intent {
                             MaintenanceIntent::Nested(id)
                             | MaintenanceIntent::Failed(id)
-                            | MaintenanceIntent::FailFast(id) => id,
+                            | MaintenanceIntent::FailFast(id)
+                            | MaintenanceIntent::Woken(id) => id,
                         },
                     ) {
                         hook();
                     }
                     Ok(())
                 };
+                if let MaintenanceIntent::Woken(id) = self.intent {
+                    guard()?;
+                    let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+                    if state.attempts.contains(&id) {
+                        return Err(Error::Busy);
+                    }
+                    drop(state);
+                    let definitions = self.definitions.try_read().map_err(|error| match error {
+                        std::sync::TryLockError::WouldBlock => Error::Busy,
+                        std::sync::TryLockError::Poisoned(_) => Error::Poisoned,
+                    })?;
+                    let current = TaskStore::new(owner.store())
+                        .load(id)?
+                        .ok_or(Error::Ownership)?;
+                    return match harness.authenticated_scoped_woken_abort_graph(
+                        &current,
+                        &definitions.registry,
+                        &targets,
+                    ) {
+                        Ok(affected) => Ok(affected),
+                        Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
+                        Err(crate::runtime::Error::Invalid(reason)) => {
+                            // Invalid wake or binding cannot authorize the callback.
+                            // Hold failure locally so ordinary graph maintenance
+                            // drains owned work without stopping unrelated roots.
+                            let _task_gate =
+                                owner.task_gate().try_lock().map_err(|error| match error {
+                                    durable_store::controls::PollGateError::Busy => Error::Busy,
+                                    _ => Error::Poisoned,
+                                })?;
+                            let store = owner.store();
+                            let boundary = store.put_version().map_err(task_store::Error::from)?;
+                            let tasks = TaskStore::new(store);
+                            let latest = tasks.load(id)?.ok_or(Error::Ownership)?;
+                            if latest != current
+                                || latest.task.state() != &TaskState::Running
+                                || latest.task.abort_requested()
+                            {
+                                return Err(Error::Busy);
+                            }
+                            let mut next = latest.clone();
+                            next.task
+                                .hold_failure(format!(
+                                    "interrupted woken execution requires reconciliation: {reason}"
+                                ))
+                                .map_err(Error::Transition)?;
+                            let batch = tasks.prepare_save(&[Save::Update(&next)])?;
+                            match store.commit_with_prefix_put_fence(
+                                &batch.checks,
+                                &batch.mutations,
+                                &[
+                                    task_store::PREFIX,
+                                    crate::ownership_edge::PREFIX,
+                                    b"runtime/conversation/",
+                                ],
+                                boundary,
+                            ) {
+                                Ok(()) => Ok(Vec::new()),
+                                Err(
+                                    durable_store::Error::Conflict { .. }
+                                    | durable_store::Error::WriteLockBusy(_),
+                                ) => Err(Error::Busy),
+                                Err(error) => Err(task_store::Error::from(error).into()),
+                            }
+                        }
+                        Err(error) if runtime_pre_transaction_busy(&error) => Err(Error::Busy),
+                        Err(error) => Err(Error::Handler(format!("woken graph abort: {error}"))),
+                    };
+                }
                 match harness.scoped_abort_graph(
                     None,
                     Some(self.intent),
@@ -2407,7 +2769,8 @@ impl PendingMaintenance {
                             .remove(&match self.intent {
                                 MaintenanceIntent::Nested(id)
                                 | MaintenanceIntent::Failed(id)
-                                | MaintenanceIntent::FailFast(id) => id,
+                                | MaintenanceIntent::FailFast(id)
+                                | MaintenanceIntent::Woken(id) => id,
                             })
                         {
                             hook();
@@ -2933,6 +3296,13 @@ pub(crate) fn before_woken_recovery_commit_for_test(
         .lock()
         .unwrap()
         .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+pub(crate) fn run_woken_recovery_hook(id: Uuid) {
+    let hook = woken_recovery_hooks().lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 #[cfg(test)]
 pub(crate) fn after_ready_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
@@ -3975,6 +4345,33 @@ impl AdmissionHandle<'_> {
             .ok_or_else(|| "conversation callback start busy; reconciliation required".into())
     }
 
+    /// Pin all owned conversations until the first callback poll. Durable
+    /// markers and graph/claim checks must be committed before that poll.
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(crate) fn woken_owned_start_leases(
+        &self,
+    ) -> Result<(Vec<Uuid>, Vec<durable_store::controls::CallbackStartLease>), String> {
+        let owner = &self.lease.attachment.owner;
+        let key = crate::runtime::woken_owned_graph_key(self.running.task.id());
+        let Some(entry) = owner.store().get(&key).map_err(|e| e.to_string())? else {
+            return Ok((vec![], vec![]));
+        };
+        let graph: crate::runtime::WokenOwnedGraphEvidence =
+            serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+        let mut ids: Vec<_> = graph.edges.iter().map(|edge| edge.edge.child).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for &id in &ids {
+            owner.conversation_controls().get(id);
+        }
+        let leases = owner
+            .conversation_controls()
+            .try_callback_start_many(ids.iter().copied())
+            .map_err(|e| format!("owned start lease: {e:?}"))?
+            .ok_or("owned start lease busy")?;
+        Ok((ids, leases))
+    }
+
     /// Obtain a nested target's conversation start lease. The caller must
     /// compose the returned identity in a checked marker transaction before
     /// polling a callback; this lookup alone does not authorize it.
@@ -4354,6 +4751,18 @@ impl AdmissionHandle<'_> {
         };
         // Until evidence traversal covers conversation ownership edges, refuse
         // to authorize cleanup through one, including after a live graph abort.
+        #[cfg(feature = "experimental-graph-revision")]
+        if !nested {
+            checks.extend(
+                provisional_woken_owned_checks(
+                    self.validator.ok_or("missing harness")?,
+                    owner.store(),
+                    &current,
+                    boundary,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
         let records = tasks.list().map_err(|e| e.to_string())?;
         let mut task_ids = HashSet::from([current.task.id()]);
         loop {
@@ -4373,7 +4782,20 @@ impl AdmissionHandle<'_> {
         if crate::ownership_edge::reject_foreground_children(owner.store(), task_ids)
             .map_err(|e| e.to_string())?
         {
-            return Err("owned conversation requires reconciliation".into());
+            // The graph checks above authenticate this recorded snapshot; the
+            // first-poll path separately holds every owned conversation gate.
+            #[cfg(feature = "experimental-graph-revision")]
+            let authenticated_graph = !nested
+                && owner
+                    .store()
+                    .get(&crate::runtime::woken_owned_graph_key(current.task.id()))
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+            #[cfg(not(feature = "experimental-graph-revision"))]
+            let authenticated_graph = false;
+            if !authenticated_graph {
+                return Err("owned conversation requires reconciliation".into());
+            }
         }
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
@@ -4507,6 +4929,8 @@ impl AdmissionHandle<'_> {
             )
             .map_err(|e| e.to_string());
         commit?;
+        #[cfg(test)]
+        invoke_boundary(conversation_claim_finished_hooks(), current.task.id());
         Ok(record)
     }
 
@@ -4778,6 +5202,7 @@ impl AdmissionHandle<'_> {
         identity_lease: &crate::nested_identity::IdentityLease,
         expected_identity: &str,
         policy: crate::async_task_tool::ConversationCancelPolicy,
+        owned_ids: &[Uuid],
     ) -> Result<Vec<u8>, String> {
         if identity_lease.as_deref() != Some(expected_identity)
             || !self.abort
@@ -4861,6 +5286,18 @@ impl AdmissionHandle<'_> {
                     .map_err(|e| e.to_string())?,
             )
         };
+        #[cfg(feature = "experimental-graph-revision")]
+        if !nested {
+            checks.extend(
+                provisional_woken_owned_checks(
+                    self.validator.ok_or("missing harness")?,
+                    owner.store(),
+                    &current,
+                    boundary,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
                 owner.store(),
@@ -4974,6 +5411,20 @@ impl AdmissionHandle<'_> {
         let mut mutations = conversation_start.mutations;
         mutations.extend(task_start.mutations);
         checks.extend(self.graph_start_checks());
+        #[cfg(feature = "experimental-graph-revision")]
+        if !owned_ids.is_empty() {
+            let (marked_ids, owned) =
+                prepare_woken_owned_callback_start(owner.store(), claim, &marker)?;
+            if marked_ids != owned_ids {
+                return Err("owned start lease graph changed".into());
+            }
+            checks.extend(owned.checks);
+            mutations.extend(owned.mutations);
+        }
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        if !owned_ids.is_empty() {
+            return Err("owned markers unavailable".into());
+        }
         let result = owner
             .store()
             .commit_with_prefix_put_fence(
@@ -5668,6 +6119,18 @@ impl AdmissionHandle<'_> {
                     .map_err(|e| e.to_string())?,
             )
         };
+        #[cfg(feature = "experimental-graph-revision")]
+        if !nested {
+            checks.extend(
+                provisional_woken_owned_checks(
+                    self.validator.ok_or("missing harness")?,
+                    owner.store(),
+                    &current,
+                    boundary,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
                 owner.store(),
@@ -5786,6 +6249,19 @@ impl AdmissionHandle<'_> {
             .map_err(|e| e.to_string())?;
             checks.extend(conversation_finish.checks);
             checks.extend(task_finish.checks);
+            #[cfg(feature = "experimental-graph-revision")]
+            if owner
+                .store()
+                .get(&crate::runtime::woken_owned_graph_key(claim.task))
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                let owned = prepare_woken_owned_callback_finish(owner.store(), claim, marker)?;
+                checks.extend(owned.checks);
+                if memo.is_none() {
+                    mutations.extend(owned.mutations);
+                }
+            }
             if memo.is_none() {
                 mutations.extend(conversation_finish.mutations);
                 mutations.extend(task_finish.mutations);
@@ -6150,6 +6626,17 @@ impl AdmissionHandle<'_> {
         checks.extend(task_finish.checks);
         let mut mutations = conversation_finish.mutations;
         mutations.extend(task_finish.mutations);
+        #[cfg(feature = "experimental-graph-revision")]
+        if owner
+            .store()
+            .get(&crate::runtime::woken_owned_graph_key(claim.task))
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            let owned = prepare_woken_owned_callback_finish(owner.store(), claim, marker)?;
+            checks.extend(owned.checks);
+            mutations.extend(owned.mutations);
+        }
         mutations.push(durable_store::Mutation::Put {
             key,
             value: serde_json::to_vec(claim).map_err(|e| e.to_string())?,
@@ -10500,13 +10987,22 @@ impl Scheduler {
                                                     harness,
                                                     None,
                                                 )?;
+                                            #[cfg(feature = "experimental-graph-revision")]
+                                            let owned_checks = provisional_woken_owned_checks(
+                                                harness, store, &running, boundary,
+                                            )
+                                            .ok();
+                                            #[cfg(not(feature = "experimental-graph-revision"))]
+                                            let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
                                             if uncertain.is_none()
+                                                && owned_checks.is_some()
                                                 && !has_live_owned(
                                                     store,
                                                     running.task.id(),
                                                     &records,
                                                 )?
                                             {
+                                                checks.extend(owned_checks.unwrap());
                                                 checks.extend(binding);
                                                 checks.extend(descendants);
                                                 _nested_identity_leases = leases;
@@ -12052,7 +12548,8 @@ impl Scheduler {
         let parent = match intent {
             MaintenanceIntent::Nested(id)
             | MaintenanceIntent::Failed(id)
-            | MaintenanceIntent::FailFast(id) => id,
+            | MaintenanceIntent::FailFast(id)
+            | MaintenanceIntent::Woken(id) => id,
         };
         let Ok(Some((fixed, nested))) = resolve_maintenance(&self.ts(), intent) else {
             return false;
@@ -12885,6 +13382,48 @@ impl Scheduler {
             .store(true, std::sync::atomic::Ordering::Release);
         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
         batch.checks.extend(child_checks);
+        #[cfg(feature = "experimental-graph-revision")]
+        match crate::runtime::prepare_woken_owned_reservation(
+            self.ts().store(),
+            snapshot,
+            &next.task,
+        ) {
+            Ok(Some((checks, mutation))) => {
+                batch.checks.extend(checks);
+                batch.mutations.push(mutation);
+            }
+            Ok(None) => match crate::runtime::prepare_woken_owned_child_reservation(
+                self.ts().store(),
+                snapshot,
+                &next.task,
+            ) {
+                Ok(Some((checks, mutation))) => {
+                    batch.checks.extend(checks);
+                    batch.mutations.push(mutation);
+                }
+                Ok(None) => (),
+                Err(crate::runtime::Error::Storage(error)) => {
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Err(task_store::Error::from(error).into());
+                }
+                Err(_) => {
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(false);
+                }
+            },
+            Err(crate::runtime::Error::Storage(error)) => {
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(task_store::Error::from(error).into());
+            }
+            Err(_) => {
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Ok(false);
+            }
+        }
         #[cfg(test)]
         if let Some(hook) = &self.reservation_commit_hook {
             hook(0, self.ts().store());
@@ -13631,9 +14170,21 @@ impl Scheduler {
                                                 harness,
                                                 None,
                                             )?;
+                                        #[cfg(feature = "experimental-graph-revision")]
+                                        let owned_checks = provisional_woken_owned_checks(
+                                            harness,
+                                            store,
+                                            &item,
+                                            recovery_graph_version,
+                                        )
+                                        .ok();
+                                        #[cfg(not(feature = "experimental-graph-revision"))]
+                                        let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
                                         if uncertain.is_none()
+                                            && owned_checks.is_some()
                                             && !has_live_owned(store, item.task.id(), &records)?
                                         {
+                                            checks.extend(owned_checks.unwrap());
                                             checks.extend(binding);
                                             checks.extend(descendants);
                                             _nested_identity_leases = leases;
@@ -13688,6 +14239,20 @@ impl Scheduler {
                                     return Err(Error::Handler(
                                         "interrupted woken marker mismatch".into(),
                                     ));
+                                }
+                                #[cfg(feature = "experimental-graph-revision")]
+                                if nested_ancestry.is_none()
+                                    && store
+                                        .get(&crate::runtime::woken_owned_graph_key(claim.task))
+                                        .map_err(task_store::Error::from)?
+                                        .is_some()
+                                {
+                                    let owned = prepare_woken_owned_callback_finish(
+                                        store, &claim, &expected,
+                                    )
+                                    .map_err(Error::Handler)?;
+                                    batch.checks.extend(owned.checks);
+                                    batch.mutations.extend(owned.mutations);
                                 }
                                 if nested_ancestry.is_some() {
                                     let ancestry_batch =
@@ -15364,6 +15929,7 @@ impl Scheduler {
             fence: self.failure_fence.clone(),
             state: self.live_invocations.clone(),
             scheduler_poison: self.poisoned.clone(),
+            definitions: self.wake_reader.definitions.clone(),
             intent,
             independent,
         })
@@ -15440,6 +16006,62 @@ impl Scheduler {
                 {
                     self.unbound_cancel_roots.insert(task.id());
                     self.deferred_recovery.insert(task.id());
+                }
+            }
+        }
+        // Interrupted woken roots with foreground owned conversations require
+        // the scoped graph coordinator; inline recovery cannot mark a
+        // conversation and its inputs in the task-only transaction.
+        if nonblocking && allow_maintenance && self.validator.is_some() {
+            let active = self
+                .live_invocations
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .attempts
+                .clone();
+            for root in &self.unbound_cancel_roots {
+                let Some(record) = held_tasks.iter().find(|item| item.task.id() == *root) else {
+                    continue;
+                };
+                if active.contains(root)
+                    || record.task.state() != &TaskState::Running
+                    || record.task.abort_requested()
+                    || record.task.replay_safe()
+                    || !matches!(record.task.owner(), TaskOwner::Conversation(_))
+                    || record.task.checkpoint().phase != "replay-safe-async-wait"
+                    || !self
+                        .registered(&record.task)
+                        .is_ok_and(|reg| reg.handler.conversation_woken_cancel_enabled())
+                {
+                    continue;
+                }
+                let mut ids = HashSet::from([*root]);
+                loop {
+                    let before = ids.len();
+                    for item in &held_tasks {
+                        if !item.task.is_background()
+                            && let TaskOwner::Task(parent) = item.task.owner()
+                            && ids.contains(parent)
+                        {
+                            ids.insert(item.task.id());
+                        }
+                    }
+                    if ids.len() == before {
+                        break;
+                    }
+                }
+                if crate::ownership_edge::reject_foreground_children(owner.store(), ids)
+                    .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+                {
+                    if independent_only
+                        && excluded.iter().copied().any(|intent| {
+                            !self.separate_from_maintenance(&owner, &record.task, intent)
+                        })
+                    {
+                        continue;
+                    }
+                    return Ok(self
+                        .deferred_maintenance(MaintenanceIntent::Woken(*root), independent_only));
                 }
             }
         }
@@ -16271,6 +16893,12 @@ impl Scheduler {
             {
                 continue;
             }
+            #[cfg(feature = "experimental-graph-revision")]
+            if !crate::runtime::woken_owned_reservation_may_start(owner.store(), &snapshot.task)
+                .map_err(|error| Error::Handler(error.to_string()))?
+            {
+                continue;
+            }
             let graph = cleanup_graph.as_ref().unwrap();
             let mut pending = false;
             let mut anchors = vec![snapshot.task.id()];
@@ -16401,211 +17029,172 @@ impl Scheduler {
                 break;
             }
         }
-        if let Some((snapshot, woken_cleanup_lease, nested_identity_leases)) = abortable {
-            self.poisoned
-                .store(true, std::sync::atomic::Ordering::Release);
-            if snapshot.task.holds_restart_cleanup() {
-                // One bounded salvage attempt: a crashed attempt is never dispatched again.
-                let key = restart_receipt_key(snapshot.task.id());
-                let receipt = self
-                    .ts()
-                    .store()
-                    .get(&key)
-                    .map_err(task_store::Error::from)?;
-                let valid_registration = self.registered(&snapshot.task).ok().is_some_and(|reg| {
-                    reg.replay_safe
-                        && reg.restart_after
-                        && reg.version == snapshot.task.definition_version()
-                });
-                let evidence = if valid_registration {
-                    receipt.as_ref().and_then(|entry| {
-                        restart_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
-                    })
-                } else {
-                    None
-                };
-                let mut next = snapshot.clone();
-                next.task
-                    .finish_restart_cleanup()
-                    .map_err(Error::Transition)?;
-                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
-                if let Some((_, checks)) = evidence {
-                    batch.checks.extend(checks);
-                } else if let Some(entry) = receipt {
-                    batch.checks.push(durable_store::Check {
-                        key: key.clone(),
-                        expected: durable_store::Expected::Version(entry.version),
-                    });
-                    batch
-                        .mutations
-                        .push(durable_store::Mutation::Delete { key });
-                } else {
-                    batch.checks.push(durable_store::Check {
-                        key,
-                        expected: durable_store::Expected::Missing,
-                    });
-                }
-                let committed = if independent_only {
-                    self.commit_independent_abort_batch(&batch, graph_version)?
-                } else {
-                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
-                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => true,
-                        Err(error) => return Err(task_store::Error::from(error).into()),
-                    }
-                };
+        'abort_attempt: {
+            if let Some((snapshot, woken_cleanup_lease, nested_identity_leases)) = abortable {
                 self.poisoned
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(TickReservation::Progress(committed));
-            }
-            if snapshot.task.restarts() > 0
-                && snapshot.task.restarts() >= snapshot.task.restart_limit()
-            {
-                let key = abort_receipt_key(snapshot.task.id());
-                let receipt = self
-                    .ts()
-                    .store()
-                    .get(&key)
-                    .map_err(task_store::Error::from)?;
-                let valid_registration = self.registered(&snapshot.task).ok().is_some_and(|reg| {
-                    reg.version == snapshot.task.definition_version()
-                        && reg.replay_safe == snapshot.task.replay_safe()
-                        && (reg.replay_safe
-                            || (!snapshot.task.replay_safe()
-                                && reg.cancellable_durable_async
-                                && reg.checkpointable_hooks
-                                && reg.handler.requires_park_cancel_claim()))
-                        && reg
-                            .abort
-                            .as_ref()
-                            .is_some_and(|abort| Arc::ptr_eq(abort, &reg.handler))
-                });
-                let evidence = if valid_registration {
-                    receipt.as_ref().and_then(|entry| {
-                        abort_receipt_evidence(
-                            self.ts().store(),
-                            &snapshot.task,
-                            entry,
-                            self.registered(&snapshot.task)
-                                .ok()
-                                .is_some_and(|reg| reg.handler.requires_park_cancel_claim()),
-                        )
-                        .ok()
-                    })
-                } else {
-                    None
-                };
-                if let Some((_, checks)) = evidence {
-                    let mut next = snapshot.clone();
-                    if snapshot.task.woken_interrupted_attempt().is_some() {
-                        next.task
-                            .fail_interrupted_woken_ready()
-                            .map_err(Error::Transition)?;
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if snapshot.task.holds_restart_cleanup() {
+                    // One bounded salvage attempt: a crashed attempt is never dispatched again.
+                    let key = restart_receipt_key(snapshot.task.id());
+                    let receipt = self
+                        .ts()
+                        .store()
+                        .get(&key)
+                        .map_err(task_store::Error::from)?;
+                    let valid_registration =
+                        self.registered(&snapshot.task).ok().is_some_and(|reg| {
+                            reg.replay_safe
+                                && reg.restart_after
+                                && reg.version == snapshot.task.definition_version()
+                        });
+                    let evidence = if valid_registration {
+                        receipt.as_ref().and_then(|entry| {
+                            restart_receipt_evidence(self.ts().store(), &snapshot.task, entry).ok()
+                        })
                     } else {
-                        next.task.cancel().map_err(Error::Transition)?;
-                    }
+                        None
+                    };
+                    let mut next = snapshot.clone();
+                    next.task
+                        .finish_restart_cleanup()
+                        .map_err(Error::Transition)?;
                     let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
-                    batch.checks.extend(checks);
-                    #[cfg(test)]
-                    if let Some(hook) = &self.reservation_commit_hook {
-                        hook(0, self.ts().store());
+                    if let Some((_, checks)) = evidence {
+                        batch.checks.extend(checks);
+                    } else if let Some(entry) = receipt {
+                        batch.checks.push(durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        });
+                        batch
+                            .mutations
+                            .push(durable_store::Mutation::Delete { key });
+                    } else {
+                        batch.checks.push(durable_store::Check {
+                            key,
+                            expected: durable_store::Expected::Missing,
+                        });
                     }
-                    if independent_only {
-                        let progress =
-                            self.commit_independent_abort_batch(&batch, graph_version)?;
-                        self.poisoned
-                            .store(false, std::sync::atomic::Ordering::Release);
-                        return Ok(TickReservation::Progress(progress));
-                    }
-                    match self.ts().store().commit(&batch.checks, &batch.mutations) {
-                        Ok(()) => (),
-                        Err(durable_store::Error::Conflict { .. }) => {
+                    let committed = if independent_only {
+                        self.commit_independent_abort_batch(&batch, graph_version)?
+                    } else {
+                        match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                            Ok(()) | Err(durable_store::Error::Conflict { .. }) => true,
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    };
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(TickReservation::Progress(committed));
+                }
+                if snapshot.task.restarts() > 0
+                    && snapshot.task.restarts() >= snapshot.task.restart_limit()
+                {
+                    let key = abort_receipt_key(snapshot.task.id());
+                    let receipt = self
+                        .ts()
+                        .store()
+                        .get(&key)
+                        .map_err(task_store::Error::from)?;
+                    let valid_registration =
+                        self.registered(&snapshot.task).ok().is_some_and(|reg| {
+                            reg.version == snapshot.task.definition_version()
+                                && reg.replay_safe == snapshot.task.replay_safe()
+                                && (reg.replay_safe
+                                    || (!snapshot.task.replay_safe()
+                                        && reg.cancellable_durable_async
+                                        && reg.checkpointable_hooks
+                                        && reg.handler.requires_park_cancel_claim()))
+                                && reg
+                                    .abort
+                                    .as_ref()
+                                    .is_some_and(|abort| Arc::ptr_eq(abort, &reg.handler))
+                        });
+                    let evidence = if valid_registration {
+                        receipt.as_ref().and_then(|entry| {
+                            abort_receipt_evidence(
+                                self.ts().store(),
+                                &snapshot.task,
+                                entry,
+                                self.registered(&snapshot.task)
+                                    .ok()
+                                    .is_some_and(|reg| reg.handler.requires_park_cancel_claim()),
+                            )
+                            .ok()
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((_, checks)) = evidence {
+                        let mut next = snapshot.clone();
+                        if snapshot.task.woken_interrupted_attempt().is_some() {
+                            next.task
+                                .fail_interrupted_woken_ready()
+                                .map_err(Error::Transition)?;
+                        } else {
+                            next.task.cancel().map_err(Error::Transition)?;
+                        }
+                        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                        batch.checks.extend(checks);
+                        #[cfg(test)]
+                        if let Some(hook) = &self.reservation_commit_hook {
+                            hook(0, self.ts().store());
+                        }
+                        if independent_only {
+                            let progress =
+                                self.commit_independent_abort_batch(&batch, graph_version)?;
                             self.poisoned
                                 .store(false, std::sync::atomic::Ordering::Release);
+                            return Ok(TickReservation::Progress(progress));
+                        }
+                        match self.ts().store().commit(&batch.checks, &batch.mutations) {
+                            Ok(()) => (),
+                            Err(durable_store::Error::Conflict { .. }) => {
+                                self.poisoned
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                return Ok(TickReservation::Progress(true));
+                            }
+                            Err(error) => return Err(task_store::Error::from(error).into()),
+                        }
+                    } else {
+                        if independent_only {
+                            let progress =
+                                self.independent_abort_update(snapshot, graph_version, |task| {
+                                    task.fail_abort_restart()
+                                })?;
+                            self.poisoned
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            return Ok(TickReservation::Progress(progress));
+                        }
+                        let update = self.ts().update(snapshot, |task| task.fail_abort_restart());
+                        if !self.reservation_update_committed(update)? {
                             return Ok(TickReservation::Progress(true));
                         }
-                        Err(error) => return Err(task_store::Error::from(error).into()),
                     }
-                } else {
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(TickReservation::Progress(true));
+                }
+                if let Some(reason) = self.blocked_reason(&snapshot.task) {
+                    let diagnostic = if matches!(reason, BlockedReason::MissingTask)
+                        && snapshot.task.checkpoint().phase == "replay-safe-async-wait"
+                    {
+                        "orphaned: missing task definition; parked external work requires reconciliation".into()
+                    } else {
+                        orphan_diagnostic(&reason)
+                    };
                     if independent_only {
                         let progress =
                             self.independent_abort_update(snapshot, graph_version, |task| {
-                                task.fail_abort_restart()
+                                task.start()?;
+                                task.fail(diagnostic)
                             })?;
                         self.poisoned
                             .store(false, std::sync::atomic::Ordering::Release);
                         return Ok(TickReservation::Progress(progress));
                     }
-                    let update = self.ts().update(snapshot, |task| task.fail_abort_restart());
-                    if !self.reservation_update_committed(update)? {
-                        return Ok(TickReservation::Progress(true));
-                    }
-                }
-                self.poisoned
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(TickReservation::Progress(true));
-            }
-            if let Some(reason) = self.blocked_reason(&snapshot.task) {
-                let diagnostic = if matches!(reason, BlockedReason::MissingTask)
-                    && snapshot.task.checkpoint().phase == "replay-safe-async-wait"
-                {
-                    "orphaned: missing task definition; parked external work requires reconciliation".into()
-                } else {
-                    orphan_diagnostic(&reason)
-                };
-                if independent_only {
-                    let progress =
-                        self.independent_abort_update(snapshot, graph_version, |task| {
-                            task.start()?;
-                            task.fail(diagnostic)
-                        })?;
-                    self.poisoned
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    return Ok(TickReservation::Progress(progress));
-                }
-                #[cfg(test)]
-                invoke_boundary(reservation_update_hooks(), snapshot.task.id());
-                let update = self.ts().update(snapshot, |t| {
-                    t.start()?;
-                    t.fail(diagnostic)
-                });
-                if !self.reservation_update_committed(update)? {
-                    return Ok(TickReservation::Progress(true));
-                }
-                self.poisoned
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Ok(TickReservation::Progress(true));
-            }
-            let abort = self
-                .registered(&snapshot.task)
-                .ok()
-                .and_then(|r| r.abort.clone());
-            if let Some(abort) = abort {
-                #[cfg(test)]
-                if independent_only {
-                    let hook = independent_abort_reservation_hooks()
-                        .lock()
-                        .unwrap()
-                        .remove(&snapshot.task.id());
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                }
-                if !self.reserve_resolved(snapshot, independent_only.then_some(graph_version))? {
-                    if independent_only {
-                        #[cfg(test)]
-                        if let Some(hook) = independent_abort_conflict_hooks()
-                            .lock()
-                            .unwrap()
-                            .remove(&snapshot.task.id())
-                        {
-                            hook();
-                        }
-                        return Ok(TickReservation::Progress(false));
-                    }
-                    let reason = self
-                        .blocked_reason(&snapshot.task)
-                        .ok_or(Error::Registration)?;
-                    let diagnostic = orphan_diagnostic(&reason);
+                    #[cfg(test)]
+                    invoke_boundary(reservation_update_hooks(), snapshot.task.id());
                     let update = self.ts().update(snapshot, |t| {
                         t.start()?;
                         t.fail(diagnostic)
@@ -16617,47 +17206,96 @@ impl Scheduler {
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(TickReservation::Progress(true));
                 }
-                let running = self
-                    .ts()
-                    .load(snapshot.task.id())?
-                    .ok_or(Error::Ownership)?;
-                let mut invocation = self.make_invocation(running, abort, true)?;
-                invocation.woken_cleanup_lease = woken_cleanup_lease;
-                invocation.nested_identity_leases = nested_identity_leases;
-                #[cfg(test)]
-                if let Some(hook) = woken_reserved_hooks()
-                    .lock()
-                    .unwrap()
-                    .remove(&snapshot.task.id())
-                {
-                    hook();
+                let abort = self
+                    .registered(&snapshot.task)
+                    .ok()
+                    .and_then(|r| r.abort.clone());
+                if let Some(abort) = abort {
+                    #[cfg(test)]
+                    if independent_only {
+                        let hook = independent_abort_reservation_hooks()
+                            .lock()
+                            .unwrap()
+                            .remove(&snapshot.task.id());
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    if !self
+                        .reserve_resolved(snapshot, independent_only.then_some(graph_version))?
+                    {
+                        if independent_only {
+                            #[cfg(test)]
+                            if let Some(hook) = independent_abort_conflict_hooks()
+                                .lock()
+                                .unwrap()
+                                .remove(&snapshot.task.id())
+                            {
+                                hook();
+                            }
+                            return Ok(TickReservation::Progress(false));
+                        }
+                        let Some(reason) = self.blocked_reason(&snapshot.task) else {
+                            // A checked reservation may lose a race or be deferred by
+                            // owned-graph evidence while its registration remains valid.
+                            break 'abort_attempt;
+                        };
+                        let diagnostic = orphan_diagnostic(&reason);
+                        let update = self.ts().update(snapshot, |t| {
+                            t.start()?;
+                            t.fail(diagnostic)
+                        });
+                        if !self.reservation_update_committed(update)? {
+                            return Ok(TickReservation::Progress(true));
+                        }
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(true));
+                    }
+                    let running = self
+                        .ts()
+                        .load(snapshot.task.id())?
+                        .ok_or(Error::Ownership)?;
+                    let mut invocation = self.make_invocation(running, abort, true)?;
+                    invocation.woken_cleanup_lease = woken_cleanup_lease;
+                    invocation.nested_identity_leases = nested_identity_leases;
+                    #[cfg(test)]
+                    if let Some(hook) = woken_reserved_hooks()
+                        .lock()
+                        .unwrap()
+                        .remove(&snapshot.task.id())
+                    {
+                        hook();
+                    }
+                    self.poisoned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    drop(gate);
+                    return Ok(TickReservation::Invocation(Box::new(invocation)));
+                } else {
+                    if independent_only {
+                        let progress =
+                            self.independent_abort_update(snapshot, graph_version, |task| {
+                                task.start()?;
+                                task.fail(
+                                    "orphaned: missing abort handler or task definition".into(),
+                                )
+                            })?;
+                        self.poisoned
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(TickReservation::Progress(progress));
+                    }
+                    let update = self.ts().update(snapshot, |t| {
+                        t.start()?;
+                        t.fail("orphaned: missing abort handler or task definition".into())
+                    });
+                    if !self.reservation_update_committed(update)? {
+                        return Ok(TickReservation::Progress(true));
+                    }
                 }
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
-                drop(gate);
-                return Ok(TickReservation::Invocation(Box::new(invocation)));
-            } else {
-                if independent_only {
-                    let progress =
-                        self.independent_abort_update(snapshot, graph_version, |task| {
-                            task.start()?;
-                            task.fail("orphaned: missing abort handler or task definition".into())
-                        })?;
-                    self.poisoned
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    return Ok(TickReservation::Progress(progress));
-                }
-                let update = self.ts().update(snapshot, |t| {
-                    t.start()?;
-                    t.fail("orphaned: missing abort handler or task definition".into())
-                });
-                if !self.reservation_update_committed(update)? {
-                    return Ok(TickReservation::Progress(true));
-                }
+                return Ok(TickReservation::Progress(true));
             }
-            self.poisoned
-                .store(false, std::sync::atomic::Ordering::Release);
-            return Ok(TickReservation::Progress(true));
         }
         if independent_only {
             return Ok(TickReservation::Progress(progress));
@@ -18519,7 +19157,8 @@ pub(crate) fn resolve_maintenance(
     let id = match intent {
         MaintenanceIntent::Nested(id)
         | MaintenanceIntent::Failed(id)
-        | MaintenanceIntent::FailFast(id) => id,
+        | MaintenanceIntent::FailFast(id)
+        | MaintenanceIntent::Woken(id) => id,
     };
     let Some(parent) = records.iter().find(|item| item.task.id() == id) else {
         return Ok(None);
@@ -18535,6 +19174,15 @@ pub(crate) fn resolve_maintenance(
                 && matches!(parent.task.state(), TaskState::CompletingFailed(_))
                 && !owned_graph_uncertain(ts.store(), id)?
                 && has_owned_work(ts.store(), id, &records, true)? =>
+        {
+            Ok(Some((Some(id), None)))
+        }
+        MaintenanceIntent::Woken(_)
+            if !parent.task.abort_requested()
+                && parent.task.state() == &TaskState::Running
+                && !parent.task.replay_safe()
+                && matches!(parent.task.owner(), TaskOwner::Conversation(_))
+                && parent.task.checkpoint().phase == "replay-safe-async-wait" =>
         {
             Ok(Some((Some(id), None)))
         }
@@ -18612,6 +19260,24 @@ pub(crate) fn unsafe_descendant_reconciliation(
     Ok((unresolved, checks))
 }
 
+/// Carry authenticated owned-graph evidence into a dependent woken cleanup
+/// transaction. This is an additional fence only: it never enables dispatch.
+#[cfg(feature = "experimental-graph-revision")]
+fn provisional_woken_owned_checks(
+    harness: &crate::runtime::Harness,
+    store: &durable_store::Store,
+    root: &task_store::StoredTask,
+    boundary: u64,
+) -> Result<Vec<durable_store::Check>, Error> {
+    // Even when no owned-graph record has ever existed, a foreground edge
+    // may already have been admitted. The Harness walks the current graph and
+    // fences the relevant prefixes together with the missing evidence key.
+    let _ = store;
+    harness
+        .woken_owned_graph_checks_if_required(root, boundary)
+        .map_err(|e| Error::Handler(e.to_string()))
+}
+
 /// Verify nested cancelled children while the caller holds the Harness
 /// selection gate. The returned identity leases must remain held through the
 /// same commit as every returned store check. Unverifiable evidence remains an
@@ -18662,6 +19328,8 @@ pub(crate) fn authenticated_woken_terminal_descendants(
 > {
     let (_, root_checks) =
         woken_terminal_after_checks(store, parent, boundary).map_err(Error::Handler)?;
+    #[cfg(feature = "experimental-graph-revision")]
+    let owned_checks = provisional_woken_owned_checks(harness, store, parent, boundary)?;
     let (uncertain, mut checks, leases) = authenticated_unsafe_descendant_reconciliation_inner(
         store,
         parent.task.id(),
@@ -18673,7 +19341,95 @@ pub(crate) fn authenticated_woken_terminal_descendants(
         true,
     )?;
     checks.extend(root_checks);
+    #[cfg(feature = "experimental-graph-revision")]
+    checks.extend(owned_checks);
     Ok((uncertain, checks, leases))
+}
+
+/// Pin all extension names selected by the parent and its owned child as one
+/// start lease. The caller must retain the registry and both identity leases,
+/// validate both conversation bindings and graph evidence, then carry this
+/// lease through the callback's first poll. This does not authorize dispatch.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn owned_child_cleanup_selection_lease(
+    registry: &Registry,
+    root: &Task,
+    child: &Task,
+    harness: &crate::runtime::Harness,
+) -> Result<crate::extension::SelectionStartLease, Error> {
+    let mut selections = Vec::new();
+    for (task, woken_root) in [(root, true), (child, false)] {
+        let registration = task
+            .kind()
+            .and_then(|kind| registry.entries.get(kind))
+            .ok_or(Error::Registration)?;
+        let checkpointable = registration
+            .conversation_checkpointable
+            .as_ref()
+            .ok_or(Error::Registration)?;
+        if task.replay_safe()
+            || !task.abort_requested()
+            || registration.replay_safe
+            || registration.version != task.definition_version()
+            || !registration.handler.conversation_cancel_dispatch_enabled()
+            || (woken_root && !registration.handler.conversation_woken_cancel_enabled())
+            || registration
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &registration.handler))
+        {
+            return Err(Error::Ownership);
+        }
+        if let Some(selection) = &checkpointable.2 {
+            selections.push(selection);
+        }
+    }
+    harness
+        .checkpointable_selection_start_many(selections)
+        .map_err(|_| Error::Busy)
+}
+
+/// Pin both registrations' live identities. The caller must hold the registry
+/// lease and selection gate, authenticate the graph/bindings and retain these
+/// leases through the checked operation. This does not authorize a callback.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn owned_child_cleanup_identity_leases(
+    registry: &Registry,
+    root: &Task,
+    child: &Task,
+) -> Result<Vec<crate::nested_identity::IdentityLease>, Error> {
+    let mut leases = Vec::with_capacity(2);
+    for (task, woken_root) in [(root, true), (child, false)] {
+        let registration = task
+            .kind()
+            .and_then(|kind| registry.entries.get(kind))
+            .ok_or(Error::Registration)?;
+        if task.replay_safe()
+            || !task.abort_requested()
+            || registration.replay_safe
+            || registration.version != task.definition_version()
+            || registration.conversation_checkpointable.is_none()
+            || !registration.handler.conversation_cancel_dispatch_enabled()
+            || (woken_root && !registration.handler.conversation_woken_cancel_enabled())
+            || registration
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &registration.handler))
+        {
+            return Err(Error::Ownership);
+        }
+        let lease = registration
+            .handler
+            .conversation_cleanup_identity_lease()
+            .map_err(|failure| match failure {
+                crate::nested_identity::LeaseFailure::Busy => Error::Busy,
+                crate::nested_identity::LeaseFailure::Mismatch => Error::Ownership,
+            })?;
+        leases.push(lease);
+    }
+    Ok(leases)
 }
 
 /// The terminal marker must have been committed with the cancelled root and

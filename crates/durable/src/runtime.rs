@@ -111,6 +111,443 @@ pub(crate) fn owned_cleanup_key(id: Uuid) -> Vec<u8> {
     format!("runtime/owned-cleanup-attempt/{id}").into_bytes()
 }
 
+// Immutable evidence of the exact owned-conversation graph marked with a
+// recovered woken root. This is not callback authorization on its own.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenOwnedGraphEvidence {
+    pub version: u32,
+    pub root: Uuid,
+    pub interrupted_attempt: Uuid,
+    pub root_before_version: u64,
+    pub tasks: Vec<crate::task::Task>,
+    pub edges: Vec<WokenOwnedEdgeEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<WokenOwnedStructureEvidence>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenOwnedStructureEvidence {
+    pub boundary: u64,
+    pub root_revision: Option<u64>,
+    pub global_revision: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WokenOwnedEdgeEvidence {
+    pub edge: crate::ownership_edge::Edge,
+    pub edge_version: u64,
+    pub conversation_before_version: u64,
+}
+pub(crate) fn woken_owned_graph_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-graph/v1/{root}").into_bytes()
+}
+
+// A reservation is the one permitted change to the root's execution
+// revision after the graph mark. It is evidence, never authorization alone.
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedReservation {
+    version: u32,
+    graph_version: u64,
+    ready_version: u64,
+    running: crate::task::Task,
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+fn woken_owned_reservation_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-reservation/v1/{root}").into_bytes()
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedChildReservation {
+    version: u32,
+    root: Uuid,
+    child: Uuid,
+    graph_version: u64,
+    ready_version: u64,
+    running: crate::task::Task,
+}
+
+/// Reservation evidence only. Callers must also authenticate the pending
+/// conversation binding, park claim, selected registration and identity lease.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn woken_owned_child_reservation_checks(
+    store: &durable_store::Store,
+    child: &crate::task_store::StoredTask,
+) -> Result<(Uuid, Vec<Check>), Error> {
+    let crate::task::TaskOwner::Conversation(conversation) = child.task.owner() else {
+        return Err(Error::Invalid("owned child owner missing".into()));
+    };
+    let edge_key = crate::ownership_edge::edge_key(*conversation);
+    let edge_entry = store.get(&edge_key)?.ok_or(Error::NotFound)?;
+    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+        return Err(Error::Invalid("owned child is not foreground".into()));
+    }
+    let root = edge.edge.task;
+    let graph_key = woken_owned_graph_key(root);
+    let graph_entry = store.get(&graph_key)?.ok_or(Error::NotFound)?;
+    let graph: WokenOwnedGraphEvidence = serde_json::from_slice(&graph_entry.value)?;
+    let structure = graph
+        .structure
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("owned structure missing".into()))?;
+    let marked_edge = graph
+        .edges
+        .iter()
+        .find(|marked| marked.edge.child == *conversation)
+        .ok_or(Error::NotFound)?;
+    if graph.version != 1
+        || graph.root != root
+        || marked_edge.edge != edge.edge
+        || marked_edge.edge_version != edge.version
+    {
+        return Err(Error::Invalid("owned child edge changed".into()));
+    }
+    let marker_key = format!(
+        "runtime/woken-owned-child-reservation/v1/{root}/{}",
+        child.task.id()
+    )
+    .into_bytes();
+    let marker_entry = store.get(&marker_key)?.ok_or(Error::NotFound)?;
+    let marker: WokenOwnedChildReservation = serde_json::from_slice(&marker_entry.value)?;
+    if marker.version != 1
+        || marker.root != root
+        || marker.child != child.task.id()
+        || marker.graph_version != graph_entry.version
+        || marker.running != child.task
+        || child.task.state() != &crate::task::TaskState::Running
+        || !child.task.abort_requested()
+    {
+        return Err(Error::Invalid("owned child reservation changed".into()));
+    }
+    let task_key = crate::task_store::key(child.task.id());
+    let marker_commit = store
+        .commit_for_version(&marker_key, marker_entry.version)?
+        .ok_or(Error::NotFound)?;
+    if store.commit_for_version(&task_key, child.version)? != Some(marker_commit) {
+        return Err(Error::Invalid("child reservation was not atomic".into()));
+    }
+    let root_key = crate::task_store::key(root);
+    let root_task = crate::task_store::TaskStore::new(store)
+        .load(root)
+        .map_err(|e| Error::Invalid(e.to_string()))?
+        .ok_or(Error::NotFound)?;
+    let graph_commit = store
+        .commit_for_version(&graph_key, graph_entry.version)?
+        .ok_or(Error::NotFound)?;
+    let root_before = store
+        .commit_for_version(&root_key, graph.root_before_version)?
+        .ok_or(Error::NotFound)?;
+    if store.commit_for_version(&root_key, root_task.version)? != Some(graph_commit)
+        || store.next_commit_for_key(&root_key, root_before)? != Some(graph_commit)
+        || root_task.task.state() != &crate::task::TaskState::Ready
+        || !root_task.task.abort_requested()
+        || root_task.task.woken_interrupted_attempt() != Some(graph.interrupted_attempt)
+    {
+        return Err(Error::Invalid("owned graph root changed".into()));
+    }
+    let revision_key = durable_store::graph_revision::task_structure_revision(root);
+    let before_revision = structure
+        .root_revision
+        .ok_or_else(|| Error::Invalid("owned revision missing".into()))?;
+    let before_commit = store
+        .commit_for_version(&revision_key, before_revision)?
+        .ok_or(Error::NotFound)?;
+    let revision = store.get(&revision_key)?.ok_or(Error::NotFound)?;
+    if store.next_commit_for_key(&revision_key, before_commit)? != Some(marker_commit)
+        || store.commit_for_version(&revision_key, revision.version)? != Some(marker_commit)
+    {
+        return Err(Error::Invalid("owned child revision changed".into()));
+    }
+    let global_key = durable_store::graph_revision::global_structure_revision();
+    if store.get(&global_key)?.map(|entry| entry.version) != structure.global_revision {
+        return Err(Error::Invalid("global structure changed".into()));
+    }
+    let global_expected = structure.global_revision.map_or(
+        Expected::MissingUnchangedSince(structure.boundary),
+        Expected::Version,
+    );
+    let checks = vec![
+        Check {
+            key: edge_key,
+            expected: Expected::Version(edge_entry.version),
+        },
+        Check {
+            key: graph_key,
+            expected: Expected::Version(graph_entry.version),
+        },
+        Check {
+            key: marker_key,
+            expected: Expected::Version(marker_entry.version),
+        },
+        Check {
+            key: root_key,
+            expected: Expected::Version(root_task.version),
+        },
+        Check {
+            key: task_key,
+            expected: Expected::Version(child.version),
+        },
+        Check {
+            key: revision_key,
+            expected: Expected::Version(revision.version),
+        },
+        Check {
+            key: global_key,
+            expected: global_expected,
+        },
+    ];
+    Ok((root, checks))
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn prepare_woken_owned_child_reservation(
+    store: &durable_store::Store,
+    ready: &crate::task_store::StoredTask,
+    running: &crate::task::Task,
+) -> Result<Option<(Vec<Check>, Mutation)>, Error> {
+    let crate::task::TaskOwner::Conversation(conversation) = ready.task.owner() else {
+        return Ok(None);
+    };
+    let edge_key = crate::ownership_edge::edge_key(*conversation);
+    let Some(edge_entry) = store.get(&edge_key)? else {
+        return Ok(None);
+    };
+    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+        return Ok(None);
+    }
+    let root = edge.edge.task;
+    let graph_key = woken_owned_graph_key(root);
+    let Some(graph_entry) = store.get(&graph_key)? else {
+        return Ok(None);
+    };
+    let graph: WokenOwnedGraphEvidence = serde_json::from_slice(&graph_entry.value)?;
+    if graph.version != 1
+        || graph.root != root
+        || !graph.tasks.iter().any(|task| task.id() == ready.task.id())
+    {
+        return Err(Error::Invalid("owned child graph mismatch".into()));
+    }
+    let key = format!(
+        "runtime/woken-owned-child-reservation/v1/{root}/{}",
+        ready.task.id()
+    )
+    .into_bytes();
+    let marker = WokenOwnedChildReservation {
+        version: 1,
+        root,
+        child: ready.task.id(),
+        graph_version: graph_entry.version,
+        ready_version: ready.version,
+        running: running.clone(),
+    };
+    Ok(Some((
+        vec![
+            Check {
+                key: graph_key,
+                expected: Expected::Version(graph_entry.version),
+            },
+            Check {
+                key: edge_key,
+                expected: Expected::Version(edge_entry.version),
+            },
+            Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            },
+        ],
+        Mutation::Put {
+            key,
+            value: serde_json::to_vec(&marker)?,
+        },
+    )))
+}
+
+// Read-only scheduling hint. The reservation transaction repeats every check;
+// stale or invalid evidence merely keeps this root out of the candidate set.
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn woken_owned_reservation_may_start(
+    store: &durable_store::Store,
+    task: &crate::task::Task,
+) -> Result<bool, Error> {
+    let (entry, root, is_root) =
+        if let Some(entry) = store.get(&woken_owned_graph_key(task.id()))? {
+            (entry, task.id(), true)
+        } else {
+            let crate::task::TaskOwner::Conversation(conversation) = task.owner() else {
+                return Ok(true);
+            };
+            let edge_key = crate::ownership_edge::edge_key(*conversation);
+            let Some(edge_entry) = store.get(&edge_key)? else {
+                return Ok(true);
+            };
+            let Ok(edge) = crate::ownership_edge::decode(&edge_key, edge_entry) else {
+                return Ok(false);
+            };
+            if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+                return Ok(true);
+            }
+            let root = edge.edge.task;
+            let Some(entry) = store.get(&woken_owned_graph_key(root))? else {
+                return Ok(true);
+            };
+            (entry, root, false)
+        };
+    let Ok(graph) = serde_json::from_slice::<WokenOwnedGraphEvidence>(&entry.value) else {
+        return Ok(false);
+    };
+    let Some(structure) = graph.structure else {
+        return Ok(false);
+    };
+    if graph.version != 1
+        || graph.root != root
+        || (is_root && task.woken_interrupted_attempt() != Some(graph.interrupted_attempt))
+        || (!is_root && !graph.tasks.iter().any(|marked| marked.id() == task.id()))
+        || store
+            .get(&if is_root {
+                woken_owned_reservation_key(root)
+            } else {
+                format!(
+                    "runtime/woken-owned-child-reservation/v1/{root}/{}",
+                    task.id()
+                )
+                .into_bytes()
+            })?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    for (key, expected) in [
+        (
+            durable_store::graph_revision::task_structure_revision(root),
+            structure.root_revision,
+        ),
+        (
+            durable_store::graph_revision::global_structure_revision(),
+            structure.global_revision,
+        ),
+    ] {
+        if store.get(&key)?.map(|entry| entry.version) != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn prepare_woken_owned_reservation(
+    store: &durable_store::Store,
+    ready: &crate::task_store::StoredTask,
+    running: &crate::task::Task,
+) -> Result<Option<(Vec<Check>, Mutation)>, Error> {
+    let graph_key = woken_owned_graph_key(ready.task.id());
+    let Some(entry) = store.get(&graph_key)? else {
+        return Ok(None);
+    };
+    let graph: WokenOwnedGraphEvidence = serde_json::from_slice(&entry.value)?;
+    let structure = graph
+        .structure
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("owned graph revision missing".into()))?;
+    if graph.version != 1
+        || graph.root != ready.task.id()
+        || ready.task.woken_interrupted_attempt() != Some(graph.interrupted_attempt)
+        || !ready.task.abort_requested()
+        || ready.task.state() != &crate::task::TaskState::Ready
+        || running.id() != ready.task.id()
+        || running.state() != &crate::task::TaskState::Running
+        || running.attempt_id().is_none()
+    {
+        return Err(Error::Invalid("invalid owned reservation".into()));
+    }
+    let mut expected = ready.task.clone();
+    expected
+        .start_attempt(running.attempt_id().unwrap())
+        .map_err(|e| Error::Invalid(format!("{e:?}")))?;
+    if expected != *running {
+        return Err(Error::Invalid("owned reservation changed task".into()));
+    }
+    let key = woken_owned_reservation_key(graph.root);
+    let mut checks = vec![
+        Check {
+            key: graph_key,
+            expected: Expected::Version(entry.version),
+        },
+        Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        },
+    ];
+    for (key, version) in [
+        (
+            durable_store::graph_revision::task_structure_revision(graph.root),
+            structure.root_revision,
+        ),
+        (
+            durable_store::graph_revision::global_structure_revision(),
+            structure.global_revision,
+        ),
+    ] {
+        checks.push(Check {
+            key,
+            expected: version.map_or(
+                Expected::MissingUnchangedSince(structure.boundary),
+                Expected::Version,
+            ),
+        });
+    }
+    let value = serde_json::to_vec(&WokenOwnedReservation {
+        version: 1,
+        graph_version: entry.version,
+        ready_version: ready.version,
+        running: running.clone(),
+    })?;
+    Ok(Some((checks, Mutation::Put { key, value })))
+}
+
+/// Evidence committed with the completed owned conversation and retirement of
+/// its cleanup attempt. Consumers must additionally authenticate its graph.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OwnedCleanupReceipt {
+    pub version: u32,
+    pub conversation: Uuid,
+    pub attempt: Uuid,
+    pub marker_version: u64,
+    pub edge: crate::ownership_edge::Edge,
+    pub edge_version: u64,
+    pub started_conversation_version: u64,
+}
+pub(crate) fn owned_cleanup_receipt_key(conversation: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("runtime/owned-cleanup-receipt/v1/{conversation}/{attempt}").into_bytes()
+}
+
+#[cfg(test)]
+fn owned_cleanup_final_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn before_owned_cleanup_final_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    owned_cleanup_final_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CleanupAttempt {
     attempt: Uuid,
@@ -4992,6 +5429,11 @@ impl Harness {
         ))
     }
     /// Atomically publish a new registry snapshot to subsequent execution phases.
+    #[cfg(test)]
+    pub(crate) fn set_extension_registry_for_test(&self, registry: crate::extension::Registry) {
+        *self.extensions.write().unwrap() = registry;
+    }
+
     pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
         let _mutation = self
             .extension_start_gates
@@ -5069,6 +5511,15 @@ impl Harness {
     ) -> Result<crate::extension::SelectionStartLease, Error> {
         self.extension_start_gates
             .try_start(selection)
+            .map_err(|_| Error::TaskPublicationBusy)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_selection_start_many<'a>(
+        &self,
+        selections: impl IntoIterator<Item = &'a crate::extension::StableExtensionSelection>,
+    ) -> Result<crate::extension::SelectionStartLease, Error> {
+        self.extension_start_gates
+            .try_start_many(selections)
             .map_err(|_| Error::TaskPublicationBusy)
     }
     fn validate_checkpointable_selection(
@@ -6051,7 +6502,17 @@ impl Harness {
         &mut self,
         state: &Conversation,
         expected: Expected,
+        fence: TaskResultFence,
+    ) -> Result<(), Error> {
+        self.save_with_task_result_and_extra(state, expected, fence, None)
+    }
+
+    fn save_with_task_result_and_extra(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
         mut fence: TaskResultFence,
+        extra: Option<&crate::task_store::OwnedBatch>,
     ) -> Result<(), Error> {
         for _ in 0..8 {
             #[cfg(test)]
@@ -6063,10 +6524,14 @@ impl Harness {
             let mut checks = vec![fence.check.clone()];
             checks.extend(fence.binding.clone());
             checks.extend(fence.evidence.clone());
-            let batch = crate::task_store::OwnedBatch {
+            let mut batch = crate::task_store::OwnedBatch {
                 checks,
                 mutations: vec![],
             };
+            if let Some(extra) = extra {
+                batch.checks.extend(extra.checks.clone());
+                batch.mutations.extend(extra.mutations.clone());
+            }
             match self.save_composed_locked(state, expected.clone(), None, &[], &[], Some(&batch)) {
                 Err(Error::Storage(durable_store::Error::Conflict { key }))
                     if key == fence.check.key =>
@@ -11767,6 +12232,7 @@ impl Harness {
             false,
             false,
             &Default::default(),
+            None,
         )
     }
 
@@ -11797,6 +12263,64 @@ impl Harness {
             false,
             false,
             &Default::default(),
+            None,
+        )?);
+        Ok(checks)
+    }
+
+    /// Provisional direct-child binding. Callers must hold both selected
+    /// registration and identity leases, and separately authenticate park,
+    /// claim, first poll, receipt, and all descendant effects. This does not
+    /// authorize callback dispatch.
+    #[cfg(feature = "experimental-graph-revision")]
+    #[allow(dead_code)]
+    pub(crate) fn checkpointable_owned_child_admission_checks(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<Vec<Check>, Error> {
+        let crate::task::TaskOwner::Conversation(conversation) = task.owner() else {
+            return Err(Error::Invalid("owned child conversation missing".into()));
+        };
+        let store = self.owner.store();
+        let tasks = crate::task_store::TaskStore::new(store);
+        let child = tasks
+            .load(task.id())
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .ok_or(Error::NotFound)?;
+        if child.task != *task {
+            return Err(Error::Invalid("owned child changed".into()));
+        }
+        let (root, mut checks) = woken_owned_child_reservation_checks(store, &child)?;
+        let edge = store
+            .get(&crate::ownership_edge::edge_key(*conversation))?
+            .ok_or(Error::NotFound)?;
+        checks.extend(self.checkpointable_cancel_root_capability_checks(*conversation)?);
+        checks.extend(self.checkpointable_conversation_checks_inner(
+            task,
+            registry,
+            true,
+            false,
+            false,
+            &Default::default(),
+            Some((*conversation, edge.version)),
+        )?);
+        let root = tasks
+            .load(root)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .ok_or(Error::NotFound)?;
+        let crate::task::TaskOwner::Conversation(parent_conversation) = root.task.owner() else {
+            return Err(Error::Invalid("owned root conversation missing".into()));
+        };
+        checks.extend(self.checkpointable_cancel_root_capability_checks(*parent_conversation)?);
+        checks.extend(self.checkpointable_conversation_checks_inner(
+            &root.task,
+            registry,
+            true,
+            false,
+            false,
+            &Default::default(),
+            None,
         )?);
         Ok(checks)
     }
@@ -11921,6 +12445,7 @@ impl Harness {
             false,
             terminal,
             authenticated_ancestors,
+            None,
         )?);
         Ok((conversation, checks))
     }
@@ -11977,6 +12502,7 @@ impl Harness {
             true,
             false,
             &Default::default(),
+            None,
         )
     }
 
@@ -11988,6 +12514,7 @@ impl Harness {
         allow_failed_root: bool,
         allow_cancelled_child: bool,
         authenticated_ancestors: &std::collections::HashSet<Uuid>,
+        allowed_owned_edge: Option<(Uuid, u64)>,
     ) -> Result<Vec<Check>, Error> {
         let store = self.owner.store();
         let tasks = crate::task_store::TaskStore::new(store);
@@ -12038,16 +12565,25 @@ impl Harness {
                 crate::task::TaskOwner::Conversation(id) => {
                     let edge = crate::ownership_edge::edge_key(*id);
                     let edge_boundary = store.put_version()?;
-                    if store.get(&edge)?.is_some() {
-                        return Err(Error::Invalid(
+                    match store.get(&edge)? {
+                        Some(entry) if allowed_owned_edge == Some((*id, entry.version)) => {
+                            checks.push(Check {
+                                key: edge,
+                                expected: Expected::Version(entry.version),
+                            });
+                        }
+                        Some(_) => return Err(Error::Invalid(
                             "owned conversations are not supported for checkpointable execution"
                                 .into(),
-                        ));
+                        )),
+                        None if allowed_owned_edge.is_none() => checks.push(Check {
+                            key: edge,
+                            expected: Expected::MissingUnchangedSince(edge_boundary),
+                        }),
+                        None => {
+                            return Err(Error::Invalid("owned conversation edge missing".into()));
+                        }
                     }
-                    checks.push(Check {
-                        key: edge,
-                        expected: Expected::MissingUnchangedSince(edge_boundary),
-                    });
                     let key = Self::key(*id);
                     let entry = store.get(&key)?.ok_or_else(|| {
                         Error::Invalid("checkpointable conversation missing".into())
@@ -12151,6 +12687,427 @@ impl Harness {
             }
         }
     }
+    /// Distinguish an ordinary woken root from one whose owned-graph evidence
+    /// was removed. Returned checks are provisional and must be committed with
+    /// the caller's other admission, identity and receipt fences.
+    #[allow(dead_code)]
+    pub(crate) fn woken_owned_graph_checks_if_required(
+        &self,
+        root: &crate::task_store::StoredTask,
+        boundary: u64,
+    ) -> Result<Vec<Check>, Error> {
+        let store = self.owner.store();
+        let evidence_key = woken_owned_graph_key(root.task.id());
+        if store.get(&evidence_key)?.is_some() {
+            return self.replay_safe_woken_owned_cleanup_checks(root, boundary);
+        }
+        if store.first_commit_for_key(&evidence_key)?.is_some() {
+            return Err(Error::Invalid("owned graph evidence was removed".into()));
+        }
+        let records = crate::task_store::TaskStore::new(store)
+            .list()
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let mut ids = std::collections::HashSet::from([root.task.id()]);
+        loop {
+            let before = ids.len();
+            for record in &records {
+                if !record.task.is_background()
+                    && let crate::task::TaskOwner::Task(parent) = record.task.owner()
+                    && ids.contains(parent)
+                {
+                    ids.insert(record.task.id());
+                }
+            }
+            if ids.len() == before {
+                break;
+            }
+        }
+        if crate::ownership_edge::reject_foreground_children(store, ids)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+        {
+            return Err(Error::Invalid("owned graph evidence missing".into()));
+        }
+        Ok(vec![
+            Check {
+                key: evidence_key,
+                expected: Expected::MissingUnchangedSince(boundary),
+            },
+            Check {
+                key: crate::ownership_edge::PREFIX.to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+            Check {
+                key: crate::task_store::PREFIX.to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+        ])
+    }
+
+    /// Provisional evidence for a drained owned graph containing only
+    /// replay-safe work across conversation edges. The scoped structural
+    /// revision is required to detect graph changes after the mark.
+    /// Unsafe owned-conversation descendants also require separate terminal
+    /// and identity authentication. Do not use this for callback dispatch.
+    #[allow(dead_code)]
+    #[cfg_attr(
+        not(feature = "experimental-graph-revision"),
+        allow(unreachable_code, unused_variables)
+    )]
+    pub(crate) fn replay_safe_woken_owned_cleanup_checks(
+        &self,
+        root: &crate::task_store::StoredTask,
+        boundary: u64,
+    ) -> Result<Vec<Check>, Error> {
+        use crate::task::TaskOwner;
+        use std::collections::{HashMap, HashSet};
+        let store = self.owner.store();
+        // A legacy store cannot prove that its pre-migration owned graph did
+        // not have an erased edge or task. Keep external cleanup fail-closed.
+        if store.legacy_version_boundary()? != 0 {
+            return Err(Error::Invalid(
+                "legacy owned graph requires reconciliation".into(),
+            ));
+        }
+        let evidence_key = woken_owned_graph_key(root.task.id());
+        let evidence_entry = store
+            .get(&evidence_key)?
+            .ok_or_else(|| Error::Invalid("missing owned graph evidence".into()))?;
+        let evidence: WokenOwnedGraphEvidence = serde_json::from_slice(&evidence_entry.value)?;
+        if evidence.version != 1
+            || evidence.root != root.task.id()
+            || root.task.woken_interrupted_attempt() != Some(evidence.interrupted_attempt)
+            || !root.task.abort_requested()
+            || evidence.edges.is_empty()
+        {
+            return Err(Error::Invalid("owned graph evidence changed".into()));
+        }
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        return Err(Error::Invalid("owned graph revision is unavailable".into()));
+        #[cfg(feature = "experimental-graph-revision")]
+        let structure_checks = {
+            let structure = evidence
+                .structure
+                .as_ref()
+                .ok_or_else(|| Error::Invalid("owned graph revision missing".into()))?;
+            let mut checks = Vec::new();
+            for (key, version) in [
+                (
+                    durable_store::graph_revision::task_structure_revision(root.task.id()),
+                    structure.root_revision,
+                ),
+                (
+                    durable_store::graph_revision::global_structure_revision(),
+                    structure.global_revision,
+                ),
+            ] {
+                let current = store.get(&key)?.map(|entry| entry.version);
+                if current != version {
+                    if key != durable_store::graph_revision::task_structure_revision(root.task.id())
+                    {
+                        return Err(Error::Invalid("owned graph structure changed".into()));
+                    }
+                    let reservation_key = woken_owned_reservation_key(root.task.id());
+                    let reservation_entry = store
+                        .get(&reservation_key)?
+                        .ok_or_else(|| Error::Invalid("owned reservation missing".into()))?;
+                    let reservation: WokenOwnedReservation =
+                        serde_json::from_slice(&reservation_entry.value)?;
+                    let commit = store
+                        .commit_for_version(&reservation_key, reservation_entry.version)?
+                        .ok_or_else(|| Error::Invalid("untracked owned reservation".into()))?;
+                    let graph_commit = store
+                        .commit_for_version(&evidence_key, evidence_entry.version)?
+                        .ok_or_else(|| Error::Invalid("untracked graph evidence".into()))?;
+                    let prior_revision = match version {
+                        Some(v) => store.commit_for_version(&key, v)?,
+                        None => None,
+                    };
+                    let reserved_attempt = reservation.running.attempt_id();
+                    if matches!(root.task.state(), crate::task::TaskState::Failed(_)) {
+                        let terminal_key =
+                            crate::task_scheduler::woken_conversation_terminal_key(root.task.id());
+                        let terminal_entry = store.get(&terminal_key)?.ok_or(Error::NotFound)?;
+                        let terminal: crate::task_scheduler::WokenConversationCancelTerminalMarker =
+                            serde_json::from_slice(&terminal_entry.value)?;
+                        if Some(terminal.cleanup_attempt) != reserved_attempt
+                            || store.commit_for_version(
+                                &crate::task_store::key(root.task.id()),
+                                terminal.running_task_version,
+                            )? != Some(commit)
+                        {
+                            return Err(Error::Invalid(
+                                "owned terminal reservation changed".into(),
+                            ));
+                        }
+                        let (_, terminal_checks) =
+                            crate::task_scheduler::woken_terminal_after_checks(
+                                store, root, boundary,
+                            )
+                            .map_err(Error::Invalid)?;
+                        checks.extend(terminal_checks);
+                    } else if root.task.attempt_id() != reserved_attempt {
+                        return Err(Error::Invalid("owned live reservation changed".into()));
+                    }
+                    if reservation.version != 1
+                        || reservation.graph_version != evidence_entry.version
+                        || reservation.running.id() != root.task.id()
+                        || reserved_attempt.is_none()
+                        || store.next_commit_for_key(
+                            &crate::task_store::key(root.task.id()),
+                            graph_commit,
+                        )? != Some(commit)
+                        || store.commit_for_version(
+                            &crate::task_store::key(root.task.id()),
+                            reservation.ready_version,
+                        )? != Some(graph_commit)
+                        || prior_revision.is_none()
+                        || store.next_commit_for_key(&key, prior_revision.unwrap())? != Some(commit)
+                        || match current {
+                            Some(v) => store.commit_for_version(&key, v)?,
+                            None => None,
+                        } != Some(commit)
+                    {
+                        return Err(Error::Invalid("owned reservation revision changed".into()));
+                    }
+                    checks.push(Check {
+                        key: reservation_key,
+                        expected: Expected::Version(reservation_entry.version),
+                    });
+                }
+                checks.push(Check {
+                    key,
+                    expected: current.map_or(
+                        Expected::MissingUnchangedSince(structure.boundary),
+                        Expected::Version,
+                    ),
+                });
+            }
+            checks
+        };
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        let structure_checks: Vec<Check> = Vec::new();
+        let graph_commit = store
+            .commit_for_version(&evidence_key, evidence_entry.version)?
+            .ok_or_else(|| Error::Invalid("untracked graph evidence".into()))?;
+        let root_key = crate::task_store::key(root.task.id());
+        let before = store
+            .commit_for_version(&root_key, evidence.root_before_version)?
+            .ok_or_else(|| Error::Invalid("untracked root boundary".into()))?;
+        if store.next_commit_for_key(&root_key, before)? != Some(graph_commit) {
+            return Err(Error::Invalid("root graph mark was not atomic".into()));
+        }
+        let graph = crate::ownership_edge::CleanupGraph::load(store)
+            .map_err(|e| Error::Invalid(format!("ownership graph: {e}")))?;
+        if graph.uncertain_task(root.task.id()) {
+            return Err(Error::Invalid("uncertain ownership graph".into()));
+        }
+        let records = crate::task_store::TaskStore::new(store)
+            .list()
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let expected_tasks: HashMap<_, _> = evidence
+            .tasks
+            .iter()
+            .map(|task| (task.id(), task))
+            .collect();
+        if expected_tasks.len() != evidence.tasks.len()
+            || !expected_tasks.contains_key(&root.task.id())
+        {
+            return Err(Error::Invalid("invalid owned task manifest".into()));
+        }
+        let expected: HashMap<_, _> = evidence
+            .edges
+            .iter()
+            .map(|item| (item.edge.child, item))
+            .collect();
+        if expected.len() != evidence.edges.len() {
+            return Err(Error::Invalid("duplicate owned edge".into()));
+        }
+        let mut tasks = vec![(root.task.id(), false)];
+        let mut seen_tasks = HashSet::new();
+        let mut seen_conversations = HashSet::new();
+        let mut checks = vec![
+            Check {
+                key: evidence_key,
+                expected: Expected::Version(evidence_entry.version),
+            },
+            Check {
+                key: root_key,
+                expected: Expected::Version(root.version),
+            },
+        ];
+        checks.extend(structure_checks);
+        while let Some((task, through_conversation)) = tasks.pop() {
+            if !seen_tasks.insert(task) {
+                return Err(Error::Invalid("owned graph cycle".into()));
+            }
+            let current = records
+                .iter()
+                .find(|item| item.task.id() == task)
+                .ok_or(Error::NotFound)?;
+            let marked = expected_tasks
+                .get(&task)
+                .ok_or_else(|| Error::Invalid("unmarked owned task".into()))?;
+            if current.task.owner() != marked.owner()
+                || current.task.kind() != marked.kind()
+                || current.task.definition_version() != marked.definition_version()
+                || current.task.input() != marked.input()
+                || current.task.replay_safe() != marked.replay_safe()
+                || current.task.is_background() != marked.is_background()
+                || (marked.is_terminal() && current.task != **marked)
+                || (task != root.task.id()
+                    && !marked.is_terminal()
+                    && !current.task.abort_requested())
+            {
+                return Err(Error::Invalid("owned task identity changed".into()));
+            }
+            for item in records.iter().filter(|item| {
+                item.task.owner() == &TaskOwner::Task(task) && !item.task.is_background()
+            }) {
+                tasks.push((item.task.id(), through_conversation));
+            }
+            for edge in graph.task_edges(task) {
+                if !seen_conversations.insert(edge.child) {
+                    return Err(Error::Invalid("owned conversation cycle".into()));
+                }
+                let marked = expected
+                    .get(&edge.child)
+                    .ok_or_else(|| Error::Invalid("unmarked owned conversation".into()))?;
+                let edge_key = crate::ownership_edge::edge_key(edge.child);
+                let edge_entry = store.get(&edge_key)?.ok_or(Error::NotFound)?;
+                let current_edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                if current_edge.edge != marked.edge || current_edge.version != marked.edge_version {
+                    return Err(Error::Invalid("owned edge changed".into()));
+                }
+                checks.push(Check {
+                    key: edge_key,
+                    expected: Expected::Version(edge_entry.version),
+                });
+                let conversation_key = Self::key(edge.child);
+                let conversation_entry = store.get(&conversation_key)?.ok_or(Error::NotFound)?;
+                let conversation: Conversation = serde_json::from_slice(&conversation_entry.value)?;
+                if conversation.id != edge.child
+                    || conversation.abort_requested
+                    || matches!(conversation.phase, Phase::Blocked { .. })
+                {
+                    return Err(Error::Invalid("owned cleanup incomplete".into()));
+                }
+                let before = store
+                    .commit_for_version(&conversation_key, marked.conversation_before_version)?
+                    .ok_or_else(|| Error::Invalid("untracked owned boundary".into()))?;
+                if store.next_commit_for_key(&conversation_key, before)? != Some(graph_commit) {
+                    return Err(Error::Invalid("owned graph mark was not atomic".into()));
+                }
+                let receipt_prefix =
+                    format!("runtime/owned-cleanup-receipt/v1/{}/", edge.child).into_bytes();
+                let mut matched = Vec::new();
+                for (key, entry) in store.list(&receipt_prefix)? {
+                    let Ok(receipt) = serde_json::from_slice::<OwnedCleanupReceipt>(&entry.value)
+                    else {
+                        return Err(Error::Invalid("invalid owned receipt".into()));
+                    };
+                    if receipt.version != 1
+                        || receipt.conversation != edge.child
+                        || receipt.attempt.is_nil()
+                        || key != owned_cleanup_receipt_key(edge.child, receipt.attempt)
+                        || receipt.edge != marked.edge
+                        || receipt.edge_version != marked.edge_version
+                    {
+                        continue;
+                    }
+                    let start = store
+                        .commit_for_version(
+                            &conversation_key,
+                            receipt.started_conversation_version,
+                        )?
+                        .ok_or_else(|| Error::Invalid("untracked cleanup start".into()))?;
+                    let marker_key = owned_cleanup_key(edge.child);
+                    let marker_start = store
+                        .commit_for_version(&marker_key, receipt.marker_version)?
+                        .ok_or_else(|| Error::Invalid("untracked cleanup marker".into()))?;
+                    let receipt_commit = store
+                        .commit_for_version(&key, entry.version)?
+                        .ok_or_else(|| Error::Invalid("untracked cleanup receipt".into()))?;
+                    let finished = store
+                        .commit_for_version(&conversation_key, conversation_entry.version)?
+                        .ok_or_else(|| Error::Invalid("untracked owned result".into()))?;
+                    if start >= graph_commit
+                        && marker_start > start
+                        && receipt_commit > marker_start
+                        && finished == receipt_commit
+                    {
+                        matched.push((key, entry.version));
+                    }
+                }
+                if matched.len() != 1 {
+                    return Err(Error::Invalid("owned cleanup receipt unavailable".into()));
+                }
+                let (receipt_key, receipt_version) = matched.pop().unwrap();
+                checks.push(Check {
+                    key: receipt_key,
+                    expected: Expected::Version(receipt_version),
+                });
+                checks.push(Check {
+                    key: conversation_key,
+                    expected: Expected::Version(conversation_entry.version),
+                });
+                let marker_key = owned_cleanup_key(edge.child);
+                if store.get(&marker_key)?.is_some() {
+                    return Err(Error::Invalid("owned cleanup marker remains".into()));
+                }
+                checks.push(Check {
+                    key: marker_key,
+                    expected: Expected::MissingUnchangedSince(boundary),
+                });
+                for item in records.iter().filter(|item| {
+                    item.task.owner() == &TaskOwner::Conversation(edge.child)
+                        && !item.task.is_background()
+                }) {
+                    tasks.push((item.task.id(), true));
+                }
+            }
+            if task != root.task.id() && !current.task.is_terminal() {
+                return Err(Error::Invalid("owned task cleanup incomplete".into()));
+            }
+            if through_conversation {
+                let item = records
+                    .iter()
+                    .find(|item| item.task.id() == task)
+                    .ok_or(Error::NotFound)?;
+                if !item.task.replay_safe() || !item.task.is_terminal() {
+                    return Err(Error::Invalid(
+                        "owned unsafe or live task requires reconciliation".into(),
+                    ));
+                }
+                checks.push(Check {
+                    key: crate::task_store::key(task),
+                    expected: Expected::Version(item.version),
+                });
+            }
+        }
+        if seen_tasks.len() != expected_tasks.len() {
+            return Err(Error::Invalid("marked owned task missing".into()));
+        }
+        if seen_conversations.len() != expected.len() {
+            return Err(Error::Invalid("marked owned edge missing".into()));
+        }
+        checks.extend([
+            Check {
+                key: crate::task_store::PREFIX.to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+            Check {
+                key: crate::ownership_edge::PREFIX.to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+            Check {
+                key: b"runtime/conversation/".to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+        ]);
+        Ok(checks)
+    }
+
     /// Read provisional test receipt evidence for a stopped root. The
     /// identity lease and all durable evidence remain fenced through commit.
     /// This does not authorize external callback execution.
@@ -14835,6 +15792,84 @@ impl Harness {
         .map(|result| result.expect("woken graph has a fixed root").0)
     }
 
+    /// Caller holds the discovered conversation controls and a registry lease.
+    /// Revalidate the wake, selection and identity under the task gate and keep
+    /// those guards until the owned graph and wake transition commit together.
+    #[allow(dead_code)]
+    pub(crate) fn authenticated_scoped_woken_abort_graph(
+        &mut self,
+        expected: &crate::task_store::StoredTask,
+        registry: &crate::task_scheduler::Registry,
+        targets: &[Uuid],
+    ) -> Result<Vec<Uuid>, Error> {
+        let owner = self.owner.clone();
+        let gate = match owner.task_gate().try_lock() {
+            Ok(gate) => gate,
+            Err(durable_store::controls::PollGateError::Busy) => {
+                return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
+            }
+            Err(durable_store::controls::PollGateError::Poisoned) => return Err(Error::Failed),
+            Err(durable_store::controls::PollGateError::Reentrant) => {
+                return Err(Error::ReentrantAbort);
+            }
+        };
+        let selection_gate = self.checkpointable_extension_gate();
+        let _selection = selection_gate.lock().map_err(|_| Error::Failed)?;
+        let handler = registry
+            .conversation_receipt_handler(&expected.task)
+            .ok_or_else(|| Error::Invalid("woken registration changed".into()))?;
+        if !handler.conversation_woken_cancel_enabled() {
+            return Err(Error::Invalid("woken cancellation disabled".into()));
+        }
+        let _identity =
+            handler
+                .conversation_cleanup_identity_lease()
+                .map_err(|error| match error {
+                    crate::nested_identity::LeaseFailure::Busy => {
+                        Error::TaskScheduler(crate::task_scheduler::Error::Busy)
+                    }
+                    crate::nested_identity::LeaseFailure::Mismatch => {
+                        Error::Invalid("woken identity changed".into())
+                    }
+                })?;
+        let store = owner.store();
+        let graph = crate::ownership_edge::CleanupGraph::load(store)
+            .map_err(|error| Error::Invalid(format!("woken ownership graph: {error}")))?;
+        if graph.uncertain_task(expected.task.id()) {
+            return Err(Error::Invalid("uncertain woken ownership graph".into()));
+        }
+        let boundary = store.put_version()?;
+        let (attempt, mut checks) =
+            crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
+                store,
+                &expected.task,
+                boundary,
+            )
+            .map_err(Error::Invalid)?;
+        if expected.task.attempt_id() != Some(attempt) {
+            return Err(Error::Invalid("woken attempt changed".into()));
+        }
+        checks.extend(self.checkpointable_conversation_checks(&expected.task, registry)?);
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            None,
+            Some(expected.task.id()),
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some((false, targets)),
+            None,
+            Some((expected, &checks)),
+            || {
+                #[cfg(test)]
+                crate::task_scheduler::run_woken_recovery_hook(expected.task.id());
+            },
+        )
+        .map(|result| result.expect("woken graph has a fixed root").0)
+    }
+
     // Discovery is read-only; commit repeats the graph scan under the task
     // gate and refuses any conversation outside the acquired scope.
     fn scoped_direct_abort(
@@ -14972,6 +16007,7 @@ impl Harness {
             }
             let mut states = Vec::new();
             let mut edge_checks = Vec::new();
+            let mut woken_edges = Vec::new();
             while !cq.is_empty() || !tq.is_empty() {
                 while let Some(id) = cq.pop_front() {
                     if !conversations.insert(id) {
@@ -15011,6 +16047,9 @@ impl Harness {
                             expected: Expected::Version(edge.version),
                         });
                         if background || edge.edge.mode == Mode::Foreground {
+                            if woken.is_some() && edge.edge.mode == Mode::Foreground {
+                                woken_edges.push(edge.clone());
+                            }
                             cq.push_back(edge.edge.child);
                         }
                     }
@@ -15192,8 +16231,70 @@ impl Harness {
             }
             batch.checks.extend(edge_checks);
             batch.checks.extend(callback_checks);
-            if let Some((_, checks)) = woken {
+            if let Some((root, checks)) = woken {
                 batch.checks.extend_from_slice(checks);
+                let mut edges = Vec::new();
+                for edge in &woken_edges {
+                    let (_, conversation_before_version) = states
+                        .iter()
+                        .find(|(state, _)| state.id == edge.edge.child)
+                        .ok_or(Error::NotFound)?;
+                    edges.push(WokenOwnedEdgeEvidence {
+                        edge: edge.edge.clone(),
+                        edge_version: edge.version,
+                        conversation_before_version: *conversation_before_version,
+                    });
+                }
+                edges.sort_by_key(|edge| edge.edge.child);
+                let mut graph_tasks: Vec<_> =
+                    tasks.iter().map(|id| by_id[id].task.clone()).collect();
+                graph_tasks.sort_by_key(|task| task.id());
+                #[cfg(feature = "experimental-graph-revision")]
+                let structure = {
+                    let root_key =
+                        durable_store::graph_revision::task_structure_revision(root.task.id());
+                    let global_key = durable_store::graph_revision::global_structure_revision();
+                    let root_revision = store.get(&root_key)?.map(|entry| entry.version);
+                    let global_revision = store.get(&global_key)?.map(|entry| entry.version);
+                    for (key, version) in [(root_key, root_revision), (global_key, global_revision)]
+                    {
+                        batch.checks.push(Check {
+                            key,
+                            expected: version.map_or(
+                                Expected::MissingUnchangedSince(graph_version),
+                                Expected::Version,
+                            ),
+                        });
+                    }
+                    Some(WokenOwnedStructureEvidence {
+                        boundary: graph_version,
+                        root_revision,
+                        global_revision,
+                    })
+                };
+                #[cfg(not(feature = "experimental-graph-revision"))]
+                let structure = None;
+                let evidence = WokenOwnedGraphEvidence {
+                    version: 1,
+                    root: root.task.id(),
+                    interrupted_attempt: root
+                        .task
+                        .attempt_id()
+                        .ok_or_else(|| Error::Invalid("missing woken attempt".into()))?,
+                    root_before_version: root.version,
+                    tasks: graph_tasks,
+                    edges,
+                    structure,
+                };
+                let key = woken_owned_graph_key(root.task.id());
+                batch.checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                batch.mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&evidence)?,
+                });
             }
             if let Some(parent) = nested_parent {
                 batch.checks.push(Check {
@@ -16479,6 +17580,7 @@ impl Harness {
         let edge_expected = edge
             .as_ref()
             .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+        let conversation_id = c.id;
         let key = owned_cleanup_key(c.id);
         if let Some(marker) = store.get(&key)? {
             let ephemeral = serde_json::from_slice::<CleanupAttempt>(&marker.value)
@@ -16546,9 +17648,18 @@ impl Harness {
                 .await
         };
         if result.is_ok() {
-            let marker = store
-                .get(&key)?
-                .ok_or_else(|| Error::Invalid("cleanup marker missing".into()))?;
+            let Some(marker) = store.get(&key)? else {
+                // A fully completed owned cleanup retires the marker together
+                // with its conversation and immutable receipt.
+                if matches!(result, Ok(true))
+                    && store
+                        .get(&owned_cleanup_receipt_key(conversation_id, attempt))?
+                        .is_some()
+                {
+                    return result;
+                }
+                return Err(Error::Invalid("cleanup marker missing".into()));
+            };
             if cleanup_attempt_id(&marker.value) != Some(attempt) {
                 return Err(Error::Invalid("cleanup marker changed".into()));
             }
@@ -16957,8 +18068,85 @@ impl Harness {
             c.abort_requested = false;
             finish_abort(&mut c);
         }
+        let cleanup_receipt = if !c.abort_requested && !matches!(c.phase, Phase::Blocked { .. }) {
+            if let Some(attempt) = cleanup_attempt {
+                let store = self.owner.store();
+                let edge_key = crate::ownership_edge::edge_key(c.id);
+                if let Some(edge_entry) = store.get(&edge_key)? {
+                    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+                        .map_err(|e| Error::Invalid(format!("ownership edge: {e}")))?;
+                    let marker_key = owned_cleanup_key(c.id);
+                    let marker = store
+                        .get(&marker_key)?
+                        .ok_or_else(|| Error::Invalid("cleanup marker missing".into()))?;
+                    if cleanup_attempt_id(&marker.value) != Some(attempt) {
+                        return Err(Error::Invalid("cleanup marker changed".into()));
+                    }
+                    let receipt_key = owned_cleanup_receipt_key(c.id, attempt);
+                    let receipt = OwnedCleanupReceipt {
+                        version: 1,
+                        conversation: c.id,
+                        attempt,
+                        marker_version: marker.version,
+                        edge: edge.edge,
+                        edge_version: edge_entry.version,
+                        started_conversation_version: version,
+                    };
+                    Some(crate::task_store::OwnedBatch {
+                        checks: vec![
+                            Check {
+                                key: marker_key.clone(),
+                                expected: Expected::Version(marker.version),
+                            },
+                            Check {
+                                key: edge_key,
+                                expected: Expected::Version(edge_entry.version),
+                            },
+                            Check {
+                                key: receipt_key.clone(),
+                                expected: Expected::Missing,
+                            },
+                        ],
+                        mutations: vec![
+                            Mutation::Delete { key: marker_key },
+                            Mutation::Put {
+                                key: receipt_key,
+                                value: serde_json::to_vec(&receipt)?,
+                            },
+                        ],
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if cleanup_receipt.is_some() {
+            let hook = owned_cleanup_final_hooks().lock().unwrap().remove(&c.id);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         if let Some(check) = task_result_check {
-            self.save_with_task_result_check(&c, Expected::Version(version), check)?;
+            self.save_with_task_result_and_extra(
+                &c,
+                Expected::Version(version),
+                check,
+                cleanup_receipt.as_ref(),
+            )?;
+        } else if let Some(receipt) = cleanup_receipt.as_ref() {
+            self.save_composed_locked(
+                &c,
+                Expected::Version(version),
+                None,
+                &[],
+                &[],
+                Some(receipt),
+            )?;
         } else {
             self.save(&c, Expected::Version(version))?;
         }

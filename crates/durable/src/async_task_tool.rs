@@ -11089,8 +11089,9 @@ mod tests {
             let task = driver.get(parent.id()).unwrap().unwrap();
             let child: AsyncTaskCall =
                 serde_json::from_value(task.checkpoint().data.clone()).unwrap();
+            let ids_temporary = root.join("combined-ids.tmp");
             std::fs::write(
-                root.join("combined-ids"),
+                &ids_temporary,
                 serde_json::to_vec(&vec![
                     parked,
                     unsafe_id,
@@ -11101,6 +11102,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+            std::fs::rename(ids_temporary, root.join("combined-ids")).unwrap();
             loop {
                 std::hint::black_box((&driver, &binding));
                 std::thread::park();
@@ -11356,12 +11358,14 @@ mod tests {
             let task = driver.get(parent.id()).unwrap().unwrap();
             let child: AsyncTaskCall =
                 serde_json::from_value(task.checkpoint().data.clone()).unwrap();
+            let ids_temporary = root.join("combined-ids.tmp");
             std::fs::write(
-                root.join("combined-ids"),
+                &ids_temporary,
                 serde_json::to_vec(&(unsafe_id, parent.id(), child.task_id(), cancel_id, kinds))
                     .unwrap(),
             )
             .unwrap();
+            std::fs::rename(ids_temporary, root.join("combined-ids")).unwrap();
             loop {
                 std::hint::black_box((&driver, &binding));
                 std::thread::park();
@@ -12814,12 +12818,14 @@ mod tests {
             wait_state(&driver, gate.task_id(), |state| {
                 matches!(state, crate::task::TaskState::Waiting(_))
             });
+            let ids_temporary = root.join("combined-ids.tmp");
             std::fs::write(
-                root.join("combined-ids"),
+                &ids_temporary,
                 serde_json::to_vec(&(id, bridge.task_id(), gate.task_id(), sealed.task_id()))
                     .unwrap(),
             )
             .unwrap();
+            std::fs::rename(ids_temporary, root.join("combined-ids")).unwrap();
             loop {
                 std::hint::black_box((&driver, &binding));
                 std::thread::park();

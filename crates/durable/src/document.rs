@@ -5401,6 +5401,7 @@ mod detached_task_documents_tests {
         }
         normalize_graph_checks(&mut graph);
         reconcile_task_checks(&mut document_batch, &mut graph);
+        normalize_graph_checks(&mut graph);
         transaction.append(document_batch).unwrap();
         transaction.append(graph).unwrap();
         transaction.commit(owner.store()).unwrap();
