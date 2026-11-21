@@ -489,7 +489,10 @@ mod tests {
         let metadata = ModelMetadata {
             provider_api: Some(ModelApi::OpenaiCodexResponses),
             replay_identity: Some(ResolvedModelIdentity {
-                provider: "openai-codex".into(),
+                provider: endpoint_replay_scope(
+                    "openai-codex",
+                    "https://chatgpt.com/backend-api/codex/responses",
+                ),
                 model: "model".into(),
             }),
             ..Default::default()
