@@ -3723,7 +3723,10 @@ Workspace tests, the imported-details regression and all-target Clippy pass.
 
 Native edit results preserve a numbered display diff alongside the unified
 patch. Unified hunk headers use Pi's explicit line counts, including for a
-single line and zero-length ranges. The display diff uses old-file numbers for
+single line and zero-length ranges. Both edit diff formats use Pi's line
+alignment, including its choice between repeated lines. Large or difficult edit
+comparisons that exceed the alignment search budget use the existing native
+diff algorithm. The display diff uses old-file numbers for
 deletions and context, new-file numbers for insertions, and four context lines
 on either side of a change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
