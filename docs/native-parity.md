@@ -478,7 +478,8 @@ form, including multiple keys and explicitly unbound actions.
 
 RPC startup ignores ordinary positional messages and accepts prompts through
 stdin. The root CLI rejects `@file` arguments in RPC mode before loading
-settings and prints Pi's diagnostic to stderr.
+settings or displaying help and prints Pi's diagnostic to stderr.
+Version and session export still take precedence over the attachment check.
 
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
