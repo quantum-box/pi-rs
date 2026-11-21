@@ -1866,7 +1866,16 @@ impl Handler for Executor {
                         expected,
                         cancel.conversation_cancel_policy(),
                     )?;
-                    let start = admission.conversation_callback_start_lease()?;
+                    let start = if matches!(task.owner(), crate::task::TaskOwner::Task(_)) {
+                        let (conversation, start) =
+                            admission.nested_conversation_callback_start_lease()?;
+                        if conversation != claim.conversation {
+                            return Err("nested conversation changed".into());
+                        }
+                        start
+                    } else {
+                        admission.conversation_callback_start_lease()?
+                    };
                     let marker = admission.record_woken_conversation_start_markers(
                         self,
                         &claim,
@@ -2041,7 +2050,17 @@ impl Handler for Executor {
                         expected,
                         cancel.conversation_cancel_policy(),
                     )?;
-                    let start = admission.conversation_callback_start_lease()?;
+                    let nested = matches!(task.owner(), crate::task::TaskOwner::Task(_));
+                    let start = if nested {
+                        let (conversation, start) =
+                            admission.nested_conversation_callback_start_lease()?;
+                        if conversation != claim.conversation {
+                            return Err("woken cancel conversation changed".into());
+                        }
+                        start
+                    } else {
+                        admission.conversation_callback_start_lease()?
+                    };
                     let marker = admission.record_woken_conversation_start_markers(
                         self,
                         &claim,
@@ -2098,28 +2117,31 @@ impl Handler for Executor {
                         );
                     }
                     let after = if self.block_results {
-                        admission.conversation_cancel_hook_snapshot().and_then(
-                            |(snapshot, check)| {
-                                let memo = ConversationAbortMemo {
-                                    admission,
-                                    handler: self,
-                                    claim: ConversationAbortClaim::Woken(&claim),
-                                    nested: false,
-                                    identity: &_identity_lease,
-                                    expected_identity: expected,
-                                    marker: &marker,
-                                    snapshot: &check,
-                                    failed: Mutex::new(false),
-                                };
-                                self.conversation_cancel_after_result(
-                                    task,
-                                    after_arguments,
-                                    snapshot,
-                                    &memo,
-                                )
-                                .map(|result| (result, check))
-                            },
-                        )
+                        (if nested {
+                            admission.nested_conversation_cancel_hook_snapshot()
+                        } else {
+                            admission.conversation_cancel_hook_snapshot()
+                        })
+                        .and_then(|(snapshot, check)| {
+                            let memo = ConversationAbortMemo {
+                                admission,
+                                handler: self,
+                                claim: ConversationAbortClaim::Woken(&claim),
+                                nested,
+                                identity: &_identity_lease,
+                                expected_identity: expected,
+                                marker: &marker,
+                                snapshot: &check,
+                                failed: Mutex::new(false),
+                            };
+                            self.conversation_cancel_after_result(
+                                task,
+                                after_arguments,
+                                snapshot,
+                                &memo,
+                            )
+                            .map(|result| (result, check))
+                        })
                     } else {
                         Err("no selected after".into())
                     };
