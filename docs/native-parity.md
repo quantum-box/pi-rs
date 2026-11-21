@@ -2120,12 +2120,16 @@ yet been exercised in this environment.
 
 ### Edit matching checkpoint
 
-File edits preserve UTF-8 BOMs and the file's LF/CRLF convention. Matching first
-uses exact text, then Pi-compatible Unicode normalization, quote/dash handling
-and trailing-space normalization. If fuzzy matching is needed, only touched
-line blocks are rewritten from the normalized view. Other line content retains
-its original characters and whitespace. Fuzzy trailing-space matching follows
-ECMAScript `trimEnd`: U+FEFF is trimmed, while U+0085 is retained. A missing
+File edits preserve UTF-8 BOMs and untouched line endings in files that mix
+LF, CRLF and lone CR. New line breaks follow Pi's convention for the line where
+the replacement starts, with the preceding line as a fallback at an
+unterminated end of file. If a splice would merge a lone CR and LF into one
+break, the edit keeps both breaks so the written file matches the diff.
+Matching first uses exact text, then Pi-compatible Unicode normalization,
+quote/dash handling and trailing-space normalization. If fuzzy matching is
+needed, only touched line blocks are rewritten from the normalized view. Other
+line content retains its original characters and whitespace. Fuzzy trailing-space
+matching follows ECMAScript `trimEnd`: U+FEFF is trimmed, while U+0085 is retained. A missing
 U+0085 in an edit target therefore cannot cause a fuzzy match and file rewrite.
 Local and injected edit regressions verify that this mismatch leaves the file
 or backend untouched.

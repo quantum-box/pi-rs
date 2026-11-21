@@ -152,7 +152,11 @@ fn replace(mut text: String, replacements: &[Replacement], offset: usize) -> Str
     }
     text
 }
-fn preserve_lines(original: &str, base: &str, replacements: Vec<Replacement>) -> Result<String> {
+fn preserve_lines(
+    original: &str,
+    base: &str,
+    replacements: Vec<Replacement>,
+) -> Result<Vec<Replacement>> {
     let original_lines: Vec<_> = original.split_inclusive('\n').collect();
     let mut offset = 0;
     let spans: Vec<_> = base
@@ -191,21 +195,91 @@ fn preserve_lines(original: &str, base: &str, replacements: Vec<Replacement>) ->
             });
         }
     }
+    let original_spans: Vec<_> = {
+        let mut offset = 0;
+        original_lines
+            .iter()
+            .map(|line| {
+                let start = offset;
+                offset += line.len();
+                (start, offset)
+            })
+            .collect()
+    };
+    Ok(groups
+        .into_iter()
+        .map(|group| {
+            let start = spans[group.first_line].0;
+            let end = spans[group.end_line - 1].1;
+            Replacement {
+                edit_index: group.replacements[0].edit_index,
+                start: original_spans[group.first_line].0,
+                end: original_spans[group.end_line - 1].1,
+                text: replace(base[start..end].into(), &group.replacements, start),
+            }
+        })
+        .collect())
+}
+
+// Replacement offsets refer to LF-normalized UTF-8. Map them to byte offsets in
+// the original, then splice without rewriting untouched line endings.
+fn apply_to_original(original: &str, replacements: &[Replacement]) -> String {
+    let bytes = original.as_bytes();
+    let mut original_offset = 0;
+    let mut normalized_offset = 0;
+    let mut position = 0;
     let mut result = String::new();
-    let mut next_line = 0;
-    for group in groups {
-        result.extend(original_lines[next_line..group.first_line].iter().copied());
-        let start = spans[group.first_line].0;
-        let end = spans[group.end_line - 1].1;
-        result.push_str(&replace(
-            base[start..end].into(),
-            &group.replacements,
-            start,
-        ));
-        next_line = group.end_line;
+    for replacement in replacements {
+        let mut advance = |target: usize| {
+            while normalized_offset < target {
+                if bytes[original_offset] == b'\r' && bytes.get(original_offset + 1) == Some(&b'\n')
+                {
+                    original_offset += 1;
+                }
+                original_offset += 1;
+                normalized_offset += 1;
+            }
+            original_offset
+        };
+        let start = advance(replacement.start);
+        push_splice(&mut result, &original[position..start]);
+        if replacement.text.contains('\n') {
+            let ending = line_ending_at(original, start);
+            let text = replacement.text.replace('\n', ending);
+            push_splice(&mut result, &text);
+        } else {
+            push_splice(&mut result, &replacement.text);
+        }
+        position = advance(replacement.end);
     }
-    result.extend(original_lines[next_line..].iter().copied());
-    Ok(result)
+    push_splice(&mut result, &original[position..]);
+    result
+}
+
+fn push_splice(result: &mut String, part: &str) {
+    if part.is_empty() {
+        return;
+    }
+    // Preserve two normalized breaks when a lone CR meets an LF at a splice.
+    if result.ends_with('\r') && part.starts_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(part);
+}
+
+fn line_ending_at(original: &str, offset: usize) -> &'static str {
+    let bytes = original.as_bytes();
+    let line_feed = bytes[offset..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| offset + i)
+        .or_else(|| bytes[..offset].iter().rposition(|&b| b == b'\n'));
+    match line_feed {
+        Some(i) if i > 0 && bytes[i - 1] == b'\r' => "\r\n",
+        Some(_) => "\n",
+        None if bytes.contains(&b'\r') => "\r",
+        None => "\n",
+    }
 }
 pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
     let edits = edits(arguments)?;
@@ -213,9 +287,6 @@ pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
     let (bom, body) = original
         .strip_prefix('\u{feff}')
         .map_or(("", original), |body| ("\u{feff}", body));
-    let crlf = body
-        .find('\n')
-        .is_some_and(|index| body[..index].ends_with('\r'));
     let normalized = lf(body);
     let fuzzy_content = fuzzy(&normalized);
     let edits: Vec<_> = edits
@@ -285,11 +356,12 @@ pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
             pair[0].edit_index, pair[1].edit_index
         )));
     }
-    let changed = if use_fuzzy {
+    let replacements = if use_fuzzy {
         preserve_lines(&normalized, base, replacements)?
     } else {
-        replace(base.clone(), &replacements, 0)
+        replacements
     };
+    let changed = replace(normalized.clone(), &replacements, 0);
     if changed == normalized {
         return Err(Error::Config(if count == 1 {
             format!(
@@ -299,10 +371,10 @@ pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
             format!("No changes made to {path}. The replacements produced identical content.")
         }));
     }
-    let restored = if crlf {
-        changed.replace('\n', "\r\n")
-    } else {
+    let restored = if body == normalized {
         changed
+    } else {
+        apply_to_original(body, &replacements)
     };
     Ok((format!("{bom}{restored}"), count))
 }
