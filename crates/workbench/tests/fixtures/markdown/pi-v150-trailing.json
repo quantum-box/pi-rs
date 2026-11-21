@@ -90,6 +90,56 @@
         "paint 🧑‍💻",
         "next"
       ]
+    },
+    {
+      "source": "- one\n\n  ***",
+      "width": 14,
+      "lines": [
+        "- one",
+        "",
+        "  ────────────"
+      ]
+    },
+    {
+      "source": "1. before\n\n   ***\n\n   after",
+      "width": 14,
+      "lines": [
+        "1. before",
+        "",
+        "   ───────────",
+        "",
+        "   after"
+      ]
+    },
+    {
+      "source": "- a\n  - b\n\n    ***\n  - c",
+      "width": 14,
+      "lines": [
+        "- a",
+        "    - b",
+        "",
+        "      ────────",
+        "",
+        "    - c"
+      ]
+    },
+    {
+      "source": "- one\n  ***\n  two",
+      "width": 14,
+      "lines": [
+        "- one",
+        "  ────────────",
+        "  two"
+      ]
+    },
+    {
+      "source": "- ***\n\n- two",
+      "width": 14,
+      "lines": [
+        "- ────────────",
+        "",
+        "- two"
+      ]
     }
   ],
   "cases": [

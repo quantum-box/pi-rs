@@ -93,6 +93,11 @@ const fixture = {
     ['alpha chartreuse', 9],
     ['abc 日本語 test', 8],
     ['paint 🧑‍💻 next', 8],
+    ['- one\n\n  ***', 14],
+    ['1. before\n\n   ***\n\n   after', 14],
+    ['- a\n  - b\n\n    ***\n  - c', 14],
+    ['- one\n  ***\n  two', 14],
+    ['- ***\n\n- two', 14],
   ].map(([source, width]) => ({
     source, width, lines: new Markdown(source, 0, 0, theme).render(width).map(line => line.trimEnd()),
   })),

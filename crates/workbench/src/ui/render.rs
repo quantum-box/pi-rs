@@ -2746,16 +2746,26 @@ fn markdown_plain_at_depth(
             }
             Event::HardBreak => flush(&mut spans, &mut lines, width, item_prefixes.last()),
             Event::Rule => {
-                flush(&mut spans, &mut lines, width, item_prefixes.last());
-                if lists.is_empty()
-                    && let Some(end) = previous_paragraph_end.take()
-                    && end <= range.start
-                    && text[end..range.start].trim().is_empty()
-                {
-                    lines.push(Line::default());
-                }
-                lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
-                if lists.is_empty() {
+                if let Some(prefix) = item_prefixes.last() {
+                    if spans.as_slice() != [prefix.clone()] {
+                        flush(&mut spans, &mut lines, width, Some(prefix));
+                    }
+                    let indent = prefix.text.width().min(width.saturating_sub(1));
+                    let rule_width = width.saturating_sub(indent).min(80);
+                    spans.push(Span::themed("─".repeat(rule_width), theme, "mdHr"));
+                    flush(&mut spans, &mut lines, width, Some(prefix));
+                    if let Some(end) = item_block_ends.last_mut() {
+                        *end = Some(range.end);
+                    }
+                } else {
+                    flush(&mut spans, &mut lines, width, None);
+                    if let Some(end) = previous_paragraph_end.take()
+                        && end <= range.start
+                        && text[end..range.start].trim().is_empty()
+                    {
+                        lines.push(Line::default());
+                    }
+                    lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
                     last_rule_separator = Some(lines.len());
                     lines.push(Line::default());
                 }
