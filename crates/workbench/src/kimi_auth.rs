@@ -506,8 +506,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(14)).await;
         assert!(!refresh.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
-        let err = refresh.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("token refresh timed out"));
+        assert!(matches!(
+            refresh.await.unwrap(),
+            Err(err) if err.to_string().contains("token refresh timed out")
+        ));
         server.abort();
     }
 
