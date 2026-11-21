@@ -1777,6 +1777,8 @@ impl Anthropic {
         let progress = self.progress.clone();
         let allow_empty_signature = self.allow_empty_signature;
         let reasoning = self.reasoning.clone();
+        let observation_headers =
+            pi_rs_core::observes_provider_stream().then(|| self.headers.clone());
         Ok(Box::pin(async_stream::try_stream! {
             let mut size = 0_usize;
             let mut events = response.bytes_stream().map(move |chunk| {
@@ -1811,6 +1813,11 @@ impl Anthropic {
                 })?;
                 let value: Value = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed Anthropic SSE event".into()))?;
+                if let Some(headers) = &observation_headers {
+                    pi_rs_core::observe_provider_stream(
+                        &provider, ModelApi::AnthropicMessages, &requested_model, &value, &error_secrets, headers,
+                    ).await;
+                }
                 let previous = metadata.clone();
                 match value["type"].as_str() {
                     Some("message_start") if !started => {
