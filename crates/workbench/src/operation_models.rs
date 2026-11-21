@@ -128,9 +128,12 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
         return Some(date.to_utc());
     }
+    let value = value.trim();
+    let Some((weekday, rest)) = value.split_once(',') else {
+        return classifier_retry_asctime(value);
+    };
     // Date.parse also accepts the obsolete RFC 850 HTTP-date form. Use
     // JavaScript's 1950/2049 pivot for its two-digit year.
-    let (weekday, rest) = value.trim().split_once(',')?;
     if ![
         "Monday",
         "Tuesday",
@@ -166,6 +169,42 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     )
     .ok()
     .map(|date| date.and_utc())
+}
+
+fn classifier_retry_asctime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Local, LocalResult, TimeZone};
+
+    let explicit_zone = value
+        .rsplit_once(char::is_whitespace)
+        .filter(|(_, zone)| zone.eq_ignore_ascii_case("GMT") || zone.eq_ignore_ascii_case("UTC"));
+    let date = explicit_zone.map_or(value, |(date, _)| date);
+    let (weekday, date) = date.split_once(char::is_whitespace)?;
+    // Date.parse recognizes the weekday but does not use it to check the date.
+    weekday.parse::<chrono::Weekday>().ok()?;
+    let date =
+        chrono::NaiveDateTime::parse_from_str(date.trim_start(), "%b %d %H:%M:%S %Y").ok()?;
+    if explicit_zone.is_some() {
+        Some(date.and_utc())
+    } else {
+        // Pi's Date.parse treats an asctime value with no zone as local time.
+        let offset = match Local.offset_from_local_datetime(&date) {
+            LocalResult::Single(offset) => offset,
+            LocalResult::Ambiguous(first, second) => {
+                // The larger offset maps the repeated wall time to its first instant.
+                std::cmp::max_by_key(first, second, |offset| offset.local_minus_utc())
+            }
+            LocalResult::None => {
+                // JavaScript moves through forward clock changes using the
+                // offset from before the gap. Look up that offset the day before.
+                let previous = date.checked_sub_days(chrono::Days::new(1))?;
+                Local.offset_from_local_datetime(&previous).earliest()?
+            }
+        };
+        offset
+            .from_local_datetime(&date)
+            .single()
+            .map(|date| date.to_utc())
+    }
 }
 
 fn classifier_retry_delay(
@@ -3044,6 +3083,12 @@ mod tests {
                 "over 60 seconds",
             ),
             (
+                Api::SystemOne,
+                vec![(429, "retry-after: Mon Nov  6 08:51:00 2095\r\n")],
+                false,
+                "over 60 seconds",
+            ),
+            (
                 Api::OpenRouterImages,
                 vec![(429, "retry-after-ms: 0\r\n")],
                 false,
@@ -3184,6 +3229,35 @@ mod tests {
             HeaderValue::from_static("Sunday, 06-Nov-94 08:51:00 GMT"),
         );
         assert!(classifier_retry_delay(&headers, 0, old_now).is_err());
+        for zone in ["GMT", "UTC"] {
+            headers.insert(
+                "retry-after",
+                HeaderValue::from_str(&format!("Mon Nov  6 08:49:37 1994 {zone}")).unwrap(),
+            );
+            assert_eq!(
+                classifier_retry_delay(&headers, 0, old_now).unwrap(),
+                Duration::from_secs(5)
+            );
+        }
+        use chrono::TimeZone;
+        let local_now = chrono::Local
+            .with_ymd_and_hms(1994, 11, 6, 8, 49, 32)
+            .earliest()
+            .unwrap()
+            .to_utc();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:49:37 1994"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, local_now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:51:00 1994"),
+        );
+        assert!(classifier_retry_delay(&headers, 0, local_now).is_err());
         assert_eq!(
             classifier_retry_date("Sunday, 06-Nov-50 08:49:37 GMT")
                 .unwrap()
@@ -3196,6 +3270,38 @@ mod tests {
                 .to_rfc3339(),
             "2049-11-06T08:49:37+00:00"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_retry_asctime_follows_local_clock_changes() {
+        const CHILD: &str = "PI_RS_CLASSIFIER_RETRY_CLOCK_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_models::tests::classifier_retry_asctime_follows_local_clock_changes",
+                ])
+                .env(CHILD, "1")
+                .env("TZ", "America/New_York")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        for (header, expected) in [
+            ("Sun Mar 10 02:00:05 2024", "2024-03-10T07:00:05+00:00"),
+            ("Sun Nov  3 01:00:05 2024", "2024-11-03T05:00:05+00:00"),
+        ] {
+            assert_eq!(
+                classifier_retry_date(header).unwrap().to_rfc3339(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
