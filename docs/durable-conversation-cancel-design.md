@@ -140,21 +140,13 @@ the original claim, attempt, owner, definition identity and both markers in one
 transaction. External cleanup work is deferred while the unsafe checkpointable
 root remains live. Direct writes to the store remain outside these API fences.
 
-If writer contention prevents a selected cancellation receipt commit, the
-completed callback result, selected after result, identity and lease stay pending.
-The driver retries only a definitely unstarted write and never reruns the
-callback. Before the first callback poll, it captures a durable mutation revision
-and checks it in the start transaction. The first receipt write and every retry
-check task, ownership and conversation mutations against that same boundary.
-A change, including one from an unrelated graph, conservatively leaves that
-receipt for reconciliation; independent work can still run. Shutdown returns
-any unresolved result and its lease. Indeterminate commits remain unresolved.
-
-The mutation history is installed using database triggers, so older open Store
-connections also record puts, updates and deletes. The history is append-only
-and currently has no compaction policy; storage use grows with mutations under
-the three tracked prefixes. Callback markers and extension memo keys are outside
-those prefixes.
+If writer contention prevents a cancellation receipt commit, the completed
+callback result, selected after result, identity and lease remain pending for
+reconciliation and are returned on driver shutdown. The driver does not retry
+these receipts automatically: a later graph snapshot could include different
+children than the callback-start snapshot. Other independent graphs continue
+to run. Indeterminate commits also remain unresolved rather than being treated
+as uncommitted.
 
 Interrupted-woken cancellation drains foreground task descendants before the
 parent callback. Foreground owned conversations are not yet supported by this

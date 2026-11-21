@@ -618,7 +618,6 @@ pub struct KnownConversationCancel {
     receipt: Option<ConversationCancelReceipt>,
     snapshot_check: Option<durable_store::Check>,
     nested: bool,
-    graph_start_boundary: u64,
 }
 impl std::fmt::Debug for KnownConversationCancel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -640,7 +639,6 @@ impl KnownConversationCancel {
         snapshot_check: durable_store::Check,
         nested: bool,
         commit_state: KnownCancelCommitState,
-        graph_start_boundary: u64,
     ) -> Self {
         Self {
             claim: receipt.claim.clone(),
@@ -652,7 +650,6 @@ impl KnownConversationCancel {
             receipt: Some(receipt),
             snapshot_check: Some(snapshot_check),
             nested,
-            graph_start_boundary,
         }
     }
     pub fn after_result(&self) -> Option<&Value> {
@@ -716,7 +713,6 @@ pub struct KnownWokenCancel {
     identity: Arc<crate::nested_identity::IdentityLease>,
     attachment: Option<Arc<KnownCancelAttachment>>,
     commit_state: KnownCancelCommitState,
-    graph_start_boundary: u64,
 }
 impl KnownWokenCancel {
     pub(crate) fn new(
@@ -725,7 +721,6 @@ impl KnownWokenCancel {
         marker: Vec<u8>,
         identity: crate::nested_identity::IdentityLease,
         commit_state: KnownCancelCommitState,
-        graph_start_boundary: u64,
     ) -> Self {
         Self {
             receipt,
@@ -734,7 +729,6 @@ impl KnownWokenCancel {
             identity: Arc::new(identity),
             attachment: None,
             commit_state,
-            graph_start_boundary,
         }
     }
     pub fn after_result(&self) -> Option<&Value> {
@@ -3716,7 +3710,6 @@ pub struct AdmissionHandle<'a> {
     activity: &'a crate::worker_activity::WorkerActivity,
     standalone: bool,
     validator: Option<&'a crate::runtime::Harness>,
-    graph_start_boundary: Option<u64>,
 }
 
 impl DetachedInvocation {
@@ -3745,50 +3738,12 @@ impl DetachedInvocation {
             activity: &self.activity,
             standalone: self.validator.is_none(),
             validator: self.validator.as_ref(),
-            graph_start_boundary: None,
         }
         .admit_task_tool_child(tool, key, input)
     }
 }
 
 impl AdmissionHandle<'_> {
-    pub(crate) fn graph_start_boundary(&self) -> Result<u64, String> {
-        self.lease
-            .attachment
-            .owner
-            .store()
-            .graph_mutation_revision()
-            .map_err(|e| e.to_string())
-    }
-    pub(crate) fn with_graph_start_boundary(&self, boundary: u64) -> AdmissionHandle<'_> {
-        AdmissionHandle {
-            running: self.running,
-            lease: self.lease,
-            abort: self.abort,
-            definitions: self.definitions,
-            activity: self.activity,
-            standalone: self.standalone,
-            validator: self.validator,
-            graph_start_boundary: Some(boundary),
-        }
-    }
-    fn graph_start_checks(&self) -> Vec<durable_store::Check> {
-        self.graph_start_boundary
-            .map(|boundary| {
-                [
-                    task_store::PREFIX,
-                    crate::ownership_edge::PREFIX,
-                    b"runtime/conversation/",
-                ]
-                .iter()
-                .map(|prefix| durable_store::Check {
-                    key: prefix.to_vec(),
-                    expected: durable_store::Expected::PrefixMutationsUnchangedSince(boundary),
-                })
-                .collect()
-            })
-            .unwrap_or_default()
-    }
     /// Pin the registered hook names before claiming a callback. The claim
     /// subsequently validates the exact persisted identities under this lease.
     pub(crate) fn conversation_selection_start_lease(
@@ -3850,7 +3805,6 @@ impl AdmissionHandle<'_> {
             receipt: None,
             snapshot_check: None,
             nested: false,
-            graph_start_boundary: 0,
         }
     }
     #[cfg(test)]
@@ -4624,7 +4578,6 @@ impl AdmissionHandle<'_> {
         mutations.extend(task_start.mutations);
         #[cfg(test)]
         invoke_boundary(conversation_start_hooks(), current.task.id());
-        checks.extend(self.graph_start_checks());
         let result = owner
             .store()
             .commit_with_prefix_put_fence(
@@ -4822,7 +4775,6 @@ impl AdmissionHandle<'_> {
         checks.extend(task_start.checks);
         let mut mutations = conversation_start.mutations;
         mutations.extend(task_start.mutations);
-        checks.extend(self.graph_start_checks());
         let result = owner
             .store()
             .commit_with_prefix_put_fence(
@@ -5284,7 +5236,6 @@ impl AdmissionHandle<'_> {
                 }
             }
         }
-        let receipt_commit = memo.is_none();
         let memo_result = if let Some((memo_key, value)) = memo {
             let storage_key =
                 format!("runtime/extension-memo/{}/{}", current.task.id(), memo_key).into_bytes();
@@ -5322,9 +5273,6 @@ impl AdmissionHandle<'_> {
             conversation_receipt_before_commit_hooks(),
             current.task.id(),
         );
-        if receipt_commit {
-            checks.extend(self.graph_start_checks());
-        }
         owner
             .store()
             .commit_with_prefix_put_fence(
@@ -5617,6 +5565,7 @@ impl AdmissionHandle<'_> {
                 mutations.extend(task_finish.mutations);
             }
         }
+        #[cfg(test)]
         let receipt_commit = memo.is_none();
         let memo_result = if let Some((memo_key, value)) = memo {
             let key =
@@ -5656,9 +5605,6 @@ impl AdmissionHandle<'_> {
                 conversation_receipt_before_commit_hooks(),
                 current.task.id(),
             );
-        }
-        if receipt_commit {
-            checks.extend(self.graph_start_checks());
         }
         owner
             .store()
@@ -8509,7 +8455,6 @@ impl DetachedInvocation {
                     activity: &activity,
                     standalone: validator.is_none(),
                     validator: validator.as_ref(),
-                    graph_start_boundary: None,
                 };
                 handler.run_abort_with_retained_result(
                     &running.task,
@@ -8595,7 +8540,6 @@ impl DetachedInvocation {
                                 activity: &activity,
                                 standalone: validator.is_none(),
                                 validator: validator.as_ref(),
-                                graph_start_boundary: None,
                             };
                             if let Some(cancellation) = cancellation {
                                 handler.run_with_admission_and_cancellation(
@@ -10839,145 +10783,16 @@ impl Scheduler {
     /// Known cancellation results are retained for reconciliation. Retrying
     /// their receipt against a newly sampled graph could authorize different
     /// descendants than those observed at callback start.
-    fn retry_known_cancel(&self, completed: &mut CompletedInvocation) {
-        if let Some(known) = completed.known_woken_cancel().cloned() {
-            if known.commit_state != KnownCancelCommitState::Busy
-                || !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
-                || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
-            {
-                return;
-            }
-            let Some(attachment) = &known.attachment else {
-                return;
-            };
-            let Some(expected) = known.identity.as_ref().as_deref() else {
-                return;
-            };
-            let Some(harness) = &attachment.harness else {
-                return;
-            };
-            let Ok(harness) = harness.try_lock() else {
-                return;
-            };
-            let admission = AdmissionHandle {
-                running: &completed.running,
-                lease: &completed.lease,
-                abort: true,
-                definitions: &self.wake_reader.definitions,
-                activity: &self.activity,
-                standalone: false,
-                validator: Some(&harness),
-                graph_start_boundary: Some(known.graph_start_boundary),
-            };
-            let result = admission.store_woken_conversation_cancel_receipt_and_after(
-                attachment.handler.as_ref(),
-                &known.receipt,
-                &known.identity,
-                expected,
-                &known.marker,
-                &known.snapshot,
-            );
-            match result {
-                Ok(()) => {
-                    completed.result = InvocationResult::Abort(Some(
-                        "interrupted woken execution; reconciliation required".into(),
-                    ))
-                }
-                Err(error) => {
-                    if let InvocationResult::KnownWokenCancel(ref mut pending) = completed.result {
-                        pending.commit_state = match error {
-                            HookFenceError::WriteLockBusy => KnownCancelCommitState::Busy,
-                            HookFenceError::Conflict => KnownCancelCommitState::Stale,
-                            HookFenceError::Other(_) => KnownCancelCommitState::Uncertain,
-                        };
-                    }
-                }
-            }
-            return;
-        }
-        let Some(known) = completed.known_conversation_cancel().cloned() else {
-            return;
-        };
-        if known.commit_state != KnownCancelCommitState::Busy
-            || !Arc::ptr_eq(&self.live_invocations, &completed.lease.state)
-            || !Arc::ptr_eq(&self.attachment, &completed.lease.attachment)
-        {
-            return;
-        }
-        let (Some(receipt), Some(snapshot), Some(identity), Some(attachment)) = (
-            &known.receipt,
-            &known.snapshot_check,
-            &known.identity,
-            &known.attachment,
-        ) else {
-            return;
-        };
-        let Some(expected) = identity.as_ref().as_deref() else {
-            return;
-        };
-        let Some(harness) = &attachment.harness else {
-            return;
-        };
-        let Ok(harness) = harness.try_lock() else {
-            return;
-        };
-        let admission = AdmissionHandle {
-            running: &completed.running,
-            lease: &completed.lease,
-            abort: true,
-            definitions: &self.wake_reader.definitions,
-            activity: &self.activity,
-            standalone: false,
-            validator: Some(&harness),
-            graph_start_boundary: Some(known.graph_start_boundary),
-        };
-        let result = if known.nested {
-            admission.store_nested_conversation_cancel_receipt_and_after(
-                attachment.handler.as_ref(),
-                receipt,
-                identity,
-                expected,
-                &known.marker,
-                snapshot,
-            )
-        } else {
-            admission.store_conversation_cancel_receipt_and_after(
-                attachment.handler.as_ref(),
-                receipt,
-                identity,
-                expected,
-                &known.marker,
-                snapshot,
-            )
-        };
-        match result {
-            Ok(()) => completed.result = InvocationResult::Abort(None),
-            Err(error) => {
-                if let InvocationResult::KnownConversationCancel(ref mut pending) = completed.result
-                {
-                    pending.commit_state = match error {
-                        HookFenceError::WriteLockBusy => KnownCancelCommitState::Busy,
-                        HookFenceError::Conflict => KnownCancelCommitState::Stale,
-                        HookFenceError::Other(_) => KnownCancelCommitState::Uncertain,
-                    };
-                }
-            }
-        }
-    }
-
     pub fn try_resume_pending(
         &mut self,
         pending: PendingSettlement,
     ) -> Result<bool, SettlementError> {
         let (mut lease, mut settlement) = match pending {
-            PendingSettlement::Unprepared(mut completed) => {
+            PendingSettlement::Unprepared(completed) => {
                 if completed.known_cancel_state().is_some() {
-                    self.retry_known_cancel(&mut completed);
-                    if completed.known_cancel_state().is_some() {
-                        return Err(SettlementError::Pending {
-                            completed: Box::new(completed),
-                        });
-                    }
+                    return Err(SettlementError::Pending {
+                        completed: Box::new(completed),
+                    });
                 }
                 return self.try_settle_invocation(completed);
             }

@@ -86,8 +86,6 @@ pub enum Expected {
     /// No put under this byte prefix after the observed database put version.
     /// Pair this with checks on observed keys to fence deletion.
     PrefixUnchangedSince(u64),
-    /// No insertion, update, or deletion under the tracked prefix since this mutation revision.
-    PrefixMutationsUnchangedSince(u64),
     Version(u64),
     /// Version must match and the monotonic deadline must not have elapsed.
     VersionBefore(u64, Instant),
@@ -215,33 +213,6 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_store_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version>=0));
             INSERT OR IGNORE INTO durable_store_meta(id, version) VALUES(1, 0);
             CREATE TABLE IF NOT EXISTS durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;")?;
-        // Triggers cover writes from already-open older Store connections as well.
-        // History is append-only and its SQLite rowid survives reopen.
-        conn.execute_batch("BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS durable_graph_mutation_history (revision INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL);
-            CREATE INDEX IF NOT EXISTS durable_graph_mutation_history_key ON durable_graph_mutation_history(key, revision);
-            CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_insert AFTER INSERT ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END;
-            CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_update AFTER UPDATE ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END;
-            CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_delete AFTER DELETE ON durable_store_entries WHEN substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(OLD.key); END;
-            ")?;
-        // A pre-existing table or trigger with this name must implement the exact fence.
-        let history_schema: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='durable_graph_mutation_history'", [], |row| row.get(0)).optional()?;
-        if history_schema.as_deref() != Some("CREATE TABLE durable_graph_mutation_history (revision INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL)") {
-            conn.execute_batch("ROLLBACK;")?;
-            return Err(Error::InvalidSnapshot);
-        }
-        for (name, expected) in [
-            ("durable_graph_mutation_insert", "CREATE TRIGGER durable_graph_mutation_insert AFTER INSERT ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END"),
-            ("durable_graph_mutation_update", "CREATE TRIGGER durable_graph_mutation_update AFTER UPDATE ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END"),
-            ("durable_graph_mutation_delete", "CREATE TRIGGER durable_graph_mutation_delete AFTER DELETE ON durable_store_entries WHEN substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(OLD.key); END"),
-        ] {
-            let actual: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [name], |row| row.get(0)).optional()?;
-            if actual.as_deref() != Some(expected) {
-                conn.execute_batch("ROLLBACK;")?;
-                return Err(Error::InvalidSnapshot);
-            }
-        }
-        conn.execute_batch("COMMIT;")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS durable_task_document_owners (document_key BLOB PRIMARY KEY NOT NULL, owner BLOB NOT NULL) WITHOUT ROWID;")?;
         // The version boundary distinguishes pre-migration writes, whose commit
         // grouping is unknowable, from all subsequently recorded puts.
@@ -416,16 +387,6 @@ impl Store {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         Ok(conn.query_row(
             "SELECT sequence FROM durable_commit_meta WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// Current append-only graph mutation revision (including deletes).
-    pub fn graph_mutation_revision(&self) -> Result<u64, Error> {
-        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
-        Ok(conn.query_row(
-            "SELECT COALESCE(MAX(revision),0) FROM durable_graph_mutation_history",
             [],
             |r| r.get(0),
         )?)
@@ -1487,31 +1448,6 @@ impl Store {
                         tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND key<?2 AND version>?3)", params![check.key, end, boundary], |r| r.get(0))?
                     } else {
                         tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND version>?2)", params![check.key, boundary], |r| r.get(0))?
-                    };
-                    !changed
-                }
-                Expected::PrefixMutationsUnchangedSince(boundary) => {
-                    if ![
-                        b"durable/task/".as_slice(),
-                        b"durable/conversation-owner/".as_slice(),
-                        b"runtime/conversation/".as_slice(),
-                    ]
-                    .contains(&check.key.as_slice())
-                    {
-                        return Err(Error::InvalidSnapshot);
-                    }
-                    let current: u64 = tx.query_row(
-                        "SELECT COALESCE(MAX(revision),0) FROM durable_graph_mutation_history",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    if boundary > current {
-                        return Err(Error::InvalidSnapshot);
-                    }
-                    let changed: bool = if let Some(end) = prefix_end(&check.key) {
-                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_graph_mutation_history WHERE key>=?1 AND key<?2 AND revision>?3)", params![check.key,end,boundary], |r| r.get(0))?
-                    } else {
-                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_graph_mutation_history WHERE key>=?1 AND revision>?2)", params![check.key,boundary], |r| r.get(0))?
                     };
                     !changed
                 }
@@ -2633,205 +2569,5 @@ mod document_history_tests {
             .unwrap();
         assert!(value.is_none());
         assert!(db.document_at_bounded(&key, deleted, 0).unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
-mod graph_mutation_revision_tests {
-    use super::*;
-
-    #[test]
-    fn migration_tracks_writes_from_connection_opened_before_installation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.sqlite");
-        let old = rusqlite::Connection::open(&path).unwrap();
-        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
-        let key = b"durable/task/old".as_slice();
-        old.execute(
-            "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,1)",
-            rusqlite::params![key, b"initial".as_slice()],
-        )
-        .unwrap();
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.get(key).unwrap().unwrap().value, b"initial");
-        let second = Store::open(&path).unwrap();
-        for sql in [
-            "UPDATE durable_store_entries SET value=X'31',version=2 WHERE key=?1",
-            "DELETE FROM durable_store_entries WHERE key=?1",
-            "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,X'32',3)",
-        ] {
-            let before = store.graph_mutation_revision().unwrap();
-            old.execute(sql, [key]).unwrap();
-            assert!(matches!(
-                second.commit(
-                    &[Check {
-                        key: b"durable/task/".to_vec(),
-                        expected: Expected::PrefixMutationsUnchangedSince(before)
-                    }],
-                    &[]
-                ),
-                Err(Error::Conflict { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn concurrent_open_installs_one_complete_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("concurrent.sqlite");
-        let old = rusqlite::Connection::open(&path).unwrap();
-        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
-        drop(old);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
-                let path = path.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    Store::open(path)
-                })
-            })
-            .collect();
-        barrier.wait();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert!(results.iter().any(Result::is_ok));
-        for result in results {
-            match result {
-                Ok(_) => (),
-                Err(Error::Storage(rusqlite::Error::SqliteFailure(code, _)))
-                    if matches!(
-                        code.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) =>
-                {
-                    ()
-                }
-                Err(error) => panic!("unexpected concurrent open error: {error}"),
-            }
-        }
-        let first = Store::open(&path).unwrap();
-        let second = Store::open(&path).unwrap();
-        let boundary = first.graph_mutation_revision().unwrap();
-        second
-            .commit(
-                &[],
-                &[Mutation::Put {
-                    key: b"durable/task/race".to_vec(),
-                    value: vec![1],
-                }],
-            )
-            .unwrap();
-        assert!(matches!(
-            first.commit(
-                &[Check {
-                    key: b"durable/task/".to_vec(),
-                    expected: Expected::PrefixMutationsUnchangedSince(boundary)
-                }],
-                &[]
-            ),
-            Err(Error::Conflict { .. })
-        ));
-    }
-
-    #[test]
-    fn migration_fails_closed_on_read_only_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("readonly.sqlite");
-        let old = rusqlite::Connection::open(&path).unwrap();
-        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
-        drop(old);
-        let readonly = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        assert!(Store::initialize(readonly, true).is_err());
-        let probe = rusqlite::Connection::open(&path).unwrap();
-        let installed: bool = probe.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_mutation_history')", [], |r| r.get(0)).unwrap();
-        assert!(!installed);
-    }
-
-    #[test]
-    fn migration_rejects_forged_existing_trigger() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("forged.sqlite");
-        let old = rusqlite::Connection::open(&path).unwrap();
-        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID; CREATE TRIGGER durable_graph_mutation_delete AFTER DELETE ON durable_store_entries BEGIN SELECT 1; END;").unwrap();
-        drop(old);
-        assert!(matches!(Store::open(&path), Err(Error::InvalidSnapshot)));
-        let probe = rusqlite::Connection::open(&path).unwrap();
-        let installed: bool = probe.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_mutation_history')", [], |r| r.get(0)).unwrap();
-        assert!(!installed);
-    }
-
-    #[test]
-    fn migration_rejects_incompatible_history_schema() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("broken.sqlite");
-        let old = rusqlite::Connection::open(&path).unwrap();
-        old.execute_batch(
-            "CREATE VIEW durable_graph_mutation_history AS SELECT 1 AS revision, X'00' AS key;",
-        )
-        .unwrap();
-        drop(old);
-        assert!(Store::open(&path).is_err());
-    }
-
-    #[test]
-    fn graph_fence_detects_deletes_and_aba_across_reopen_and_old_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("graph.sqlite");
-        let store = Store::open(&path).unwrap();
-        let key = b"durable/task/example".to_vec();
-        store
-            .commit(
-                &[],
-                &[Mutation::Put {
-                    key: key.clone(),
-                    value: b"old".to_vec(),
-                }],
-            )
-            .unwrap();
-        let boundary = store.graph_mutation_revision().unwrap();
-        let old_connection = rusqlite::Connection::open(&path).unwrap();
-        old_connection
-            .execute("DELETE FROM durable_store_entries WHERE key=?1", [&key])
-            .unwrap();
-        let check = Check {
-            key: b"durable/task/".to_vec(),
-            expected: Expected::PrefixMutationsUnchangedSince(boundary),
-        };
-        assert!(matches!(
-            store.commit(&[check.clone()], &[]),
-            Err(Error::Conflict { .. })
-        ));
-        drop(store);
-        let reopened = Store::open(&path).unwrap();
-        assert!(matches!(
-            reopened.commit(&[check], &[]),
-            Err(Error::Conflict { .. })
-        ));
-        let before_aba = reopened.graph_mutation_revision().unwrap();
-        reopened
-            .commit(
-                &[],
-                &[Mutation::Put {
-                    key: key.clone(),
-                    value: b"same".to_vec(),
-                }],
-            )
-            .unwrap();
-        reopened.commit(&[], &[Mutation::Delete { key }]).unwrap();
-        assert!(matches!(
-            reopened.commit(
-                &[Check {
-                    key: b"durable/task/".to_vec(),
-                    expected: Expected::PrefixMutationsUnchangedSince(before_aba)
-                }],
-                &[]
-            ),
-            Err(Error::Conflict { .. })
-        ));
     }
 }
