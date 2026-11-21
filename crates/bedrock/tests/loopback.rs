@@ -1190,12 +1190,18 @@ async fn custom_http02_sdk_client_keeps_extensions_with_and_without_headers() {
 async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
     use pi_rs_core::{
         Agent, CancellationToken, Extension, ExtensionResult, ExtensionState, Limits, MemoryStore,
-        ProviderResponseEvent, Registry, Session,
+        Notification, ProviderResponseEvent, ProviderStreamEvent, Registry, Session,
     };
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use tokio::sync::Notify;
 
-    struct Observer(Arc<Notify>);
+    struct Observer {
+        headers_received: Arc<Notify>,
+        frames: Arc<Mutex<Vec<ProviderStreamEvent>>>,
+    }
     #[async_trait::async_trait]
     impl Extension for Observer {
         fn id(&self) -> &str {
@@ -1217,7 +1223,20 @@ async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
             for protected in ["set-cookie", "x-echo-token", "x-echo-key"] {
                 assert!(!event.headers.contains_key(protected));
             }
-            self.0.notify_one();
+            self.headers_received.notify_one();
+            Ok(())
+        }
+
+        fn handles_provider_stream_event(&self) -> bool {
+            true
+        }
+
+        async fn provider_stream_event(
+            &self,
+            event: &ProviderStreamEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            self.frames.lock().unwrap().push(event.clone());
             Ok(())
         }
     }
@@ -1226,8 +1245,12 @@ async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
     let address = listener.local_addr().unwrap();
     let released = Arc::new(Notify::new());
     let mut registry = Registry::default();
+    let frames = Arc::new(Mutex::new(Vec::new()));
     registry
-        .register(Arc::new(Observer(released.clone())))
+        .register(Arc::new(Observer {
+            headers_received: released.clone(),
+            frames: frames.clone(),
+        }))
         .unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
@@ -1262,7 +1285,10 @@ async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
             data.extend_from_slice(&buffer[..received]);
         }
         let frames = [
-            event("messageStart", json!({"role": "assistant"})),
+            event("initial-response", json!({})),
+            event("messageStart", json!({
+                "role": "assistant", "vendorField": "preserved", "echo": "fixture-session"
+            })),
             event("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"text": "hello"}})),
             event("contentBlockStop", json!({"contentBlockIndex": 0})),
             event("messageStop", json!({"stopReason": "end_turn"})),
@@ -1275,7 +1301,9 @@ async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
         tokio::time::timeout(Duration::from_secs(10), released.notified())
             .await
             .expect("extension must observe headers before the first event frame");
-        socket.write_all(&frames).await.unwrap();
+        socket.write_all(&frames[..7]).await.unwrap();
+        tokio::task::yield_now().await;
+        socket.write_all(&frames[7..]).await.unwrap();
     });
     let config = aws_sdk_bedrockruntime::Config::builder()
         .behavior_version_latest()
@@ -1305,7 +1333,16 @@ async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
             Some("hello".into()),
             &mut inputs,
             &CancellationToken::new(),
-            &mut |_| {},
+            &mut |notification| {
+                if let Notification::Text("hello") = notification {
+                    let frames = frames.lock().unwrap();
+                    assert_eq!(frames.len(), 2);
+                    assert_eq!(
+                        frames[1].data["contentBlockDelta"]["delta"]["text"],
+                        "hello"
+                    );
+                }
+            },
         )
         .await;
     let server = server.await;
@@ -1314,4 +1351,12 @@ async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
         "hello",
     );
     server.unwrap();
+    let frames = frames.lock().unwrap();
+    assert_eq!(frames.len(), 5);
+    assert_eq!(frames[0].provider, "amazon-bedrock");
+    assert_eq!(frames[0].api, pi_rs_core::ModelApi::BedrockConverseStream);
+    assert_eq!(frames[0].model, "test-model");
+    assert_eq!(frames[0].data["messageStart"]["vendorField"], "preserved");
+    assert_eq!(frames[0].data["messageStart"]["echo"], "[redacted]");
+    assert_eq!(frames[4].data["metadata"]["usage"]["outputTokens"], 1);
 }
