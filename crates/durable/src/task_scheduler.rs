@@ -13256,13 +13256,46 @@ impl Scheduler {
                         let claim: WokenConversationCancelClaim =
                             serde_json::from_slice(&entry.value)
                                 .map_err(|e| Error::Handler(e.to_string()))?;
-                        let TaskOwner::Conversation(conversation) = item.task.owner() else {
-                            return Err(Error::Handler("woken claim owner changed".into()));
+                        let nested_ancestry = match item.task.owner() {
+                            TaskOwner::Conversation(conversation)
+                                if *conversation == claim.conversation =>
+                            {
+                                None
+                            }
+                            TaskOwner::Task(_) => {
+                                let (conversation, ancestry, checks, version) =
+                                    task_store::read_nested_cancel_claim_ancestry(
+                                        store,
+                                        item.task.id(),
+                                        claim.claim_id,
+                                    )?;
+                                let ancestry_key = &checks
+                                    .first()
+                                    .ok_or_else(|| Error::Handler("missing ancestry check".into()))?
+                                    .key;
+                                let claim_commit = store
+                                    .commit_for_version(&woken_key, entry.version)
+                                    .map_err(task_store::Error::from)?;
+                                let ancestry_commit = store
+                                    .commit_for_version(ancestry_key, version)
+                                    .map_err(task_store::Error::from)?;
+                                if conversation != claim.conversation
+                                    || claim_commit.is_none()
+                                    || claim_commit != ancestry_commit
+                                {
+                                    return Err(Error::Handler(
+                                        "woken claim ancestry mismatch".into(),
+                                    ));
+                                }
+                                Some((ancestry, checks))
+                            }
+                            _ => return Err(Error::Handler("woken claim owner changed".into())),
                         };
+                        let conversation = claim.conversation;
                         if claim.version != 3
                             || claim.claim_id.is_nil()
                             || claim.task != item.task.id()
-                            || claim.conversation != *conversation
+                            || claim.conversation != conversation
                             || claim.conversation.is_nil()
                             || claim.kind.is_empty()
                             || Some(claim.kind.as_str()) != item.task.kind()
@@ -13326,7 +13359,8 @@ impl Scheduler {
                             None
                         };
                         let mut _nested_identity_leases = Vec::new();
-                        let after = if _identity.is_some()
+                        let after = if nested_ancestry.is_none()
+                            && _identity.is_some()
                             && task_marker.is_none()
                             && conversation_marker.is_none()
                         {
@@ -13385,6 +13419,16 @@ impl Scheduler {
                             .retain(|check| check.key != task_key && check.key != conversation_key);
                         match (task_marker, conversation_marker) {
                             (None, None) => {
+                                if let Some((ancestry, checks)) = &nested_ancestry {
+                                    batch.checks.extend(checks.clone());
+                                    for ancestor in ancestry.iter().skip(1) {
+                                        batch.checks.push(durable_store::Check {
+                                            key: format!("durable/task-callback-start/{ancestor}")
+                                                .into_bytes(),
+                                            expected: durable_store::Expected::Missing,
+                                        });
+                                    }
+                                }
                                 for key in [task_key, conversation_key] {
                                     batch.checks.push(durable_store::Check {
                                         key,
@@ -13405,17 +13449,41 @@ impl Scheduler {
                                         "interrupted woken marker mismatch".into(),
                                     ));
                                 }
-                                for (key, marker) in [
-                                    (task_key, task_marker),
-                                    (conversation_key, conversation_marker),
-                                ] {
+                                if nested_ancestry.is_some() {
+                                    let ancestry_batch =
+                                        task_store::prepare_nested_woken_cancel_ancestry_finish(
+                                            store,
+                                            item.task.id(),
+                                            conversation,
+                                            claim.claim_id,
+                                            &expected,
+                                        )?;
+                                    batch.checks.extend(ancestry_batch.checks);
+                                    batch.mutations.extend(ancestry_batch.mutations);
                                     batch.checks.push(durable_store::Check {
-                                        key: key.clone(),
-                                        expected: durable_store::Expected::Version(marker.version),
+                                        key: conversation_key.clone(),
+                                        expected: durable_store::Expected::Version(
+                                            conversation_marker.version,
+                                        ),
                                     });
-                                    batch
-                                        .mutations
-                                        .push(durable_store::Mutation::Delete { key });
+                                    batch.mutations.push(durable_store::Mutation::Delete {
+                                        key: conversation_key,
+                                    });
+                                } else {
+                                    for (key, marker) in [
+                                        (task_key, task_marker),
+                                        (conversation_key, conversation_marker),
+                                    ] {
+                                        batch.checks.push(durable_store::Check {
+                                            key: key.clone(),
+                                            expected: durable_store::Expected::Version(
+                                                marker.version,
+                                            ),
+                                        });
+                                        batch
+                                            .mutations
+                                            .push(durable_store::Mutation::Delete { key });
+                                    }
                                 }
                             }
                             _ => {

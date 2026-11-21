@@ -8197,8 +8197,13 @@ async fn nested_woken_evidence_worker() {
     #[async_trait]
     impl crate::async_task_tool::DurableParkCancel for Cancel {
         async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
-            std::fs::write(self.0.join("nested-cancelled"), b"called")
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("nested-cancelled"))
                 .map_err(|e| e.to_string())?;
+            writeln!(file, "called").map_err(|e| e.to_string())?;
             Ok(())
         }
     }
@@ -8484,5 +8489,211 @@ async fn nested_woken_driver_claim_marker_and_receipt_survive_kill() {
             )
             .unwrap()
             .is_some()
+    );
+    let child_id = child.task.id();
+    drop(records);
+    drop(store);
+    let mut reopened = launch(true);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            assert!(
+                reopened.try_wait().unwrap().is_none(),
+                "reopened worker exited"
+            );
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let record = crate::task_store::TaskStore::new(&store)
+                .load(child_id)
+                .unwrap()
+                .unwrap();
+            if matches!(record.task.state(), crate::task::TaskState::Failed(_)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let _ = reopened.kill();
+        let _ = reopened.wait();
+        panic!("child did not settle after reopen");
+    });
+    reopened.kill().unwrap();
+    reopened.wait().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
+        "called\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_woken_markers_retire_after_interruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = |resume: bool| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+            ])
+            .env("PI_TEST_NESTED_WOKEN_DIR", dir.path());
+        if resume {
+            command
+                .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+                .env("PI_TEST_NESTED_WOKEN_PROBE", "1")
+                .env("PI_TEST_WOKEN_START_DIR", dir.path());
+        }
+        command.spawn().unwrap()
+    };
+    let mut initial = launch(false);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("nested-woken").exists() {
+            assert!(initial.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    initial.kill().unwrap();
+    initial.wait().unwrap();
+    let mut callback = launch(true);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("woken-start").exists() {
+            assert!(callback.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    callback.kill().unwrap();
+    callback.wait().unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let root = records
+        .iter()
+        .find(|r| matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_)))
+        .unwrap();
+    let child = records
+        .iter()
+        .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
+        .unwrap();
+    let ids = [root.task.id(), child.task.id()];
+    for id in ids {
+        assert!(
+            store
+                .get(format!("durable/task-callback-start/{id}").as_bytes())
+                .unwrap()
+                .is_some()
+        );
+    }
+    drop(records);
+    drop(store);
+    let mut reopened = launch(true);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            assert!(reopened.try_wait().unwrap().is_none());
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let record = crate::task_store::TaskStore::new(&store)
+                .load(ids[1])
+                .unwrap()
+                .unwrap();
+            if matches!(record.task.state(), crate::task::TaskState::Failed(_)) {
+                for id in ids {
+                    assert!(
+                        store
+                            .get(format!("durable/task-callback-start/{id}").as_bytes())
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let _ = reopened.kill();
+        let _ = reopened.wait();
+        panic!("interrupted markers were not retired");
+    });
+    reopened.kill().unwrap();
+    reopened.wait().unwrap();
+    assert!(!dir.path().join("nested-cancelled").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_woken_real_callback_records_receipt_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = |resume: bool| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+            ])
+            .env("PI_TEST_NESTED_WOKEN_DIR", dir.path());
+        if resume {
+            command
+                .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+                .env("PI_TEST_NESTED_WOKEN_PROBE", "1")
+                .env("PI_TEST_WOKEN_REAL", "1");
+        }
+        command.spawn().unwrap()
+    };
+    let mut initial = launch(false);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("nested-woken").exists() {
+            assert!(initial.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    initial.kill().unwrap();
+    initial.wait().unwrap();
+    let mut resumed = launch(true);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            assert!(resumed.try_wait().unwrap().is_none());
+            let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+            let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+            let root = records
+                .iter()
+                .find(|r| matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_)));
+            if let Some(child) = root.and_then(|root| {
+                records
+                    .iter()
+                    .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
+            }) {
+                let receipt = format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                );
+                if store.get(receipt.as_bytes()).unwrap().is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let _ = resumed.kill();
+        let _ = resumed.wait();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        panic!("real callback receipt missing: {records:?} {files:?}");
+    });
+    resumed.kill().unwrap();
+    resumed.wait().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
+        "called\n"
     );
 }
