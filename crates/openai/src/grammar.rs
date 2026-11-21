@@ -51,9 +51,7 @@ pub(super) fn project_input(
                 .get(&(id, name))
                 .copied()
                 .or_else(|| item["arguments"].as_str())?;
-            let parsed = pi_rs_core::parse_tool_arguments(arguments).ok()?;
-            let object = parsed.as_object().filter(|object| object.len() == 1)?;
-            object.get(property)?.as_str().map(str::to_owned)
+            pi_rs_core::lossless_openai_grammar_input(arguments, property)
         });
         if let Some(raw) = projected_input {
             custom_calls.insert(id.to_owned());

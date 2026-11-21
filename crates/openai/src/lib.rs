@@ -263,8 +263,9 @@ impl OpenAiResponses {
         })
     }
     fn has_implicit_strict_tools(&self) -> bool {
-        // OpenAI Responses may enable strict sampling when the field is omitted.
-        self.provider == "openai-chatgpt" || self.endpoint.host_str() == Some("api.openai.com")
+        // OpenAI and Copilot Responses may enable strict sampling when the field is omitted.
+        matches!(self.provider.as_str(), "openai-chatgpt" | "github-copilot")
+            || self.endpoint.host_str() == Some("api.openai.com")
     }
 
     pub fn with_http_options(
@@ -2800,8 +2801,7 @@ mod tests {
     }
 
     #[test]
-    fn official_responses_explicitly_disables_implicit_strict_sampling() {
-        let model = OpenAiResponses::new_api(DEFAULT_ENDPOINT, "fixture".into()).unwrap();
+    fn responses_explicitly_disables_implicit_strict_sampling_on_openai_and_copilot() {
         let req = request();
         let declarations = [pi_rs_core::ToolDeclaration {
             spec: req.tools[0].clone(),
@@ -2809,18 +2809,28 @@ mod tests {
                 strict: pi_rs_core::StrictToolPolicy::Prefer,
             }),
         }];
-        let prepared = model
-            .prepare_tool_request(req.clone(), &declarations)
-            .unwrap();
-        assert_eq!(prepared.wire_tools.declarations[0]["strict"], false);
-        assert_eq!(
-            prepared.wire_tools.declarations[0]["parameters"],
-            req.tools[0].parameters
-        );
-        let stream_tools = model
-            .stream_only_constrained_tools(&req, &declarations, false)
-            .unwrap();
-        assert_eq!(stream_tools.declarations, prepared.wire_tools.declarations);
+        for model in [
+            OpenAiResponses::new_api(DEFAULT_ENDPOINT, "fixture".into()).unwrap(),
+            OpenAiResponses::new_api_provider(
+                "https://api.individual.githubcopilot.com/responses",
+                "fixture".into(),
+                "github-copilot",
+            )
+            .unwrap(),
+        ] {
+            let prepared = model
+                .prepare_tool_request(req.clone(), &declarations)
+                .unwrap();
+            assert_eq!(prepared.wire_tools.declarations[0]["strict"], false);
+            assert_eq!(
+                prepared.wire_tools.declarations[0]["parameters"],
+                req.tools[0].parameters
+            );
+            let stream_tools = model
+                .stream_only_constrained_tools(&req, &declarations, false)
+                .unwrap();
+            assert_eq!(stream_tools.declarations, prepared.wire_tools.declarations);
+        }
     }
 
     #[tokio::test]
