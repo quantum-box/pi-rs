@@ -788,7 +788,7 @@ impl ResourceFilter {
             .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
             .transpose()?;
         if let Some(patterns) = &patterns {
-            validate_patterns(patterns)?;
+            validate_resource_patterns(patterns, true)?;
         }
         Ok(Self {
             patterns,
@@ -934,6 +934,10 @@ impl ResourceFilter {
 }
 
 pub(crate) fn validate_patterns(patterns: &[String]) -> Result<()> {
+    validate_resource_patterns(patterns, false)
+}
+
+fn validate_resource_patterns(patterns: &[String], settings_filter: bool) -> Result<()> {
     for pattern in patterns
         .iter()
         .filter(|pattern| !pattern.starts_with(['+', '-']))
@@ -942,16 +946,27 @@ pub(crate) fn validate_patterns(patterns: &[String]) -> Result<()> {
             .strip_prefix('!')
             .unwrap_or(pattern)
             .replace('\\', "/");
-        globset::GlobBuilder::new(&pattern)
-            .literal_separator(true)
-            .backslash_escape(false)
-            .build()
-            .map_err(|error| {
-                Error::Config(format!("invalid resource pattern {pattern:?}: {error}"))
-            })?;
+        if settings_filter && pattern.starts_with('#') {
+            continue;
+        }
+        resource_glob(&pattern, settings_filter).map_err(|error| {
+            Error::Config(format!("invalid resource pattern {pattern:?}: {error}"))
+        })?;
     }
     Ok(())
 }
+
+fn resource_glob(
+    pattern: &str,
+    allow_unclosed_class: bool,
+) -> std::result::Result<globset::Glob, globset::Error> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .allow_unclosed_class(allow_unclosed_class)
+        .build()
+}
+
 pub(crate) fn selected(path: &Path, root: &Path, filters: &[String]) -> bool {
     select_resource(path, root, filters, false)
 }
@@ -1130,6 +1145,9 @@ pub(crate) fn resource_matches(
         .as_deref()
         .map(normalize)
         .unwrap_or_else(|| pattern.replace('\\', "/"));
+    if !exact && !directory_roots && pattern.starts_with('#') {
+        return false;
+    }
     let pattern = if exact {
         pattern
     } else {
@@ -1172,11 +1190,7 @@ pub(crate) fn resource_matches(
             return false;
         }
     }
-    let Ok(glob) = globset::GlobBuilder::new(&pattern)
-        .literal_separator(true)
-        .backslash_escape(false)
-        .build()
-    else {
+    let Ok(glob) = resource_glob(&pattern, !directory_roots) else {
         return false;
     };
     let matcher = glob.compile_matcher();
@@ -1214,11 +1228,7 @@ fn matches_hidden_filter_segments(candidate: &str, pattern: &str) -> bool {
             }
             continue;
         }
-        let Ok(glob) = globset::GlobBuilder::new(segment)
-            .literal_separator(true)
-            .backslash_escape(false)
-            .build()
-        else {
+        let Ok(glob) = resource_glob(segment, true) else {
             return false;
         };
         let matcher = glob.compile_matcher();
@@ -5291,6 +5301,33 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         let explicit =
             ResourceFilter::new(&json!({"prompts": [".*.md", invalid]}), "prompts").unwrap();
         assert!(explicit.includes(&path, &root, false).unwrap());
+    }
+
+    #[test]
+    fn settings_filters_accept_literal_brackets_and_ignore_comments() {
+        let root = Path::new("/package");
+        for (name, patterns, expected) in [
+            ("draft[.md", json!(["draft[.md"]), true),
+            (".draft[.md", json!([".draft[.md"]), true),
+            ("draft[.md", json!(["draft?.md"]), true),
+            ("#literal.md", json!(["#literal.md"]), false),
+            (
+                "#literal.md",
+                json!(["no-match", "+prompts/#literal.md"]),
+                true,
+            ),
+            ("visible.md", json!(["#ignore {", "*.md"]), true),
+        ] {
+            let filter = ResourceFilter::new(&json!({"prompts": patterns}), "prompts").unwrap();
+            assert_eq!(
+                filter
+                    .includes(&root.join("prompts").join(name), root, false)
+                    .unwrap(),
+                expected,
+                "{name} with {patterns}"
+            );
+        }
+        assert!(validate_patterns(&["draft[.md".into()]).is_err());
     }
 
     #[test]

@@ -1861,6 +1861,9 @@ Settings filter globs require an explicit leading dot to match a hidden path
 component. A visible basename can still match independently of its hidden
 parent path. Native manifest discovery and brace combinations outside the
 bounded expansion retain native glob matching.
+Settings filters treat an unclosed character class as literal text and ignore
+ordinary glob patterns that start with `#`. Exact overrides can select a path
+containing `#`.
 
 ### Resource discovery checkpoint
 
