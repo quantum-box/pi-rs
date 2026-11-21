@@ -2120,6 +2120,10 @@ legacy metadata hooks retain their existing bounded execution.
 
 ### Markdown presentation checkpoint
 
+Terminal Markdown expands tabs to three spaces before parsing, matching Pi.
+This applies to block marker indentation, reference definitions, and inline and
+fenced code.
+
 Level-one headings use underlining, lower-level headings retain their markers,
 and code blocks show language-labelled fences with indented syntax highlighting.
 Code blocks are separated from following blocks; syntax tokens use the active

@@ -1513,18 +1513,14 @@ fn markdown_at_depth(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
-    if text.contains('\r') {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        return markdown_at_depth(
-            &normalized,
-            theme,
-            width,
-            depth,
-            mermaid,
-            hyperlinks,
-            preserve_source,
-        );
-    }
+    // Pi expands tabs before lexing Markdown, including fenced code. Use the
+    // same normalized text for block parsing and reference definitions.
+    let normalized = text
+        .contains('\r')
+        .then(|| text.replace("\r\n", "\n").replace('\r', "\n"));
+    let text = normalized.as_deref().unwrap_or(text);
+    let expanded = text.contains('\t').then(|| text.replace('\t', "   "));
+    let text = expanded.as_deref().unwrap_or(text);
     let sanitized = super::math_blocks::reference_source(text);
     let reference_source = sanitized.as_ref();
     markdown_at_depth_with_refs(
@@ -2904,6 +2900,40 @@ mod tests {
     }
 
     #[test]
+    fn markdown_expands_tabs_before_parsing_like_pinned_pi() {
+        let theme = Theme::system();
+        let rule = "─".repeat(80);
+        for (source, expected) in [
+            ("a\tb", vec!["a   b"]),
+            ("\t# heading", vec!["heading"]),
+            ("\n\n\t# heading", vec!["", "heading"]),
+            ("\t> quote", vec!["│ quote"]),
+            ("\t---", vec![rule.as_str()]),
+            ("\t```\nx\n```", vec!["```", "  x", "```"]),
+            ("`a\tb`", vec!["a   b"]),
+            ("```\na\tb\n```", vec!["```", "  a   b", "```"]),
+            ("> a\tb", vec!["│ a   b"]),
+            ("- a\tb", vec!["- a   b"]),
+            ("a\tb\r\nc\td", vec!["a   b", "c   d"]),
+            (
+                "[x][r]\n\n[r]:\thttps://example.org",
+                vec!["x (https://example.org)", ""],
+            ),
+        ] {
+            let lines = markdown(source, &theme, 80)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lines, expected, "{source:?}");
+        }
+    }
+
+    #[test]
     fn markdown_spacing_normalizes_line_endings() {
         let theme = Theme::system();
         for source in [
@@ -3179,18 +3209,18 @@ mod tests {
             ("> - ~~`a\n>   b`~~", "a b"),
             ("1. ~~`a\n   b`~~", "a b"),
             ("- outer\n  - ~~`a\n    b`~~", "a b"),
-            ("> ~~`a\n>\tb`~~", "a b"),
-            ("-\t~~`a\n\tb`~~", "a b"),
-            ("1.\t~~`a\n\tb`~~", "a b"),
-            ("- ~~`a\n\tb`~~", "a   b"),
-            ("- ~~`a\n \tb`~~", "a    b"),
-            ("- ~~`a\n  \tb`~~", "a b"),
+            ("> ~~`a\n>\tb`~~", "a   b"),
+            ("-\t~~`a\n\tb`~~", "a    b"),
+            ("1.\t~~`a\n\tb`~~", "a    b"),
+            ("- ~~`a\n\tb`~~", "a  b"),
+            ("- ~~`a\n \tb`~~", "a   b"),
+            ("- ~~`a\n  \tb`~~", "a    b"),
             ("- ~~`a\n b`~~", "a  b"),
             (" - ~~`a\n   b`~~", "a b"),
             ("  - ~~`a\n    b`~~", "a b"),
             ("   - ~~`a\n     b`~~", "a b"),
-            ("  - ~~`a\n\tb`~~", "a b"),
-            ("  -\t~~`a\n\tb`~~", "a b"),
+            ("  - ~~`a\n\tb`~~", "a    b"),
+            ("  -\t~~`a\n\tb`~~", "a    b"),
             ("  1. ~~`a\n     b`~~", "a b"),
             ("  - outer\n    - ~~`a\n      b`~~", "a b"),
             (">   - ~~`a\n>     b`~~", "a b"),
