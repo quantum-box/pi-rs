@@ -1152,6 +1152,18 @@ clamps them to at least one and uses Pi's numeric comparison and notices.
 
 ### Model-selection checkpoint
 
+Native hosts can build a `ModelCatalog` from explicitly authorized provider,
+endpoint, protocol and model definitions through `ModelClientFactory::catalog`.
+Optional metadata describes entries. A missing credential or invalid entry
+fails the catalog as a unit. SDK hosts that want Pi-style fallback can pass an
+authorized default to `ModelCatalog::session_builder_with_fallback`. It
+restores an exact authorized historical model first and reports a missing
+provider-qualified model through `AgentSession::model_fallback` when it
+commits the supplied default. The host chooses the default and may keep
+using the exact-only builder. Automatic provider discovery, credential
+refresh, and selection for provider-less legacy history remain host-owned.
+
+
 Native SDK hosts can construct OpenAI-compatible chat, OpenAI Responses,
 ChatGPT Responses, Anthropic Messages and Gemini clients from an explicitly supplied credential snapshot,
 provider identity and endpoint, then register them in a host-owned model catalog.
@@ -1173,6 +1185,22 @@ support; capability-aware filtering awaits the provider catalog.
 The model and thinking selectors accept Ctrl+S to save a startup default.
 `/settings` currently edits tool-output and thinking-block visibility and saves
 model/thinking defaults. `/settings-json` displays the resolved settings.
+
+### Native SDK saved API keys
+
+`pi_rs_workbench::auth_factory::AuthFileReadGrants` reads a Pi-format
+`auth.json` into an owned `HostAuthSnapshot` for the native model client
+factory. The caller supplies one absolute file path and exact provider and
+endpoint grants. An endpointless entry is usable only on granted routes. A
+pi-rs entry with a saved endpoint must also match that endpoint. File contents
+can supply variables for key expansion, including Pi's `$$` and `$!` escapes.
+The pi-rs `literal` flag preserves the key verbatim.
+
+Each load reads the file afresh and leaves existing clients and snapshots
+usable. The caller owns the lifetime of each client and should load the file
+off the UI thread. Unresolved variable or command references and OAuth entries
+leave the route unconfigured. The SDK host controls ambient environment access,
+OAuth, and any credential writes.
 
 ### Regular terminal checkpoint
 
@@ -1880,6 +1908,12 @@ post-exit drain at two seconds to bound continuously writing descendants. Unit a
 limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
 
 ### Text paging checkpoint
+
+Unrestricted local `read` accepts JavaScript numbers for `offset` and `limit`.
+Fractional values and negative slice endpoints select the same lines as Pi,
+and continuation notices use the original numeric bounds. Negative endpoints
+count lines and rewind the same file while keeping memory bounded. Scoped and
+injected read tools retain positive integer paging parameters.
 
 Text reads now scan files with bounded memory, including files larger than
 4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next

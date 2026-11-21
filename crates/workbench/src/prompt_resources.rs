@@ -320,6 +320,10 @@ fn discover(grants: &PromptReadGrants, filename: &str) -> Result<Option<PromptRe
 }
 
 pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
+    read_optional_resource(path, "prompt resource")
+}
+
+pub(crate) fn read_optional_resource(path: &Path, kind: &str) -> Result<Option<String>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     // Opening a FIFO for reading otherwise waits indefinitely for a writer.
@@ -336,7 +340,7 @@ pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
     };
     if !file.metadata()?.is_file() {
         return Err(Error::Config(format!(
-            "prompt resource is not a regular file: {}",
+            "{kind} is not a regular file: {}",
             path.display()
         )));
     }
@@ -344,12 +348,12 @@ pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
     file.take(MAX_PROMPT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PROMPT_BYTES {
         return Err(Error::Config(format!(
-            "prompt resource exceeds size limit: {}",
+            "{kind} exceeds size limit: {}",
             path.display()
         )));
     }
     let text = String::from_utf8(bytes)
-        .map_err(|_| Error::Config(format!("prompt resource is not UTF-8: {}", path.display())))?;
+        .map_err(|_| Error::Config(format!("{kind} is not UTF-8: {}", path.display())))?;
     Ok(Some(
         text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned(),
     ))
