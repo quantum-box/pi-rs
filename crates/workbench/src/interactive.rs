@@ -1161,6 +1161,7 @@ impl View {
             }
             Some(Entry::Tool {
                 id: String::new(),
+                call_id: None,
                 name: if tool.name.is_empty() {
                     "tool".into()
                 } else {
@@ -1887,6 +1888,7 @@ impl View {
                     let id = format!("unattributed-{}", record.id);
                     self.lines.push(Entry::Tool {
                         id: id.clone(),
+                        call_id: None,
                         name: format!("{tool_name} (unattributed, call {call_id})"),
                         arguments: String::new(),
                         output: String::new(),
@@ -1900,6 +1902,7 @@ impl View {
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
                         id: format!("shell-{}", record.id),
+                        call_id: None,
                         name: if execution.exclude_from_context {
                             "bash (excluded)"
                         } else {
@@ -2020,6 +2023,7 @@ impl View {
         }
         self.lines.push(Entry::Tool {
             id: invocation.operation_id.to_string(),
+            call_id: Some(invocation.call.id.clone()),
             name: invocation.call.name.clone(),
             arguments: invocation.call.arguments.clone(),
             output: String::new(),
@@ -2108,6 +2112,29 @@ impl View {
             *finished = true;
         }
     }
+    fn update_tool_progress(&mut self, event: &Value) {
+        let (Some(call_id), Some(tool_name), Some(content)) = (
+            event["toolCallId"].as_str(),
+            event["toolName"].as_str(),
+            event["partialResult"]["content"].as_array(),
+        ) else {
+            return;
+        };
+        if let Some(Entry::Tool { output, .. }) = self.lines.iter_mut().rev().find(|entry| {
+            matches!(entry,
+                Entry::Tool { call_id: Some(id), name, finished: false, .. }
+                if id == call_id && name == tool_name
+            )
+        }) {
+            let text = content
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *output = crate::ui::render::strip_shell_ansi(&text);
+        }
+    }
     fn receive(&mut self, value: &Value) {
         match value["type"].as_str() {
             Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
@@ -2127,6 +2154,7 @@ impl View {
                 self.shell_running = true;
                 self.lines.push(Entry::Tool {
                     id: value["executionId"].as_str().unwrap_or_default().into(),
+                    call_id: None,
                     name: if value["excludeFromContext"] == true { "bash (excluded)" } else { "bash" }.into(),
                     arguments: json!({"command":value["command"]}).to_string(),
                     output: String::new(),
@@ -2226,6 +2254,7 @@ impl View {
                     append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
                 } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
             }
+            Some("tool_execution_update") => self.update_tool_progress(value),
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -2280,6 +2309,7 @@ impl View {
                             for call in calls {
                                 self.lines.push(Entry::Tool {
                                     id: call["operation_id"].as_str().unwrap_or_default().into(),
+                                    call_id: call["call"]["id"].as_str().map(str::to_owned),
                                     name: call["call"]["name"].as_str().unwrap_or("tool").into(),
                                     arguments: call["call"]["arguments"]
                                         .as_str()
@@ -10933,6 +10963,40 @@ exit {exit}
         );
         assert!(
             matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
+        );
+    }
+
+    #[test]
+    fn mcp_tool_progress_renders_in_pending_row_until_final_result() {
+        use super::*;
+
+        let mut view = View::default();
+        view.receive(&json!({"type":"record","record":{"event":{"type":"assistant","content":"","invocations":[
+            {"operation_id":"run","call":{"id":"call","name":"mcp__fixture__work","arguments":"{}"}},
+            {"operation_id":"other","call":{"id":"other","name":"mcp__fixture__work","arguments":"{}"}}
+        ]}}}));
+        let update = json!({
+            "type": "tool_execution_update",
+            "toolCallId": "call",
+            "toolName": "mcp__fixture__work",
+            "partialResult": {"content": [{"type":"text","text":"working\u{1b}[31m"}]},
+        });
+        view.receive(&update);
+        let theme = crate::ui::theme::Theme::system();
+        let pending = view.lines[0].render(&theme, 80, false, true, Default::default());
+        assert!(
+            pending
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text == "working")
+        );
+        assert!(matches!(view.lines[1], Entry::Tool { ref output, .. } if output.is_empty()));
+        view.receive(&json!({"type":"record","record":{"event":{
+            "type":"tool_finished","operation_id":"run","outcome":{"status":"succeeded","detail":"done"}
+        }}}));
+        view.receive(&update);
+        assert!(
+            matches!(view.lines[0], Entry::Tool { ref output, finished: true, .. } if output == "done")
         );
     }
 

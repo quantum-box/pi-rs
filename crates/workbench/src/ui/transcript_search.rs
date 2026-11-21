@@ -449,6 +449,7 @@ mod tests {
         let theme = Theme::system();
         let entry = Entry::Tool {
             id: "test".into(),
+            call_id: None,
             name: "bash".into(),
             arguments: "{}".into(),
             output: "\x1b[31ma\u{85}b\x1b[0m".into(),
