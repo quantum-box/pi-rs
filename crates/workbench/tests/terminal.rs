@@ -3765,13 +3765,15 @@ pathlib.Path('editor-end').write_text(line if line else 'disconnected')
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
     );
     let master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let mut baseline = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::tcgetattr(slave_fd, &mut baseline) }, 0);
     assert_eq!(
         unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
         0
@@ -3851,4 +3853,29 @@ pathlib.Path('editor-end').write_text(line if line else 'disconnected')
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "disconnected");
+    // A normal frontend shutdown must still restore the pre-editor tty modes.
+    assert_eq!(
+        unsafe { libc::kill(process.child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut bytes = [0; 8192];
+        let _ = master.read(&mut bytes);
+        if process.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "frontend did not shut down");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Darwin revokes the old slave descriptor when its session leader exits.
+    let mut restored = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::tcgetattr(master.as_raw_fd(), &mut restored) },
+        0
+    );
+    assert_eq!(restored.c_iflag, baseline.c_iflag);
+    assert_eq!(restored.c_oflag, baseline.c_oflag);
+    assert_eq!(restored.c_lflag, baseline.c_lflag);
+    assert_eq!(restored.c_cc, baseline.c_cc);
 }

@@ -111,6 +111,25 @@ fn open_pty() -> io::Result<(File, File)> {
     ))
 }
 
+/// Observe a stopped direct child without consuming its eventual exit status.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn child_stopped(pid: u32) -> io::Result<bool> {
+    let mut event: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut event,
+            libc::WNOHANG | libc::WSTOPPED,
+        )
+    };
+    match check(status) {
+        Ok(_) => Ok(event.si_code == libc::CLD_STOPPED),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn inherited_descriptors() -> io::Result<Vec<libc::c_int>> {
     #[cfg(target_os = "linux")]
     let directory = "/proc/self/fd";

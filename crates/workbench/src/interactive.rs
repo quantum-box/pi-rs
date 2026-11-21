@@ -8211,6 +8211,14 @@ impl RunningExternalEditor {
         let status = self.child.try_wait()?;
         #[cfg(windows)]
         let status = self.child.inner_mut().try_wait()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.pty.is_some() && status.is_none() && editor_pty::child_stopped(self.child.id())? {
+            // A session-local stop cannot suspend Pi's job in the outer
+            // shell. Release the dialog instead of relaying to a stopped editor.
+            return Err(Error::Config(
+                "External editor suspended. Draft unchanged".into(),
+            ));
+        }
         #[cfg(unix)]
         if let (Some(tty), Some(pty)) = (&self.terminal_state, &mut self.pty) {
             let drained = pty.relay(&tty.tty, status.is_none())?;
@@ -9186,6 +9194,30 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(editor.child.try_wait().unwrap().is_some());
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn suspended_extension_editor_returns_to_dialog() {
+        let mut editor = super::RunningExternalEditor::start_with_terminal(
+            "/bin/sh -c 'kill -STOP $$'",
+            "draft",
+            super::ExternalEditorTarget::Extension(uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let error = loop {
+            match editor.poll() {
+                Err(error) => break error,
+                Ok(None) => {}
+                Ok(Some(status)) => panic!("editor exited before stopping: {status}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "editor did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(error.to_string().contains("External editor suspended"));
+        assert_eq!(std::fs::read(editor.file.path()).unwrap(), b"draft");
+    }
+
     #[cfg(unix)]
     #[test]
     fn worker_exit_cancels_only_extension_editor_and_removes_tempfile() {
