@@ -36,14 +36,14 @@ the production unhooked opt-in joins conversation owner, registration, abort
 and claim/receipt evidence at the relevant boundaries.
 
 `register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel`
-opts an unhooked conversation root into cancellation after a committed park or
+opts an unhooked conversation root or registered nested child into cancellation after a committed park or
 an interrupted wake. This changes the persisted registration identity. The
 woken path binds the original attempt, cleanup attempt, identity, conversation
 and park proof to claim, first poll and receipt; a late Tool result blocks
 receipt settlement and remains reconciliation evidence. The callback is polled
 at most once. A successful callback does not determine the interrupted Tool's
 outcome: the task fails for reconciliation and `abort_and_wait` can report
-pending cleanup. Woken roots with live owned work fail closed; woken child cancellation remains unsupported.
+pending cleanup. Woken roots and children with unsupported or uncertain owned work fail closed. Nested claims bind the exact foreground ancestry; callback markers are retired atomically across it. A stopped callback is never replayed, and a retained child receipt does not resolve the interrupted Tool outcome.
 A separate `register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel`
 registration runs the replay-safe selected after hook with fenced memo and
 retains its rich result with the callback receipt and snapshot version. An

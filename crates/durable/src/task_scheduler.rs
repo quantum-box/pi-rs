@@ -4281,17 +4281,6 @@ impl AdmissionHandle<'_> {
         }
         let validator = self.validator.ok_or("missing harness")?;
         let nested = matches!(current.task.owner(), TaskOwner::Task(_));
-        if nested {
-            #[cfg(test)]
-            let probe = std::env::var_os("PI_TEST_NESTED_WOKEN_PROBE").is_some();
-            #[cfg(not(test))]
-            let probe = false;
-            if !probe {
-                return Err(
-                    "woken child cancellation is not yet enabled; reconciliation required".into(),
-                );
-            }
-        }
         let (conversation, mut checks) = if nested {
             validator
                 .checkpointable_nested_cancel_conversation_checks(
@@ -12987,10 +12976,6 @@ impl Scheduler {
             let mut pending_roots = Vec::new();
             self.unbound_cancel_roots.clear();
             if self.validator.is_none() {
-                #[cfg(test)]
-                let nested_probe = std::env::var_os("PI_TEST_NESTED_WOKEN_PROBE").is_some();
-                #[cfg(not(test))]
-                let nested_probe = false;
                 for record in &records {
                     if !live.contains(&record.task.id())
                         && !record.task.replay_safe()
@@ -13003,8 +12988,7 @@ impl Scheduler {
                             }) || ((matches!(
                                 record.task.owner(),
                                 TaskOwner::Conversation(_)
-                            ) || nested_probe
-                                && matches!(record.task.owner(), TaskOwner::Task(_)))
+                            ) || matches!(record.task.owner(), TaskOwner::Task(_)))
                                 && self.registered(&record.task).is_ok_and(|reg| {
                                     reg.handler.conversation_woken_cancel_enabled()
                                 }))))
@@ -14227,14 +14211,10 @@ impl Scheduler {
                 }
                 // Unbound schedulers defer explicitly opted-in woken roots until
                 // the Harness can authenticate the complete admission boundary.
-                #[cfg(test)]
-                let nested_probe = std::env::var_os("PI_TEST_NESTED_WOKEN_PROBE").is_some();
-                #[cfg(not(test))]
-                let nested_probe = false;
                 if !item.task.replay_safe()
                     && !item.task.abort_requested()
                     && (matches!(item.task.owner(), TaskOwner::Conversation(_))
-                        || nested_probe && matches!(item.task.owner(), TaskOwner::Task(_)))
+                        || matches!(item.task.owner(), TaskOwner::Task(_)))
                     && item.task.checkpoint().phase == "replay-safe-async-wait"
                     && let (Some(harness), Ok(reg)) =
                         (self.validator.as_ref(), self.registered(&item.task))

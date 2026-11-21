@@ -34675,11 +34675,104 @@ mod scheduler_tests {
                 let tasks = crate::task_store::TaskStore::new(h.owner.store());
                 let mut running = tasks.load(op).unwrap().unwrap();
                 running.task.start_attempt(Uuid::new_v4()).unwrap();
+                tasks
+                    .save(&[crate::task_store::Save::Update(&running)])
+                    .unwrap();
+                let mut running = tasks.load(op).unwrap().unwrap();
+                let candidate_adapter = Arc::new(
+                    TaskTool::new(
+                        pi_rs_core::ToolSpec {
+                            name: "candidate".into(),
+                            description: "".into(),
+                            parameters: serde_json::json!({"type":"object"}),
+                        },
+                        "candidate-child",
+                        false,
+                        1,
+                        Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!(null)))),
+                    )
+                    .with_deferred_arguments(),
+                );
+                registry
+                    .register_conversation_checkpointable(
+                        &candidate_adapter,
+                        Arc::new(|| true),
+                        None,
+                    )
+                    .unwrap();
+                let mut candidate = Task::new(
+                    Uuid::new_v4(),
+                    crate::task::TaskOwner::Task(op),
+                    crate::task::Checkpoint {
+                        phase: "initial".into(),
+                        data: serde_json::json!(null),
+                    },
+                    5,
+                )
+                .unwrap()
+                .registered("candidate-child".into(), false);
+                candidate.start_attempt(Uuid::new_v4()).unwrap();
+                let candidate_key = crate::task_store::key(candidate.id());
+                h.owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: candidate_key.clone(),
+                            expected: Expected::Missing,
+                        }],
+                        &[Mutation::Put {
+                            key: candidate_key,
+                            value: serde_json::to_vec(&candidate).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                let (candidate_conversation, candidate_checks) = h
+                    .checkpointable_nested_woken_candidate_checks(&candidate, &registry)
+                    .unwrap();
+                assert_eq!(candidate_conversation, id);
+                h.owner.store().commit(&candidate_checks, &[]).unwrap();
+                assert!(
+                    h.checkpointable_nested_woken_candidate_checks(
+                        &candidate,
+                        &Registry::default()
+                    )
+                    .is_err()
+                );
+                let conversation_key = Harness::key(id);
+                let same = h.owner.store().get(&conversation_key).unwrap().unwrap();
+                h.owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: conversation_key.clone(),
+                            expected: Expected::Version(same.version),
+                        }],
+                        &[Mutation::Put {
+                            key: conversation_key,
+                            value: same.value,
+                        }],
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    h.owner.store().commit(&candidate_checks, &[]),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                let (_, candidate_checks) = h
+                    .checkpointable_nested_woken_candidate_checks(&candidate, &registry)
+                    .unwrap();
                 running.task.request_abort().unwrap();
                 tasks
                     .save(&[crate::task_store::Save::Update(&running)])
                     .unwrap();
                 let running = tasks.load(op).unwrap().unwrap();
+                assert!(matches!(
+                    h.owner.store().commit(&candidate_checks, &[]),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(
+                    h.checkpointable_nested_woken_candidate_checks(&candidate, &registry)
+                        .is_err()
+                );
                 assert!(
                     h.checkpointable_conversation_checks(&running.task, &registry)
                         .is_err()
