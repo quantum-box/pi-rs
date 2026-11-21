@@ -76,14 +76,6 @@ impl Catalog {
         }
         details
     }
-
-    fn has_exact(&self, model: &str) -> bool {
-        exact(model, &self.models, self.provider.id()).is_some()
-            || self
-                .aliases
-                .iter()
-                .any(|(_, name)| name.eq_ignore_ascii_case(unqualified(model, self.provider.id())))
-    }
 }
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
@@ -205,6 +197,47 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
         .collect()
 }
 
+fn exact_scope_matches<'a>(
+    model: &str,
+    qualified: Option<&'a Catalog>,
+    catalogs: &'a [Catalog],
+) -> Vec<(&'a Catalog, &'a str)> {
+    if let Some(catalog) = qualified {
+        let id = unqualified(model, catalog.provider.id());
+        if let Some(matched) = catalog.models.iter().find(|m| m.eq_ignore_ascii_case(id)) {
+            return vec![(catalog, matched)];
+        }
+    }
+    catalogs
+        .iter()
+        .filter_map(|catalog| {
+            let matched = catalog
+                .models
+                .iter()
+                .find(|id| id.eq_ignore_ascii_case(model))?;
+            Some((catalog, matched.as_str()))
+        })
+        .collect()
+}
+
+fn add_scoped_choice(
+    selected: &mut Vec<ScopedChoice>,
+    provider: &Provider,
+    model: String,
+    thinking: Option<String>,
+) {
+    if !selected
+        .iter()
+        .any(|choice| &choice.provider == provider && choice.model == model)
+    {
+        selected.push(ScopedChoice {
+            provider: provider.clone(),
+            model,
+            thinking,
+        });
+    }
+}
+
 pub fn scoped_choices<'a>(
     patterns: impl IntoIterator<Item = &'a str>,
     catalogs: &[Catalog],
@@ -217,31 +250,62 @@ pub fn scoped_choices<'a>(
         .filter(|pattern| !pattern.is_empty())
     {
         let glob = pattern.contains(['*', '?', '[']);
-        let qualified = pattern
-            .split_once('/')
-            .and_then(|(prefix, _)| {
-                catalogs
+        let qualified = pattern.split_once('/').and_then(|(prefix, _)| {
+            catalogs
+                .iter()
+                .find(|catalog| prefix.eq_ignore_ascii_case(catalog.provider.id()))
+        });
+        let suffix = thinking_suffix(pattern);
+        // Pi strips the suffix before testing a glob-like pattern for a literal ID.
+        let (mut exact, mut thinking) = if glob {
+            let (model, level) =
+                suffix.map_or((pattern, None), |(base, level)| (base, Some(level)));
+            (exact_scope_matches(model, qualified, catalogs), level)
+        } else {
+            (exact_scope_matches(pattern, qualified, catalogs), None)
+        };
+        if let Some((model, level)) = suffix.filter(|_| exact.is_empty() && !glob) {
+            exact = exact_scope_matches(model, qualified, catalogs);
+            thinking = Some(level);
+        }
+        if !exact.is_empty() {
+            if exact.len() > 1 {
+                let mut providers: Vec<_> = exact
                     .iter()
-                    .find(|catalog| prefix.eq_ignore_ascii_case(catalog.provider.id()))
-                    .map(|catalog| &catalog.provider)
+                    .map(|(catalog, _)| catalog.provider.id())
+                    .collect();
+                providers.sort_unstable();
+                warnings.push(format!(
+                    "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
+                    providers.join(", ")
+                ));
+            }
+            for (catalog, model) in exact {
+                add_scoped_choice(
+                    &mut selected,
+                    &catalog.provider,
+                    model.to_owned(),
+                    thinking.map(str::to_owned),
+                );
+            }
+            continue;
+        }
+        // Keep native display-name aliases ahead of partial matches.
+        let qualified = qualified.or_else(|| {
+            if glob {
+                return None;
+            }
+            catalogs.iter().find(|catalog| {
+                catalog.aliases.iter().any(|(_, name)| {
+                    name.eq_ignore_ascii_case(pattern)
+                        || suffix.is_some_and(|(model, _)| name.eq_ignore_ascii_case(model))
+                })
             })
-            .or_else(|| {
-                if glob {
-                    return None;
-                }
-                catalogs
-                    .iter()
-                    .find(|catalog| {
-                        catalog.has_exact(pattern)
-                            || thinking_suffix(pattern)
-                                .is_some_and(|(model, _)| catalog.has_exact(model))
-                    })
-                    .map(|catalog| &catalog.provider)
-            });
+        });
         let mut matched = false;
         for catalog in catalogs
             .iter()
-            .filter(|catalog| qualified.is_none_or(|provider| provider == &catalog.provider))
+            .filter(|catalog| qualified.is_none_or(|named| named.provider == catalog.provider))
         {
             let candidates = search_ids(&catalog.models, &catalog.aliases);
             let resolved = scope([pattern], &candidates, catalog.provider.id());
@@ -250,17 +314,13 @@ pub fn scoped_choices<'a>(
             }
             matched = true;
             warnings.extend(resolved.warnings);
-            for mut choice in resolved.choices {
-                choice.model = canonical(choice.model, &catalog.models, &catalog.aliases);
-                if selected.iter().all(|existing| {
-                    existing.provider != catalog.provider || existing.model != choice.model
-                }) {
-                    selected.push(ScopedChoice {
-                        provider: catalog.provider.clone(),
-                        model: choice.model,
-                        thinking: choice.thinking,
-                    });
-                }
+            for choice in resolved.choices {
+                add_scoped_choice(
+                    &mut selected,
+                    &catalog.provider,
+                    canonical(choice.model, &catalog.models, &catalog.aliases),
+                    choice.thinking,
+                );
             }
             if !glob {
                 break;
@@ -548,7 +608,16 @@ mod tests {
                         false,
                     )
                     .unwrap(),
-                models: vec!["same".into(), "exact-extra".into()],
+                models: [
+                    "same",
+                    "exact-extra",
+                    "literal[1m]",
+                    "literal1",
+                    "anthropic/same",
+                    "alias-extra",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
                 aliases: Vec::new(),
                 probe_details: false,
                 complete: false,
@@ -563,8 +632,10 @@ mod tests {
                         false,
                     )
                     .unwrap(),
-                models: vec!["same".into(), "exact".into()],
-                aliases: Vec::new(),
+                models: ["same", "exact", "literalm", "literal2"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                aliases: vec![("exact".into(), "alias".into())],
                 probe_details: false,
                 complete: false,
             },
@@ -574,7 +645,7 @@ mod tests {
                 "anthropic/same:high",
                 "ollama/same:off",
                 "exact",
-                "ollama/*",
+                "ollama/exact-*",
             ],
             &catalogs,
         );
@@ -589,6 +660,45 @@ mod tests {
                 "ollama/same:off",
                 "anthropic/exact",
                 "ollama/exact-extra"
+            ]
+        );
+
+        for (pattern, expected) in [
+            ("SAME", ["ollama/same", "anthropic/same"]),
+            ("same:high", ["ollama/same:high", "anthropic/same:high"]),
+        ] {
+            let (choices, warnings) = scoped_choices([pattern, "anthropic/same:off"], &catalogs);
+            assert_eq!(
+                choices
+                    .iter()
+                    .map(super::ScopedChoice::pattern)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                warnings,
+                [format!(
+                    "Pattern \"{pattern}\" matches several providers: anthropic, ollama. Use provider/id to choose one."
+                )]
+            );
+        }
+
+        let (choices, warnings) = scoped_choices(
+            ["literal[1m]:high", "literal[12]", "alias", "anthropic/same"],
+            &catalogs,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(
+            choices
+                .iter()
+                .map(super::ScopedChoice::pattern)
+                .collect::<Vec<_>>(),
+            [
+                "ollama/literal[1m]:high",
+                "ollama/literal1",
+                "anthropic/literal2",
+                "anthropic/exact",
+                "anthropic/same"
             ]
         );
     }

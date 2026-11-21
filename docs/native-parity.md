@@ -117,6 +117,10 @@ Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
 without `defaultProvider` are still accepted.
+Model scopes (`--models` and `enabledModels`) add all available providers that
+share an exact unqualified model ID and warn about the ambiguity. A literal ID
+containing glob characters takes precedence over glob expansion across providers,
+with an optional thinking suffix applied to the selected models.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
