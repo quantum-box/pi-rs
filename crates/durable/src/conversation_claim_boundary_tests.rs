@@ -7921,6 +7921,24 @@ async fn owned_graph_reservation_survives_reopen() {
 
 #[cfg(feature = "experimental-graph-revision")]
 #[tokio::test]
+async fn owned_graph_terminal_requires_authenticated_woken_marker() {
+    exercise_woken_owned_graph_receipt(false, 11).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_terminal_accepts_only_bound_woken_receipt() {
+    exercise_woken_owned_graph_receipt(false, 12).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_terminal_rejects_late_tool_receipt() {
+    exercise_woken_owned_graph_receipt(false, 13).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
 async fn owned_graph_driver_commits_reservation_evidence() {
     exercise_woken_owned_graph_receipt(false, 6).await;
 }
@@ -8706,7 +8724,12 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             assert_eq!(reservation["running"]["id"], json!(root.task.id()));
             return;
         }
-        let proof_root = if graph_aba == 4 || graph_aba == 5 {
+        let proof_root = if graph_aba == 4
+            || graph_aba == 5
+            || graph_aba == 11
+            || graph_aba == 12
+            || graph_aba == 13
+        {
             let mut running = recovered.clone();
             running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
             let (reservation_checks, marker) =
@@ -8724,6 +8747,166 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 .replay_safe_woken_owned_cleanup_checks(&running, store.put_version().unwrap())
                 .unwrap();
             store.commit(&new_checks, &[]).unwrap();
+            if graph_aba == 11 {
+                tasks
+                    .update(&running, |task| task.fail("interrupted".into()))
+                    .unwrap();
+                let failed = tasks.load(root.task.id()).unwrap().unwrap();
+                assert!(
+                    harness
+                        .replay_safe_woken_owned_cleanup_checks(
+                            &failed,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                );
+                return;
+            }
+            if graph_aba == 12 || graph_aba == 13 {
+                let boundary = store.put_version().unwrap();
+                let (claim, claim_checks) =
+                    crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+                        &store,
+                        &running.task,
+                        uuid::Uuid::new_v4(),
+                        crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+                        boundary,
+                    )
+                    .unwrap();
+                let claim_key = crate::task_scheduler::woken_conversation_claim_key(root.task.id());
+                let mut checks = claim_checks;
+                checks.push(durable_store::Check {
+                    key: claim_key.clone(),
+                    expected: durable_store::Expected::Missing,
+                });
+                store
+                    .commit(
+                        &checks,
+                        &[durable_store::Mutation::Put {
+                            key: claim_key,
+                            value: serde_json::to_vec(&claim).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                let snapshot_key =
+                    format!("runtime/conversation/{}", claim.conversation).into_bytes();
+                let snapshot_version = store.get(&snapshot_key).unwrap().unwrap().version;
+                let after = json!({"task_content_v1":{"isError":true,"output":[{"type":"text","text":"aborted"}],"diagnostics":[{"severity":"error","code":"aborted","message":"Tool was aborted"}]}});
+                crate::async_task_tool::validate_aborted_after_result(&after).unwrap();
+                let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
+                    version: 2,
+                    claim: claim.clone(),
+                    result: "callback returned".into(),
+                    after_result: Some(after),
+                    snapshot_version: Some(snapshot_version),
+                };
+                let receipt_key =
+                    crate::task_scheduler::woken_conversation_receipt_key(root.task.id());
+                store
+                    .commit(
+                        &[],
+                        &[durable_store::Mutation::Put {
+                            key: receipt_key.clone(),
+                            value: serde_json::to_vec(&receipt).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                let receipt_version = store.get(&receipt_key).unwrap().unwrap().version;
+                let mut failed = running.clone();
+                failed
+                    .task
+                    .fail("interrupted woken execution; reconciliation required".into())
+                    .unwrap();
+                let terminal = crate::task_scheduler::WokenConversationCancelTerminalMarker {
+                    version: 1,
+                    claim_id: claim.claim_id,
+                    cleanup_attempt: claim.cleanup_attempt,
+                    woken_attempt: claim.woken_attempt,
+                    running_task_version: running.version,
+                    terminal_task: failed.task.clone(),
+                    receipt_version,
+                };
+                let terminal_key =
+                    crate::task_scheduler::woken_conversation_terminal_key(root.task.id());
+                let mut batch = tasks
+                    .prepare_save(&[crate::task_store::Save::Update(&failed)])
+                    .unwrap();
+                batch.checks.push(durable_store::Check {
+                    key: terminal_key.clone(),
+                    expected: durable_store::Expected::Missing,
+                });
+                batch.mutations.push(durable_store::Mutation::Put {
+                    key: terminal_key,
+                    value: serde_json::to_vec(&terminal).unwrap(),
+                });
+                store.commit(&batch.checks, &batch.mutations).unwrap();
+                let failed = tasks.load(root.task.id()).unwrap().unwrap();
+                let checks = harness
+                    .replay_safe_woken_owned_cleanup_checks(&failed, store.put_version().unwrap())
+                    .unwrap();
+                store.commit(&checks, &[]).unwrap();
+                if graph_aba == 13 {
+                    let late = format!(
+                        "durable/unsafe-park-async/{}/{}/intent/receipt",
+                        root.task.id(),
+                        claim.woken_attempt
+                    )
+                    .into_bytes();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: late.clone(),
+                                expected: durable_store::Expected::Missing,
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key: late,
+                                value: b"late".to_vec(),
+                            }],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        store.commit(&checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    assert!(
+                        harness
+                            .replay_safe_woken_owned_cleanup_checks(
+                                &failed,
+                                store.put_version().unwrap()
+                            )
+                            .is_err()
+                    );
+                    return;
+                }
+                let receipt_entry = store.get(&receipt_key).unwrap().unwrap();
+                let mut forged = receipt.clone();
+                forged.claim.cleanup_attempt = uuid::Uuid::new_v4();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: receipt_key.clone(),
+                            expected: durable_store::Expected::Version(receipt_entry.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key: receipt_key,
+                            value: serde_json::to_vec(&forged).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    store.commit(&checks, &[]),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(
+                    harness
+                        .replay_safe_woken_owned_cleanup_checks(
+                            &failed,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                );
+                return;
+            }
             if graph_aba == 4 {
                 let key = crate::task_store::key(child.task.id());
                 let original = store.get(&key).unwrap().unwrap();

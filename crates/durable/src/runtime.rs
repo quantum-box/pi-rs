@@ -12730,12 +12730,38 @@ impl Harness {
                         None => None,
                     };
                     let reserved_attempt = reservation.running.attempt_id();
+                    let live_reservation = root.task.attempt_id() == reserved_attempt
+                        || root.task.retired_attempt_id() == reserved_attempt;
+                    if !live_reservation {
+                        if !matches!(root.task.state(), crate::task::TaskState::Failed(_)) {
+                            return Err(Error::Invalid("owned terminal state unavailable".into()));
+                        }
+                        let terminal_key =
+                            crate::task_scheduler::woken_conversation_terminal_key(root.task.id());
+                        let terminal_entry = store.get(&terminal_key)?.ok_or(Error::NotFound)?;
+                        let terminal: crate::task_scheduler::WokenConversationCancelTerminalMarker =
+                            serde_json::from_slice(&terminal_entry.value)?;
+                        if Some(terminal.cleanup_attempt) != reserved_attempt
+                            || store.commit_for_version(
+                                &crate::task_store::key(root.task.id()),
+                                terminal.running_task_version,
+                            )? != Some(commit)
+                        {
+                            return Err(Error::Invalid(
+                                "owned terminal reservation changed".into(),
+                            ));
+                        }
+                        let (_, terminal_checks) =
+                            crate::task_scheduler::woken_terminal_after_checks(
+                                store, root, boundary,
+                            )
+                            .map_err(Error::Invalid)?;
+                        checks.extend(terminal_checks);
+                    }
                     if reservation.version != 1
                         || reservation.graph_version != evidence_entry.version
                         || reservation.running.id() != root.task.id()
                         || reserved_attempt.is_none()
-                        || (root.task.attempt_id() != reserved_attempt
-                            && root.task.retired_attempt_id() != reserved_attempt)
                         || store.next_commit_for_key(
                             &crate::task_store::key(root.task.id()),
                             graph_commit,
