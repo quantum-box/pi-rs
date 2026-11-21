@@ -28,7 +28,10 @@ fn lf(text: &str) -> String {
 pub(super) fn normalized_content(text: &str) -> String {
     lf(text.strip_prefix('\u{feff}').unwrap_or(text))
 }
-pub(super) fn unified_patch(path: &str, diff: &similar::TextDiff<'_, '_, '_, str>) -> String {
+pub(super) fn unified_patch<'a>(
+    path: &str,
+    diff: &'a similar::TextDiff<'a, 'a, 'a, str>,
+) -> String {
     use std::fmt::Write as _;
 
     let mut patch = format!("--- {path}\n+++ {path}\n");
