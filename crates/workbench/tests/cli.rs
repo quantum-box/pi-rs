@@ -553,6 +553,78 @@ fn mcp_add_saves_stdio_and_http_options() {
 }
 
 #[test]
+fn mcp_config_writes_validate_urls_and_report_the_removal_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("agent");
+    let global = home.join("mcp.json");
+    let project = root.path().join(".pi/mcp.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &[
+            "mcp",
+            "add",
+            "global",
+            "--url",
+            "https://example.invalid/mcp?tenant=fixture",
+        ][..],
+        &[
+            "mcp",
+            "add",
+            "local",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--local",
+        ][..],
+    ] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let old_global = std::fs::read(&global).unwrap();
+    let old_project = std::fs::read(&project).unwrap();
+    for url in [
+        "not a URL",
+        "ftp://example.invalid/mcp",
+        "http://example.invalid/mcp",
+        "https://account:fixture-secret@example.invalid/mcp",
+    ] {
+        let result = run(&["mcp", "add", "global", "--url", url]);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(error.contains("MCP URL"), "{error}");
+        assert!(!error.contains("fixture-secret"));
+    }
+    let result = run(&["mcp", "remove", "local"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No global MCP server named \"local\"") && error.contains("use --local"),
+        "{error}"
+    );
+    let result = run(&["mcp", "remove", "--local", "global"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No project MCP server named \"global\"") && error.contains("omit --local"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&global).unwrap(), old_global);
+    assert_eq!(std::fs::read(&project).unwrap(), old_project);
+    assert!(run(&["mcp", "remove", "--local", "local"]).status.success());
+    assert!(run(&["mcp", "remove", "global"]).status.success());
+}
+
+#[test]
 fn startup_fork_preserves_inert_sibling_history() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source.jsonl");

@@ -1177,6 +1177,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 ));
             }
             let mut value = if let Some(url) = url {
+                pi_rs_workbench::mcp::validate_server_url(&url)?;
                 json!({"url":url})
             } else {
                 json!({"command":command[0],"args":command[1..]})
@@ -1508,18 +1509,35 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             output(json!({"type":"mcp_logged_out","name":name}));
         }
         McpCommand::Remove { name, local } => {
-            let path = path(args, local);
-            config::update_object(&path, |document| {
-                document
+            let selected = path(args, local);
+            config::update_object(&selected, |document| {
+                if document
                     .get_mut("mcpServers")
                     .and_then(Value::as_object_mut)
                     .and_then(|servers| servers.remove(&name))
-                    .ok_or_else(|| {
-                        Error::Config("MCP server not found in this configuration".into())
-                    })?;
-                Ok(())
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                let scope = if local { "project" } else { "global" };
+                let mut message = format!(
+                    "No {scope} MCP server named {name:?} in {}.",
+                    selected.display()
+                );
+                let other = path(args, !local);
+                // Inspect only the definition of the requested name. A partial
+                // project override is not a server in the opposite scope.
+                if config::read_object(&other)
+                    .ok()
+                    .and_then(|document| report_server_config(&document["mcpServers"][&name]))
+                    .is_some()
+                {
+                    let hint = if local { "omit --local" } else { "use --local" };
+                    message.push_str(&format!(" It is defined in {}; {hint}.", other.display()));
+                }
+                Err(Error::Config(message))
             })?;
-            output(json!({"type":"mcp_removed","name":name,"path":path}));
+            output(json!({"type":"mcp_removed","name":name,"path":selected}));
         }
     }
     Ok(())

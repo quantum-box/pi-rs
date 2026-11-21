@@ -33,6 +33,24 @@ use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
 use crate::process_cleanup::Children;
 
+/// Validate the URL before storing or connecting to a streamable HTTP server.
+pub fn validate_server_url(url: &str) -> Result<()> {
+    let parsed = reqwest_mcp::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .ok_or_else(|| Error::Config("MCP URL must be an HTTP or HTTPS URL".into()))?;
+    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if (parsed.scheme() == "http" && !loopback)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(Error::Config(
+            "MCP URL requires HTTPS or loopback HTTP and no embedded credentials".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
@@ -654,17 +672,7 @@ impl McpExtension {
             {
                 return Err(Error::Config("MCP URL requires streamable HTTP".into()));
             }
-            let parsed = reqwest_mcp::Url::parse(url)
-                .map_err(|_| Error::Config("invalid MCP URL".into()))?;
-            let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-            if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback))
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-            {
-                return Err(Error::Config(
-                    "MCP URL requires HTTPS or loopback HTTP and no embedded credentials".into(),
-                ));
-            }
+            validate_server_url(url)?;
             let mut headers = HashMap::new();
             for (name, value) in &config.headers {
                 let name: reqwest_mcp::header::HeaderName = name
