@@ -2462,6 +2462,11 @@ pinned Pi renderer. Image data remains cached across scroll and resize, and
 placements are cleared independently of cached uploads. iTerm2 retains its
 whole-image rendering behavior.
 
+Fullscreen transcript search temporarily hides Kitty and iTerm2 placements that
+overlap the search box in both rows and columns, matching Pi v1.6.0. Images
+beside the box stay visible. Closing the box redraws the hidden placements,
+reusing cached Kitty uploads.
+
 Unit tests and a PTY fixture cover upper/lower clipping, scrolling, cached resize
 and terminal restoration. The existing Kitty/iTerm2 fixture passed both modes.
 Regular-mode active-region images and iTerm2 partial-image behavior remain open.
