@@ -128,9 +128,12 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
         return Some(date.to_utc());
     }
+    let value = value.trim();
+    let Some((weekday, rest)) = value.split_once(',') else {
+        return classifier_retry_asctime(value);
+    };
     // Date.parse also accepts the obsolete RFC 850 HTTP-date form. Use
     // JavaScript's 1950/2049 pivot for its two-digit year.
-    let (weekday, rest) = value.trim().split_once(',')?;
     if ![
         "Monday",
         "Tuesday",
@@ -166,6 +169,25 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     )
     .ok()
     .map(|date| date.and_utc())
+}
+
+fn classifier_retry_asctime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+
+    let explicit_zone = value
+        .rsplit_once(char::is_whitespace)
+        .filter(|(_, zone)| zone.eq_ignore_ascii_case("GMT") || zone.eq_ignore_ascii_case("UTC"));
+    let date = explicit_zone.map_or(value, |(date, _)| date);
+    let date = chrono::NaiveDateTime::parse_from_str(date, "%a %b %d %H:%M:%S %Y").ok()?;
+    if explicit_zone.is_some() {
+        Some(date.and_utc())
+    } else {
+        // Pi's Date.parse treats an asctime value with no zone as local time.
+        chrono::Local
+            .from_local_datetime(&date)
+            .earliest()
+            .map(|date| date.to_utc())
+    }
 }
 
 fn classifier_retry_delay(
@@ -3044,6 +3066,12 @@ mod tests {
                 "over 60 seconds",
             ),
             (
+                Api::SystemOne,
+                vec![(429, "retry-after: Sun Nov  6 08:51:00 2095\r\n")],
+                false,
+                "over 60 seconds",
+            ),
+            (
                 Api::OpenRouterImages,
                 vec![(429, "retry-after-ms: 0\r\n")],
                 false,
@@ -3184,6 +3212,35 @@ mod tests {
             HeaderValue::from_static("Sunday, 06-Nov-94 08:51:00 GMT"),
         );
         assert!(classifier_retry_delay(&headers, 0, old_now).is_err());
+        for zone in ["GMT", "UTC"] {
+            headers.insert(
+                "retry-after",
+                HeaderValue::from_str(&format!("Sun Nov  6 08:49:37 1994 {zone}")).unwrap(),
+            );
+            assert_eq!(
+                classifier_retry_delay(&headers, 0, old_now).unwrap(),
+                Duration::from_secs(5)
+            );
+        }
+        use chrono::TimeZone;
+        let local_now = chrono::Local
+            .with_ymd_and_hms(1994, 11, 6, 8, 49, 32)
+            .earliest()
+            .unwrap()
+            .to_utc();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:49:37 1994"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, local_now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:51:00 1994"),
+        );
+        assert!(classifier_retry_delay(&headers, 0, local_now).is_err());
         assert_eq!(
             classifier_retry_date("Sunday, 06-Nov-50 08:49:37 GMT")
                 .unwrap()
