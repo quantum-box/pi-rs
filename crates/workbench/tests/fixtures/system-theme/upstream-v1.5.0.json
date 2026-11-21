@@ -1,0 +1,1501 @@
+[
+  {
+    "name": "indexed",
+    "input": {},
+    "output": {
+      "colors": {
+        "selectedBg": "",
+        "searchMatchBg": "",
+        "userMessageBg": "",
+        "customMessageBg": "",
+        "toolPendingBg": "",
+        "toolSuccessBg": "",
+        "toolErrorBg": "",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "",
+        "toolTitle": "",
+        "syntaxOperator": "",
+        "syntaxPunctuation": "",
+        "muted": "",
+        "dim": "",
+        "thinkingText": "",
+        "toolOutput": "",
+        "mdLinkUrl": "",
+        "mdQuote": "",
+        "mdQuoteBorder": "",
+        "mdHr": "",
+        "mdCodeBlockBorder": "",
+        "toolDiffContext": "",
+        "syntaxComment": "",
+        "scrollbarTrack": "",
+        "scrollbarThumb": "",
+        "searchMatchText": "",
+        "borderMuted": "",
+        "accent": 5,
+        "borderAccent": 5,
+        "customMessageLabel": 5,
+        "mdCode": 5,
+        "mdListBullet": 5,
+        "syntaxType": 5,
+        "border": 4,
+        "mdLink": 4,
+        "syntaxKeyword": 4,
+        "syntaxVariable": 6,
+        "success": 2,
+        "mdCodeBlock": 2,
+        "toolDiffAdded": 2,
+        "bashMode": 2,
+        "syntaxNumber": 5,
+        "error": 1,
+        "toolDiffRemoved": 1,
+        "warning": 3,
+        "mdHeading": 3,
+        "syntaxFunction": 3,
+        "syntaxString": 2,
+        "thinkingOff": "",
+        "thinkingMinimal": 4,
+        "thinkingLow": 4,
+        "thinkingMedium": 6,
+        "thinkingHigh": 5,
+        "thinkingXhigh": 13,
+        "thinkingMax": 1
+      },
+      "dim": [
+        "customMessageText",
+        "syntaxOperator",
+        "syntaxPunctuation",
+        "muted",
+        "dim",
+        "thinkingText",
+        "toolOutput",
+        "mdLinkUrl",
+        "mdQuote",
+        "mdQuoteBorder",
+        "mdHr",
+        "mdCodeBlockBorder",
+        "toolDiffContext",
+        "syntaxComment",
+        "scrollbarTrack",
+        "scrollbarThumb",
+        "searchMatchText",
+        "borderMuted",
+        "thinkingOff"
+      ]
+    }
+  },
+  {
+    "name": "indexedLight",
+    "input": {
+      "appearanceHint": "light"
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "",
+        "searchMatchBg": "",
+        "userMessageBg": "",
+        "customMessageBg": "",
+        "toolPendingBg": "",
+        "toolSuccessBg": "",
+        "toolErrorBg": "",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "",
+        "toolTitle": "",
+        "syntaxOperator": "",
+        "syntaxPunctuation": "",
+        "muted": "",
+        "dim": "",
+        "thinkingText": "",
+        "toolOutput": "",
+        "mdLinkUrl": "",
+        "mdQuote": "",
+        "mdQuoteBorder": "",
+        "mdHr": "",
+        "mdCodeBlockBorder": "",
+        "toolDiffContext": "",
+        "syntaxComment": "",
+        "scrollbarTrack": "",
+        "scrollbarThumb": "",
+        "searchMatchText": "",
+        "borderMuted": "",
+        "accent": 5,
+        "borderAccent": 5,
+        "customMessageLabel": 5,
+        "mdCode": 5,
+        "mdListBullet": 5,
+        "syntaxType": 5,
+        "border": 4,
+        "mdLink": 4,
+        "syntaxKeyword": 4,
+        "syntaxVariable": 6,
+        "success": 2,
+        "mdCodeBlock": 2,
+        "toolDiffAdded": 2,
+        "bashMode": 2,
+        "syntaxNumber": 5,
+        "error": 1,
+        "toolDiffRemoved": 1,
+        "warning": 3,
+        "mdHeading": 3,
+        "syntaxFunction": 3,
+        "syntaxString": 2,
+        "thinkingOff": "",
+        "thinkingMinimal": 4,
+        "thinkingLow": 4,
+        "thinkingMedium": 6,
+        "thinkingHigh": 5,
+        "thinkingXhigh": 13,
+        "thinkingMax": 1
+      },
+      "dim": [
+        "customMessageText",
+        "syntaxOperator",
+        "syntaxPunctuation",
+        "muted",
+        "dim",
+        "thinkingText",
+        "toolOutput",
+        "mdLinkUrl",
+        "mdQuote",
+        "mdQuoteBorder",
+        "mdHr",
+        "mdCodeBlockBorder",
+        "toolDiffContext",
+        "syntaxComment",
+        "scrollbarTrack",
+        "scrollbarThumb",
+        "searchMatchText",
+        "borderMuted",
+        "thinkingOff"
+      ],
+      "appearance": "light"
+    }
+  },
+  {
+    "name": "indexedGrayscale",
+    "input": {
+      "saturation": 0
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "",
+        "searchMatchBg": "",
+        "userMessageBg": "",
+        "customMessageBg": "",
+        "toolPendingBg": "",
+        "toolSuccessBg": "",
+        "toolErrorBg": "",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "",
+        "toolTitle": "",
+        "syntaxOperator": "",
+        "syntaxPunctuation": "",
+        "muted": "",
+        "dim": "",
+        "thinkingText": "",
+        "toolOutput": "",
+        "mdLinkUrl": "",
+        "mdQuote": "",
+        "mdQuoteBorder": "",
+        "mdHr": "",
+        "mdCodeBlockBorder": "",
+        "toolDiffContext": "",
+        "syntaxComment": "",
+        "scrollbarTrack": "",
+        "scrollbarThumb": "",
+        "searchMatchText": "",
+        "borderMuted": "",
+        "accent": "",
+        "borderAccent": "",
+        "customMessageLabel": "",
+        "mdCode": "",
+        "mdListBullet": "",
+        "syntaxType": "",
+        "border": "",
+        "mdLink": "",
+        "syntaxKeyword": "",
+        "syntaxVariable": "",
+        "success": "",
+        "mdCodeBlock": "",
+        "toolDiffAdded": "",
+        "bashMode": "",
+        "syntaxNumber": "",
+        "error": "",
+        "toolDiffRemoved": "",
+        "warning": "",
+        "mdHeading": "",
+        "syntaxFunction": "",
+        "syntaxString": "",
+        "thinkingOff": "",
+        "thinkingMinimal": "",
+        "thinkingLow": "",
+        "thinkingMedium": "",
+        "thinkingHigh": "",
+        "thinkingXhigh": "",
+        "thinkingMax": ""
+      },
+      "dim": [
+        "customMessageText",
+        "syntaxOperator",
+        "syntaxPunctuation",
+        "muted",
+        "dim",
+        "thinkingText",
+        "toolOutput",
+        "mdLinkUrl",
+        "mdQuote",
+        "mdQuoteBorder",
+        "mdHr",
+        "mdCodeBlockBorder",
+        "toolDiffContext",
+        "syntaxComment",
+        "scrollbarTrack",
+        "scrollbarThumb",
+        "searchMatchText",
+        "borderMuted",
+        "thinkingOff"
+      ]
+    }
+  },
+  {
+    "name": "dracula",
+    "input": {
+      "background": {
+        "r": 40,
+        "g": 42,
+        "b": 54
+      },
+      "foreground": {
+        "r": 248,
+        "g": 248,
+        "b": 242
+      },
+      "palette": [
+        {
+          "r": 33,
+          "g": 34,
+          "b": 44
+        },
+        {
+          "r": 255,
+          "g": 85,
+          "b": 85
+        },
+        {
+          "r": 80,
+          "g": 250,
+          "b": 123
+        },
+        {
+          "r": 241,
+          "g": 250,
+          "b": 140
+        },
+        {
+          "r": 189,
+          "g": 147,
+          "b": 249
+        },
+        {
+          "r": 255,
+          "g": 121,
+          "b": 198
+        },
+        {
+          "r": 139,
+          "g": 233,
+          "b": 253
+        },
+        {
+          "r": 248,
+          "g": 248,
+          "b": 242
+        },
+        {
+          "r": 98,
+          "g": 114,
+          "b": 164
+        },
+        {
+          "r": 255,
+          "g": 110,
+          "b": 110
+        },
+        {
+          "r": 105,
+          "g": 255,
+          "b": 148
+        },
+        {
+          "r": 255,
+          "g": 255,
+          "b": 165
+        },
+        {
+          "r": 214,
+          "g": 172,
+          "b": 255
+        },
+        {
+          "r": 255,
+          "g": 146,
+          "b": 223
+        },
+        {
+          "r": 164,
+          "g": 255,
+          "b": 255
+        },
+        {
+          "r": 255,
+          "g": 255,
+          "b": 255
+        }
+      ]
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#45236c",
+        "searchMatchBg": "#393c04",
+        "userMessageBg": "#45236c",
+        "customMessageBg": "#670447",
+        "toolPendingBg": "#31384c",
+        "toolSuccessBg": "#11441e",
+        "toolErrorBg": "#5f2220",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "#96a2c7",
+        "toolTitle": "",
+        "syntaxOperator": "#96a2c7",
+        "syntaxPunctuation": "#96a2c7",
+        "muted": "#96a2c7",
+        "dim": "#7484b5",
+        "thinkingText": "#8e9cc3",
+        "toolOutput": "#96a2c7",
+        "mdLinkUrl": "#96a2c7",
+        "mdQuote": "#96a2c7",
+        "mdQuoteBorder": "#96a2c7",
+        "mdHr": "#96a2c7",
+        "mdCodeBlockBorder": "#96a2c7",
+        "toolDiffContext": "#96a2c7",
+        "syntaxComment": "#96a2c7",
+        "scrollbarTrack": "#424d6e",
+        "scrollbarThumb": "#8f9cc4",
+        "searchMatchText": "#96a2c7",
+        "borderMuted": "#6c7daf",
+        "accent": "#f16cb9",
+        "borderAccent": "#ea66b3",
+        "customMessageLabel": "#f16dba",
+        "mdCode": "#f16dba",
+        "mdListBullet": "#f16dba",
+        "syntaxType": "#f16dba",
+        "border": "#ae85e9",
+        "mdLink": "#b58bf0",
+        "syntaxKeyword": "#b58bf0",
+        "syntaxVariable": "#53b2c6",
+        "success": "#39c15c",
+        "mdCodeBlock": "#39c15c",
+        "toolDiffAdded": "#39c15c",
+        "bashMode": "#38b959",
+        "syntaxNumber": "#f16dba",
+        "error": "#f9756f",
+        "toolDiffRemoved": "#f9756f",
+        "warning": "#a4ab3b",
+        "mdHeading": "#a4ab3b",
+        "syntaxFunction": "#a4ab3b",
+        "syntaxString": "#39c15c",
+        "thinkingOff": "#6272a4",
+        "thinkingMinimal": "#8c62c3",
+        "thinkingLow": "#9268ca",
+        "thinkingMedium": "#3296a8",
+        "thinkingHigh": "#d856a3",
+        "thinkingXhigh": "#d068b3",
+        "thinkingMax": "#ff5555"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  },
+  {
+    "name": "draculaGrayscale",
+    "input": {
+      "background": {
+        "r": 40,
+        "g": 42,
+        "b": 54
+      },
+      "foreground": {
+        "r": 248,
+        "g": 248,
+        "b": 242
+      },
+      "palette": [
+        {
+          "r": 33,
+          "g": 34,
+          "b": 44
+        },
+        {
+          "r": 255,
+          "g": 85,
+          "b": 85
+        },
+        {
+          "r": 80,
+          "g": 250,
+          "b": 123
+        },
+        {
+          "r": 241,
+          "g": 250,
+          "b": 140
+        },
+        {
+          "r": 189,
+          "g": 147,
+          "b": 249
+        },
+        {
+          "r": 255,
+          "g": 121,
+          "b": 198
+        },
+        {
+          "r": 139,
+          "g": 233,
+          "b": 253
+        },
+        {
+          "r": 248,
+          "g": 248,
+          "b": 242
+        },
+        {
+          "r": 98,
+          "g": 114,
+          "b": 164
+        },
+        {
+          "r": 255,
+          "g": 110,
+          "b": 110
+        },
+        {
+          "r": 105,
+          "g": 255,
+          "b": 148
+        },
+        {
+          "r": 255,
+          "g": 255,
+          "b": 165
+        },
+        {
+          "r": 214,
+          "g": 172,
+          "b": 255
+        },
+        {
+          "r": 255,
+          "g": 146,
+          "b": 223
+        },
+        {
+          "r": 164,
+          "g": 255,
+          "b": 255
+        },
+        {
+          "r": 255,
+          "g": 255,
+          "b": 255
+        }
+      ],
+      "saturation": 0
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#393939",
+        "searchMatchBg": "#393939",
+        "userMessageBg": "#393939",
+        "customMessageBg": "#393939",
+        "toolPendingBg": "#393939",
+        "toolSuccessBg": "#393939",
+        "toolErrorBg": "#393939",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "#a3a3a3",
+        "toolTitle": "",
+        "syntaxOperator": "#a3a3a3",
+        "syntaxPunctuation": "#a3a3a3",
+        "muted": "#a3a3a3",
+        "dim": "#868686",
+        "thinkingText": "#9d9d9d",
+        "toolOutput": "#a3a3a3",
+        "mdLinkUrl": "#a3a3a3",
+        "mdQuote": "#a3a3a3",
+        "mdQuoteBorder": "#a3a3a3",
+        "mdHr": "#a3a3a3",
+        "mdCodeBlockBorder": "#a3a3a3",
+        "toolDiffContext": "#a3a3a3",
+        "syntaxComment": "#a3a3a3",
+        "scrollbarTrack": "#4e4e4e",
+        "scrollbarThumb": "#9d9d9d",
+        "searchMatchText": "#a3a3a3",
+        "borderMuted": "#7f7f7f",
+        "accent": "#a3a3a3",
+        "borderAccent": "#9d9d9d",
+        "customMessageLabel": "#a3a3a3",
+        "mdCode": "#a3a3a3",
+        "mdListBullet": "#a3a3a3",
+        "syntaxType": "#a3a3a3",
+        "border": "#9d9d9d",
+        "mdLink": "#a3a3a3",
+        "syntaxKeyword": "#a3a3a3",
+        "syntaxVariable": "#a3a3a3",
+        "success": "#a3a3a3",
+        "mdCodeBlock": "#a3a3a3",
+        "toolDiffAdded": "#a3a3a3",
+        "bashMode": "#9d9d9d",
+        "syntaxNumber": "#a3a3a3",
+        "error": "#a3a3a3",
+        "toolDiffRemoved": "#a3a3a3",
+        "warning": "#a3a3a3",
+        "mdHeading": "#a3a3a3",
+        "syntaxFunction": "#a3a3a3",
+        "syntaxString": "#a3a3a3",
+        "thinkingOff": "#747474",
+        "thinkingMinimal": "#7b7b7b",
+        "thinkingLow": "#818181",
+        "thinkingMedium": "#878787",
+        "thinkingHigh": "#8d8d8d",
+        "thinkingXhigh": "#939393",
+        "thinkingMax": "#999999"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  },
+  {
+    "name": "solarizedLight",
+    "input": {
+      "background": {
+        "r": 253,
+        "g": 246,
+        "b": 227
+      },
+      "foreground": {
+        "r": 101,
+        "g": 123,
+        "b": 131
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#dfe7eb",
+        "searchMatchBg": "#ede3de",
+        "userMessageBg": "#dfe7eb",
+        "customMessageBg": "#e6e4ee",
+        "toolPendingBg": "#e4e6e6",
+        "toolSuccessBg": "#dee8e2",
+        "toolErrorBg": "#eee3e2",
+        "text": "#4a5a60",
+        "userMessageText": "#4a5a60",
+        "customMessageText": "#677075",
+        "toolTitle": "#49595f",
+        "syntaxOperator": "#677075",
+        "syntaxPunctuation": "#677075",
+        "muted": "#677075",
+        "dim": "#869095",
+        "thinkingText": "#7b858a",
+        "toolOutput": "#677075",
+        "mdLinkUrl": "#677176",
+        "mdQuote": "#677176",
+        "mdQuoteBorder": "#677075",
+        "mdHr": "#677075",
+        "mdCodeBlockBorder": "#677176",
+        "toolDiffContext": "#677075",
+        "syntaxComment": "#677075",
+        "scrollbarTrack": "#e1e2e3",
+        "scrollbarThumb": "#97a0a5",
+        "searchMatchText": "#677075",
+        "borderMuted": "#9aa3a7",
+        "accent": "#755ab5",
+        "borderAccent": "#8a70ca",
+        "customMessageLabel": "#755ab5",
+        "mdCode": "#765bb6",
+        "mdListBullet": "#765bb6",
+        "syntaxType": "#755ab5",
+        "border": "#3c8db2",
+        "mdLink": "#2f7899",
+        "syntaxKeyword": "#2f7798",
+        "syntaxVariable": "#287c82",
+        "success": "#337f59",
+        "mdCodeBlock": "#337f59",
+        "toolDiffAdded": "#337f59",
+        "bashMode": "#3f966b",
+        "syntaxNumber": "#337f59",
+        "error": "#c6253c",
+        "toolDiffRemoved": "#c6253c",
+        "warning": "#8e6701",
+        "mdHeading": "#8e6701",
+        "syntaxFunction": "#8e6701",
+        "syntaxString": "#a65517",
+        "thinkingOff": "#c3c7c9",
+        "thinkingMinimal": "#b6c3cb",
+        "thinkingLow": "#9ec1d4",
+        "thinkingMedium": "#a1b6df",
+        "thinkingHigh": "#b4a4e8",
+        "thinkingXhigh": "#e583cc",
+        "thinkingMax": "#fe7177"
+      },
+      "dim": [],
+      "appearance": "light"
+    }
+  },
+  {
+    "name": "backgroundOnly",
+    "input": {
+      "background": {
+        "r": 30,
+        "g": 30,
+        "b": 30
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#1f343f",
+        "searchMatchBg": "#432a1b",
+        "userMessageBg": "#1f343f",
+        "customMessageBg": "#332b49",
+        "toolPendingBg": "#2e3133",
+        "toolSuccessBg": "#21372a",
+        "toolErrorBg": "#4a2425",
+        "text": "#dddfe0",
+        "userMessageText": "#dadcde",
+        "customMessageText": "#99a1a6",
+        "toolTitle": "#dbddde",
+        "syntaxOperator": "#99a1a6",
+        "syntaxPunctuation": "#99a1a6",
+        "muted": "#99a1a6",
+        "dim": "#7a8489",
+        "thinkingText": "#919a9f",
+        "toolOutput": "#99a1a6",
+        "mdLinkUrl": "#98a1a6",
+        "mdQuote": "#98a1a6",
+        "mdQuoteBorder": "#99a1a6",
+        "mdHr": "#99a1a6",
+        "mdCodeBlockBorder": "#98a1a6",
+        "toolDiffContext": "#99a1a6",
+        "syntaxComment": "#99a1a6",
+        "scrollbarTrack": "#44494c",
+        "scrollbarThumb": "#929ba0",
+        "searchMatchText": "#98a1a6",
+        "borderMuted": "#727c81",
+        "accent": "#a493d6",
+        "borderAccent": "#9d8bd4",
+        "customMessageLabel": "#a493d6",
+        "mdCode": "#a493d6",
+        "mdListBullet": "#a493d6",
+        "syntaxType": "#a493d6",
+        "border": "#57a3c8",
+        "mdLink": "#62aacd",
+        "syntaxKeyword": "#62aacd",
+        "syntaxVariable": "#55b0b7",
+        "success": "#61b487",
+        "mdCodeBlock": "#61b487",
+        "toolDiffAdded": "#61b487",
+        "bashMode": "#57ad80",
+        "syntaxNumber": "#61b487",
+        "error": "#eb777a",
+        "toolDiffRemoved": "#eb777a",
+        "warning": "#ca961d",
+        "mdHeading": "#c9961c",
+        "syntaxFunction": "#ca961d",
+        "syntaxString": "#dd8751",
+        "thinkingOff": "#677176",
+        "thinkingMinimal": "#627a86",
+        "thinkingLow": "#50849e",
+        "thinkingMedium": "#5d81c9",
+        "thinkingHigh": "#926fe2",
+        "thinkingXhigh": "#dc4abd",
+        "thinkingMax": "#fe475a"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  },
+  {
+    "name": "midGray",
+    "input": {
+      "background": {
+        "r": 128,
+        "g": 128,
+        "b": 128
+      },
+      "foreground": {
+        "r": 255,
+        "g": 255,
+        "b": 255
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#317c9e",
+        "searchMatchBg": "#b45d19",
+        "userMessageBg": "#317c9e",
+        "customMessageBg": "#7f65c1",
+        "toolPendingBg": "#6c767b",
+        "toolSuccessBg": "#35835b",
+        "toolErrorBg": "#dc2d45",
+        "text": "#000000",
+        "userMessageText": "#000000",
+        "customMessageText": "#000000",
+        "toolTitle": "#000000",
+        "syntaxOperator": "#000000",
+        "syntaxPunctuation": "#000000",
+        "muted": "#000000",
+        "dim": "#000000",
+        "thinkingText": "#000000",
+        "toolOutput": "#000000",
+        "mdLinkUrl": "#000000",
+        "mdQuote": "#000000",
+        "mdQuoteBorder": "#000000",
+        "mdHr": "#000000",
+        "mdCodeBlockBorder": "#000000",
+        "toolDiffContext": "#000000",
+        "syntaxComment": "#000000",
+        "scrollbarTrack": "#60696e",
+        "scrollbarThumb": "#000000",
+        "searchMatchText": "#000000",
+        "borderMuted": "#000000",
+        "accent": "#000000",
+        "borderAccent": "#000000",
+        "customMessageLabel": "#000000",
+        "mdCode": "#000000",
+        "mdListBullet": "#000000",
+        "syntaxType": "#000000",
+        "border": "#000000",
+        "mdLink": "#000000",
+        "syntaxKeyword": "#000000",
+        "syntaxVariable": "#000000",
+        "success": "#000000",
+        "mdCodeBlock": "#000000",
+        "toolDiffAdded": "#000000",
+        "bashMode": "#000000",
+        "syntaxNumber": "#000000",
+        "error": "#000000",
+        "toolDiffRemoved": "#000000",
+        "warning": "#000000",
+        "mdHeading": "#000000",
+        "syntaxFunction": "#000000",
+        "syntaxString": "#000000",
+        "thinkingOff": "#3e4345",
+        "thinkingMinimal": "#303a40",
+        "thinkingLow": "#1f313a",
+        "thinkingMedium": "#172133",
+        "thinkingHigh": "#000000",
+        "thinkingXhigh": "#000000",
+        "thinkingMax": "#000000"
+      },
+      "dim": [],
+      "appearance": "light"
+    }
+  },
+  {
+    "name": "black",
+    "input": {
+      "background": {
+        "r": 0,
+        "g": 0,
+        "b": 0
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#1d2e37",
+        "searchMatchBg": "#3b2619",
+        "userMessageBg": "#1d2e37",
+        "customMessageBg": "#2d2740",
+        "toolPendingBg": "#292c2e",
+        "toolSuccessBg": "#1e3026",
+        "toolErrorBg": "#402222",
+        "text": "#dadcdd",
+        "userMessageText": "#d8dadc",
+        "customMessageText": "#969fa4",
+        "toolTitle": "#d8dbdc",
+        "syntaxOperator": "#969fa4",
+        "syntaxPunctuation": "#969fa4",
+        "muted": "#969fa4",
+        "dim": "#778187",
+        "thinkingText": "#8d979c",
+        "toolOutput": "#969fa4",
+        "mdLinkUrl": "#969fa4",
+        "mdQuote": "#969fa4",
+        "mdQuoteBorder": "#969fa4",
+        "mdHr": "#969fa4",
+        "mdCodeBlockBorder": "#969fa4",
+        "toolDiffContext": "#969fa4",
+        "syntaxComment": "#969fa4",
+        "scrollbarTrack": "#414649",
+        "scrollbarThumb": "#90999e",
+        "searchMatchText": "#969fa4",
+        "borderMuted": "#6f787e",
+        "accent": "#a291d5",
+        "borderAccent": "#9a86d3",
+        "customMessageLabel": "#a291d5",
+        "mdCode": "#a290d5",
+        "mdListBullet": "#a290d5",
+        "syntaxType": "#a291d5",
+        "border": "#529fc5",
+        "mdLink": "#5ea7cb",
+        "syntaxKeyword": "#5ea7cb",
+        "syntaxVariable": "#51adb5",
+        "success": "#5db185",
+        "mdCodeBlock": "#5db185",
+        "toolDiffAdded": "#5db185",
+        "bashMode": "#52a97c",
+        "syntaxNumber": "#5db185",
+        "error": "#ec7276",
+        "toolDiffRemoved": "#ec7276",
+        "warning": "#c7941a",
+        "mdHeading": "#c79319",
+        "syntaxFunction": "#c7941a",
+        "syntaxString": "#dc844c",
+        "thinkingOff": "#646d72",
+        "thinkingMinimal": "#5f7683",
+        "thinkingLow": "#4d809a",
+        "thinkingMedium": "#597dc6",
+        "thinkingHigh": "#8f6ae1",
+        "thinkingXhigh": "#d944ba",
+        "thinkingMax": "#fe3a53"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  },
+  {
+    "name": "white",
+    "input": {
+      "background": {
+        "r": 255,
+        "g": 255,
+        "b": 255
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#edf1f3",
+        "searchMatchBg": "#f3efec",
+        "userMessageBg": "#edf1f3",
+        "customMessageBg": "#f0eff5",
+        "toolPendingBg": "#eff0f0",
+        "toolSuccessBg": "#edf1ee",
+        "toolErrorBg": "#f4efee",
+        "text": "#494f52",
+        "userMessageText": "#494f52",
+        "customMessageText": "#737d83",
+        "toolTitle": "#484e52",
+        "syntaxOperator": "#737d83",
+        "syntaxPunctuation": "#737d83",
+        "muted": "#737d83",
+        "dim": "#929ba0",
+        "thinkingText": "#879197",
+        "toolOutput": "#737d83",
+        "mdLinkUrl": "#737d83",
+        "mdQuote": "#737d83",
+        "mdQuoteBorder": "#737d83",
+        "mdHr": "#737d83",
+        "mdCodeBlockBorder": "#737d83",
+        "toolDiffContext": "#737d83",
+        "syntaxComment": "#737d83",
+        "scrollbarTrack": "#eceded",
+        "scrollbarThumb": "#a3abaf",
+        "searchMatchText": "#737d83",
+        "borderMuted": "#a7aeb2",
+        "accent": "#8268c4",
+        "borderAccent": "#9580d1",
+        "customMessageLabel": "#8268c4",
+        "mdCode": "#8368c4",
+        "mdListBullet": "#8368c4",
+        "syntaxType": "#8268c4",
+        "border": "#4a9ac0",
+        "mdLink": "#3685a9",
+        "syntaxKeyword": "#3685a9",
+        "syntaxVariable": "#2e8a91",
+        "success": "#3a8e64",
+        "mdCodeBlock": "#3a8e64",
+        "toolDiffAdded": "#3a8e64",
+        "bashMode": "#4ba476",
+        "syntaxNumber": "#3a8e64",
+        "error": "#dc2c44",
+        "toolDiffRemoved": "#dc2c44",
+        "warning": "#9e7300",
+        "mdHeading": "#9e7300",
+        "syntaxFunction": "#9e7300",
+        "syntaxString": "#b9601b",
+        "thinkingOff": "#cfd2d4",
+        "thinkingMinimal": "#c4ced4",
+        "thinkingLow": "#b0ccdb",
+        "thinkingMedium": "#b1c2e3",
+        "thinkingHigh": "#bfb3e9",
+        "thinkingXhigh": "#e79ad1",
+        "thinkingMax": "#fe898b"
+      },
+      "dim": [],
+      "appearance": "light"
+    }
+  },
+  {
+    "name": "frappe",
+    "input": {
+      "background": {
+        "r": 48,
+        "g": 52,
+        "b": 70
+      },
+      "foreground": {
+        "r": 198,
+        "g": 208,
+        "b": 245
+      },
+      "palette": [
+        {
+          "r": 81,
+          "g": 87,
+          "b": 109
+        },
+        {
+          "r": 231,
+          "g": 130,
+          "b": 132
+        },
+        {
+          "r": 166,
+          "g": 209,
+          "b": 137
+        },
+        {
+          "r": 229,
+          "g": 200,
+          "b": 144
+        },
+        {
+          "r": 140,
+          "g": 170,
+          "b": 238
+        },
+        {
+          "r": 244,
+          "g": 184,
+          "b": 228
+        },
+        {
+          "r": 129,
+          "g": 200,
+          "b": 190
+        },
+        {
+          "r": 181,
+          "g": 191,
+          "b": 226
+        },
+        {
+          "r": 98,
+          "g": 104,
+          "b": 128
+        },
+        {
+          "r": 230,
+          "g": 113,
+          "b": 114
+        },
+        {
+          "r": 142,
+          "g": 199,
+          "b": 114
+        },
+        {
+          "r": 217,
+          "g": 186,
+          "b": 115
+        },
+        {
+          "r": 123,
+          "g": 158,
+          "b": 240
+        },
+        {
+          "r": 242,
+          "g": 164,
+          "b": 219
+        },
+        {
+          "r": 90,
+          "g": 191,
+          "b": 181
+        },
+        {
+          "r": 165,
+          "g": 173,
+          "b": 206
+        }
+      ]
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#283d73",
+        "searchMatchBg": "#4e3e1c",
+        "userMessageBg": "#283d73",
+        "customMessageBg": "#5d2b52",
+        "toolPendingBg": "#3c404c",
+        "toolSuccessBg": "#324723",
+        "toolErrorBg": "#662b2e",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "#a2a7b9",
+        "toolTitle": "",
+        "syntaxOperator": "#a2a7b9",
+        "syntaxPunctuation": "#a2a7b9",
+        "muted": "#a2a7b9",
+        "dim": "#8389a2",
+        "thinkingText": "#9ba1b5",
+        "toolOutput": "#a2a7b9",
+        "mdLinkUrl": "#a2a7b9",
+        "mdQuote": "#a2a7b9",
+        "mdQuoteBorder": "#a2a7b9",
+        "mdHr": "#a2a7b9",
+        "mdCodeBlockBorder": "#a2a7b9",
+        "toolDiffContext": "#a2a7b9",
+        "syntaxComment": "#a2a7b9",
+        "scrollbarTrack": "#4f5467",
+        "scrollbarThumb": "#9ca1b5",
+        "searchMatchText": "#a2a7b9",
+        "borderMuted": "#7c839c",
+        "accent": "#cc92bd",
+        "borderAccent": "#c58cb6",
+        "customMessageLabel": "#cc92bd",
+        "mdCode": "#cc92bd",
+        "mdListBullet": "#cc92bd",
+        "syntaxType": "#cc92bd",
+        "border": "#82a0e3",
+        "mdLink": "#88a6ea",
+        "syntaxKeyword": "#88a6ea",
+        "syntaxVariable": "#70b7ad",
+        "success": "#8db770",
+        "mdCodeBlock": "#8db770",
+        "toolDiffAdded": "#8db770",
+        "bashMode": "#86b069",
+        "syntaxNumber": "#cc92bd",
+        "error": "#e6898a",
+        "toolDiffRemoved": "#e6898a",
+        "warning": "#c0a46d",
+        "mdHeading": "#c0a46d",
+        "syntaxFunction": "#c0a46d",
+        "syntaxString": "#8db770",
+        "thinkingOff": "#727891",
+        "thinkingMinimal": "#627ebe",
+        "thinkingLow": "#6884c5",
+        "thinkingMedium": "#589a91",
+        "thinkingHigh": "#b57da6",
+        "thinkingXhigh": "#c67bb0",
+        "thinkingMax": "#e07c7e"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  },
+  {
+    "name": "frappeHalf",
+    "input": {
+      "background": {
+        "r": 48,
+        "g": 52,
+        "b": 70
+      },
+      "foreground": {
+        "r": 198,
+        "g": 208,
+        "b": 245
+      },
+      "palette": [
+        {
+          "r": 81,
+          "g": 87,
+          "b": 109
+        },
+        {
+          "r": 231,
+          "g": 130,
+          "b": 132
+        },
+        {
+          "r": 166,
+          "g": 209,
+          "b": 137
+        },
+        {
+          "r": 229,
+          "g": 200,
+          "b": 144
+        },
+        {
+          "r": 140,
+          "g": 170,
+          "b": 238
+        },
+        {
+          "r": 244,
+          "g": 184,
+          "b": 228
+        },
+        {
+          "r": 129,
+          "g": 200,
+          "b": 190
+        },
+        {
+          "r": 181,
+          "g": 191,
+          "b": 226
+        },
+        {
+          "r": 98,
+          "g": 104,
+          "b": 128
+        },
+        {
+          "r": 230,
+          "g": 113,
+          "b": 114
+        },
+        {
+          "r": 142,
+          "g": 199,
+          "b": 114
+        },
+        {
+          "r": 217,
+          "g": 186,
+          "b": 115
+        },
+        {
+          "r": 123,
+          "g": 158,
+          "b": 240
+        },
+        {
+          "r": 242,
+          "g": 164,
+          "b": 219
+        },
+        {
+          "r": 90,
+          "g": 191,
+          "b": 181
+        },
+        {
+          "r": 165,
+          "g": 173,
+          "b": 206
+        }
+      ],
+      "saturation": 0.5
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#34405a",
+        "searchMatchBg": "#483f2c",
+        "userMessageBg": "#34405a",
+        "customMessageBg": "#503749",
+        "toolPendingBg": "#3e4046",
+        "toolSuccessBg": "#394431",
+        "toolErrorBg": "#543737",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "#a4a7b0",
+        "toolTitle": "",
+        "syntaxOperator": "#a4a7b0",
+        "syntaxPunctuation": "#a4a7b0",
+        "muted": "#a4a7b0",
+        "dim": "#878a96",
+        "thinkingText": "#9ea1ab",
+        "toolOutput": "#a4a7b0",
+        "mdLinkUrl": "#a4a7b0",
+        "mdQuote": "#a4a7b0",
+        "mdQuoteBorder": "#a4a7b0",
+        "mdHr": "#a4a7b0",
+        "mdCodeBlockBorder": "#a4a7b0",
+        "toolDiffContext": "#a4a7b0",
+        "syntaxComment": "#a4a7b0",
+        "scrollbarTrack": "#52545e",
+        "scrollbarThumb": "#9fa1ac",
+        "searchMatchText": "#a4a7b0",
+        "borderMuted": "#808390",
+        "accent": "#ba9db2",
+        "borderAccent": "#b497ac",
+        "customMessageLabel": "#ba9db2",
+        "mdCode": "#ba9db2",
+        "mdListBullet": "#ba9db2",
+        "syntaxType": "#ba9db2",
+        "border": "#92a1c3",
+        "mdLink": "#98a7c9",
+        "syntaxKeyword": "#98a7c9",
+        "syntaxVariable": "#8fafaa",
+        "success": "#9baf8e",
+        "mdCodeBlock": "#9baf8e",
+        "toolDiffAdded": "#9baf8e",
+        "bashMode": "#94a987",
+        "syntaxNumber": "#ba9db2",
+        "error": "#c99a99",
+        "toolDiffRemoved": "#c99a99",
+        "warning": "#b3a68b",
+        "mdHeading": "#b3a68b",
+        "syntaxFunction": "#b3a68b",
+        "syntaxString": "#9baf8e",
+        "thinkingOff": "#767985",
+        "thinkingMinimal": "#7180a0",
+        "thinkingLow": "#7786a6",
+        "thinkingMedium": "#73938e",
+        "thinkingHigh": "#a4889c",
+        "thinkingXhigh": "#b08aa4",
+        "thinkingMax": "#c18e8e"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  },
+  {
+    "name": "grayLight",
+    "input": {
+      "background": {
+        "r": 170,
+        "g": 170,
+        "b": 170
+      },
+      "foreground": {
+        "r": 17,
+        "g": 17,
+        "b": 17
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#56a2c8",
+        "searchMatchBg": "#d87e41",
+        "userMessageBg": "#56a2c8",
+        "customMessageBg": "#9d8ad4",
+        "toolPendingBg": "#919a9f",
+        "toolSuccessBg": "#56ad7f",
+        "toolErrorBg": "#ec676d",
+        "text": "#000000",
+        "userMessageText": "#000000",
+        "customMessageText": "#000000",
+        "toolTitle": "#000000",
+        "syntaxOperator": "#000000",
+        "syntaxPunctuation": "#000000",
+        "muted": "#000000",
+        "dim": "#222425",
+        "thinkingText": "#000000",
+        "toolOutput": "#000000",
+        "mdLinkUrl": "#000000",
+        "mdQuote": "#000000",
+        "mdQuoteBorder": "#000000",
+        "mdHr": "#000000",
+        "mdCodeBlockBorder": "#000000",
+        "toolDiffContext": "#000000",
+        "syntaxComment": "#000000",
+        "scrollbarTrack": "#8c969b",
+        "scrollbarThumb": "#3d4245",
+        "searchMatchText": "#000000",
+        "borderMuted": "#404548",
+        "accent": "#000000",
+        "borderAccent": "#000000",
+        "customMessageLabel": "#000000",
+        "mdCode": "#000000",
+        "mdListBullet": "#000000",
+        "syntaxType": "#000000",
+        "border": "#000000",
+        "mdLink": "#000000",
+        "syntaxKeyword": "#000000",
+        "syntaxVariable": "#000000",
+        "success": "#000000",
+        "mdCodeBlock": "#000000",
+        "toolDiffAdded": "#000000",
+        "bashMode": "#000000",
+        "syntaxNumber": "#000000",
+        "error": "#000000",
+        "toolDiffRemoved": "#000000",
+        "warning": "#000000",
+        "mdHeading": "#000000",
+        "syntaxFunction": "#000000",
+        "syntaxString": "#000000",
+        "thinkingOff": "#6b747a",
+        "thinkingMinimal": "#59707c",
+        "thinkingLow": "#3f6b82",
+        "thinkingMedium": "#3d5c9b",
+        "thinkingHigh": "#603ea4",
+        "thinkingXhigh": "#841d6f",
+        "thinkingMax": "#8c0322"
+      },
+      "dim": [],
+      "appearance": "light"
+    }
+  },
+  {
+    "name": "blueBackground",
+    "input": {
+      "background": {
+        "r": 24,
+        "g": 61,
+        "b": 104
+      },
+      "foreground": {
+        "r": 238,
+        "g": 206,
+        "b": 153
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#264b5d",
+        "searchMatchBg": "#65391d",
+        "userMessageBg": "#264b5d",
+        "customMessageBg": "#4a3b6e",
+        "toolPendingBg": "#41474a",
+        "toolSuccessBg": "#284f3a",
+        "toolErrorBg": "#732a2e",
+        "text": "",
+        "userMessageText": "",
+        "customMessageText": "#a5acb0",
+        "toolTitle": "",
+        "syntaxOperator": "#a5acb0",
+        "syntaxPunctuation": "#a5acb0",
+        "muted": "#a5acb0",
+        "dim": "#869095",
+        "thinkingText": "#9fa7ab",
+        "toolOutput": "#a5acb0",
+        "mdLinkUrl": "#a5acb0",
+        "mdQuote": "#a5acb0",
+        "mdQuoteBorder": "#a5acb0",
+        "mdHr": "#a5acb0",
+        "mdCodeBlockBorder": "#a5acb0",
+        "toolDiffContext": "#a5acb0",
+        "syntaxComment": "#a5acb0",
+        "scrollbarTrack": "#535b5f",
+        "scrollbarThumb": "#9fa7ab",
+        "searchMatchText": "#a5acb0",
+        "borderMuted": "#808a8f",
+        "accent": "#aea1d9",
+        "borderAccent": "#a99ad7",
+        "customMessageLabel": "#aea1d9",
+        "mdCode": "#aea1d9",
+        "mdListBullet": "#aea1d9",
+        "syntaxType": "#aea1d9",
+        "border": "#6cafd1",
+        "mdLink": "#77b4d3",
+        "syntaxKeyword": "#77b4d3",
+        "syntaxVariable": "#69bac1",
+        "success": "#74bd95",
+        "mdCodeBlock": "#74bd95",
+        "toolDiffAdded": "#74bd95",
+        "bashMode": "#6ab98e",
+        "syntaxNumber": "#74bd95",
+        "error": "#e98d8d",
+        "toolDiffRemoved": "#e98d8d",
+        "warning": "#d6a12d",
+        "mdHeading": "#d6a12d",
+        "syntaxFunction": "#d6a12d",
+        "syntaxString": "#e0976a",
+        "thinkingOff": "#757f85",
+        "thinkingMinimal": "#708895",
+        "thinkingLow": "#5c92ad",
+        "thinkingMedium": "#6d8fd2",
+        "thinkingHigh": "#9d81e6",
+        "thinkingXhigh": "#e365c5",
+        "thinkingMax": "#fe6a71"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  },
+  {
+    "name": "redBackground",
+    "input": {
+      "background": {
+        "r": 163,
+        "g": 71,
+        "b": 81
+      },
+      "foreground": {
+        "r": 22,
+        "g": 25,
+        "b": 36
+      }
+    },
+    "output": {
+      "colors": {
+        "selectedBg": "#2f7798",
+        "searchMatchBg": "#a75517",
+        "userMessageBg": "#2f7798",
+        "customMessageBg": "#765bb6",
+        "toolPendingBg": "#677075",
+        "toolSuccessBg": "#337f59",
+        "toolErrorBg": "#c6253c",
+        "text": "#f2f4f8",
+        "userMessageText": "#f2f4f8",
+        "customMessageText": "#c4c8ca",
+        "toolTitle": "#f6f6f9",
+        "syntaxOperator": "#c4c8ca",
+        "syntaxPunctuation": "#c4c8ca",
+        "muted": "#c4c8ca",
+        "dim": "#a7aeb2",
+        "thinkingText": "#bfc4c6",
+        "toolOutput": "#c3c7ca",
+        "mdLinkUrl": "#c4c8ca",
+        "mdQuote": "#c4c8ca",
+        "mdQuoteBorder": "#c4c8ca",
+        "mdHr": "#c4c8ca",
+        "mdCodeBlockBorder": "#c4c8ca",
+        "toolDiffContext": "#c3c7ca",
+        "syntaxComment": "#c4c8ca",
+        "scrollbarTrack": "#778186",
+        "scrollbarThumb": "#bfc4c6",
+        "searchMatchText": "#c3c8ca",
+        "borderMuted": "#a2a9ae",
+        "accent": "#c8c2e0",
+        "borderAccent": "#c4bddf",
+        "customMessageLabel": "#c9c2e0",
+        "mdCode": "#c9c2e0",
+        "mdListBullet": "#c9c2e0",
+        "syntaxType": "#c9c2e0",
+        "border": "#a6c9dc",
+        "mdLink": "#aecddd",
+        "syntaxKeyword": "#aecddd",
+        "syntaxVariable": "#a4d1d5",
+        "success": "#aad2ba",
+        "mdCodeBlock": "#aad2ba",
+        "toolDiffAdded": "#aad2ba",
+        "bashMode": "#a2cfb4",
+        "syntaxNumber": "#aad2ba",
+        "error": "#e5bbba",
+        "toolDiffRemoved": "#e5bbba",
+        "warning": "#eac070",
+        "mdHeading": "#eac171",
+        "syntaxFunction": "#eac171",
+        "syntaxString": "#e3bfaa",
+        "thinkingOff": "#97a0a5",
+        "thinkingMinimal": "#93a8b3",
+        "thinkingLow": "#84b1c9",
+        "thinkingMedium": "#98b0de",
+        "thinkingHigh": "#b8aae9",
+        "thinkingXhigh": "#e79fd3",
+        "thinkingMax": "#fea2a2"
+      },
+      "dim": [],
+      "appearance": "dark"
+    }
+  }
+]

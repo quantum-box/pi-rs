@@ -6,8 +6,8 @@ pub mod oauth;
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
@@ -54,16 +54,32 @@ fn recognized_response_event(kind: &str) -> bool {
     )
 }
 
+/// Routing headers used by an API-key Responses endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionAffinityFormat {
+    OpenAi,
+    OpenAiNoSession,
+    OpenRouter,
+    Disabled,
+}
+
 #[derive(Clone)]
 pub struct OpenAiResponses {
     client: Client,
     endpoint: Url,
+    endpoint_source: String,
     token: String,
     thinking: Option<String>,
     provider: String,
     headers: reqwest::header::HeaderMap,
     sampling: BTreeMap<String, Value>,
     identity_safe_transport: bool,
+    cache_retention: CacheRetention,
+    explicit_cache_mode: bool,
+    session_cache_key: Option<String>,
+    session_affinity_format: Option<SessionAffinityFormat>,
+    prompt_cache_key_enabled: bool,
+    use_developer_role: bool,
 }
 
 impl OpenAiResponses {
@@ -107,6 +123,7 @@ impl OpenAiResponses {
     }
 
     fn create(endpoint: &str, token: String, plan: bool) -> Result<Self> {
+        let endpoint_source = endpoint.to_owned();
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("invalid OpenAI Responses endpoint".into()))?;
         let secure = endpoint.as_str() == DEFAULT_ENDPOINT
@@ -136,17 +153,108 @@ impl OpenAiResponses {
         Ok(Self {
             client,
             endpoint,
+            endpoint_source,
             token,
             thinking: None,
             identity_safe_transport: true,
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
             sampling: BTreeMap::new(),
+            cache_retention: CacheRetention::Short,
+            explicit_cache_mode: false,
+            session_cache_key: None,
+            session_affinity_format: None,
+            prompt_cache_key_enabled: true,
+            use_developer_role: false,
         })
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+        self
+    }
+
+    /// Configure Responses prompt cache retention for the selected model.
+    pub fn with_cache_retention(mut self, retention: CacheRetention, explicit_mode: bool) -> Self {
+        self.cache_retention = retention;
+        self.explicit_cache_mode = explicit_mode;
+        self
+    }
+
+    /// Select whether model instructions use the developer role. Defaults to
+    /// the system role when model reasoning capability is not supplied.
+    pub fn with_developer_role(mut self, enabled: bool) -> Self {
+        self.use_developer_role = enabled;
+        self
+    }
+
+    /// Set the Pi session identity used for prompt cache affinity.
+    pub fn with_session_cache_key(mut self, session_id: &str) -> Self {
+        self.session_cache_key =
+            (!session_id.is_empty()).then(|| session_id.chars().take(64).collect());
+        self
+    }
+
+    /// Override the automatically detected API-key session routing format.
+    pub fn with_session_affinity_format(mut self, format: SessionAffinityFormat) -> Self {
+        self.session_affinity_format = Some(format);
+        self
+    }
+
+    fn with_session_routing(mut self, session_id: &str) -> Result<Self> {
+        if session_id.is_empty()
+            || self.provider == "openai-chatgpt"
+            || self.cache_retention == CacheRetention::None
+        {
+            return Ok(self);
+        }
+        let format = self.session_affinity_format.unwrap_or_else(|| {
+            if self.provider == "openrouter" || self.endpoint_source.contains("openrouter.ai") {
+                SessionAffinityFormat::OpenRouter
+            } else {
+                SessionAffinityFormat::OpenAi
+            }
+        });
+        let names: &[&str] = match format {
+            SessionAffinityFormat::OpenAi => &["session-id", "x-client-request-id"],
+            SessionAffinityFormat::OpenAiNoSession => &["x-client-request-id"],
+            SessionAffinityFormat::OpenRouter => &["x-session-id"],
+            SessionAffinityFormat::Disabled => &[],
+        };
+        if names.iter().all(|name| self.headers.contains_key(*name)) {
+            return Ok(self);
+        }
+        let bytes = session_id
+            .chars()
+            .map(|ch| u8::try_from(u32::from(ch)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::Config("Invalid session affinity ID".into()))?;
+        let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+        let start = bytes
+            .iter()
+            .position(|byte| !whitespace(byte))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !whitespace(byte))
+            .map_or(start, |index| index + 1);
+        let value = reqwest::header::HeaderValue::from_bytes(&bytes[start..end])
+            .map_err(|_| Error::Config("Invalid session affinity ID".into()))?;
+        for name in names {
+            self.headers.entry(*name).or_insert_with(|| value.clone());
+        }
+        Ok(self)
+    }
+
+    /// Enable or disable the automatic session-derived prompt cache key.
+    pub fn with_prompt_cache_key_enabled(mut self, enabled: bool) -> Self {
+        self.prompt_cache_key_enabled = enabled;
+        self
+    }
+
+    /// Disable retention while preserving the model cache protocol.
+    pub fn without_cache(mut self) -> Self {
+        self.cache_retention = CacheRetention::None;
         self
     }
 
@@ -160,11 +268,65 @@ impl OpenAiResponses {
         self
     }
 
+    /// Add automatic headers without replacing explicitly configured values.
+    pub fn with_default_headers(mut self, headers: &reqwest::header::HeaderMap) -> Self {
+        for (name, value) in headers {
+            self.headers
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        self
+    }
+
     /// Set request body defaults from the selected model's sampling parameters.
     pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Result<Self> {
         validate_sampling(&sampling)?;
         self.sampling = sampling;
         Ok(self)
+    }
+
+    fn apply_cache(&self, body: &mut Value) {
+        if self.prompt_cache_key_enabled
+            && self.cache_retention != CacheRetention::None
+            && let Some(key) = &self.session_cache_key
+        {
+            body.as_object_mut()
+                .expect("Responses request object")
+                .entry("prompt_cache_key")
+                .or_insert_with(|| json!(key));
+        }
+        if self.provider == "openai-chatgpt" {
+            let object = body.as_object_mut().expect("Responses request object");
+            object.remove("prompt_cache_retention");
+            object.remove("prompt_cache_options");
+            if self.cache_retention == CacheRetention::None {
+                object.remove("prompt_cache_key");
+            }
+            return;
+        }
+        if self.cache_retention == CacheRetention::None {
+            let object = body.as_object_mut().expect("Responses request object");
+            object.remove("prompt_cache_key");
+            object.remove("prompt_cache_retention");
+            object.remove("prompt_cache_options");
+        }
+        let cache = match (self.explicit_cache_mode, self.cache_retention) {
+            (true, CacheRetention::None) => {
+                Some(("prompt_cache_options", json!({"mode":"explicit"})))
+            }
+            (true, CacheRetention::Long) => Some(("prompt_cache_options", json!({"ttl":"30m"}))),
+            (false, CacheRetention::Long) => Some(("prompt_cache_retention", json!("24h"))),
+            _ => None,
+        };
+        if let Some((key, value)) = cache {
+            let object = body.as_object_mut().expect("Responses request object");
+            // An explicitly configured cache policy takes precedence as a whole.
+            if !object.contains_key("prompt_cache_options")
+                && !object.contains_key("prompt_cache_retention")
+            {
+                object.insert(key.into(), value);
+            }
+        }
     }
 
     /// Return the signed-in account's displayable models in server order.
@@ -224,6 +386,14 @@ impl OpenAiResponses {
 
 /// Protect fields that control the agent's conversation, tools, and transport.
 pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
+    if sampling.contains_key("prompt_cache_options")
+        && sampling.contains_key("prompt_cache_retention")
+    {
+        return Err(Error::Config(
+            "sampling parameters cannot combine prompt_cache_options and prompt_cache_retention"
+                .into(),
+        ));
+    }
     if let Some(key) = sampling.keys().find(|key| {
         matches!(
             key.as_str(),
@@ -269,12 +439,17 @@ pub fn thinking_levels(model: &str) -> Vec<String> {
     levels.iter().map(|level| (*level).into()).collect()
 }
 
-fn payload(request: &ModelRequest, provider: &str, edited_scope: &str) -> Value {
+fn payload(
+    request: &ModelRequest,
+    provider: &str,
+    edited_scope: &str,
+    instruction_role: &str,
+) -> Value {
     let mut input = Vec::new();
     for message in &request.messages {
         match message {
             Message::System { content } => {
-                input.push(json!({"role":"developer", "content": content}))
+                input.push(json!({"role":instruction_role, "content": content}))
             }
             Message::User { content } => input.push(json!({"role":"user", "content": content})),
             Message::UserWithImages { content, images } => {
@@ -405,15 +580,68 @@ impl Model for OpenAiResponses {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
-        pi_rs_core::protected_model_fingerprint(&(
-            headers,
-            "openai-responses-v1",
-            self.endpoint.as_str(),
-            &self.provider,
-            &self.token,
-            &self.thinking,
-            &self.sampling,
-        ))
+        let base =
+            if self.cache_retention == CacheRetention::Short || self.provider == "openai-chatgpt" {
+                pi_rs_core::protected_model_fingerprint(&(
+                    headers,
+                    "openai-responses-v1",
+                    self.endpoint.as_str(),
+                    &self.provider,
+                    &self.token,
+                    &self.thinking,
+                    &self.sampling,
+                ))
+            } else {
+                pi_rs_core::protected_model_fingerprint(&(
+                    headers,
+                    "openai-responses-v1",
+                    self.endpoint.as_str(),
+                    &self.provider,
+                    &self.token,
+                    &self.thinking,
+                    &self.sampling,
+                    match self.cache_retention {
+                        CacheRetention::None => "none",
+                        CacheRetention::Short => "short",
+                        CacheRetention::Long => "long",
+                    },
+                    self.explicit_cache_mode,
+                ))
+            };
+        let base = if self.session_affinity_format.is_none()
+            && self.provider != "openrouter"
+            && self.endpoint_source.contains("openrouter.ai")
+                != self.endpoint.as_str().contains("openrouter.ai")
+        {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    self.endpoint_source.contains("openrouter.ai"),
+                ))
+            })
+        } else {
+            base
+        };
+        let base = match self.session_affinity_format {
+            None => base,
+            Some(format) => base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, format!("{format:?}")))
+            }),
+        };
+        let base = if self.prompt_cache_key_enabled {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "prompt-cache-key-disabled"))
+            })
+        };
+        if self.use_developer_role {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "system-instruction-role"))
+            })
+        }
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -437,11 +665,101 @@ impl Model for OpenAiResponses {
         }
     }
 
+    async fn stream_in_session(
+        &self,
+        _request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone()
+            .with_session_cache_key(&session_id.to_string())
+            .with_session_routing(&session_id.to_string())?
+            .stream(request)
+            .await
+    }
+
+    async fn stream_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone()
+            .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?
+            .stream(request)
+            .await
+    }
+
+    async fn stream_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone().without_cache().stream(request).await
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        let stream = self.stream_enriched(request).await?;
+        Ok(Box::pin(stream.filter_map(|event| async move {
+            match event {
+                Ok(pi_rs_core::EnrichedModelEvent::Legacy(event)) => Some(Ok(event)),
+                Ok(pi_rs_core::EnrichedModelEvent::TextDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Text(delta)))
+                }
+                Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Reasoning(delta)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })))
+    }
+
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        self.clone()
+            .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?
+            .stream_enriched(request)
+            .await
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        self.clone().without_cache().stream_enriched(request).await
+    }
+}
+
+impl OpenAiResponses {
+    async fn stream_enriched(
+        &self,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
         let model = request.model.clone();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
-        let mut body = payload(&request, &self.provider, &edited_scope);
+        let mut body = payload(
+            &request,
+            &self.provider,
+            &edited_scope,
+            if self.use_developer_role {
+                "developer"
+            } else {
+                "system"
+            },
+        );
         let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
@@ -454,6 +772,7 @@ impl Model for OpenAiResponses {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
+        self.apply_cache(&mut body);
         let error_secrets = pi_rs_core::provider_error_secrets(
             Some(self.token.as_str()),
             self.headers.iter().filter_map(|(name, value)| {
@@ -472,6 +791,9 @@ impl Model for OpenAiResponses {
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         if !response.status().is_success() {
             let status = response.status();
+            if status.as_u16() == 413 {
+                return Err(Error::Model("413 request too large".into()));
+            }
             if status.as_u16() == 429 || status.is_server_error() {
                 let info =
                     pi_rs_core::provider_limit_info(response.bytes_stream(), &error_secrets).await;
@@ -496,6 +818,9 @@ impl Model for OpenAiResponses {
             }
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             let body = pi_rs_core::sanitized_provider_error(&body, &error_secrets);
+            if pi_rs_core::provider_context_overflow(&body, &[]) {
+                return Err(Error::Model("context window exceeded".into()));
+            }
             return Err(response_error(body["error"]["code"].as_str(), Some(status)));
         }
         let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
@@ -537,7 +862,8 @@ impl Model for OpenAiResponses {
         Ok(Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
-            let mut reasoning = String::new();
+            let mut reasoning: BTreeMap<u64, String> = BTreeMap::new();
+            let mut text_items: BTreeMap<u64, String> = BTreeMap::new();
             while let Some(item) = source.next().await {
                 let item = item.map_err(|error| match error {
                     EventStreamError::Transport(RawStreamError::LimitExceeded) => Error::Model("OpenAI stream exceeds 32 MiB".into()),
@@ -549,21 +875,65 @@ impl Model for OpenAiResponses {
                 let kind = field(&event, "type")?;
                 started |= recognized_response_event(kind);
                 match kind {
-                    "response.output_text.delta" | "response.refusal.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
-                    "response.reasoning_summary_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
+                    "response.output_item.added" if event["item"]["type"] == "reasoning" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?;
+                        yield pi_rs_core::EnrichedModelEvent::ReasoningStart { index };
+                    }
+                    "response.output_item.added" if event["item"]["type"] == "message" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI text index".into()))?;
+                        text_items.entry(index).or_default();
+                        yield pi_rs_core::EnrichedModelEvent::TextStart { index };
+                    }
+                    "response.output_text.delta" | "response.refusal.delta" => {
+                        let delta = field(&event,"delta")?;
+                        if let Some(index) = event["output_index"].as_u64() {
+                            text_items.entry(index).or_default().push_str(delta);
+                            yield pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: delta.into() };
+                        } else {
+                            yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Text(delta.into()));
+                        }
+                    }
+                    "response.output_item.done" if event["item"]["type"] == "message" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI text index".into()))?;
+                        let content = event["item"]["content"].as_array().map(|parts| parts.iter().filter_map(|part| match part["type"].as_str() {
+                            Some("output_text") => part["text"].as_str(),
+                            Some("refusal") => part["refusal"].as_str(),
+                            _ => None,
+                        }).collect::<String>()).unwrap_or_else(|| text_items.get(&index).cloned().unwrap_or_default());
+                        yield pi_rs_core::EnrichedModelEvent::TextEnd { index, content };
+                    }
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => { let text = field(&event,"delta")?; let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?; reasoning.entry(index).or_default().push_str(text); yield pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta:text.into() }; },
+                    "response.reasoning_summary_part.done" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?;
+                        if let Some(text) = reasoning.get_mut(&index) {
+                            text.push_str("\n\n");
+                            yield pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta:"\n\n".into() };
+                        }
+                    }
+                    "response.output_item.done" if event["item"]["type"] == "reasoning" => {
+                        let item = &event["item"];
+                        let text = |key: &str| item[key].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n\n")).unwrap_or_default();
+                        let summary = text("summary");
+                        let content = text("content");
+                        let finalized = if summary.is_empty() { content } else { summary };
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?;
+                        let content = if finalized.is_empty() { reasoning.get(&index).cloned().unwrap_or_default() } else { finalized };
+                        reasoning.insert(index, content.clone());
+                        yield pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content };
+                    }
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = &event["item"];
                         if provider == "openai-chatgpt" && item["namespace"] != NAMESPACE { Err(Error::Model("unexpected OpenAI tool namespace".into()))?; }
                         let call = ToolCall { id:field(item,"call_id")?.into(), name:field(item,"name")?.into(), arguments:String::new() };
                         if calls.insert(index, call.clone()).is_some() { Err(Error::Model("duplicate OpenAI tool index".into()))?; }
-                        yield ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:String::new() });
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:String::new() }));
                     }
                     "response.function_call_arguments.delta" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let delta = field(&event,"delta")?;
                         calls.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI tool call".into()))?.arguments.push_str(delta);
-                        yield ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta.into() });
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta.into() }));
                     }
                     "response.completed" | "response.incomplete" => {
                         let response = &event["response"];
@@ -583,8 +953,9 @@ impl Model for OpenAiResponses {
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
-                        yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
-                        yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
+                        let reasoning: String = reasoning.into_values().collect();
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() }));
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
                     "response.failed" | "error" => {
@@ -597,6 +968,8 @@ impl Model for OpenAiResponses {
                             Error::Model("OpenAI account quota or billing limit reached".into())
                         } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
                             Error::RetryableModel("OpenAI returned a transient stream error".into())
+                        } else if pi_rs_core::provider_context_overflow(error, &error_secrets) {
+                            Error::Model("context window exceeded".into())
                         } else {
                             response_error(code, None)
                         })?;
@@ -615,6 +988,211 @@ impl Model for OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn interleaved_text_items_have_boundaries_and_legacy_projection() {
+        use std::io::{Read, Write};
+        for legacy in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let _ = socket.read(&mut [0; 8192]).unwrap();
+                let events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"a"}),
+                    json!({"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning"}}),
+                    json!({"type":"response.reasoning_text.delta","output_index":1,"delta":"r"}),
+                    json!({"type":"response.output_item.added","output_index":2,"item":{"type":"message"}}),
+                    json!({"type":"response.refusal.delta","output_index":2,"delta":"b"}),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"c"}),
+                    json!({"type":"response.output_item.done","output_index":2,"item":{"type":"message","content":[{"type":"refusal","refusal":"B"}]}}),
+                    json!({"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","content":[{"text":"R"}]}}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"AC"}]}}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "key".into(),
+                "fixture",
+            )
+            .unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream: pi_rs_core::EnrichedModelStream = if legacy {
+                Box::pin(
+                    model
+                        .stream(request)
+                        .await
+                        .unwrap()
+                        .map(|event| event.map(pi_rs_core::EnrichedModelEvent::Legacy)),
+                )
+            } else {
+                model.stream_enriched(request).await.unwrap()
+            };
+            let mut seen = Vec::new();
+            while let Some(event) = stream.next().await {
+                use pi_rs_core::EnrichedModelEvent::*;
+                match event.unwrap() {
+                    TextStart { index } => seen.push(format!("start:{index}")),
+                    TextDelta { index, delta } => seen.push(format!("delta:{index}:{delta}")),
+                    TextEnd { index, content } => seen.push(format!("end:{index}:{content}")),
+                    ReasoningStart { index } => seen.push(format!("reasoning-start:{index}")),
+                    ReasoningDelta { index, delta } => {
+                        seen.push(format!("reasoning-delta:{index}:{delta}"))
+                    }
+                    ReasoningEnd { index, content } => {
+                        seen.push(format!("reasoning-end:{index}:{content}"))
+                    }
+                    Legacy(ModelEvent::Text(delta)) => seen.push(format!("text:{delta}")),
+                    Legacy(ModelEvent::Reasoning(delta)) => seen.push(format!("reasoning:{delta}")),
+                    _ => {}
+                }
+            }
+            worker.join().unwrap();
+            let expected = if legacy {
+                vec!["text:a", "reasoning:r", "text:b", "text:c"]
+            } else {
+                vec![
+                    "start:0",
+                    "delta:0:a",
+                    "reasoning-start:1",
+                    "reasoning-delta:1:r",
+                    "start:2",
+                    "delta:2:b",
+                    "delta:0:c",
+                    "end:2:B",
+                    "reasoning-end:1:R",
+                    "end:0:AC",
+                ]
+            };
+            assert_eq!(seen, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_reasoning_text_and_retains_it_in_metadata() {
+        use std::io::{Read, Write};
+        for (mixed, legacy) in [(false, false), (true, false), (false, true)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let mut events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"Consider "}),
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"this."}),
+                ];
+                let summary = if mixed {
+                    json!([{"text":"Short summary"}])
+                } else {
+                    json!([])
+                };
+                if mixed {
+                    events.push(json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Short summary"}));
+                    events.push(
+                        json!({"type":"response.reasoning_summary_part.done","output_index":0}),
+                    );
+                }
+                let item = json!({"type":"reasoning","id":"rs_1","summary":summary,"content":[{"type":"reasoning_text","text":"Consider this."}]});
+                events
+                    .push(json!({"type":"response.output_item.done","output_index":0,"item":item}));
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":[item]}}));
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "key".into(),
+                "fixture",
+            )
+            .unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream: pi_rs_core::EnrichedModelStream = if legacy {
+                Box::pin(
+                    model
+                        .stream(request)
+                        .await
+                        .unwrap()
+                        .map(|event| event.map(pi_rs_core::EnrichedModelEvent::Legacy)),
+                )
+            } else {
+                model.stream_enriched(request).await.unwrap()
+            };
+            let mut deltas = Vec::new();
+            let mut ended = None;
+            let mut reasoning = None;
+            let mut complete = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    pi_rs_core::EnrichedModelEvent::ReasoningDelta { delta, .. } => {
+                        deltas.push(delta)
+                    }
+                    pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Reasoning(delta)) => {
+                        deltas.push(delta)
+                    }
+                    pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content } => {
+                        ended = Some((index, content))
+                    }
+                    pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)) => {
+                        reasoning = metadata.reasoning
+                    }
+                    pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { .. }) => {
+                        complete = true
+                    }
+                    _ => {}
+                }
+            }
+            worker.join().unwrap();
+            let expected_deltas = if mixed {
+                vec!["Consider ", "this.", "Short summary", "\n\n"]
+            } else {
+                vec!["Consider ", "this."]
+            };
+            assert_eq!(deltas, expected_deltas);
+            assert_eq!(
+                reasoning.as_deref(),
+                Some(if mixed {
+                    "Short summary"
+                } else {
+                    "Consider this."
+                })
+            );
+            assert_eq!(
+                ended,
+                (!legacy).then(|| (
+                    0,
+                    if mixed {
+                        "Short summary"
+                    } else {
+                        "Consider this."
+                    }
+                    .to_owned()
+                ))
+            );
+            assert!(complete);
+        }
+    }
+
     #[tokio::test]
     async fn http_400_does_not_classify_echoed_credential_as_subscription_code() {
         use std::io::{Read, Write};
@@ -1016,11 +1594,11 @@ mod tests {
             max_output_tokens: 16,
         };
         assert_eq!(
-            payload(&request, "shared", &scope_a)["input"][0]["type"],
+            payload(&request, "shared", &scope_a, "developer")["input"][0]["type"],
             "reasoning"
         );
         assert!(
-            !payload(&request, "shared", &scope_b)
+            !payload(&request, "shared", &scope_b, "developer")
                 .to_string()
                 .contains("encrypted_content")
         );
@@ -1156,7 +1734,7 @@ mod tests {
 
     #[test]
     fn plan_payload_uses_stateless_stream_and_namespaced_tools() {
-        let body = payload(&request(), "openai-chatgpt", "openai-chatgpt");
+        let body = payload(&request(), "openai-chatgpt", "openai-chatgpt", "developer");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "developer");
@@ -1178,7 +1756,7 @@ mod tests {
             }],
             replay: None,
         });
-        let body = payload(&request, "openai", "openai");
+        let body = payload(&request, "openai", "openai", "developer");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "read");
         assert!(body["input"][2].get("namespace").is_none());
@@ -1192,7 +1770,7 @@ mod tests {
     fn tool_images_are_sent_as_images_not_base64_text() {
         let mut request = request();
         request.messages.push(Message::Tool { is_structured: Some(true), is_error: false, call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
-        let body = payload(&request, "openai-chatgpt", "openai-chatgpt");
+        let body = payload(&request, "openai-chatgpt", "openai-chatgpt", "developer");
         let output = &body["input"][2]["output"];
         assert_eq!(output[0]["type"], "input_text");
         assert!(!output[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
@@ -1213,14 +1791,524 @@ mod tests {
             is_structured: Some(false),
         });
         assert_eq!(
-            payload(&request, "openai", "openai")["input"][2]["output"],
+            payload(&request, "openai", "openai", "developer")["input"][2]["output"],
             text
         );
         request.messages[2] =
             serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
-        let output = &payload(&request, "openai", "openai")["input"][2]["output"];
+        let output = &payload(&request, "openai", "openai", "developer")["input"][2]["output"];
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(output[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
+    }
+
+    #[test]
+    fn responses_cache_modes_follow_model_capabilities() {
+        let client =
+            OpenAiResponses::new_api("https://example.com/v1/responses", "token".into()).unwrap();
+        for (retention, explicit, expected) in [
+            (CacheRetention::Short, false, json!({})),
+            (CacheRetention::Short, true, json!({})),
+            (
+                CacheRetention::Long,
+                false,
+                json!({"prompt_cache_retention":"24h"}),
+            ),
+            (
+                CacheRetention::Long,
+                true,
+                json!({"prompt_cache_options":{"ttl":"30m"}}),
+            ),
+            (
+                CacheRetention::None,
+                true,
+                json!({"prompt_cache_options":{"mode":"explicit"}}),
+            ),
+        ] {
+            let mut body = json!({});
+            client
+                .clone()
+                .with_cache_retention(retention, explicit)
+                .apply_cache(&mut body);
+            assert_eq!(body, expected);
+        }
+        let mut body = json!({"prompt_cache_retention":"user"});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, false)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_retention"], "user");
+        let mut body = json!({"prompt_cache_retention":"24h"});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, true)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_retention":"24h"}));
+        let mut body = json!({"prompt_cache_options":{"mode":"explicit"}});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, false)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_options":{"mode":"explicit"}}));
+        assert!(
+            validate_sampling(&BTreeMap::from([
+                ("prompt_cache_retention".into(), json!("24h")),
+                ("prompt_cache_options".into(), json!({"ttl":"30m"})),
+            ]))
+            .is_err()
+        );
+        let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, true)
+            .without_cache()
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_options":{"mode":"explicit"}}));
+        let plan = OpenAiResponses::new("http://localhost/responses", "token".into()).unwrap();
+        let mut body = json!({});
+        plan.with_cache_retention(CacheRetention::Long, true)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({}));
+        let plan = OpenAiResponses::new("http://localhost/responses", "token".into()).unwrap();
+        let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
+        plan.without_cache().apply_cache(&mut body);
+        assert_eq!(body, json!({}));
+    }
+
+    #[tokio::test]
+    async fn sdk_instruction_role_defaults_to_system_and_can_enable_developer() {
+        use std::io::{Read, Write};
+        for (developer, expected) in [
+            (None, "system"),
+            (Some(true), "developer"),
+            (Some(false), "system"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let model =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap();
+            let model = if let Some(enabled) = developer {
+                model.with_developer_role(enabled)
+            } else {
+                model
+            };
+            let mut req = request();
+            req.messages = vec![Message::System {
+                content: "rules".into(),
+            }];
+            let _ = model.stream(req).await;
+            assert_eq!(server.join().unwrap()["input"][0]["role"], expected);
+        }
+    }
+
+    #[test]
+    fn instruction_role_is_applied_and_changes_recovery_identity() {
+        let model =
+            OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
+        assert_ne!(
+            model.context_identity(),
+            model.clone().with_developer_role(true).context_identity()
+        );
+        assert_eq!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_developer_role(true)
+                .with_developer_role(false)
+                .context_identity()
+        );
+        let mut req = request();
+        req.messages = vec![
+            Message::System {
+                content: "rules".into(),
+            },
+            Message::User {
+                content: "hello".into(),
+            },
+        ];
+        let body = payload(&req, "openai", "openai", "system");
+        assert_eq!(body["input"][0]["role"], "system");
+        assert_eq!(body["input"][1]["role"], "user");
+    }
+
+    #[test]
+    fn sdk_session_routing_formats_preserve_explicit_headers() {
+        let model = OpenAiResponses::new_api_provider(
+            "https://openrouter.ai/api/v1/responses",
+            "fixture".into(),
+            "openrouter",
+        )
+        .unwrap();
+        let router = model.clone().with_session_routing("session-one").unwrap();
+        assert_eq!(router.headers["x-session-id"], "session-one");
+        let openai = model
+            .clone()
+            .with_session_affinity_format(SessionAffinityFormat::OpenAi)
+            .with_session_routing("session-one")
+            .unwrap();
+        assert_eq!(openai.headers["session-id"], "session-one");
+        assert_eq!(openai.headers["x-client-request-id"], "session-one");
+        let nosession = model
+            .clone()
+            .with_session_affinity_format(SessionAffinityFormat::OpenAiNoSession)
+            .with_session_routing("session-one")
+            .unwrap();
+        assert!(!nosession.headers.contains_key("session-id"));
+        assert_eq!(nosession.headers["x-client-request-id"], "session-one");
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-session-id", "explicit".parse().unwrap());
+        let overridden = model
+            .clone()
+            .with_headers(headers)
+            .with_session_routing("日本")
+            .unwrap();
+        assert_eq!(overridden.headers["x-session-id"], "explicit");
+        assert!(model.clone().with_session_routing("日本").is_err());
+        let disabled_cache = model
+            .clone()
+            .without_cache()
+            .with_session_routing("日本")
+            .unwrap();
+        assert!(disabled_cache.headers.is_empty());
+        let subdomain = OpenAiResponses::new_api_provider(
+            "https://edge.openrouter.ai/v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(subdomain.headers["x-session-id"], "id");
+        let uppercase = OpenAiResponses::new_api_provider(
+            "https://OPENROUTER.AI/v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(uppercase.headers["session-id"], "id");
+        let path = OpenAiResponses::new_api_provider(
+            "https://example.com/openrouter.ai/../v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(path.headers["x-session-id"], "id");
+        assert!(
+            model
+                .clone()
+                .with_session_routing("")
+                .unwrap()
+                .headers
+                .is_empty()
+        );
+        assert!(
+            model
+                .with_session_affinity_format(SessionAffinityFormat::Disabled)
+                .with_session_routing("日本")
+                .unwrap()
+                .headers
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_session_routing_sends_headers_and_summary_omits_them() {
+        use std::io::{Read, Write};
+        for (summary, enriched) in [(false, false), (true, false), (false, true), (true, true)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                while !data.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 2048];
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&chunk[..n]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                String::from_utf8(data).unwrap().to_ascii_lowercase()
+            });
+            let model =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap();
+            match (summary, enriched) {
+                (true, true) => {
+                    let _ = model
+                        .stream_enriched_for_summary(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            request(),
+                        )
+                        .await;
+                }
+                (true, false) => {
+                    let _ = model
+                        .stream_for_summary(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), request())
+                        .await;
+                }
+                (false, true) => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            "session-one",
+                            request(),
+                        )
+                        .await;
+                }
+                (false, false) => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            "session-one",
+                            request(),
+                        )
+                        .await;
+                }
+            }
+            let sent = server.join().unwrap();
+            assert_eq!(sent.contains("session-id: session-one\r\n"), !summary);
+            assert_eq!(
+                sent.contains("x-client-request-id: session-one\r\n"),
+                !summary
+            );
+        }
+    }
+
+    #[test]
+    fn session_cache_keys_are_clamped_and_respect_explicit_keys() {
+        let model =
+            OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
+        let identity = format!("{}tail", "猫".repeat(64));
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .context_identity()
+        );
+        assert_eq!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .with_prompt_cache_key_enabled(true)
+                .context_identity()
+        );
+        let mut body = json!({});
+        model
+            .clone()
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "猫".repeat(64));
+        let mut body = json!({"prompt_cache_key":"configured"});
+        model
+            .clone()
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "configured");
+        let mut body = json!({});
+        model
+            .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
+        let mut body = json!({"prompt_cache_key":"explicit"});
+        model
+            .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "explicit");
+        let mut body = json!({});
+        model
+            .clone()
+            .with_session_cache_key("")
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
+        let mut body = json!({});
+        model
+            .with_session_cache_key(&identity)
+            .without_cache()
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_prompt_cache_key_is_omitted_from_sdk_session_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut block = [0; 4096];
+            let end = loop {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let size: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + size {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            body
+        });
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_prompt_cache_key_enabled(false);
+        let _ = model
+            .stream_enriched_in_session_with_identity(
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                "external-session",
+                request(),
+            )
+            .await;
+        assert!(server.join().unwrap().get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_cache_policy_is_sent_without_an_automatic_alternative() {
+        use std::io::{Read, Write};
+        for (explicit, key, value) in [
+            (true, "prompt_cache_retention", json!("24h")),
+            (false, "prompt_cache_options", json!({"mode":"explicit"})),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            });
+            let client =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap()
+                    .with_cache_retention(CacheRetention::Long, explicit)
+                    .with_sampling(BTreeMap::from([(key.into(), value.clone())]))
+                    .unwrap();
+            let _ = client.stream(request()).await;
+            let body = server.join().unwrap();
+            assert_eq!(body[key], value);
+            let other = if explicit {
+                "prompt_cache_options"
+            } else {
+                "prompt_cache_retention"
+            };
+            assert!(body.get(other).is_none());
+        }
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {

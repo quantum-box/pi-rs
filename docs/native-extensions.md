@@ -35,8 +35,10 @@ the extension state and its `entries` contain typed JSON data. Entries appear
 as Pi-style `custom` entries in RPC and follow the active branch across checkout
 and restart. An SDK host can also call `AgentSession::append_custom_entry`.
 [`bookmark_entry.rs`](../crates/extensions/examples/bookmark_entry.rs) shows an
-executable extension. This currently covers command results and the SDK; it
-does not yet expose immediate `appendEntry` calls from every hook or tool.
+executable extension. Session-owned resource discovery callbacks can also call
+`ToolHost::append_entry` immediately and read active-branch entries through the
+host. Other callback and tool paths do not yet all expose these operations; see
+the [native parity details](native-parity.md#active-run-native-custom-messages).
 
 Commands can also add messages to the next model context. Implement
 `supports_command_effects` and return `ExtensionCommandEffects` from
@@ -52,9 +54,20 @@ multiple trigger actions in one command produce one turn. SDK hosts can call
 `AgentSession::extension_command_and_run` for commands that may request a turn;
 the synchronous command API rejects those requests. An idle SDK host can also
 call `AgentSession::send_custom_message(message, true)` to start a model turn,
-or pass `false` to save the message without a turn. Hooks and tools do not yet
-expose Pi's immediate `sendMessage` API, streaming delivery modes, or custom
-message renderers.
+or pass `false` to save the message without a turn. Native tools and supported
+callbacks can call `ToolHost::send_message` with steering, follow-up, next-turn,
+trigger-turn, or after-turn delivery. Supported callbacks and recovery behavior
+are listed in the [native parity details](native-parity.md#active-run-native-custom-messages).
+Custom message renderers are not yet supported.
+
+Executable hosts advertising `command_failure_classification_v1` accept the
+`command_effects_classified_v1` request. Its successful protocol envelope
+contains a typed `Ok` effects value or an `Err` containing `Callback` or
+`Transport`. An outer protocol error is a host or dispatch failure. A host
+without this capability receives the existing command request; its untyped
+errors remain failures because their origin is unknown. The standard extension
+server advertises the capability and propagates typed errors from extensions it
+hosts, including executable extensions.
 
 ## Write another extension
 

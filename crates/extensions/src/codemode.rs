@@ -86,9 +86,38 @@ impl Drop for WorkerPermit {
 fn worker_limit() -> usize {
     std::env::var("PI_CODEMODE_MAX_WORKERS")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0 && *value <= 1024)
+        .and_then(|value| parse_worker_limit(&value))
         .unwrap_or(2)
+}
+
+fn parse_worker_limit(value: &str) -> Option<usize> {
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let radix_number = |digits: &str, radix| {
+        (!digits.is_empty() && digits.chars().all(|c| c.is_ascii() && c.is_digit(radix)))
+            .then(|| u64::from_str_radix(digits, radix).ok().map(|n| n as f64))
+            .flatten()
+    };
+    // Pi uses JavaScript Number(), which also accepts unsigned radix prefixes.
+    let number = if let Some(digits) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        radix_number(digits, 16)?
+    } else if let Some(digits) = value
+        .strip_prefix("0o")
+        .or_else(|| value.strip_prefix("0O"))
+    {
+        radix_number(digits, 8)?
+    } else if let Some(digits) = value
+        .strip_prefix("0b")
+        .or_else(|| value.strip_prefix("0B"))
+    {
+        radix_number(digits, 2)?
+    } else {
+        value.parse::<f64>().ok()?
+    };
+    (number.is_finite() && number.fract() == 0.0 && number > 0.0 && number <= 1024.0)
+        .then_some(number as usize)
 }
 
 async fn acquire_worker(
@@ -647,7 +676,17 @@ fn install_globals(
             async move {
                 let result = match serde_json::from_str::<Value>(&arguments) {
                     Ok(args) if has_operations => {
-                        let _permit = slots.acquire().await.expect("model operation slots");
+                        // Only inference consumes Pi's four model-call slots.
+                        // Discovery and model resolution must remain available
+                        // while slow classifier or image requests are in flight.
+                        let _permit = if matches!(
+                            args["action"].as_str(),
+                            Some("classify" | "generateImages")
+                        ) {
+                            Some(slots.acquire().await.expect("model operation slots"))
+                        } else {
+                            None
+                        };
                         if model_usage.lock().expect("codemode output").limit_exceeded {
                             return Ok::<_, rquickjs::Error>(
                                 json!({"ok":false,"error":"Script output limit exceeded"})
@@ -1304,6 +1343,18 @@ fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Stri
 mod tests {
     use super::*;
 
+    #[test]
+    fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
+        for value in ["3", " 3 ", "3.0", "3e0", "+3", "0x3", "0o3", "0b11"] {
+            assert_eq!(parse_worker_limit(value), Some(3), "{value:?}");
+        }
+        for value in [
+            "", "0", "-1", "1.5", "NaN", "Infinity", "1025", "3workers", "+0x3", "0x+3",
+        ] {
+            assert_eq!(parse_worker_limit(value), None, "{value:?}");
+        }
+    }
+
     #[tokio::test]
     async fn worker_admission_is_bounded_and_cancellable_without_leaking_permits() {
         assert_eq!(WORKER_WAIT_LIMIT, Duration::from_secs(60));
@@ -1590,6 +1641,88 @@ mod tests {
     }
 
     struct Host;
+    #[tokio::test]
+    async fn model_discovery_remains_available_when_inference_slots_are_full() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ModelHost {
+            started: AtomicUsize,
+            changed: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for ModelHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                match args["action"].as_str() {
+                    Some("resolve") => Outcome::Structured {
+                        data: json!(true),
+                        attachments: vec![],
+                    },
+                    Some("classify") => {
+                        self.started.fetch_add(1, Ordering::SeqCst);
+                        self.changed.notify_one();
+                        let _permit = self.release.acquire().await.unwrap();
+                        Outcome::Structured {
+                            data: json!({"stopReason":"stop","answers":{}}),
+                            attachments: vec![],
+                        }
+                    }
+                    Some("list") => {
+                        while self.started.load(Ordering::SeqCst) < 4 {
+                            self.changed.notified().await;
+                        }
+                        self.release.add_permits(4);
+                        Outcome::Structured {
+                            data: json!([]),
+                            attachments: vec![],
+                        }
+                    }
+                    _ => Outcome::Failed("unexpected action".into()),
+                }
+            }
+        }
+        let host = Arc::new(ModelHost {
+            started: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let code = r#"
+            const model = {provider:'fixture', id:'fixture'};
+            const context = {state:{}, questions:{x:{type:'bool', instructions:'test', criteria:{true:'yes', false:'no'}}}};
+            const calls = Array.from({length:4}, () => models.classify(model, context));
+            await models.getModelsOfType('classifier');
+            await Promise.all(calls);
+            text('discovery completed');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(3)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            host,
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected completed script")
+        };
+        assert_eq!(data["isError"], false, "{data}");
+        assert!(data["content"].to_string().contains("discovery completed"));
+    }
+
     #[tokio::test]
     async fn model_calls_validate_before_host_and_preserve_provider_errors() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3136,6 +3269,72 @@ mod tests {
         }
         session.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn model_catalogue_validates_search_arguments_before_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CatalogHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for CatalogHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert!(args["id"].is_null() || args["id"] == "fixture");
+                Outcome::Structured {
+                    data: json!([{"id":"fixture"}]),
+                    attachments: vec![],
+                }
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let code = r#"
+            for (const call of [
+                () => models.getModelsOfType('chat', 12),
+                () => models.getAvailableOfType('image', {}),
+                () => models.getModelOfType('classifier', 'fixture'),
+                () => models.getModelOfType('chat', null, 'fixture'),
+                () => models.getModelOfType('chat', 'fixture', 42),
+                () => models.getModelsOfType('invalid'),
+            ]) {
+                let rejected = false;
+                try { await call(); } catch (_) { rejected = true; }
+                if (!rejected) throw new Error('invalid search accepted');
+            }
+            await models.getModelsOfType('chat', null);
+            await models.getModelsOfType('chat', 'fixture', 'ignored');
+            await models.getAvailableOfType('chat', NaN);
+            const model = await models.getModelOfType('chat', new String('fixture'), 'fixture');
+            if (model.id !== 'fixture') throw new Error('valid search failed');
+            text('ok');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(2)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(CatalogHost(calls.clone())),
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected completed script")
+        };
+        assert_eq!(data["isError"], false, "{data}");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
     #[test]
     fn options_are_restricted_to_the_first_line() {
         let reply = run("text('first');\n// @options: {}", None);

@@ -141,6 +141,17 @@ impl Editor {
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
     }
+    // Only transcript search retains U+0085 internally. Rendering remains
+    // sanitized by Span; all other control characters stay excluded.
+    pub(super) fn insert_search(&mut self, text: &str) {
+        self.remember();
+        let text: String = text
+            .chars()
+            .filter(|character| !character.is_control() || *character == '\u{85}')
+            .collect();
+        self.text.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+    }
     /// Insert a typed character, grouping consecutive typing as Pi does.
     /// Paste and programmatic insertion continue to use the atomic `insert`.
     pub fn type_character(&mut self, character: char) {
@@ -376,6 +387,14 @@ impl Editor {
     }
 
     pub fn action(&mut self, action: &str) -> bool {
+        self.action_inner(action, false)
+    }
+
+    pub(super) fn search_action(&mut self, action: &str) -> bool {
+        self.action_inner(action, true)
+    }
+
+    fn action_inner(&mut self, action: &str, search: bool) -> bool {
         if !matches!(
             action,
             "tui.editor.deleteWordBackward"
@@ -445,7 +464,11 @@ impl Editor {
             "tui.editor.yank" => {
                 if let Some(text) = self.kills.first().cloned() {
                     let start = self.cursor;
-                    self.insert(&text);
+                    if search {
+                        self.insert_search(&text);
+                    } else {
+                        self.insert(&text);
+                    }
                     self.yank = Some((start..self.cursor, 0));
                 }
             }

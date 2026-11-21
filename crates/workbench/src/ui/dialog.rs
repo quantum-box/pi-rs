@@ -117,12 +117,19 @@ impl Dialog {
         }
     }
     pub fn paste(&mut self, text: &str) {
-        if matches!(
-            self.request,
-            UiRequest::Input { .. } | UiRequest::Editor { .. }
-        ) && self.editor.text.len().saturating_add(text.len()) <= 1024 * 1024
-        {
-            self.editor.insert(text);
+        let text = match self.request {
+            UiRequest::Input { .. } => Cow::Owned(text.replace(['\r', '\n'], "")),
+            UiRequest::Editor { .. } if text.contains('\r') => {
+                Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+            }
+            UiRequest::Editor { .. } => Cow::Borrowed(text),
+            _ => return,
+        };
+        // Enforce the response limit after the same sanitization and tab
+        // expansion that insertion uses, so pasted tabs cannot exceed it.
+        let text = super::render::clean(&text);
+        if self.editor.text.len().saturating_add(text.len()) <= 1024 * 1024 {
+            self.editor.insert(&text);
         }
     }
     pub fn input(&mut self, key: KeyEvent, keys: &Keys) -> Option<UiResponse> {
@@ -529,6 +536,41 @@ mod tests {
             Some(UiResponse::Cancelled)
         );
     }
+    #[test]
+    fn single_line_paste_removes_line_breaks_and_bounds_expanded_tabs() {
+        let mut dialog = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Input {
+                title: "Input".into(),
+                initial_value: Some("start".into()),
+                placeholder: None,
+                timeout: None,
+            },
+        );
+        dialog.paste("\r\n一\ntwo\rthree\tend");
+        assert_eq!(dialog.editor.text, "start一twothree    end");
+        let keys = Keys::default();
+        assert!(matches!(
+            dialog.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys),
+            Some(UiResponse::Text(text)) if text == "start一twothree    end"
+        ));
+
+        dialog.editor.replace("x".repeat(1024 * 1024 - 3));
+        dialog.paste("\t");
+        assert_eq!(dialog.editor.text.len(), 1024 * 1024 - 3);
+
+        let mut multiline = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: None,
+                timeout: None,
+            },
+        );
+        multiline.paste("a\r\nb\rc\nd\te");
+        assert_eq!(multiline.editor.text, "a\nb\nc\nd    e");
+    }
+
     #[test]
     fn editor_dialog_coalesces_typed_words_but_not_paste() {
         let keys = Keys::default();

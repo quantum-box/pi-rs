@@ -50,8 +50,20 @@ pub enum Token {
 }
 pub enum Query {
     Tokens(Vec<Token>),
-    Regex(fancy_regex::Regex),
+    Regex(SearchRegex),
     Invalid,
+}
+pub enum SearchRegex {
+    Linear(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+impl SearchRegex {
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            Self::Linear(regex) => regex.is_match(text),
+            Self::Fancy(regex) => regex.is_match(text).unwrap_or(false),
+        }
+    }
 }
 impl Query {
     pub fn new(query: &str) -> Self {
@@ -60,13 +72,26 @@ impl Query {
             if pattern.trim_matches(is_whitespace).is_empty() {
                 return Self::Invalid;
             }
-            return fancy_regex::RegexBuilder::new(&format!(
+            let pattern = pattern.trim_matches(is_whitespace);
+            let linear = format!(
                 "(?i){}",
-                pattern.trim_matches(is_whitespace)
-            ))
-            .backtrack_limit(100_000)
-            .build()
-            .map_or(Self::Invalid, Self::Regex);
+                js_regex_dots(&ascii_regex_classes(pattern), pattern)
+            );
+            if let Ok(regex) = regex::Regex::new(&linear) {
+                return Self::Regex(SearchRegex::Linear(regex));
+            }
+            // The advanced engine cannot disable Unicode for boundaries.
+            // Avoid mixing its Unicode boundaries with ASCII word classes.
+            let advanced = format!(
+                "(?i){}",
+                js_regex_dots(&translate_regex_classes(pattern, false), pattern)
+            );
+            return fancy_regex::RegexBuilder::new(&advanced)
+                .backtrack_limit(100_000)
+                .build()
+                .map_or(Self::Invalid, |regex| {
+                    Self::Regex(SearchRegex::Fancy(regex))
+                });
         }
         let mut tokens = Vec::new();
         let mut buffer = String::new();
@@ -115,7 +140,7 @@ impl Query {
                 .fields
                 .iter()
                 .enumerate()
-                .find(|(_, field)| regex.is_match(field).unwrap_or(false))
+                .find(|(_, field)| regex.is_match(field))
                 .map(|(index, _)| if index == 0 { 0 } else { TEXT }),
             Self::Tokens(tokens) => {
                 let mut total = 0;
@@ -149,7 +174,142 @@ impl Query {
         }
     }
 }
-fn is_whitespace(character: char) -> bool {
+// JavaScript's dot excludes all four line terminators. Preserve native inline
+// dotall behavior and avoid rewriting patterns with user bracket expressions.
+fn js_regex_dots(pattern: &str, original: &str) -> String {
+    let mut escaped = false;
+    for (offset, ch) in original.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '[' {
+            return pattern.to_owned();
+        } else if ch == '('
+            && let Some(flags) = original[offset..].strip_prefix("(?")
+            && flags
+                .chars()
+                .take_while(|c| "imsUx-".contains(*c))
+                .any(|c| c == 's')
+        {
+            return pattern.to_owned();
+        }
+    }
+    let mut result = String::with_capacity(pattern.len());
+    let mut escaped = false;
+    let mut in_class = false;
+    for ch in pattern.chars() {
+        if escaped {
+            result.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            result.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        }
+        if ch == ']' {
+            in_class = false;
+        }
+        if ch == '.' && !in_class {
+            result.push_str(r"[^\n\r\x{2028}\x{2029}]");
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+// JavaScript's non-Unicode regular expressions use ASCII for these classes.
+// Translate single-shorthand bracket expressions too. More complex bracket
+// expressions remain untouched; their union and negation need a JS parser.
+fn ascii_regex_classes(pattern: &str) -> String {
+    translate_regex_classes(pattern, true)
+}
+
+fn translate_regex_classes(pattern: &str, ascii_boundary: bool) -> String {
+    if !ascii_boundary {
+        let mut escaped = false;
+        for character in pattern.chars() {
+            if escaped {
+                if matches!(character, 'b' | 'B') {
+                    return pattern.to_owned();
+                }
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '[' {
+                return pattern.to_owned();
+            }
+        }
+    }
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '[' {
+            let mut probe = chars.clone();
+            let negated = probe.peek() == Some(&'^');
+            if negated {
+                probe.next();
+            }
+            let shorthand = match (probe.next(), probe.next(), probe.next()) {
+                (Some('\\'), Some(kind @ ('d' | 'D' | 'w' | 'W')), Some(']')) => Some(kind),
+                _ => None,
+            };
+            if let Some(kind) = shorthand {
+                let positive = matches!(kind, 'd' | 'w') != negated;
+                let word = matches!(kind, 'w' | 'W');
+                result.push_str(match (word, positive) {
+                    (false, true) => "(?-i:[0-9])",
+                    (false, false) => "(?-i:[^0-9])",
+                    (true, true) => "(?-i:[A-Za-z0-9_])",
+                    (true, false) => "(?-i:[^A-Za-z0-9_])",
+                });
+                chars = probe;
+            } else {
+                result.push('[');
+                let mut escaped = false;
+                for next in chars.by_ref() {
+                    result.push(next);
+                    if escaped {
+                        escaped = false;
+                    } else if next == '\\' {
+                        escaped = true;
+                    } else if next == ']' {
+                        break;
+                    }
+                }
+            }
+        } else if character == '\\' {
+            let Some(next) = chars.next() else {
+                result.push(character);
+                break;
+            };
+            let replacement = match next {
+                'd' => Some("(?-i:[0-9])"),
+                'D' => Some("(?-i:[^0-9])"),
+                'w' => Some("(?-i:[A-Za-z0-9_])"),
+                'W' => Some("(?-i:[^A-Za-z0-9_])"),
+                'b' if ascii_boundary => Some(r"(?-u:\b)"),
+                'B' if ascii_boundary => Some(r"(?-u:\B)"),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                result.push_str(replacement);
+            } else {
+                result.push(character);
+                result.push(next);
+            }
+        } else {
+            result.push(character);
+        }
+    }
+    result
+}
+pub(super) fn is_whitespace(character: char) -> bool {
     matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
 }
 fn normalize(value: &str) -> String {
@@ -160,7 +320,7 @@ fn normalize(value: &str) -> String {
         .join(" ")
 }
 
-fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
+pub(super) fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
     let query: Vec<_> = query.encode_utf16().collect();
     let text: Vec<_> = text.encode_utf16().collect();
     if let Some(score) = alignment_score(&query, &text) {
@@ -238,6 +398,275 @@ fn position_score(text: &[u16], positions: &[usize]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_dot_uses_javascript_line_terminators() {
+        let doc = |text: &str| {
+            Document::new(
+                text.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for pattern in [r"re:^.$", r"re:^(?=.).$"] {
+            for text in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+                assert!(
+                    Query::new(pattern).score(&doc(text)).is_none(),
+                    "{pattern} {text:?}"
+                );
+            }
+            for text in ["a", "\u{85}"] {
+                assert!(
+                    Query::new(pattern).score(&doc(text)).is_some(),
+                    "{pattern} {text:?}"
+                );
+            }
+        }
+        assert!(Query::new(r"re:^(?=\.)\.$").score(&doc(".")).is_some());
+        assert!(Query::new(r"re:^(.)\1$").score(&doc("\r\r")).is_none());
+        let combined = Query::new(r"re:^(?=\w)..$");
+        assert!(combined.score(&doc("aZ")).is_some());
+        assert!(combined.score(&doc("a\r")).is_none());
+        assert!(combined.score(&doc("éZ")).is_none());
+        let bracket = Query::new(r"re:^[\w].$");
+        assert!(bracket.score(&doc("aZ")).is_some());
+        assert!(bracket.score(&doc("éZ")).is_none());
+        // Dot rewriting is intentionally skipped for user bracket expressions.
+        assert!(bracket.score(&doc("a\r")).is_some());
+        assert_eq!(js_regex_dots("(?s:.)", "(?s:.)"), "(?s:.)");
+        assert_eq!(js_regex_dots("[.]", "[.]"), "[.]");
+        assert!(Query::new(r"re:(?s)^.$").score(&doc("\n")).is_some());
+        for text in ["s\r", "(s\r"] {
+            assert!(Query::new(r"re:\(?s.").score(&doc(text)).is_none());
+        }
+        for text in ["sX", "(sX"] {
+            assert!(Query::new(r"re:\(?s.").score(&doc(text)).is_some());
+        }
+        assert_eq!(js_regex_dots(r"\\(?s:.)", r"\\(?s:.)"), r"\\(?s:.)");
+        let long = format!("{}z", "a".repeat(50_000));
+        assert!(Query::new(r"re:^.*z(?=$)").score(&doc(&long)).is_some());
+    }
+
+    #[test]
+    fn regex_shorthand_classes_match_javascript_ascii_rules() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for (pattern, yes, no) in [
+            (r"re:^\d+$", "123", "١٢٣"),
+            (r"re:^\D+$", "١٢٣", "123"),
+            (r"re:^\w+$", "A_2", "K"),
+            (r"re:^\W+$", "K", "A_2"),
+        ] {
+            assert!(
+                Query::new(pattern).score(&doc(yes)).is_some(),
+                "{pattern} {yes}"
+            );
+            assert!(
+                Query::new(pattern).score(&doc(no)).is_none(),
+                "{pattern} {no}"
+            );
+        }
+        assert!(Query::new(r"re:^\\d$").score(&doc(r"\d")).is_some());
+        assert_eq!(ascii_regex_classes(r"[\d]"), r"(?-i:[0-9])");
+    }
+
+    #[test]
+    fn regex_single_shorthand_brackets_use_javascript_ascii_classes() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for (pattern, yes, no) in [
+            (r"re:^[\d]+$", "123", "١٢٣"),
+            (r"re:^[^\d]+$", "١٢٣", "123"),
+            (r"re:^[\D]+$", "١٢٣", "123"),
+            (r"re:^[^\D]+$", "123", "١٢٣"),
+            (r"re:^[\w]+$", "A_2", "K"),
+            (r"re:^[^\w]+$", "K", "A"),
+            (r"re:^[\W]+$", "K", "A"),
+            (r"re:^[^\W]+$", "A_2", "K"),
+            (r"re:^[a-z]+\d$", "abc1", "abc١"),
+        ] {
+            assert!(
+                Query::new(pattern).score(&doc(yes)).is_some(),
+                "{pattern} {yes}"
+            );
+            assert!(
+                Query::new(pattern).score(&doc(no)).is_none(),
+                "{pattern} {no}"
+            );
+        }
+        assert_eq!(ascii_regex_classes(r"[a\d]"), r"[a\d]");
+        assert_eq!(ascii_regex_classes(r"\[\d\]"), r"\[(?-i:[0-9])\]");
+    }
+
+    #[test]
+    fn advanced_regex_brackets_and_boundaries_keep_original_semantics() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for pattern in [r"[\w]+(?=$)", r"\b[\w]+\b(?=$)", r"\b\w+\b(?=$)"] {
+            assert_eq!(translate_regex_classes(pattern, false), pattern);
+            assert!(
+                Query::new(&format!("re:{pattern}"))
+                    .score(&doc("fooá"))
+                    .is_some()
+            );
+        }
+        assert!(Query::new(r"re:^[\w]+$").score(&doc("fooá")).is_none());
+        assert!(Query::new(r"re:^(?=\w)\w+$").score(&doc("fooá")).is_none());
+    }
+
+    #[test]
+    fn regex_word_boundaries_use_ascii_with_non_ascii_neighbours() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for text in ["Kfoo", "fooá", "Kfooá", "foo"] {
+            assert!(
+                Query::new(r"re:\b\w+\b").score(&doc(text)).is_some(),
+                "{text}"
+            );
+        }
+        for text in ["á", "K", ""] {
+            assert!(
+                Query::new(r"re:\b\w+\b").score(&doc(text)).is_none(),
+                "{text}"
+            );
+        }
+        for text in ["Kfooá", "foo", "a_b"] {
+            assert!(
+                Query::new(r"re:\B\w+\B").score(&doc(text)).is_some(),
+                "{text}"
+            );
+        }
+        for text in ["K", "á", "a"] {
+            assert!(
+                Query::new(r"re:\B\w+\B").score(&doc(text)).is_none(),
+                "{text}"
+            );
+        }
+        for (pattern, text, expected) in [
+            (r"re:^K\bfoo\bá$", "Kfooá", true),
+            (r"re:^K\bfoo\bá$", "Kfooxá", false),
+            (r"re:^K\Bfoo\Bá$", "Kfooá", false),
+            (r"re:^K\B!$", "K!", true),
+            (r"re:^\Bfoo\b$", "foo", false),
+            (r"re:^f\Boo\b$", "foo", true),
+        ] {
+            assert_eq!(
+                Query::new(pattern).score(&doc(text)).is_some(),
+                expected,
+                "{pattern} {text}"
+            );
+        }
+        assert!(Query::new(r"re:^\\b$").score(&doc(r"\b")).is_some());
+        assert_eq!(ascii_regex_classes(r"[\b]\w"), r"[\b](?-i:[A-Za-z0-9_])");
+    }
+
+    #[test]
+    fn regex_word_boundary_finds_match_after_long_session_text() {
+        let text = format!("{} missing", "a".repeat(50_000));
+        let document = Document::new(String::new(), String::new(), String::new(), text, true);
+        assert!(Query::new(r"re:\bmissing\b").score(&document).is_some());
+        assert!(
+            Query::new(r"re:\bmissing\b(?=$)")
+                .score(&document)
+                .is_some()
+        );
+        let nonmatching = format!("{} missingx", "a".repeat(50_000));
+        let document = Document::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            nonmatching,
+            true,
+        );
+        assert!(Query::new(r"re:\bmissing\b").score(&document).is_none());
+    }
+
+    #[test]
+    fn advanced_regex_uses_javascript_ascii_shorthands_and_boundaries() {
+        let doc = |text: &str| {
+            Document::new(
+                text.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for (pattern, text, expected) in [
+            (r"re:^(?=\w)\w+$", "abc_2", true),
+            (r"re:^(?=\w)\w+$", "é", false),
+            (r"re:^(?=\W)\W+$", "é", true),
+            (r"re:^(?=\W)\W+$", "K", true),
+            (r"re:^(?=\D)\D+$", "١", true),
+            (r"re:^(?=\D)\D+$", "1", false),
+            (r"re:^(.)\1\d$", "aa5", true),
+            (r"re:^(.)\1\d$", "éé١", false),
+            (r"re:(?<=\w)!", "é!", false),
+            (r"re:(?<=\w)!", "a!", true),
+            (r"re:\b\w+\b(?=$)", "Kfoo", true),
+            (r"re:\b\w+\b(?=á|$)", "fooá", true),
+            (r"re:\B\w+\B(?=o)", "fooá", true),
+            (r"re:^(?=\\w)\\w$", r"\w", true),
+        ] {
+            assert_eq!(
+                Query::new(pattern).score(&doc(text)).is_some(),
+                expected,
+                "{pattern} {text}"
+            );
+        }
+        // The bounded engine retains its previous Unicode behavior for a
+        // boundary-containing expression. Pi returns false for this input;
+        // translating only \w would introduce a different false negative.
+        assert!(Query::new(r"re:\b\w+\b(?=$)").score(&doc("fooá")).is_some());
+        assert_eq!(translate_regex_classes(r"\b\w+(?=$)", false), r"\b\w+(?=$)");
+        assert_ne!(
+            translate_regex_classes(r"\\b\w+(?=$)", false),
+            r"\\b\w+(?=$)"
+        );
+    }
+
+    #[test]
+    fn advanced_regex_keeps_long_input_and_backtracking_limit() {
+        let doc =
+            |text: String| Document::new(String::new(), String::new(), String::new(), text, true);
+        let text = format!("{} missing", "a".repeat(50_000));
+        assert!(Query::new(r"re:(?=\w)missing$").score(&doc(text)).is_some());
+        assert!(
+            Query::new(r"re:^(a+)+(?=b)$")
+                .score(&doc("a".repeat(10_000)))
+                .is_none()
+        );
+    }
 
     #[test]
     fn imported_external_identity_is_searchable_after_reopen_and_fork_changes_it() {

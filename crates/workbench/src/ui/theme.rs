@@ -1,19 +1,49 @@
 //! Pi theme roles and color formats, rendered without embedded escape strings.
 use crossterm::style::Color;
-use palette::convert::FromColorUnclamped;
-use palette::{FromColor, LinSrgb, Okhsl, Oklab, Oklch, Srgb};
+use palette::Srgb;
 use pi_rs::{Error, Result};
-use serde::Deserialize;
+#[cfg(test)]
+use pi_rs_workbench::theme_parser::resolve;
+#[cfg(test)]
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
 static TERMINAL_BACKGROUND: AtomicU32 = AtomicU32::new(0);
 static TERMINAL_FOREGROUND: AtomicU32 = AtomicU32::new(0);
+static TERMINAL_COLORS_PENDING: AtomicBool = AtomicBool::new(false);
 static TERMINAL_PALETTE: std::sync::Mutex<PaletteState> =
     std::sync::Mutex::new(PaletteState::new());
+
+#[cfg(any(unix, windows))]
+pub fn mark_terminal_colors_pending() {
+    TERMINAL_COLORS_PENDING.store(true, Ordering::Relaxed);
+}
+
+#[cfg(any(unix, windows))]
+pub fn finish_terminal_colors_pending() -> bool {
+    TERMINAL_COLORS_PENDING.swap(false, Ordering::Relaxed)
+}
+
+#[cfg(any(unix, windows))]
+pub struct PendingTerminalColors;
+
+#[cfg(any(unix, windows))]
+impl PendingTerminalColors {
+    pub fn new() -> Self {
+        mark_terminal_colors_pending();
+        Self
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for PendingTerminalColors {
+    fn drop(&mut self) {
+        finish_terminal_colors_pending();
+    }
+}
 
 struct PaletteState {
     current: Option<[[u8; 3]; 16]>,
@@ -79,7 +109,7 @@ fn unpack_terminal_color(value: u32) -> Option<[u8; 3]> {
     (value & 0x1000000 != 0).then_some([(value >> 16) as u8, (value >> 8) as u8, value as u8])
 }
 
-fn terminal_is_dark(background: [u8; 3], foreground: Option<[u8; 3]>) -> bool {
+pub(super) fn terminal_is_dark(background: [u8; 3], foreground: Option<[u8; 3]>) -> bool {
     let color = |rgb: [u8; 3]| {
         Srgb::new(
             rgb[0] as f64 / 255.0,
@@ -92,8 +122,8 @@ fn terminal_is_dark(background: [u8; 3], foreground: Option<[u8; 3]>) -> bool {
     let white_contrast = 1.05 / (luminance + 0.05);
     let black_contrast = (luminance + 0.05) / 0.05;
     if let Some(foreground) = foreground {
-        let foreground_lightness = Oklab::from_color(color(foreground).into_linear()).l;
-        let background_lightness = Oklab::from_color(linear).l;
+        let foreground_lightness = super::system_theme_color::rgb_to_lab(foreground)[0];
+        let background_lightness = super::system_theme_color::rgb_to_lab(background)[0];
         if (foreground_lightness - background_lightness).abs() > 0.05 {
             let dark = foreground_lightness > background_lightness;
             if (if dark { white_contrast } else { black_contrast }) >= 4.5 {
@@ -153,6 +183,7 @@ pub struct Theme {
     pub name: String,
     pub path: Option<PathBuf>,
     colors: BTreeMap<String, Color>,
+    dim: BTreeSet<String>,
 }
 /// Watches the selected custom file while retaining the last valid theme.
 pub struct ThemeWatcher {
@@ -189,13 +220,6 @@ impl ThemeWatcher {
         *theme = next;
         Ok(true)
     }
-}
-#[derive(Deserialize)]
-struct Definition {
-    name: String,
-    #[serde(default)]
-    vars: BTreeMap<String, Value>,
-    colors: BTreeMap<String, Value>,
 }
 impl Theme {
     pub fn load(
@@ -296,131 +320,57 @@ impl Theme {
     }
 
     pub fn parse(text: &str, path: Option<PathBuf>) -> Result<Self> {
-        let value: Value = serde_json::from_str(text)?;
-        let schema: Value = serde_json::from_str(include_str!("../../assets/theme.schema.json"))?;
-        let validator =
-            jsonschema::validator_for(&schema).map_err(|error| Error::Config(error.to_string()))?;
-        if let Err(error) = validator.validate(&value) {
-            return Err(Error::Config(format!("invalid theme: {error}")));
-        }
-        let definition: Definition = serde_json::from_value(value)?;
-        if definition.name == "system" {
-            return Err(Error::Config("system is a reserved theme name".into()));
-        }
-        let mut colors = BTreeMap::new();
-        for (role, value) in &definition.colors {
-            colors.insert(
-                role.clone(),
-                resolve(value, &definition.vars, &mut BTreeSet::new())?,
-            );
-        }
-        for (role, fallback) in [
-            ("scrollbarTrack", "muted"),
-            ("scrollbarThumb", "text"),
-            ("searchMatchBg", "selectedBg"),
-            ("searchMatchText", "text"),
-            ("thinkingMax", "thinkingXhigh"),
-        ] {
-            if !colors.contains_key(role) {
-                colors.insert(
-                    role.into(),
-                    colors.get(fallback).copied().unwrap_or(Color::Reset),
-                );
-            }
-        }
+        let parsed = pi_rs_workbench::theme_parser::parse_theme(text)?;
         Ok(Self {
-            name: definition.name,
+            name: parsed.name,
             path,
-            colors,
+            colors: parsed.colors,
+            dim: BTreeSet::new(),
         })
     }
     pub fn color(&self, role: &str) -> Color {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
     }
     pub fn is_dim(&self, role: &str) -> bool {
-        self.name == "system"
-            && matches!(
-                role,
-                "customMessageText"
-                    | "muted"
-                    | "dim"
-                    | "thinkingText"
-                    | "toolOutput"
-                    | "mdLinkUrl"
-                    | "mdQuote"
-                    | "mdQuoteBorder"
-                    | "mdHr"
-                    | "mdCodeBlockBorder"
-                    | "toolDiffContext"
-                    | "syntaxComment"
-                    | "scrollbarTrack"
-                    | "scrollbarThumb"
-                    | "searchMatchText"
-                    | "borderMuted"
-                    | "thinkingOff"
-            )
+        self.dim.contains(role)
     }
     pub fn system() -> Self {
+        if TERMINAL_COLORS_PENDING.load(Ordering::Relaxed) {
+            let generated = super::system_theme::generate(None, None, None, 0.0, None);
+            return Self {
+                name: "system".into(),
+                path: None,
+                colors: generated.colors,
+                dim: generated.dim,
+            };
+        }
         let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
+        let foreground = unpack_terminal_color(TERMINAL_FOREGROUND.load(Ordering::Relaxed));
         let palette = TERMINAL_PALETTE.lock().expect("terminal palette").current;
-        Self::system_with_palette(
+        Self::system_generated(
             background,
-            palette.as_ref().map(|palette| palette.as_slice()),
+            foreground,
+            palette.as_ref().map(|p| p.as_slice()),
         )
     }
 
-    fn system_with_palette(background: Option<[u8; 3]>, palette: Option<&[[u8; 3]]>) -> Self {
-        // Pi uses the terminal's ANSI slots when no palette has been reported.
-        let roles = [
-            ("accent", 5),
-            ("border", 4),
-            ("borderAccent", 5),
-            ("success", 2),
-            ("error", 1),
-            ("warning", 3),
-            ("mdHeading", 3),
-            ("mdLink", 4),
-            ("mdCode", 5),
-            ("mdCodeBlock", 2),
-            ("mdListBullet", 5),
-            ("customMessageLabel", 5),
-            ("toolDiffAdded", 2),
-            ("toolDiffRemoved", 1),
-            ("bashMode", 2),
-            ("syntaxKeyword", 4),
-            ("syntaxFunction", 3),
-            ("syntaxVariable", 6),
-            ("syntaxString", 2),
-            ("syntaxNumber", 5),
-            ("syntaxType", 5),
-            ("thinkingMinimal", 4),
-            ("thinkingLow", 4),
-            ("thinkingMedium", 6),
-            ("thinkingHigh", 5),
-            ("thinkingXhigh", 13),
-            ("thinkingMax", 1),
-        ];
-        // Without a reported background Pi leaves colors as ANSI indices, even if
-        // a palette was reported. The terminal can then render its own colors.
-        let palette = background
-            .and(palette)
-            .filter(|palette| palette.len() == 16);
+    fn system_generated(
+        background: Option<[u8; 3]>,
+        foreground: Option<[u8; 3]>,
+        palette: Option<&[[u8; 3]]>,
+    ) -> Self {
+        let generated = super::system_theme::generate(background, foreground, palette, 1.0, None);
         Self {
             name: "system".into(),
             path: None,
-            colors: roles
-                .into_iter()
-                .map(|(key, index)| {
-                    let color = palette
-                        .map(|palette| {
-                            let [r, g, b] = palette[index as usize];
-                            Color::Rgb { r, g, b }
-                        })
-                        .unwrap_or(Color::AnsiValue(index));
-                    (key.into(), color)
-                })
-                .collect(),
+            colors: generated.colors,
+            dim: generated.dim,
         }
+    }
+
+    #[cfg(test)]
+    fn system_with_palette(background: Option<[u8; 3]>, palette: Option<&[[u8; 3]]>) -> Self {
+        Self::system_generated(background, None, palette)
     }
 }
 
@@ -428,143 +378,6 @@ pub fn parse_auto_theme_setting(value: &str) -> Option<(&str, &str)> {
     let (light, dark) = value.split_once('/')?;
     let (light, dark) = (light.trim(), dark.trim());
     (!light.is_empty() && !dark.is_empty() && !dark.contains('/')).then_some((light, dark))
-}
-
-fn resolve(
-    value: &Value,
-    variables: &BTreeMap<String, Value>,
-    seen: &mut BTreeSet<String>,
-) -> Result<Color> {
-    if let Some(index) = value.as_u64() {
-        return u8::try_from(index)
-            .map(Color::AnsiValue)
-            .map_err(|_| Error::Config("color index must be 0..255".into()));
-    }
-    let text = value
-        .as_str()
-        .ok_or_else(|| Error::Config("invalid color value".into()))?;
-    if text.is_empty() {
-        return Ok(Color::Reset);
-    }
-    if let Some(hex) = text.strip_prefix('#') {
-        let hex = if hex.len() == 3 {
-            hex.chars().flat_map(|c| [c, c]).collect::<String>()
-        } else {
-            hex.into()
-        };
-        if hex.len() != 6 {
-            return Err(Error::Config("hex color needs 3 or 6 digits".into()));
-        }
-        let number =
-            u32::from_str_radix(&hex, 16).map_err(|_| Error::Config("invalid hex color".into()))?;
-        return Ok(Color::Rgb {
-            r: (number >> 16) as u8,
-            g: (number >> 8) as u8,
-            b: number as u8,
-        });
-    }
-    if let Some((kind, _)) = text.split_once('(')
-        && (kind.eq_ignore_ascii_case("okhsl") || kind.eq_ignore_ascii_case("oklch"))
-    {
-        return parse_function_color(text, kind.eq_ignore_ascii_case("okhsl"));
-    }
-    if !seen.insert(text.into()) {
-        return Err(Error::Config(format!("circular color variable {text:?}")));
-    }
-    let variable = variables
-        .get(text)
-        .ok_or_else(|| Error::Config(format!("missing color variable {text:?}")))?;
-    let result = resolve(variable, variables, seen);
-    seen.remove(text);
-    result
-}
-
-fn parse_function_color(text: &str, is_hsl: bool) -> Result<Color> {
-    use std::sync::OnceLock;
-    static HSL: OnceLock<regex::Regex> = OnceLock::new();
-    static LCH: OnceLock<regex::Regex> = OnceLock::new();
-    let number = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?";
-    let pattern = if is_hsl { &HSL } else { &LCH };
-    let pattern = pattern.get_or_init(|| {
-        let expression = if is_hsl {
-            format!(r"(?i)^okhsl\(\s*({number})(?:deg)?\s+({number})(%)?\s+({number})(%)?\s*\)$")
-        } else {
-            format!(r"(?i)^oklch\(\s*({number})(%)?\s+({number})\s+({number})(?:deg)?\s*\)$")
-        };
-        regex::Regex::new(&expression).expect("valid color pattern")
-    });
-    let invalid = || Error::Config(format!("invalid color value: {text}"));
-    let captures = pattern.captures(text).ok_or_else(invalid)?;
-    let number = |index: usize| -> Result<f64> {
-        let value = captures[index].parse::<f64>().map_err(|_| invalid())?;
-        if value.is_finite() {
-            Ok(value)
-        } else {
-            Err(invalid())
-        }
-    };
-    let rgb: Srgb<f64> = if is_hsl {
-        let hue = number(1)?;
-        let saturation = number(2)?
-            / if captures.get(3).is_some() {
-                100.0
-            } else {
-                1.0
-            };
-        let lightness = number(4)?
-            / if captures.get(5).is_some() {
-                100.0
-            } else {
-                1.0
-            };
-        if !(0.0..=1.0).contains(&saturation) || !(0.0..=1.0).contains(&lightness) {
-            return Err(invalid());
-        }
-        Srgb::from_color(Okhsl::new(hue, saturation, lightness))
-    } else {
-        let lightness = number(1)?
-            / if captures.get(2).is_some() {
-                100.0
-            } else {
-                1.0
-            };
-        let chroma = number(3)?;
-        let hue = number(4)?;
-        if !(0.0..=1.0).contains(&lightness) || chroma < 0.0 {
-            return Err(invalid());
-        }
-        let at_chroma = |chroma| LinSrgb::from_color_unclamped(Oklch::new(lightness, chroma, hue));
-        let in_gamut = |rgb: LinSrgb<f64>| {
-            [rgb.red, rgb.green, rgb.blue]
-                .into_iter()
-                .all(|channel| (-1e-7..=1.0 + 1e-7).contains(&channel))
-        };
-        let direct = at_chroma(chroma);
-        let linear = if in_gamut(direct) {
-            direct
-        } else {
-            let mut linear = at_chroma(0.0);
-            let (mut low, mut high) = (0.0, chroma);
-            for _ in 0..20 {
-                let middle = (low + high) / 2.0;
-                let candidate = at_chroma(middle);
-                if in_gamut(candidate) {
-                    low = middle;
-                    linear = candidate;
-                } else {
-                    high = middle;
-                }
-            }
-            linear
-        };
-        Srgb::from_linear(linear)
-    };
-    let rgb: Srgb<u8> = rgb.into_format();
-    Ok(Color::Rgb {
-        r: rgb.red,
-        g: rgb.green,
-        b: rgb.blue,
-    })
 }
 
 #[cfg(test)]
@@ -713,6 +526,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(unix, windows))]
+    fn system_theme_stays_grayscale_until_color_query_settles() {
+        const CHILD: &str = "PI_RS_PENDING_SYSTEM_THEME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::theme::tests::system_theme_stays_grayscale_until_color_query_settles",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        assert_eq!(Theme::system().color("accent"), Color::Reset);
+        set_terminal_color(false, 0, 0, 0);
+        assert_eq!(Theme::system().color("accent"), Color::Reset);
+        assert!(finish_terminal_colors_pending());
+        assert!(!finish_terminal_colors_pending());
+        assert!(matches!(Theme::system().color("accent"), Color::Rgb { .. }));
+    }
+
+    #[test]
     fn system_without_background_keeps_indexed_colors_even_with_palette() {
         let palette = [[17, 34, 51]; 16];
         let theme = Theme::system_with_palette(None, Some(&palette));
@@ -721,16 +560,21 @@ mod tests {
         assert!(theme.is_dim("muted"));
 
         let theme = Theme::system_with_palette(Some([0, 0, 0]), Some(&palette));
-        assert_eq!(
-            theme.color("accent"),
-            Color::Rgb {
-                r: 17,
-                g: 34,
-                b: 51
-            }
-        );
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!theme.is_dim("muted"));
         let theme = Theme::system_with_palette(Some([0, 0, 0]), Some(&palette[..15]));
-        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+    }
+
+    #[test]
+    fn system_theme_uses_reported_foreground_and_generated_dim_flags() {
+        let bg = Some([0, 0, 0]);
+        let bright = Theme::system_generated(bg, Some([255, 255, 255]), None);
+        let weak = Theme::system_generated(bg, Some([40, 40, 40]), None);
+        assert_eq!(bright.color("text"), Color::Reset);
+        assert!(matches!(weak.color("text"), Color::Rgb { .. }));
+        assert!(!bright.is_dim("muted"));
+        assert!(Theme::system_generated(None, None, None).is_dim("muted"));
     }
 
     #[test]
@@ -740,10 +584,10 @@ mod tests {
             assert_eq!(state.record(index, [index, 10, 20]), index == 0);
         }
         let previous = state.current.unwrap();
-        assert_eq!(
+        assert!(matches!(
             Theme::system_with_palette(Some([0, 0, 0]), Some(&previous)).color("accent"),
-            Color::Rgb { r: 5, g: 10, b: 20 }
-        );
+            Color::Rgb { .. }
+        ));
 
         state.begin();
         for index in 0..15 {
@@ -757,9 +601,9 @@ mod tests {
         }
         assert!(state.record(15, [15, 30, 40]));
         let updated = state.current.unwrap();
-        assert_eq!(
+        assert_ne!(
             Theme::system_with_palette(Some([0, 0, 0]), Some(&updated)).color("accent"),
-            Color::Rgb { r: 5, g: 30, b: 40 }
+            Theme::system_with_palette(Some([0, 0, 0]), Some(&previous)).color("accent")
         );
         state.begin();
         for index in 0..16 {

@@ -1,0 +1,2868 @@
+{
+  "reference": "Pi v1.5.0 f9a26365568127461c47a07a37dcb42c140a3ac5 packages/tui/src/components/markdown.ts",
+  "width": 80,
+  "narrowCases": [
+    {
+      "source": "- > abc",
+      "width": 3,
+      "lines": [
+        "- a",
+        "  b",
+        "  c"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "source": "hello",
+      "lines": [
+        "hello"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        }
+      ]
+    },
+    {
+      "source": "hello\n",
+      "lines": [
+        "hello"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello\n"
+        }
+      ]
+    },
+    {
+      "source": "hello\n\n",
+      "lines": [
+        "hello",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "hello\n\n\n",
+      "lines": [
+        "hello",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "hello\n\n[r]: https://e.co",
+      "lines": [
+        "hello",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "hello\n\n[r]: https://e.co\n",
+      "lines": [
+        "hello",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "hello\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "hello",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "# head",
+      "lines": [
+        "head"
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# head"
+        }
+      ]
+    },
+    {
+      "source": "# head\n",
+      "lines": [
+        "head"
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# head\n"
+        }
+      ]
+    },
+    {
+      "source": "# head\n\n",
+      "lines": [
+        "head",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# head"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "# head\n\n\n",
+      "lines": [
+        "head",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# head"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "# head\n\n[r]: https://e.co",
+      "lines": [
+        "head",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# head"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "# head\n\n[r]: https://e.co\n",
+      "lines": [
+        "head",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# head"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "# head\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "head",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# head"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "---",
+      "lines": [
+        "────────────────────────────────────────────────────────────────────────────────"
+      ],
+      "tokens": [
+        {
+          "type": "hr",
+          "raw": "---"
+        }
+      ]
+    },
+    {
+      "source": "---\n",
+      "lines": [
+        "────────────────────────────────────────────────────────────────────────────────"
+      ],
+      "tokens": [
+        {
+          "type": "hr",
+          "raw": "---\n"
+        }
+      ]
+    },
+    {
+      "source": "---\n\n",
+      "lines": [
+        "────────────────────────────────────────────────────────────────────────────────",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "hr",
+          "raw": "---"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "---\n\n\n",
+      "lines": [
+        "────────────────────────────────────────────────────────────────────────────────",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "hr",
+          "raw": "---"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "---\n\n[r]: https://e.co",
+      "lines": [
+        "────────────────────────────────────────────────────────────────────────────────",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "hr",
+          "raw": "---"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "---\n\n[r]: https://e.co\n",
+      "lines": [
+        "────────────────────────────────────────────────────────────────────────────────",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "hr",
+          "raw": "---"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "---\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "────────────────────────────────────────────────────────────────────────────────",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "hr",
+          "raw": "---"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- item",
+      "lines": [
+        "- item"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item"
+        }
+      ]
+    },
+    {
+      "source": "- item\n",
+      "lines": [
+        "- item"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n",
+      "lines": [
+        "- item",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n\n",
+      "lines": [
+        "- item",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n[r]: https://e.co",
+      "lines": [
+        "- item",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n[r]: https://e.co\n",
+      "lines": [
+        "- item",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "- item",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "> quoted",
+      "lines": [
+        "│ quoted"
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted"
+        }
+      ]
+    },
+    {
+      "source": "> quoted\n",
+      "lines": [
+        "│ quoted"
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted\n"
+        }
+      ]
+    },
+    {
+      "source": "> quoted\n\n",
+      "lines": [
+        "│ quoted",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "> quoted\n\n\n",
+      "lines": [
+        "│ quoted",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "> quoted\n\n[r]: https://e.co",
+      "lines": [
+        "│ quoted",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "> quoted\n\n[r]: https://e.co\n",
+      "lines": [
+        "│ quoted",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "> quoted\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "│ quoted",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "```\nx\n```",
+      "lines": [
+        "```",
+        "  x",
+        "```"
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\nx\n```"
+        }
+      ]
+    },
+    {
+      "source": "```\nx\n```\n",
+      "lines": [
+        "```",
+        "  x",
+        "```"
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\nx\n```\n"
+        }
+      ]
+    },
+    {
+      "source": "```\nx\n```\n\n",
+      "lines": [
+        "```",
+        "  x",
+        "```",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\nx\n```"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "```\nx\n```\n\n\n",
+      "lines": [
+        "```",
+        "  x",
+        "```",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\nx\n```"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "```\nx\n```\n\n[r]: https://e.co",
+      "lines": [
+        "```",
+        "  x",
+        "```",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\nx\n```"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "```\nx\n```\n\n[r]: https://e.co\n",
+      "lines": [
+        "```",
+        "  x",
+        "```",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\nx\n```"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "```\nx\n```\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "```",
+        "  x",
+        "```",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\nx\n```"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "| A |\n|---|\n| x |",
+      "lines": [
+        "┌───┐",
+        "│ A │",
+        "├───┤",
+        "│ x │",
+        "└───┘"
+      ],
+      "tokens": [
+        {
+          "type": "table",
+          "raw": "| A |\n|---|\n| x |"
+        }
+      ]
+    },
+    {
+      "source": "| A |\n|---|\n| x |\n",
+      "lines": [
+        "┌───┐",
+        "│ A │",
+        "├───┤",
+        "│ x │",
+        "└───┘"
+      ],
+      "tokens": [
+        {
+          "type": "table",
+          "raw": "| A |\n|---|\n| x |\n"
+        }
+      ]
+    },
+    {
+      "source": "| A |\n|---|\n| x |\n\n",
+      "lines": [
+        "┌───┐",
+        "│ A │",
+        "├───┤",
+        "│ x │",
+        "└───┘",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "table",
+          "raw": "| A |\n|---|\n| x |"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "| A |\n|---|\n| x |\n\n\n",
+      "lines": [
+        "┌───┐",
+        "│ A │",
+        "├───┤",
+        "│ x │",
+        "└───┘",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "table",
+          "raw": "| A |\n|---|\n| x |"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "| A |\n|---|\n| x |\n\n[r]: https://e.co",
+      "lines": [
+        "┌───┐",
+        "│ A │",
+        "├───┤",
+        "│ x │",
+        "└───┘",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "table",
+          "raw": "| A |\n|---|\n| x |"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "| A |\n|---|\n| x |\n\n[r]: https://e.co\n",
+      "lines": [
+        "┌───┐",
+        "│ A │",
+        "├───┤",
+        "│ x │",
+        "└───┘",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "table",
+          "raw": "| A |\n|---|\n| x |"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "| A |\n|---|\n| x |\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "┌───┐",
+        "│ A │",
+        "├───┤",
+        "│ x │",
+        "└───┘",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "table",
+          "raw": "| A |\n|---|\n| x |"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$",
+      "lines": [
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$\n",
+      "lines": [
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$\n\n",
+      "lines": [
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n\n"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$\n\n\n",
+      "lines": [
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$\n\n[r]: https://e.co",
+      "lines": [
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$\n\n[r]: https://e.co\n",
+      "lines": [
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "x²",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "\\[\nx^2\n\\]",
+      "lines": [
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "\\[\nx^2\n\\]"
+        }
+      ]
+    },
+    {
+      "source": "\\[\nx^2\n\\]\n",
+      "lines": [
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "\\[\nx^2\n\\]\n"
+        }
+      ]
+    },
+    {
+      "source": "\\[\nx^2\n\\]\n\n",
+      "lines": [
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "\\[\nx^2\n\\]\n\n"
+        }
+      ]
+    },
+    {
+      "source": "\\[\nx^2\n\\]\n\n\n",
+      "lines": [
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "\\[\nx^2\n\\]\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "\\[\nx^2\n\\]\n\n[r]: https://e.co",
+      "lines": [
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "\\[\nx^2\n\\]\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "\\[\nx^2\n\\]\n\n[r]: https://e.co\n",
+      "lines": [
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "\\[\nx^2\n\\]\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "\\[\nx^2\n\\]\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "x²",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "\\[\nx^2\n\\]\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]",
+      "lines": [
+        "[x][r]"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n",
+      "lines": [
+        "[x][r]"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n",
+      "lines": [
+        "[x][r]",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n\n",
+      "lines": [
+        "[x][r]",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n[r]: https://e.co",
+      "lines": [
+        "x (https://e.co)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n[r]: https://e.co\n",
+      "lines": [
+        "x (https://e.co)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n[r]: https://e.co\n\n",
+      "lines": [
+        "x (https://e.co)",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- a\n  - b\n  1. b",
+      "lines": [
+        "- a",
+        "    - b",
+        "    1. b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n  - b\n  1. b"
+        }
+      ]
+    },
+    {
+      "source": "- a\n\n  ```\n  x\n  ```\n  - b",
+      "lines": [
+        "- a",
+        "",
+        "  ```",
+        "    x",
+        "  ```",
+        "    - b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n\n  ```\n  x\n  ```\n  - b"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n\n  - inner\n\n    second\n\n  tail",
+      "lines": [
+        "- outer",
+        "",
+        "    - inner",
+        "",
+        "      second",
+        "",
+        "  tail"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n\n  - inner\n\n    second\n\n  tail"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n\n  1. inner\n\n     next\n\n  tail\n\n- sibling",
+      "lines": [
+        "- outer",
+        "",
+        "    1. inner",
+        "",
+        "       next",
+        "",
+        "  tail",
+        "",
+        "- sibling"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n\n  1. inner\n\n     next\n\n  tail\n\n- sibling"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n  - first\n    - nested\n\n      next\n\n    tail\n\n  end",
+      "lines": [
+        "- outer",
+        "    - first",
+        "        - nested",
+        "",
+        "          next",
+        "",
+        "      tail",
+        "",
+        "  end"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n  - first\n    - nested\n\n      next\n\n    tail\n\n  end"
+        }
+      ]
+    },
+    {
+      "source": "[r]: https://e.co",
+      "lines": [
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "[r]: https://e.co\n\n",
+      "lines": [
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "> quoted\n>\n",
+      "lines": [
+        "│ quoted"
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> quoted\n>\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n  $$x^2$$\n\n",
+      "lines": [
+        "- item",
+        "",
+        "  x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item\n\n  $$x^2$$"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "hello\n\n[r]: https://e.co\n\n[s]: https://s.co",
+      "lines": [
+        "hello",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[s]: https://s.co"
+        }
+      ]
+    },
+    {
+      "source": "$$x$$\n[r]: https://e.co",
+      "lines": [
+        "x",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x$$\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "[r]: https://e.co\n\ntext",
+      "lines": [
+        "",
+        "text"
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "text"
+        }
+      ]
+    },
+    {
+      "source": "[r]: https://e.co\n\n$$x^2$$\n\n[s]: https://s.co",
+      "lines": [
+        "",
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[s]: https://s.co"
+        }
+      ]
+    },
+    {
+      "source": "text\n\n[r]: https://e.co\n\n[s]: https://s.co\n\nend",
+      "lines": [
+        "text",
+        "",
+        "",
+        "",
+        "end"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[s]: https://s.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "end"
+        }
+      ]
+    },
+    {
+      "source": "text\n\n[r]: https://e.co\n\nend",
+      "lines": [
+        "text",
+        "",
+        "",
+        "end"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "end"
+        }
+      ]
+    },
+    {
+      "source": "> text\n>\n> [r]: https://e.co",
+      "lines": [
+        "│ text"
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> text\n>\n> [r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "> text\n>\n> [r]: https://e.co\n>\n",
+      "lines": [
+        "│ text"
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> text\n>\n> [r]: https://e.co\n>\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n  [r]: https://e.co\n\n",
+      "lines": [
+        "- item",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item\n\n  [r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "```\na\n\n",
+      "lines": [
+        "```",
+        "  a",
+        "",
+        "```"
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\na\n\n"
+        }
+      ]
+    },
+    {
+      "source": "```\n\n",
+      "lines": [
+        "```",
+        "",
+        "```"
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```\n\n"
+        }
+      ]
+    },
+    {
+      "source": "    code\n\n",
+      "lines": [
+        "```",
+        "  code",
+        "```",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "    code"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n  ```\n  x\n\n",
+      "lines": [
+        "- item",
+        "",
+        "  ```",
+        "    x",
+        "  ```",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item\n\n  ```\n  x"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "$$x^2$$\n[r]: https://e.co",
+      "lines": [
+        "x²",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: https://e.co"
+        }
+      ]
+    },
+    {
+      "source": "hello  \n\n",
+      "lines": [
+        "hello",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello  "
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "# Hello\n\n[ref]: https://example.com",
+      "lines": [
+        "Hello",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# Hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[ref]: https://example.com"
+        }
+      ]
+    },
+    {
+      "source": "# Hello\n\n[ref]: https://example.com\n\nworld",
+      "lines": [
+        "Hello",
+        "",
+        "",
+        "world"
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# Hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[ref]: https://example.com"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "world"
+        }
+      ]
+    },
+    {
+      "source": "# First\n\n## Last\n\n[ref]: https://example.com",
+      "lines": [
+        "First",
+        "",
+        "Last",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "heading",
+          "raw": "# First"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "heading",
+          "raw": "## Last"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[ref]: https://example.com"
+        }
+      ]
+    },
+    {
+      "source": "[before][ref]\n\n$$\\frac{1}{2}$$\n\n[after][ref]\n\n[ref]: https://example.org",
+      "lines": [
+        "before (https://example.org)",
+        "",
+        "1",
+        "─",
+        "2",
+        "",
+        "after (https://example.org)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[before][ref]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$\\frac{1}{2}$$\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "[after][ref]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[ref]: https://example.org"
+        }
+      ]
+    },
+    {
+      "source": "- one\n\n  second paragraph\n\n",
+      "lines": [
+        "- one",
+        "",
+        "  second paragraph",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n\n  second paragraph"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- one\n\n  ```js\n  x\n  ```\n\n",
+      "lines": [
+        "- one",
+        "",
+        "  ```js",
+        "    x",
+        "  ```",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n\n  ```js\n  x\n  ```"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- one\n\n  > quote\n\n",
+      "lines": [
+        "- one",
+        "",
+        "  │ quote",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n\n  > quote"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- one\n  - nested\n\n- two\n",
+      "lines": [
+        "- one",
+        "    - nested",
+        "",
+        "- two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n  - nested\n\n- two\n"
+        }
+      ]
+    },
+    {
+      "source": "1. one\n\n   second\n\n2. two\n\n",
+      "lines": [
+        "1. one",
+        "",
+        "   second",
+        "",
+        "2. two",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "1. one\n\n   second\n\n2. two"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- [x] task\n\n  more\n\n",
+      "lines": [
+        "- [x] task",
+        "",
+        "      more",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- [x] task\n\n  more"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- [link][r]\n\n  [r]: https://e.co\n\n",
+      "lines": [
+        "- link (https://e.co)",
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- [link][r]\n\n  [r]: https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n  [r]: https://e.co\n\n  end\n\n",
+      "lines": [
+        "- item",
+        "",
+        "",
+        "  end",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item\n\n  [r]: https://e.co\n\n  end"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "- item\n\n  ```\n  x\n  ```\n\n- next\n\n",
+      "lines": [
+        "- item",
+        "",
+        "  ```",
+        "    x",
+        "  ```",
+        "",
+        "- next",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- item\n\n  ```\n  x\n  ```\n\n- next"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "first\n\nsecond\n\n# heading\n\nlast\n\n",
+      "lines": [
+        "first",
+        "",
+        "second",
+        "",
+        "heading",
+        "",
+        "last",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "first"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "second"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "heading",
+          "raw": "# heading"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "last"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][ref]\n\n[ref]: https://first.example\n\n[ref]: https://second.example\n\nend",
+      "lines": [
+        "x (https://first.example)",
+        "",
+        "",
+        "",
+        "end"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][ref]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[ref]: https://first.example"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "end"
+        }
+      ]
+    },
+    {
+      "source": "alpha\n\n[ref]:\n  https://e.co\n\n[x][ref]",
+      "lines": [
+        "alpha",
+        "",
+        "",
+        "x (https://e.co)"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "alpha"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[ref]:\n  https://e.co"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "[x][ref]"
+        }
+      ]
+    },
+    {
+      "source": "前文\n\n$$x^2$$\n\n後文\n\n",
+      "lines": [
+        "前文",
+        "",
+        "x²",
+        "",
+        "後文",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "前文"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "後文"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "> outer\n>\n> > inner\n>\n> end\n\n",
+      "lines": [
+        "│ outer",
+        "│",
+        "│ │ inner",
+        "│",
+        "│ end",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> outer\n>\n> > inner\n>\n> end"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "```text\nline\n\n```\n\nnext",
+      "lines": [
+        "```text",
+        "  line",
+        "",
+        "```",
+        "",
+        "next"
+      ],
+      "tokens": [
+        {
+          "type": "code",
+          "raw": "```text\nline\n\n```"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "next"
+        }
+      ]
+    },
+    {
+      "source": "<div>\nx\n</div>\n\nnext",
+      "lines": [
+        "<div>",
+        "x",
+        "</div>",
+        "",
+        "next"
+      ],
+      "tokens": [
+        {
+          "type": "html",
+          "raw": "<div>\nx\n</div>"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "next"
+        }
+      ]
+    },
+    {
+      "source": "hello  ",
+      "lines": [
+        "hello"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "hello  "
+        }
+      ]
+    },
+    {
+      "source": "[x]: /a\n[x]: /b\n",
+      "lines": [
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[x]: /a\n\n"
+        }
+      ]
+    },
+    {
+      "source": "text\n\n[x]: /a\n[x]: /b\n\nend",
+      "lines": [
+        "text",
+        "",
+        "",
+        "end"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[x]: /a\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "end"
+        }
+      ]
+    },
+    {
+      "source": "[x]: /a\n\n[x]: /b\n\n",
+      "lines": [
+        "",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[x]: /a"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "text\n\n[x]: /a\n\n[x]: /b\n\nend",
+      "lines": [
+        "text",
+        "",
+        "",
+        "",
+        "end"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[x]: /a"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "end"
+        }
+      ]
+    },
+    {
+      "source": "[x]: /a\n\nhello\n\n[x]: /b\n\nend",
+      "lines": [
+        "",
+        "hello",
+        "",
+        "",
+        "end"
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[x]: /a"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "hello"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "end"
+        }
+      ]
+    },
+    {
+      "source": "- >",
+      "lines": [
+        "-"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- >"
+        }
+      ]
+    },
+    {
+      "source": "- ```\n  a\n\n\n  ```",
+      "lines": [
+        "- ```",
+        "    a",
+        "",
+        "",
+        "  ```"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- ```\n  a\n\n\n  ```"
+        }
+      ]
+    },
+    {
+      "source": "- first\n\n  # heading\n\n  next",
+      "lines": [
+        "- first",
+        "",
+        "  heading",
+        "",
+        "  next"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- first\n\n  # heading\n\n  next"
+        }
+      ]
+    },
+    {
+      "source": "- # heading\n\n  next",
+      "lines": [
+        "- heading",
+        "",
+        "  next"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- # heading\n\n  next"
+        }
+      ]
+    },
+    {
+      "source": "[x]: /a\n\n# h\n[X]: /b\n\nend",
+      "lines": [
+        "",
+        "h",
+        "",
+        "end"
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[x]: /a"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "heading",
+          "raw": "# h\n"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "end"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n- outer\n  - inner\n\n    [r]: /url\n",
+      "lines": [
+        "x (/url)",
+        "",
+        "- outer",
+        "    - inner",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n\n    [r]: /url\n"
+        }
+      ]
+    },
+    {
+      "source": "[r]: /first\n\n- [x][r]\n\n  [r]: /second\n",
+      "lines": [
+        "",
+        "- x (/first)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[r]: /first"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  [r]: /second\n"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n  - inner\n\n    [r]: /first\n\n[x][r]\n\n[r]: /second",
+      "lines": [
+        "- outer",
+        "    - inner",
+        "",
+        "",
+        "x (/first)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n\n    [r]: /first"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n> [r]: /url\n\n$$x^2$$",
+      "lines": [
+        "x (/url)",
+        "",
+        "",
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "blockquote",
+          "raw": "> [r]: /url"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$"
+        }
+      ]
+    },
+    {
+      "source": "- first\n\n  [r]: /one\n\ntext\n\n- [x][r]\n\n  [r]: /two",
+      "lines": [
+        "- first",
+        "",
+        "",
+        "text",
+        "",
+        "- x (/one)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- first\n\n  [r]: /one"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  [r]: /two"
+        }
+      ]
+    },
+    {
+      "source": "- a\n  - b\n\n    [r]: /one\n\ntext\n\n- [x][r]\n\n  [r]: /two",
+      "lines": [
+        "- a",
+        "    - b",
+        "",
+        "",
+        "text",
+        "",
+        "- x (/one)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n  - b\n\n    [r]: /one"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  [r]: /two"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n- outer\n\n  [r]:\n    /url\n    \"title\"\n",
+      "lines": [
+        "x (/url)",
+        "",
+        "- outer",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- outer\n\n  [r]:\n    /url\n    \"title\"\n"
+        }
+      ]
+    },
+    {
+      "source": "> [x][r]\n\n[r]: /url",
+      "lines": [
+        "│ x (/url)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> [x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /url"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n$$\n[r]: /fake\n$$",
+      "lines": [
+        "[x][r]",
+        "",
+        "[r]: /fake"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$\n[r]: /fake\n$$"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n$$x$$\n- outer\n  - inner\n\n    [r]: /url",
+      "lines": [
+        "x (/url)",
+        "",
+        "x",
+        "",
+        "- outer",
+        "    - inner",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$x$$\n"
+        },
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n\n    [r]: /url"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n$$\n\n[r]: /fake\n\n$$\n\n[r]: /real",
+      "lines": [
+        "x (/real)",
+        "",
+        "[r]: /fake",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$\n\n[r]: /fake\n\n$$\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /real"
+        }
+      ]
+    },
+    {
+      "source": "[https://e.co/a_b][r]\n\n[r]: /real",
+      "lines": [
+        "https://e.co/a_b (/real)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[https://e.co/a_b][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /real"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n> $$\n>\n> [r]: /fake\n>\n> $$\n\n[r]: /real",
+      "lines": [
+        "x (/real)",
+        "",
+        "│ [r]: /fake",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "blockquote",
+          "raw": "> $$\n>\n> [r]: /fake\n>\n> $$"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /real"
+        }
+      ]
+    },
+    {
+      "source": "- [x][r]\n\n  $$\n\n  [r]: /fake\n\n  $$",
+      "lines": [
+        "- [x][r]",
+        "",
+        "  [r]: /fake"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  $$\n\n  [r]: /fake\n\n  $$"
+        }
+      ]
+    },
+    {
+      "source": "- [**bold**][r]\n\n  $$\n\n  [r]: /fake\n\n  $$",
+      "lines": [
+        "- [bold][r]",
+        "",
+        "  [r]: /fake"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- [**bold**][r]\n\n  $$\n\n  [r]: /fake\n\n  $$"
+        }
+      ]
+    }
+  ]
+}

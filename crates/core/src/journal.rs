@@ -163,6 +163,14 @@ pub enum Event {
         format: String,
         entry: serde_json::Value,
     },
+    /// An imported result whose reused call ID cannot identify one operation.
+    ImportedUnattributedToolResult {
+        call_id: String,
+        tool_name: String,
+        content: crate::ContextContent,
+        is_error: bool,
+        details: Option<serde_json::Value>,
+    },
     /// Replace or omit one message in future model context, preserving raw history.
     ContextEdited {
         target: u64,
@@ -479,20 +487,72 @@ pub enum OperationState {
 pub trait SessionStore: Send {
     fn load(&mut self) -> Result<Vec<Record>>;
     fn append(&mut self, record: &Record) -> Result<()>;
+
+    /// Whether this store supports atomic auxiliary record metadata.
+    fn supports_record_metadata(&self) -> bool {
+        false
+    }
+
+    /// Maximum encoded record size, including its terminating newline, when
+    /// this store uses the native JSONL record format.
+    fn encoded_record_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Load auxiliary data committed atomically with records. Legacy stores
+    /// need not implement this until they support metadata-bearing records.
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        Ok(BTreeMap::new())
+    }
+
+    /// Atomically commit a record and its optional auxiliary data. Legacy
+    /// stores fail closed instead of silently discarding metadata.
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        if metadata.is_some() {
+            return Err(Error::Session(
+                "session store does not support record metadata".into(),
+            ));
+        }
+        self.append(record)
+    }
 }
 
 #[derive(Default)]
 pub struct MemoryStore {
     records: Vec<Record>,
+    metadata: BTreeMap<u64, serde_json::Value>,
 }
 
 impl SessionStore for MemoryStore {
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
         Ok(self.records.clone())
     }
 
     fn append(&mut self, record: &Record) -> Result<()> {
         self.records.push(record.clone());
+        Ok(())
+    }
+
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        Ok(self.metadata.clone())
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.records.push(record.clone());
+        if let Some(metadata) = metadata {
+            self.metadata.insert(record.id, metadata.clone());
+        }
         Ok(())
     }
 }
@@ -502,12 +562,55 @@ pub struct Session {
     retry: crate::RetryControl,
     store: Box<dyn SessionStore>,
     records: Vec<Record>,
+    record_metadata: BTreeMap<u64, serde_json::Value>,
     head: u64,
     run_id: Option<Uuid>,
     poisoned: bool,
 }
 
 impl Session {
+    pub fn supports_record_metadata(&self) -> bool {
+        self.store.supports_record_metadata()
+    }
+    pub(crate) fn compaction_details_budget(
+        &self,
+        event: &Event,
+        from_extension: bool,
+        truncated: bool,
+    ) -> Result<usize> {
+        let Some(limit) = self.store.encoded_record_limit() else {
+            return Ok(4 * 1024 * 1024);
+        };
+        let mut metadata = serde_json::json!({"details":null});
+        if truncated {
+            metadata["nativeFileDetailsTruncated"] = true.into();
+        }
+        if from_extension {
+            metadata["fromExtension"] = true.into();
+            metadata["nativeGeneratedFileDetails"] = true.into();
+        }
+        let record = Record {
+            timestamp: Some(record_timestamp()),
+            run_id: self.run_id,
+            version: self
+                .records
+                .last()
+                .map_or(TURN_END_JOURNAL_VERSION, |record| {
+                    record.version.max(TURN_END_JOURNAL_VERSION)
+                }),
+            id: self.records.len() as u64 + 1,
+            parent: (self.head != 0).then_some(self.head),
+            event: event.clone(),
+        };
+        let envelope = encode_record(&record, Some(&metadata))?
+            .len()
+            .saturating_add(1);
+        // `null` in the template occupies four bytes; replace it with details.
+        Ok(limit
+            .saturating_sub(envelope)
+            .saturating_add(4)
+            .min(4 * 1024 * 1024))
+    }
     pub fn retry_control(&self) -> crate::RetryControl {
         self.retry.clone()
     }
@@ -534,24 +637,76 @@ impl Session {
         Ok(session)
     }
 
+    /// Hold the journal lock while reading a complete session without repairing it.
+    /// This is intended for exports that must not modify the source journal.
+    pub fn open_for_share(path: impl AsRef<Path>) -> Result<Self> {
+        let session = Self::with_store(ShareFileStore(FileStore::open_existing(path.as_ref())?))?;
+        if session.host_binding().is_none() && session.pending_tree_trigger_handoff().is_some() {
+            return Err(Error::Session(
+                "journal requires handoff recovery before sharing".into(),
+            ));
+        }
+        Ok(session)
+    }
+
     /// Read a stable, complete-record prefix without locking or repairing the source.
     pub fn snapshot(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
         let length = file.metadata()?.len();
-        let (records, _, _) = read_complete_records(file.take(length))?;
+        let (records, metadata, _, _) = read_complete_records(file.take(length))?;
         if records.is_empty() {
             return Err(Error::Session("journal has no committed header".into()));
         }
-        Self::from_records(records)
+        Self::with_store(MemoryStore { records, metadata })
     }
 
     /// Restore a validated, in-memory snapshot without mutating its source.
+    /// `Record` does not contain auxiliary metadata; use
+    /// `from_records_with_metadata` when the source includes it.
     pub fn from_records(records: Vec<Record>) -> Result<Self> {
-        Self::with_store(MemoryStore { records })
+        Self::with_store(MemoryStore {
+            records,
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    /// Restore records together with their atomic auxiliary metadata.
+    pub fn from_records_with_metadata(
+        records: Vec<Record>,
+        metadata: BTreeMap<u64, serde_json::Value>,
+    ) -> Result<Self> {
+        Self::with_store(MemoryStore { records, metadata })
+    }
+
+    /// Restore serialized native records, preserving auxiliary metadata.
+    pub fn from_serialized_records(values: Vec<serde_json::Value>) -> Result<Self> {
+        let mut records = Vec::with_capacity(values.len());
+        let mut metadata = BTreeMap::new();
+        for value in values {
+            let legacy = legacy_compaction_metadata(&value);
+            let stored: PersistedRecord = serde_json::from_value(value)?;
+            if let Some(extra) = stored.metadata.or(legacy) {
+                metadata.insert(stored.record.id, extra);
+            }
+            records.push(stored.record);
+        }
+        Self::from_records_with_metadata(records, metadata)
     }
 
     pub fn with_store(mut store: impl SessionStore + 'static) -> Result<Self> {
         let mut records = store.load()?;
+        let record_metadata = store.load_record_metadata()?;
+        if record_metadata
+            .keys()
+            .any(|id| *id == 0 || *id > records.len() as u64)
+        {
+            return Err(Error::Session(
+                "record metadata references a missing record".into(),
+            ));
+        }
+        if record_metadata.values().any(serde_json::Value::is_null) {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
         let head = validated_head(&records)?;
         restore_imported_compaction_prompts(&mut records);
         let mut session = Self {
@@ -559,6 +714,7 @@ impl Session {
             retry: crate::RetryControl::default(),
             store: Box::new(store),
             records,
+            record_metadata,
             head,
             run_id: None,
             poisoned: false,
@@ -569,6 +725,25 @@ impl Session {
             })?;
         }
         Ok(session)
+    }
+
+    /// Return auxiliary metadata attached atomically to a journal record.
+    pub fn record_metadata(&self, id: u64) -> Option<&serde_json::Value> {
+        self.record_metadata.get(&id)
+    }
+
+    /// Verify the provenance of all Pi source entries in this snapshot.
+    pub fn validated_pi_conversion_counts(&self) -> Result<BTreeMap<u64, u64>> {
+        let relevant = self
+            .records
+            .iter()
+            .filter_map(|record| {
+                matches!(&record.event,
+            Event::SourceEntry { format, .. } if format == "pi")
+                .then_some(record.id)
+            })
+            .collect();
+        crate::pi_import::validate_conversions(self, &relevant)
     }
 
     pub(crate) fn set_run_id(&mut self, run_id: Option<Uuid>) {
@@ -698,6 +873,31 @@ impl Session {
         Ok(project_messages(&branch, ops))
     }
 
+    /// Snapshot a settled branch for use as model input. Failed or cancelled
+    /// assistant records remain available through `conversation_at` for display,
+    /// but are excluded here even when their content was edited.
+    pub fn model_conversation_at(&self, record_id: u64) -> Result<Vec<Message>> {
+        if record_id == 0
+            || record_id > self.records.len() as u64
+            || matches!(
+                self.records[record_id as usize - 1].event,
+                Event::Checkout { .. }
+            )
+        {
+            return Err(Error::Session(
+                "invalid conversation snapshot record".into(),
+            ));
+        }
+        let branch = self.path(record_id);
+        let ops = operations(&branch);
+        ensure_settled(ops.clone())?;
+        let excluded = failed_assistant_records(&branch);
+        Ok(project_message_entries(&branch, ops)
+            .into_iter()
+            .filter_map(|(source, message)| (!excluded.contains(&source)).then_some(message))
+            .collect())
+    }
+
     pub(crate) fn abandoned_branch(&self, target: u64) -> AbandonedBranch {
         let (branch, common_ancestor) = self.branch_divergence(target);
         let first_abandoned = common_ancestor.map_or(0, |index| index + 1);
@@ -705,8 +905,11 @@ impl Session {
         let Some(first) = branch.get(first_abandoned) else {
             return abandoned;
         };
+        let excluded = failed_assistant_records(&branch);
         let mut messages = conversation_entries_since(&branch, self.operations(), first.id);
-        messages.retain(|(_, message)| !matches!(message, Message::Tool { .. }));
+        messages.retain(|(source, message)| {
+            !excluded.contains(source) && !matches!(message, Message::Tool { .. })
+        });
         for (_, message) in &messages {
             if let Message::Assistant { calls, .. } = message {
                 for call in calls {
@@ -1593,6 +1796,13 @@ impl Session {
         Ok(records)
     }
 
+    pub(crate) fn fork_session_after_handoff(&self, requested: u64) -> Result<Self> {
+        let target = self.validated_fork_target(self.fork_target_after_handoff(requested)?)?;
+        let records = self.fork_records_after_handoff(requested)?;
+        let metadata = self.fork_metadata(target, &records);
+        Self::from_records_with_metadata(records, metadata)
+    }
+
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
         self.queued_input_records()
             .filter_map(|record| match &record.event {
@@ -1905,20 +2115,341 @@ impl Session {
         timestamps
     }
 
+    /// Clone every branch only when the journal contains no executable or queued work.
+    /// Unsupported histories return `None` so callers may retain branch-only behavior.
+    pub fn fork_inert_full_history(&self) -> Result<Option<Self>> {
+        if self.host_binding().is_some()
+            || self.records.iter().any(|record| {
+                matches!(
+                    record.event,
+                    Event::HostBound { .. } | Event::HostRunBound { .. }
+                )
+            })
+        {
+            return Err(Error::Session(
+                "managed sessions must be forked by their host".into(),
+            ));
+        }
+        let inert = self.records.iter().all(|record| {
+            record.run_id.is_none()
+                && match &record.event {
+                    Event::Created { .. }
+                    | Event::SessionInfo { .. }
+                    | Event::ParentSession { .. }
+                    | Event::Checkout { .. }
+                    | Event::User { .. }
+                    | Event::UserWithImages { .. }
+                    | Event::UserImages { .. }
+                    | Event::ModelSelected { .. }
+                    | Event::Label { .. }
+                    | Event::ContextEdited { .. }
+                    | Event::Compacted { .. }
+                    | Event::BranchSummary { .. }
+                    | Event::BashExecution { .. } => true,
+                    Event::SourceEntry { format, .. } => {
+                        matches!(format.as_str(), "pi" | "pi-rs:external-session-id")
+                    }
+                    Event::ModelFinished { reply, .. } => reply.is_none(),
+                    Event::Assistant { invocations, .. } => invocations.is_empty(),
+                    _ => false,
+                }
+        });
+        if !inert {
+            return Ok(None);
+        }
+        let mut records = self.records.clone();
+        if let Event::Created { session_id } = &mut records[0].event {
+            *session_id = Uuid::new_v4();
+            records[0].timestamp = Some(record_timestamp());
+        }
+        Ok(Some(Self::from_records_with_metadata(
+            records,
+            self.record_metadata.clone(),
+        )?))
+    }
+
     /// Export one settled branch with fresh session identity and remapped record references.
+    /// Auxiliary record metadata is not representable in this legacy return type;
+    /// use `fork_session` or `fork_to` when it must be preserved.
     pub fn fork_records(&self, target: u64) -> Result<Vec<Record>> {
         if self.host_binding().is_some() {
             return Err(Error::Session(
                 "managed sessions must be forked by their host".into(),
             ));
         }
+        let target = self.validated_fork_target(target)?;
         self.conversation_at(target)?;
         let branch = self.path(target);
+        let pi_sources: Vec<_> = self.records.iter().filter(|record|
+            matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi")).collect();
+        let legacy_pi = pi_sources.first().is_some_and(|record| {
+            matches!(&record.event, Event::SourceEntry { entry, .. }
+                if entry["type"] == "session" && entry["version"].as_u64().unwrap_or(1) == 1)
+        });
+        let source_ids: BTreeMap<u64, String> = pi_sources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let Event::SourceEntry { entry, .. } = &record.event else {
+                    return None;
+                };
+                if entry["type"] == "session" {
+                    return None;
+                }
+                entry["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| (legacy_pi && index > 0).then(|| format!("legacy-{index}")))
+                    .map(|id| (record.id, id))
+            })
+            .collect();
+        let sources_by_id: BTreeMap<_, _> = source_ids
+            .iter()
+            .map(|(record, id)| (id.as_str(), *record))
+            .collect();
+        let source_indices: BTreeMap<u64, usize> = pi_sources
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.id, index))
+            .collect();
+        // Only durable import provenance proves which native records belong
+        // to a source entry. In particular, an entry may produce zero or
+        // several records, and timestamps alone cannot distinguish a native
+        // child from a conversion.
+        let mut canonical = BTreeMap::new();
+        let mut unproven = BTreeMap::<u64, u64>::new();
+        let selected: std::collections::HashSet<_> =
+            branch.iter().map(|record| record.id).collect();
+        let selected_source_ids: std::collections::HashSet<_> = source_ids
+            .iter()
+            .filter_map(|(id, source)| selected.contains(id).then_some(source.as_str()))
+            .collect();
+        let mut relevant_sources = selected.clone();
+        for source in &self.records {
+            if let Event::SourceEntry { format, entry } = &source.event
+                && format == "pi" && entry["type"] == "label"
+                && (entry["targetId"].as_str().is_some_and(|id| selected_source_ids.contains(id))
+                    || self.records.get(source.id as usize).is_some_and(|record|
+                        matches!(&record.event, Event::Label { target, .. } if selected.contains(target))))
+            {
+                relevant_sources.insert(source.id);
+            }
+        }
+        let verified_conversions = crate::pi_import::validate_conversions(self, &relevant_sources)?;
+        for source in &self.records {
+            let Event::SourceEntry { format, entry } = &source.event else {
+                continue;
+            };
+            if format != "pi" || entry["type"] == "session" {
+                continue;
+            }
+            if !selected.contains(&source.id)
+                && !(entry["type"] == "label"
+                    && (entry["targetId"].as_str().is_some_and(|id| selected_source_ids.contains(id))
+                        || self.records.get(source.id as usize).is_some_and(|record|
+                            matches!(&record.event, Event::Label { target, .. } if selected.contains(target)))))
+            {
+                continue;
+            }
+            let count = verified_conversions.get(&source.id).copied();
+            if let Some(count) = count {
+                if count > self.records.len() as u64 - source.id {
+                    return Err(Error::Session(
+                        "invalid imported Pi conversion provenance".into(),
+                    ));
+                }
+                let mut parent = source.id;
+                for offset in 0..count {
+                    let derived = self
+                        .records
+                        .get((source.id + offset) as usize)
+                        .filter(|record| {
+                            record.parent == Some(parent)
+                                && record.timestamp == source.timestamp
+                                && record.run_id.is_none()
+                                && !matches!(
+                                    record.event,
+                                    Event::SourceEntry { .. } | Event::Checkout { .. }
+                                )
+                        })
+                        .ok_or_else(|| {
+                            Error::Session("invalid imported Pi conversion provenance".into())
+                        })?;
+                    if canonical.insert(derived.id, source.id).is_some() {
+                        return Err(Error::Session(
+                            "overlapping imported Pi conversion provenance".into(),
+                        ));
+                    }
+                    parent = derived.id;
+                }
+                if selected.contains(&source.id)
+                    && (1..=count).any(|offset| !selected.contains(&(source.id + offset)))
+                {
+                    return Err(Error::Session(
+                        "cannot fork through a partial imported Pi conversion".into(),
+                    ));
+                }
+            } else {
+                let mut parent = source.id;
+                for derived in self.records.iter().skip(source.id as usize) {
+                    if derived.parent != Some(parent)
+                        || derived.timestamp != source.timestamp
+                        || derived.run_id.is_some()
+                        || matches!(
+                            derived.event,
+                            Event::SourceEntry { .. } | Event::Checkout { .. }
+                        )
+                    {
+                        break;
+                    }
+                    unproven.insert(source.id, source.id);
+                    unproven.insert(derived.id, source.id);
+                    parent = derived.id;
+                }
+            }
+        }
+        let mut uncertain_targets = BTreeMap::<u64, std::collections::HashSet<u64>>::new();
+        for record in &self.records {
+            if let Event::Label { target, .. } = record.event
+                && let Some(source) = unproven.get(&target)
+                && selected.contains(source)
+            {
+                uncertain_targets.entry(*source).or_default().insert(target);
+            }
+        }
+        if uncertain_targets.values().any(|targets| {
+            targets.len() > 1 || targets.iter().any(|target| !selected.contains(target))
+        }) {
+            return Err(Error::Session(
+                "cannot resolve ambiguous imported label targets without conversion provenance"
+                    .into(),
+            ));
+        }
+        // Labels are session-wide, but a selected fork contains fresh labels
+        // only for targets retained on its path. Keep stable record slots for
+        // removed labels so all other native references remain remappable.
+        let removed_labels: std::collections::HashSet<u64> = branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::Label { .. } => Some(record.id),
+                Event::SourceEntry { format, entry }
+                    if format == "pi" && entry["type"] == "label" =>
+                {
+                    Some(record.id)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut label_replacements = BTreeMap::new();
+        let mut next = None;
+        for record in branch.iter().rev() {
+            if removed_labels.contains(&record.id) {
+                label_replacements.insert(record.id, next);
+            } else {
+                next = Some(record.id);
+            }
+        }
+        let mut source_labels = BTreeMap::new();
+        for record in &branch {
+            if let Event::SourceEntry { format, entry } = &record.event
+                && format == "pi"
+                && entry["type"] == "label"
+                && let Some(id) = source_ids.get(&record.id)
+            {
+                source_labels.insert(id.clone(), record.id);
+            }
+        }
+        // A Pi label is stored as a source record followed by its native
+        // projection. A fork through only one half cannot preserve both the
+        // Pi tree and the native session's global label state.
+        for (index, record) in branch.iter().enumerate() {
+            let Event::SourceEntry { format, entry } = &record.event else {
+                continue;
+            };
+            if format != "pi" {
+                continue;
+            }
+            if entry["type"] == "label" {
+                let paired = branch.get(index + 1).is_some_and(|next| {
+                    next.parent == Some(record.id) && next.timestamp == record.timestamp
+                        && next.run_id.is_none()
+                        && (canonical.get(&next.id) == Some(&record.id)
+                            || (unproven.get(&next.id) == Some(&record.id)
+                                && entry["targetId"].as_str().is_some_and(|target_id| {
+                                    sources_by_id.get(target_id)
+                                        .is_some_and(|target_source| matches!(&next.event,
+                                            Event::Label { target, .. }
+                                                if target == target_source || unproven.get(target) == Some(target_source)
+                                                    || canonical.get(target) == Some(target_source)))
+                                })))
+                        && matches!(&next.event, Event::Label { label, .. }
+                            if label.as_deref() == entry["label"].as_str())
+                });
+                if !paired {
+                    return Err(Error::Session(
+                        "cannot fork through an incomplete or ambiguous imported Pi label".into(),
+                    ));
+                }
+            } else {
+                for key in ["targetId", "fromId"] {
+                    if entry[key]
+                        .as_str()
+                        .is_some_and(|id| source_labels.contains_key(id))
+                    {
+                        return Err(Error::Session(format!(
+                            "cannot fork: Pi {key} references a removed label"
+                        )));
+                    }
+                }
+                if entry["type"] == "message"
+                    && entry["message"]["role"] == "branchSummary"
+                    && entry["message"]["fromId"]
+                        .as_str()
+                        .is_some_and(|id| source_labels.contains_key(id))
+                {
+                    return Err(Error::Session(
+                        "cannot fork: Pi branch summary references a removed label".into(),
+                    ));
+                }
+            }
+        }
+        for record in &branch {
+            let referenced = match &record.event {
+                Event::ContextEdited { target, .. } => Some(*target),
+                Event::BranchSummary { from, .. } => *from,
+                _ => None,
+            };
+            if referenced.is_some_and(|id| removed_labels.contains(&id)) {
+                return Err(Error::Session(
+                    "cannot fork: retained entry references a removed label".into(),
+                ));
+            }
+        }
         let ids: BTreeMap<_, _> = branch
             .iter()
             .enumerate()
             .map(|(index, record)| (record.id, index as u64 + 1))
             .collect();
+        let mut labels = BTreeMap::<u64, (String, Option<String>, u64)>::new();
+        let mut label_order = 0_u64;
+        for record in &self.records {
+            if let Event::Label { target, label } = &record.event {
+                let target = canonical.get(target).copied().unwrap_or(*target);
+                if let Some(label) = label.as_ref().filter(|label| !label.is_empty()) {
+                    let order = labels.get(&target).map_or_else(
+                        || {
+                            let order = label_order;
+                            label_order += 1;
+                            order
+                        },
+                        |(_, _, order)| *order,
+                    );
+                    labels.insert(target, (label.clone(), record.timestamp.clone(), order));
+                } else {
+                    labels.remove(&target);
+                }
+            }
+        }
         // Tree messages are consumed session-wide, even when their delivery is
         // on a branch that is absent from the fork's ancestry.
         let globally_consumed: std::collections::HashSet<Uuid> = self
@@ -1936,8 +2467,15 @@ impl Session {
                 .summary_usage(&self.records)
                 .and_then(|(_, metadata)| metadata.map(Box::new));
             let mut record = record.clone();
+            let original_id = record.id;
             record.id = ids[&record.id];
             record.parent = record.parent.and_then(|parent| ids.get(&parent).copied());
+            if removed_labels.contains(&original_id) {
+                record.event = Event::SessionInfo {
+                    name: None,
+                    cwd: None,
+                };
+            }
             if matches!(&record.event, Event::TreeMessageQueued { input } if globally_consumed.contains(&input.id))
             {
                 record.event = Event::SessionInfo {
@@ -1952,6 +2490,79 @@ impl Session {
                 }
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
+                }
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    if let Some(old) = entry.get("boundary").and_then(serde_json::Value::as_u64) {
+                        if let Some(new) = ids.get(&old) {
+                            entry["boundary"] = serde_json::json!(new);
+                        } else if let Some(object) = entry.as_object_mut() {
+                            // A missing retained record must not become a valid
+                            // all-history boundary on recovery.
+                            object.remove("boundary");
+                        }
+                    }
+                }
+                Event::SourceEntry { format, entry } if format == "pi" => {
+                    if legacy_pi && entry["type"] != "session" {
+                        if let Some(id) = source_ids.get(&original_id) {
+                            entry["id"] = serde_json::json!(id);
+                        }
+                        if entry["type"] == "compaction"
+                            && let Some(index) = entry["firstKeptEntryIndex"]
+                                .as_u64()
+                                .and_then(|n| usize::try_from(n).ok())
+                        {
+                            let current = source_indices[&original_id];
+                            let boundary = if index >= current && index < pi_sources.len() {
+                                current
+                            } else {
+                                index
+                            };
+                            let source = pi_sources
+                                .get(boundary)
+                                .and_then(|record| source_ids.get(&record.id))
+                                .ok_or_else(|| {
+                                    Error::Session(
+                                        "cannot map legacy Pi compaction boundary".into(),
+                                    )
+                                })?;
+                            entry["firstKeptEntryId"] = serde_json::json!(source);
+                            entry
+                                .as_object_mut()
+                                .expect("Pi entry object")
+                                .remove("firstKeptEntryIndex");
+                        }
+                    }
+                    if entry["type"] == "compaction"
+                        && let Some(old) = entry["firstKeptEntryId"].as_str()
+                        && let Some(label_id) = source_labels.get(old)
+                    {
+                        let replacement = label_replacements
+                            .get(label_id)
+                            .copied()
+                            .flatten()
+                            .ok_or_else(|| {
+                                Error::Session(
+                                    "fork compaction boundary has no retained entry".into(),
+                                )
+                            })?;
+                        let replacement_entry = &self.records[(replacement - 1) as usize];
+                        let Event::SourceEntry { format, .. } = &replacement_entry.event else {
+                            return Err(Error::Session(
+                                "fork compaction boundary cannot be represented as a Pi entry"
+                                    .into(),
+                            ));
+                        };
+                        let replacement_id = source_ids
+                            .get(&replacement)
+                            .filter(|_| format == "pi")
+                            .ok_or_else(|| {
+                                Error::Session(
+                                    "fork compaction boundary lacks a Pi entry ID".into(),
+                                )
+                            })?;
+                        entry["firstKeptEntryId"] = serde_json::json!(replacement_id);
+                    }
                 }
                 Event::TreeTriggerHandoff { return_to, .. } => {
                     *return_to = *ids
@@ -1975,7 +2586,26 @@ impl Session {
                     usage_metadata,
                     ..
                 } => {
-                    *retain_from = retain_from.and_then(|id| ids.get(&id).copied());
+                    *retain_from = retain_from.and_then(|id| {
+                        let replacement =
+                            label_replacements.get(&id).copied().unwrap_or(Some(id))?;
+                        let is_self = label_replacements.contains_key(&id)
+                            && matches!(&self.records[(replacement - 1) as usize].event,
+                                Event::SourceEntry { format, entry }
+                                if format == "pi" && entry["type"] == "compaction")
+                            && canonical.get(&original_id) == Some(&replacement);
+                        if is_self || replacement == original_id {
+                            return None;
+                        }
+                        let replacement = if label_replacements.contains_key(&id)
+                            && canonical.get(&(replacement + 1)) == Some(&replacement)
+                        {
+                            replacement + 1
+                        } else {
+                            replacement
+                        };
+                        ids.get(&replacement).copied()
+                    });
                     *usage_metadata = summary_metadata;
                 }
                 Event::BranchSummary {
@@ -2024,8 +2654,105 @@ impl Session {
                 });
             }
         }
+        let mut retained_labels: Vec<_> = labels
+            .into_iter()
+            .filter_map(|(target, (label, timestamp, order))| {
+                (!removed_labels.contains(&target))
+                    .then(|| ids.get(&target).copied())
+                    .flatten()
+                    .map(|target| (target, label, timestamp, order))
+            })
+            .collect();
+        retained_labels.sort_by_key(|(_, _, _, order)| *order);
+        for (target, label, timestamp, _) in retained_labels {
+            let id = records.len() as u64 + 1;
+            records.push(Record {
+                timestamp,
+                run_id: None,
+                version: records
+                    .last()
+                    .map_or(TURN_END_JOURNAL_VERSION, |record| record.version),
+                id,
+                parent: Some(id - 1),
+                event: Event::Label {
+                    target,
+                    label: Some(label),
+                },
+            });
+        }
         validated_head(&records)?;
         Ok(records)
+    }
+
+    /// Fork a settled branch in memory, preserving auxiliary record metadata.
+    pub fn fork_session(&self, target: u64) -> Result<Self> {
+        let target = self.validated_fork_target(target)?;
+        let records = self.fork_records(target)?;
+        let metadata = self.fork_metadata(target, &records);
+        Self::from_records_with_metadata(records, metadata)
+    }
+
+    fn validated_fork_target(&self, target: u64) -> Result<u64> {
+        if target == 0 || target > self.records.len() as u64 {
+            return Err(Error::Session("invalid fork entry".into()));
+        }
+        let path = self.path(target);
+        let mut relevant: std::collections::HashSet<_> =
+            path.iter().map(|record| record.id).collect();
+        let sources: Vec<_> = self.records.iter().filter(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi")).collect();
+        let legacy = sources.first().is_some_and(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["type"] == "session" && entry["version"].as_u64().unwrap_or(1) == 1));
+        let names: std::collections::HashSet<String> = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                if !relevant.contains(&record.id) {
+                    return None;
+                }
+                let Event::SourceEntry { entry, .. } = &record.event else {
+                    return None;
+                };
+                entry["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| (legacy && index > 0).then(|| format!("legacy-{index}")))
+            })
+            .collect();
+        for source in &sources {
+            if let Event::SourceEntry { entry, .. } = &source.event && entry["type"] == "label"
+                && (entry["targetId"].as_str().is_some_and(|id| names.contains(id))
+                    || self.records.get(source.id as usize).is_some_and(|record| matches!(&record.event, Event::Label { target, .. } if relevant.contains(target))))
+            { relevant.insert(source.id); }
+        }
+        let verified = crate::pi_import::validate_conversions(self, &relevant)?;
+        if let Some(source) = path
+            .iter()
+            .rev()
+            .find(|record| matches!(&record.event, Event::SourceEntry { .. }))
+            && let Some(count) = verified.get(&source.id)
+            && target >= source.id
+            && target < source.id + count
+        {
+            return Ok(source.id + count);
+        }
+        Ok(target)
+    }
+
+    fn fork_metadata(&self, target: u64, records: &[Record]) -> BTreeMap<u64, serde_json::Value> {
+        let path = self.path(target);
+        path
+            .iter()
+            .enumerate()
+            .filter_map(|(index, original)| {
+                let forked = records.get(index)?;
+                (std::mem::discriminant(&original.event) == std::mem::discriminant(&forked.event)
+                    || matches!(&original.event, Event::Label { .. })
+                    || matches!(&original.event, Event::SourceEntry { format, entry } if format == "pi" && entry["type"] == "label"))
+                    .then(|| {
+                        self.record_metadata.get(&original.id).map(|value| (forked.id, value.clone()))
+                    })
+                    .flatten()
+            })
+            .collect()
     }
 
     /// Publish a complete local journal without replacing an existing file.
@@ -2035,7 +2762,7 @@ impl Session {
                 "managed sessions must be exported by their host".into(),
             ));
         }
-        publish_snapshot(&self.records, destination.as_ref())
+        publish_snapshot(&self.records, &self.record_metadata, destination.as_ref())
     }
 
     /// Publish an already validated in-memory fork and keep the same locked
@@ -2070,7 +2797,7 @@ impl Session {
         };
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
         for record in &self.records {
-            let mut line = serde_json::to_vec(record)?;
+            let mut line = encode_record(record, self.record_metadata.get(&record.id))?;
             line.push(b'\n');
             if line.len() > MAX_RECORD_BYTES {
                 return Err(Error::Session("journal record exceeds size limit".into()));
@@ -2090,6 +2817,7 @@ impl Session {
         parent_dir.sync_all()?;
         self.store = Box::new(FileStore {
             file,
+            metadata: self.record_metadata.clone(),
             #[cfg(windows)]
             lock_file,
             #[cfg(unix)]
@@ -2100,8 +2828,8 @@ impl Session {
 
     /// Create and open an independent, persistent branch with fresh session identity.
     pub fn fork_to(&self, target: u64, destination: impl AsRef<Path>) -> Result<Self> {
-        let records = self.fork_records(target)?;
-        publish_snapshot(&records, destination.as_ref())?;
+        let fork = self.fork_session(target)?;
+        publish_snapshot(&fork.records, &fork.record_metadata, destination.as_ref())?;
         Self::open(destination)
     }
 
@@ -2192,9 +2920,49 @@ impl Session {
     }
 
     fn append_inner(&mut self, event: Event, model_marker: bool) -> Result<&Record> {
+        self.append_inner_with_metadata(event, model_marker, None, false)
+    }
+
+    pub(crate) fn append_with_record_metadata(
+        &mut self,
+        event: Event,
+        metadata: serde_json::Value,
+    ) -> Result<&Record> {
+        if metadata.is_null() {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
+        self.append_inner_with_metadata(event, true, Some(metadata), false)
+    }
+
+    /// Append optional presentation metadata only when the store can retain it.
+    pub(crate) fn append_with_advisory_metadata(
+        &mut self,
+        event: Event,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<&Record> {
+        self.append_inner_with_metadata(event, true, metadata, true)
+    }
+
+    fn append_inner_with_metadata(
+        &mut self,
+        event: Event,
+        model_marker: bool,
+        mut metadata: Option<serde_json::Value>,
+        advisory: bool,
+    ) -> Result<&Record> {
+        if advisory && !self.store.supports_record_metadata() {
+            metadata = None;
+        }
         if self.poisoned {
             return Err(Error::Session(
                 "journal write failed; reopen before continuing".into(),
+            ));
+        }
+        // Reject unsupported metadata before appending even implicit marker
+        // records. No write was attempted, so the journal remains usable.
+        if metadata.is_some() && !self.store.supports_record_metadata() {
+            return Err(Error::Session(
+                "session store does not support record metadata".into(),
             ));
         }
         // A native message branching directly from a legacy Pi source needs a
@@ -2270,11 +3038,29 @@ impl Session {
             parent,
             event,
         };
-        if let Err(err) = self.store.append(&record) {
+        // Reject an oversized metadata record before a store write is attempted;
+        // this is a deterministic validation failure, not an ambiguous I/O error.
+        if metadata.is_some()
+            && let Some(limit) = self.store.encoded_record_limit()
+            && encode_record(&record, metadata.as_ref())?
+                .len()
+                .saturating_add(1)
+                > limit
+        {
+            if advisory {
+                metadata = None;
+            } else {
+                return Err(Error::Session("journal record exceeds size limit".into()));
+            }
+        }
+        if let Err(err) = self.store.append_with_metadata(&record, metadata.as_ref()) {
             self.poisoned = true;
             return Err(err);
         }
         self.head = next_head;
+        if let Some(metadata) = metadata {
+            self.record_metadata.insert(id, metadata);
+        }
         self.records.push(record);
         Ok(self.records.last().unwrap())
     }
@@ -2311,7 +3097,11 @@ pub(crate) fn validate_custom_message(message: &crate::CustomMessage) -> Result<
     Ok(())
 }
 
-fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
+fn publish_snapshot(
+    records: &[Record],
+    metadata: &BTreeMap<u64, serde_json::Value>,
+    destination: &Path,
+) -> Result<()> {
     validated_head(records)?;
     let parent = destination
         .parent()
@@ -2320,8 +3110,12 @@ fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
     std::fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     for record in records {
-        serde_json::to_writer(&mut temporary, record)?;
-        writeln!(temporary)?;
+        let mut line = encode_record(record, metadata.get(&record.id))?;
+        line.push(b'\n');
+        if line.len() > MAX_RECORD_BYTES {
+            return Err(Error::Session("journal record exceeds size limit".into()));
+        }
+        temporary.write_all(&line)?;
     }
     temporary.as_file().sync_all()?;
     temporary
@@ -2330,6 +3124,31 @@ fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// Whether a completion is a marked, display-only cancelled turn partial.
+#[doc(hidden)]
+pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
+    let Event::ModelFinished {
+        request_id,
+        failure: Some(ModelFailure::Cancelled),
+        partial,
+        ..
+    } = &record.event
+    else {
+        return false;
+    };
+    let Some(parent) = record
+        .parent
+        .and_then(|id| id.checked_sub(1))
+        .and_then(|index| records.get(index as usize))
+    else {
+        return false;
+    };
+    matches!(&parent.event, Event::SourceEntry { format, entry }
+        if format == "pi-rs:aborted-turn-partial"
+            && entry["requestId"].as_str().and_then(|id| Uuid::parse_str(id).ok()) == Some(*request_id)
+            && !partial.is_empty())
 }
 
 fn validate_context_edit(
@@ -2341,7 +3160,8 @@ fn validate_context_edit(
         .checked_sub(1)
         .and_then(|index| records.get(index as usize))
         .ok_or_else(|| Error::Session("invalid context edit target".into()))?;
-    let assistant = matches!(record.event, Event::Assistant { .. });
+    let assistant =
+        matches!(record.event, Event::Assistant { .. }) || is_aborted_turn_partial(records, record);
     if !assistant
         && !matches!(
             record.event,
@@ -2351,6 +3171,7 @@ fn validate_context_edit(
                 | Event::UserWithImages { .. }
                 | Event::ToolFinished { .. }
                 | Event::ToolReconciled { .. }
+                | Event::ImportedUnattributedToolResult { .. }
         )
     {
         return Err(Error::Session(
@@ -2492,6 +3313,7 @@ fn validated_head(records: &[Record]) -> Result<u64> {
 
 struct FileStore {
     file: File,
+    metadata: BTreeMap<u64, serde_json::Value>,
     #[cfg(windows)]
     lock_file: File,
     #[cfg(unix)]
@@ -2500,8 +3322,20 @@ struct FileStore {
 
 impl FileStore {
     fn open(path: &Path) -> Result<Self> {
+        Self::open_with_create(path, true)
+    }
+
+    fn open_existing(path: &Path) -> Result<Self> {
+        Self::open_with_create(path, false)
+    }
+
+    fn open_with_create(path: &Path, create: bool) -> Result<Self> {
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -2528,6 +3362,7 @@ impl FileStore {
             .map_err(|err| Error::Session(format!("cannot lock journal: {err}")))?;
         Ok(Self {
             file,
+            metadata: BTreeMap::new(),
             #[cfg(windows)]
             lock_file,
             #[cfg(unix)]
@@ -2551,8 +3386,67 @@ impl Drop for FileStore {
     }
 }
 
-fn read_complete_records(reader: impl Read) -> Result<(Vec<Record>, u64, bool)> {
+#[derive(Deserialize)]
+struct PersistedRecord {
+    #[serde(flatten)]
+    record: Record,
+    #[serde(
+        default,
+        rename = "piRsRecordMetadata",
+        deserialize_with = "deserialize_present_metadata"
+    )]
+    metadata: Option<serde_json::Value>,
+}
+
+fn deserialize_present_metadata<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    <serde_json::Value as Deserialize>::deserialize(deserializer).map(Some)
+}
+
+// Draft versions stored these fields inside Event::Compacted. Preserve them
+// while restoring the original public enum shape.
+fn legacy_compaction_metadata(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let event = value.get("event")?.as_object()?;
+    if event.get("type")?.as_str()? != "compacted" {
+        return None;
+    }
+    let from_extension = event
+        .get("from_extension")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let details = event.get("details");
+    if !from_extension && details.is_none() {
+        return None;
+    }
+    let mut result = serde_json::json!({"fromExtension":from_extension});
+    if let Some(details) = details {
+        result["details"] = details.clone();
+    }
+    Some(result)
+}
+
+fn encode_record(record: &Record, metadata: Option<&serde_json::Value>) -> Result<Vec<u8>> {
+    if let Some(metadata) = metadata {
+        if metadata.is_null() {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
+        let mut value = serde_json::to_value(record)?;
+        value
+            .as_object_mut()
+            .expect("record serializes as an object")
+            .insert("piRsRecordMetadata".into(), metadata.clone());
+        Ok(serde_json::to_vec(&value)?)
+    } else {
+        Ok(serde_json::to_vec(record)?)
+    }
+}
+
+type CompleteRecords = (Vec<Record>, BTreeMap<u64, serde_json::Value>, u64, bool);
+
+fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
     let mut records = Vec::new();
+    let mut metadata = BTreeMap::new();
     let mut offset = 0;
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
@@ -2569,35 +3463,106 @@ fn read_complete_records(reader: impl Read) -> Result<(Vec<Record>, u64, bool)> 
             if records.is_empty() {
                 return Err(Error::Session("journal has no committed header".into()));
             }
-            return Ok((records, offset, true));
+            return Ok((records, metadata, offset, true));
         }
-        records.push(serde_json::from_slice(&line)?);
+        let stored: PersistedRecord = serde_json::from_slice(&line)?;
+        let legacy = if stored.metadata.is_none()
+            && matches!(stored.record.event, Event::Compacted { .. })
+        {
+            legacy_compaction_metadata(&serde_json::from_slice(&line)?)
+        } else {
+            None
+        };
+        if let Some(extra) = stored.metadata.or(legacy) {
+            metadata.insert(stored.record.id, extra);
+        }
+        records.push(stored.record);
         offset += line.len() as u64;
         line.clear();
     }
-    Ok((records, offset, false))
+    Ok((records, metadata, offset, false))
+}
+
+// Keep the same exclusive lock as a normal session without recovery writes.
+struct ShareFileStore(FileStore);
+
+impl SessionStore for ShareFileStore {
+    fn encoded_record_limit(&self) -> Option<usize> {
+        Some(MAX_RECORD_BYTES)
+    }
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
+    fn load(&mut self) -> Result<Vec<Record>> {
+        let (records, metadata, _, incomplete) = read_complete_records(&mut self.0.file)?;
+        if incomplete || records.is_empty() {
+            return Err(Error::Session(
+                "journal is incomplete; reopen it before sharing".into(),
+            ));
+        }
+        self.0.metadata = metadata;
+        Ok(records)
+    }
+
+    fn append(&mut self, record: &Record) -> Result<()> {
+        self.0.append(record)
+    }
+
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        self.0.load_record_metadata()
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.0.append_with_metadata(record, metadata)
+    }
 }
 
 impl SessionStore for FileStore {
+    fn encoded_record_limit(&self) -> Option<usize> {
+        Some(MAX_RECORD_BYTES)
+    }
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
-        let (records, offset, incomplete) = read_complete_records(&mut self.file)?;
+        let (records, metadata, offset, incomplete) = read_complete_records(&mut self.file)?;
         if incomplete {
             validated_head(&records)?;
             self.file.set_len(offset)?;
             self.file.sync_all()?;
         }
         self.file.seek(SeekFrom::End(0))?;
+        self.metadata = metadata;
         Ok(records)
     }
 
     fn append(&mut self, record: &Record) -> Result<()> {
-        let mut line = serde_json::to_vec(record)?;
+        self.append_with_metadata(record, None)
+    }
+
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        Ok(self.metadata.clone())
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let mut line = encode_record(record, metadata)?;
         line.push(b'\n');
         if line.len() > MAX_RECORD_BYTES {
             return Err(Error::Session("journal record exceeds size limit".into()));
         }
         self.file.write_all(&line)?;
         self.file.sync_data()?;
+        if let Some(metadata) = metadata {
+            self.metadata.insert(record.id, metadata.clone());
+        }
         #[cfg(unix)]
         if record.id == 1 {
             File::open(&self.parent)?.sync_all()?;
@@ -2805,6 +3770,30 @@ fn project_message_entries(
     messages
 }
 
+/// Failed assistant records remain visible in history, but are never model input.
+pub(crate) fn failed_assistant_records(path: &[&Record]) -> std::collections::HashSet<u64> {
+    let failed: std::collections::HashSet<_> = path
+        .iter()
+        .filter_map(|record| match record.event {
+            Event::ModelFinished {
+                request_id,
+                failure: Some(_),
+                ..
+            } => Some(request_id),
+            _ => None,
+        })
+        .collect();
+    path.iter()
+        .filter_map(|record| match &record.event {
+            Event::Assistant {
+                request_id: Some(id),
+                ..
+            } if failed.contains(id) => Some(record.id),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
@@ -2987,6 +3976,18 @@ fn conversation_entries_since_inner(
             })
             .collect()
     };
+    let unattributed: BTreeMap<_, _> = path
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ImportedUnattributedToolResult {
+                call_id,
+                tool_name,
+                is_error,
+                ..
+            } => Some((record.id, (call_id, tool_name, is_error))),
+            _ => None,
+        })
+        .collect();
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
@@ -2996,6 +3997,10 @@ fn conversation_entries_since_inner(
                 Message::User {
                     content: content.clone(),
                 },
+            )),
+            Event::ImportedUnattributedToolResult { content, .. } => messages.push((
+                record.id,
+                project_content(Message::User { content: String::new() }, content),
             )),
             Event::BashExecution { execution } if !execution.exclude_from_context => {
                 messages.push((
@@ -3097,6 +4102,18 @@ fn conversation_entries_since_inner(
             None => Some((source, message)),
         })
         .map(|(source, mut message)| {
+            if let Some((call_id, tool_name, is_error)) = unattributed.get(&source) {
+                let status = if **is_error { "error" } else { "success" };
+                let label = format!(
+                    "Historical unattributed tool result ({tool_name}, call {call_id}, {status}):\n"
+                );
+                match &mut message {
+                    Message::User { content } | Message::UserWithImages { content, .. } => {
+                        content.insert_str(0, &label)
+                    }
+                    _ => {}
+                }
+            }
             if let (Some(omitted), Message::Assistant { calls, replay, .. }) =
                 (omitted_calls.get(&source), &mut message)
             {
@@ -3293,8 +4310,392 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 }
 
 #[cfg(test)]
+mod record_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_compaction_fields_survive_journal_and_serialized_import() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        let mut values: Vec<_> = session
+            .records()
+            .iter()
+            .map(|record| serde_json::to_value(record).unwrap())
+            .collect();
+        values[1]["event"]["from_extension"] = true.into();
+        values[1]["event"]["details"] = serde_json::Value::Null;
+        let expected = serde_json::json!({"fromExtension":true,"details":null});
+        let imported = Session::from_serialized_records(values.clone()).unwrap();
+        assert_eq!(imported.record_metadata(2), Some(&expected));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        let bytes = values
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, bytes).unwrap();
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.record_metadata(2), Some(&expected));
+    }
+
+    #[test]
+    fn fork_remaps_overflow_retention_boundary() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "base".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let base = session.head();
+        session
+            .append(Event::User {
+                content: "abandoned".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session.checkout(base).unwrap();
+        session
+            .append(Event::User {
+                content: "retained".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let retained = session.head();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":retained,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let (marker, boundary) = fork
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    Some((record, entry["boundary"].as_u64().unwrap()))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(boundary, retained);
+        assert!(boundary < marker.id);
+        assert!(
+            matches!(&fork.records()[(boundary - 1) as usize].event, Event::User { content, .. } if content == "retained")
+        );
+    }
+
+    #[test]
+    fn fork_invalidates_overflow_boundary_on_another_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "base".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let base = session.head();
+        session
+            .append(Event::User {
+                content: "abandoned".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let abandoned = session.head();
+        session.checkout(base).unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":abandoned,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let entry = fork
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(entry.get("boundary").is_none());
+    }
+
+    #[test]
+    fn metadata_envelope_rejects_duplicate_record_fields() {
+        let record = Session::with_store(MemoryStore::default())
+            .unwrap()
+            .records()[0]
+            .clone();
+        let valid = serde_json::to_string(&record).unwrap();
+        assert!(serde_json::from_str::<PersistedRecord>(&valid).is_ok());
+        let duplicate = valid.replacen("\"id\":1", "\"id\":1,\"id\":2", 1);
+        assert_ne!(duplicate, valid);
+        assert!(serde_json::from_str::<PersistedRecord>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn null_record_metadata_is_rejected_on_restore() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut value = serde_json::to_value(&session.records()[0]).unwrap();
+        value["piRsRecordMetadata"] = serde_json::Value::Null;
+        assert!(Session::from_serialized_records(vec![value]).is_err());
+        assert!(
+            Session::from_records_with_metadata(
+                session.records().to_vec(),
+                [(1, serde_json::Value::Null)].into_iter().collect()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn file_metadata_is_atomic_and_survives_reopen_and_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.jsonl");
+        let metadata = serde_json::json!({"details": {"origin": "extension"}});
+        let mut session = Session::open(&path).unwrap();
+        let id = session
+            .append_with_record_metadata(
+                Event::SessionInfo {
+                    name: None,
+                    cwd: None,
+                },
+                metadata.clone(),
+            )
+            .unwrap()
+            .id;
+        assert_eq!(session.record_metadata(id), Some(&metadata));
+        let snapshot = Session::snapshot(&path).unwrap();
+        assert_eq!(snapshot.record_metadata(id), Some(&metadata));
+        let export = directory.path().join("export.jsonl");
+        session.export_jsonl(&export).unwrap();
+        let exported = Session::snapshot(&export).unwrap();
+        assert_eq!(exported.record_metadata(id), Some(&metadata));
+        let values = std::fs::read_to_string(&export)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let imported = Session::from_serialized_records(values).unwrap();
+        assert_eq!(imported.record_metadata(id), Some(&metadata));
+        let fork_path = directory.path().join("fork.jsonl");
+        let fork = session.fork_to(id, &fork_path).unwrap();
+        assert_eq!(fork.record_metadata(id), Some(&metadata));
+        let in_memory_fork = session.fork_session_after_handoff(id).unwrap();
+        assert_eq!(in_memory_fork.record_metadata(id), Some(&metadata));
+        let public_fork = session.fork_session(id).unwrap();
+        assert_eq!(public_fork.record_metadata(id), Some(&metadata));
+        drop(session);
+        let share = Session::open_for_share(&path).unwrap();
+        assert_eq!(share.record_metadata(id), Some(&metadata));
+        let share_export = directory.path().join("share-export.jsonl");
+        share.export_jsonl(&share_export).unwrap();
+        assert_eq!(
+            Session::snapshot(&share_export)
+                .unwrap()
+                .record_metadata(id),
+            Some(&metadata)
+        );
+        drop(share);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.record_metadata(id), Some(&metadata));
+    }
+
+    #[test]
+    fn legacy_store_rejects_metadata_without_appending() {
+        struct Legacy(MemoryStore);
+        impl SessionStore for Legacy {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                self.0.append(record)
+            }
+        }
+        let mut session = Session::with_store(Legacy(MemoryStore::default())).unwrap();
+        let length = session.records().len();
+        let result = session.append_with_record_metadata(
+            Event::SessionInfo {
+                name: None,
+                cwd: None,
+            },
+            serde_json::json!({"x": 1}),
+        );
+        assert!(result.is_err());
+        assert_eq!(session.records().len(), length);
+        let record = session
+            .append(Event::SessionInfo {
+                name: Some("still writable".into()),
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(record.id, length as u64 + 1);
+        assert_eq!(session.records().len(), length + 1);
+    }
+
+    #[test]
+    fn oversized_metadata_rejection_does_not_poison_file_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-metadata.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let length = session.records().len();
+        let result = session.append_with_record_metadata(
+            Event::SessionInfo {
+                name: None,
+                cwd: None,
+            },
+            serde_json::json!({"value": "x".repeat(MAX_RECORD_BYTES)}),
+        );
+        assert!(result.is_err());
+        assert_eq!(session.records().len(), length);
+        session
+            .append(Event::User {
+                content: "still writable".into(),
+                input_id: None,
+            })
+            .unwrap();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
+        assert!(reopened.records().iter().any(|record| matches!(&record.event, Event::User { content, .. } if content == "still writable")));
+    }
+}
+
+#[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn inert_full_history_preserves_branches_and_record_metadata() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "root".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let root = session.head();
+        session
+            .append_with_record_metadata(
+                Event::User {
+                    content: "sibling".into(),
+                    input_id: None,
+                },
+                serde_json::json!({"fixture":"retained"}),
+            )
+            .unwrap();
+        let sibling = session.head();
+        session.checkout(root).unwrap();
+        session
+            .append(Event::User {
+                content: "active".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let active = session.head();
+        session.checkout(sibling).unwrap();
+        let original_id = session.session_id();
+        let mut fork = session.fork_inert_full_history().unwrap().unwrap();
+        assert_ne!(fork.session_id(), original_id);
+        assert_eq!(fork.head(), sibling);
+        assert_eq!(
+            fork.record_metadata(sibling),
+            Some(&serde_json::json!({"fixture":"retained"}))
+        );
+        fork.checkout(active).unwrap();
+        assert!(
+            fork.current_messages()
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "active"))
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        fork.export_jsonl(&path).unwrap();
+        assert_eq!(
+            Session::open(&path).unwrap().record_metadata(sibling),
+            Some(&serde_json::json!({"fixture":"retained"}))
+        );
+    }
+
+    #[test]
+    fn inert_full_history_excludes_recoverable_and_queued_work() {
+        let message = crate::CustomMessage {
+            custom_type: "queue".into(),
+            content: crate::ContextContent::Text("text".into()),
+            display: false,
+            details: None,
+        };
+        let events = [
+            Event::Run {
+                state: RunState::Running,
+                initial: None,
+            },
+            Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message,
+                },
+            },
+            Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id: Uuid::new_v4(),
+                    call: crate::ToolCall {
+                        id: "x".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            },
+            Event::ModelFinished {
+                request_id: Uuid::new_v4(),
+                metadata: Default::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: "reply".into(),
+                    invocations: Vec::new(),
+                    advertised_tools: Vec::new(),
+                    max_output_tokens: 16,
+                }),
+            },
+        ];
+        for event in events {
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session.append(event).unwrap();
+            assert!(session.fork_inert_full_history().unwrap().is_none());
+        }
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.set_run_id(Some(Uuid::new_v4()));
+        session
+            .append(Event::Assistant {
+                content: "partial".into(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        assert!(session.fork_inert_full_history().unwrap().is_none());
+    }
 
     #[test]
     fn fork_does_not_resurrect_tree_message_consumed_on_another_branch() {
@@ -3479,6 +4880,50 @@ mod session_metadata_tests {
     }
 
     #[test]
+    fn share_open_rejects_pending_handoff_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handoff.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_user_with_images("A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message: crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(2).unwrap();
+        session
+            .append_user_with_images("B".into(), vec![], None)
+            .unwrap();
+        let original_head = session.head();
+        session.begin_tree_trigger_handoff(run_id).unwrap().unwrap();
+        drop(session);
+        let original = std::fs::read(&path).unwrap();
+        assert!(Session::open_for_share(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(Session::open(&path).unwrap().head(), original_head);
+    }
+
+    #[test]
     fn dropping_the_store_unlocks_duplicated_file_descriptors() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
@@ -3546,7 +4991,11 @@ mod session_metadata_tests {
         session.set_name("experiment").unwrap();
         let source_records = session.records().len();
         let records = session.fork_records(session.head()).unwrap();
-        let fork = Session::with_store(MemoryStore { records }).unwrap();
+        let fork = Session::with_store(MemoryStore {
+            records,
+            metadata: BTreeMap::new(),
+        })
+        .unwrap();
         assert_ne!(fork.session_id(), session.session_id());
         assert_eq!(fork.name(), Some("experiment"));
         assert_eq!(fork.labels().get(&3).map(String::as_str), Some("chosen"));
@@ -3562,6 +5011,44 @@ mod session_metadata_tests {
         );
         assert_eq!(session.records().len(), source_records);
         assert!(session.records().iter().any(|record| matches!(&record.event, Event::Assistant { content, .. } if content == "old answer")));
+    }
+
+    #[test]
+    fn abandoned_branch_excludes_failed_assistant_when_failure_precedes_boundary() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let request_id = Uuid::new_v4();
+        let target = session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .append(Event::Assistant {
+                content: "failed partial".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "keep this".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let abandoned = session.abandoned_branch(target);
+        assert_eq!(
+            abandoned.messages,
+            vec![Message::User {
+                content: "keep this".into()
+            }]
+        );
     }
 
     #[test]
@@ -4040,6 +5527,174 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn fork_resolves_off_branch_label_changes_and_timestamps() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("first".into(), vec![], None)
+            .unwrap();
+        let first = session.head();
+        session
+            .append_user_with_images("second".into(), vec![], None)
+            .unwrap();
+        let second = session.head();
+        session.set_label(first, Some("stale".into())).unwrap();
+        let target = session.head();
+        session.set_label(first, None).unwrap();
+        session.set_label(second, Some("current".into())).unwrap();
+        let timestamp = session.records().last().unwrap().timestamp.clone();
+        let fork = session.fork_session(target).unwrap();
+        assert_eq!(fork.labels().len(), 1);
+        assert_eq!(
+            fork.labels().get(&second).map(String::as_str),
+            Some("current")
+        );
+        assert_eq!(fork.label_timestamps().get(&second), timestamp.as_ref());
+    }
+
+    #[test]
+    fn fork_keeps_compaction_boundary_at_immediate_parent_user() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("retained".into(), vec![], None)
+            .unwrap();
+        let user = session.head();
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: Some(user),
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        assert!(
+            fork.current_messages().iter().any(
+                |message| matches!(message, Message::User { content } if content == "retained")
+            )
+        );
+        assert!(fork.records().iter().any(|record|
+            matches!(record.event, Event::Compacted { retain_from: Some(id), .. } if id == user)));
+    }
+
+    #[test]
+    fn fork_rejects_malformed_import_conversion_ranges() {
+        let base = Session::with_store(MemoryStore::default()).unwrap();
+        let mut records = base.records().to_vec();
+        let mut source = records[0].clone();
+        source.id = 2;
+        source.parent = Some(1);
+        source.timestamp = None;
+        source.event = Event::SourceEntry {
+            format: "pi".into(),
+            entry: serde_json::json!({"type":"custom","id":"a","customType":"x"}),
+        };
+        records.push(source.clone());
+        for count in [serde_json::json!(u64::MAX), serde_json::json!("invalid")] {
+            let session = Session::from_records_with_metadata(
+                records.clone(),
+                [(
+                    2,
+                    serde_json::json!({"pi_rs_import_conversion_count_v1":count}),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+            assert!(
+                session
+                    .fork_records(2)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("provenance")
+            );
+        }
+        for nested in [
+            Event::SourceEntry {
+                format: "pi".into(),
+                entry: serde_json::json!({"type":"custom","id":"b","customType":"y"}),
+            },
+            Event::Checkout { target: 1 },
+        ] {
+            let mut child = source.clone();
+            child.id = 3;
+            child.parent = Some(2);
+            child.event = nested;
+            let mut records = records.clone();
+            records.push(child);
+            let session = Session::from_records_with_metadata(
+                records,
+                [
+                    (2, serde_json::json!({"pi_rs_import_conversion_count_v1":1})),
+                    (3, serde_json::json!({"pi_rs_import_conversion_count_v1":0})),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+            assert!(
+                session
+                    .fork_records(2)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("provenance")
+            );
+        }
+    }
+
+    #[test]
+    fn fork_rechains_labels_in_reinsert_order_and_keeps_slot_metadata() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("one".into(), vec![], None)
+            .unwrap();
+        let first = session.head();
+        session
+            .append_user_with_images("two".into(), vec![], None)
+            .unwrap();
+        let second = session.head();
+        session
+            .append_with_record_metadata(
+                Event::Label {
+                    target: first,
+                    label: Some("old".into()),
+                },
+                serde_json::json!({"note":"preserve"}),
+            )
+            .unwrap();
+        let old_label = session.head();
+        session.set_label(second, Some("second".into())).unwrap();
+        session.set_label(first, None).unwrap();
+        session.set_label(first, Some("first".into())).unwrap();
+        let target = session.head();
+        for fork in [
+            session.fork_session(target).unwrap(),
+            session.fork_session_after_handoff(target).unwrap(),
+        ] {
+            let labels: Vec<_> = fork
+                .records()
+                .iter()
+                .filter_map(|record| match &record.event {
+                    Event::Label {
+                        target,
+                        label: Some(label),
+                    } => Some((*target, label.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(labels, vec![(second, "second"), (first, "first")]);
+            assert_eq!(
+                fork.record_metadata(old_label),
+                Some(&serde_json::json!({"note":"preserve"}))
+            );
+        }
+    }
+
+    #[test]
     fn label_timestamps_track_the_latest_change_and_clear_with_labels() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         session.set_label(1, Some("first".into())).unwrap();
@@ -4137,6 +5792,39 @@ mod snapshot_tests {
             })
             .unwrap();
         assert_eq!(session.name(), Some("\u{0085}"));
+    }
+
+    #[test]
+    fn share_open_retains_lock_and_never_repairs_or_creates_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        assert!(Session::open_for_share(&path).is_err());
+        assert!(!path.exists());
+        drop(Session::open(&path).unwrap());
+        let original = std::fs::read(&path).unwrap();
+        let share = Session::open_for_share(&path).unwrap();
+        assert!(
+            Session::open(&path).is_err(),
+            "share must retain the journal lock"
+        );
+        drop(share);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let mut named = Session::open_for_share(&path).unwrap();
+        named.set_name("explicit name").unwrap();
+        drop(named);
+        assert_eq!(
+            Session::snapshot(&path).unwrap().name(),
+            Some("explicit name")
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"incomplete\":")
+            .unwrap();
+        let incomplete = std::fs::read(&path).unwrap();
+        assert!(Session::open_for_share(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), incomplete);
     }
 
     #[test]

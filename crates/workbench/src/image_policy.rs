@@ -1,6 +1,9 @@
 //! Apply workbench request policy and catalog usage estimates.
 use futures_util::StreamExt;
-use pi_rs::{Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result};
+use pi_rs::{
+    EnrichedModelEvent, EnrichedModelStream, Message, Model, ModelEvent, ModelMetadata,
+    ModelRequest, ModelStream, Result,
+};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -105,47 +108,9 @@ impl Model for WorkbenchModel {
         external_id: &str,
         request: ModelRequest,
     ) -> Result<ModelStream> {
-        let mut headers = HeaderMap::new();
-        let (client, configured) = if !self.session_affinity.is_empty() && !external_id.is_empty() {
-            self.client.resolve_affinity_headers().await?
-        } else {
-            (self.client.clone(), HeaderMap::new())
-        };
-        if !external_id.is_empty()
-            && self
-                .session_affinity
-                .iter()
-                .any(|name| !configured.contains_key(*name))
-        {
-            // Fetch's Headers converts JS strings to ByteString (Latin-1),
-            // then strips HTTP whitespace at the edges before validation.
-            // Reject unrepresentable or invalid bytes rather than dispatching
-            // a request with a different or missing affinity identity.
-            let bytes = external_id
-                .chars()
-                .map(|ch| u8::try_from(u32::from(ch)))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
-            let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
-            let start = bytes
-                .iter()
-                .position(|byte| !whitespace(byte))
-                .unwrap_or(bytes.len());
-            let end = bytes
-                .iter()
-                .rposition(|byte| !whitespace(byte))
-                .map_or(start, |index| index + 1);
-            let trimmed = &bytes[start..end];
-            let value = HeaderValue::from_bytes(trimmed)
-                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
-            for &name in self.session_affinity {
-                if !configured.contains_key(name) {
-                    headers.insert(name, value.clone());
-                }
-            }
-        }
+        let (client, headers) = self.affinity_headers(external_id).await?;
         let stream = client
-            .stream_with_headers(self.filtered(request), &headers, false)
+            .stream_with_headers(self.filtered(request), &headers, false, Some(external_id))
             .await?;
         Ok(self.estimate_usage(stream))
     }
@@ -157,9 +122,71 @@ impl Model for WorkbenchModel {
     ) -> Result<ModelStream> {
         let stream = self
             .client
-            .stream_with_headers(self.filtered(request), &HeaderMap::new(), true)
+            .stream_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
             .await?;
         Ok(self.estimate_usage(stream))
+    }
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        let (client, headers) = self.affinity_headers(external_id).await?;
+        let stream = client
+            .stream_enriched_with_headers(
+                self.filtered(request),
+                &headers,
+                false,
+                Some(external_id),
+            )
+            .await?;
+        Ok(self.estimate_enriched_usage(stream))
+    }
+
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        let (client, headers) = self.affinity_headers(external_id).await?;
+        let stream = client
+            .stream_detailed_with_headers(
+                self.filtered(request),
+                &headers,
+                false,
+                Some(external_id),
+            )
+            .await?;
+        Ok(self.estimate_detailed_usage(stream))
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        let stream = self
+            .client
+            .stream_detailed_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
+            .await?;
+        Ok(self.estimate_detailed_usage(stream))
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        let stream = self
+            .client
+            .stream_enriched_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
+            .await?;
+        Ok(self.estimate_enriched_usage(stream))
     }
 }
 
@@ -216,9 +243,150 @@ impl Model for PreparedWorkbenchModel {
             .stream_for_summary(request_id, session_id, request)
             .await
     }
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        self.inner
+            .stream_enriched_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.inner
+            .stream_detailed_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.inner
+            .stream_detailed_for_summary(request_id, session_id, request)
+            .await
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        self.inner
+            .stream_enriched_for_summary(request_id, session_id, request)
+            .await
+    }
 }
 
 impl WorkbenchModel {
+    async fn affinity_headers(&self, external_id: &str) -> Result<(Client, HeaderMap)> {
+        let mut headers = HeaderMap::new();
+        let (client, configured) = if !self.session_affinity.is_empty() && !external_id.is_empty() {
+            self.client.resolve_affinity_headers().await?
+        } else {
+            (self.client.clone(), HeaderMap::new())
+        };
+        if !external_id.is_empty()
+            && self
+                .session_affinity
+                .iter()
+                .any(|name| !configured.contains_key(*name))
+        {
+            // Fetch's Headers converts JS strings to ByteString (Latin-1),
+            // then strips HTTP whitespace at the edges before validation.
+            // Reject unrepresentable or invalid bytes rather than dispatching
+            // a request with a different or missing affinity identity.
+            let bytes = external_id
+                .chars()
+                .map(|ch| u8::try_from(u32::from(ch)))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
+            let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+            let start = bytes
+                .iter()
+                .position(|byte| !whitespace(byte))
+                .unwrap_or(bytes.len());
+            let end = bytes
+                .iter()
+                .rposition(|byte| !whitespace(byte))
+                .map_or(start, |index| index + 1);
+            let trimmed = &bytes[start..end];
+            let value = HeaderValue::from_bytes(trimmed)
+                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
+            for &name in self.session_affinity {
+                if !configured.contains_key(name) {
+                    headers.insert(name, value.clone());
+                }
+            }
+        }
+        Ok((client, headers))
+    }
+
+    fn estimate_detailed_usage(
+        &self,
+        mut stream: pi_rs::DetailedModelStream,
+    ) -> pi_rs::DetailedModelStream {
+        let Some(price) = self.price.clone() else {
+            return stream;
+        };
+        Box::pin(async_stream::try_stream! {
+            let mut metadata = ModelMetadata::default();
+            while let Some(event) = stream.next().await {
+                let event = event?;
+                if let EnrichedModelEvent::Legacy(ModelEvent::Metadata(current)) = &event.event { metadata.clone_from(current); }
+                if let EnrichedModelEvent::Legacy(ModelEvent::Complete { usage: Some(usage), .. }) = &event.event
+                    && metadata.cost_breakdown.is_none()
+                    && let Some(breakdown) = price.estimate(*usage, &metadata)
+                    && let Some(total) = breakdown.total()
+                {
+                    metadata.cost_breakdown = Some(breakdown);
+                    if metadata.cost_usd.is_none() { metadata.cost_usd = Some(total); metadata.cost_from_provider = Some(false); }
+                    yield pi_rs::DetailedModelEvent::from(EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata.clone())));
+                }
+                yield event;
+            }
+        })
+    }
+
+    fn estimate_enriched_usage(&self, mut stream: EnrichedModelStream) -> EnrichedModelStream {
+        let Some(price) = self.price.clone() else {
+            return stream;
+        };
+        Box::pin(async_stream::try_stream! {
+            let mut metadata = ModelMetadata::default();
+            while let Some(event) = stream.next().await {
+                let event = event?;
+                if let EnrichedModelEvent::Legacy(ModelEvent::Metadata(current)) = &event {
+                    metadata.clone_from(current);
+                }
+                if let EnrichedModelEvent::Legacy(ModelEvent::Complete { usage: Some(usage), .. }) = &event
+                    && metadata.cost_breakdown.is_none()
+                    && let Some(breakdown) = price.estimate(*usage, &metadata)
+                    && let Some(total) = breakdown.total()
+                {
+                    metadata.cost_breakdown = Some(breakdown);
+                    if metadata.cost_usd.is_none() {
+                        metadata.cost_usd = Some(total);
+                        metadata.cost_from_provider = Some(false);
+                    }
+                    yield EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata.clone()));
+                }
+                yield event;
+            }
+        })
+    }
+
     fn estimate_usage(&self, mut stream: ModelStream) -> ModelStream {
         let Some(price) = self.price.clone() else {
             return stream;
@@ -309,7 +477,299 @@ fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn enriched_usage_estimation_preserves_reasoning_events() {
+        use futures_util::StreamExt;
+        let model = super::WorkbenchModel {
+            client: super::Client::Google(
+                pi_rs::google::Google::new("https://example.com", "key").unwrap(),
+            ),
+            block_images: false,
+            supports_images: None,
+            session_affinity: &[],
+            price: Some(
+                serde_json::from_value(serde_json::json!({"input": 2.0, "output": 4.0})).unwrap(),
+            ),
+        };
+        let events = vec![
+            Ok(pi_rs::EnrichedModelEvent::ReasoningStart { index: 3 }),
+            Ok(pi_rs::EnrichedModelEvent::Legacy(
+                pi_rs::ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(pi_rs::Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                    }),
+                },
+            )),
+        ];
+        let events: Vec<_> = model
+            .estimate_enriched_usage(Box::pin(futures_util::stream::iter(events)))
+            .collect()
+            .await;
+        assert!(matches!(
+            &events[0],
+            Ok(pi_rs::EnrichedModelEvent::ReasoningStart { index: 3 })
+        ));
+        assert!(
+            matches!(&events[1], Ok(pi_rs::EnrichedModelEvent::Legacy(pi_rs::ModelEvent::Metadata(metadata))) if metadata.cost_breakdown.is_some() && metadata.cost_from_provider == Some(false))
+        );
+        assert!(matches!(
+            &events[2],
+            Ok(pi_rs::EnrichedModelEvent::Legacy(
+                pi_rs::ModelEvent::Complete { .. }
+            ))
+        ));
+        let events = vec![
+            Ok(pi_rs::DetailedModelEvent::redacted_start(3)),
+            Ok(pi_rs::DetailedModelEvent::from(
+                pi_rs::EnrichedModelEvent::Legacy(pi_rs::ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(pi_rs::Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                    }),
+                }),
+            )),
+        ];
+        let events: Vec<_> = model
+            .estimate_detailed_usage(Box::pin(futures_util::stream::iter(events)))
+            .collect()
+            .await;
+        assert!(events[0].as_ref().unwrap().is_redacted_start());
+        assert!(
+            matches!(&events[1].as_ref().unwrap().event, pi_rs::EnrichedModelEvent::Legacy(pi_rs::ModelEvent::Metadata(metadata)) if metadata.cost_breakdown.is_some())
+        );
+    }
     use super::*;
+
+    #[tokio::test]
+    async fn responses_session_cache_key_uses_external_identity_and_skips_summaries() {
+        use std::io::{Read, Write};
+        for (identity, summary, expected) in [
+            (
+                "session-one".to_owned(),
+                false,
+                Some("session-one".to_owned()),
+            ),
+            (
+                format!("{}tail", "猫".repeat(64)),
+                false,
+                Some("猫".repeat(64)),
+            ),
+            (String::new(), false, None),
+            ("session-one".to_owned(), true, None),
+        ] {
+            for enriched in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let server = std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10))
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let end = loop {
+                        let n = socket.read(&mut buffer).unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    while bytes.len() < end + length {
+                        let n = socket.read(&mut buffer).unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    body
+                });
+                let model = WorkbenchModel {
+                    client: Client::OpenAi(
+                        pi_rs::openai::OpenAiResponses::new_api(
+                            &format!("http://{address}/responses"),
+                            "fixture".into(),
+                        )
+                        .unwrap(),
+                    ),
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let request = ModelRequest {
+                    model: "fixture".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 1,
+                };
+                if enriched && summary {
+                    let _ = model
+                        .stream_enriched_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                } else if enriched {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            &identity,
+                            request,
+                        )
+                        .await;
+                } else if summary {
+                    let _ = model
+                        .stream_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                } else {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            &identity,
+                            request,
+                        )
+                        .await;
+                }
+                let body = server.join().unwrap();
+                assert_eq!(
+                    body.get("prompt_cache_key").and_then(|v| v.as_str()),
+                    expected.as_deref()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_session_headers_respect_explicit_values_and_summary_boundary() {
+        use std::io::{Read, Write};
+        for (summary, explicit, enriched) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut block = [0; 2048];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                String::from_utf8(bytes).unwrap().to_ascii_lowercase()
+            });
+            let mut headers = HeaderMap::new();
+            if explicit {
+                headers.insert("session-id", "explicit".parse().unwrap());
+            }
+            let model = WorkbenchModel {
+                client: Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(
+                        &format!("http://{address}/responses"),
+                        "fixture".into(),
+                    )
+                    .unwrap()
+                    .with_headers(headers),
+                ),
+                block_images: false,
+                supports_images: None,
+                session_affinity: &["session-id", "x-client-request-id"],
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            match (summary, enriched) {
+                (true, true) => {
+                    let _ = model
+                        .stream_enriched_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                }
+                (true, false) => {
+                    let _ = model
+                        .stream_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                }
+                (false, true) => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            "session-one",
+                            request,
+                        )
+                        .await;
+                }
+                (false, false) => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            "session-one",
+                            request,
+                        )
+                        .await;
+                }
+            }
+            let headers = server.join().unwrap();
+            assert_eq!(
+                headers.contains("x-client-request-id: session-one\r\n"),
+                !summary
+            );
+            assert_eq!(
+                headers.contains("session-id: session-one\r\n"),
+                !summary && !explicit
+            );
+            assert_eq!(headers.contains("session-id: explicit\r\n"), explicit);
+        }
+    }
 
     #[tokio::test]
     async fn external_identity_is_used_for_affinity_header() {

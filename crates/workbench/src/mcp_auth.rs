@@ -537,6 +537,138 @@ impl CredentialStore for FileCredentials {
     }
 }
 
+// Keep authorization results in memory until the caller has crossed the
+// cancellation boundary. No credential file is touched during preparation.
+#[derive(Clone)]
+struct StagedCredentials {
+    store: FileCredentials,
+    staged: Staging,
+}
+
+#[async_trait::async_trait]
+impl CredentialStore for StagedCredentials {
+    async fn load(&self) -> std::result::Result<Option<StoredCredentials>, AuthError> {
+        self.store.load().await
+    }
+    async fn save(&self, credentials: StoredCredentials) -> std::result::Result<(), AuthError> {
+        *self
+            .staged
+            .credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((self.store.clone(), credentials));
+        Ok(())
+    }
+    async fn clear(&self) -> std::result::Result<(), AuthError> {
+        *self
+            .staged
+            .credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
+    }
+    async fn acquire_refresh_guard(
+        &self,
+    ) -> std::result::Result<Option<CredentialRefreshGuard>, AuthError> {
+        self.store.acquire_refresh_guard().await
+    }
+}
+
+#[derive(Default)]
+struct StagingState {
+    credentials: Mutex<Option<(FileCredentials, StoredCredentials)>>,
+    callback: Mutex<Option<crate::oauth_callback::Callback>>,
+    guard: Mutex<Option<CredentialRefreshGuard>>,
+}
+type Staging = Arc<StagingState>;
+
+async fn reply_staged(staged: &Staging, success: bool) {
+    let callback = staged
+        .callback
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(callback) = callback {
+        // The browser must not hold the login open indefinitely after the result.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), callback.reply(success)).await;
+    }
+}
+
+async fn deadline_login<F>(
+    deadline: tokio::time::Instant,
+    staged: Staging,
+    cancellation: &pi_rs::CancellationToken,
+    prepare: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    deadline_login_with_commit(
+        deadline,
+        staged,
+        cancellation,
+        prepare,
+        |store, credentials| async move { store.save(credentials).await.map_err(auth_error) },
+    )
+    .await
+}
+
+async fn deadline_login_with_commit<F, C, Fut>(
+    deadline: tokio::time::Instant,
+    staged: Staging,
+    cancellation: &pi_rs::CancellationToken,
+    prepare: F,
+    commit: C,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+    C: FnOnce(FileCredentials, StoredCredentials) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    // Acquiring the lock is preparation too: expiry must never leave a queued
+    // writer that can replace credentials later.
+    let ready = async {
+        prepare.await?;
+        let (store, credentials) = staged
+            .credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| Error::Config("MCP OAuth produced no credentials".into()))?;
+        let guard = staged
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
+        Ok::<_, Error>((store, credentials, guard))
+    };
+    let ready = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        result = tokio::time::timeout_at(deadline, ready) =>
+            result.map_err(|_| Error::Config("MCP login timed out".into())).and_then(|result| result),
+    };
+    let result = match ready {
+        Ok((store, credentials, _guard)) if tokio::time::Instant::now() < deadline => {
+            // The blocking write retains the lease even if the caller is dropped.
+            commit(store, credentials).await
+        }
+        Ok(_) => Err(Error::Config("MCP login timed out".into())),
+        Err(error) => Err(error),
+    };
+    // A failed or cancelled preparation can leave the guard in staging.
+    drop(
+        staged
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(),
+    );
+    reply_staged(&staged, result.is_ok()).await;
+    result
+}
+
 /// Restore a previously authorized client. Each connection is bound to one login generation.
 pub async fn client(
     name: &str,
@@ -647,6 +779,7 @@ pub async fn login_with_secret_with_http_options(
         scopes,
         options,
         announce,
+        None,
     )
     .await
     .map(|_| ())
@@ -682,6 +815,7 @@ pub async fn login_with_metadata_with_http_options(
         scopes,
         options,
         announce,
+        None,
     )
     .await
     .map(|_| ())
@@ -706,6 +840,23 @@ pub async fn login_configured_with_http_options(
     scopes: &[String],
     options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
+) -> Result<()> {
+    login_configured_inner(
+        name, url, settings, challenge, scopes, options, announce, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn login_configured_inner(
+    name: &str,
+    url: &str,
+    settings: Option<&OAuthClientSettings>,
+    challenge: Option<&str>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    announce: impl Fn(&str),
+    staging: Option<Staging>,
 ) -> Result<()> {
     let default = OAuthClientSettings::default();
     let settings = settings.unwrap_or(&default);
@@ -744,9 +895,109 @@ pub async fn login_configured_with_http_options(
         scopes,
         options,
         announce,
+        staging,
     )
     .await
     .map(|_| ())
+}
+
+/// CLI login with an absolute deadline covering all preparation. Once the
+/// credential commit begins it runs to completion, even after the deadline.
+#[allow(clippy::too_many_arguments)]
+pub async fn login_with_secret_with_http_options_and_deadline(
+    name: &str,
+    url: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+) -> Result<()> {
+    let staged = Staging::default();
+    deadline_login(deadline, staged.clone(), cancellation, async {
+        authorize(
+            name,
+            url,
+            Registration::New(ClientOptions {
+                client_id,
+                client_secret,
+                ..ClientOptions::default()
+            }),
+            scopes,
+            options,
+            announce,
+            Some(staged.clone()),
+        )
+        .await
+        .map(|_| ())
+    })
+    .await
+}
+
+/// Deadline-aware CLI login using a hosted client metadata document.
+#[allow(clippy::too_many_arguments)]
+pub async fn login_with_metadata_with_http_options_and_deadline(
+    name: &str,
+    url: &str,
+    client_metadata_url: &str,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+) -> Result<()> {
+    let staged = Staging::default();
+    deadline_login(deadline, staged.clone(), cancellation, async {
+        authorize(
+            name,
+            url,
+            Registration::New(ClientOptions {
+                metadata_url: Some(client_metadata_url),
+                ..ClientOptions::default()
+            }),
+            scopes,
+            options,
+            announce,
+            Some(staged.clone()),
+        )
+        .await
+        .map(|_| ())
+    })
+    .await
+}
+
+/// Deadline-aware CLI login using configured client settings.
+#[allow(clippy::too_many_arguments)]
+pub async fn login_configured_with_http_options_and_deadline(
+    name: &str,
+    url: &str,
+    settings: Option<&OAuthClientSettings>,
+    challenge: Option<&str>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+) -> Result<()> {
+    let staged = Staging::default();
+    deadline_login(
+        deadline,
+        staged.clone(),
+        cancellation,
+        login_configured_inner(
+            name,
+            url,
+            settings,
+            challenge,
+            scopes,
+            options,
+            announce,
+            Some(staged.clone()),
+        ),
+    )
+    .await
 }
 
 pub(crate) async fn upgrade(
@@ -787,6 +1038,7 @@ pub(crate) async fn upgrade(
         &scopes,
         options,
         announce,
+        None,
     )
     .await
 }
@@ -1060,6 +1312,7 @@ async fn authorize(
     scopes: &[String],
     http_options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
+    staging: Option<Staging>,
 ) -> Result<Uuid> {
     use rmcp::transport::auth::{AuthorizationRequest, AuthorizationSession};
     use std::time::Duration;
@@ -1131,7 +1384,14 @@ async fn authorize(
         }));
     }
     let mut manager = oauth_manager(url, http_options).await?;
-    manager.set_credential_store(store.clone());
+    if let Some(staged) = staging.as_ref() {
+        manager.set_credential_store(StagedCredentials {
+            store: store.clone(),
+            staged: staged.clone(),
+        });
+    } else {
+        manager.set_credential_store(store.clone());
+    }
     let metadata = if let Some(metadata_url) = options.auth_server_metadata_url {
         configured_metadata(metadata_url, url, http_options).await?
     } else {
@@ -1246,15 +1506,35 @@ async fn authorize(
             incoming.reply(false).await;
             return Err(Error::Config("MCP OAuth authorization was declined".into()));
         }
-        let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
-        let result = session.handle_callback_url(incoming.url.as_str()).await;
-        incoming.reply(result.is_ok()).await;
-        result.map(|_| ()).map_err(auth_error)
+        if let Some(staged) = &staging {
+            let callback_url = incoming.url.to_string();
+            *staged.callback.lock().unwrap_or_else(|e| e.into_inner()) = Some(incoming);
+            let guard = store
+                .acquire_refresh_guard()
+                .await
+                .map_err(auth_error)?
+                .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
+            session
+                .handle_callback_url(&callback_url)
+                .await
+                .map_err(auth_error)?;
+            *staged.guard.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+            Ok(())
+        } else {
+            let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
+            let result = session.handle_callback_url(incoming.url.as_str()).await;
+            incoming.reply(result.is_ok()).await;
+            result.map(|_| ()).map_err(auth_error)
+        }
     };
-    tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(600), receive) => result.map_err(|_| Error::Config("MCP login timed out".into()))?,
-        _ = tokio::signal::ctrl_c() => Err(Error::Cancelled),
-    }?;
+    if staging.is_some() {
+        receive.await?;
+    } else {
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(600), receive) => result.map_err(|_| Error::Config("MCP login timed out".into()))?,
+            _ = tokio::signal::ctrl_c() => Err(Error::Cancelled),
+        }?;
+    }
     Ok(generation)
 }
 
@@ -1296,6 +1576,528 @@ pub(crate) async fn test_oauth_client(
 mod tests {
     use super::*;
 
+    fn staged_fixture(path: PathBuf) -> (StagedCredentials, Staging) {
+        let staged = Staging::default();
+        let store = FileCredentials {
+            path,
+            generation: Some(Uuid::new_v4()),
+            new_login: true,
+            upgrade: None,
+            registration: Arc::default(),
+            lease: Arc::default(),
+        };
+        (
+            StagedCredentials {
+                store,
+                staged: staged.clone(),
+            },
+            staged,
+        )
+    }
+
+    fn fixture_credentials() -> StoredCredentials {
+        serde_json::from_value(serde_json::json!({
+            "client_id":"fixture", "token_response":{"access_token":"new", "token_type":"Bearer"}
+        }))
+        .unwrap()
+    }
+
+    async fn stage_fixture(store: &StagedCredentials) -> Result<()> {
+        let guard = store
+            .store
+            .acquire_refresh_guard()
+            .await
+            .map_err(auth_error)?
+            .expect("fixture credential guard");
+        store
+            .save(fixture_credentials())
+            .await
+            .map_err(auth_error)?;
+        *store.staged.guard.lock().unwrap() = Some(guard);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deadline_login_stages_then_commits_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, staged) = staged_fixture(path.clone());
+        deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async {
+                stage_fixture(&store).await?;
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let saved: Envelope = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.credentials.client_id, "fixture");
+    }
+
+    #[tokio::test]
+    async fn deadline_login_timeout_never_commits_staged_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, staged) = staged_fixture(path.clone());
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(30),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async {
+                stage_fixture(&store).await?;
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_deadline_do_not_interrupt_started_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let cancellation = pi_rs::CancellationToken::new();
+        let child_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut login = tokio::spawn(async move {
+            deadline_login_with_commit(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                staged,
+                &child_cancellation,
+                async move { stage_fixture(&store).await },
+                |store, credentials| async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    store.save(credentials).await.map_err(auth_error)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+            .await
+            .expect("commit did not start")
+            .unwrap();
+        cancellation.cancel();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut login)
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        tokio::time::resume();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), login)
+            .await
+            .expect("commit did not complete")
+            .unwrap()
+            .unwrap();
+        let saved: Envelope = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.credentials.client_id, "fixture");
+    }
+
+    #[tokio::test]
+    async fn deadline_login_bounds_waiting_for_commit_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, staged) = staged_fixture(path.clone());
+        let guard = store.store.acquire_refresh_guard().await.unwrap();
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(30),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async { stage_fixture(&store).await },
+        )
+        .await;
+        assert!(result.is_err());
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn staged_exchange_holds_guard_until_commit_before_logout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let competitor = FileCredentials {
+            lease: Arc::default(),
+            ..store.store.clone()
+        };
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let login = tokio::spawn(async move {
+            deadline_login(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async move {
+                    stage_fixture(&store).await?;
+                    staged_tx.send(()).unwrap();
+                    continue_rx.await.unwrap();
+                    Ok(())
+                },
+            )
+            .await
+        });
+        staged_rx.await.unwrap();
+        // Inspect the same OS lock that login, logout, and refresh use.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert!(matches!(
+            lock.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+        let logout = tokio::spawn(async move {
+            attempt_tx.send(()).unwrap();
+            let _guard = competitor.acquire_refresh_guard().await.unwrap();
+            // Logout may proceed only after the login has made its write visible.
+            assert!(competitor.read().unwrap().is_some());
+            competitor.clear().await.unwrap();
+        });
+        attempt_rx.await.unwrap();
+        continue_tx.send(()).unwrap();
+        login.await.unwrap().unwrap();
+        logout.await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_aborts_preparation_and_releases_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let cancellation = pi_rs::CancellationToken::new();
+        let trigger = cancellation.clone();
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            staged,
+            &cancellation,
+            async move {
+                stage_fixture(&store).await?;
+                trigger.cancel();
+                std::future::pending::<Result<()>>().await
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(!path.exists());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert!(lock.try_lock().is_ok());
+    }
+
+    async fn fixture_callback() -> (crate::oauth_callback::Callback, tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest_mcp::Url::parse(&format!(
+            "http://{}/callback",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let mut browser = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        browser
+            .write_all(
+                b"GET /callback?code=fixture&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let callback = crate::oauth_callback::receive(&listener, &url, "expected")
+            .await
+            .unwrap();
+        (callback, browser)
+    }
+
+    #[tokio::test]
+    async fn staged_callback_reports_actual_commit_result() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let guard = store.store.acquire_refresh_guard().await.unwrap();
+        let (callback, mut browser) = fixture_callback().await;
+        *staged.callback.lock().unwrap() = Some(callback);
+        let run = tokio::spawn(async move {
+            deadline_login(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async move { stage_fixture(&store).await },
+            )
+            .await
+        });
+        let mut byte = [0; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                browser.read(&mut byte)
+            )
+            .await
+            .is_err()
+        );
+        assert!(!path.exists());
+        drop(guard);
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        run.await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(path.is_file());
+
+        // Persisting over a directory fails after staging succeeds.
+        let bad_path = dir.path().join("directory");
+        std::fs::create_dir(&bad_path).unwrap();
+        let (store, staged) = staged_fixture(bad_path);
+        let (callback, mut browser) = fixture_callback().await;
+        *staged.callback.lock().unwrap() = Some(callback);
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async move { stage_fixture(&store).await },
+        )
+        .await;
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(result.is_err());
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    // Drain the complete HTTP request before replying. Closing a socket with
+    // unread request bytes can reset the connection and discard the response.
+    fn read_refresh_request(socket: &mut std::net::TcpStream, mut on_partial: impl FnMut(usize)) {
+        use std::io::Read as _;
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut chunk = [0; 1024];
+        let header_end = loop {
+            let count = socket.read(&mut chunk).expect("read refresh headers");
+            assert!(count > 0, "refresh request ended before its headers");
+            data.extend_from_slice(&chunk[..count]);
+            assert!(data.len() <= 64 * 1024, "refresh request too large");
+            if let Some(index) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+        assert!(
+            headers.starts_with("POST /token "),
+            "unexpected request line"
+        );
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("refresh request content length");
+        assert!(length <= 64 * 1024 - header_end, "refresh body too large");
+        if data.len() > header_end && data.len() < header_end + length {
+            on_partial(data.len() - header_end);
+        }
+        while data.len() < header_end + length {
+            let count = socket.read(&mut chunk).expect("read refresh body");
+            assert!(count > 0, "refresh request ended before its body");
+            data.extend_from_slice(&chunk[..count]);
+            assert!(data.len() <= 64 * 1024, "refresh request too large");
+            if data.len() < header_end + length {
+                on_partial(data.len() - header_end);
+            }
+        }
+        let body = std::str::from_utf8(&data[header_end..header_end + length]).unwrap();
+        assert!(body.contains("grant_type=refresh_token"));
+        assert!(body.contains("refresh_token=old-refresh"));
+    }
+
+    fn direct_fixture_options() -> crate::mcp::HttpOptionsWithProxyHosts {
+        crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: Vec::new(),
+                idle_timeout: None,
+            },
+            proxy_hosts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_fixture_waits_for_the_complete_request_body() {
+        use std::io::Write as _;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_refresh_request(&mut socket, |received| {
+                partial_tx.send(received).unwrap();
+            });
+            done_tx.send(()).unwrap();
+        });
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        let body = "grant_type=refresh_token&refresh_token=old-refresh";
+        write!(
+            client,
+            "POST /token HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        client.write_all(&body.as_bytes()[..10]).unwrap();
+        let received = partial_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(received > 0 && received <= 10);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        client.write_all(&body.as_bytes()[10..]).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+    }
+
+    async fn fixture_headers<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: std::time::Duration,
+    ) -> std::io::Result<(String, Vec<String>, usize)> {
+        use tokio::io::AsyncBufReadExt;
+        tokio::time::timeout(deadline, async {
+            let mut lines = Vec::new();
+            let mut bytes = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await? == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "incomplete fixture headers",
+                    ));
+                }
+                bytes += line.len();
+                if bytes > 64 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture headers too large",
+                    ));
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                lines.push(line);
+            }
+            if lines.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing fixture request line",
+                ));
+            }
+            let first = lines.remove(0);
+            let mut length = 0;
+            for line in &lines {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid fixture content length",
+                        )
+                    })?;
+                }
+            }
+            if length > 64 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fixture body too large",
+                ));
+            }
+            Ok((first, lines, length))
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture headers timed out")
+        })?
+    }
+
+    async fn fixture_body<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        length: usize,
+        deadline: std::time::Duration,
+    ) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut body = vec![0; length];
+        tokio::time::timeout(deadline, reader.read_exact(&mut body))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture body timed out")
+            })??;
+        Ok(body)
+    }
+
+    #[tokio::test]
+    async fn oauth_fixture_rejects_incomplete_headers_and_bounds_idle_reads() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        sender
+            .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\r\n")
+            .await
+            .unwrap();
+        drop(sender);
+        let error = fixture_headers(
+            &mut BufReader::new(receiver),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let (_sender, receiver) = tokio::io::duplex(256);
+        let error = fixture_headers(
+            &mut BufReader::new(receiver),
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        sender.write_all(b"x").await.unwrap();
+        drop(sender);
+        let error = fixture_body(
+            &mut BufReader::new(receiver),
+            2,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let (_sender, receiver) = tokio::io::duplex(256);
+        let error = fixture_body(
+            &mut BufReader::new(receiver),
+            1,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
     #[test]
     fn callback_validation_preserves_explicit_default_port() {
         for url in [
@@ -1325,9 +2127,9 @@ mod tests {
     #[test]
     fn refresh_saves_token_and_only_dispatches_for_live_callers() {
         use rmcp::transport::streamable_http_client::{AuthRequiredError, StreamableHttpError};
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         for (reactive, cancel) in [(false, true), (true, true), (false, false), (true, false)] {
             let dir = tempfile::tempdir().unwrap();
@@ -1354,8 +2156,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let server = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
-                let mut request = [0; 4096];
-                assert!(socket.read(&mut request).unwrap() > 0);
+                read_refresh_request(&mut socket, |_| {});
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let body =
@@ -1374,7 +2175,8 @@ mod tests {
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let task = runtime.as_ref().unwrap().block_on(async move {
                 let url = format!("http://{address}");
-                let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+                let options = direct_fixture_options();
+                let mut manager = oauth_manager(&format!("{url}/mcp"), Some(&options)).await.unwrap();
                 manager.set_metadata(serde_json::from_value(serde_json::json!({
                     "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
                     "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
@@ -1382,6 +2184,7 @@ mod tests {
                 manager.configure_client_id("fixture").unwrap();
                 manager.set_credential_store(task_store);
                 let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager), Arc::default());
+                let manager = client.0.auth_manager.clone();
                 let task = tokio::spawn(async move {
                     let result = client.call(reactive.then(|| "old".to_owned()), |_| {
                         let index = task_calls.fetch_add(1, Ordering::SeqCst);
@@ -1396,8 +2199,9 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
                 }).await.unwrap();
-                task.abort_handle()
+                (task.abort_handle(), manager)
             });
+            let (task, manager) = task;
             if cancel {
                 task.abort();
                 drop(runtime.take());
@@ -1420,13 +2224,22 @@ mod tests {
                 });
             }
             drop(runtime);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !String::from_utf8_lossy(&std::fs::read(&store.path).unwrap()).contains("rotated")
-            {
-                assert!(Instant::now() < deadline, "rotated token was not saved");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            let observer = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            observer.block_on(async {
+                // Both proactive and reactive refreshes hold this mutex until
+                // their HTTP response and credential save have completed.
+                let _manager = tokio::time::timeout(Duration::from_secs(5), manager.lock())
+                    .await
+                    .expect("refresh worker did not finish");
+                assert!(
+                    String::from_utf8_lossy(&std::fs::read(&store.path).unwrap())
+                        .contains("rotated"),
+                    "refresh worker finished without saving the rotated token (reactive={reactive}, cancel={cancel})"
+                );
+            });
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 usize::from(reactive) + usize::from(!cancel),
@@ -1437,8 +2250,8 @@ mod tests {
 
     #[test]
     fn cancelled_runtime_persists_rotated_mcp_refresh_token() {
-        use std::io::{Read as _, Write as _};
-        use std::time::{Duration, Instant};
+        use std::io::Write as _;
+        use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
         let store = FileCredentials {
             path: directory.path().join("credentials.json"),
@@ -1462,8 +2275,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut request = [0; 4096];
-            assert!(socket.read(&mut request).unwrap() > 0);
+            read_refresh_request(&mut socket, |_| {});
             started_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let body = r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#;
@@ -1474,16 +2286,22 @@ mod tests {
             .build()
             .unwrap();
         let task_store = store.clone();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
         let task = runtime.block_on(async move {
             let url = format!("http://{address}");
-            let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+            let options = direct_fixture_options();
+            let mut manager = oauth_manager(&format!("{url}/mcp"), Some(&options)).await.unwrap();
             manager.set_metadata(serde_json::from_value(serde_json::json!({
                 "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
                 "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
             })).unwrap());
             manager.configure_client_id("fixture").unwrap();
             manager.set_credential_store(task_store);
-            let task = tokio::spawn(async move { crate::mcp_refresh::run(async move { manager.refresh_token().await }).await });
+            let task = tokio::spawn(async move { crate::mcp_refresh::run(async move {
+                let result = manager.refresh_token().await;
+                let _ = worker_tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                result
+            }).await });
             tokio::time::timeout(Duration::from_secs(5), async {
                 while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
             }).await.unwrap();
@@ -1493,18 +2311,15 @@ mod tests {
         drop(runtime);
         release_tx.send(()).unwrap();
         server.join().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let bytes = std::fs::read(&store.path).unwrap();
-            if String::from_utf8_lossy(&bytes).contains("rotated") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "rotated refresh token was not persisted"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        worker_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refresh worker did not finish")
+            .expect("refresh worker failed");
+        let bytes = std::fs::read(&store.path).unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("rotated"),
+            "refresh worker finished without persisting the rotated token"
+        );
     }
 
     #[test]
@@ -1563,8 +2378,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_manager_uses_proxy_for_registration_and_refresh() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    async fn oauth_manager_uses_proxy_for_registration_code_exchange_and_refresh() {
+        use tokio::io::{AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let options = crate::mcp::HttpOptionsWithProxyHosts {
             http: crate::mcp::HttpOptions {
@@ -1585,6 +2400,7 @@ mod tests {
             for body in [
                 r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#,
                 r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#,
+                r#"{"access_token":"newer","token_type":"Bearer","refresh_token":"next2"}"#,
             ] {
                 let (socket, _) =
                     tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
@@ -1592,43 +2408,26 @@ mod tests {
                         .unwrap()
                         .unwrap();
                 let mut socket = BufReader::new(socket);
-                let mut first = String::new();
-                socket.read_line(&mut first).await.unwrap();
-                let mut len = 0;
-                loop {
-                    let mut line = String::new();
-                    socket.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        len = n.trim().parse().unwrap();
-                    }
-                }
+                let (first, _, _) = fixture_headers(&mut socket, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
                 assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
                 socket
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await
                     .unwrap();
-                first.clear();
-                socket.read_line(&mut first).await.unwrap();
-                loop {
-                    let mut line = String::new();
-                    socket.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                    assert!(
-                        !line
-                            .to_ascii_lowercase()
-                            .starts_with("proxy-authorization:")
-                    );
-                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        len = n.trim().parse().unwrap();
-                    }
-                }
-                let mut data = vec![0; len];
-                socket.read_exact(&mut data).await.unwrap();
+                let (first, headers, length) =
+                    fixture_headers(&mut socket, std::time::Duration::from_secs(5))
+                        .await
+                        .unwrap();
+                assert!(headers.iter().all(|line| {
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                }));
+                let data = fixture_body(&mut socket, length, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
                 requests.push((first, String::from_utf8(data).unwrap()));
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
@@ -1646,15 +2445,166 @@ mod tests {
             .await
             .unwrap();
         manager.configure_client(config).unwrap();
-        let store = rmcp::transport::auth::InMemoryCredentialStore::new();
-        let creds: StoredCredentials = serde_json::from_value(serde_json::json!({"client_id":"fixture", "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh"}})).unwrap();
-        store.save(creds).await.unwrap();
-        manager.set_credential_store(store);
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
         manager.refresh_token().await.unwrap();
         let requests = server.await.unwrap();
         assert!(requests[0].0.starts_with("POST /register "));
         assert!(requests[1].0.starts_with("POST /token "));
-        assert!(requests[1].1.contains("refresh_token=old-refresh"));
+        assert!(requests[1].1.contains("grant_type=authorization_code"));
+        assert!(requests[1].1.contains("code=fixture-code"));
+        assert!(requests[2].0.starts_with("POST /token "));
+        assert!(requests[2].1.contains("refresh_token=next"));
+    }
+
+    #[tokio::test]
+    async fn no_proxy_routes_oauth_discovery_metadata_registration_code_exchange_and_refresh_directly()
+     {
+        use std::time::Duration;
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", origin.local_addr().unwrap());
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!(
+                        "http://localhost:{}",
+                        proxy.local_addr().unwrap().port()
+                    ))
+                    .unwrap()
+                    .no_proxy(reqwest_mcp::NoProxy::from_string("127.0.0.1"))
+                    .tunnel_http(true),
+                ],
+                idle_timeout: None,
+            },
+            proxy_hosts: vec!["localhost".into()],
+        };
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut token_requests = 0;
+            loop {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), origin.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let (first, headers, length) = fixture_headers(&mut socket, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                assert!(headers.iter().all(|line| {
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                }));
+                let body = fixture_body(&mut socket, length, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                requests.push((first.clone(), String::from_utf8(body).unwrap()));
+                let (status, response) = if first.starts_with("GET /metadata ") {
+                    ("200 OK", serde_json::json!({"issuer":server_base,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if first.starts_with("POST /register ") {
+                    (
+                        "200 OK",
+                        r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#
+                            .to_owned(),
+                    )
+                } else if first.starts_with("POST /token ") {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#
+                            .to_owned(),
+                    )
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+                if first.starts_with("POST /token ") {
+                    token_requests += 1;
+                    if token_requests == 2 {
+                        return requests;
+                    }
+                }
+            }
+        });
+        let resource = format!("{base}/mcp");
+        let mut manager = oauth_manager(&resource, Some(&options)).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), manager.resolve_metadata())
+            .await
+            .unwrap();
+        let metadata = configured_metadata(&format!("{base}/metadata"), &resource, Some(&options))
+            .await
+            .unwrap();
+        manager.set_metadata(metadata);
+        let config = manager
+            .register_client("fixture", "http://127.0.0.1/callback", &[])
+            .await
+            .unwrap();
+        manager.configure_client(config).unwrap();
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
+        manager.refresh_token().await.unwrap();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /.well-known/"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /metadata "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("POST /register "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("refresh_token=next"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("grant_type=authorization_code")
+                    && body.contains("code=fixture-code"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

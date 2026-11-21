@@ -21,6 +21,7 @@ test = false
 evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
 
 [dependencies]
+pi-rs-file-url = { path = "../file-url" }
 arboard = { version = "3.7", features = ["wayland-data-control"] }
 async-trait = "0.1"
 async-stream = "0.3"
@@ -48,6 +49,8 @@ libc = "0.2"
 jsonschema = { version = "0.33", default-features = false }
 palette = "0.7"
 pulldown-cmark = "0.13"
+unicase = "2"
+ryu-js = "1.0.3"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 shell-words = "1"
 similar = "2.7"
@@ -85,7 +88,7 @@ reqwest = { version = "0.12", default-features = false, features = ["socks"] }
 reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["socks"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 tower = "0.5"
 
 [target.'cfg(unix)'.dependencies]

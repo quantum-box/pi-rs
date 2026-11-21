@@ -1,4 +1,6 @@
 //! Prepare queue submissions in order without blocking cancellation or extension UI replies.
+#[path = "mode_coordinator.rs"]
+mod mode_coordinator;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,8 +28,13 @@ pub(super) struct Processor {
 
 impl Processor {
     pub async fn run(self: Arc<Self>, mut requests: mpsc::Receiver<Request>) {
+        let mut coordinator = None;
         while let Some(request) = requests.recv().await {
-            self.handle(request).await;
+            if let Request::SetQueueMode { kind, mode, id } = request {
+                self.set_mode(kind, mode, id, &mut coordinator);
+            } else {
+                self.handle(request).await;
+            }
         }
     }
 
@@ -72,7 +79,17 @@ impl Processor {
             },
             Request::ClearQueue { id } => self.clear(id),
             Request::SetSessionName { name, id } => self.rename(name, id),
-            Request::SetQueueMode { kind, mode, id } => self.set_mode(kind, mode, id),
+            Request::SetQueueMode { kind, mode, id } => {
+                // The direct path runs on the dedicated stdin reader thread.
+                // Its coordinator dies with that thread and is never reused by
+                // another worker or runtime.
+                thread_local! {
+                    static MODE: std::cell::RefCell<Option<mode_coordinator::Coordinator>> = const { std::cell::RefCell::new(None) };
+                }
+                MODE.with(|coordinator| {
+                    self.set_mode(kind, mode, id, &mut coordinator.borrow_mut())
+                });
+            }
             _ => unreachable!("only queue requests are routed to this task"),
         }
     }
@@ -252,7 +269,30 @@ impl Processor {
         });
     }
 
-    fn set_mode(&self, kind: InputKind, mode: QueueMode, id: Option<Value>) {
+    fn set_mode(
+        &self,
+        kind: InputKind,
+        mode: QueueMode,
+        id: Option<Value>,
+        slot: &mut Option<mode_coordinator::Coordinator>,
+    ) {
+        if id
+            .as_ref()
+            .is_some_and(|id| id.get("_rpc_mode_token").is_some())
+        {
+            if slot
+                .as_ref()
+                .is_some_and(|coordinator| !coordinator.matches(&self.inputs))
+            {
+                *slot = None;
+            }
+            let coordinator = slot
+                .get_or_insert_with(|| mode_coordinator::Coordinator::start(self.inputs.clone()).0);
+            if let Err(error) = coordinator.submit(kind, mode, id.clone()) {
+                control_response(mode_command(kind), id, Err(error));
+            }
+            return;
+        }
         let (reply, receiver) = oneshot::channel();
         let _ = self
             .inputs
@@ -276,7 +316,7 @@ impl Processor {
                 })
                 .await
                 .map_err(|error| Error::Config(error.to_string()))??;
-                Ok(json!({"mode":mode}))
+                Ok(Value::Null)
             }
             .await;
             control_response(mode_command(kind), id, result);

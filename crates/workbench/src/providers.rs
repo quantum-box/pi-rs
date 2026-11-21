@@ -1,4 +1,5 @@
 //! Provider selection and shared workbench catalog and progress controls.
+use futures_util::StreamExt;
 use std::collections::BTreeMap;
 
 use pi_rs::anthropic::Anthropic;
@@ -196,11 +197,14 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if bearer
+                let mut client = if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                    Anthropic::with_oauth_token(endpoint, &token)?
+                } else if bearer
                     || matches!(
                         self.id(),
                         "fireworks" | "openrouter" | "minimax" | "minimax-cn"
-                    ) {
+                    )
+                {
                     Anthropic::with_bearer_token(endpoint, &token)?
                 } else {
                     Anthropic::new(endpoint, &token)?
@@ -359,6 +363,14 @@ impl Deferred {
     ) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
+            Some(Credential::AnthropicOAuth) if self.http_settings.is_some() => Some(
+                super::anthropic_auth::access(
+                    self.http_settings.as_ref().expect("settings checked"),
+                    None,
+                    false,
+                )
+                .await?,
+            ),
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
@@ -563,21 +575,36 @@ impl Client {
         request: ModelRequest,
         defaults: &HeaderMap,
         cache_disabled: bool,
+        session_cache_key: Option<&str>,
     ) -> Result<ModelStream> {
         match self {
-            Self::Ollama(client) if cache_disabled => {
-                client
-                    .clone()
-                    .with_cache_retention(CacheRetention::None)
-                    .stream(request)
-                    .await
+            Self::Ollama(client) => {
+                let client = if cache_disabled {
+                    client.clone().without_cache()
+                } else {
+                    let client = client.clone().with_default_headers(defaults);
+                    if let Some(key) = session_cache_key {
+                        client.with_session_cache_key(key)
+                    } else {
+                        client
+                    }
+                };
+                client.stream(request).await
             }
-            Self::Ollama(client) if !defaults.is_empty() => {
-                client
-                    .clone()
-                    .with_default_headers(defaults)
-                    .stream(request)
-                    .await
+            Self::OpenAi(client) => {
+                let client = if cache_disabled {
+                    client.clone().without_cache()
+                } else if let Some(key) = session_cache_key {
+                    client.clone().with_session_cache_key(key)
+                } else {
+                    client.clone()
+                };
+                let client = if cache_disabled {
+                    client
+                } else {
+                    client.with_default_headers(defaults)
+                };
+                client.stream(request).await
             }
             Self::Anthropic(client) if cache_disabled => {
                 client.clone().without_cache().stream(request).await
@@ -608,10 +635,149 @@ impl Client {
                     request,
                     defaults,
                     cache_disabled,
+                    session_cache_key,
                 ))
                 .await
             }
             _ => self.stream(request).await,
+        }
+    }
+
+    pub async fn stream_enriched_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+        cache_disabled: bool,
+        session_cache_key: Option<&str>,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        match self {
+            Self::OpenAi(client) => {
+                if cache_disabled {
+                    client
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else if let Some(key) = session_cache_key {
+                    // Workbench applies its own model-specific affinity headers.
+                    // Do not let the standalone SDK add a second default set.
+                    client
+                        .clone()
+                        .with_default_headers(defaults)
+                        .with_session_affinity_format(
+                            pi_rs::openai::SessionAffinityFormat::Disabled,
+                        )
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            key,
+                            request,
+                        )
+                        .await
+                } else {
+                    let stream = client.stream(request).await?;
+                    Ok(Box::pin(
+                        stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                    ))
+                }
+            }
+            Self::Anthropic(client) => {
+                if cache_disabled {
+                    client
+                        .clone()
+                        .without_cache()
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else {
+                    let client = if defaults.is_empty() {
+                        client.clone()
+                    } else {
+                        client.clone().with_default_headers(defaults)
+                    };
+                    client
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            session_cache_key.unwrap_or_default(),
+                            request,
+                        )
+                        .await
+                }
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(client.resolve().await?.stream_enriched_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                ))
+                .await
+            }
+            _ => {
+                let stream = self
+                    .stream_with_headers(request, defaults, cache_disabled, session_cache_key)
+                    .await?;
+                Ok(Box::pin(
+                    stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                ))
+            }
+        }
+    }
+
+    pub async fn stream_detailed_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+        cache_disabled: bool,
+        session_cache_key: Option<&str>,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        match self {
+            Self::Anthropic(client) => {
+                if cache_disabled {
+                    client
+                        .clone()
+                        .without_cache()
+                        .stream_detailed_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else {
+                    let client = if defaults.is_empty() {
+                        client.clone()
+                    } else {
+                        client.clone().with_default_headers(defaults)
+                    };
+                    client
+                        .stream_detailed_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            session_cache_key.unwrap_or_default(),
+                            request,
+                        )
+                        .await
+                }
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(client.resolve().await?.stream_detailed_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                ))
+                .await
+            }
+            _ => Ok(Box::pin(
+                self.stream_enriched_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                )
+                .await?
+                .map(|event| event.map(Into::into)),
+            )),
         }
     }
 
@@ -744,7 +910,16 @@ impl Client {
                     .chat_cache_support(&args.provider, &args.model, configured.as_ref())
                     .map(cache_retention)
                     .unwrap_or_default();
-                let client = client.with_cache_retention(retention);
+                let (key_enabled, long) = args.model_profiles.chat_prompt_cache_policy(
+                    &args.provider,
+                    &args.model,
+                    configured.as_ref(),
+                    args.model_endpoint_for(&args.provider, Some(&args.model)),
+                    std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long"),
+                );
+                let client = client
+                    .with_cache_retention(retention)
+                    .with_prompt_cache_policy(key_enabled, long);
                 let mapped = configured.as_ref().and_then(|model| {
                     let level = thinking.or((model.reasoning == Some(true)).then_some("off"))?;
                     model.mapped_effort(level)
@@ -761,7 +936,7 @@ impl Client {
                     .chat_compatibility(&args.provider, configured.as_ref());
                 let client = client.with_chat_compatibility(
                     compatibility,
-                    configured.as_ref().and_then(|model| model.reasoning),
+                    super::thinking::adopted_reasoning(args),
                     thinking.is_some_and(|level| level != "off"),
                     configured
                         .as_ref()
@@ -770,7 +945,14 @@ impl Client {
                 let sampling = configured
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();
-                Self::Ollama(client.with_sampling(sampling)?)
+                Self::Ollama(
+                    client
+                        .with_thinking_budgets(
+                            thinking,
+                            args.settings.value().get("thinkingBudgets").cloned(),
+                        )
+                        .with_sampling(sampling)?,
+                )
             }
             Self::Anthropic(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
@@ -902,7 +1084,23 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
+                let (supports_long, explicit_cache) = args
+                    .model_profiles
+                    .responses_cache_support(&args.provider, metadata.as_ref());
+                let supports_developer = args
+                    .model_profiles
+                    .chat_compatibility(&args.provider, metadata.as_ref())
+                    .supports_developer_role();
+                let use_developer = metadata.as_ref().and_then(|model| model.reasoning)
+                    == Some(true)
+                    && supports_developer != Some(false);
                 let client = client
+                    .with_developer_role(use_developer)
+                    .with_cache_retention(cache_retention(supports_long), explicit_cache)
+                    .with_prompt_cache_key_enabled(
+                        args.model_profiles
+                            .responses_prompt_cache_key_enabled(&args.provider, metadata.as_ref()),
+                    )
                     .with_thinking(thinking)
                     .with_sampling(sampling)
                     .map_err(|error| {
@@ -958,26 +1156,31 @@ impl Client {
         })
     }
 
-    pub async fn thinking_levels(&self, model: &str) -> Option<(Vec<String>, Option<bool>)> {
+    pub async fn thinking_levels(
+        &self,
+        model: &str,
+    ) -> Option<(Option<Vec<String>>, Option<bool>)> {
         match self {
             Self::Ollama(client) => {
                 let details = client.model_details(&[model.into()]).await.remove(model)?;
-                Some((details.thinking_levels?, details.reasoning))
+                (details.thinking_levels.is_some() || details.reasoning.is_some())
+                    .then_some((details.thinking_levels, details.reasoning))
             }
             Self::Anthropic(client) => client
                 .model(model)
                 .await
                 .filter(|entry| entry.has_known_thinking())
-                .map(|entry| (entry.thinking_levels, entry.reasoning)),
+                .map(|entry| (Some(entry.thinking_levels), entry.reasoning)),
             Self::Google(client) => client
                 .model(model)
                 .await
-                .map(|entry| (entry.thinking_levels, Some(entry.reasoning))),
+                .map(|entry| (Some(entry.thinking_levels), Some(entry.reasoning))),
             Self::PiMessages(client) => {
                 let details = client.model_details(&[model.into()]).await.remove(model)?;
-                Some((details.thinking_levels?, details.reasoning))
+                (details.thinking_levels.is_some() || details.reasoning.is_some())
+                    .then_some((details.thinking_levels, details.reasoning))
             }
-            Self::OpenAi(_) => Some((pi_rs::openai::thinking_levels(model), None)),
+            Self::OpenAi(_) => Some((Some(pi_rs::openai::thinking_levels(model)), None)),
             Self::Bedrock(_) => None,
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await
@@ -1045,6 +1248,84 @@ impl Model for Client {
         }
     }
 
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.stream_detailed_with_headers(request, &HeaderMap::new(), false, Some(external_id))
+            .await
+    }
+
+    async fn stream_detailed_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.stream_detailed_with_headers(request, &HeaderMap::new(), true, None)
+            .await
+    }
+
+    async fn stream_in_session(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_in_session_with_identity(
+            request_id,
+            session_id,
+            &session_id.to_string(),
+            request,
+        )
+        .await
+    }
+
+    async fn stream_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_with_headers(request, &HeaderMap::new(), false, Some(external_id))
+            .await
+    }
+
+    async fn stream_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_with_headers(request, &HeaderMap::new(), true, None)
+            .await
+    }
+
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        self.stream_enriched_with_headers(request, &HeaderMap::new(), false, Some(external_id))
+            .await
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        self.stream_enriched_with_headers(request, &HeaderMap::new(), true, None)
+            .await
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         match self {
             Self::Ollama(client) => client.stream(request).await,
@@ -1054,7 +1335,7 @@ impl Model for Client {
             Self::OpenAi(client) => client.stream(request).await,
             Self::Bedrock(client) => client.stream(request).await,
             Self::Deferred(_) => {
-                self.stream_with_headers(request, &HeaderMap::new(), false)
+                self.stream_with_headers(request, &HeaderMap::new(), false, None)
                     .await
             }
         }
@@ -1117,6 +1398,149 @@ mod estimation_tests {
     use super::*;
     use clap::Parser;
 
+    #[tokio::test]
+    async fn bundled_chat_models_send_model_specific_strict_field() {
+        use std::io::{Read, Write};
+        for (provider, model_id, config, expected) in [
+            (
+                "huggingface",
+                "deepseek-ai/DeepSeek-R1",
+                serde_json::json!({}),
+                Some(false),
+            ),
+            (
+                "huggingface",
+                "deepseek-ai/DeepSeek-R1",
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":false}}}}),
+                None,
+            ),
+            (
+                "openrouter",
+                "~deepseek/deepseek-flash-latest",
+                serde_json::json!({}),
+                Some(false),
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({}),
+                None,
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":true}}}}),
+                Some(false),
+            ),
+            (
+                "huggingface",
+                "deepseek-ai/DeepSeek-R1",
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":true},"modelOverrides":{"deepseek-ai/DeepSeek-R1":{"compat":{"supportsStrictMode":false}}}}}}),
+                None,
+            ),
+            (
+                "huggingface",
+                "custom",
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":true},"models":[{"id":"custom","compat":{"supportsStrictMode":false}}]}}}),
+                None,
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":false},"models":[{"id":"deepseek-ai/DeepSeek-V4-Pro-0813","compat":{"supportsStrictMode":true}}]}}}),
+                Some(false),
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let endpoint = format!("http://{address}/v1/chat/completions");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
+            args.provider = args.model_profiles.provider(provider).unwrap();
+            args.model = model_id.into();
+            let client = Client::Ollama(
+                pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                    .unwrap()
+                    .with_provider(provider)
+                    .with_native_probes(false),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let _ = client
+                .stream(ModelRequest {
+                    model: model_id.into(),
+                    messages: vec![],
+                    tools: vec![pi_rs::ToolSpec {
+                        name: "probe".into(),
+                        description: "probe".into(),
+                        parameters: serde_json::json!({"type":"object","properties":{}}),
+                    }],
+                    max_output_tokens: 10,
+                })
+                .await;
+            let body = server.join().unwrap();
+            assert_eq!(
+                body["tools"][0]["function"]
+                    .get("strict")
+                    .and_then(serde_json::Value::as_bool),
+                expected,
+                "{provider}/{model_id}"
+            );
+        }
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn google_thinking_budget_settings_follow_model_options() {
@@ -1150,6 +1574,382 @@ mod estimation_tests {
                 .with_thinking(Some("high")),
         );
         assert_eq!(reset.context_identity(), expected.context_identity());
+    }
+
+    #[tokio::test]
+    async fn chat_cache_key_reaches_resolved_and_deferred_client_sessions() {
+        use std::io::{Read, Write};
+        for (deferred, summary, path) in [false, true].into_iter().flat_map(|deferred| {
+            [false, true].into_iter().flat_map(move |summary| {
+                ["legacy", "enriched", "detailed"]
+                    .into_iter()
+                    .map(move |path| (deferred, summary, path))
+            })
+        }) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let endpoint = format!("http://{address}/v1/chat/completions");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"test":{
+                "api":"openai-completions", "baseUrl":endpoint, "compat":{"promptCacheKeyMode":"enabled"}, "models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::ChatCompletions,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                        .unwrap()
+                        .with_provider("test")
+                        .with_native_probes(false),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let model: &dyn Model = &client;
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 10,
+            };
+            let request_id = uuid::Uuid::new_v4();
+            let session_id = uuid::Uuid::new_v4();
+            match (summary, path) {
+                (true, "legacy") => {
+                    let _ = model
+                        .stream_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "legacy") => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                (true, "enriched") => {
+                    let _ = model
+                        .stream_enriched_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "enriched") => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                (true, "detailed") => {
+                    let _ = model
+                        .stream_detailed_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "detailed") => {
+                    let _ = model
+                        .stream_detailed_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                _ => unreachable!(),
+            }
+            let body = server.join().unwrap();
+            assert_eq!(
+                body.get("prompt_cache_key")
+                    .and_then(serde_json::Value::as_str),
+                (!summary).then_some("imported-session")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_instruction_role_follows_model_capabilities() {
+        use std::io::{Read, Write};
+        for (models, overrides, provider_compat, expected) in [
+            (
+                serde_json::json!([{"id":"m","reasoning":true}]),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                "developer",
+            ),
+            (
+                serde_json::json!([{"id":"m","reasoning":false}]),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                "system",
+            ),
+            (
+                serde_json::json!([{"id":"m","reasoning":true}]),
+                serde_json::json!({}),
+                serde_json::json!({"supportsDeveloperRole":false}),
+                "system",
+            ),
+            (
+                serde_json::json!([{"id":"m","reasoning":true,"compat":{"supportsDeveloperRole":true}}]),
+                serde_json::json!({}),
+                serde_json::json!({"supportsDeveloperRole":false}),
+                "developer",
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                "system",
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!({"m":{"name":"partial"}}),
+                serde_json::json!({}),
+                "system",
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let endpoint = format!("http://{address}/responses");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(
+                &serde_json::json!({"providers":{"test":{
+                    "api":"openai-responses", "baseUrl":endpoint, "compat":provider_compat,
+                    "models":models, "modelOverrides":overrides
+                }}}),
+            )
+            .unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = Client::OpenAi(
+                pi_rs::openai::OpenAiResponses::new_api_provider(
+                    &endpoint,
+                    "fixture".into(),
+                    "test",
+                )
+                .unwrap(),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let _ = client
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![pi_rs::Message::System {
+                        content: "rules".into(),
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 10,
+                })
+                .await;
+            let body = server.join().unwrap();
+            assert_eq!(body["input"][0]["role"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_cache_key_modes_reach_workbench_requests() {
+        use std::io::{Read, Write};
+        for (mode, expected) in [("disabled", None), ("enabled", Some("external-session"))] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let endpoint = format!("http://{address}/responses");
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"test":{
+                "api":"openai-responses", "baseUrl":endpoint, "compat":{"promptCacheKeyMode":"disabled"},
+                "models":[{"id":"m", "compat":{"promptCacheKeyMode":mode}}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = Client::OpenAi(
+                pi_rs::openai::OpenAiResponses::new_api_provider(
+                    &endpoint,
+                    "fixture".into(),
+                    "test",
+                )
+                .unwrap(),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let model = super::super::image_policy::WorkbenchModel {
+                client,
+                block_images: false,
+                supports_images: None,
+                session_affinity: &[],
+                price: None,
+            };
+            let _ = model
+                .stream_enriched_in_session_with_identity(
+                    uuid::Uuid::new_v4(),
+                    uuid::Uuid::new_v4(),
+                    "external-session",
+                    ModelRequest {
+                        model: "m".into(),
+                        messages: vec![],
+                        tools: vec![],
+                        max_output_tokens: 10,
+                    },
+                )
+                .await;
+            let body = server.join().unwrap();
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(|v| v.as_str()),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -2044,7 +2844,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), true)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), true, None)
                 .await
                 .unwrap();
             args.model = "anthropic.claude-opus-4-8".into();
@@ -2053,7 +2853,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             for (model, level) in [
@@ -2067,7 +2867,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2083,7 +2883,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2094,7 +2894,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.model_profiles = super::super::model_profiles::Profiles::parse(
@@ -2117,7 +2917,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2128,7 +2928,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                     .await
                     .unwrap();
             }
@@ -2140,7 +2940,7 @@ mod bedrock_tests {
                         .with_model_options(&args, false)
                         .unwrap();
                     let _stream = client
-                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                         .await
                         .unwrap();
                 }
@@ -2161,7 +2961,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let _stream = client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.thinking = Some("low".into());
@@ -2171,7 +2971,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let error = match client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
             {
                 Ok(_) => panic!("invalid selected budget accepted"),

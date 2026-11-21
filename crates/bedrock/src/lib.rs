@@ -628,6 +628,8 @@ struct ReasoningBlock {
     redacted: Vec<u8>,
 }
 
+const REDACTED_THINKING: &str = "[Reasoning redacted]";
+
 fn push_replay_text(out: &mut Vec<ContentBlock>, pending_whitespace: &mut String, text: &str) {
     if text.trim().is_empty() {
         if let Some(ContentBlock::Text(previous)) = out.last_mut() {
@@ -1389,7 +1391,7 @@ impl Model for Bedrock {
                             match delta {
                                 types::ReasoningContentBlockDelta::Text(text) => { if !block.redacted.is_empty() { Err(Error::Model("mixed Bedrock reasoning block".into()))?; } received=received.saturating_add(text.len()); block.text.push_str(&text); yield ModelEvent::Reasoning(text); },
                                 types::ReasoningContentBlockDelta::Signature(signature) => { if !block.redacted.is_empty() { Err(Error::Model("mixed Bedrock reasoning block".into()))?; } received=received.saturating_add(signature.len()); block.signature.push_str(&signature); },
-                                types::ReasoningContentBlockDelta::RedactedContent(blob) => { if !block.text.is_empty() || !block.signature.is_empty() { Err(Error::Model("mixed Bedrock reasoning block".into()))?; } received=received.saturating_add(blob.as_ref().len()); block.redacted.extend_from_slice(blob.as_ref()); },
+                                types::ReasoningContentBlockDelta::RedactedContent(blob) => { if !block.text.is_empty() || !block.signature.is_empty() { Err(Error::Model("mixed Bedrock reasoning block".into()))?; } received=received.saturating_add(blob.as_ref().len()); if block.redacted.is_empty() && !blob.as_ref().is_empty() { yield ModelEvent::Reasoning(REDACTED_THINKING.into()); } block.redacted.extend_from_slice(blob.as_ref()); },
                                 _ => Err(Error::Model("unsupported Bedrock reasoning delta".into()))?,
                             }
                             if received > 4 * 1024 * 1024 { Err(Error::Model("Bedrock stream exceeds size limit".into()))?; }
@@ -1411,7 +1413,7 @@ impl Model for Bedrock {
             let reason=stop.ok_or_else(|| Error::RetryableModel("Bedrock stream ended before messageStop".into()))?;
             if !open_tools.is_empty() || (!calls.is_empty() && reason != "tool_use") || (calls.is_empty() && reason == "tool_use") { Err(Error::Model("incomplete Bedrock tool response".into()))?; }
             if reasoning.keys().any(|i| !stopped_blocks.contains(i)) { Err(Error::Model("incomplete Bedrock reasoning block".into()))?; }
-            let reasoning_text: String = reasoning.values().map(|b| b.text.as_str()).collect();
+            let reasoning_text: String = reasoning.values().map(|b| if b.redacted.is_empty() { b.text.as_str() } else { REDACTED_THINKING }).collect();
             let mut ordered = BTreeMap::new();
             for (i,text) in text_blocks { ordered.insert(i, serde_json::json!({"type":"text", "text":text})); }
             for (i,call) in &calls { let input=history_tool_input(&call.arguments); ordered.insert(*i, serde_json::json!({"type":"tool_use", "id":call.id,"name":call.name,"input":input,"raw_arguments":call.arguments})); }
@@ -1692,22 +1694,17 @@ mod tests {
         let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut socket, _) = listener.accept().unwrap();
         socket.set_nonblocking(true).unwrap();
-        // Allow the writer thread to start even on a loaded CI runner; the
-        // separate empty-read assertion below still uses a short deadline.
-        configure_sts_fixture_socket(&socket, Duration::from_secs(5)).unwrap();
+        configure_sts_fixture_socket(&socket, Duration::from_millis(200)).unwrap();
         let (release, hold) = std::sync::mpsc::channel::<()>();
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             client.write_all(b"x").unwrap();
             // Keep the connection open until the bounded read times out.
-            let _ = hold.recv_timeout(Duration::from_secs(15));
+            let _ = hold.recv_timeout(Duration::from_secs(5));
         });
         let mut byte = [0];
         socket.read_exact(&mut byte).unwrap();
         assert_eq!(&byte, b"x");
-        socket
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
         let error = socket.read(&mut byte).unwrap_err();
         assert!(matches!(
             error.kind(),

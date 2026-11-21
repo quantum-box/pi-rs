@@ -45,6 +45,7 @@ struct Endpoint {
     path: PathBuf,
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
+    compaction_overflow_reason_v1: bool,
     text_result_v2: bool,
     structured_text_result: bool,
 }
@@ -190,6 +191,12 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    CompactionLifecycleV1 {
+        event: LifecycleEvent,
+        trigger: pi_rs_core::CompactionTrigger,
+        metadata: Option<Value>,
+        state: Option<ExtensionState>,
+    },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
         state: Option<ExtensionState>,
@@ -248,6 +255,11 @@ enum ProtocolRequest {
         arguments: String,
         state: Option<ExtensionState>,
     },
+    CommandEffectsClassifiedV1 {
+        name: String,
+        arguments: String,
+        state: Option<ExtensionState>,
+    },
     BeforeTool {
         name: String,
         arguments: Value,
@@ -290,6 +302,10 @@ enum ProtocolRequest {
         keep_turns: usize,
         state: Option<ExtensionState>,
     },
+    BeforeSummaryCompaction {
+        preparation: pi_rs_core::CompactionPreparation,
+        state: Option<ExtensionState>,
+    },
     AfterCompaction {
         summary: String,
         keep_turns: usize,
@@ -321,6 +337,8 @@ struct Description {
     command_entries: bool,
     #[serde(default)]
     command_effects: bool,
+    #[serde(default)]
+    command_failure_classification_v1: bool,
     #[serde(default)]
     input_hook: bool,
     #[serde(default)]
@@ -364,6 +382,12 @@ struct Description {
     tree_hook_host_calls: bool,
     #[serde(default)]
     compaction_hook_host_calls: bool,
+    #[serde(default)]
+    before_summary_compaction_v1: bool,
+    #[serde(default)]
+    compaction_overflow_reason_v1: bool,
+    #[serde(default)]
+    compaction_lifecycle_v1: bool,
     #[serde(default)]
     resources_hook_host_calls: bool,
     #[serde(default)]
@@ -651,6 +675,7 @@ impl ExecutableExtension {
             path: executable,
             flags: None,
             pi_lifecycle_fields: false,
+            compaction_overflow_reason_v1: false,
             text_result_v2: false,
             structured_text_result: false,
         };
@@ -661,6 +686,8 @@ impl ExecutableExtension {
             description,
         };
         extension.endpoint.pi_lifecycle_fields = extension.description.pi_lifecycle_fields;
+        extension.endpoint.compaction_overflow_reason_v1 =
+            extension.description.compaction_overflow_reason_v1;
         extension.endpoint.text_result_v2 = extension.description.text_result_v2;
         extension.endpoint.structured_text_result = extension.description.structured_text_result;
         extension.apply_flags(&mut BTreeMap::new())?;
@@ -1046,6 +1073,36 @@ impl Extension for ExecutableExtension {
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             call_duplex(&path, request, host, &cancellation, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    async fn compaction_lifecycle_with_host(
+        &self,
+        event: &LifecycleEvent,
+        trigger: pi_rs_core::CompactionTrigger,
+        metadata: Option<&Value>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if !self.description.compaction_lifecycle_v1 {
+            return self.lifecycle_with_host(event, state, host).await;
+        }
+        let request = ProtocolRequest::CompactionLifecycleV1 {
+            event: event.clone(),
+            trigger,
+            metadata: metadata.cloned(),
+            state: state.cloned(),
+        };
+        if !self.description.lifecycle_host_calls {
+            return self.request_async(request).await;
+        }
+        let endpoint = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex(&endpoint, request, host, &cancellation, &runtime)
         })
         .await
         .map_err(|error| error.to_string())?
@@ -1503,6 +1560,30 @@ impl Extension for ExecutableExtension {
                 })
         }
     }
+    fn command_effects_classified(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> std::result::Result<pi_rs_core::ExtensionCommandEffects, pi_rs_core::CommandCallbackFailure>
+    {
+        if self.description.command_failure_classification_v1 {
+            let response: std::result::Result<
+                pi_rs_core::ExtensionCommandEffects,
+                pi_rs_core::CommandCallbackFailure,
+            > = self
+                .request(ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                    state: previous.cloned(),
+                })
+                .map_err(pi_rs_core::CommandCallbackFailure::Transport)?;
+            response
+        } else {
+            self.command_effects(name, arguments, previous)
+                .map_err(pi_rs_core::CommandCallbackFailure::Transport)
+        }
+    }
     async fn before_tool(
         &self,
         name: &str,
@@ -1773,6 +1854,39 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
     }
+    fn handles_before_summary_compaction(&self) -> bool {
+        self.description.before_summary_compaction_v1
+    }
+
+    async fn before_summary_compaction(
+        &self,
+        preparation: &pi_rs_core::CompactionPreparation,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::BeforeSummaryCompactionResult>> {
+        if !self.description.before_summary_compaction_v1 {
+            return Ok(None);
+        }
+        let request = ProtocolRequest::BeforeSummaryCompaction {
+            preparation: preparation.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let duplex = self.description.compaction_hook_host_calls;
+        tokio::task::spawn_blocking(move || {
+            if duplex {
+                call_duplex(&path, request, host, &cancelled, &runtime)
+            } else {
+                call(&path, request, Some(&cancelled))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     fn before_compaction(
         &self,
         compaction: &mut Compaction,
@@ -2090,6 +2204,10 @@ struct DuplexRequest {
     #[serde(default)]
     has_custom_messages: bool,
     #[serde(default)]
+    has_custom_entries: bool,
+    #[serde(default)]
+    has_custom_entry_read: bool,
+    #[serde(default)]
     has_keyed_messages: bool,
     #[serde(default)]
     has_prevalidated_calls: bool,
@@ -2097,6 +2215,13 @@ struct DuplexRequest {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    ListCustomEntries {
+        #[serde(default)]
+        custom_type: Option<String>,
+    },
+    AppendEntry {
+        entry: pi_rs_core::CustomEntry,
+    },
     SendMessage {
         message: pi_rs_core::CustomMessage,
         delivery: pi_rs_core::CustomMessageDelivery,
@@ -2529,6 +2654,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
 ) -> ExtensionResult<T> {
+    project_overflow_reason(&mut request, endpoint.compaction_overflow_reason_v1);
     if let ProtocolRequest::Lifecycle {
         event: LifecycleEvent::ToolExecutionEnd { result, .. },
         ..
@@ -2568,6 +2694,8 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 Ok(DuplexFrame::Call { .. }
                     | DuplexFrame::CheckedCall { .. }
                     | DuplexFrame::SendMessage { .. }
+                    | DuplexFrame::AppendEntry { .. }
+                    | DuplexFrame::ListCustomEntries { .. }
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
             );
@@ -2584,6 +2712,8 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 has_ui: host.has_ui(),
                 has_progress: host.supports_progress(),
                 has_custom_messages: host.supports_custom_messages(),
+                has_custom_entries: host.supports_custom_entries(),
+                has_custom_entry_read: host.supports_custom_entry_read(),
                 has_keyed_messages: host.supports_keyed_messages(),
                 has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
             })
@@ -2600,6 +2730,30 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(DuplexFrame::ListCustomEntries { custom_type })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during entry lookup".to_owned()),
+                        result = host.custom_entries(custom_type.as_deref()) => result,
+                    }
+                });
+                writer
+                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
+            Ok(Ok(DuplexFrame::AppendEntry { entry })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during entry persistence".to_owned()),
+                        result = host.append_entry(entry) => result,
+                    }
+                });
+                writer
+                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
             Ok(Ok(DuplexFrame::SendMessage {
                 message,
                 delivery,
@@ -2685,6 +2839,11 @@ struct RemoteHost {
     has_ui: bool,
     has_progress: bool,
     has_custom_messages: bool,
+    has_custom_entries: bool,
+    has_custom_entry_read: bool,
+    entry_lifetime: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    entry_waiting: Option<std::sync::mpsc::Sender<()>>,
     has_keyed_messages: bool,
     has_prevalidated_calls: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
@@ -2728,6 +2887,70 @@ fn wire_prevalidated_calls(
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
+    fn supports_custom_entry_read(&self) -> bool {
+        self.has_custom_entry_read
+            && self
+                .entry_lifetime
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn custom_entries(
+        &self,
+        custom_type: Option<&str>,
+    ) -> ExtensionResult<Vec<pi_rs_core::CustomEntryRecord>> {
+        if !self.supports_custom_entry_read() {
+            return Err("custom entry reading is unavailable".into());
+        }
+        let io = self.io.clone();
+        let lifetime = self.entry_lifetime.clone();
+        let custom_type = custom_type.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            if !lifetime.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("extension callback has finished".into());
+            }
+            duplex_write_line(&mut io.1, &DuplexFrame::ListCustomEntries { custom_type })?;
+            duplex_read_line::<ExtensionResult<Vec<pi_rs_core::CustomEntryRecord>>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    fn close_custom_entry_scope(&self) {
+        self.entry_lifetime
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    fn supports_custom_entries(&self) -> bool {
+        self.has_custom_entries
+            && self
+                .entry_lifetime
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn append_entry(&self, entry: pi_rs_core::CustomEntry) -> ExtensionResult<()> {
+        if !self.supports_custom_entries() {
+            return Err("custom entry persistence is unavailable".into());
+        }
+        let io = self.io.clone();
+        let lifetime = self.entry_lifetime.clone();
+        #[cfg(test)]
+        let waiting = self.entry_waiting.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(waiting) = waiting {
+                let _ = waiting.send(());
+            }
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            if !lifetime.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("extension callback has finished".into());
+            }
+            duplex_write_line(&mut io.1, &DuplexFrame::AppendEntry { entry })?;
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     fn supports_prevalidated_call_accounting(&self) -> bool {
         self.has_prevalidated_calls
     }
@@ -2877,6 +3100,11 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         has_ui: request.has_ui,
         has_progress: request.has_progress,
         has_custom_messages: request.has_custom_messages,
+        has_custom_entries: request.has_custom_entries,
+        has_custom_entry_read: request.has_custom_entry_read,
+        entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        #[cfg(test)]
+        entry_waiting: None,
         has_keyed_messages: request.has_keyed_messages,
         has_prevalidated_calls: request.has_prevalidated_calls,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
@@ -2885,6 +3113,8 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         .enable_all()
         .build()?;
     let response = runtime.block_on(dispatch_with_host(extension, request.request, host.clone()));
+    host.entry_lifetime
+        .store(false, std::sync::atomic::Ordering::Release);
     let mut io = host
         .io
         .lock()
@@ -2915,6 +3145,21 @@ impl Drop for CancelOnDrop {
 
 /// Select the field naming advertised by the executable. Older v1 executables
 /// never advertised this capability and must keep receiving the v1 names.
+// Older executable peers deserialize a closed CompactionReason enum. Project
+// the new automatic reason to their existing threshold value on both transports.
+fn project_overflow_reason(request: &mut ProtocolRequest, supported: bool) {
+    if supported {
+        return;
+    }
+    let reason = match request {
+        ProtocolRequest::BeforeSummaryCompaction { preparation, .. } => &mut preparation.reason,
+        _ => return,
+    };
+    if matches!(*reason, pi_rs_core::CompactionTrigger::Overflow) {
+        *reason = pi_rs_core::CompactionTrigger::Threshold;
+    }
+}
+
 fn wire_request(request: &ProtocolRequest, pi_fields: bool) -> ExtensionResult<Value> {
     let mut value = serde_json::to_value(request).map_err(|error| error.to_string())?;
     if pi_fields {
@@ -2991,9 +3236,10 @@ fn wire_request(request: &ProtocolRequest, pi_fields: bool) -> ExtensionResult<V
 
 fn call<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
-    request: ProtocolRequest,
+    mut request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
+    project_overflow_reason(&mut request, endpoint.compaction_overflow_reason_v1);
     let presence_response = matches!(
         &request,
         ProtocolRequest::ToolResult {
@@ -3286,6 +3532,7 @@ async fn dispatch_inner(
             host_calls: true,
             command_entries: extension.supports_command_entries(),
             command_effects: extension.supports_command_effects(),
+            command_failure_classification_v1: true,
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
             result_presence_v1: true,
@@ -3307,6 +3554,9 @@ async fn dispatch_inner(
             transition_hook_host_calls: true,
             tree_hook_host_calls: true,
             compaction_hook_host_calls: true,
+            before_summary_compaction_v1: extension.handles_before_summary_compaction(),
+            compaction_overflow_reason_v1: true,
+            compaction_lifecycle_v1: true,
             resources_hook_host_calls: true,
             user_bash_hook_host_calls: true,
             user_bash_stream_host_calls: true,
@@ -3445,23 +3695,45 @@ async fn dispatch_inner(
             }
         }
         ProtocolRequest::Lifecycle { event, state } => {
-            if host.supports_custom_messages() {
-                encode(
-                    extension
-                        .lifecycle_with_host(&event, state.as_ref(), host)
-                        .await,
-                )
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .lifecycle_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
             } else {
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
         }
-        ProtocolRequest::DiscoverResources { event, state } => {
-            if host.supports_custom_messages() {
-                encode(
-                    extension
-                        .discover_resources_with_host(&event, state.as_ref(), host)
-                        .await,
+        ProtocolRequest::CompactionLifecycleV1 {
+            event,
+            trigger,
+            metadata,
+            state,
+        } => encode(
+            extension
+                .compaction_lifecycle_with_host(
+                    &event,
+                    trigger,
+                    metadata.as_ref(),
+                    state.as_ref(),
+                    host,
                 )
+                .await,
+        ),
+        ProtocolRequest::DiscoverResources { event, state } => {
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .discover_resources_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
             } else {
                 encode(extension.discover_resources(&event, state.as_ref()).await)
             }
@@ -3488,12 +3760,15 @@ async fn dispatch_inner(
             }
         }
         ProtocolRequest::BeforeSessionTransition { event, state } => {
-            if host.supports_custom_messages() {
-                encode(
-                    extension
-                        .before_session_transition_with_host(&event, state.as_ref(), host)
-                        .await,
-                )
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .before_session_transition_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
             } else {
                 encode(
                     extension
@@ -3682,6 +3957,20 @@ async fn dispatch_inner(
             }
             encode(extension.command_effects(&name, &arguments, state.as_ref()))
         }
+        ProtocolRequest::CommandEffectsClassifiedV1 {
+            name,
+            arguments,
+            state,
+        } => {
+            if !extension.command_names().contains(&name.as_str()) {
+                return Err("unknown extension command".into());
+            }
+            encode(Ok(extension.command_effects_classified(
+                &name,
+                &arguments,
+                state.as_ref(),
+            )))
+        }
         ProtocolRequest::ToolCall {
             name,
             mut arguments,
@@ -3813,6 +4102,11 @@ async fn dispatch_inner(
                 }
             }))
         }
+        ProtocolRequest::BeforeSummaryCompaction { preparation, state } => encode(
+            extension
+                .before_summary_compaction(&preparation, state.as_ref(), host)
+                .await,
+        ),
         ProtocolRequest::BeforeCompaction {
             summary,
             keep_turns,
@@ -3945,6 +4239,208 @@ mod tests {
         }))
         .unwrap();
         assert!(!description.pi_lifecycle_fields);
+        assert!(!description.before_summary_compaction_v1);
+        assert!(!description.compaction_overflow_reason_v1);
+        assert!(!description.compaction_lifecycle_v1);
+    }
+
+    #[tokio::test]
+    async fn detailed_compaction_protocol_preserves_trigger_and_metadata() {
+        use std::sync::Mutex;
+        struct Hook(Arc<Mutex<Option<Value>>>);
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "detailed"
+            }
+            async fn compaction_lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                trigger: pi_rs_core::CompactionTrigger,
+                metadata: Option<&Value>,
+                _: Option<&ExtensionState>,
+                _: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<()> {
+                *self.0.lock().unwrap() =
+                    Some(serde_json::json!({"trigger":trigger,"metadata":metadata}));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let extension: Arc<dyn Extension> = Arc::new(Hook(seen.clone()));
+        let request = ProtocolRequest::CompactionLifecycleV1 {
+            event: LifecycleEvent::SessionCompactFailed {
+                reason: pi_rs_core::CompactionReason::Threshold,
+                error_message: None,
+                aborted: false,
+                will_retry: false,
+                from_extension: true,
+            },
+            trigger: pi_rs_core::CompactionTrigger::Overflow,
+            metadata: Some(serde_json::json!({"details":{"source":"hook"}})),
+            state: None,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        dispatch_with_host(extension, decoded, Arc::new(DetachedHost))
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(
+                serde_json::json!({"trigger":"overflow","metadata":{"details":{"source":"hook"}}})
+            )
+        );
+    }
+
+    #[test]
+    fn overflow_reason_is_negotiated_for_legacy_executables() {
+        for supported in [false, true] {
+            let mut pre = ProtocolRequest::BeforeSummaryCompaction {
+                preparation: pi_rs_core::CompactionPreparation {
+                    branch_entries: vec![],
+                    first_kept_entry: None,
+                    tokens_before: 0,
+                    reason: pi_rs_core::CompactionTrigger::Overflow,
+                    will_retry: true,
+                    custom_instructions: None,
+                },
+                state: None,
+            };
+            project_overflow_reason(&mut pre, supported);
+            let pre = serde_json::to_value(pre).unwrap();
+            assert_eq!(
+                pre["preparation"]["reason"],
+                if supported { "overflow" } else { "threshold" }
+            );
+            assert_eq!(pre["preparation"]["willRetry"], true);
+        }
+    }
+
+    struct PreSummaryFixture;
+    #[async_trait::async_trait]
+    impl Extension for PreSummaryFixture {
+        fn id(&self) -> &str {
+            "pre-summary"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            preparation: &pi_rs_core::CompactionPreparation,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<Option<pi_rs_core::BeforeSummaryCompactionResult>> {
+            assert!(host.tools().is_empty());
+            Ok(Some(pi_rs_core::BeforeSummaryCompactionResult {
+                cancel: false,
+                compaction: Some(pi_rs_core::ExtensionCompaction {
+                    summary: "provided".into(),
+                    first_kept_entry: preparation.first_kept_entry,
+                    tokens_before: preparation.tokens_before,
+                    usage: None,
+                    details: None,
+                }),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_summary_dispatch_advertises_and_returns_hook_result() {
+        let fixture: Arc<dyn Extension> = Arc::new(PreSummaryFixture);
+        let descriptor: Description = serde_json::from_value(
+            dispatch(fixture.clone(), ProtocolRequest::Describe)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(descriptor.before_summary_compaction_v1);
+        assert!(descriptor.compaction_overflow_reason_v1);
+        let result = dispatch_with_host(
+            fixture,
+            ProtocolRequest::BeforeSummaryCompaction {
+                preparation: pi_rs_core::CompactionPreparation {
+                    branch_entries: vec![],
+                    first_kept_entry: Some(8),
+                    tokens_before: 17,
+                    reason: pi_rs_core::CompactionTrigger::Threshold,
+                    will_retry: false,
+                    custom_instructions: None,
+                },
+                state: None,
+            },
+            Arc::new(DetachedHost),
+        )
+        .await
+        .unwrap();
+        let result: Option<pi_rs_core::BeforeSummaryCompactionResult> =
+            serde_json::from_value(result).unwrap();
+        let result = result.unwrap().compaction.unwrap();
+        assert_eq!(result.summary, "provided");
+        assert_eq!(result.first_kept_entry, Some(8));
+        assert_eq!(result.tokens_before, 17);
+    }
+
+    #[tokio::test]
+    async fn legacy_process_is_not_sent_pre_summary_request() {
+        let description: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy", "dependencies":[], "commands":[], "tools":[]
+        }))
+        .unwrap();
+        let extension = ExecutableExtension {
+            description,
+            endpoint: Endpoint {
+                path: PathBuf::from("nonexistent-pre-summary-executable"),
+                flags: None,
+                pi_lifecycle_fields: false,
+                compaction_overflow_reason_v1: false,
+                text_result_v2: false,
+                structured_text_result: false,
+            },
+        };
+        let preparation = pi_rs_core::CompactionPreparation {
+            branch_entries: vec![],
+            first_kept_entry: None,
+            tokens_before: 0,
+            reason: pi_rs_core::CompactionTrigger::Manual,
+            will_retry: false,
+            custom_instructions: None,
+        };
+        assert!(!extension.handles_before_summary_compaction());
+        assert!(
+            extension
+                .before_summary_compaction(&preparation, None, Arc::new(DetachedHost))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pre_summary_request_round_trips_only_with_explicit_capability() {
+        let description: Description = serde_json::from_value(serde_json::json!({
+            "id":"modern", "dependencies":[], "commands":[], "tools":[],
+            "before_summary_compaction_v1":true
+        }))
+        .unwrap();
+        assert!(description.before_summary_compaction_v1);
+        let request = ProtocolRequest::BeforeSummaryCompaction {
+            preparation: pi_rs_core::CompactionPreparation {
+                branch_entries: vec![],
+                first_kept_entry: Some(7),
+                tokens_before: 42,
+                reason: pi_rs_core::CompactionTrigger::Manual,
+                will_retry: false,
+                custom_instructions: Some("instructions".into()),
+            },
+            state: None,
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        let decoded: ProtocolRequest = serde_json::from_value(wire).unwrap();
+        assert!(
+            matches!(decoded, ProtocolRequest::BeforeSummaryCompaction { preparation, .. } if preparation.first_kept_entry == Some(7) && preparation.tokens_before == 42)
+        );
     }
 
     #[test]
@@ -3991,6 +4487,7 @@ mod tests {
         .unwrap();
         assert!(!request.has_progress);
         assert!(!request.has_keyed_messages);
+        assert!(!request.has_custom_entry_read);
         let legacy: DuplexFrame = serde_json::from_value(serde_json::json!({"type":"send_message","message":{"customType":"test","content":"hello","display":false},"delivery":"steer"})).unwrap();
         assert!(matches!(legacy, DuplexFrame::SendMessage { key: None, .. }));
         let keyed = DuplexFrame::SendMessage {
@@ -4224,6 +4721,10 @@ mod tests {
             has_ui: false,
             has_progress: false,
             has_custom_messages: false,
+            has_custom_entries: false,
+            has_custom_entry_read: false,
+            entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            entry_waiting: None,
             has_keyed_messages: false,
             has_prevalidated_calls: false,
             io: Arc::new(std::sync::Mutex::new((
@@ -4243,6 +4744,19 @@ mod tests {
                 .await
                 .unwrap_err(),
             "custom message delivery is unavailable"
+        );
+        assert!(!remote.supports_custom_entries());
+        assert!(!remote.supports_custom_entry_read());
+        assert!(remote.custom_entries(None).await.is_err());
+        assert_eq!(
+            remote
+                .append_entry(pi_rs_core::CustomEntry {
+                    custom_type: "fixture".into(),
+                    data: None
+                })
+                .await
+                .unwrap_err(),
+            "custom entry persistence is unavailable"
         );
     }
 
@@ -5427,6 +5941,164 @@ else:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn executable_discovery_persists_custom_entry_in_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("entry-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    result={'id':'entry-hook','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'resources_hook_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['has_custom_entries'] and frame['has_custom_entry_read'] and frame['request']['type']=='discover_resources'
+    print(json.dumps({'type':'list_custom_entries','custom_type':'fixture'}),flush=True)
+    assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'count':1}
+    print(json.dumps({'type':'append_entry','entry':{'customType':'fixture','data':{'count':7}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'list_custom_entries','custom_type':'fixture'}),flush=True)
+    assert [r['entry']['data']['count'] for r in json.loads(sys.stdin.readline())['Ok']]==[1,7]
+    print(json.dumps({'type':'complete','response':{'Ok':{'skillPaths':[],'promptPaths':[],'themePaths':[]}}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(extension)).unwrap();
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "fixture".into(),
+                data: Some(serde_json::json!({"count":1})),
+            })
+            .unwrap();
+        registry
+            .discover_resources_in_session(
+                &pi_rs_core::ResourceDiscoveryEvent {
+                    cwd: directory.path().into(),
+                    reason: pi_rs_core::ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                Duration::from_secs(5),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        let restored = pi_rs_core::Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "fixture" && entry.data == Some(serde_json::json!({"count":7}))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_transition_reads_and_appends_entry_before_veto() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transition-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    result={'id':'transition-hook','dependencies':[],'commands':[],'tools':[],'session_transition_hook':True,'transition_hook_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['has_custom_entries'] and frame['has_custom_entry_read'] and frame['request']['type']=='before_session_transition'
+    print(json.dumps({'type':'list_custom_entries','custom_type':'transition'}),flush=True)
+    assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'value':1}
+    print(json.dumps({'type':'append_entry','entry':{'customType':'transition','data':{'value':2}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':True}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(extension)).unwrap();
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "transition".into(),
+                data: Some(serde_json::json!({"value":1})),
+            })
+            .unwrap();
+        let entry_id = session.head();
+        let cancelled = registry
+            .session_transition_cancelled_in_session(
+                &pi_rs_core::BeforeSessionTransition::Fork {
+                    entry_id,
+                    position: pi_rs_core::ForkPosition::At,
+                },
+                &mut session,
+                Duration::from_secs(5),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(cancelled);
+        assert!(session.branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "transition" && entry.data == Some(serde_json::json!({"value":2}))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_scoped_sdk_start_reads_and_appends_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        struct UnusedModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for UnusedModel {
+            async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                Err(pi_rs_core::Error::Config("unexpected model request".into()))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request=json.load(sys.stdin)
+    result={'id':'startup-hook','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    if frame['request']['event']['type']=='session_start':
+        assert frame['has_custom_entries'] and frame['has_custom_entry_read']
+        print(json.dumps({'type':'list_custom_entries','custom_type':'startup'}),flush=True)
+        assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'before':True}
+        print(json.dumps({'type':'append_entry','entry':{'customType':'startup','data':{'after':True}}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(UnusedModel), "fixture")
+            .extension(Arc::new(extension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "startup".into(),
+                data: Some(serde_json::json!({"before":true})),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), session.start())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "startup" && entry.data == Some(serde_json::json!({"after":true}))
+        )));
+        session.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn executable_input_request_and_tool_hooks_use_message_channel() {
         use std::os::unix::fs::PermissionsExt;
         struct Host(std::sync::atomic::AtomicUsize);
@@ -5454,7 +6126,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'before_summary_compaction_v1':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -5473,6 +6145,7 @@ else:
     elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
     elif kind=='before_session_transition': result=False
     elif kind=='before_tree': result=None
+    elif kind=='before_summary_compaction': result={'cancel':False,'compaction':{'summary':'supplied','firstKeptEntry':1,'tokensBefore':2,'usage':None,'details':None}}
     elif kind=='before_compaction': result=[r['summary'],r['keep_turns'],{'allow':True,'reason':None}]
     elif kind=='after_compaction': result=None
     elif kind=='before_tool': result={'allow':True,'reason':None}
@@ -5645,6 +6318,23 @@ else:
                 .unwrap()
                 .is_none()
         );
+        let preparation = pi_rs_core::CompactionPreparation {
+            branch_entries: vec![],
+            first_kept_entry: Some(1),
+            tokens_before: 2,
+            reason: pi_rs_core::CompactionTrigger::Manual,
+            will_retry: false,
+            custom_instructions: None,
+        };
+        let supplied = extension
+            .before_summary_compaction(&preparation, None, host.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .compaction
+            .unwrap();
+        assert_eq!(supplied.summary, "supplied");
+        assert_eq!(supplied.first_kept_entry, Some(1));
         let mut compaction = Compaction {
             summary: "summary".into(),
             keep_turns: 1,
@@ -5663,7 +6353,7 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 14);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 15);
     }
 
     #[tokio::test]
@@ -6356,6 +7046,10 @@ else:
             has_ui: false,
             has_progress: false,
             has_custom_messages: false,
+            has_custom_entries: false,
+            has_custom_entry_read: false,
+            entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            entry_waiting: None,
             has_keyed_messages: false,
             has_prevalidated_calls: false,
             io: Arc::new(std::sync::Mutex::new((
@@ -6364,6 +7058,18 @@ else:
             ))),
         };
         assert!(!host.supports_prevalidated_call_accounting());
+        host.has_custom_entries = true;
+        host.entry_lifetime
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!host.supports_custom_entries());
+        assert!(
+            host.append_entry(pi_rs_core::CustomEntry {
+                custom_type: "late".into(),
+                data: None
+            })
+            .await
+            .is_err()
+        );
         host.has_prevalidated_calls = true;
         assert!(host.supports_prevalidated_call_accounting());
         host.has_prevalidated_calls = false;
@@ -6377,6 +7083,62 @@ else:
             results,
             vec![Outcome::Skipped("host cannot account for prevalidated calls".into()); 2]
         );
+    }
+
+    #[tokio::test]
+    async fn executable_entry_waiting_for_transport_is_rejected_after_callback() {
+        let (waiting, seen_waiting) = std::sync::mpsc::channel();
+        let host = Arc::new(RemoteHost {
+            tools: vec![],
+            has_ui: false,
+            has_progress: false,
+            has_custom_messages: false,
+            has_custom_entries: true,
+            has_custom_entry_read: true,
+            entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            entry_waiting: Some(waiting),
+            has_keyed_messages: false,
+            has_prevalidated_calls: false,
+            io: Arc::new(std::sync::Mutex::new((
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            ))),
+        });
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn({
+            let io = host.io.clone();
+            move || {
+                let _guard = io.lock().unwrap();
+                let _ = locked.send(());
+                let _ = released.recv();
+            }
+        });
+        acquired.await.unwrap();
+        let pending = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.append_entry(pi_rs_core::CustomEntry {
+                    custom_type: "late".into(),
+                    data: None,
+                })
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || seen_waiting.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        host.close_custom_entry_scope();
+        release.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        holder.join().unwrap();
     }
 
     #[cfg(unix)]
@@ -6662,6 +7424,66 @@ else:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn classified_command_protocol_preserves_relay_and_legacy_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for classified in [false, true] {
+            let path = root
+                .path()
+                .join(if classified { "new.py" } else { "old.py" });
+            let script = format!(
+                r##"#!/usr/bin/env python3
+import json,sys
+r=json.load(sys.stdin)
+if r['type']=='describe':
+ result={{'Ok':{{'id':'relay','dependencies':[],'commands':['callback','transport'],'tools':[],'command_effects':True,'command_failure_classification_v1':{}}}}}
+elif r['type']=='command_effects_classified_v1':
+ result={{'Ok':{{'Err':{{'Callback' if r['name']=='callback' else 'Transport':'failure'}}}}}}
+elif r['type']=='command_effects': result={{'Err':'legacy failure'}}
+else: result={{'Ok':None}}
+print(json.dumps({{'version':1,'response':result}}))
+"##,
+                if classified { "True" } else { "False" }
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let executable: Arc<dyn Extension> = Arc::new(ExecutableExtension::load(path).unwrap());
+            assert_eq!(
+                executable
+                    .command_effects("callback", "", None)
+                    .unwrap_err(),
+                "legacy failure"
+            );
+            for name in ["callback", "transport"] {
+                let request = ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: name.into(),
+                    arguments: String::new(),
+                    state: None,
+                };
+                let response = dispatch(executable.clone(), request).await.unwrap();
+                let kind = if classified && name == "callback" {
+                    "Callback"
+                } else {
+                    "Transport"
+                };
+                assert!(response["Err"][kind].is_string(), "{response}");
+            }
+            let unknown = dispatch(
+                executable,
+                ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: "unknown".into(),
+                    arguments: String::new(),
+                    state: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(unknown, "unknown extension command");
+        }
+    }
+
+    #[tokio::test]
     async fn command_output_protocol_transports_custom_entries() {
         struct Entries;
         impl Extension for Entries {
@@ -6796,6 +7618,7 @@ else:
         .unwrap();
         assert!(!descriptor.command_entries);
         assert!(!descriptor.command_effects);
+        assert!(!descriptor.command_failure_classification_v1);
         assert!(!descriptor.cache_warming_hook);
         assert!(!descriptor.session_lifecycle_hook);
         assert!(!descriptor.session_transition_reasons);

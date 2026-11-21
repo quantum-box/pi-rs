@@ -56,6 +56,19 @@ pub enum SessionEvent {
     },
 }
 
+/// A configured extension command for native host command pickers.
+/// `source_path` is a lossy UTF-8 rendering suitable for JSON; it is display
+/// metadata and must not be used as a filesystem authorization boundary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SdkRegisteredCommand {
+    pub extension_id: String,
+    pub name: String,
+    pub invocation_name: String,
+    pub description: Option<String>,
+    pub source_path: Option<String>,
+    pub source_kind: crate::ExtensionCommandSourceKind,
+}
+
 /// Result of navigating to a transcript entry through extension hooks.
 #[derive(Clone, Debug)]
 pub struct TreeNavigationResult {
@@ -169,10 +182,22 @@ struct SessionOwner {
 const MAX_IDLE_INPUT_DEPTH: usize = 16;
 
 struct IdleChildRequest {
-    input: crate::AgentInput,
+    action: IdleChildAction,
     reply: tokio::sync::oneshot::Sender<Result<()>>,
     lifetime: CancellationToken,
     gate: Arc<Mutex<()>>,
+}
+
+enum IdleChildAction {
+    Input(crate::AgentInput),
+    AppendEntry(
+        crate::CustomEntry,
+        tokio::sync::oneshot::Sender<crate::ExtensionResult<()>>,
+    ),
+    ReadEntries(
+        Option<String>,
+        tokio::sync::oneshot::Sender<crate::ExtensionResult<Vec<crate::CustomEntryRecord>>>,
+    ),
 }
 
 #[derive(Clone)]
@@ -193,10 +218,14 @@ tokio::task_local! {
 
 impl IdleInputScope {
     async fn submit(&self, input: crate::AgentInput) -> Result<()> {
+        self.submit_action(IdleChildAction::Input(input)).await
+    }
+
+    async fn submit_action(&self, action: IdleChildAction) -> Result<()> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         self.children
             .send(IdleChildRequest {
-                input,
+                action,
                 reply,
                 lifetime: self.lifetime.clone(),
                 gate: self.gate.clone(),
@@ -220,6 +249,41 @@ struct ScopedIdleHost {
 
 #[async_trait::async_trait]
 impl crate::ToolHost for ScopedIdleHost {
+    fn supports_custom_entries(&self) -> bool {
+        !self.scope.lifetime.is_cancelled()
+            && !self.scope.cancellation.is_cancelled()
+            && !self.scope.owner.closed.is_cancelled()
+    }
+    fn supports_custom_entry_read(&self) -> bool {
+        self.supports_custom_entries()
+    }
+    async fn append_entry(&self, entry: crate::CustomEntry) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_entry(&entry).map_err(|error| error.to_string())?;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.scope
+            .submit_action(IdleChildAction::AppendEntry(entry, reply))
+            .await
+            .map_err(|error| error.to_string())?;
+        result
+            .await
+            .map_err(|_| "custom entry response lost".to_owned())?
+    }
+    async fn custom_entries(
+        &self,
+        custom_type: Option<&str>,
+    ) -> crate::ExtensionResult<Vec<crate::CustomEntryRecord>> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.scope
+            .submit_action(IdleChildAction::ReadEntries(
+                custom_type.map(str::to_owned),
+                reply,
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        result
+            .await
+            .map_err(|_| "custom entry response lost".to_owned())?
+    }
     fn supports_prevalidated_call_accounting(&self) -> bool {
         !self.scope.lifetime.is_cancelled() && self.inner.supports_prevalidated_call_accounting()
     }
@@ -749,6 +813,24 @@ impl SessionControl {
                 })?;
             config.model = Arc::downgrade(&model);
             config.model_name = name;
+        } else {
+            let config = self.owner.config.lock().expect("run config");
+            let registry = config
+                .registry
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            let cached = config
+                .model
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            if !branch_client(&registry, journal.session_id(), None, &config.model_name)
+                .is_some_and(|client| Arc::ptr_eq(&client, &cached))
+            {
+                return Err(Error::Config(format!(
+                    "session branch requires registered model {}",
+                    config.model_name
+                )));
+            }
         }
         let startup = self
             .owner
@@ -1350,6 +1432,10 @@ impl SessionBuilder {
         let guarded = resolved
             .as_ref()
             .map(|(provider, name, client)| (provider.as_str(), name.as_str(), client));
+        // A request-only journal does not carry a provider. Record the initial
+        // qualified choice before its first request, while leaving existing
+        // historical selections (including unqualified ones) untouched.
+        let initial_selection = session.model_identity_at(session.head()).is_none();
         let (_, _revoked) = self.registry.commit_session_model_bindings(
             session.session_id(),
             bindings,
@@ -1357,14 +1443,36 @@ impl SessionBuilder {
             || {
                 if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
                     session.select_provider_model_atomic(provider, name)?;
+                } else if initial_selection && let Some(provider) = &self.model_provider {
+                    session.select_provider_model_atomic(provider, &self.model_name)?;
                 }
                 Ok(())
             },
         )?;
-        if let Some((_, name, client)) = resolved {
+        if let Some((provider, name, client)) = resolved {
             self.model = client;
             self.model_name = name;
+            self.model_provider = Some(provider);
         }
+        // Registered historical models must be active even before startup
+        // hooks run: synchronous checkout and fork can be called immediately.
+        let model_identity_resolved = match session.model_identity_at(session.head()) {
+            Some((provider, name, _)) => match branch_client(
+                &self.registry,
+                session.session_id(),
+                provider.as_deref(),
+                &name,
+            ) {
+                Some(client) => {
+                    self.model = client;
+                    self.model_name = name;
+                    self.model_provider = provider;
+                    true
+                }
+                None => false,
+            },
+            None => true,
+        };
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
@@ -1394,6 +1502,8 @@ impl SessionBuilder {
         Ok(AgentSession {
             model: self.model,
             model_name: self.model_name,
+            model_provider: self.model_provider,
+            model_identity_resolved,
             system_prompt: self.system_prompt,
             registry,
             limits: self.limits,
@@ -1428,6 +1538,8 @@ impl SessionBuilder {
 pub struct AgentSession {
     model: Arc<dyn Model>,
     model_name: String,
+    model_provider: Option<String>,
+    model_identity_resolved: bool,
     system_prompt: String,
     registry: Arc<Registry>,
     limits: Limits,
@@ -1446,6 +1558,21 @@ pub struct AgentSession {
 #[derive(Clone)]
 enum BranchResolution {
     Registered,
+    Legacy {
+        model: String,
+        client: Arc<dyn Model>,
+        inherited: bool,
+    },
+    Existing {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
+    Inherited {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
     Historical {
         provider: String,
         model: String,
@@ -1466,10 +1593,88 @@ impl AgentSession {
     }
     fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
         let Some((provider, name, _)) = journal.model_identity_at(target) else {
-            return Ok(BranchResolution::Registered);
+            let current = if journal.session_id() == self.session_id {
+                journal.model_identity_at(journal.head())
+            } else {
+                let source = self.journal()?;
+                source.model_identity_at(source.head())
+            };
+            if let Some((Some(provider), name, _)) = &current {
+                let client = branch_client(&self.registry, self.session_id, Some(provider), name)
+                    .ok_or_else(|| {
+                    Error::Config(format!("session branch requires registered model {name}"))
+                })?;
+                return Ok(BranchResolution::Inherited {
+                    provider: provider.clone(),
+                    model: name.clone(),
+                    client,
+                });
+            }
+            if let Some((None, name, _)) = &current {
+                let client = branch_client(&self.registry, self.session_id, None, name)
+                    .ok_or_else(|| {
+                        Error::Config(format!("session branch requires registered model {name}"))
+                    })?;
+                return Ok(BranchResolution::Legacy {
+                    model: name.clone(),
+                    client,
+                    inherited: true,
+                });
+            }
+            if !self.model_identity_resolved {
+                return Err(Error::Config(
+                    "current session model is not registered".into(),
+                ));
+            }
+            if let Some(provider) = &self.model_provider {
+                let client = branch_client(
+                    &self.registry,
+                    self.session_id,
+                    Some(provider),
+                    &self.model_name,
+                )
+                .filter(|client| Arc::ptr_eq(client, &self.model))
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "session branch requires registered model {}",
+                        self.model_name
+                    ))
+                })?;
+                return Ok(BranchResolution::Inherited {
+                    provider: provider.clone(),
+                    model: self.model_name.clone(),
+                    client,
+                });
+            }
+            let client = branch_client(&self.registry, self.session_id, None, &self.model_name)
+                .filter(|client| Arc::ptr_eq(client, &self.model))
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "session branch requires registered model {}",
+                        self.model_name
+                    ))
+                })?;
+            return Ok(BranchResolution::Legacy {
+                model: self.model_name.clone(),
+                client,
+                inherited: true,
+            });
         };
-        if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some() {
-            return Ok(BranchResolution::Registered);
+        if let Some(client) =
+            branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+        {
+            return Ok(match provider {
+                Some(provider) => BranchResolution::Existing {
+                    provider,
+                    model: name,
+                    client,
+                },
+                None => BranchResolution::Legacy {
+                    model: name,
+                    client,
+                    inherited: false,
+                },
+            });
         }
         if let (Some(provider), Some(resolver)) = (provider, &self.historical_model_resolver) {
             return match resolver.resolve(&provider, &name)? {
@@ -1513,6 +1718,8 @@ impl AgentSession {
             })?;
         self.model = model;
         self.model_name = name;
+        self.model_provider = provider.map(str::to_owned);
+        self.model_identity_resolved = true;
         self.refresh_run_config();
         Ok(())
     }
@@ -1591,6 +1798,44 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+    /// Inspect configured extension commands, including collision-resolved
+    /// invocation names and extension provenance. Prompt templates, skills and
+    /// built-in host commands remain the host's responsibility. Per-request
+    /// registry refreshes are not reflected in this configured snapshot.
+    pub fn registered_commands(&self) -> Vec<SdkRegisteredCommand> {
+        self.registry
+            .registered_commands()
+            .into_iter()
+            .map(|command| SdkRegisteredCommand {
+                extension_id: command.extension_id,
+                name: command.name,
+                invocation_name: command.invocation_name,
+                description: command.description,
+                source_path: command
+                    .source_path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                source_kind: command.source_kind,
+            })
+            .collect()
+    }
+
+    /// Execute a collision-resolved invocation returned by `registered_commands`.
+    /// Unlike Pi's `prompt`, native `prompt` does not dispatch slash commands;
+    /// hosts explicitly route commands through this method.
+    pub async fn invoke_registered_command(
+        &mut self,
+        invocation: &str,
+        arguments: &str,
+    ) -> Result<Option<String>> {
+        let command = self
+            .registry
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.invocation_name == invocation)
+            .ok_or_else(|| Error::Config("extension command is not registered".into()))?;
+        self.extension_command_and_run(&command.extension_id, &command.name, arguments)
+            .await
+    }
     pub fn pending_inputs(&self) -> Result<usize> {
         let input = self
             .input
@@ -1665,6 +1910,33 @@ impl AgentSession {
         &self.model_name
     }
 
+    /// Provider of the selected runtime model. Legacy provider-less selections
+    /// return `None`. Returns an error if the journal is busy, the historical
+    /// model or client binding is unavailable, or direct journal changes have
+    /// not been reconciled. This is a point-in-time check, not an authorization grant.
+    pub fn model_provider(&self) -> Result<Option<&str>> {
+        let journal = self.journal()?;
+        let matches_selection =
+            journal
+                .model_identity_at(journal.head())
+                .is_none_or(|(provider, name, _)| {
+                    provider.as_deref() == self.model_provider.as_deref() && name == self.model_name
+                });
+        let registered = branch_client(
+            &self.registry,
+            self.session_id,
+            self.model_provider.as_deref(),
+            &self.model_name,
+        )
+        .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
+        if !self.model_identity_resolved || !matches_selection || !registered {
+            return Err(Error::Config(
+                "current session model is not registered or reconciled".into(),
+            ));
+        }
+        Ok(self.model_provider.as_deref())
+    }
+
     /// Supply a client for a historical model name in this session.
     pub fn register_branch_model(
         &self,
@@ -1726,7 +1998,18 @@ impl AgentSession {
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
         let count = journal.records().len();
-        journal.select_provider_model(provider, &name, None)?;
+        let replaces_selected_client =
+            journal.model_identity_at(journal.head()).is_some_and(
+                |(selected_provider, selected_name, _)| {
+                    selected_provider.as_deref() == provider && selected_name == name
+                },
+            ) && branch_client(&self.registry, self.session_id, provider, &name)
+                .is_some_and(|existing| !Arc::ptr_eq(&existing, &model));
+        if replaces_selected_client && let Some(provider) = provider {
+            journal.select_provider_model_atomic(provider, &name)?;
+        } else {
+            journal.select_provider_model(provider, &name, None)?;
+        }
         if let Some(provider) = provider {
             self.registry.register_session_provider_model(
                 self.session_id,
@@ -1748,6 +2031,8 @@ impl AgentSession {
         }
         self.model = model;
         self.model_name = name;
+        self.model_provider = provider.map(str::to_owned);
+        self.model_identity_resolved = true;
         self.refresh_run_config();
         Ok(())
     }
@@ -1774,7 +2059,11 @@ impl AgentSession {
             None => None,
         };
         let (fallback_previous, startup_error) = self
-            .start_with_fallback(Some((model.clone(), provider.clone(), name.clone())))
+            .start_with_fallback(
+                Some((model.clone(), provider.clone(), name.clone())),
+                true,
+                false,
+            )
             .await?;
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
             Some(previous) => previous,
@@ -1844,6 +2133,14 @@ impl AgentSession {
         }
         Ok(())
     }
+    /// The host-configured base prompt used when preparing future requests.
+    /// Extension context hooks can change the actual prompt for each request;
+    /// this accessor does not execute hooks or report their effective output.
+    /// Forks copy the configured value and can subsequently change it independently.
+    pub fn configured_system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         self.system_prompt = prompt.into();
@@ -1878,6 +2175,46 @@ impl AgentSession {
                 .try_lock()
                 .map_err(|_| Error::Session("session journal is in use".into()))?;
             let revoked = match &resolution {
+                BranchResolution::Legacy { model, client, .. } => {
+                    self.registry
+                        .commit_existing_legacy_model(
+                            self.session_id,
+                            model,
+                            client.clone(),
+                            || journal.checkout(record),
+                        )?
+                        .1
+                }
+                BranchResolution::Existing {
+                    provider,
+                    model,
+                    client,
+                } => {
+                    self.registry
+                        .commit_existing_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout(record),
+                        )?
+                        .1
+                }
+                BranchResolution::Inherited {
+                    provider,
+                    model,
+                    client,
+                } => {
+                    self.registry
+                        .commit_existing_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout_provider_model_atomic(record, provider, model),
+                        )?
+                        .1
+                }
                 BranchResolution::Fallback {
                     provider,
                     model,
@@ -1921,8 +2258,24 @@ impl AgentSession {
                 InputHooks::new(&self.registry, &journal),
             )
         };
+        if !revoked
+            && let BranchResolution::Legacy {
+                model,
+                client,
+                inherited: true,
+            } = &resolution
+        {
+            self.model = client.clone();
+            self.model_name = model.clone();
+            self.model_provider = None;
+            self.model_identity_resolved = true;
+            self.refresh_run_config();
+        }
         match resolution {
-            BranchResolution::Historical { .. } => {
+            BranchResolution::Legacy { .. }
+            | BranchResolution::Historical { .. }
+            | BranchResolution::Inherited { .. }
+            | BranchResolution::Existing { .. } => {
                 self.model_fallback = None;
             }
             BranchResolution::Fallback {
@@ -1949,6 +2302,8 @@ impl AgentSession {
         {
             self.model = client;
             self.model_name = model;
+            self.model_provider = provider;
+            self.model_identity_resolved = true;
             self.refresh_run_config();
         }
         emit(
@@ -1966,12 +2321,14 @@ impl AgentSession {
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
         self.ensure_open()?;
-        let (initial_target, mut resolution) = {
+        let (initial_target, initial_resolution) = {
             let journal = self.session.lock().await;
             let target = journal.tree_navigation_target(selected)?;
             let resolution = match target {
-                Some(target) => self.resolve_branch_model(&journal, target)?,
-                None => BranchResolution::Registered,
+                Some(target) if journal.model_identity_at(target).is_some() => {
+                    Some(self.resolve_branch_model(&journal, target)?)
+                }
+                _ => None,
             };
             (target, resolution)
         };
@@ -1979,12 +2336,13 @@ impl AgentSession {
         let session = self.session.clone();
         let mut journal = session.lock().await;
         let target = journal.tree_navigation_target(selected)?;
-        if target != initial_target {
-            resolution = match target {
+        let resolution = match (target == initial_target, initial_resolution) {
+            (true, Some(resolution)) => resolution,
+            _ => match target {
                 Some(target) => self.resolve_branch_model(&journal, target)?,
                 None => BranchResolution::Registered,
-            };
-        }
+            },
+        };
         let first_record = journal.records().len();
         let editor_text = {
             journal
@@ -2016,6 +2374,43 @@ impl AgentSession {
         let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tree_resolution = match &resolution {
             BranchResolution::Registered => None,
+            BranchResolution::Legacy { model, client, .. } => {
+                Some(crate::agent::TreeModelResolution {
+                    provider: String::new(),
+                    model: model.clone(),
+                    client: client.clone(),
+                    fallback: false,
+                    require_existing: true,
+                    legacy: true,
+                    revoked: revoked.clone(),
+                })
+            }
+            BranchResolution::Existing {
+                provider,
+                model,
+                client,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: false,
+                require_existing: true,
+                legacy: false,
+                revoked: revoked.clone(),
+            }),
+            BranchResolution::Inherited {
+                provider,
+                model,
+                client,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: true,
+                require_existing: true,
+                legacy: false,
+                revoked: revoked.clone(),
+            }),
             BranchResolution::Historical {
                 provider,
                 model,
@@ -2025,6 +2420,8 @@ impl AgentSession {
                 model: model.clone(),
                 client: client.clone(),
                 fallback: false,
+                require_existing: false,
+                legacy: false,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Fallback {
@@ -2037,6 +2434,8 @@ impl AgentSession {
                 model: model.clone(),
                 client: client.clone(),
                 fallback: true,
+                require_existing: false,
+                legacy: false,
                 revoked: revoked.clone(),
             }),
         };
@@ -2074,6 +2473,20 @@ impl AgentSession {
                 } else if restored.is_err() {
                     revoked.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+            }
+            if !revoked.load(std::sync::atomic::Ordering::SeqCst)
+                && journal.model_identity_at(journal.head()).is_none()
+                && let BranchResolution::Legacy {
+                    model,
+                    client,
+                    inherited: true,
+                } = &resolution
+            {
+                self.model = client.clone();
+                self.model_name = model.clone();
+                self.model_provider = None;
+                self.model_identity_resolved = true;
+                self.refresh_run_config();
             }
             self.model_fallback = match resolution {
                 BranchResolution::Fallback {
@@ -2137,7 +2550,7 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        let (_, error) = self.start_with_fallback(None).await?;
+        let (_, error) = self.start_with_fallback(None, true, false).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -2147,11 +2560,18 @@ impl AgentSession {
     async fn start_with_fallback(
         &mut self,
         fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
+        drain_triggers: bool,
+        defer_startup: bool,
     ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
+        if !defer_startup && crate::agent::resumable_compaction_run(&journal).is_some() {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before startup".into(),
+            ));
+        }
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
             if let Some(events) = &self.events {
@@ -2161,8 +2581,17 @@ impl AgentSession {
                 InputHooks::new(&self.registry, &journal);
         }
         let mut replaced = None;
-        if let Some((provider, name, level)) = journal.model_identity_at(journal.head()) {
-            if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some()
+        let selected = journal.model_identity_at(journal.head());
+        let missing_legacy = selected.is_none()
+            && self.model_provider.is_none()
+            && !branch_client(&self.registry, self.session_id, None, &self.model_name)
+                .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
+        let current =
+            selected.or_else(|| missing_legacy.then(|| (None, self.model_name.clone(), None)));
+        if let Some((provider, name, level)) = current {
+            if !missing_legacy
+                && branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+                    .is_some()
             {
                 self.restore_branch_model(provider.as_deref(), name)?;
             } else if let Some((model, replacement_provider, replacement)) = fallback {
@@ -2196,13 +2625,23 @@ impl AgentSession {
                 }
                 self.model = model;
                 self.model_name = replacement;
+                self.model_provider = replacement_provider;
+                self.model_identity_resolved = true;
                 self.refresh_run_config();
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
-            } else {
+            } else if !missing_legacy {
                 self.restore_branch_model(provider.as_deref(), name)?;
+            } else {
+                return Err(Error::Config(format!(
+                    "session branch requires registered model {name}"
+                )));
             }
         }
-        let startup = self.pending_start.lock().expect("session startup").take();
+        let startup = if defer_startup {
+            None
+        } else {
+            self.pending_start.lock().expect("session startup").take()
+        };
         let startup_result = if let Some((reason, previous_session_file)) = startup {
             let active = self.begin_run();
             let events = self.events.as_ref().expect("open session").clone();
@@ -2225,7 +2664,8 @@ impl AgentSession {
         drop(journal);
         drop(order);
         let startup_result = match startup_result {
-            Ok(()) => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) if drain_triggers => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
         match startup_result {
@@ -2393,7 +2833,7 @@ impl AgentSession {
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let session = Session::from_records(self.journal()?.fork_records_after_handoff(record)?)?;
+        let session = self.journal()?.fork_session_after_handoff(record)?;
         let resolution = self.resolve_branch_model(&session, session.head())?;
         self.fork_snapshot(session, resolution)
     }
@@ -2405,16 +2845,54 @@ impl AgentSession {
         {
             session.select_provider_model_atomic(provider, model)?;
         }
+        if let BranchResolution::Legacy { model, client, .. } = &resolution {
+            let (fork, revoked) = self.registry.commit_existing_legacy_model(
+                self.session_id,
+                model,
+                client.clone(),
+                || self.fork_session(session, resolution.clone()),
+            )?;
+            if revoked {
+                return Err(Error::Config(
+                    "model client was revoked while preparing fork".into(),
+                ));
+            }
+            return Ok(fork);
+        }
+        if let BranchResolution::Inherited {
+            provider,
+            model,
+            client,
+        }
+        | BranchResolution::Existing {
+            provider,
+            model,
+            client,
+        } = &resolution
+        {
+            let (fork, revoked) = self.registry.commit_existing_session_model(
+                self.session_id,
+                provider,
+                model,
+                client.clone(),
+                || self.fork_session(session, resolution.clone()),
+            )?;
+            if revoked {
+                return Err(Error::Config(
+                    "model client was revoked while preparing fork".into(),
+                ));
+            }
+            return Ok(fork);
+        }
         self.fork_session(session, resolution)
     }
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
         let journal = self.journal()?;
-        let records = journal.fork_records_after_handoff(record)?;
-        let snapshot = Session::from_records(records)?;
-        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
+        let snapshot = journal.fork_session_after_handoff(record)?;
         drop(journal);
+        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         self.fork_snapshot_to(snapshot, resolution, &destination)
     }
 
@@ -2458,9 +2936,13 @@ impl AgentSession {
             }
         };
         let target = journal.fork_target_after_handoff(target)?;
-        let snapshot = Session::from_records(journal.fork_records_after_handoff(target)?)?;
-        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
+        let snapshot = journal.fork_session_after_handoff(target)?;
         drop(journal);
+        let initial_resolution = if snapshot.model_identity_at(snapshot.head()).is_some() {
+            Some(self.resolve_branch_model(&snapshot, snapshot.head())?)
+        } else {
+            None
+        };
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
             let events = self.events.as_ref().expect("open session");
@@ -2482,7 +2964,11 @@ impl AgentSession {
                 return Err(Error::Cancelled);
             }
         }
-        let snapshot = Session::from_records(self.journal()?.fork_records_after_handoff(target)?)?;
+        let snapshot = self.journal()?.fork_session_after_handoff(target)?;
+        let resolution = match initial_resolution {
+            Some(resolution) => resolution,
+            None => self.resolve_branch_model(&snapshot, snapshot.head())?,
+        };
         match destination {
             Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
             None => self.fork_snapshot(snapshot, resolution),
@@ -2506,7 +2992,10 @@ impl AgentSession {
         let selection = session.model_identity_at(session.head());
         let (provider, model_name, model) = if let Some((provider, name, _)) = selection {
             let model = match &resolution {
-                BranchResolution::Historical { client, .. }
+                BranchResolution::Legacy { client, .. }
+                | BranchResolution::Existing { client, .. }
+                | BranchResolution::Inherited { client, .. }
+                | BranchResolution::Historical { client, .. }
                 | BranchResolution::Fallback { client, .. } => Some(client.clone()),
                 BranchResolution::Registered => {
                     branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
@@ -2517,7 +3006,23 @@ impl AgentSession {
             })?;
             (provider, name, model)
         } else {
-            (None, self.model_name.clone(), self.model.clone())
+            // A fork before the first model selection still uses the source's
+            // active client. Preserve its qualified identity when it is known.
+            match &resolution {
+                BranchResolution::Legacy { model, client, .. } => {
+                    (None, model.clone(), client.clone())
+                }
+                BranchResolution::Inherited {
+                    provider,
+                    model,
+                    client,
+                } => (Some(provider.clone()), model.clone(), client.clone()),
+                _ => (
+                    self.model_provider.clone(),
+                    self.model_name.clone(),
+                    self.model.clone(),
+                ),
+            }
         };
         session
             .auto_compaction_control()
@@ -2549,7 +3054,17 @@ impl AgentSession {
         );
         fork.registry = self.registry.clone();
         match resolution {
-            BranchResolution::Historical {
+            BranchResolution::Existing {
+                provider,
+                model,
+                client,
+            }
+            | BranchResolution::Inherited {
+                provider,
+                model,
+                client,
+            }
+            | BranchResolution::Historical {
                 provider,
                 model,
                 client,
@@ -2593,7 +3108,7 @@ impl AgentSession {
                     model,
                 });
             }
-            BranchResolution::Registered => {}
+            BranchResolution::Legacy { .. } | BranchResolution::Registered => {}
         }
         fork.historical_model_resolver = self.historical_model_resolver.clone();
         fork.refresh_run_config();
@@ -2604,8 +3119,15 @@ impl AgentSession {
     }
 
     pub async fn prompt(&mut self, input: impl Into<String>) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, &mut |_| {})
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
     }
     /// Submit text and images as one durable user message.
     pub async fn prompt_with_images(
@@ -2618,6 +3140,7 @@ impl AgentSession {
             Some(images),
             Uuid::new_v4(),
             true,
+            false,
             &mut |_| {},
         )
         .await
@@ -2627,11 +3150,79 @@ impl AgentSession {
         input: impl Into<String>,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, observer)
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            observer,
+        )
+        .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        self.run(None, Uuid::new_v4(), &mut |_| {}).await
+        let recovery = {
+            let journal = self.journal_async().await;
+            crate::agent::resumable_compaction_run(&journal)
+        };
+        let (_, startup_error) = self
+            .start_with_fallback(None, false, recovery.is_some())
+            .await?;
+        if let Some(error) = startup_error {
+            return Err(error);
+        }
+        if recovery.as_ref().is_some_and(|(_, model, _)| {
+            model
+                .as_ref()
+                .is_some_and(|model| model != &self.model_name)
+        }) {
+            return Err(Error::Session(
+                "pending compaction recovery requires its original model".into(),
+            ));
+        }
+        if let Some((run_id, _, _)) = recovery.as_ref()
+            && !self.registry.extensions.is_empty()
+        {
+            let journal = self.journal_async().await;
+            let agent = Agent {
+                model: self.model.as_ref(),
+                model_name: &self.model_name,
+                registry: &self.registry,
+                system_prompt: &self.system_prompt,
+                limits: self.limits.clone(),
+            };
+            agent
+                .settle_recovery_before_hooks(&journal, *run_id)
+                .await?;
+            return Err(Error::Session(
+                "pending compaction recovery requires reconciliation after extensions changed"
+                    .into(),
+            ));
+        }
+        let run_id = recovery.map(|(run_id, _, _)| run_id);
+        if run_id.is_none() {
+            self.drain_idle_triggers().await?;
+        }
+        let result = self
+            .run_input(
+                None,
+                None,
+                run_id.unwrap_or_else(Uuid::new_v4),
+                false,
+                true,
+                &mut |_| {},
+            )
+            .await;
+        if result.is_ok() && run_id.is_some() {
+            let unresolved = {
+                let journal = self.journal_async().await;
+                crate::agent::resumable_compaction_run(&journal).is_some()
+            };
+            if !unresolved {
+                self.start().await?;
+            }
+        }
+        result
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
     pub async fn run(
@@ -2640,17 +3231,59 @@ impl AgentSession {
         run_id: Uuid,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(input, None, run_id, false, observer).await
+        self.run_input(input, None, run_id, false, false, observer)
+            .await
     }
+    /// Run with ordered provider text and reasoning item events.
+    pub async fn run_with_events(
+        &mut self,
+        input: Option<String>,
+        run_id: Uuid,
+        observer: &mut crate::AgentObserver<'_>,
+    ) -> Result<String> {
+        self.run_input_with_events(input, None, run_id, false, false, observer)
+            .await
+    }
+
     async fn run_input(
+        &mut self,
+        input: Option<String>,
+        images: Option<Vec<crate::ImageContent>>,
+        run_id: Uuid,
+        prepare: bool,
+        already_started: bool,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        let mut adapter = |event: crate::AgentEvent<'_>| match event {
+            crate::AgentEvent::Notification(event) => observer(event),
+            crate::AgentEvent::TextDelta { delta, .. } => observer(Notification::Text(delta)),
+            crate::AgentEvent::ReasoningDelta { delta, .. } => {
+                observer(Notification::Reasoning(delta))
+            }
+            _ => {}
+        };
+        self.run_input_with_events(
+            input,
+            images,
+            run_id,
+            prepare,
+            already_started,
+            &mut adapter,
+        )
+        .await
+    }
+    async fn run_input_with_events(
         &mut self,
         mut input: Option<String>,
         mut images: Option<Vec<crate::ImageContent>>,
         run_id: Uuid,
         prepare: bool,
-        observer: &mut Observer<'_>,
+        already_started: bool,
+        observer: &mut crate::AgentObserver<'_>,
     ) -> Result<String> {
-        self.start().await?;
+        if !already_started {
+            self.start().await?;
+        }
         let journal_owner = self
             .control
             .owner
@@ -2667,10 +3300,26 @@ impl AgentSession {
         let mut input_queue = input_owner.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
-        let mut observe = |event: Notification<'_>| {
-            self.control.observe(&event);
-            emit(&events, &event);
+        let observe_event = std::sync::Mutex::new(|event: crate::AgentEvent<'_>| {
+            match &event {
+                crate::AgentEvent::Notification(notification) => {
+                    self.control.observe(notification);
+                    emit(&events, notification);
+                }
+                crate::AgentEvent::TextDelta { delta, .. } => {
+                    emit(&events, &Notification::Text(delta))
+                }
+                crate::AgentEvent::ReasoningDelta { delta, .. } => {
+                    emit(&events, &Notification::Reasoning(delta))
+                }
+                _ => {}
+            }
             observer(event);
+        });
+        let mut observe = |event: Notification<'_>| {
+            (observe_event.lock().expect("agent event observer"))(crate::AgentEvent::Notification(
+                event,
+            ))
         };
         let config = self
             .control
@@ -2714,13 +3363,15 @@ impl AgentSession {
                 let pending_trigger = journal.pending_custom_trigger();
                 if let Some(trigger_id) = pending_trigger {
                     agent
-                        .run_correlated(
+                        .run_correlated_with_events(
                             &mut journal,
                             trigger_id,
                             None,
                             &mut input_queue,
                             &active.token,
-                            &mut observe,
+                            &mut |event: crate::AgentEvent<'_>| {
+                                (observe_event.lock().expect("agent event observer"))(event)
+                            },
                         )
                         .await?;
                 }
@@ -2744,13 +3395,15 @@ impl AgentSession {
                 ));
             }
             agent
-                .run_correlated(
+                .run_correlated_with_events(
                     &mut journal,
                     run_id,
                     input,
                     &mut input_queue,
                     &active.token,
-                    &mut observe,
+                    &mut |event: crate::AgentEvent<'_>| {
+                        (observe_event.lock().expect("agent event observer"))(event)
+                    },
                 )
                 .await
         }
@@ -3091,10 +3744,28 @@ where
         gate: scope.gate.clone(),
     };
     tokio::pin!(future);
+    let mut entry_error = None;
+    enum Work {
+        Message(
+            crate::QueuedCustomMessage,
+            tokio::sync::oneshot::Sender<crate::ExtensionResult<()>>,
+        ),
+        Child(IdleChildRequest),
+    }
     loop {
         tokio::select! {
             biased;
-            Some((input, reply)) = incoming.recv() => {
+            _ = closed.cancelled() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
+            _ = scope.cancellation.cancelled() => return Err(entry_error.take().unwrap_or(Error::Cancelled)),
+            result = &mut future => return match entry_error { Some(error) => Err(error), None => result },
+            work = async {
+                tokio::select! {
+                    Some((message, reply)) = incoming.recv() => Work::Message(message, reply),
+                    Some(child) = children.recv() => Work::Child(child),
+                    else => std::future::pending().await,
+                }
+            } => match work {
+            Work::Message(input, reply) => {
                 let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
                     crate::agent::queue_custom_message(journal, input, observer)
                 } else {
@@ -3105,19 +3776,53 @@ where
                     Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
                 }
             }
-            Some(child) = children.recv() => {
+            Work::Child(child) => {
                 if child.reply.is_closed() { continue; }
-                let _guard = child.gate.lock().expect("idle scope gate");
+                let guard = child.gate.lock().expect("idle scope gate");
                 if child.lifetime.is_cancelled() || scope.cancellation.is_cancelled() || closed.is_cancelled() {
                     let _ = child.reply.send(Err(Error::Cancelled));
                     continue;
                 }
-                let result = child.input.apply(journal, observer);
-                let _ = child.reply.send(result);
-            }
-            _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
-            _ = scope.cancellation.cancelled() => return Err(Error::Cancelled),
-            result = &mut future => return result,
+                match child.action {
+                    IdleChildAction::Input(input) => {
+                        let result = input.apply(journal, observer);
+                        let _ = child.reply.send(result);
+                    }
+                    IdleChildAction::AppendEntry(entry, reply) => {
+                        if reply.is_closed() { let _ = child.reply.send(Ok(())); continue; }
+                        if let Err(error) = journal.ensure_settled() {
+                            let _ = reply.send(Err(error.to_string()));
+                            let _ = child.reply.send(Ok(()));
+                            continue;
+                        }
+                        let result = journal.append_custom_entry(entry).map(|()| observer(Notification::Committed(journal.records().last().expect("appended custom entry"))));
+                        match result {
+                            Ok(()) => { let _ = reply.send(Ok(())); let _ = child.reply.send(Ok(())); }
+                            Err(error) => {
+                                let _ = reply.send(Err(error.to_string()));
+                                let _ = child.reply.send(Ok(()));
+                                if entry_error.is_none() { entry_error = Some(error); }
+                            }
+                        }
+                    }
+                    IdleChildAction::ReadEntries(custom_type, mut reply) => {
+                        drop(guard);
+                        if reply.is_closed() { let _ = child.reply.send(Ok(())); continue; }
+                        tokio::select! {
+                            biased;
+                            _ = closed.cancelled() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
+                            _ = scope.cancellation.cancelled() => return Err(entry_error.take().unwrap_or(Error::Cancelled)),
+                            result = &mut future => return match entry_error { Some(error) => Err(error), None => result },
+                            _ = child.lifetime.cancelled() => { let _ = child.reply.send(Err(Error::Cancelled)); },
+                            _ = reply.closed() => { let _ = child.reply.send(Ok(())); },
+                            records = crate::extension::branch_custom_entries(journal, custom_type.as_deref()) => {
+                                let _ = reply.send(records);
+                                let _ = child.reply.send(Ok(()));
+                            }
+                        }
+                    }
+                }
+            }}
         }
     }
 }
@@ -3244,7 +3949,18 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         },
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
-        Notification::Reasoning(text) => SessionEvent::Reasoning((*text).into()),
+        Notification::Reasoning(text) => {
+            if matches!(
+                crate::reasoning_event_metadata(),
+                Some(
+                    crate::ReasoningEventMetadata::Start { .. }
+                        | crate::ReasoningEventMetadata::End { .. }
+                )
+            ) {
+                return;
+            }
+            SessionEvent::Reasoning((*text).into())
+        }
         Notification::ToolCallDelta(delta) => SessionEvent::ToolCallDelta((*delta).clone()),
         Notification::ExtensionLifecycleError {
             extension,
@@ -3460,6 +4176,24 @@ mod tests {
         assert!(after_shutdown.token.is_cancelled());
         drop(after_shutdown);
         assert!(session.prompt("after shutdown").await.is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_prompt_tracks_changes_and_forks_independently() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .system_prompt("initial")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.configured_system_prompt(), "initial");
+        session.set_system_prompt("updated").unwrap();
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.configured_system_prompt(), "updated");
+        fork.set_system_prompt("fork prompt").unwrap();
+        assert_eq!(session.configured_system_prompt(), "updated");
+        assert_eq!(fork.configured_system_prompt(), "fork prompt");
+        fork.close().await.unwrap();
         session.close().await.unwrap();
     }
 
@@ -3853,6 +4587,38 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_hook_model_replaces_revoked_selection_free_legacy_client() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(NamedBranchModel("old")), "old")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        session
+            .set_model_with_hooks(
+                Arc::new(NamedBranchModel("new")),
+                "new",
+                serde_json::json!({"id":"new", "provider":"fixture"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("fixture"));
+        assert_eq!(session.prompt("next").await.unwrap(), "new");
+        assert!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, crate::LifecycleEvent::SessionStart { .. }))
+        );
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -4524,6 +5290,361 @@ mod tests {
             }
             self.records.lock().unwrap().push(record.clone());
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn inherited_model_cannot_restore_a_revoked_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            branch_client(&session.registry, session.session_id, Some("a"), "shared").is_none()
+        );
+    }
+
+    #[test]
+    fn inherited_model_reservation_does_not_restore_concurrently_revoked_binding() {
+        let registry = Arc::new(Registry::default());
+        let id = Uuid::new_v4();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("a"));
+        registry
+            .register_session_provider_model(id, "a", "shared", client.clone())
+            .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let worker_registry = registry.clone();
+        let worker_client = client.clone();
+        let worker = std::thread::spawn(move || {
+            worker_registry.commit_existing_session_model(id, "a", "shared", worker_client, || {
+                ready_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        ready_rx.recv().unwrap();
+        registry.remove_session_branch_models(id);
+        continue_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().unwrap().1);
+        assert!(branch_client(&registry, id, Some("a"), "shared").is_none());
+        assert!(
+            registry
+                .commit_existing_session_model(id, "a", "shared", client, || Ok(()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_inherits_the_model_restored_during_startup() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .navigate_tree(old, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(session.prompt("one").await.unwrap(), "b");
+        assert_eq!(session.prompt("two").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkout_before_startup_inherits_registered_historical_model() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session.checkout(old).unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(session.prompt("one").await.unwrap(), "b");
+        assert_eq!(session.prompt("two").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_historical_model_cannot_silently_inherit_default() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("missing"), "shared", None)
+            .unwrap();
+        let original_head = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+            .provider("default")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(session.journal().unwrap().head(), original_head);
+        assert_eq!(session.journal().unwrap().model_provider(), Some("missing"));
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_current_client_is_inherited_across_transitions() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(NamedBranchModel("model-A")), "model-A")
+            .build(journal)
+            .unwrap();
+        session
+            .journal()
+            .unwrap()
+            .select_model("model-B", None)
+            .unwrap();
+        session
+            .register_branch_model("model-B", Arc::new(NamedBranchModel("model-B")))
+            .unwrap();
+        let mut fork = session.fork_at(old).unwrap();
+        assert_eq!(fork.prompt("one").await.unwrap(), "model-B");
+        assert_eq!(fork.prompt("two").await.unwrap(), "model-B");
+        fork.close().await.unwrap();
+        session.checkout(old).unwrap();
+        assert_eq!(session.prompt("checkout").await.unwrap(), "model-B");
+        session
+            .navigate_tree(old, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("tree").await.unwrap(), "model-B");
+        let mut hooked = session
+            .fork_with_hooks(old, crate::ForkPosition::At, None)
+            .await
+            .unwrap();
+        assert_eq!(hooked.prompt("hook").await.unwrap(), "model-B");
+        hooked.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_revocation_blocks_selection_free_transitions_and_prompt() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "a")
+            .build(journal)
+            .unwrap();
+        session.checkout(old).unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        assert!(session.prompt("must not run").await.is_err());
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .fork_with_hooks(old, crate::ForkPosition::At, None)
+                .await
+                .is_err()
+        );
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn legacy_reservation_detects_revocation_and_blocks_replacement() {
+        let registry = Registry::default();
+        let id = Uuid::new_v4();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("a"));
+        registry
+            .register_session_branch_model(id, "a".into(), client.clone())
+            .unwrap();
+        let (_, revoked) = registry
+            .commit_existing_legacy_model(id, "a", client.clone(), || {
+                assert!(
+                    registry
+                        .register_session_branch_model(id, "a".into(), client.clone())
+                        .is_err()
+                );
+                registry.remove_session_branch_models(id);
+                Ok(())
+            })
+            .unwrap();
+        assert!(revoked);
+        assert!(branch_client(&registry, id, None, "a").is_none());
+        assert!(
+            registry
+                .commit_existing_legacy_model(id, "a", client, || Ok(()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_journal_selection_requires_current_registered_identity() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .journal()
+            .unwrap()
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        session
+            .register_provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap();
+        let mut fork = session.fork_at(old).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "b");
+        fork.close().await.unwrap();
+        session.checkout(old).unwrap();
+        assert_eq!(session.prompt("checkout").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hooked_fork_reserves_the_model_restored_during_startup() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut fork = session
+            .fork_with_hooks(old, crate::ForkPosition::At, None)
+            .await
+            .unwrap();
+        assert_eq!(fork.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(fork.prompt("one").await.unwrap(), "b");
+        assert_eq!(fork.prompt("two").await.unwrap(), "b");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn initial_provider_selection_on_imported_head_is_atomic() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .append(crate::Event::SourceEntry {
+                format: "pi".into(),
+                entry: serde_json::json!({"type":"message"}),
+            })
+            .unwrap();
+        let head = original.head();
+        for fail_on in [1, 2] {
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on,
+            })
+            .unwrap();
+            let result = SessionBuilder::new(Arc::new(ProviderBranchModel("provider")), "shared")
+                .provider("provider")
+                .unwrap()
+                .build(journal);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
+            if fail_on == 1 {
+                assert!(result.is_err());
+                assert_eq!(restored.head(), head);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(restored.head(), head + 1);
+                assert_eq!(restored.model_provider(), Some("provider"));
+            }
         }
     }
 
@@ -9029,6 +10150,840 @@ mod tests {
         }
     }
 
+    struct ResumeSettlementModel {
+        summary_id: Uuid,
+        attempts: std::sync::Mutex<Vec<(Uuid, crate::UsageReport, crate::ModelMetadata)>>,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for ResumeSettlementModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            id: Uuid,
+            usage: &crate::UsageReport,
+            metadata: &crate::ModelMetadata,
+        ) -> Result<()> {
+            if id == self.summary_id {
+                let mut attempts = self.attempts.lock().unwrap();
+                attempts.push((id, usage.clone(), metadata.clone()));
+                if attempts.len() == 1 {
+                    return Err(Error::RetryableModel("settlement unavailable".into()));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_reopens_and_settles_saved_overflow_summaries() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resume.jsonl");
+            let run_id = Uuid::new_v4();
+            let turn_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            let steering_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal.select_model("fixture", None).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            let boundary = journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap()
+                .id;
+            if silent {
+                journal
+                    .append(Event::ModelRequested {
+                        model: "fixture".into(),
+                        messages: 1,
+                        tools: 0,
+                        max_output_tokens: 16,
+                        request_id: Some(turn_id),
+                        context_head: None,
+                        context_sha256: None,
+                        context_transformed: None,
+                        context_configuration_sha256: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::ModelFinished {
+                        request_id: turn_id,
+                        metadata: Default::default(),
+                        usage: crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            },
+                        },
+                        failure: None,
+                        partial: String::new(),
+                        reply: Some(RecordedReply {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            advertised_tools: vec![],
+                            max_output_tokens: 16,
+                        }),
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "answer".into(),
+                        invocations: vec![],
+                        usage: Some(crate::Usage {
+                            input_tokens: 1001,
+                            output_tokens: 2,
+                        }),
+                        request_id: Some(turn_id),
+                    })
+                    .unwrap();
+            }
+            journal
+                .append(Event::SourceEntry {
+                    format: if silent {
+                        "pi-rs:silent-overflow"
+                    } else {
+                        "pi-rs:overflow-recovery"
+                    }
+                    .into(),
+                    entry: serde_json::json!({"requestId":turn_id}),
+                })
+                .unwrap();
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(summary_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id: summary_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some("stop".into()),
+                        ..Default::default()
+                    },
+                    usage: crate::UsageReport::Measured {
+                        usage: crate::Usage {
+                            input_tokens: 9,
+                            output_tokens: 3,
+                        },
+                    },
+                    failure: None,
+                    partial: "saved summary".into(),
+                    reply: None,
+                })
+                .unwrap();
+            if !silent {
+                journal
+                    .append(Event::InputQueued {
+                        input: crate::QueuedInput {
+                            id: steering_id,
+                            kind: crate::InputKind::Steer,
+                            content: "after recovery".into(),
+                        },
+                    })
+                    .unwrap();
+            }
+            drop(journal);
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let limits = Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                model_requests: 2,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            };
+            // Startup would append immediate context; recovery must be
+            // classified before this callback can invalidate the summary.
+            let guarded_model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .start()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
+                    .prompt("new prompt")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            guarded.close().await.unwrap();
+            drop(guarded);
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reconciliation")
+            );
+            assert!(
+                !guarded
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                Event::CustomMessage { message, .. } if message.custom_type == "lifecycle"))
+            );
+            assert_eq!(guarded_model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(guarded_model.attempts.lock().unwrap().len(), 2);
+            guarded.close().await.unwrap();
+            drop(guarded);
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert!(
+                !session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
+            drop(session);
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
+                .limits(limits)
+                .open(&path)
+                .unwrap();
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            {
+                let attempts = model.attempts.lock().unwrap();
+                assert_eq!(attempts.len(), 2);
+                assert!(attempts.iter().all(|(id, usage, metadata)| *id == summary_id && matches!(usage, crate::UsageReport::Measured { usage } if usage.input_tokens == 9 && usage.output_tokens == 3) && metadata.finish_reason.as_deref() == Some("stop")));
+            }
+            assert!(session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "saved summary")));
+            if !silent {
+                let journal = session.journal().unwrap();
+                let compacted = journal.records().iter().position(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "saved summary")).unwrap();
+                let delivered = journal.records().iter().position(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)).unwrap();
+                assert!(compacted < delivered);
+            }
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
+            session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_handles_interrupted_compaction_markers_without_duplicate_requests() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            for started in [false, true] {
+                let summary_id = Uuid::new_v4();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("interrupted.jsonl");
+                let run_id = Uuid::new_v4();
+                let turn_id = Uuid::new_v4();
+                let mut journal = Session::open(&path).unwrap();
+                journal
+                    .append(Event::User {
+                        content: "old".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "old reply".into(),
+                        invocations: vec![],
+                        usage: None,
+                        request_id: None,
+                    })
+                    .unwrap();
+                journal.set_run_id(Some(run_id));
+                journal
+                    .append(Event::Run {
+                        state: RunState::Running,
+                        initial: Some("new".into()),
+                    })
+                    .unwrap();
+                let boundary = journal
+                    .append(Event::User {
+                        content: "new".into(),
+                        input_id: Some(run_id),
+                    })
+                    .unwrap()
+                    .id;
+                if silent {
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(turn_id),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::ModelFinished {
+                            request_id: turn_id,
+                            metadata: Default::default(),
+                            usage: crate::UsageReport::Measured {
+                                usage: crate::Usage {
+                                    input_tokens: 1001,
+                                    output_tokens: 2,
+                                },
+                            },
+                            failure: None,
+                            partial: String::new(),
+                            reply: Some(RecordedReply {
+                                content: "answer".into(),
+                                invocations: vec![],
+                                advertised_tools: vec![],
+                                max_output_tokens: 16,
+                            }),
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::Assistant {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            usage: Some(crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            }),
+                            request_id: Some(turn_id),
+                        })
+                        .unwrap();
+                }
+                journal
+                    .append(Event::SourceEntry {
+                        format: if silent {
+                            "pi-rs:silent-overflow"
+                        } else {
+                            "pi-rs:overflow-recovery"
+                        }
+                        .into(),
+                        entry: serde_json::json!({"requestId":turn_id}),
+                    })
+                    .unwrap();
+                if started {
+                    journal.append(Event::SourceEntry { format: "pi-rs:overflow-retention-v1".into(), entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}) }).unwrap();
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(summary_id),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                }
+                let trigger = Uuid::new_v4();
+                let steering_id = Uuid::new_v4();
+                if started && !silent {
+                    journal
+                        .append(Event::InputQueued {
+                            input: crate::QueuedInput {
+                                id: steering_id,
+                                kind: crate::InputKind::Steer,
+                                content: "queued steering".into(),
+                            },
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::CustomMessageQueued {
+                            input: crate::QueuedCustomMessage {
+                                id: trigger,
+                                delivery: crate::CustomMessageDelivery::TriggerTurn,
+                                message: crate::CustomMessage {
+                                    custom_type: "queued".into(),
+                                    content: crate::ContextContent::Text("later".into()),
+                                    display: false,
+                                    details: None,
+                                },
+                            },
+                        })
+                        .unwrap();
+                }
+                drop(journal);
+                let model = Arc::new(ResumeSettlementModel {
+                    summary_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
+                let mut session = SessionBuilder::new(model.clone(), "fixture")
+                    .limits(Limits {
+                        context_window: if silent && !started { None } else { Some(1000) },
+                        output_tokens_per_request: 16,
+                        model_requests: 3,
+                        compaction_tokens: Some(crate::CompactionTokens {
+                            reserve_tokens: Some(0),
+                            keep_recent_tokens: None,
+                        }),
+                        ..Limits::default()
+                    })
+                    .open(&path)
+                    .unwrap();
+                if silent && started {
+                    session
+                        .controls()
+                        .set_auto_compaction_enabled(false)
+                        .unwrap();
+                }
+                if started {
+                    assert!(
+                        session
+                            .resume()
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settlement unavailable")
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+                }
+                let result = session.resume().await;
+                if silent {
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                } else if started {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("requires reconciliation")
+                    );
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                    assert!(
+                        model
+                            .attempts
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed))
+                    );
+                    assert_eq!(model.attempts.lock().unwrap().len(), 2);
+                    assert!(
+                        session
+                            .journal()
+                            .unwrap()
+                            .queued_inputs()
+                            .iter()
+                            .any(|input| input.input.id == steering_id)
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)));
+                    assert_eq!(
+                        session.journal().unwrap().pending_custom_trigger(),
+                        Some(trigger)
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+                }
+                session.close().await.unwrap();
+                drop(session);
+                if silent {
+                    let mut reopened = SessionBuilder::new(model.clone(), "fixture")
+                        .limits(Limits {
+                            context_window: Some(1000),
+                            output_tokens_per_request: 16,
+                            model_requests: 3,
+                            compaction_tokens: Some(crate::CompactionTokens {
+                                reserve_tokens: Some(0),
+                                keep_recent_tokens: None,
+                            }),
+                            ..Limits::default()
+                        })
+                        .open(&path)
+                        .unwrap();
+                    assert_eq!(reopened.prompt("next").await.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                    {
+                        let attempts = model.attempts.lock().unwrap();
+                        if started {
+                            assert_eq!(attempts.len(), 2);
+                            assert!(attempts.iter().all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed)));
+                        } else {
+                            assert!(attempts.is_empty());
+                        }
+                    }
+                    reopened.close().await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_recovers_overflow_before_marker_without_resending_turn() {
+        use crate::journal::{Event, ModelFailure, RecordedReply, RunState};
+        for length in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("before-marker.jsonl");
+            let run_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            // A completed compaction from an earlier turn of the same run
+            // must not hide a later pre-marker overflow.
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-recovery".into(),
+                    entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+                })
+                .unwrap();
+            journal
+                .append(Event::Compacted {
+                    summary: "earlier summary".into(),
+                    system_prompt: None,
+                    retain_from: None,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "intervening turn".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "intervening answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(request_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some(
+                            if length {
+                                "length"
+                            } else {
+                                "pi-rs:context-overflow"
+                            }
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                    usage: if length {
+                        crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 20,
+                                output_tokens: 2,
+                            },
+                        }
+                    } else {
+                        crate::UsageReport::Unconfirmed
+                    },
+                    failure: (!length).then_some(ModelFailure::Failed),
+                    partial: String::new(),
+                    reply: length.then(|| RecordedReply {
+                        content: "partial".into(),
+                        invocations: vec![],
+                        advertised_tools: vec![],
+                        max_output_tokens: 16,
+                    }),
+                })
+                .unwrap();
+            drop(journal);
+            for disabled in [false, true] {
+                let gate_path = dir.path().join(format!("gate-{disabled}.jsonl"));
+                std::fs::copy(&path, &gate_path).unwrap();
+                let gate_model = Arc::new(ResumeSettlementModel {
+                    summary_id: request_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
+                let limits = Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: if disabled { 3 } else { 0 },
+                    ..Limits::default()
+                };
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits.clone())
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                assert!(
+                    gated
+                        .resume()
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("settlement unavailable")
+                );
+                gated.close().await.unwrap();
+                drop(gated);
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits)
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                let _ = gated.resume().await;
+                assert_eq!(gate_model.attempts.lock().unwrap().len(), 2);
+                assert_eq!(gate_model.calls.load(Ordering::SeqCst), 0);
+                gated.close().await.unwrap();
+            }
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id: request_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: 3,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .open(&path)
+                .unwrap();
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                2,
+                "only summary and retry may call the model"
+            );
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
+        }
+    }
+
+    struct SilentFailureModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for SilentFailureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            if request.messages.iter().any(|message| matches!(message, crate::Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
+                return Err(Error::Model("summary failed".into()));
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(crate::Usage {
+                        input_tokens: if call == 0 { 1001 } else { 1 },
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_compaction_failure_does_not_block_the_next_prompt() {
+        for model_requests in [1, 3] {
+            let model = Arc::new(SilentFailureModel(AtomicUsize::new(0)));
+            let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+            journal
+                .append(crate::Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .build(journal)
+                .unwrap();
+            assert_eq!(session.prompt("new").await.unwrap(), "answer");
+            assert!(session.journal().unwrap().records().iter().any(|record| matches!(&record.event, crate::Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+            assert_eq!(session.prompt("next").await.unwrap(), "answer");
+            assert_eq!(
+                model.0.load(Ordering::SeqCst),
+                if model_requests == 1 { 2 } else { 3 }
+            );
+            session.close().await.unwrap();
+        }
+    }
+
     struct TriggerCommand;
     impl Extension for TriggerCommand {
         fn id(&self) -> &str {
@@ -10392,6 +12347,541 @@ mod tests {
     }
 
     struct IdleLifecycleMessages;
+
+    struct ScopedStartupEntries;
+    #[async_trait::async_trait]
+    impl Extension for ScopedStartupEntries {
+        fn id(&self) -> &str {
+            "scoped-startup-entries"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if !matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                return Ok(());
+            }
+            assert!(host.supports_custom_entries());
+            assert!(host.supports_custom_entry_read());
+            let previous = host.custom_entries(Some("startup")).await?;
+            assert_eq!(previous.len(), 1);
+            assert_eq!(
+                previous[0].entry.data,
+                Some(serde_json::json!({"before":true}))
+            );
+            host.append_entry(crate::CustomEntry {
+                custom_type: "startup".into(),
+                data: Some(serde_json::Value::Null),
+            })
+            .await?;
+            let current = host.custom_entries(Some("startup")).await?;
+            assert_eq!(current.len(), 2);
+            assert_eq!(current[1].entry.data, Some(serde_json::Value::Null));
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "context".into(),
+                    content: crate::ContextContent::Text("startup message".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_start_reads_and_appends_custom_entries() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedStartupEntries))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .append_custom_entry(crate::CustomEntry {
+                custom_type: "startup".into(),
+                data: Some(serde_json::json!({"before":true})),
+            })
+            .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(3), session.start())
+            .await
+            .unwrap()
+            .unwrap();
+        let journal = session.journal().unwrap();
+        let entries: Vec<_> = journal
+            .branch()
+            .iter()
+            .filter_map(|record| match &record.event {
+                crate::Event::CustomEntry { entry } if entry.custom_type == "startup" => {
+                    Some(entry.data.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                Some(serde_json::json!({"before":true})),
+                Some(serde_json::Value::Null)
+            ]
+        );
+        drop(journal);
+        assert!(
+            matches!(session.messages().unwrap().as_slice(), [Message::User { content }] if content == "startup message")
+        );
+        session.close().await.unwrap();
+    }
+
+    struct ScopedEntryFailure(Arc<std::sync::atomic::AtomicBool>);
+    struct ScopedEntryFailureFollower(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFailureFollower {
+        fn id(&self) -> &str {
+            "scoped-entry-follower"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFailure {
+        fn id(&self) -> &str {
+            "scoped-entry-failure"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                let error = host
+                    .append_entry(crate::CustomEntry {
+                        custom_type: "failed".into(),
+                        data: None,
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("fixture write failed"));
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_start_propagates_entry_store_failure() {
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("fixture write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        let journal = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let follower = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedEntryFailure(observed.clone())))
+            .unwrap()
+            .extension(Arc::new(ScopedEntryFailureFollower(follower.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let error = platform_time::timeout(std::time::Duration::from_secs(3), session.start())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("fixture write failed"));
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(follower.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    struct ScopedEntryFailurePending(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFailurePending {
+        fn id(&self) -> &str {
+            "scoped-entry-failure-pending"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                let error = host
+                    .append_entry(crate::CustomEntry {
+                        custom_type: "failed".into(),
+                        data: None,
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("fixture write failed"));
+                self.0.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_entry_write_failure_takes_precedence_over_abort_and_close() {
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("fixture write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        for close in [false, true] {
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let journal = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+            let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+                .extension(Arc::new(ScopedEntryFailurePending(ready.clone())))
+                .unwrap()
+                .build(journal)
+                .unwrap();
+            let control = session.controls();
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(session.start(), async {
+                    ready.notified().await;
+                    if close {
+                        control.owner.closed.cancel();
+                    } else {
+                        control.abort();
+                    }
+                })
+            })
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fixture write failed")
+            );
+        }
+    }
+
+    struct ScopedEntryFlood(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFlood {
+        fn id(&self) -> &str {
+            "scoped-entry-flood"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                let progressed = Arc::new(tokio::sync::Notify::new());
+                for _ in 0..48 {
+                    let host = host.clone();
+                    let progressed = progressed.clone();
+                    tokio::spawn(async move {
+                        while host
+                            .append_entry(crate::CustomEntry {
+                                custom_type: "flood".into(),
+                                data: None,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            progressed.notify_one();
+                        }
+                    });
+                }
+                progressed.notified().await;
+                self.0.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_entry_producers_do_not_starve_abort() {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedEntryFlood(ready.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.start(), async {
+                ready.notified().await;
+                control.abort();
+            })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn idle_entry_pump_prioritizes_completion_and_cancellation_over_queued_work() {
+        for cancelled in [false, true] {
+            let session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+                .in_memory()
+                .unwrap();
+            let control = session.controls();
+            let (sender, mut incoming) = mpsc::channel(32);
+            let (children_sender, mut children) = mpsc::unbounded_channel();
+            let scope = IdleInputScope {
+                owner: control.owner.clone(),
+                children: children_sender.clone(),
+                host: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
+                states: Default::default(),
+                cancellation: CancellationToken::new(),
+                lifetime: CancellationToken::new(),
+                gate: Arc::new(Mutex::new(())),
+                depth: 0,
+            };
+            let mut journal = session.session.lock().await;
+            let before = journal.records().len();
+            let (inner, inner_response) = tokio::sync::oneshot::channel();
+            let (outer, outer_response) = tokio::sync::oneshot::channel();
+            assert!(
+                children_sender
+                    .send(IdleChildRequest {
+                        action: IdleChildAction::AppendEntry(
+                            crate::CustomEntry {
+                                custom_type: "queued".into(),
+                                data: None
+                            },
+                            inner
+                        ),
+                        reply: outer,
+                        lifetime: scope.lifetime.clone(),
+                        gate: scope.gate.clone(),
+                    })
+                    .is_ok()
+            );
+            if cancelled {
+                scope.cancellation.cancel();
+            }
+            let future = async move {
+                if cancelled {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            };
+            let result = pump_idle_callback(
+                &mut journal,
+                &mut |_| {},
+                &mut incoming,
+                &mut children,
+                &control.owner.closed,
+                &scope,
+                future,
+            )
+            .await;
+            if cancelled {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(journal.records().len(), before);
+            drop(children);
+            assert!(outer_response.await.is_err());
+            assert!(inner_response.await.is_err());
+        }
+    }
+
+    struct ScopedLateEntryProducer {
+        release: Arc<tokio::sync::Notify>,
+        done: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ScopedLateEntryProducer {
+        fn id(&self) -> &str {
+            "scoped-late-entry"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if !matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                return Ok(());
+            }
+            let release = self.release.clone();
+            let done = self.done.lock().unwrap().take().unwrap();
+            tokio::spawn(async move {
+                release.notified().await;
+                let result = host
+                    .append_entry(crate::CustomEntry {
+                        custom_type: "late".into(),
+                        data: None,
+                    })
+                    .await;
+                let _ = done.send(result.is_err());
+            });
+            Ok(())
+        }
+    }
+    struct ScopedLateEntryRelease {
+        release: Arc<tokio::sync::Notify>,
+        done: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ScopedLateEntryRelease {
+        fn id(&self) -> &str {
+            "scoped-late-release"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if !matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                return Ok(());
+            }
+            self.release.notify_one();
+            let done = self.done.lock().await.take().unwrap();
+            assert!(done.await.unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_start_rejects_previous_handler_late_entries() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (done, received) = tokio::sync::oneshot::channel();
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedLateEntryProducer {
+                release: release.clone(),
+                done: Mutex::new(Some(done)),
+            }))
+            .unwrap()
+            .extension(Arc::new(ScopedLateEntryRelease {
+                release,
+                done: tokio::sync::Mutex::new(Some(received)),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(3), session.start())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.custom_type == "late")));
+        session.close().await.unwrap();
+    }
+
+    struct ScopedInputEntries;
+    #[async_trait::async_trait]
+    impl Extension for ScopedInputEntries {
+        fn id(&self) -> &str {
+            "scoped-input-entries"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            assert!(host.custom_entries(Some("input")).await?.is_empty());
+            host.append_entry(crate::CustomEntry {
+                custom_type: "input".into(),
+                data: Some(serde_json::json!({"indexed":true})),
+            })
+            .await?;
+            assert_eq!(host.custom_entries(Some("input")).await?.len(), 1);
+            Ok(crate::InputAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_idle_input_reads_and_appends_custom_entries() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(ScopedInputEntries))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("prompt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.custom_type == "input")));
+        assert!(
+            !serde_json::to_string(&session.messages().unwrap())
+                .unwrap()
+                .contains("indexed")
+        );
+        session.close().await.unwrap();
+    }
     #[async_trait::async_trait]
     impl Extension for IdleLifecycleMessages {
         fn id(&self) -> &str {

@@ -30,7 +30,7 @@ pub(crate) fn frame_budget() -> FrameBudget {
     FrameBudget(FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now() + FRAME_TIME))))
 }
 
-fn frame_expired() -> bool {
+pub(super) fn frame_expired() -> bool {
     FRAME_DEADLINE.with(|cell| {
         cell.get()
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -217,7 +217,7 @@ fn unescape_with_offsets(source: &str, escaped: &[u8]) -> (String, Vec<usize>) {
 // Marked can split a mailbox into plain text plus a link to only its suffix.
 // Rejoin only native-validated mailboxes whose entire extent consists of
 // unchanged text and bare email tokens, never across formatting boundaries.
-fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
+fn repair_split_mail(tokens: &[Value], source: &str, refs: &RefDefs<'_>) -> Option<Vec<Value>> {
     if frame_expired() {
         return None;
     }
@@ -259,6 +259,12 @@ fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
                     {
                         split_link |= cursor != range.start || end != range.end;
                     }
+                    // A dollar inside a validated local part can start a
+                    // math token extending past the mailbox. Re-lex its
+                    // suffix below after restoring the complete link.
+                    "latex" if cursor >= range.start => {
+                        split_link = true;
+                    }
                     _ => valid = false,
                 }
             }
@@ -278,11 +284,24 @@ fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
         let raw = source.get(range.clone())?;
         replacement.push(json!({"type":"link", "raw":raw, "text":raw, "href":href,
             "tokens":[{"type":"text", "raw":raw, "text":raw}]}));
-        if range.end < end {
-            let raw = source.get(range.end..end)?;
-            replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+        let math_overlap = tokens[last].get("type").and_then(Value::as_str) == Some("latex");
+        let splice_end = if math_overlap { tokens.len() - 1 } else { last };
+        let suffix_end = if math_overlap { source.len() } else { end };
+        if range.end < suffix_end {
+            let raw = source.get(range.end..suffix_end)?;
+            if math_overlap {
+                let suffix = LEXER.with(|lexer| {
+                    lexer
+                        .borrow()
+                        .as_ref()
+                        .and_then(|lexer| lexer.tokens(raw, refs))
+                })?;
+                replacement.extend(suffix);
+            } else {
+                replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+            }
         }
-        tokens.splice(first..=last, replacement);
+        tokens.splice(first..=splice_end, replacement);
     }
     Some(tokens)
 }
@@ -294,10 +313,11 @@ fn token_nodes(
     whole: &str,
     run_start: usize,
     cell_end: Option<usize>,
+    refs: &RefDefs<'_>,
 ) -> Option<Vec<Node>> {
     let mut result = Vec::new();
     let mut cursor = 0usize;
-    let tokens = repair_split_mail(tokens, source)?;
+    let tokens = repair_split_mail(tokens, source, refs)?;
     for token in &tokens {
         if frame_expired() {
             return None;
@@ -331,7 +351,15 @@ fn token_nodes(
                 .iter()
                 .map(|offset| offsets.get(cursor + offset).copied())
                 .collect::<Option<Vec<_>>>()?;
-            token_nodes(children, text, &child_offsets, whole, run_start, cell_end)
+            token_nodes(
+                children,
+                text,
+                &child_offsets,
+                whole,
+                run_start,
+                cell_end,
+                refs,
+            )
         };
         let group = match kind {
             "del" => Some((Tag::Strikethrough, TagEnd::Strikethrough)),
@@ -407,11 +435,12 @@ fn token_nodes(
         } else {
             let event = match kind {
                 "codespan" => Event::Code(text.to_owned().into()),
+                "latex" => Event::InlineMath(raw.to_owned().into()),
                 "escape" | "text" => Event::Text(text.to_owned().into()),
                 "br" => Event::HardBreak,
                 "html" => Event::InlineHtml(raw.to_owned().into()),
-                // Pi displays unhandled inline tokens, including images and
-                // unsupported math, from their raw source.
+                // Pi displays unhandled inline tokens, including images,
+                // from their raw source.
                 _ => Event::Text(raw.to_owned().into()),
             };
             result.push(Node::Leaf((event, span)));
@@ -422,7 +451,7 @@ fn token_nodes(
 }
 
 #[derive(Clone, Copy)]
-enum Container {
+pub(super) enum Container {
     Quote,
     Item(usize),
 }
@@ -454,7 +483,10 @@ fn normalize_newlines(source: &str) -> (String, Vec<usize>) {
 
 // Marked's block lexer removes container prefixes before inline lexing. Keep
 // byte boundaries into the original document for rendering and link guards.
-fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(String, Vec<usize>)> {
+pub(super) fn normalize_continuations(
+    source: &str,
+    containers: &[Container],
+) -> Option<(String, Vec<usize>)> {
     let bytes = source.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut offsets = vec![0];
@@ -537,7 +569,7 @@ fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(St
     ))
 }
 
-fn item_indent(original: &str, start: usize) -> Option<usize> {
+pub(super) fn item_indent(original: &str, start: usize) -> Option<usize> {
     let line = original.get(start..)?.split('\n').next()?.as_bytes();
     let leading = line.iter().take_while(|byte| **byte == b' ').count();
     if leading > 3 {
@@ -586,7 +618,7 @@ fn inline_run(
     let Some(source) = original.get(start..end) else {
         return nodes;
     };
-    if !source.contains("~~") || source.len() > MAX_RUN_BYTES || frame_expired() {
+    if !needs_inline_lexer(source) || source.len() > MAX_RUN_BYTES || frame_expired() {
         return nodes;
     }
     // Marked's block table lexer removes a backslash before each pipe before
@@ -610,8 +642,48 @@ fn inline_run(
             .and_then(|lexer| lexer.tokens(&source, refs))
     });
     tokens
-        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start, cell_end))
+        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start, cell_end, refs))
         .unwrap_or(nodes)
+}
+
+fn needs_inline_lexer(source: &str) -> bool {
+    if source.contains("~~") {
+        return true;
+    }
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    let mut probes = 0;
+    while index < bytes.len() {
+        if frame_expired() {
+            return false;
+        }
+        if bytes[index] == b'\\' {
+            let start = index;
+            while bytes.get(index) == Some(&b'\\') {
+                index += 1;
+            }
+            if (index - start) % 2 == 1 && matches!(bytes.get(index), Some(b'(' | b'[')) {
+                return true;
+            }
+            if (index - start) % 2 == 1 && bytes.get(index) == Some(&b'$') {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'$' {
+            // A fixed number of bounded suffix probes keeps the pre-scan
+            // linear even when many candidate delimiters have no match.
+            if probes == 8 {
+                return true;
+            }
+            probes += 1;
+            if super::math_tokenizer::inline(&source[index..]).is_some() {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 fn rewrite(
     nodes: Vec<Node>,
@@ -675,21 +747,178 @@ fn rewrite(
     result
 }
 
-pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Spanned> {
-    let parser = Parser::new_ext(parsed, options);
-    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !original.contains("~~") {
-        return parser
+pub(super) fn events(
+    original: &str,
+    parsed: &str,
+    options: Options,
+    reference_source: &str,
+) -> Vec<Spanned> {
+    if original == reference_source {
+        let parser = Parser::new_ext(parsed, options);
+        let events = parser
             .into_offset_iter()
-            .map(|(event, range)| (event.into_static(), range))
-            .collect();
+            .map(|(event, range)| (event.into_static(), range));
+        if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !needs_inline_lexer(original) {
+            return events.collect();
+        }
+        let references = Parser::new_ext(original, options);
+        let nodes = rewrite(
+            tree(events),
+            original,
+            references.reference_definitions(),
+            None,
+            &[],
+        );
+        let mut output = Vec::new();
+        for node in nodes {
+            node.flatten(&mut output);
+        }
+        return output;
     }
-    let references = Parser::new_ext(original, options);
+    let references = Parser::new_ext(reference_source, options);
+    let mut sanitized = None;
+    let mut scan_work = 0usize;
+    let mut scan_incomplete = false;
+    loop {
+        let input = sanitized.as_deref().unwrap_or(parsed);
+        scan_work = scan_work.saturating_add(input.len());
+        if scan_work > 1024 * 1024 || frame_expired() {
+            scan_incomplete = true;
+            break;
+        }
+        let local = Parser::new_ext(input, options);
+        let invalid: Vec<_> = local
+            .reference_definitions()
+            .iter()
+            .filter(|(label, _)| references.reference_definitions().get(label).is_none())
+            .map(|(_, definition)| definition.span.clone())
+            .collect();
+        if invalid.is_empty() {
+            break;
+        }
+        let mut bytes = input.as_bytes().to_vec();
+        for range in invalid {
+            for byte in &mut bytes[range] {
+                if !matches!(*byte, b'\n' | b'\r') {
+                    *byte = b' ';
+                }
+            }
+        }
+        sanitized = String::from_utf8(bytes).ok();
+        if sanitized.is_none() {
+            break;
+        }
+    }
+    let mut callback = |link: pulldown_cmark::BrokenLink<'_>| {
+        references
+            .reference_definitions()
+            .get(&link.reference)
+            .map(|definition| {
+                (
+                    definition.dest.clone().into_static(),
+                    definition
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "".into())
+                        .into_static(),
+                )
+            })
+    };
+    let parser = Parser::new_with_broken_link_callback(
+        sanitized.as_deref().unwrap_or(parsed),
+        options,
+        Some(&mut callback),
+    );
+    let events = parser
+        .into_offset_iter()
+        .map(|(event, range)| {
+            let mut event = event.into_static();
+            if let Event::Start(
+                Tag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }
+                | Tag::Image {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                },
+            ) = &mut event
+                && matches!(
+                    link_type,
+                    LinkType::Reference
+                        | LinkType::ReferenceUnknown
+                        | LinkType::Collapsed
+                        | LinkType::CollapsedUnknown
+                        | LinkType::Shortcut
+                        | LinkType::ShortcutUnknown
+                )
+                && let Some(definition) = references.reference_definitions().get(id)
+            {
+                *dest_url = definition.dest.clone().into_static();
+                *title = definition
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "".into())
+                    .into_static();
+            }
+            (event, range)
+        })
+        .collect::<Vec<_>>();
+    let events = if scan_incomplete {
+        // If the budget prevented removing all local definitions, do not let
+        // one select a destination absent from the authoritative map. Preserve
+        // its source text as a bounded fallback.
+        let mut safe = Vec::with_capacity(events.len());
+        let mut iter = events.into_iter();
+        while let Some((event, range)) = iter.next() {
+            let invalid = match &event {
+                Event::Start(
+                    Tag::Link { link_type, id, .. } | Tag::Image { link_type, id, .. },
+                ) => {
+                    matches!(
+                        link_type,
+                        LinkType::Reference
+                            | LinkType::ReferenceUnknown
+                            | LinkType::Collapsed
+                            | LinkType::CollapsedUnknown
+                            | LinkType::Shortcut
+                            | LinkType::ShortcutUnknown
+                    ) && references.reference_definitions().get(id).is_none()
+                }
+                _ => false,
+            };
+            if invalid && let Some(raw) = original.get(range.clone()) {
+                let mut level = 1usize;
+                for (child, _) in iter.by_ref() {
+                    match child {
+                        Event::Start(Tag::Link { .. } | Tag::Image { .. }) => level += 1,
+                        Event::End(TagEnd::Link | TagEnd::Image) => {
+                            level -= 1;
+                            if level == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                safe.push((Event::Text(raw.to_owned().into()), range));
+            } else {
+                safe.push((event, range));
+            }
+        }
+        safe
+    } else {
+        events
+    };
+    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !needs_inline_lexer(original) {
+        return events;
+    }
     let nodes = rewrite(
-        tree(
-            parser
-                .into_offset_iter()
-                .map(|(event, range)| (event.into_static(), range)),
-        ),
+        tree(events),
         original,
         references.reference_definitions(),
         None,
@@ -705,6 +934,27 @@ pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Span
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_reference_scan_never_uses_local_definitions() {
+        for len in [600_000, 1_100_000] {
+            let source = format!(
+                "[x][r]\n\n{}\n\n[r]: /first\n\n[r]: /second",
+                "a".repeat(len)
+            );
+            let actual = events(&source, &source, Options::empty(), "");
+            assert!(!actual.iter().any(|(event, _)| matches!(event,
+                Event::Start(Tag::Link { dest_url, .. }) if dest_url.as_ref() == "/first" || dest_url.as_ref() == "/second"
+            )));
+        }
+    }
+
+    #[test]
+    fn math_probe_skips_escaped_dollars_in_linear_time() {
+        let escaped = r"\$".repeat(32_000);
+        assert!(!needs_inline_lexer(&escaped));
+        assert!(needs_inline_lexer(&(escaped + " $x^2$")));
+    }
 
     #[test]
     fn expanded_tab_offsets_remain_bounded_and_point_to_source() {
@@ -726,7 +976,7 @@ mod tests {
     fn exhausted_frame_budget_applies_to_every_inline_run_and_is_restored() {
         let previous = FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now())));
         let text = "~~first~~\n\n~~second~~";
-        let result = events(text, text, Options::empty());
+        let result = events(text, text, Options::empty(), text);
         assert!(
             !result
                 .iter()
@@ -763,7 +1013,7 @@ mod tests {
                 .is_none()
         );
         let document = format!("~~ok~~\n\n{}", "x".repeat(MAX_DOCUMENT_BYTES));
-        let result = events(&document, &document, Options::empty());
+        let result = events(&document, &document, Options::empty(), &document);
         assert!(
             !result
                 .iter()

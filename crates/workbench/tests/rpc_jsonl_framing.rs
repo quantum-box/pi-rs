@@ -1,8 +1,69 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+#[test]
+fn rpc_ignores_positional_messages_before_eof() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--mode",
+            "rpc",
+            "ignored first",
+            "ignored second",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{{\"type\":\"get_state\",\"id\":\"live\"}}").unwrap();
+    input.flush().unwrap();
+    let response = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("RPC did not respond while stdin was open: {error}");
+        });
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["id"], "live");
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["messageCount"], 0);
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("RPC process did not exit after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    reader.join().unwrap();
+}
 
 #[test]
 fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
@@ -22,6 +83,8 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
             "--no-trust",
             "--mode",
             "rpc",
+            "ignored first",
+            "ignored second",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
@@ -37,8 +100,9 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
         .write_all("{\"type\":\"get_state\",\"id\":\"a\u{2028}b\"}\n".as_bytes())
         .unwrap();
     input
-        .write_all(b"{\"type\":\"get_state\",\"id\":\"last\"}\r")
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"last\"}\r\n")
         .unwrap();
+    input.write_all(b"{\"id\":\"object\",\"type\":{\"x\":1}}\n{\"id\":\"array\",\"type\":[1,null,[true,2],{}]}\n{\"id\":\"number\",\"type\":1.0}\n{\"id\":\"shadow\",\"type\":{\"toString\":0}}\n{\"id\":\"missing\"}\n[]\n123\n\"text\"\ntrue\nnull\n{\"type\":\"get_state\",\"id\":\"after\"}\r").unwrap();
     drop(input);
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
@@ -62,13 +126,121 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 4, "{responses:?}");
+    assert_eq!(responses.len(), 15, "{responses:?}");
     assert_eq!(responses[0]["id"], "bad�id");
     assert_eq!(responses[0]["success"], true);
+    assert_eq!(responses[0]["data"]["messageCount"], 0);
     assert_eq!(responses[1]["command"], "parse");
     assert_eq!(responses[1]["success"], false);
     assert_eq!(responses[2]["id"], "a\u{2028}b");
     assert_eq!(responses[2]["success"], true);
     assert_eq!(responses[3]["id"], "last");
     assert_eq!(responses[3]["success"], true);
+    for (response, id, error) in [
+        (&responses[4], "object", "Unknown command: [object Object]"),
+        (
+            &responses[5],
+            "array",
+            "Unknown command: 1,,true,2,[object Object]",
+        ),
+        (&responses[6], "number", "Unknown command: 1"),
+        (
+            &responses[7],
+            "shadow",
+            "Cannot convert object to primitive value",
+        ),
+        (&responses[8], "missing", "Unknown command: undefined"),
+    ] {
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"], error);
+        assert_eq!(response["success"], false);
+    }
+    assert_eq!(responses[4]["command"], serde_json::json!({"x":1}));
+    assert_eq!(
+        responses[5]["command"],
+        serde_json::json!([1, null, [true, 2], {}])
+    );
+    for response in &responses[9..13] {
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["error"], "Unknown command: undefined");
+        assert!(response.get("command").is_none());
+        assert!(response.get("id").is_none());
+    }
+    assert_eq!(responses[13]["command"], "parse");
+    assert_eq!(responses[13]["success"], false);
+    assert_eq!(responses[14]["id"], "after");
+    assert_eq!(responses[14]["success"], true);
+}
+
+#[test]
+fn rpc_session_name_type_errors_use_pi_response_envelopes() {
+    let root = tempfile::tempdir().unwrap();
+    let input_path = root.path().join("input");
+    let output_path = root.path().join("output");
+    std::fs::write(
+        &input_path,
+        concat!(
+            "{\"type\":\"set_session_name\",\"id\":\"missing\"}\n",
+            "{\"type\":\"set_session_name\",\"id\":\"null\",\"name\":null}\n",
+            "{\"type\":\"set_session_name\",\"id\":\"number\",\"name\":42}\n",
+            "{\"type\":\"get_state\",\"id\":\"after\"}\n",
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::from(std::fs::File::open(input_path).unwrap()))
+        .stdout(Stdio::from(std::fs::File::create(&output_path).unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("RPC process did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    let output = std::fs::read_to_string(output_path).unwrap();
+    let responses: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for (id, error) in [
+        (
+            "missing",
+            "Cannot read properties of undefined (reading 'trim')",
+        ),
+        ("null", "Cannot read properties of null (reading 'trim')"),
+        ("number", "command.name.trim is not a function"),
+    ] {
+        let response = responses
+            .iter()
+            .find(|response| response["id"] == id)
+            .unwrap();
+        assert_eq!(response["command"], "set_session_name");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["error"], error);
+    }
+    assert!(
+        responses
+            .iter()
+            .any(|response| response["id"] == "after" && response["success"] == true)
+    );
 }

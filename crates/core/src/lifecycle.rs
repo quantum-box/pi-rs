@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ExtensionStates, Message, Notification, Observer, Record, Registry, RunState, Session, Usage,
+    ExtensionStates, Message, Notification, Observer, Record, Registry, RunState, Session,
+    ToolHost, Usage,
 };
 
 /// Branch navigation as selected by the user, before any session changes.
@@ -334,7 +335,7 @@ pub async fn notify(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) {
-    notify_inner(registry, event, states, timeout, observer, None).await;
+    notify_inner(registry, event, states, timeout, observer, None, None).await;
 }
 
 pub(crate) async fn notify_with_host(
@@ -345,7 +346,7 @@ pub(crate) async fn notify_with_host(
     observer: &mut Observer<'_>,
     host: std::sync::Arc<dyn crate::ToolHost>,
 ) {
-    notify_inner(registry, event, states, timeout, observer, Some(host)).await;
+    notify_inner(registry, event, states, timeout, observer, Some(host), None).await;
 }
 
 pub(crate) async fn notify_idle_with_host(
@@ -358,6 +359,17 @@ pub(crate) async fn notify_idle_with_host(
     notify_session_with_host(registry, session, event, timeout, observer, true).await
 }
 
+/// Deliver an idle lifecycle event while the caller owns the session journal.
+pub async fn notify_in_session(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> crate::Result<()> {
+    notify_idle_with_host(registry, session, event, timeout, observer).await
+}
+
 pub(crate) async fn notify_session_with_host(
     registry: &Registry,
     session: &mut Session,
@@ -366,6 +378,30 @@ pub(crate) async fn notify_session_with_host(
     observer: &mut Observer<'_>,
     idle: bool,
 ) -> crate::Result<()> {
+    notify_session_compaction_with_host(registry, session, event, timeout, observer, idle, None)
+        .await
+}
+
+pub(crate) async fn notify_session_compaction_with_host(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    idle: bool,
+    compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
+) -> crate::Result<()> {
+    if idle
+        && compaction.is_none()
+        && matches!(
+            event,
+            LifecycleEvent::SessionStart { .. }
+                | LifecycleEvent::SessionShutdown { .. }
+                | LifecycleEvent::SessionInfoChanged { .. }
+        )
+    {
+        return notify_idle_session_entries(registry, session, event, timeout, observer).await;
+    }
     let states = session.extension_states();
     let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
     let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender, idle });
@@ -382,7 +418,15 @@ pub(crate) async fn notify_session_with_host(
         }
     };
     {
-        let future = notify_with_host(registry, event, &states, timeout, &mut collect, host);
+        let future = notify_inner(
+            registry,
+            event,
+            &states,
+            timeout,
+            &mut collect,
+            Some(host),
+            compaction,
+        );
         tokio::pin!(future);
         loop {
             tokio::select! {
@@ -418,6 +462,116 @@ pub(crate) async fn notify_session_with_host(
     }
 }
 
+async fn notify_idle_session_entries(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> crate::Result<()> {
+    use crate::extension::{SessionEntryHost, SessionEntryRequest, branch_custom_entries};
+    let states = session.extension_states();
+    let deadline = platform_time::Instant::now() + timeout.min(Duration::from_secs(10));
+    let mut errors = Vec::new();
+    let mut host_error = None;
+    for extension in registry
+        .extensions
+        .iter()
+        .filter(|extension| extension.handles_lifecycle() && extension.handles_session_lifecycle())
+    {
+        let (sender, mut messages) = tokio::sync::mpsc::channel(32);
+        let (entry_sender, mut entries) = tokio::sync::mpsc::channel(32);
+        let host = std::sync::Arc::new(SessionEntryHost {
+            messages: std::sync::Arc::new(crate::agent::LifecycleMessageHost {
+                sender,
+                idle: true,
+            }),
+            entries: entry_sender,
+        });
+        enum Request {
+            Entry(SessionEntryRequest),
+            Message(
+                crate::QueuedCustomMessage,
+                tokio::sync::oneshot::Sender<crate::ExtensionResult<()>>,
+            ),
+        }
+        let result = {
+            let future = platform_time::timeout_at(
+                deadline,
+                crate::sdk::scope_extension_callback(host.callback_scope_owner(), async {
+                    extension
+                        .lifecycle_with_host(
+                            &event,
+                            states.get(extension.id()),
+                            crate::sdk::scope_callback_host(host),
+                        )
+                        .await
+                }),
+            );
+            tokio::pin!(future);
+            'callback: loop {
+                tokio::select! {
+                    biased;
+                    result = &mut future => break result,
+                    request = async {
+                        tokio::select! {
+                            Some(entry) = entries.recv() => Request::Entry(entry),
+                            Some((message, reply)) = messages.recv() => Request::Message(message, reply),
+                            else => std::future::pending().await,
+                        }
+                    } => match request {
+                        Request::Entry(SessionEntryRequest::Append(entry, reply)) => {
+                            if reply.is_closed() { continue; }
+                            if let Err(error) = session.ensure_settled() { let _ = reply.send(Err(error.to_string())); continue; }
+                            let result = session.append_custom_entry(entry).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom entry"))));
+                            match result {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); if host_error.is_none() { host_error = Some(error); } }
+                            }
+                        }
+                        Request::Entry(SessionEntryRequest::List(custom_type, mut reply)) => {
+                            if reply.is_closed() { continue; }
+                            tokio::select! {
+                                biased;
+                                result = &mut future => break 'callback result,
+                                _ = reply.closed() => {},
+                                result = branch_custom_entries(session, custom_type.as_deref()) => { let _ = reply.send(result); }
+                            }
+                        }
+                        Request::Message(input, reply) => {
+                            let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                                crate::agent::queue_custom_message(session, input, observer)
+                            } else {
+                                session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                            };
+                            match result {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); if host_error.is_none() { host_error = Some(error); } }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push((extension.id().to_owned(), error)),
+            Err(_) => errors.push((extension.id().to_owned(), "lifecycle hook timed out".into())),
+        }
+    }
+    for (extension, message) in &errors {
+        observer(Notification::ExtensionLifecycleError {
+            extension,
+            event: event.kind(),
+            message,
+        });
+    }
+    match host_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 async fn notify_inner(
     registry: &Registry,
     event: LifecycleEvent,
@@ -425,6 +579,7 @@ async fn notify_inner(
     timeout: Duration,
     observer: &mut Observer<'_>,
     host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+    compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
     let deadline = platform_time::Instant::now() + timeout.min(Duration::from_secs(10));
     for extension in registry.extensions.iter().filter(|extension| {
@@ -459,16 +614,25 @@ async fn notify_inner(
                 async {
                     match &host {
                         Some(host) => {
-                            extension
-                                .lifecycle_with_host(
-                                    &event,
-                                    states.get(extension.id()),
-                                    crate::sdk::scope_callback_host(
-                                        host.for_extension(extension.id())
-                                            .unwrap_or_else(|| host.clone()),
-                                    ),
-                                )
-                                .await
+                            let scoped = crate::sdk::scope_callback_host(
+                                host.for_extension(extension.id())
+                                    .unwrap_or_else(|| host.clone()),
+                            );
+                            if let Some((trigger, metadata)) = &compaction {
+                                extension
+                                    .compaction_lifecycle_with_host(
+                                        &event,
+                                        *trigger,
+                                        metadata.as_ref(),
+                                        states.get(extension.id()),
+                                        scoped,
+                                    )
+                                    .await
+                            } else {
+                                extension
+                                    .lifecycle_with_host(&event, states.get(extension.id()), scoped)
+                                    .await
+                            }
                         }
                         None => {
                             extension
@@ -497,6 +661,278 @@ async fn notify_inner(
 mod wire_tests {
     use super::*;
     use serde_json::json;
+
+    struct SessionEntryHook(&'static str, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::Extension for SessionEntryHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            _: &LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: std::sync::Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let previous = host.custom_entries(Some("lifecycle")).await?;
+            host.append_entry(crate::CustomEntry {
+                custom_type: "lifecycle".into(),
+                data: Some(json!({"prior":previous.len()})),
+            })
+            .await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_reads_and_writes_entries_in_extension_order() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(SessionEntryHook("first", seen.clone())))
+            .unwrap();
+        registry
+            .register(Arc::new(SessionEntryHook("second", seen.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        notify_idle_with_host(
+            &registry,
+            &mut session,
+            LifecycleEvent::SessionStart {
+                reason: SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        let entries = crate::extension::branch_custom_entries(&mut session, Some("lifecycle"))
+            .await
+            .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entry.data, Some(json!({"prior":0})));
+        assert_eq!(entries[1].entry.data, Some(json!({"prior":1})));
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_continues_after_entry_store_failure() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> crate::Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> crate::Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(crate::Error::Session("fixture write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(SessionEntryHook("first", seen.clone())))
+            .unwrap();
+        registry
+            .register(Arc::new(SessionEntryHook("second", seen.clone())))
+            .unwrap();
+        let mut session = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+        let result = notify_idle_with_host(
+            &registry,
+            &mut session,
+            LifecycleEvent::SessionShutdown {
+                reason: SessionShutdownReason::Quit,
+                target_session_file: None,
+            },
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("fixture write failed")
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_runs_after_startup_entry_failure() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> crate::Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> crate::Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(crate::Error::Session("startup write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        struct Cleanup(Arc<AtomicBool>, Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl crate::Extension for Cleanup {
+            fn id(&self) -> &str {
+                "cleanup"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<()> {
+                if matches!(event, LifecycleEvent::SessionShutdown { .. }) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+            async fn shutdown(&self) -> crate::ExtensionResult<()> {
+                self.1.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(SessionEntryHook(
+                "writer",
+                Arc::new(AtomicUsize::new(0)),
+            )))
+            .unwrap();
+        registry
+            .register(Arc::new(Cleanup(shutdown.clone(), closed.clone())))
+            .unwrap();
+        let mut session = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+        let start = notify_idle_with_host(
+            &registry,
+            &mut session,
+            LifecycleEvent::SessionStart {
+                reason: SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .await;
+        assert!(
+            start
+                .unwrap_err()
+                .to_string()
+                .contains("startup write failed")
+        );
+        let _ = notify_idle_with_host(
+            &registry,
+            &mut session,
+            LifecycleEvent::SessionShutdown {
+                reason: SessionShutdownReason::Quit,
+                target_session_file: None,
+            },
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .await;
+        registry.shutdown().await.unwrap();
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn detailed_compaction_callback_receives_trigger_and_committed_metadata() {
+        use std::sync::{Arc, Mutex};
+        struct Hook(Arc<Mutex<Option<serde_json::Value>>>);
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                "detailed-compaction"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn compaction_lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                trigger: crate::CompactionTrigger,
+                metadata: Option<&serde_json::Value>,
+                _: Option<&crate::ExtensionState>,
+                _: Arc<dyn crate::ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                *self.0.lock().unwrap() = Some(json!({"trigger":trigger,"metadata":metadata}));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Hook(seen.clone()))).unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let metadata = json!({"details":{"source":"hook"}});
+        let record = session
+            .append_with_record_metadata(
+                crate::Event::Compacted {
+                    summary: "summary".into(),
+                    system_prompt: None,
+                    retain_from: None,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                },
+                metadata.clone(),
+            )
+            .unwrap()
+            .clone();
+        notify_session_compaction_with_host(
+            &registry,
+            &mut session,
+            LifecycleEvent::SessionCompact {
+                compaction_entry: Box::new(record),
+                from_extension: true,
+                reason: CompactionReason::Threshold,
+                will_retry: true,
+            },
+            Duration::from_secs(1),
+            &mut |_| {},
+            true,
+            Some((crate::CompactionTrigger::Overflow, Some(metadata.clone()))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(json!({"trigger":"overflow","metadata":metadata}))
+        );
+    }
 
     #[test]
     fn transition_and_lifecycle_fields_use_pi_names() {

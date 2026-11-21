@@ -6,6 +6,38 @@ the webview does not need to compile pi-rs to WebAssembly. The SDK does not
 automatically install the workbench's tools, load its configuration, or manage
 credentials for an embedding host.
 
+## Host-owned model catalog
+
+`ModelCatalogBuilder` collects already constructed clients by exact provider
+and model name. Its immutable `ModelCatalog` creates a `SessionBuilder` and
+resolves provider-qualified historical selections when sessions reopen or
+navigate branches. This is useful when two providers use the same model name:
+the SDK never guesses a provider or silently replaces an existing binding.
+
+For older journals that recorded a model name without its provider, the host
+may explicitly authorize that name with `session_builder_with_legacy_model`.
+Use this only when the host knows which provider the old name represents; the
+ordinary `session_builder` deliberately leaves such histories unbound.
+
+```rust,no_run
+use std::sync::Arc;
+use pi_rs::{Model, ModelCatalogBuilder};
+
+fn session_builder(client: Arc<dyn Model>) -> pi_rs::Result<pi_rs::SessionBuilder> {
+    let mut models = ModelCatalogBuilder::new();
+    models.register("my-provider", "my-model", client)?;
+    models.build().session_builder("my-provider", "my-model")
+}
+```
+
+Clients, endpoints and credentials remain the host's responsibility. Journal
+identities are used only for exact lookups in this trusted snapshot; unknown
+identities do not cause a network request or automatic fallback. Build a new
+catalog and new sessions after changing credentials or endpoint policy. Existing
+sessions retain their original clients. Hosts needing automatic fallback can
+provide their own `HistoricalModelResolver` instead. This provider-neutral API
+does not depend on Tauri or a desktop runtime.
+
 ## Native quickstart
 
 The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
@@ -51,12 +83,19 @@ The fixture's `configure` installs one invoke handler and replaces any handler
 already set on the builder. To integrate with other application commands, use
 the fixture's public `session_state` and `commands` in one handler, as exercised
 by [the composition test](../fixtures/tauri-sdk/tests/composition.rs).
+To use a host-configured session, construct it with `SessionBuilder` and pass it
+to `session_state_from_session`. The host owns the choice and authorization of
+its journal, resources, model and extensions; the IPC commands do not accept
+those settings. This constructor neither reloads resources nor switches sessions.
 Closing requests SDK shutdown before waiting for the session lock. The SDK
 cancels the active run and makes later run tokens inherit cancellation; ordinary
 `abort` still affects only the current run. The fixture rejects queued prompts
-and waits for an admitted prompt to settle so SDK cleanup can finish. Close can
-wait if startup itself never settles. This example uses an in-memory session
-without extension hooks or tools; cancellation cannot undo work already begun.
+and waits for an admitted prompt to settle so SDK cleanup can finish. After SDK
+close completes, the state drops its owned session and releases its journal
+handle; another owner may then reopen it. Close can wait if startup itself never
+settles. The following minimal sketch uses an in-memory session without extension hooks
+or tools; it does not implement the fixture's supervised close lifecycle.
+Cancellation cannot undo work already begun.
 
 ```rust
 use std::sync::Arc;
