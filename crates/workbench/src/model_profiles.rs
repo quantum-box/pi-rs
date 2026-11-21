@@ -953,7 +953,7 @@ impl Profiles {
         Provider::ALL
             .into_iter()
             .chain(std::iter::once(
-                Provider::named("openai-chatgpt").expect("ChatGPT provider"),
+                self.provider("openai-chatgpt").expect("ChatGPT provider"),
             ))
             .chain(builtin_chat::PROVIDERS.iter().map(|builtin| {
                 let provider = builtin.provider();
@@ -966,6 +966,7 @@ impl Profiles {
                     .values()
                     .filter(|profile| {
                         matches!(profile.provider, Provider::Custom { .. })
+                            && profile.provider.id() != "openai-chatgpt"
                             && builtin_chat::find(profile.provider.id()).is_none()
                     })
                     .map(|profile| profile.provider.clone()),
