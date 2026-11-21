@@ -4020,6 +4020,26 @@ for line in sys.stdin:
         text.contains("Reconnected") && text.contains("Tools · 1")
     });
 
+    master.write_all(b"x").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Exposure of ready") && text.contains("codemode ✓")
+    });
+    master.write_all(b"\x1b[B\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Exposure updated") && text.contains("Exposure · direct")
+    });
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(saved["mcpServers"]["ready"]["exposure"], "direct");
+    assert_eq!(
+        saved["mcpServers"]["ready"]["toolExposure"]["fixture_tool"],
+        "hidden"
+    );
+    master.write_all(b"t").unwrap();
+    output_until(&mut master, |text| text.contains("fixture_tool · hidden"));
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("MCP server · ready"));
+
     for enabled in [false, true] {
         master.write_all(b"e").unwrap();
         output_until(&mut master, |text| {

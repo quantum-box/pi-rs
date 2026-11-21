@@ -422,10 +422,14 @@ impl Runtime {
                     .reconnect_mcp(args, &request, cancel)
                     .await
                     .map(|()| "Reconnected"),
-                mcp_config::ManagerAction::SetEnabled { enabled, project } => {
-                    self.set_mcp_enabled(args, &mut request, enabled, project, cancel)
+                mcp_config::ManagerAction::SetEnabled { enabled, .. } => {
+                    self.set_mcp_enabled(args, &mut request, enabled, cancel)
                         .await
                 }
+                mcp_config::ManagerAction::SetExposure(exposure) => self
+                    .set_mcp_exposure(args, &request, exposure, cancel)
+                    .await
+                    .map(|()| "Exposure updated"),
             };
             let message = match result {
                 Ok(message) => message,
@@ -442,19 +446,11 @@ impl Runtime {
         args: &Cli,
         request: &mut mcp_config::ManagerRequest,
         enabled: bool,
-        project: bool,
         cancel: &CancellationToken,
     ) -> Result<&'static str> {
-        let updated =
-            mcp_config::set_manager_enabled(args, request, enabled, project, cancel).await?;
+        let updated = mcp_config::edit_manager_config(args, request, cancel).await?;
         request.config = updated.config.clone().expect("validated MCP configuration");
-        if let Some(entry) = self
-            .mcp_inspection
-            .iter_mut()
-            .find(|entry| entry.name == request.name)
-        {
-            *entry = updated;
-        }
+        self.update_mcp_inspection(updated);
         if enabled {
             self.reconnect_mcp(args, request, cancel).await?;
             Ok("Enabled")
@@ -463,6 +459,49 @@ impl Runtime {
             let _mutation = catalog.mutation.lock().await;
             self.disconnect_mcp(&catalog, &request.name).await?;
             Ok("Disabled")
+        }
+    }
+
+    async fn set_mcp_exposure(
+        &mut self,
+        args: &Cli,
+        request: &mcp_config::ManagerRequest,
+        exposure: &str,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let catalog = self.catalog.clone();
+        let _mutation = catalog.mutation.lock().await;
+        let mut servers = catalog.servers.lock().expect("MCP catalogs").clone();
+        let staged = if let Some(index) = servers
+            .iter()
+            .position(|server| server.server_name == request.name)
+        {
+            let updated = Arc::new(servers[index].with_exposure(exposure.into()));
+            let mut registry = self.registry.clone();
+            registry.replace(updated.clone())?;
+            servers[index] = updated;
+            let system_prompt = catalog.select_mcp_tools(&mut registry, &servers)?;
+            Some((registry, system_prompt))
+        } else {
+            None
+        };
+        let updated = mcp_config::edit_manager_config(args, request, cancel).await?;
+        if let Some((registry, system_prompt)) = staged {
+            self.registry = registry;
+            self.system_prompt = system_prompt;
+            *catalog.servers.lock().expect("MCP catalogs") = servers;
+        }
+        self.update_mcp_inspection(updated);
+        Ok(())
+    }
+
+    fn update_mcp_inspection(&mut self, updated: mcp_config::Inspection) {
+        if let Some(entry) = self
+            .mcp_inspection
+            .iter_mut()
+            .find(|entry| entry.name == updated.name)
+        {
+            *entry = updated;
         }
     }
 

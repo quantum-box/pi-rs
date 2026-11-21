@@ -935,7 +935,10 @@ checks covered a stale tool being replaced, a failed restart withdrawing that
 tool, and a later retry restoring access. Enable and Disable update the
 configuration scope shown for the server and take effect in the current
 session. The project-only action adds an override for a global server in a
-trusted project. Use the CLI MCP commands to manage credentials.
+trusted project. Exposure changes between codemode, deferred and direct
+save to the server's effective configuration scope and update the model's
+tool declarations without restarting the connection. Per-tool overrides
+retain precedence. Use the CLI MCP commands to manage credentials.
 
 Trusted project overrides of a global MCP server reject unknown fields and
 invalid values before applying any part of that override, so a typo or

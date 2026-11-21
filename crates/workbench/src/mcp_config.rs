@@ -978,6 +978,7 @@ fn inspection_description(description: &str) -> String {
 pub(super) enum ManagerAction {
     Reconnect,
     SetEnabled { enabled: bool, project: bool },
+    SetExposure(&'static str),
 }
 
 pub(super) struct ManagerRequest {
@@ -987,13 +988,26 @@ pub(super) struct ManagerRequest {
     scope: InspectionScope,
 }
 
-pub(super) async fn set_manager_enabled(
+pub(super) async fn edit_manager_config(
     args: &Cli,
     request: &ManagerRequest,
-    enabled: bool,
-    in_project: bool,
     cancel: &CancellationToken,
 ) -> Result<Inspection> {
+    let mut expected = request.config.clone();
+    let (key, value, in_project) = match request.action {
+        ManagerAction::SetEnabled { enabled, project } => {
+            expected.enabled = Some(enabled);
+            ("enabled", json!(enabled), project)
+        }
+        ManagerAction::SetExposure(exposure)
+            if request.config.enabled != Some(false)
+                && ["codemode", "deferred", "direct"].contains(&exposure) =>
+        {
+            expected.exposure = Some(exposure.into());
+            ("exposure", json!(exposure), false)
+        }
+        _ => return Err(Error::Config("Invalid MCP configuration edit".into())),
+    };
     if args
         .disable_extension
         .contains(&format!("mcp-{}", request.name.replace('-', "_")))
@@ -1054,14 +1068,12 @@ pub(super) async fn set_manager_enabled(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or_else(|| Error::Config("MCP server must be an object".into()))?;
-    entry.insert("enabled".into(), json!(enabled));
+    entry.insert(key.into(), value);
     if cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
     config::write_json(path, &document)?;
     let updated = inspect()?;
-    let mut expected = request.config.clone();
-    expected.enabled = Some(enabled);
     if updated.scope != scope || updated.config.as_ref() != Some(&expected) {
         return Err(Error::Config(
             "MCP configuration changed while saving. Reload to apply it.".into(),
@@ -1177,6 +1189,16 @@ pub(super) async fn inspect_servers(
                     let _ =
                         select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
                 }
+                ("exposure", Some(config)) if enabled == Some(true) => {
+                    if let Some(exposure) = choose_exposure(entry, ui, cancel).await? {
+                        return Ok(Some(ManagerRequest {
+                            name: entry.name.clone(),
+                            config: config.clone(),
+                            scope: entry.scope,
+                            action: ManagerAction::SetExposure(exposure),
+                        }));
+                    }
+                }
                 ("reconnect" | "toggle" | "toggle-project", Some(config)) => {
                     let action = if action == "reconnect" {
                         ManagerAction::Reconnect
@@ -1197,6 +1219,31 @@ pub(super) async fn inspect_servers(
             }
         }
     }
+}
+
+async fn choose_exposure(
+    entry: &Inspection,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<Option<&'static str>> {
+    let mut choices = [
+        ("codemode", "Called from Codemode scripts"),
+        ("deferred", "Declared after tool_search discovers it"),
+        ("direct", "Declared to the model"),
+    ];
+    if let Some(index) = choices.iter().position(|(name, _)| *name == entry.exposure) {
+        choices.rotate_left(index);
+    }
+    let labels = choices.map(|(name, description)| {
+        let current = if name == entry.exposure { " ✓" } else { "" };
+        format!("{name}{current} · {description}")
+    });
+    let title = format!("Exposure of {}", entry.name);
+    let Some(index) = select_inspection(&title, &labels, &mut 0, ui, cancel).await? else {
+        return Ok(None);
+    };
+    let chosen = choices[index].0;
+    Ok((chosen != entry.exposure).then_some(chosen))
 }
 
 async fn show_inspection(
@@ -1225,6 +1272,11 @@ async fn show_inspection(
             key: "r".into(),
             value: "reconnect".into(),
             label: Some("Reconnect".into()),
+        });
+        actions.push(UiComponentAction {
+            key: "x".into(),
+            value: "exposure".into(),
+            label: Some("Exposure".into()),
         });
     }
     if let Some(enabled) = enabled {
