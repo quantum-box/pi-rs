@@ -770,6 +770,14 @@ arbitrary live components and passes a footer data provider to its
 factory. Native extensions supply updated rows through non-blocking host UI
 requests, including in terminal session and selection callbacks.
 
+### Native extension working indicator
+
+Native extensions can change the working message, hide the working display,
+or supply static or animated indicator frames. Regular and fullscreen modes
+use their existing editor border and keep the elapsed time and cancel hint.
+Pi accepts styled terminal strings in custom frames. Native frames use plain
+text in the active border theme. Retry, summary, and shell status are retained.
+
 ### Native custom message renderers
 
 Native Rust and executable extensions can match a visible custom message by

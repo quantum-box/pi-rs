@@ -100,6 +100,21 @@ when switching sessions or replacing the extension worker. Pi's arbitrary
 live components and footer data provider remain specific to its TypeScript UI
 API.
 
+## Customize the working indicator
+
+`SetWorkingMessage` changes the working text during an agent turn.
+`SetWorkingVisible` hides or shows that text and its indicator. Use
+`SetWorkingIndicator` to set `options.frames` and `options.intervalMs`.
+One frame gives a static indicator, and an empty array hides just the
+indicator. Omit `message` or `options` to restore the terminal default.
+Executable extensions use `setWorkingMessage`, `setWorkingVisible`, and
+`setWorkingIndicator` with the same fields.
+
+Both terminal modes render custom frames as single-line text in the active
+border theme. Retries, summaries, and standalone shell runs keep their own
+status. Overrides apply across turns and reset with the extension worker or
+a new session.
+
 ## Observe extension UI prompts
 
 Opt in with `handles_lifecycle` and `handles_ui_prompt_lifecycle` to observe

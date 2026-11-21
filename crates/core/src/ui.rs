@@ -126,6 +126,18 @@ pub struct UiComponentAction {
     pub label: Option<String>,
 }
 
+/// Configure the indicator shown while the interactive agent is working.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingIndicatorOptions {
+    /// A single frame is static. Empty frames hide the indicator glyph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<Vec<String>>,
+    /// Omit or set to zero to use the default interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "method",
@@ -198,6 +210,19 @@ pub enum UiRequest {
         #[serde(default)]
         lines: Option<Vec<Vec<UiComponentSpan>>>,
     },
+    /// Override the working message. Clear it with `None`.
+    SetWorkingMessage {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    SetWorkingVisible {
+        visible: bool,
+    },
+    /// Override the working animation. Restore the default with `None`.
+    SetWorkingIndicator {
+        #[serde(default)]
+        options: Option<WorkingIndicatorOptions>,
+    },
     SetTitle {
         title: String,
     },
@@ -253,6 +278,26 @@ impl UiRequest {
                     .any(|span| span.color.as_ref().is_some_and(|color| color.len() > 128)))
         {
             return Err("extension header or footer exceeds its rendering limits".into());
+        }
+        if let Self::SetWorkingMessage {
+            message: Some(message),
+        } = self
+            && (message.len() > 4096 || message.chars().any(char::is_control))
+        {
+            return Err(
+                "extension working message must be a single line of at most 4096 bytes".into(),
+            );
+        }
+        if let Self::SetWorkingIndicator {
+            options: Some(options),
+        } = self
+            && let Some(frames) = &options.frames
+            && (frames.len() > 64
+                || frames
+                    .iter()
+                    .any(|frame| frame.len() > 256 || frame.chars().any(char::is_control)))
+        {
+            return Err("extension working indicator supports 64 single-line frames of at most 256 bytes each".into());
         }
         if let Self::Custom { lines, actions, .. } = self {
             if !component_lines_within_limits(lines) {
@@ -323,6 +368,39 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn working_indicator_uses_pi_fields_and_validates_single_line_frames() {
+        let value = serde_json::json!({
+            "method": "setWorkingIndicator",
+            "options": {"frames": ["a", "b"], "intervalMs": 250}
+        });
+        let request: UiRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), value);
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+
+        for value in [
+            serde_json::json!({"method": "setWorkingIndicator", "options": {"frames": []}}),
+            serde_json::json!({"method": "setWorkingIndicator"}),
+            serde_json::json!({"method": "setWorkingMessage"}),
+            serde_json::json!({"method": "setWorkingVisible", "visible": false}),
+        ] {
+            let request: UiRequest = serde_json::from_value(value).unwrap();
+            assert!(request.validate().is_ok());
+            assert!(!request.needs_response());
+        }
+
+        for frames in [vec!["x"; 65], vec!["\x1b[31mA"], vec!["a\nb"]] {
+            let request = UiRequest::SetWorkingIndicator {
+                options: Some(WorkingIndicatorOptions {
+                    frames: Some(frames.into_iter().map(str::to_owned).collect()),
+                    interval_ms: None,
+                }),
+            };
+            assert!(request.validate().is_err());
+        }
+    }
+
     #[test]
     fn header_footer_updates_are_bounded_and_do_not_open_prompts() {
         let rows = vec![vec![UiComponentSpan {
