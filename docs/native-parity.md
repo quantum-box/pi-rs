@@ -901,9 +901,10 @@ expanding a quoted prompt argument before the model request.
 ### Local MCP checkpoint
 
 As in Pi, an MCP connection advertises filesystem roots and answers
-`roots/list` with its workspace's file URI and directory name. A server's
-stdio launch directory can be overridden independently. The roots response
-contains the workspace location and no file contents.
+`roots/list` with its resolved workspace's file URI and directory name. A
+server's stdio launch directory can be overridden independently. The roots
+response contains the workspace location and no file contents. The default
+initialize handshake offers protocol version `2025-11-25`, as in Pi 1.6.0.
 
 MCP server `notifications/message` entries append to `mcp.log` in the agent
 directory with the timestamp, configured server name, severity and logger.

@@ -103,16 +103,19 @@ struct WorkspaceRoot {
 }
 
 impl NativeClient {
-    fn for_server(name: &str, workspace: &Path) -> Self {
-        let workspace_root = std::path::absolute(workspace).ok().and_then(|path| {
-            let uri = reqwest_mcp::Url::from_file_path(&path).ok()?.to_string();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            Some(WorkspaceRoot { uri, name })
-        });
+    async fn for_server(name: &str, workspace: &Path) -> Self {
+        let workspace_root = tokio::fs::canonicalize(workspace)
+            .await
+            .ok()
+            .and_then(|path| {
+                let uri = reqwest_mcp::Url::from_file_path(&path).ok()?.to_string();
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                Some(WorkspaceRoot { uri, name })
+            });
         Self {
             server_name: Some(Arc::from(name)),
             workspace_root,
@@ -173,7 +176,8 @@ impl Drop for InteractionGuard {
 }
 impl rmcp::ClientHandler for NativeClient {
     fn get_info(&self) -> rmcp::model::ClientConfig {
-        let mut info = rmcp::model::ClientConfig::default();
+        let mut info = rmcp::model::ClientConfig::default()
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE);
         info.capabilities.roots = self.workspace_root.as_ref().map(|_| Default::default());
         info.capabilities.elicitation = Some(
             rmcp::model::ElicitationCapability::new()
@@ -690,11 +694,13 @@ impl McpExtension {
                 let service = match owned_stdio {
                     Some(owner) => {
                         NativeClient::for_server(name, workspace)
+                            .await
                             .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
                             .await
                     }
                     None => {
                         NativeClient::for_server(name, workspace)
+                            .await
                             .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
                             .await
                     }
@@ -784,7 +790,7 @@ impl McpExtension {
                         })?);
                     let native = NativeClient {
                         dispatch_closed: client.dispatch_state.clone(),
-                        ..NativeClient::for_server(name, workspace)
+                        ..NativeClient::for_server(name, workspace).await
                     };
                     start_http_service(native, client, transport_config, lifecycle).await
                 } else if let Some(resolver) = provider_token.clone() {
@@ -794,7 +800,7 @@ impl McpExtension {
                         resolver,
                     };
                     start_http_service(
-                        NativeClient::for_server(name, workspace),
+                        NativeClient::for_server(name, workspace).await,
                         client,
                         transport_config,
                         lifecycle,
@@ -802,7 +808,7 @@ impl McpExtension {
                     .await
                 } else {
                     start_http_service(
-                        NativeClient::for_server(name, workspace),
+                        NativeClient::for_server(name, workspace).await,
                         client,
                         transport_config,
                         lifecycle,
@@ -2113,6 +2119,7 @@ mod tests {
             transport.read_line(&mut line).await.unwrap();
             let init: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(init["method"], "initialize");
+            assert_eq!(init["params"]["protocolVersion"], "2025-11-25");
             assert!(init["params"]["capabilities"]["roots"].is_object());
             let reply = json!({
                 "jsonrpc":"2.0", "id": init["id"],
@@ -2140,11 +2147,11 @@ mod tests {
             transport.read_line(&mut line).await.unwrap();
             serde_json::from_str::<Value>(&line).unwrap()
         };
+        let native = NativeClient::for_server("fixture", &workspace).await;
         let (response, client) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 server,
-                NativeClient::for_server("fixture", &workspace)
-                    .serve_with_lifecycle(client_transport, ClientLifecycleMode::Initialize),
+                native.serve_with_lifecycle(client_transport, ClientLifecycleMode::Initialize),
             )
         })
         .await
@@ -2161,8 +2168,31 @@ mod tests {
             reqwest_mcp::Url::parse(uri)
                 .unwrap()
                 .to_file_path()
+                .unwrap()
+                .canonicalize()
                 .unwrap(),
-            workspace
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_workspace_root_resolves_symlinks_before_parent_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let child = physical.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let native = NativeClient::for_server("fixture", &alias.join("..")).await;
+        let root = native.workspace_root.unwrap();
+        assert_eq!(root.name, "physical");
+        assert_eq!(
+            reqwest_mcp::Url::parse(&root.uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            physical.canonicalize().unwrap()
         );
     }
 
