@@ -195,13 +195,15 @@ mod tests {
                 json!({"enabled":true,"effort":"low","budget":676,"literal":null}),
             ),
         ] {
-            let mut body = json!({});
-            let budget = compat
-                .thinking_budget_options(&mut body, Some(level), None, max, Some(true))
-                .unwrap();
-            let effort = if enabled { Some(level) } else { None };
-            compat.reasoning_options(&mut body, Some(true), enabled, effort, true, budget);
-            assert_eq!(body, json!({"chat_template_kwargs":expected}));
+            for supported in [Some(true), None] {
+                let mut body = json!({});
+                let budget = compat
+                    .thinking_budget_options(&mut body, Some(level), None, max, supported)
+                    .unwrap();
+                let effort = if enabled { Some(level) } else { None };
+                compat.reasoning_options(&mut body, supported, enabled, effort, true, budget);
+                assert_eq!(body, json!({"chat_template_kwargs":expected}));
+            }
         }
     }
 }
@@ -351,19 +353,25 @@ impl ChatCompatibility {
         max_tokens: u32,
         supported: Option<bool>,
     ) -> pi_rs_core::Result<Option<u32>> {
-        let field = self
-            .thinking_token_budget_field
-            .map(ThinkingBudgetField::as_str)
-            .or_else(|| {
-                (self.supports_thinking_token_budget == Some(true))
-                    .then_some("thinking_token_budget")
-            });
+        if supported == Some(false) {
+            return Ok(None);
+        }
+        let field = if supported == Some(true) {
+            self.thinking_token_budget_field
+                .map(ThinkingBudgetField::as_str)
+                .or_else(|| {
+                    (self.supports_thinking_token_budget == Some(true))
+                        .then_some("thinking_token_budget")
+                })
+        } else {
+            None
+        };
         let template_wants_budget = self.thinking_template().is_some_and(|(_, template)| {
             template
                 .values()
                 .any(|value| value.get("$var").and_then(Value::as_str) == Some("thinking.budget"))
         });
-        if supported != Some(true) || (field.is_none() && !template_wants_budget) {
+        if field.is_none() && !template_wants_budget {
             return Ok(None);
         }
         let (key, default) = match level {

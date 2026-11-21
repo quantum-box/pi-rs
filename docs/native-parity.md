@@ -4906,8 +4906,10 @@ the answer within the host's output limit. Off and non-reasoning models omit the
 field. Discovered Ollama reasoning capability is carried through the RPC and
 interactive worker to the request, even when discovery omits explicit thinking
 levels. Both `chatTemplateArgs` for Baseten and `chatTemplateKwargs` for
-`chat-template` can resolve `thinking.budget` using the same cap. The variable
-is omitted when thinking is off or no budget fits. Loopback tests cover the
+`chat-template` can resolve `thinking.budget` using the same cap. An explicitly
+configured template can use a selected budget for a pi-rs custom model with
+unspecified reasoning capability. The variable is omitted when thinking is off
+or no budget fits. Loopback tests cover the
 top-level field and a Baseten template argument. Live compatible-server
 verification remains open.
 
