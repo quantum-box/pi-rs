@@ -924,6 +924,7 @@ pub(super) struct Inspection {
     description: String,
     tools: Vec<String>,
     pub config: Option<ServerConfig>,
+    oauth: Option<ManagerAction>,
 }
 
 fn inspection_entries(
@@ -959,6 +960,7 @@ fn inspection_entries(
                 ),
                 tools: Vec::new(),
                 config: parsed,
+                oauth: None,
             }
         })
         .collect()
@@ -979,6 +981,8 @@ pub(super) enum ManagerAction {
     Reconnect,
     SetEnabled { enabled: bool, project: bool },
     SetExposure(&'static str),
+    SignIn,
+    SignOut,
 }
 
 pub(super) struct ManagerRequest {
@@ -986,6 +990,170 @@ pub(super) struct ManagerRequest {
     pub config: ServerConfig,
     pub action: ManagerAction,
     scope: InspectionScope,
+}
+
+pub(super) fn check_manager_connection(
+    args: &Cli,
+    name: &str,
+    expected: &ServerConfig,
+) -> Result<()> {
+    let current = configurations(args)?
+        .remove(name)
+        .map(serde_json::from_value::<ServerConfig>)
+        .transpose()?;
+    if current.as_ref() != Some(expected)
+        || args
+            .disable_extension
+            .contains(&format!("mcp-{}", name.replace('-', "_")))
+        || expected.enabled == Some(false)
+    {
+        return Err(Error::Config(
+            "MCP configuration changed. Reload before connecting.".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn manager_login(
+    args: &Cli,
+    pending: &PendingSignIn,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    use pi_rs_workbench::mcp_auth::{CliLoginClient, login_cli_with_precommit};
+    check_manager_connection(args, &pending.name, &pending.config)?;
+    let url = pending
+        .config
+        .url
+        .as_deref()
+        .ok_or_else(|| Error::Config("MCP OAuth requires HTTP".into()))?;
+    let (announce, announcement) = tokio::sync::oneshot::channel();
+    let announce = std::sync::Mutex::new(Some(announce));
+    let (redirect, manual_redirect) = tokio::sync::oneshot::channel();
+    let client = CliLoginClient::Interactive {
+        settings: pending.config.oauth_client(),
+        challenge: pending.challenge.as_deref(),
+        manual_redirect,
+    };
+    let paths = std::iter::once(path(args, false))
+        .chain(args.trusted.then(|| path(args, true)))
+        .collect();
+    let validate_args = args.clone();
+    let validate = pending.clone();
+    let options = super::http_proxy::configured_mcp(&args.settings)?;
+    let login_cancel = cancel.child_token();
+    let login = login_cli_with_precommit(
+        &pending.name,
+        url,
+        client,
+        &[],
+        Some(&options),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+        &login_cancel,
+        |url| {
+            if let Some(send) = announce.lock().expect("MCP authorization URL").take() {
+                let _ = send.send(url.to_owned());
+            }
+        },
+        paths,
+        move || check_manager_connection(&validate_args, &validate.name, &validate.config),
+    );
+    let present = present_mcp_login(&pending.name, announcement, redirect, ui, &login_cancel);
+    tokio::pin!(login, present);
+    tokio::select! {
+        biased;
+        result = &mut login => result,
+        delivered = &mut present => {
+            if let Err(error) = delivered {
+                login_cancel.cancel();
+                let result = login.await;
+                if matches!(result, Err(Error::Cancelled)) {
+                    return Err(error);
+                }
+                return result;
+            }
+            login.await
+        }
+    }
+}
+
+async fn present_mcp_login(
+    name: &str,
+    announcement: tokio::sync::oneshot::Receiver<String>,
+    redirect: tokio::sync::oneshot::Sender<reqwest_mcp::Url>,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let authorization = announcement.await.map_err(|_| Error::Cancelled)?;
+    let parsed = reqwest_mcp::Url::parse(&authorization)
+        .map_err(|_| Error::Config("Invalid MCP authorization URL".into()))?;
+    let parameter = |expected| {
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == expected).then(|| value.into_owned()))
+    };
+    let state = parameter("state")
+        .ok_or_else(|| Error::Config("MCP authorization state is missing".into()))?;
+    let callback = parameter("redirect_uri")
+        .and_then(|url| reqwest_mcp::Url::parse(&url).ok())
+        .ok_or_else(|| Error::Config("MCP authorization callback is missing".into()))?;
+    let mut notes = vec!["Open this authorization URL in your browser.".to_owned()];
+    notes.extend(
+        authorization
+            .as_bytes()
+            .chunks(64)
+            .map(|part| String::from_utf8_lossy(part).into_owned()),
+    );
+    let displayed = ui
+        .request(
+            UiRequest::Custom {
+                title: format!("Sign in to MCP {name}"),
+                lines: notes
+                    .into_iter()
+                    .map(|text| {
+                        vec![UiComponentSpan {
+                            text,
+                            ..Default::default()
+                        }]
+                    })
+                    .collect(),
+                actions: vec![UiComponentAction {
+                    key: "enter".into(),
+                    value: "paste".into(),
+                    label: Some("Paste redirect URL".into()),
+                }],
+                timeout: None,
+            },
+            cancel.clone(),
+        )
+        .await;
+    if displayed != Ok(UiResponse::Text("paste".into())) {
+        return Err(Error::Cancelled);
+    }
+    let mut title = "Paste the browser redirect URL";
+    loop {
+        let answer = ui
+            .request(
+                UiRequest::Input {
+                    title: title.into(),
+                    initial_value: None,
+                    placeholder: None,
+                    timeout: None,
+                },
+                cancel.clone(),
+            )
+            .await;
+        let Ok(UiResponse::Text(value)) = answer else {
+            return Err(Error::Cancelled);
+        };
+        if let Some(url) =
+            pi_rs_workbench::oauth_callback::manual_redirect(&value, &callback, &state)
+        {
+            let _ = redirect.send(url);
+            return Ok(());
+        }
+        title = "Invalid redirect URL. Paste the full browser redirect URL";
+    }
 }
 
 pub(super) async fn edit_manager_config(
@@ -1085,6 +1253,7 @@ pub(super) async fn edit_manager_config(
 pub(super) async fn inspect_servers(
     configured: &[Inspection],
     connected: &[Arc<McpExtension>],
+    pending: &BTreeMap<String, PendingSignIn>,
     selected: Option<(&str, &str)>,
     project_trusted: bool,
     ui: &dyn ExtensionUi,
@@ -1097,6 +1266,9 @@ pub(super) async fn inspect_servers(
             .find(|server| server.server_name == entry.name)
         {
             entry.status = "connected";
+            if server.uses_oauth() {
+                entry.oauth = Some(ManagerAction::SignOut);
+            }
             entry.description = inspection_description(&server.description);
             entry.tools = server
                 .remote_tool_names()
@@ -1108,10 +1280,16 @@ pub(super) async fn inspect_servers(
                     )
                 })
                 .collect();
+        } else if pending.get(&entry.name).is_some_and(|pending| {
+            pending.config.enabled != Some(false) && entry.config.as_ref() == Some(&pending.config)
+        }) {
+            entry.status = "needs sign-in";
+            entry.oauth = Some(ManagerAction::SignIn);
         }
     }
     // Put disconnected and invalid entries first, as the Pi manager does.
-    entries.sort_by_key(|entry| !matches!(entry.status, "disconnected" | "invalid"));
+    entries
+        .sort_by_key(|entry| !matches!(entry.status, "disconnected" | "invalid" | "needs sign-in"));
     let options = entries
         .iter()
         .map(|entry| {
@@ -1130,7 +1308,6 @@ pub(super) async fn inspect_servers(
         let _ = show_inspection(
             "MCP servers".into(),
             vec!["No MCP servers configured.".into()],
-            false,
             None,
             false,
             ui,
@@ -1175,8 +1352,7 @@ pub(super) async fn inspect_servers(
             let action = show_inspection(
                 format!("MCP server · {}", entry.name),
                 lines.clone(),
-                !entry.tools.is_empty(),
-                enabled,
+                Some(entry),
                 project_trusted && entry.scope == InspectionScope::Global,
                 ui,
                 cancel,
@@ -1188,6 +1364,16 @@ pub(super) async fn inspect_servers(
                     let mut tool_page = 0;
                     let _ =
                         select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
+                }
+                ("oauth", Some(config)) => {
+                    if let Some(action) = entry.oauth {
+                        return Ok(Some(ManagerRequest {
+                            name: entry.name.clone(),
+                            config: config.clone(),
+                            scope: entry.scope,
+                            action,
+                        }));
+                    }
                 }
                 ("exposure", Some(config)) if enabled == Some(true) => {
                     if let Some(exposure) = choose_exposure(entry, ui, cancel).await? {
@@ -1249,8 +1435,7 @@ async fn choose_exposure(
 async fn show_inspection(
     title: String,
     lines: Vec<String>,
-    tools: bool,
-    enabled: Option<bool>,
+    entry: Option<&Inspection>,
     project_toggle: bool,
     ui: &dyn ExtensionUi,
     cancel: &CancellationToken,
@@ -1260,11 +1445,26 @@ async fn show_inspection(
         value: "back".into(),
         label: Some("Back".into()),
     }];
-    if tools {
+    if entry.is_some_and(|entry| !entry.tools.is_empty()) {
         actions.push(UiComponentAction {
             key: "t".into(),
             value: "tools".into(),
             label: Some("Tools".into()),
+        });
+    }
+    let enabled = entry
+        .and_then(|entry| entry.config.as_ref())
+        .map(|config| config.enabled != Some(false));
+    if let Some(action) = entry.and_then(|entry| entry.oauth) {
+        let (key, label) = if matches!(action, ManagerAction::SignIn) {
+            ("i", "Sign in")
+        } else {
+            ("o", "Sign out")
+        };
+        actions.push(UiComponentAction {
+            key: key.into(),
+            value: "oauth".into(),
+            label: Some(label.into()),
         });
     }
     if enabled == Some(true) {

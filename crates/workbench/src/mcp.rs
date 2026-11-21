@@ -1065,6 +1065,11 @@ impl McpExtension {
         tool_exposure_with_default(&self.connection.config, name, self.exposure.as_deref())
     }
 
+    /// Whether the running HTTP connection uses saved MCP OAuth credentials.
+    pub fn uses_oauth(&self) -> bool {
+        self.connection.identity().oauth_generation.is_some()
+    }
+
     /// Whether the server advertised the resources capability at discovery.
     pub fn offers_resources(&self) -> bool {
         self.catalog.has_resources

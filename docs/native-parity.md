@@ -938,7 +938,16 @@ session. The project-only action adds an override for a global server in a
 trusted project. Exposure changes between codemode, deferred and direct
 save to the server's effective configuration scope and update the model's
 tool declarations without restarting the connection. Per-tool overrides
-retain precedence. Use the CLI MCP commands to manage credentials.
+retain precedence. The manager offers Sign in for a server requiring OAuth
+and Sign out for a live OAuth connection. Sign-in opens the browser, checks
+the applied configuration before saving credentials, and reconnects the
+server. Sign-out clears the selected server's stored credentials and removes
+its live tools. The sign-in panel shows the authorization URL and can accept
+a pasted redirect URL if the browser cannot reach the loopback callback.
+Both routes validate the callback origin, path and OAuth state. Loopback
+tests covered nonstandard metadata discovery, browser and pasted callbacks,
+a rejected state, sign-out and a reconnect failure after sign-in. Hosted
+OAuth with a pi-rs client identity still requires live acceptance.
 
 Trusted project overrides of a global MCP server reject unknown fields and
 invalid values before applying any part of that override, so a typo or

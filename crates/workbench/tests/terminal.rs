@@ -4075,3 +4075,19 @@ for line in sys.stdin:
     master.write_all(b"t").unwrap();
     output_until(&mut master, |text| text.contains("fixture_tool · hidden"));
 }
+
+#[test]
+fn mcp_manager_handles_loopback_oauth_sign_in_and_sign_out() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp_manager_oauth.py");
+    let output = Command::new("python3")
+        .arg(fixture)
+        .arg(env!("CARGO_BIN_EXE_pi"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

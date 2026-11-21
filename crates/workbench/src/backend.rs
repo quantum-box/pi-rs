@@ -1191,17 +1191,16 @@ async fn run_worker(
         let mut operation = Box::pin(async {
             if matches!(
                 &request,
-                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus { .. }
+                Request::Prompt { .. }
+                    | Request::TriggerCustom { .. }
+                    | Request::McpStatus { inspect: false }
             ) {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
                     result = async {
                         runtime.authorize_pending_mcp(&args, ui.as_ref(), &cancel).await?;
-                        if !matches!(&request, Request::McpStatus { inspect: true }) {
-                            runtime.refresh_mcp(&args).await?;
-                        }
-                        Ok::<_, Error>(())
+                        runtime.refresh_mcp(&args).await
                     } => result?,
                 }
             }
