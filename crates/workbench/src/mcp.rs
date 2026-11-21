@@ -1183,14 +1183,6 @@ fn mcp_tool_outcome(mut data: Value) -> Outcome {
     if let Some(fields) = data.as_object_mut() {
         fields.shift_remove("_meta");
     }
-    if data["isError"] == true {
-        return Outcome::TextResultWithStructuredContent {
-            output: format!("Tool failed: {data}"),
-            details: None,
-            structured_content: data,
-            is_error: true,
-        };
-    }
     Outcome::Structured {
         data,
         attachments: vec![],
@@ -2642,20 +2634,14 @@ mod tests {
         });
         let outcome = mcp_tool_outcome(result.clone());
         assert!(outcome.is_error());
-        assert!(outcome.tool_content().starts_with("Tool failed: "));
+        assert!(outcome.tool_content().contains("not available"));
         assert!(!outcome.tool_content().contains("private server metadata"));
-        let Outcome::TextResultWithStructuredContent {
-            structured_content, ..
-        } = outcome
-        else {
+        let Outcome::Structured { data, .. } = outcome else {
             panic!("MCP error result was discarded");
         };
-        assert_eq!(
-            structured_content["structuredContent"],
-            result["structuredContent"]
-        );
-        assert!(structured_content.get("_meta").is_none());
-        assert_eq!(structured_content["isError"], true);
+        assert_eq!(data["structuredContent"], result["structuredContent"]);
+        assert!(data.get("_meta").is_none());
+        assert_eq!(data["isError"], true);
 
         let success = mcp_tool_outcome(json!({"content":[],"_meta":{"secret":"private"}}));
         assert!(!success.is_error());

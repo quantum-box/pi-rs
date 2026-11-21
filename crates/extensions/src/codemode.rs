@@ -801,15 +801,12 @@ fn nested_tool_value(name: &str, outcome: Outcome) -> Value {
     // MCP call errors can carry recovery data. Transport errors and native
     // tool errors still reject their promises through the standard path.
     if name.starts_with("mcp__")
-        && let Outcome::TextResultWithStructuredContent {
-            structured_content,
-            is_error: true,
-            ..
-        } = &outcome
-        && structured_content["content"].is_array()
-        && structured_content["isError"] == true
+        && let Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } =
+            &outcome
+        && data["content"].is_array()
+        && data["isError"] == true
     {
-        return json!({"ok":true,"value":structured_content});
+        return json!({"ok":true,"value":data});
     }
     tool_value(outcome)
 }
@@ -1684,21 +1681,20 @@ mod tests {
                 if name.ends_with("offline") {
                     return Outcome::Unknown("connection closed".into());
                 }
-                let recovered = name.ends_with("recovered");
-                Outcome::TextResultWithStructuredContent {
-                    output: if recovered {
-                        "recovered by extension"
-                    } else {
-                        "Tool failed: not ready"
-                    }
-                    .into(),
-                    details: None,
-                    is_error: !recovered,
-                    structured_content: json!({
+                if name.ends_with("recovered") {
+                    return Outcome::TextResult {
+                        output: "recovered by extension".into(),
+                        details: None,
+                        is_error: false,
+                    };
+                }
+                Outcome::Structured {
+                    data: json!({
                         "isError":true,
                         "content":[{"type":"text","text":"not ready"}],
                         "structuredContent":{"retryable":true}
                     }),
+                    attachments: vec![],
                 }
             }
         }

@@ -3895,7 +3895,9 @@ impl Agent<'_> {
             }
             outcome @ Outcome::Structured { .. } => {
                 let size = outcome.tool_content().len();
-                if size > max_output_bytes {
+                if size > max_output_bytes && outcome.is_error() {
+                    Outcome::Failed("failure detail exceeds size limit".into())
+                } else if size > max_output_bytes {
                     Outcome::Truncated {
                         original_bytes: size,
                     }
