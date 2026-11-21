@@ -802,7 +802,9 @@ fn nested_tool_value(name: &str, outcome: Outcome) -> Value {
     // tool errors still reject their promises through the standard path.
     if name.starts_with("mcp__")
         && let Outcome::TextResultWithStructuredContent {
-            structured_content, ..
+            structured_content,
+            is_error: true,
+            ..
         } = &outcome
         && structured_content["content"].is_array()
         && structured_content["isError"] == true
@@ -1665,23 +1667,33 @@ mod tests {
                 true
             }
             fn tools(&self) -> Vec<ToolSpec> {
-                ["mcp__fixture__check", "mcp__fixture__offline"]
-                    .into_iter()
-                    .map(|name| ToolSpec {
-                        name: name.into(),
-                        description: "fixture".into(),
-                        parameters: json!({"type":"object"}),
-                    })
-                    .collect()
+                [
+                    "mcp__fixture__check",
+                    "mcp__fixture__offline",
+                    "mcp__fixture__recovered",
+                ]
+                .into_iter()
+                .map(|name| ToolSpec {
+                    name: name.into(),
+                    description: "fixture".into(),
+                    parameters: json!({"type":"object"}),
+                })
+                .collect()
             }
             async fn call(&self, name: &str, _: Value) -> Outcome {
                 if name.ends_with("offline") {
                     return Outcome::Unknown("connection closed".into());
                 }
+                let recovered = name.ends_with("recovered");
                 Outcome::TextResultWithStructuredContent {
-                    output: "Tool failed: not ready".into(),
+                    output: if recovered {
+                        "recovered by extension"
+                    } else {
+                        "Tool failed: not ready"
+                    }
+                    .into(),
                     details: None,
-                    is_error: true,
+                    is_error: !recovered,
                     structured_content: json!({
                         "isError":true,
                         "content":[{"type":"text","text":"not ready"}],
@@ -1700,6 +1712,9 @@ mod tests {
                     throw new Error("missing MCP error data");
                 }
                 text(result.content[0].text);
+                if (await tools.mcp__fixture__recovered({}) !== "recovered by extension") {
+                    throw new Error("MCP result ignored the extension's status override");
+                }
                 try {
                     await tools.mcp__fixture__offline({});
                     text("unexpected transport success");
