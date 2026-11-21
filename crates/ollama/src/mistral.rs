@@ -203,6 +203,17 @@ impl CallIds {
     }
 }
 
+// A repeated fragment may instead extend a longer declared tool name.
+pub(super) fn repeats_declared_name(tools: &[String], accumulated: &str, delta: &str) -> bool {
+    if accumulated != delta || !tools.iter().any(|name| name == accumulated) {
+        return false;
+    }
+    !tools.iter().any(|name| {
+        name.strip_prefix(accumulated)
+            .is_some_and(|suffix| suffix.starts_with(delta))
+    })
+}
+
 pub(super) fn stream_call_index(
     id: Option<&str>,
     function: Option<&super::WireFunction>,
@@ -392,8 +403,19 @@ mod tests {
     use super::*;
     use crate::Ollama;
     use futures_util::StreamExt;
-    use pi_rs_core::{Model, ModelEvent, ModelRequest, ToolCall};
+    use pi_rs_core::{Model, ModelEvent, ModelRequest, ToolCall, ToolSpec};
     use std::io::{BufRead, BufReader, Read, Write};
+
+    #[test]
+    fn preserves_repeated_fragments_of_a_declared_name() {
+        assert!(repeats_declared_name(&["read".into()], "read", "read"));
+        assert!(!repeats_declared_name(&["readread".into()], "read", "read"));
+        assert!(!repeats_declared_name(
+            &["read".into(), "readread_other".into()],
+            "read",
+            "read"
+        ));
+    }
 
     #[test]
     fn rejects_ambiguous_mistral_tool_continuations() {
@@ -537,7 +559,14 @@ mod tests {
             messages: vec![Message::User {
                 content: "hello".into(),
             }],
-            tools: vec![],
+            tools: ["read", "list"]
+                .into_iter()
+                .map(|name| ToolSpec {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                })
+                .collect(),
             max_output_tokens: 32,
         };
         let mut stream = client.stream(request).await.unwrap();

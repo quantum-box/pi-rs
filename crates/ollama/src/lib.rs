@@ -1104,6 +1104,14 @@ impl Ollama {
                 })
                 .collect()
         });
+        let declared_mistral_tools: Vec<String> = if mistral {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut body = json!({"model":request.model,"messages":messages,"stream":true});
         if mistral {
             body["max_tokens"] = json!(request.max_output_tokens);
@@ -1403,7 +1411,7 @@ impl Ollama {
                             if id == "null" {
                                 id.clear();
                             }
-                            if name == call.name {
+                            if mistral::repeats_declared_name(&declared_mistral_tools, &call.name, &name) {
                                 name.clear();
                             }
                             if !call.id.is_empty() {
