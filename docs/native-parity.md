@@ -264,8 +264,12 @@ still fail validation before submission.
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
 provider, and the explicit image-blocking setting retains precedence.
-Local image reads also report when the selected model cannot receive images;
-the saved tool result retains the image for later use with a compatible model.
+Local image reads report `details.imageUnsupportedByModel` in JSON and RPC
+when the selected model cannot receive an image. The terminal displays the
+warning in collapsed and expanded results, as in Pi 1.6.0. The saved result
+retains the image for a later vision model, and the warning stays out of
+model-facing text. The SDK's boolean image-support option retains its text-note
+behavior for existing callers.
 
 OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
 partial response and report the `length` finish reason. Across model providers,
