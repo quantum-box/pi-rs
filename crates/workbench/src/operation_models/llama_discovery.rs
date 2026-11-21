@@ -110,12 +110,14 @@ impl Model {
 }
 
 pub(super) fn classifier_endpoints(root: &Url, api: Api) -> Option<(Url, Url)> {
-    let inference = match api {
-        Api::SystemOne => llama_cpp::endpoint(root, "v1"),
-        Api::LlamaCppClassifier => root.clone(),
-        _ => return None,
-    };
-    operation_endpoints(inference.as_str(), api, false).ok()
+    match api {
+        Api::SystemOne => {
+            let base = llama_cpp::endpoint(root, "v1");
+            operation_endpoints(base.as_str(), api, false).ok()
+        }
+        Api::LlamaCppClassifier => Some((root.clone(), llama_cpp::endpoint(root, api.route()))),
+        _ => None,
+    }
 }
 
 fn server_root(server: &str) -> Option<Url> {

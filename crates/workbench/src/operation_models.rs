@@ -1392,20 +1392,20 @@ mod tests {
             "llama.cpp": {
                 "models": [
                     {"id":"chat","type":"classifier","api":"llama-cpp-classify",
-                     "baseUrl":"https://router.example/prefix/v1"},
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
                     {"id":"decisions","type":"classifier","api":"typesafe-system-one",
-                     "baseUrl":"https://router.example/prefix/v1"},
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
                     {"id":"other-path","type":"classifier","api":"llama-cpp-classify",
-                     "baseUrl":"https://router.example/other/v1"},
+                     "baseUrl":"https://router.example/prefix/v1"},
                     {"id":"other-host","type":"classifier","api":"llama-cpp-classify",
-                     "baseUrl":"https://other.example/prefix/v1"}
+                     "baseUrl":"https://other.example/prefix/v1/v1"}
                 ]
             }
         });
         let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
         let keys = Keys::default();
         let env = |name: &str| match name {
-            "LLAMA_BASE_URL" => Some("https://router.example/prefix/v1/".into()),
+            "LLAMA_BASE_URL" => Some("https://router.example/prefix/v1/v1/".into()),
             "LLAMA_API_KEY" => Some("router-key".into()),
             _ => None,
         };
