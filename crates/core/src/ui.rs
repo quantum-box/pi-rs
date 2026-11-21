@@ -232,6 +232,10 @@ pub enum UiRequest {
     SetTitle {
         title: String,
     },
+    /// Paste text at the main editor cursor using the frontend's paste behavior.
+    PasteToEditor {
+        text: String,
+    },
     #[serde(rename = "set_editor_text", alias = "setEditorText")]
     SetEditorText {
         text: String,
@@ -382,6 +386,15 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paste_to_editor_uses_the_pi_request_without_opening_a_dialog() {
+        let value = serde_json::json!({"method":"pasteToEditor","text":"a\r\nb"});
+        let request: UiRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), value);
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+    }
+
     #[test]
     fn hidden_thinking_label_accepts_blank_and_reset_without_a_response() {
         for label in [

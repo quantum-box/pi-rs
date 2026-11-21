@@ -786,6 +786,14 @@ the block and spacing while collapsed. Changes preserve each block's
 expansion state and the recorded thinking content. Native labels are
 limited to 16 rendered rows.
 
+### Native extension editor paste
+
+Native `pasteToEditor` inserts literal text into the prompt draft without
+dispatching key events. The main editor applies the same behavior to
+extension, terminal, and text clipboard pastes. Pastes over ten lines or 1000
+UTF-16 code units display a Pi-style marker. The full draft is available to
+editor reads, submission, and external editing.
+
 ### Native custom message renderers
 
 Native Rust and executable extensions can match a visible custom message by

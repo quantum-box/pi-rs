@@ -1354,6 +1354,7 @@ impl View {
                 title.retain(|character| !character.is_control());
                 self.pending_terminal_title = Some(title);
             }
+            pi_rs::UiRequest::PasteToEditor { text } => self.paste_editor_text(&text),
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
@@ -1627,6 +1628,18 @@ impl View {
             images: self.draft_images.clone(),
         }
     }
+    fn prepare_editor_paste(&mut self) {
+        if self.picker.as_ref().is_some_and(Picker::is_completion) {
+            self.picker = None;
+        }
+        self.history_index = None;
+    }
+
+    fn paste_editor_text(&mut self, text: &str) {
+        self.prepare_editor_paste();
+        self.editor.paste(text);
+    }
+
     fn paste_clipboard(&mut self, args: &Cli) {
         if self.clipboard.is_some() {
             return;
@@ -1654,15 +1667,14 @@ impl View {
             }
         };
         match result {
-            Ok(super::clipboard::Content::Text(text)) => self.editor.insert(&text),
+            Ok(super::clipboard::Content::Text(text)) => self.paste_editor_text(&text),
             Ok(super::clipboard::Content::Files(paths)) => {
                 match super::clipboard::file_text(
                     &paths,
                     self.editor.text.trim_start().starts_with('!'),
                 ) {
                     Ok(text) => {
-                        let before = self.editor.text[..self.editor.cursor].chars().next_back();
-                        let after = self.editor.text[self.editor.cursor..].chars().next();
+                        let (before, after) = self.editor.visible_neighbors();
                         let leading = if before.is_some_and(|value| !value.is_whitespace()) {
                             " "
                         } else {
@@ -1673,6 +1685,7 @@ impl View {
                         } else {
                             ""
                         };
+                        self.prepare_editor_paste();
                         self.editor.insert(&format!("{leading}{text}{trailing}"));
                     }
                     Err(error) => self.append(&error.to_string()),
@@ -5623,10 +5636,12 @@ pub(super) async fn run(
                     dialog.paste(&text);
                 } else if let Some(search) = &mut view.search {
                     search.paste(&text);
-                } else if let Some(picker) = &mut view.picker {
+                } else if let Some(picker) = &mut view.picker
+                    && !picker.is_completion()
+                {
                     picker.paste(&text);
                 } else {
-                    view.editor.insert(&text);
+                    view.paste_editor_text(&text);
                 }
                 dirty = true;
             }
@@ -8950,13 +8965,16 @@ fn complete_input(args: &Cli, view: &mut View) {
         Prompt(Option<String>),
         Other,
     }
-    let prefix = &view.editor.text[..view.editor.cursor];
-    let start = prefix
+    let Some((boundary, prefix)) = view.editor.completion_prefix() else {
+        return;
+    };
+    let start_in_prefix = prefix
         .char_indices()
         .rev()
         .find(|(_, character)| character.is_whitespace())
         .map_or(0, |(index, character)| index + character.len_utf8());
-    let word = &prefix[start..];
+    let word = &prefix[start_in_prefix..];
+    let start = boundary + start_in_prefix;
     let mut candidates = if start == 0 && word.starts_with('/') {
         [
             "/help",
@@ -9091,11 +9109,7 @@ fn complete_input(args: &Cli, view: &mut View) {
 }
 
 fn insert_completion(view: &mut View, range: std::ops::Range<usize>, completion: &str) {
-    let mut text = view.editor.text.clone();
-    let cursor = range.start + completion.len();
-    text.replace_range(range, completion);
-    view.editor.replace(text);
-    view.editor.cursor = cursor;
+    view.editor.replace_range(range, completion);
 }
 
 fn clean(text: &str) -> String {
@@ -11643,6 +11657,61 @@ exit {exit}
         assert!(output.contains("=== Agent messages (JSONL) ==="));
         assert!(output.contains("\"role\":\"user\""));
         assert!(output.contains("question"));
+    }
+
+    #[test]
+    fn completion_after_a_paste_marker_cannot_modify_its_hidden_text() {
+        use clap::Parser;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.workspace = workspace.path().to_owned();
+        std::fs::write(args.workspace.join("unique-file.txt"), "").unwrap();
+        let mut view = View::default();
+        let paste = format!("{}unique", "paragraph\n".repeat(11));
+        view.paste_editor_text(&paste);
+        complete_input(&args, &mut view);
+        assert_eq!(view.editor.text, paste);
+        assert_eq!(view.editor.visible_rows(80, 6).0, ["[paste #1 +12 lines]"]);
+
+        view.editor.insert("uni");
+        complete_input(&args, &mut view);
+        assert_eq!(view.editor.text, format!("{paste}unique-file.txt"));
+        assert_eq!(
+            view.editor.visible_rows(80, 6).0,
+            ["[paste #1 +12 lines]unique-file.txt"]
+        );
+    }
+
+    #[test]
+    fn extension_paste_targets_the_draft_and_get_editor_text_returns_source() {
+        let mut view = View::default();
+        view.editor.replace("leftRIGHT".into());
+        view.editor.cursor = 4;
+        view.history_index = Some(3);
+        view.picker = Some(Picker::completion(vec![("/stale".into(), None)], 0..4, 3));
+        let source = std::iter::repeat_n("row", 11)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let id = uuid::Uuid::new_v4();
+        assert!(
+            view.ui_request(&json!({"id":id,"method":"pasteToEditor","text":source}))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(view.history_index, None);
+        assert!(view.picker.is_none());
+        assert!(view.dialogs.is_empty());
+        assert_eq!(
+            view.editor.visible_rows(80, 6).0,
+            ["left[paste #1 +11 lines]RIGHT"]
+        );
+        let response = view
+            .ui_request(&json!({"id":id,"method":"getEditorText"}))
+            .unwrap();
+        assert_eq!(
+            response,
+            Some((id, pi_rs::UiResponse::Text(format!("left{source}RIGHT"))))
+        );
     }
 
     #[test]
