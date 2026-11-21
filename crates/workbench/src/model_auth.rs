@@ -865,7 +865,9 @@ mod tests {
         ready.await.unwrap();
         tokio::time::pause();
         tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(15)).await;
+        tokio::time::advance(std::time::Duration::from_secs(16)).await;
+        tokio::task::yield_now().await;
+        assert!(wait.is_finished(), "admitted refresh wait did not time out");
         let result = wait.await.unwrap();
         assert!(matches!(result, Err(err) if err.to_string().contains("refresh timed out")));
         finish.send(()).unwrap();
