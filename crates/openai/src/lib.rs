@@ -1031,13 +1031,14 @@ fn limit_visible_output(
         // not a token counter. The agent uses reported usage for accounting.
         let limit = u64::from(allowance).saturating_mul(128);
         let mut visible_units = 0_u64;
+        let mut reasoning_units = 0_u64;
         let mut streamed_tool_units = 0_u64;
         let mut text = BTreeMap::new();
         let mut reasoning = BTreeMap::new();
         while let Some(event) = stream.next().await {
             let event = event?;
             let units = |text: &str| text.encode_utf16().count() as u64;
-            let mut observe = |parts: &mut BTreeMap<u64, u64>, index, content: &str, final_block| {
+            let observe = |parts: &mut BTreeMap<u64, u64>, index, content: &str, final_block| {
                 let previous = parts.entry(index).or_default();
                 let observed = units(content);
                 let added = if final_block {
@@ -1046,15 +1047,26 @@ fn limit_visible_output(
                     observed
                 };
                 *previous = previous.saturating_add(added);
-                visible_units = visible_units.saturating_add(added);
+                added
             };
             match &event {
-                TextDelta { index, delta } => observe(&mut text, *index, delta, false),
-                TextEnd { index, content } => observe(&mut text, *index, content, true),
-                ReasoningDelta { index, delta } => observe(&mut reasoning, *index, delta, false),
-                ReasoningEnd { index, content } => observe(&mut reasoning, *index, content, true),
-                Legacy(ModelEvent::Text(delta) | ModelEvent::Reasoning(delta)) => {
+                TextDelta { index, delta } => {
+                    visible_units = visible_units.saturating_add(observe(&mut text, *index, delta, false));
+                }
+                TextEnd { index, content } => {
+                    visible_units = visible_units.saturating_add(observe(&mut text, *index, content, true));
+                }
+                ReasoningDelta { index, delta } => {
+                    reasoning_units = reasoning_units.saturating_add(observe(&mut reasoning, *index, delta, false));
+                }
+                ReasoningEnd { index, content } => {
+                    reasoning_units = reasoning_units.saturating_add(observe(&mut reasoning, *index, content, true));
+                }
+                Legacy(ModelEvent::Text(delta)) => {
                     visible_units = visible_units.saturating_add(units(delta));
+                }
+                Legacy(ModelEvent::Reasoning(delta)) => {
+                    reasoning_units = reasoning_units.saturating_add(units(delta));
                 }
                 Legacy(ModelEvent::ToolCallDelta(delta)) => {
                     streamed_tool_units = streamed_tool_units
@@ -1071,7 +1083,7 @@ fn limit_visible_output(
                 }
                 _ => {}
             }
-            if visible_units.saturating_add(streamed_tool_units) > limit {
+            if visible_units.saturating_add(reasoning_units).saturating_add(streamed_tool_units) > limit {
                 Err(Error::Budget)?;
             }
             yield event;
@@ -1442,6 +1454,28 @@ mod tests {
         assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
         assert!(matches!(stream.next().await, Some(Ok(TextEnd { .. }))));
         assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let with_thought = [
+            Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta {
+                index: 0,
+                delta: "reasoning summary".into(),
+            }),
+            Ok(TextDelta {
+                index: 0,
+                delta: "four".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream =
+            limit_visible_output(Box::pin(futures_util::stream::iter(with_thought)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
 
         let unreported = [
             Ok(TextDelta {
