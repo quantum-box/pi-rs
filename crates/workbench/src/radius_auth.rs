@@ -377,7 +377,7 @@ impl Gateway {
         let guard = admission
             .until_cancelled(super::auth_lock::acquire_async(&path))
             .await?;
-        let value = super::config::read_object_unlocked(&path)?;
+        let value = super::config::read_auth_object_locked(&guard)?;
         let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };

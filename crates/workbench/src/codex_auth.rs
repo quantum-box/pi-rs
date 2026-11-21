@@ -460,7 +460,7 @@ async fn access_at(
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let auth = super::config::read_object_unlocked(path)?;
+    let auth = super::config::read_auth_object_locked(&guard)?;
     let stored = saved(&auth)?;
     guard.check()?;
     if fresh(stored.expires) {
@@ -631,6 +631,16 @@ mod tests {
             "openai-codex":{"type":"oauth","access":old,"refresh":"old-fixture","expires":now_ms()+120_000,"extra":"preserved"},
             "openai-chatgpt":{"type":"oauth","access":"fixture-placeholder"}
         })).unwrap()).unwrap();
+        #[cfg(unix)]
+        let alias = {
+            let directory = temp.path().join("alias");
+            std::fs::create_dir(&directory).unwrap();
+            let alias = directory.join("auth.json");
+            std::os::unix::fs::symlink("../auth.json", &alias).unwrap();
+            alias
+        };
+        #[cfg(not(unix))]
+        let alias = path.clone();
         let fresh = fake_jwt("new");
         let expected = fresh.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -673,7 +683,7 @@ mod tests {
             old
         );
         let (cancelled_path, cancelled_client, cancelled_endpoint) =
-            (path.clone(), client.clone(), endpoint.clone());
+            (alias.clone(), client.clone(), endpoint.clone());
         let cancelled = tokio::spawn(async move {
             access_at(
                 &cancelled_path,
@@ -693,7 +703,7 @@ mod tests {
         reply_tx.send(()).unwrap();
         let (first, second) = tokio::join!(
             access_at(&path, &client, &endpoint, None, false),
-            access_at(&path, &client, &endpoint, None, false),
+            access_at(&alias, &client, &endpoint, None, false),
         );
         assert_eq!(first.unwrap(), expected);
         assert_eq!(second.unwrap(), expected);
@@ -703,6 +713,8 @@ mod tests {
         assert_eq!(data[PROVIDER]["accountId"], "fixture-account");
         assert_eq!(data[PROVIDER]["extra"], "preserved");
         assert_eq!(data["openai-chatgpt"]["access"], "fixture-placeholder");
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(&alias).unwrap().is_symlink());
     }
 
     #[cfg(unix)]

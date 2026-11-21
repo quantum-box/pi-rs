@@ -246,6 +246,7 @@ fn credential(json: Value) -> Result<Credential> {
 fn auth_path() -> std::path::PathBuf {
     super::config::agent_dir().join("auth.json")
 }
+#[cfg(test)]
 fn load(path: &std::path::Path) -> Result<Option<Credential>> {
     let value = super::config::read_object_unlocked(path)?;
     parse_credential(&value)
@@ -317,7 +318,8 @@ async fn access_at(
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let value = load(&path)?.ok_or_else(|| error("credentials not configured"))?;
+    let value = parse_credential(&super::config::read_auth_object_locked(&guard)?)?
+        .ok_or_else(|| error("credentials not configured"))?;
     guard.check()?;
     if no_refresh || !expires_soon(&value, refresh_window) {
         return Ok(value.access);
