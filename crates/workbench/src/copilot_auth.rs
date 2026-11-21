@@ -373,9 +373,7 @@ async fn access_at(
     let mut credential = read(&super::config::read_object_unlocked(path)?)?;
     guard.check()?;
     if !fresh(credential.expires) {
-        credential =
-            super::model_auth::with_oauth_refresh_deadline(PROVIDER, service.refresh(&credential))
-                .await?;
+        credential = service.refresh(&credential).await?;
         super::config::update_object_locked(path, Some(&guard), |data| {
             let entry = data
                 .get_mut(PROVIDER)
