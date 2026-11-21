@@ -461,6 +461,21 @@ the same endpoint-scoped credential rules as other providers. Model-specific
 reasoning and empty-signature compatibility are retained. Live acceptance with
 a Vercel account remains open.
 
+### Mistral checkpoint
+
+Mistral exposes the 34 pinned chat models using `MISTRAL_API_KEY` and the
+`mistral-conversations` transport. It sends each model's reasoning control,
+replays streamed thinking and text on the same route, and pads short tool ID
+hashes to nine characters for [Mistral's validator](https://github.com/mistralai/mistral-common/blob/main/src/mistral_common/protocol/instruct/validator.py).
+Tool errors and supported images are encoded in the tool message. In a
+session, routing and cache hints include `x-affinity` and
+`prompt_cache_key`. Parallel continuations need a tool ID or index when the
+stream does not uniquely identify the target call. Live Mistral account
+inference has not been verified.
+ Streams that omit both the
+tool index and call ID are rejected when multiple invocations fit the same
+fragments.
+
 ### Kimi Code API key checkpoint
 
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
@@ -4263,6 +4278,13 @@ unconstrained calls on official OpenAI and ChatGPT plan routes so the server
 preserves the recorded decision. Compatible endpoints that lack strict-field
 support continue to omit it.
 
+Responses-compatible endpoints that reject `max_output_tokens` can set
+`compat.supportsMaxOutputTokens: false` at the provider or model level, or in
+`modelOverrides`. Dispatch then omits the field. A conservative local size
+guard stops runaway visible output. The agent applies reported usage
+including hidden reasoning when available. When the provider omits usage,
+Pi's estimate of the visible output applies before accepting the completion.
+
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
@@ -4904,6 +4926,9 @@ their own adapters.
 `openai-codex` exposes the eight pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
+Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
+a smaller positive budget ends the run before a request goes to Codex.
+A model with `compat.supportsMaxOutputTokens: false` uses local output safeguards.
 `pi login openai-codex` uses browser PKCE, and `--device-code` selects
 device authorization. Browser sign-in also accepts a pasted code or redirect.
 The terminal offers both methods. Existing Pi Codex

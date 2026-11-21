@@ -204,6 +204,7 @@ struct ModelCompatibility {
     chat: ChatCompatibility,
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
+    supports_max_output_tokens: Option<bool>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -220,6 +221,9 @@ impl ModelCompatibility {
             chat: self.chat.overlay(newer.chat),
             allow_empty_signature: newer.allow_empty_signature.or(self.allow_empty_signature),
             supports_strict_tools: newer.supports_strict_tools.or(self.supports_strict_tools),
+            supports_max_output_tokens: newer
+                .supports_max_output_tokens
+                .or(self.supports_max_output_tokens),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -582,6 +586,7 @@ impl ModelMetadata {
         if !matches!(
             adapter,
             Adapter::ChatCompletions
+                | Adapter::MistralConversations
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
                 | Adapter::CodexResponses
@@ -660,6 +665,10 @@ impl ModelMetadata {
     }
 
     pub fn has_thinking_level_map(&self) -> bool {
+        !self.thinking_level_map.is_empty()
+    }
+
+    pub fn has_thinking_map(&self) -> bool {
         !self.thinking_level_map.is_empty()
     }
 
@@ -1338,6 +1347,16 @@ impl Profiles {
         )
     }
 
+    pub fn responses_max_output_tokens(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.cache_compatibility(provider, model)
+            .supports_max_output_tokens
+            .unwrap_or(true)
+    }
+
     pub fn responses_cache_support(
         &self,
         provider: &Provider,
@@ -1453,6 +1472,9 @@ impl Profiles {
         endpoint: &str,
     ) -> &'static [&'static str] {
         let adapter = self.model_adapter(provider, model);
+        if adapter == Adapter::MistralConversations {
+            return &["x-affinity"];
+        }
         let opencode = matches!(provider.id(), "opencode" | "opencode-go");
         let routing: &'static [&'static str] = if opencode {
             &["x-opencode-session"]
@@ -1651,7 +1673,7 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
             url.set_path(&normalized);
             return Ok(url.to_string());
         }
-        Adapter::ChatCompletions => "/chat/completions",
+        Adapter::ChatCompletions | Adapter::MistralConversations => "/chat/completions",
         Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Bedrock => return Ok(url.to_string()),
@@ -3189,6 +3211,32 @@ mod tests {
         assert_eq!(existing.supports_images(), None);
         assert_eq!(existing.context_window, Some(32000));
         assert_eq!(existing.max_tokens, None);
+    }
+
+    #[test]
+    fn mistral_catalog_uses_the_conversations_transport() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("mistral").unwrap();
+        assert_eq!(provider.adapter(), Adapter::MistralConversations);
+        assert_eq!(profiles.model_ids(&provider).len(), 34);
+        assert_eq!(profiles.model_ids(&provider)[0], "devstral-medium-latest");
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            profiles.session_affinity(
+                &provider,
+                "deepseek-v4-1-flash-1017",
+                profiles.endpoint(&provider)
+            ),
+            ["x-affinity"]
+        );
+        let model = profiles
+            .model(&provider, "deepseek-v4-1-flash-1017")
+            .unwrap();
+        assert_eq!(model.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(model.mapped_effort("off"), Some(Some("none")));
     }
 
     #[test]
