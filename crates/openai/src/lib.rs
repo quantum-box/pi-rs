@@ -1031,6 +1031,7 @@ fn limit_visible_output(
         // not a token counter. The agent uses reported usage for accounting.
         let limit = u64::from(allowance).saturating_mul(128);
         let mut visible_units = 0_u64;
+        let mut streamed_tool_units = 0_u64;
         let mut text = BTreeMap::new();
         let mut reasoning = BTreeMap::new();
         while let Some(event) = stream.next().await {
@@ -1056,20 +1057,21 @@ fn limit_visible_output(
                     visible_units = visible_units.saturating_add(units(delta));
                 }
                 Legacy(ModelEvent::ToolCallDelta(delta)) => {
-                    visible_units = visible_units
+                    streamed_tool_units = streamed_tool_units
                         .saturating_add(units(&delta.name))
                         .saturating_add(units(&delta.arguments));
                 }
                 // Some relays omit usage. Before accepting their final output
                 // or any tool call, check the same estimate Pi uses for text.
-                Legacy(ModelEvent::Complete { usage: None, .. })
-                    if visible_units.div_ceil(4) > u64::from(allowance) =>
+                Legacy(ModelEvent::Complete { calls, usage: None })
+                    if pi_rs_core::estimate_assistant_output_tokens(visible_units, calls)
+                        > u64::from(allowance) =>
                 {
                     Err(Error::Budget)?;
                 }
                 _ => {}
             }
-            if visible_units > limit {
+            if visible_units.saturating_add(streamed_tool_units) > limit {
                 Err(Error::Budget)?;
             }
             yield event;
@@ -1456,6 +1458,31 @@ mod tests {
         let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(unreported)), 2);
         assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
         assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let call = ToolCall {
+            id: "fixture".into(),
+            name: "t".into(),
+            arguments: format!("{{{}}}", " ".repeat(40)),
+        };
+        let formatted = [
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::ToolCallDelta(ToolCallDelta {
+                    index: 0,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                }),
+            )),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![call],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(formatted)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
 
         let completion = pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
             calls: vec![],
