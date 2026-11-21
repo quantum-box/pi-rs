@@ -440,6 +440,7 @@ Live acceptance with an Ant Ling account remains open.
 
 ### OpenCode Zen and Go
 
+The pinned Pi CLI defaults to Kimi K2.6 for Zen and Kimi K3 for Go.
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
 
@@ -744,6 +745,10 @@ message details. Context edits replace the affected content in the snapshot.
 Imported Gemini conversations carry signed text, thought, and function parts
 into continued requests. Tests covered a live partial, a typed tool result,
 and a resumed signed Gemini tool conversation.
+
+Native tool failures and skipped calls projected from untyped outcomes include
+Pi's empty `details` object in result events and messages. Typed tool results
+retain the details supplied by the tool.
 
 ## Verification
 
@@ -1600,7 +1605,14 @@ extensions and session names.
 
 MCP `deferred` exposure now hides tool schemas until `tool_search` loads a
 match. A native BM25 ranker uses names, descriptions, schema fields and server
-metadata. Selection state follows the journal branch and survives reopening.
+metadata. As in Pi 1.6.0, `tool_search` and Codemode `searchTools` index
+reachable local schema references once. `describeTool` follows local input
+schema references and bounds recursive and oversized declarations. Neither
+operation fetches external schemas. Native resolution also accepts RFC 6901
+array indices, empty keys and encoded separators. The declaration retains
+supported input types stated alongside a reference. A depth bound limits
+reference chains while allowing independent fields to reuse a definition.
+Selection state follows the journal branch and survives reopening.
 Exact exposure overrides and wildcard matching are supported. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
@@ -1682,8 +1694,9 @@ Classifier results include their API and invocation timestamp even if the
 request fails early or is cancelled, as they do on successful requests.
 
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
-`Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
-server-delay cap still applies to the parsed value. GMT retry dates also accept
+`Retry-After-Ms`, including decimal and exponent forms. Values that overflow
+when converted to milliseconds use the usual backoff. The 60-second
+server-delay cap applies to finite values. GMT retry dates also accept
 the obsolete RFC 850 form with JavaScript's two-digit year interpretation.
 
 ### Resource selection checkpoint
@@ -2049,6 +2062,11 @@ invoked each version's tool through a model round trip, and verified that the
 same saved notes reached both requests.
 
 ### Streaming search checkpoint
+
+Unrestricted local built-in tools coerce model arguments to their declared
+string, number and boolean types before schema validation. Optional null fields
+are treated as omissions, and edit batches also normalize replacement fields.
+Scoped tools and injected operations retain their argument handling.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 characters, and reports match
@@ -4466,6 +4484,21 @@ remove a registration. The SDK reports notification and follow-up errors
 through its session events after applying the registration change. The executable protocol negotiates that event
 independently of ordinary lifecycle events.
 
+Native extensions can subscribe to `after_provider_response` to observe the
+HTTP status and normalized headers from an agent turn. The OpenAI Responses,
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+await these callbacks in registration order before reading either a success or
+error body. This includes HTTP errors the native transports receive directly.
+Callback failures are reported as extension diagnostics. The
+callbacks share up to five seconds and at most half the remaining model time. The
+response remains under the adapter's control. Executable extensions advertise
+`after_provider_response_hook` and receive an `after_provider_response`
+request with `event.status`, `event.headers`, and their branch state. Response
+metadata is ephemeral. Credential headers, cookies, sensitive header values and
+reflected configured credentials are withheld. Bedrock and custom transports
+without response metadata reporting do not emit this event. Summary and catalog
+requests remain outside the turn hook.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
@@ -4728,6 +4761,17 @@ Classifier and image usage is included in the script result, terminal token
 total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
+
+### Cloudflare Workers AI chat checkpoint
+
+Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+`CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
+requests. Pi-format saved credentials may declare an account through their
+`env` field. A stored account scopes the key to that account's chat route.
+An unscoped saved key works only on official Workers AI routes. Credentials
+and headers inferred from classifier-only model URLs apply to those operations.
+When the inferred URL is on the configured official account, its provider
+credentials also apply to chat. Live Workers AI inference has not been verified.
 
 ### Configured llama.cpp classifiers
 
@@ -5635,10 +5679,11 @@ Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
 escapes, invalid escape characters or Unicode digits, missing values, and numeric
-fractions, exponents, and leading minus signs cut off at EOF. Offsets
-and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
-For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
-control after a surrogate in another string if no other parse error occurs first.
+fractions, exponents, and leading minus signs cut off at EOF. Offsets and
+columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+For records up to 1 MiB, diagnostic retries distinguish incomplete object
+separators and commas in nested containers. They also identify a raw control
+after a surrogate in another string if no other parse error occurs first.
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
 position-aware wording. Other malformed records, including array trailing

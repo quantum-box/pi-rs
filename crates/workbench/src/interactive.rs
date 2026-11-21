@@ -4438,9 +4438,12 @@ pub(super) async fn run(
             match task.receiver.try_recv() {
                 Ok(Ok(keys)) => {
                     if args.model_keys.revision() == task.revision {
-                        args.model_keys = keys;
+                        let result = args.replace_model_keys(keys);
                         view.invalidate_model_catalog();
-                        view.append("Provider credentials reloaded");
+                        match result {
+                            Ok(()) => view.append("Provider credentials reloaded"),
+                            Err(error) => view.append(&format!("Model profile reload: {error}")),
+                        }
                     } else {
                         view.append("Provider credentials changed during reload; keeping the newer selection");
                     }
@@ -4907,7 +4910,11 @@ pub(super) async fn run(
                     dirty = true;
                 }
                 Ok(RemoteEvent::ForgetModelKey(provider)) => {
-                    args.model_keys.forget(provider);
+                    let mut keys = args.model_keys.clone();
+                    keys.forget(provider);
+                    if let Err(error) = args.replace_model_keys(keys) {
+                        view.append(&format!("Model profile reload: {error}"));
+                    }
                     view.invalidate_model_catalog();
                     dirty = true;
                 }
@@ -5471,9 +5478,11 @@ pub(super) async fn run(
                                     &text,
                                 )
                                 .and_then(|()| super::model_auth::Keys::load())
-                                .map(|keys| {
-                                    args.model_keys = keys;
+                                .and_then(|keys| {
+                                    args.replace_model_keys(keys)?;
+                                    view.invalidate_model_catalog();
                                     view.append(&format!("API key saved for {}", provider.id()));
+                                    Ok(())
                                 }),
                             };
                             if let Err(error) = result {
@@ -6447,7 +6456,9 @@ fn edit_provider_key(provider: super::Provider, view: &mut View) {
 
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
     let removed = super::model_auth::remove(&provider)?;
-    args.model_keys.forget(provider.id());
+    let mut keys = args.model_keys.clone();
+    keys.forget(provider.id());
+    let result = args.replace_model_keys(keys);
     view.invalidate_model_catalog();
     view.append(&format!(
         "{} for {}",
@@ -6458,7 +6469,7 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
         },
         provider.id()
     ));
-    Ok(())
+    result
 }
 
 fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
