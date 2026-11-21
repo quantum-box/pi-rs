@@ -1864,6 +1864,9 @@ bounded expansion retain native glob matching.
 Settings filters treat an unclosed character class as literal text and ignore
 ordinary glob patterns that start with `#`. Exact overrides can select a path
 containing `#`.
+Each leading `!` after the filter exclusion prefix toggles glob negation.
+The resulting glob is evaluated against relative paths, absolute paths and
+basenames, as in Pi.
 
 ### Resource discovery checkpoint
 

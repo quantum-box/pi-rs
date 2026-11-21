@@ -949,7 +949,12 @@ fn validate_resource_patterns(patterns: &[String], settings_filter: bool) -> Res
         if settings_filter && pattern.starts_with('#') {
             continue;
         }
-        resource_glob(&pattern, settings_filter).map_err(|error| {
+        let target = if settings_filter {
+            pattern.trim_start_matches('!')
+        } else {
+            &pattern
+        };
+        resource_glob(target, settings_filter).map_err(|error| {
             Error::Config(format!("invalid resource pattern {pattern:?}: {error}"))
         })?;
     }
@@ -1145,13 +1150,19 @@ pub(crate) fn resource_matches(
         .as_deref()
         .map(normalize)
         .unwrap_or_else(|| pattern.replace('\\', "/"));
-    if !exact && !directory_roots && pattern.starts_with('#') {
-        return false;
-    }
+    let (pattern, negated) = if !exact && !directory_roots {
+        if pattern.starts_with('#') {
+            return false;
+        }
+        let target = pattern.trim_start_matches('!');
+        (target, (pattern.len() - target.len()) % 2 == 1)
+    } else {
+        (pattern.as_str(), false)
+    };
     let pattern = if exact {
         pattern
     } else {
-        pattern.trim_start_matches("./").to_owned()
+        pattern.trim_start_matches("./")
     };
     let mut candidates = vec![
         normalize(path),
@@ -1167,22 +1178,21 @@ pub(crate) fn resource_matches(
         }
     }
     if exact {
-        return candidates.iter().any(|candidate| candidate == &pattern);
+        return candidates.iter().any(|candidate| candidate == pattern);
     }
     if let Some(name) = path.file_name() {
         candidates.push(name.to_string_lossy().into_owned());
     }
-    if let Some(Some(extglob)) = package_diagnostic::extglob_regex(&pattern) {
+    if let Some(Some(extglob)) = package_diagnostic::extglob_regex(pattern) {
         // The bounded translator matches ASCII paths. Leave dot-path and
         // Unicode cases to the existing native matcher until their Node
         // semantics can be reproduced.
         let in_supported_subset = |candidate: &str| {
             candidate.is_ascii() && !candidate.split('/').any(|part| part.starts_with('.'))
         };
-        if candidates
-            .iter()
-            .any(|candidate| in_supported_subset(candidate) && extglob.is_match(candidate))
-        {
+        if candidates.iter().any(|candidate| {
+            in_supported_subset(candidate) && (extglob.is_match(candidate) != negated)
+        }) {
             return true;
         }
         candidates.retain(|candidate| !in_supported_subset(candidate));
@@ -1190,13 +1200,16 @@ pub(crate) fn resource_matches(
             return false;
         }
     }
-    let Ok(glob) = resource_glob(&pattern, !directory_roots) else {
+    let Ok(glob) = resource_glob(pattern, !directory_roots) else {
         return false;
     };
     let matcher = glob.compile_matcher();
     candidates.iter().any(|candidate| {
-        (matcher.is_match(candidate)
-            && (directory_roots || matches_hidden_filter_segments(candidate, &pattern)))
+        // Pi passes each spelling to minimatch separately, including when
+        // that glob is negated.
+        let matches = matcher.is_match(candidate)
+            && (directory_roots || matches_hidden_filter_segments(candidate, pattern));
+        (matches != negated)
             || (directory_roots
                 && !pattern.contains(['*', '?', '[', '{'])
                 && candidate.starts_with(&format!("{pattern}/")))
@@ -5328,6 +5341,31 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             );
         }
         assert!(validate_patterns(&["draft[.md".into()]).is_err());
+    }
+
+    #[test]
+    fn package_filters_apply_negated_globs_to_each_candidate_spelling() {
+        let root = Path::new("/package");
+        let paths =
+            ["visible.md", "draft[.md", "#literal.md"].map(|name| root.join("prompts").join(name));
+        for (pattern, expected) in [
+            ("!!visible.md", [false, false, false]),
+            ("!!@(visible|other).md", [false, false, false]),
+            ("!!!@(visible|other).md", [false, true, true]),
+            ("!!**/visible.md", [true, false, false]),
+            ("!!!**/visible.md", [false, true, true]),
+            ("!!!!**/visible.md", [true, false, false]),
+            ("!!**/draft[.md", [false, true, false]),
+            ("!!", [false, false, false]),
+            ("!!!", [true, true, true]),
+        ] {
+            let filter = ResourceFilter::new(&json!({"prompts": [pattern]}), "prompts").unwrap();
+            assert_eq!(
+                filter.apply(&paths, root, &[false; 3]).unwrap(),
+                expected,
+                "{pattern}"
+            );
+        }
     }
 
     #[test]
