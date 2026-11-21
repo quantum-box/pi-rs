@@ -4021,7 +4021,7 @@ mod estimation_tests {
 
         for (provider, model, responses) in [
             ("azure", "o4-mini", true),
-            ("azure", "gpt-5.1", true),
+            ("azure", "gpt-6-luna", true),
             ("azure", "deepseek-v4-pro", false),
             ("azure-relay", "o4-mini", true),
         ] {
@@ -4123,7 +4123,7 @@ mod estimation_tests {
                 );
                 assert!(!headers.contains("authorization:"), "{headers}");
                 assert_eq!(body["max_output_tokens"], 16);
-                if model == "gpt-5.1" {
+                if model == "gpt-6-luna" {
                     assert_eq!(body["reasoning"], json!({"effort":"none"}));
                 } else {
                     assert!(body.get("reasoning").is_none());
