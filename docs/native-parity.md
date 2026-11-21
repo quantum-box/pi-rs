@@ -5698,6 +5698,7 @@ nearest visible ancestors for navigation. Search matches every whitespace-separa
 term regardless of order or case. Editing or clearing the search unfolds branches
 and retains the selected entry or its nearest visible ancestor, including when
 the search temporarily finds no entries.
+Tree search also matches the first 200 UTF-16 units of tool-result text.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
 
