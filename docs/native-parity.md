@@ -4882,8 +4882,18 @@ credentials can be read and refreshed in place. A refresh in flight saves
 rotated credentials even when the requesting turn is cancelled. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
 
-The native transport sends uncompressed JSON over HTTP SSE. The upstream
-WebSocket transport and specialized Codex
+Codex also accepts Pi's `transport` setting. `auto` and `websocket-cached`
+can reuse a direct connection and send a transcript suffix when the request
+matches the previous conversation. `websocket` sends the full history on
+the connection, and `sse` uses HTTP directly. WebSocket requests omit the
+HTTP-only `stream` flag as specified by the [Responses WebSocket protocol](https://developers.openai.com/api/reference/resources/responses/websocket-events).
+An unavailable WebSocket
+upgrade falls back to HTTP SSE before any inference request is sent. A
+transient upgrade failure suppresses new attempts for a minute. A server
+that loses the previous response ID receives the full transcript on retry.
+The client checks an idle connection with a WebSocket ping before sending the
+next request and replaces the connection if the check fails.
+The native HTTP fallback sends uncompressed JSON. Specialized Codex
 grammar tools and tool search remain open. Authentication was exercised with
 fixtures. Live sign-in and inference were unverified because no account was
 available for acceptance.
