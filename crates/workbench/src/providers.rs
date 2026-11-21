@@ -1151,6 +1151,13 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     ))
+                    .with_managed_effort_models(
+                        args.model_profiles.anthropic_managed_effort_models(
+                            &args.provider,
+                            &args.model,
+                            args.explicit_endpoint_for(&args.provider),
+                        ),
+                    )
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
                         args.settings.value().get("thinkingBudgets").cloned(),
