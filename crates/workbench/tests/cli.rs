@@ -1837,13 +1837,19 @@ fn kimi_coding_models_send_their_specific_reasoning_options() {
 #[test]
 fn qwen_token_plans_use_model_specific_thinking_and_tool_format() {
     for (provider, model, level, effort) in [
-        ("qwen-token-plan", "deepseek-v3.2", "high", None),
+        ("qwen-token-plan", "qwen3.7-plus", "high", None),
         ("qwen-token-plan-cn", "glm-5.2", "high", Some("high")),
         (
             "qwen-token-plan-individual",
             "qwen3.8-max",
             "medium",
             Some("medium"),
+        ),
+        (
+            "qwen-token-plan-individual-cn",
+            "qwen4-max-preview",
+            "xhigh",
+            Some("xhigh"),
         ),
     ] {
         let root = tempfile::tempdir().unwrap();

@@ -415,10 +415,21 @@ or inference acceptance with an xAI subscription.
 
 ### Qwen Token Plan checkpoint
 
-The international, China, and individual Qwen Token Plan providers expose the
-pinned Pi model catalogs, regional credentials, per-model reasoning maps, and
-image limits. Their chat-completions requests use Qwen's `enable_thinking`
-switch, with `reasoning_effort` only where the selected model supports it.
+The four Qwen Token Plan providers use the Pi v1.6.0 chat catalogs,
+including the 13-model `qwen-token-plan-individual-cn` catalog. The
+international providers default to QwenCloud, and the China providers default
+to Qianwen AI Platform. Both regions still recognize their former Aliyun host
+when explicitly configured. An API key saved with an endpoint stays scoped to
+that endpoint. A Pi auth entry without an endpoint follows the named provider's official
+routes.
+
+The Team providers prefer `QWEN_TOKEN_PLAN_TEAM_API_KEY` and
+`QWEN_TOKEN_PLAN_TEAM_CN_API_KEY`. The Individual providers prefer
+`QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY` and
+`QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY`. Each also accepts its region's
+original variable as a fallback. Chat requests keep the system role and use
+Qwen's `enable_thinking` switch, with `reasoning_effort` where the selected
+model supports it.
 For models declaring strict-mode support, unconstrained and preferred fallback
 tools use `strict: false`, while successfully prepared strict tools use
 `strict: true` with the transformed schema.
@@ -460,6 +471,25 @@ System One endpoint, and Codemode supports discovery and classification with
 the same endpoint-scoped credential rules as other providers. Model-specific
 reasoning and empty-signature compatibility are retained. Live acceptance with
 a Vercel account remains open.
+
+### Mistral checkpoint
+
+Mistral exposes the 34 Pi 1.6.0 chat models using `MISTRAL_API_KEY` and the
+`mistral-conversations` transport. DeepSeek V4.1 Flash 1017 supports images
+with the catalog's resize limits. Ministral 3 3B has a 131,072-token output
+limit. Mistral Large (latest) uses the updated pricing and a 1,048,576-token
+context window with low, medium, and high reasoning effort. The transport
+sends each model's reasoning control,
+replays streamed thinking and text on the same route, and pads short tool ID
+hashes to nine characters for [Mistral's validator](https://github.com/mistralai/mistral-common/blob/main/src/mistral_common/protocol/instruct/validator.py).
+Tool errors and supported images are encoded in the tool message. In a
+session, routing and cache hints include `x-affinity` and
+`prompt_cache_key`. Parallel continuations need a tool ID or index when the
+stream does not uniquely identify the target call. Live Mistral account
+inference has not been verified.
+ Streams that omit both the
+tool index and call ID are rejected when multiple invocations fit the same
+fragments.
 
 ### Kimi Code API key checkpoint
 
@@ -4004,6 +4034,13 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 
 ### Anthropic thinking checkpoint
 
+Budgeted Anthropic Messages requests use Pi's interleaved-thinking beta by
+default. An explicit `anthropic-beta` header overrides the defaults, including
+for OAuth. Adaptive and disabled thinking do not add the interleaved beta.
+Embedders can opt out of interleaving or request omitted thinking text while
+retaining its replay signature. Loopback requests verified the header and
+payload. Live authenticated interleaved thinking was unverified.
+
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
 payload for provider replay. Live Pi RPC thinking-start partial messages include
@@ -4099,7 +4136,11 @@ streams text, thought summaries, and tool calls. It encodes image inputs and
 tool results, records measured usage including thought tokens, and preserves
 ordered signed response parts for the same model across tools and journal
 reopening. Gemini 2.5 and newer model families use their budget or level
-controls. A truncated response keeps its text and skips tool dispatch.
+controls. Host-prefixed Gemini IDs use the same version checks for thinking,
+tool call IDs, and tool-result images as in current Pi. A response ending in
+`CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
+and ends with a length stop. The native adapter does not consume continuation
+tokens.
 
 Loopback checks covered these paths and a PTY showed thinking, generation,
 and the final answer. [Generate Content API](https://ai.google.dev/api/generate-content?hl=en)
@@ -4259,6 +4300,13 @@ unconstrained calls on official OpenAI and ChatGPT plan routes so the server
 preserves the recorded decision. Compatible endpoints that lack strict-field
 support continue to omit it.
 
+Responses-compatible endpoints that reject `max_output_tokens` can set
+`compat.supportsMaxOutputTokens: false` at the provider or model level, or in
+`modelOverrides`. Dispatch then omits the field. A conservative local size
+guard stops runaway visible output. The agent applies reported usage
+including hidden reasoning when available. When the provider omits usage,
+Pi's estimate of the visible output applies before accepting the completion.
+
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
@@ -4417,11 +4465,12 @@ rejected before any credentials are sent there.
 Local acceptance covered both authentication methods, model filtering,
 inference against the catalog route, the advertised output cap and
 rejection of an unrelated endpoint. The built-in gateway ships the
-public chat model metadata from Pi 1.5.0. An authenticated catalog
-replaces that baseline and is cached privately for the gateway and
-credential. Offline startup and transient discovery failures can use
-the matching cache. Successful empty catalogs remain authoritative.
-[Pi AI 1.5.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0)
+39 public chat models from Pi 1.6. An authenticated catalog replaces that
+baseline and is cached privately for the gateway and credential. Offline
+startup and transient discovery failures can use the matching cache.
+Successful empty catalogs remain authoritative. Live authenticated Radius
+discovery for this release was unverified.
+[Pi AI 1.6.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.6.0)
 
 ### Single-shot JSON event stream
 
@@ -4787,7 +4836,8 @@ catalogues are projected from the published
 
 Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
-requests. Pi-format saved credentials may declare an account through their
+requests. Terminal `/login cloudflare-workers-ai` prompts for a masked API
+key and the account ID for routes derived from login or environment settings. Pi-format saved credentials may declare an account through their
 `env` field. A stored account scopes the key to that account's chat route.
 An unscoped saved key works only on official Workers AI routes. Credentials
 and headers inferred from classifier-only model URLs apply to those operations.
@@ -4804,7 +4854,12 @@ selects the Chat Completions, Messages, or Responses path. All three send
 `cf-aig-authorization` for gateway authentication, and saved keys remain
 scoped to their account and gateway. A concrete provider `baseUrl` can
 supply missing route identifiers for an imported key when the configured
-route agrees with any saved or environment identifiers.
+route agrees with any saved or environment identifiers. Terminal
+`/login cloudflare-ai-gateway` prompts for a masked API key, account ID, and
+gateway ID for routes derived from login or environment settings. Those
+routes can be changed by signing in again. The two Cloudflare sign-in flows
+store Pi-compatible credentials for official routes. A fixed endpoint uses
+masked key entry and binds the stored key to that endpoint.
 
 The published Pi AI package and local fixtures cover each route and
 authentication header. Live gateway authentication was unverified because
@@ -4890,24 +4945,37 @@ output, image and thinking capabilities from the pinned Pi AI release.
 User models and overrides take precedence. The CLI lists available providers
 together, and `--provider` can restrict the list to one. Built-in environment
 keys and endpoint-bound saved credentials stay off user-configured relays.
-Baseten and NVIDIA's bundled chat-completions catalogs include model-specific
-compatibility, NVIDIA polling headers and Baseten's thinking template.
-Baseten and Together match the Pi 1.6.0 catalogs of 15 and 16 entries.
-Both expose Kimi K3.1 Pro with image input. Baseten lists a 262,144-token
-output maximum, and Together lists 1,048,576 for both Kimi K3 and K3.1 Pro.
-Live inference for the updated entries was unverified.
+Baseten and NVIDIA's pinned chat-completions catalogs include model-specific
+compatibility, NVIDIA polling headers and Baseten's thinking template. Pi
+1.6.0 supplies 15 Baseten, 16 Together, 12 NVIDIA NIM and 87 Hugging Face
+Router entries. Baseten and Together expose Kimi K3.1 Pro with image input.
+Baseten lists a 262,144-token output maximum, and Together lists 1,048,576 for
+both Kimi K3 and K3.1 Pro. Hugging Face uses the system instruction role.
+Users can configure additional NVIDIA deployments by ID. Catalog entries that
+use other upstream APIs still need their own adapters. Live inference on the
+updated catalogs was unverified.
 
 ### OpenAI Codex
 
 `openai-codex` exposes the eight pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
+Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
+a smaller positive budget ends the run before a request goes to Codex.
+A model with `compat.supportsMaxOutputTokens: false` uses local output safeguards.
 `pi login openai-codex` uses browser PKCE, and `--device-code` selects
 device authorization. Browser sign-in also accepts a pasted code or redirect.
 The terminal offers both methods. Existing Pi Codex
 credentials can be read and refreshed in place. A refresh in flight saves
 rotated credentials even when the requesting turn is cancelled. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
+
+Codex and Copilot use Pi's five-minute refresh window against the expiry
+stored in `auth.json`. A refresh that returns a shorter-lived credential is
+saved for ordinary inference. An explicit bearer-token export still requires
+the effective minimum validity after the saved refresh. Loopback fixtures
+covered early refresh and persistence. Live Codex and Copilot refresh was
+unverified.
 
 The native transport sends uncompressed JSON over HTTP SSE. OpenAI Responses
 and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
@@ -4925,15 +4993,22 @@ for acceptance.
 
 ### GitHub Copilot
 
-The native catalog includes the pinned Pi AI release's 27 Copilot models across
-Chat Completions, Anthropic Messages, and OpenAI Responses.
+The native catalog includes Pi AI v1.6.0's 35 Copilot chat models across
+Chat Completions, Anthropic Messages, and OpenAI Responses. Models that
+advertise thinking effort on Chat Completions use its reasoning-effort field.
+Copilot Messages and Responses expose strict sampling for supported tools.
+Ordinary Responses function declarations explicitly send `strict: false` to
+prevent Copilot from imposing strict sampling and filling optional fields.
+Projection of Copilot's transcript-level `additional_tools` remains open.
 `COPILOT_GITHUB_TOKEN` supplies a short-lived Copilot API token.
 `pi login github-copilot` and `/login github-copilot` support GitHub.com's
 device authorization and store a Pi-compatible OAuth entry. pi-rs can also
 read an existing entry, refresh access, and filter the picker by the stored
 account catalog. If catalog discovery fails during refresh, inference uses the
-new token and the last saved catalog. Saved OAuth tokens can route to individual, business, or
-enterprise Copilot inference hosts. Requests carry the Copilot initiator and
+new token and the last saved catalog. An admitted refresh and its write finish
+even if the caller cancels. Copilot's device poller follows the server interval
+on `slow_down` and adds five seconds when it supplies no interval. Saved OAuth
+tokens can route to individual, business, or enterprise Copilot inference hosts. Requests carry the Copilot initiator and
 vision headers.
 
 Native sign-in leaves account model policies as configured. Authentication
