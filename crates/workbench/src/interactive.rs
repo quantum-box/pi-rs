@@ -1737,6 +1737,32 @@ impl View {
     }
 
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "response" && value["command"] == "set_session_label" {
+            if let Ok(request) = serde_json::from_value(value["id"].take())
+                && let Some(picker) = &mut self.picker
+                && let Some(target) = picker.take_tree_label(request)
+            {
+                if value["success"] == true {
+                    let focus = match picker.selected() {
+                        Some(Selection::Checkout(record)) => record,
+                        _ => target,
+                    };
+                    match Session::snapshot(&args.session) {
+                        Ok(session) => picker.refresh_tree(
+                            session_tree::picker(&session, TreeFilter::Default),
+                            focus,
+                        ),
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                } else {
+                    let message = value["error"]
+                        .as_str()
+                        .unwrap_or("Could not save the label");
+                    picker.show_feedback(Err(message.into()));
+                }
+            }
+            return;
+        }
         if value["type"] == "resources_discovered" {
             match serde_json::from_value::<pi_rs::DiscoveredResources>(value["resources"].take())
                 .map_err(Error::from)
@@ -4933,6 +4959,9 @@ pub(super) async fn run(
                 if view.tree_handoff.take().is_some() {
                     view.append("Branch navigation stopped when the active worker exited");
                 }
+                if let Some(picker) = &mut view.picker {
+                    picker.cancel_pending_tree_label();
+                }
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
                 {
@@ -5720,14 +5749,24 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::SetTreeLabel(id, label) => {
-                            let result = Session::open(&args.session).and_then(|mut session| {
-                                session.set_label(id, (!label.is_empty()).then_some(label))?;
-                                picker.refresh_tree(
-                                    session_tree::picker(&session, TreeFilter::Default),
-                                    id,
-                                );
-                                Ok(())
-                            });
+                            let label = (!label.is_empty()).then_some(label);
+                            let result = if let Some(active) =
+                                worker.as_mut().filter(|worker| worker.busy)
+                            {
+                                let request = uuid::Uuid::new_v4();
+                                active.send(json!({
+                                    "type":"set_session_label","target":id,"label":label,"id":request,
+                                })).map(|()| picker.track_tree_label(request, id))
+                            } else {
+                                Session::open(&args.session).and_then(|mut session| {
+                                    session.set_label(id, label)?;
+                                    picker.refresh_tree(
+                                        session_tree::picker(&session, TreeFilter::Default),
+                                        id,
+                                    );
+                                    Ok(())
+                                })
+                            };
                             if let Err(error) = result {
                                 picker.show_feedback(Err(error.to_string()));
                             }

@@ -619,6 +619,31 @@ impl Picker {
             tree.label_timestamps = timestamps;
         }
     }
+
+    pub fn track_tree_label(&mut self, request: uuid::Uuid, record: u64) {
+        if let Some(tree) = &mut self.tree {
+            tree.pending_label = Some((request, record));
+        }
+    }
+
+    pub fn take_tree_label(&mut self, request: uuid::Uuid) -> Option<u64> {
+        self.tree
+            .as_mut()?
+            .pending_label
+            .take_if(|(id, _)| *id == request)
+            .map(|(_, record)| record)
+    }
+
+    pub fn cancel_pending_tree_label(&mut self) {
+        if let Some(tree) = &mut self.tree
+            && tree.pending_label.take().is_some()
+        {
+            self.show_feedback(Err(
+                "The active worker stopped before confirming the label".into()
+            ));
+        }
+    }
+
     pub fn refresh_tree(&mut self, mut replacement: Self, record: u64) {
         let (Some(previous), Some(next)) = (&mut self.tree, &mut replacement.tree) else {
             return;
@@ -628,6 +653,7 @@ impl Picker {
         next.show_label_timestamps = previous.show_label_timestamps;
         next.rebuild_visible();
         replacement.query = std::mem::take(&mut self.query);
+        replacement.session_action = self.session_action.take();
         replacement.focus_record(record);
         *self = replacement;
     }
@@ -1734,6 +1760,7 @@ struct TreeState {
     descriptions: std::collections::BTreeMap<u64, TreeDescription>,
     label_timestamps: std::collections::BTreeMap<u64, String>,
     show_label_timestamps: bool,
+    pending_label: Option<(uuid::Uuid, u64)>,
     last_filter_focus: u64,
     roots: Vec<u64>,
     order: Vec<u64>,
@@ -1890,6 +1917,7 @@ impl TreeState {
             descriptions: Default::default(),
             label_timestamps: Default::default(),
             show_label_timestamps: false,
+            pending_label: None,
             last_filter_focus: head,
             roots,
             order: vec![],
