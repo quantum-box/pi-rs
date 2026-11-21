@@ -20,6 +20,9 @@ pub mod coding;
 pub mod coding_factories;
 mod coding_paths;
 pub use coding_paths::normalize_plain as normalize_path;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use coding_paths::windows_shell_path;
 mod file_search;
 pub mod image_profile;
 pub mod mcp;
@@ -37,6 +40,7 @@ pub mod oauth_callback;
 pub mod process_cleanup;
 pub mod prompt_resources;
 pub mod prompt_template_arguments;
+pub mod resource_factory;
 mod shell_config;
 mod shell_output;
 pub mod skill_resources;

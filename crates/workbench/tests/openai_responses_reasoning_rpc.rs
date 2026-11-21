@@ -178,6 +178,17 @@ fn responses_reasoning_item_survives_rpc_stream_and_finalization() {
             && event["success"] == true),
         "{events:?}"
     );
+    for event in events
+        .iter()
+        .filter(|event| event["type"] == "message_update")
+    {
+        assert!(event["usage"].is_object(), "{event:?}");
+        assert_eq!(event["usage"], event["message"]["usage"]);
+        assert_eq!(
+            event["usage"],
+            event["assistantMessageEvent"]["partial"]["usage"]
+        );
+    }
     let updates: Vec<_> = events
         .iter()
         .filter_map(|event| event.get("assistantMessageEvent"))
