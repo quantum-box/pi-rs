@@ -849,7 +849,6 @@ fn typescript(schema: &Value) -> String {
     let mut renderer = SchemaRenderer {
         root: schema,
         resolving: BTreeSet::new(),
-        expansions: 0,
         text: String::new(),
         units: 0,
     };
@@ -862,7 +861,6 @@ fn typescript(schema: &Value) -> String {
 struct SchemaRenderer<'a> {
     root: &'a Value,
     resolving: BTreeSet<*const Value>,
-    expansions: usize,
     text: String,
     units: usize,
 }
@@ -883,10 +881,9 @@ impl SchemaRenderer<'_> {
                 return self.write_type_without_ref(schema);
             };
             let pointer = std::ptr::from_ref(target);
-            if self.expansions >= 32 || !self.resolving.insert(pointer) {
+            if self.resolving.len() >= 32 || !self.resolving.insert(pointer) {
                 return self.write_type_without_ref(schema);
             }
-            self.expansions += 1;
             let has_sibling_type = matches!(
                 schema["type"].as_str(),
                 Some("string" | "number" | "integer" | "boolean" | "array" | "object")
@@ -1525,6 +1522,32 @@ mod tests {
         assert_eq!(
             typescript(&array),
             "({ \"count\"?: number } & { \"label\"?: string })[]"
+        );
+    }
+
+    #[test]
+    fn tool_declarations_bound_reference_depth_without_dropping_siblings() {
+        let properties: serde_json::Map<_, _> = (0..40)
+            .map(|index| (format!("field{index}"), json!({"$ref": "#/$defs/shared"})))
+            .collect();
+        let wide = json!({
+            "type": "object",
+            "$defs": {"shared": {"type": "string"}},
+            "properties": properties
+        });
+        assert_eq!(typescript(&wide).matches(": string").count(), 40);
+        let mut chain: serde_json::Map<_, _> = (0..40)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    json!({"$ref": format!("#/$defs/{}", index + 1)}),
+                )
+            })
+            .collect();
+        chain.insert("40".into(), json!({"type": "string"}));
+        assert_eq!(
+            typescript(&json!({"$ref": "#/$defs/0", "$defs": chain})),
+            "unknown"
         );
     }
 
