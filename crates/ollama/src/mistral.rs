@@ -221,7 +221,13 @@ pub(super) fn stream_call_index(
             if let Some((index, active)) = calls.first_key_value()
                 && calls.len() == 1
                 && position == 0
-                && name.is_none_or(|name| name.is_empty() || name == active.name)
+                && name.is_none_or(|name| {
+                    name.is_empty()
+                        || (name == active.name
+                            && serde_json::from_str::<Value>(&active.arguments)
+                                .is_err_and(|error| error.is_eof())
+                            && !active.arguments.is_empty())
+                })
             {
                 return Ok(*index);
             }
@@ -385,6 +391,7 @@ mod tests {
             0,
             crate::CallDelta {
                 name: "read".into(),
+                arguments: "{".into(),
                 ..Default::default()
             },
         )]
@@ -399,6 +406,17 @@ mod tests {
             0
         );
         assert!(stream_call_index(Some("late"), Some("other"), 0, true, &anonymous).is_err());
+        let complete = [(
+            0,
+            crate::CallDelta {
+                name: "read".into(),
+                arguments: "{}".into(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert!(stream_call_index(Some("late"), Some("read"), 0, true, &complete).is_err());
         assert!(stream_call_index(None, None, 0, true, &calls).is_err());
         assert_eq!(
             stream_call_index(Some("fixture-1"), None, 0, true, &calls).unwrap(),
