@@ -26,6 +26,10 @@ pub enum Selection {
         description: Option<String>,
     },
     LoginProvider(super::super::Provider),
+    VertexApiKey,
+    VertexAdc {
+        service_account: bool,
+    },
     BedrockBearer,
     BedrockProfile,
     BedrockChain,

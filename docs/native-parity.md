@@ -4866,8 +4866,13 @@ credential. Google-authenticated calls use the quota project from the credential
 file when it supplies one.
 
 Native ADC discovery checks the explicitly configured file or the local gcloud
-credentials file. The Vertex sign-in wizard and metadata-only ambient credentials
-remain unsupported. Loopback tests cover Express and project-scoped routes. No real
+credentials file. Terminal `/login google-vertex` offers a masked API key,
+ADC, or a service account file. The last two save the project and location
+in a Pi-compatible credential entry. Both file-based methods check that a
+credentials file exists before replacing the saved credential. An environment API key still
+takes precedence over ADC, and ADC uses `GOOGLE_APPLICATION_CREDENTIALS` when
+it has no saved credentials file, following Pi. Metadata-only ambient credentials remain
+unsupported. Loopback tests cover Express and project-scoped routes. No real
 Google Cloud credential was available for acceptance testing.
 
 ### OpenAI Codex
