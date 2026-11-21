@@ -581,6 +581,7 @@ impl ModelMetadata {
         if !matches!(
             adapter,
             Adapter::ChatCompletions
+                | Adapter::MistralConversations
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
                 | Adapter::Google
@@ -658,6 +659,10 @@ impl ModelMetadata {
     }
 
     pub fn has_thinking_level_map(&self) -> bool {
+        !self.thinking_level_map.is_empty()
+    }
+
+    pub fn has_thinking_map(&self) -> bool {
         !self.thinking_level_map.is_empty()
     }
 
@@ -1312,6 +1317,9 @@ impl Profiles {
         endpoint: &str,
     ) -> &'static [&'static str] {
         let adapter = self.model_adapter(provider, model);
+        if adapter == Adapter::MistralConversations {
+            return &["x-affinity"];
+        }
         if !matches!(
             adapter,
             Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
@@ -1458,7 +1466,7 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
     }
 
     let suffix = match adapter {
-        Adapter::ChatCompletions => "/chat/completions",
+        Adapter::ChatCompletions | Adapter::MistralConversations => "/chat/completions",
         Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Bedrock => return Ok(url.to_string()),
@@ -2683,6 +2691,32 @@ mod tests {
         assert_eq!(existing.supports_images(), None);
         assert_eq!(existing.context_window, Some(32000));
         assert_eq!(existing.max_tokens, None);
+    }
+
+    #[test]
+    fn mistral_catalog_uses_the_conversations_transport() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("mistral").unwrap();
+        assert_eq!(provider.adapter(), Adapter::MistralConversations);
+        assert_eq!(profiles.model_ids(&provider).len(), 34);
+        assert_eq!(profiles.model_ids(&provider)[0], "devstral-medium-latest");
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            profiles.session_affinity(
+                &provider,
+                "deepseek-v4-1-flash-1017",
+                profiles.endpoint(&provider)
+            ),
+            ["x-affinity"]
+        );
+        let model = profiles
+            .model(&provider, "deepseek-v4-1-flash-1017")
+            .unwrap();
+        assert_eq!(model.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(model.mapped_effort("off"), Some(Some("none")));
     }
 
     #[test]
