@@ -166,6 +166,12 @@ in the future afterward. The probe preserved credentials on authorization
 failure; its successful refresh path was otherwise unchanged. New-account
 browser login, other account configurations and broader live acceptance remain
 open.
+The ChatGPT plan can also use Pi's flat OAuth entries in `auth.json`. Refresh
+preserves Pi's field names, millisecond expiry and rotated token, without
+creating a native account record. If Pi refreshes that same account while
+pi-rs waits for the auth lock, pi-rs reuses the currently stored token when
+its lifetime is sufficient. Saved plan credentials are bound to OpenAI's
+official endpoint. Live refresh of an imported Pi entry is unverified.
 
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
@@ -898,8 +904,10 @@ expanding a quoted prompt argument before the model request.
 transport, tool names, per-tool exposure overrides, and resource capability.
 Invalid entries are reported in `errors`. Both forms of `pi mcp list` report
 a non-boolean `autoEnableCodemode` with its configuration file path, keep
-listing the servers, and exit with a failure status. Enabled connection
-failures also cause a nonzero exit. An invalid trusted project override currently fails the merged
+listing the servers, and exit with a failure status. Both forms also
+report malformed files and non-object `mcpServers` roots while continuing to
+list servers from the other scope. Enabled connection failures also cause a
+nonzero exit. An invalid trusted project override currently fails the merged
 configuration as a whole, preserving pi-rs's existing override validation.
 Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
@@ -1151,6 +1159,18 @@ their 100,000-match ceiling. Unrestricted local grep accepts numeric limits,
 clamps them to at least one and uses Pi's numeric comparison and notices.
 
 ### Model-selection checkpoint
+
+Native hosts can build a `ModelCatalog` from explicitly authorized provider,
+endpoint, protocol and model definitions through `ModelClientFactory::catalog`.
+Optional metadata describes entries. A missing credential or invalid entry
+fails the catalog as a unit. SDK hosts that want Pi-style fallback can pass an
+authorized default to `ModelCatalog::session_builder_with_fallback`. It
+restores an exact authorized historical model first and reports a missing
+provider-qualified model through `AgentSession::model_fallback` when it
+commits the supplied default. The host chooses the default and may keep
+using the exact-only builder. Automatic provider discovery, credential
+refresh, and selection for provider-less legacy history remain host-owned.
+
 
 Native SDK hosts can construct OpenAI-compatible chat, OpenAI Responses,
 ChatGPT Responses, Anthropic Messages and Gemini clients from an explicitly supplied credential snapshot,
@@ -1570,7 +1590,9 @@ read `auth.json`; availability checks and model calls still load credentials
 and report authentication-file errors. Memory, stack and output have explicit
 bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
-waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
+waiting for a worker. Like Pi, a script awaiting an unresolved promise fails
+as soon as it has no pending host calls or JavaScript jobs, even without a
+configured deadline. Worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
 cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
@@ -1897,6 +1919,12 @@ limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
 
 ### Text paging checkpoint
 
+Unrestricted local `read` accepts JavaScript numbers for `offset` and `limit`.
+Fractional values and negative slice endpoints select the same lines as Pi,
+and continuation notices use the original numeric bounds. Negative endpoints
+count lines and rewind the same file while keeping memory bounded. Scoped and
+injected read tools retain positive integer paging parameters.
+
 Text reads now scan files with bounded memory, including files larger than
 4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next
 `offset`, reject offsets beyond the file, and explain when a single line
@@ -2094,6 +2122,10 @@ legacy metadata hooks retain their existing bounded execution.
 
 ### Markdown presentation checkpoint
 
+Terminal Markdown expands tabs to three spaces before parsing, matching Pi.
+This applies to block marker indentation, reference definitions, and inline and
+fenced code.
+
 Level-one headings use underlining, lower-level headings retain their markers,
 and code blocks show language-labelled fences with indented syntax highlighting.
 Code blocks are separated from following blocks; syntax tokens use the active
@@ -2121,9 +2153,12 @@ have native work limits; inputs that exceed them use the existing bounded
 renderer and can differ in spacing from Pi.
 Nested list spacing follows source block boundaries. Source soft breaks
 produce separate rows in paragraphs, quotes, and list items, with list
-continuation prefixes, matching Pi. Extra source indentation, width-based
-wrapping, some numbered nested lists, and list-contained horizontal rules
-can still differ.
+continuation prefixes, matching Pi. Prose wraps at words and CJK graphemes
+and preserves inline styles across the wrap. Thematic breaks within an item
+use its continuation indentation and available width. List continuation rows
+retain extra source spaces after stripping the applicable marker indents.
+Tab-indented continuations, some numbered nested lists, and ambiguous list
+marker and rule syntax can still differ.
 If nested-math scanning exceeds its resource limit, reference links may remain
 unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
@@ -2485,8 +2520,10 @@ horizontally to keep the selected entry visible while retaining the selection
 gutter; clipping skips partially visible wide characters at either boundary
 while preserving theme styling.
 Searching includes records inside folded branches. Shift+L edits or removes a
-record label without changing its identity. Direct `/checkout` releases its
+record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
 journal lock before restoring the view.
+After tree navigation, the selected user message fills an empty editor. A draft
+already in the editor keeps its text and any native image attachments.
 
 Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
 folding, search, labels, checkout and terminal restoration. Session and queue
@@ -3088,6 +3125,9 @@ with chunked multibyte output; other local-tool parity gaps remain open.
 Invalid regular expressions in unrestricted local `grep` include the `rg:`
 prefix used by Pi's ripgrep diagnostic. Unsupported look-around and
 backreferences include ripgrep's PCRE2 suggestion.
+Malformed `glob` filters report the original glob with ripgrep's diagnostic
+before regex compilation. Unrestricted local `grep` and `ls` report the
+requested path as missing when an intermediate component is a regular file.
 
 Grep now emits a separate context block for each match, including repeated lines
 where adjacent matches overlap. The matching marker belongs to that block's
@@ -4688,6 +4728,25 @@ including model-specific compatibility, NVIDIA polling headers and Baseten's
 thinking template. Catalog entries that use other upstream APIs still need
 their own adapters.
 
+### GitHub Copilot
+
+The native catalog includes the pinned Pi AI release's 27 Copilot models across
+Chat Completions, Anthropic Messages, and OpenAI Responses.
+`COPILOT_GITHUB_TOKEN` supplies a short-lived Copilot API token.
+`pi login github-copilot` and `/login github-copilot` support GitHub.com's
+device authorization and store a Pi-compatible OAuth entry. pi-rs can also
+read an existing entry, refresh access, and filter the picker by the stored
+account catalog. If catalog discovery fails during refresh, inference uses the
+new token and the last saved catalog. Saved OAuth tokens can route to individual, business, or
+enterprise Copilot inference hosts. Requests carry the Copilot initiator and
+vision headers.
+
+Native sign-in leaves account model policies as configured. Authentication
+through private GitHub Enterprise domains remains unsupported. The published
+Pi AI package and local HTTP fixtures were used to compare the catalog and
+wire behavior. Live GitHub device authorization and Copilot inference were
+unverified because no subscription credentials were available.
+
 ### OpenRouter browser authorization
 
 `/login openrouter` and `pi login openrouter` use OpenRouter's browser
@@ -5497,7 +5556,9 @@ control after a surrogate in another string if no other parse error occurs first
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
 position-aware wording. Other malformed records, including array trailing
-commas, retain the native parser's diagnostics.
+commas, retain the native parser's diagnostics. Malformed numbers use Pi's
+position-aware wording for leading zeroes and missing digits after a minus
+sign, decimal point or exponent.
 
 ### Shell execution transcript checkpoint
 
