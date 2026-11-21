@@ -255,6 +255,11 @@ enum ProtocolRequest {
         arguments: String,
         state: Option<ExtensionState>,
     },
+    CommandEffectsClassifiedV1 {
+        name: String,
+        arguments: String,
+        state: Option<ExtensionState>,
+    },
     BeforeTool {
         name: String,
         arguments: Value,
@@ -332,6 +337,8 @@ struct Description {
     command_entries: bool,
     #[serde(default)]
     command_effects: bool,
+    #[serde(default)]
+    command_failure_classification_v1: bool,
     #[serde(default)]
     input_hook: bool,
     #[serde(default)]
@@ -1551,6 +1558,30 @@ impl Extension for ExecutableExtension {
                         .map(|entry| pi_rs_core::ExtensionCommandAction::Entry { entry })
                         .collect(),
                 })
+        }
+    }
+    fn command_effects_classified(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> std::result::Result<pi_rs_core::ExtensionCommandEffects, pi_rs_core::CommandCallbackFailure>
+    {
+        if self.description.command_failure_classification_v1 {
+            let response: std::result::Result<
+                pi_rs_core::ExtensionCommandEffects,
+                pi_rs_core::CommandCallbackFailure,
+            > = self
+                .request(ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                    state: previous.cloned(),
+                })
+                .map_err(pi_rs_core::CommandCallbackFailure::Transport)?;
+            response
+        } else {
+            self.command_effects(name, arguments, previous)
+                .map_err(pi_rs_core::CommandCallbackFailure::Transport)
         }
     }
     async fn before_tool(
@@ -3507,6 +3538,7 @@ async fn dispatch_inner(
             host_calls: true,
             command_entries: extension.supports_command_entries(),
             command_effects: extension.supports_command_effects(),
+            command_failure_classification_v1: true,
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
             result_presence_v1: true,
@@ -3930,6 +3962,20 @@ async fn dispatch_inner(
                 return Err("unknown extension command".into());
             }
             encode(extension.command_effects(&name, &arguments, state.as_ref()))
+        }
+        ProtocolRequest::CommandEffectsClassifiedV1 {
+            name,
+            arguments,
+            state,
+        } => {
+            if !extension.command_names().contains(&name.as_str()) {
+                return Err("unknown extension command".into());
+            }
+            encode(Ok(extension.command_effects_classified(
+                &name,
+                &arguments,
+                state.as_ref(),
+            )))
         }
         ProtocolRequest::ToolCall {
             name,
@@ -7413,6 +7459,66 @@ else:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn classified_command_protocol_preserves_relay_and_legacy_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for classified in [false, true] {
+            let path = root
+                .path()
+                .join(if classified { "new.py" } else { "old.py" });
+            let script = format!(
+                r##"#!/usr/bin/env python3
+import json,sys
+r=json.load(sys.stdin)
+if r['type']=='describe':
+ result={{'Ok':{{'id':'relay','dependencies':[],'commands':['callback','transport'],'tools':[],'command_effects':True,'command_failure_classification_v1':{}}}}}
+elif r['type']=='command_effects_classified_v1':
+ result={{'Ok':{{'Err':{{'Callback' if r['name']=='callback' else 'Transport':'failure'}}}}}}
+elif r['type']=='command_effects': result={{'Err':'legacy failure'}}
+else: result={{'Ok':None}}
+print(json.dumps({{'version':1,'response':result}}))
+"##,
+                if classified { "True" } else { "False" }
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let executable: Arc<dyn Extension> = Arc::new(ExecutableExtension::load(path).unwrap());
+            assert_eq!(
+                executable
+                    .command_effects("callback", "", None)
+                    .unwrap_err(),
+                "legacy failure"
+            );
+            for name in ["callback", "transport"] {
+                let request = ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: name.into(),
+                    arguments: String::new(),
+                    state: None,
+                };
+                let response = dispatch(executable.clone(), request).await.unwrap();
+                let kind = if classified && name == "callback" {
+                    "Callback"
+                } else {
+                    "Transport"
+                };
+                assert!(response["Err"][kind].is_string(), "{response}");
+            }
+            let unknown = dispatch(
+                executable,
+                ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: "unknown".into(),
+                    arguments: String::new(),
+                    state: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(unknown, "unknown extension command");
+        }
+    }
+
+    #[tokio::test]
     async fn command_output_protocol_transports_custom_entries() {
         struct Entries;
         impl Extension for Entries {
@@ -7547,6 +7653,7 @@ else:
         .unwrap();
         assert!(!descriptor.command_entries);
         assert!(!descriptor.command_effects);
+        assert!(!descriptor.command_failure_classification_v1);
         assert!(!descriptor.cache_warming_hook);
         assert!(!descriptor.session_lifecycle_hook);
         assert!(!descriptor.session_transition_reasons);

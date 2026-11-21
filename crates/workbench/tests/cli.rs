@@ -2696,6 +2696,205 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 
 #[cfg(unix)]
 #[test]
+fn rpc_idle_triggering_command_is_handled_even_when_model_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("trigger.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'trigger', 'dependencies':[], 'commands':['trigger'], 'tools':[], 'command_effects':True, 'input_hook':True}
+elif request['type'] == 'command_effects':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'commands'), 'a') as log:
+        log.write('command\n')
+    result = {'actions':[{'type':'trigger_message','message':{'customType':'hint','content':'same input','display':False}}]}
+elif request['type'] == 'input':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'hooks'), 'a') as log:
+        log.write('input\n')
+    result = {'action':'continue'}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (release, gate) = std::sync::mpsc::channel();
+    let (arrived, model_request) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut count = 0;
+        while count < 2 {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "model fixture timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("model fixture: {error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut length = 0;
+            let mut metadata = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                metadata |= line.starts_with("GET /api/ps ");
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if metadata {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert!(!request.to_string().contains("aGVsbG8="));
+            assert!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["content"] == "same input")
+            );
+            arrived.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(30))
+                .expect("model gate was not released");
+            let (status, body) = if count == 0 {
+                (
+                    "200 OK",
+                    "data: {\"id\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+            } else {
+                ("400 Bad Request", "fixture model failure")
+            };
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            count += 1;
+        }
+    });
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for (id, success) in [("ok", true), ("failure", false)] {
+        let mut request = json!({"type":"prompt", "id":id, "message":"/trigger"});
+        if id == "failure" {
+            request["images"] = json!([{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]);
+        }
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .expect("RPC event timeout");
+            if event["type"] == "response" && event["id"] == id {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                assert!(!events.iter().any(|e: &Value| e["type"] == "agent_end"));
+                model_request
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("model did not receive the triggered request");
+                release.send(()).unwrap();
+            }
+            let settled = event["type"] == "agent_settled";
+            events.push(event);
+            if settled {
+                break;
+            }
+        }
+        let responses: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "response" && e["id"] == id)
+            .collect();
+        assert_eq!(responses.len(), 1, "{events:?}");
+        assert_eq!(responses[0]["success"], true, "{events:?}");
+        assert_eq!(responses[0]["data"]["disposition"], "handled", "{events:?}");
+        assert_eq!(
+            events.iter().filter(|e| e["type"] == "agent_start").count(),
+            1,
+            "{events:?}"
+        );
+        let ends: Vec<_> = events.iter().filter(|e| e["type"] == "agent_end").collect();
+        assert_eq!(ends.len(), 1, "{events:?}");
+        assert_eq!(ends[0]["success"], success, "{events:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("commands")).unwrap(),
+        "command\ncommand\n"
+    );
+    assert!(!root.path().join("hooks").exists());
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "RPC did not shut down");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().unwrap();
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn extension_command_can_trigger_model_in_print_and_json_modes() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -2834,7 +3033,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
             assert_ne!(event["message"]["role"], "user", "{event}");
             if event["type"] == "response" && event["id"] == id {
-                assert_eq!(event["data"]["disposition"], "started", "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
                 started = true;
             }
             if event["type"] == "agent_end" {

@@ -1089,6 +1089,38 @@ impl Picker {
             "accent",
         )];
         let items = self.matches();
+        let description = if self.title == "Settings" {
+            items
+                .get(self.selected)
+                .and_then(|item| setting_description(&item.selection))
+        } else {
+            None
+        };
+        let description_lines = description.map_or_else(Vec::new, |description| {
+            if width < 4 {
+                return Vec::new();
+            }
+            let content_width = width.saturating_sub(4).max(1);
+            let layout = super::editor_layout::Layout::new(description, content_width);
+            let visible = layout.len().min(height.saturating_sub(4));
+            let truncated = visible < layout.len();
+            layout
+                .visible(description, 0, visible)
+                .enumerate()
+                .map(|(index, line)| {
+                    let line = line.trim_end();
+                    let text = if truncated && index + 1 == visible {
+                        format!(
+                            "{}…",
+                            clip_completion(line, content_width.saturating_sub(1))
+                        )
+                    } else {
+                        line.to_owned()
+                    };
+                    Line::themed(&format!("  {text}"), theme, "dim")
+                })
+                .collect::<Vec<_>>()
+        });
         let tree_layout = self.tree.as_ref().map(|tree| {
             let visible: Vec<_> = items
                 .iter()
@@ -1112,7 +1144,8 @@ impl Picker {
         let mut available = height
             .saturating_sub(
                 3 + usize::from(self.feedback.is_some())
-                    + usize::from(self.active_session.is_some()),
+                    + usize::from(self.active_session.is_some())
+                    + description_lines.len(),
             )
             .max(1);
         if let Some(limit) = self.completion_limit {
@@ -1328,6 +1361,7 @@ impl Picker {
                 };
             lines.push(Line::themed(message, theme, "dim"));
         }
+        lines.extend(description_lines);
         if let Some(feedback) = &self.feedback {
             let (message, role) = match feedback {
                 Ok(message) => (message, "dim"),
@@ -1426,6 +1460,81 @@ impl Picker {
         lines.push(Line::themed(&hint, theme, "dim"));
         lines
     }
+}
+
+// Pi's settings list explains the selected option below the list. Keep
+// descriptions keyed by the action so searching and refreshing do not detach
+// them from the setting they describe.
+fn setting_description(selection: &Selection) -> Option<&'static str> {
+    if let Selection::EditSetting(key) = selection
+        && !matches!(key.as_str(), "theme" | "modelThinkingLevels")
+    {
+        return Some("Edit the saved setting as JSON; changes apply on reload or startup.");
+    }
+    let key = match selection {
+        Selection::Setting(key, _) | Selection::EditSetting(key) => key.as_str(),
+        Selection::SaveDefaultModel => {
+            return Some("Save the current provider and model as the default for new sessions.");
+        }
+        _ => return None,
+    };
+    Some(match key {
+        "httpIdleTimeoutMs" => {
+            "Maximum idle gap while waiting for HTTP headers or body chunks. Disable it for models that pause longer."
+        }
+        "steeringMode" => {
+            "Choose whether steering messages are delivered one at a time or all at once while the agent is running."
+        }
+        "followUpMode" => {
+            "Choose whether queued follow-up messages are delivered one at a time or all at once after the agent stops."
+        }
+        "theme" => "Choose a color theme for the interface.",
+        "modelThinkingLevels" => "Override the default thinking level for specific models.",
+        "expandTools" => "Expand or collapse tool output in the transcript.",
+        "hideThinkingBlock" => "Hide thinking blocks in assistant responses.",
+        "showCacheMissNotices" => {
+            "Show transcript notices for cache costs and provider recovery diagnostics."
+        }
+        "cacheWarming" => {
+            "Keep prompt caches warm while streaming, also while idle, or turn cache warming off."
+        }
+        "defaultThinkingLevel" => {
+            "Save the current thinking level as the default for new sessions."
+        }
+        "autoCompactionEnabled" => "Automatically compact context when it gets too large.",
+        "autoRetryEnabled" => "Automatically retry supported transient errors.",
+        "images.autoResize" => "Resize large images before sending them to a model.",
+        "images.blockImages" => "Prevent images from being sent to model providers.",
+        "terminal.showImages" => "Render supported images inline in the terminal.",
+        "terminal.imageWidthCells" => "Set the preferred width of inline images in terminal cells.",
+        "tuiMode" => "Choose fullscreen or regular mode; regular mode uses terminal scrollback.",
+        "quietStartup" => "Control startup output; header keeps only the startup header.",
+        "sessionShareDestination" => "Choose where to upload sessions shared with /share.",
+        "defaultProjectTrust" => "Choose the fallback when no saved project trust decision exists.",
+        "fullscreenWheelScrollLines" => {
+            "Set lines per mouse-wheel event in fullscreen mode; auto adapts to fast scrolling where needed."
+        }
+        "autocompleteMaxVisible" => "Set the maximum number of visible autocomplete items.",
+        "enableSkillCommands" => "Register skills as /skill:name commands.",
+        "terminal.showTerminalProgress" => "Show progress indicators in the terminal tab bar.",
+        "fullscreenExitOutput" => {
+            "Print the transcript or a resume hint when exiting fullscreen mode."
+        }
+        "fullscreenScrollbar" => "Choose when the fullscreen scrollbar is visible.",
+        "fullscreenCopyOnSelect" => "Automatically copy selected text in fullscreen mode.",
+        "editorPaddingX" => "Set horizontal padding for the input editor.",
+        "markdown.mermaid" => "Render Mermaid code blocks as Unicode diagrams.",
+        "terminal.clearOnShrink" => {
+            "Clear empty terminal rows when content shrinks; this can cause flicker."
+        }
+        "showHardwareCursor" => "Use the terminal cursor instead of the drawn cursor.",
+        "outputPad" => "Set horizontal padding for messages, tool output, and command output.",
+        "doubleEscapeAction" => {
+            "Choose what happens when Escape is pressed twice with an empty editor."
+        }
+        "treeFilterMode" => "Choose the default filter when opening /tree.",
+        _ => return None,
+    })
 }
 
 fn previous_word_start(text: &str) -> usize {
@@ -2123,6 +2232,66 @@ mod tests {
             Input::UpdateModelScope { save: false }
         ));
         assert!(picker.model_scope().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn settings_describe_selected_item_within_the_available_height() {
+        let item = |label: &str, key: &str| Item {
+            label: label.into(),
+            selection: Selection::Setting(key.into(), serde_json::json!(true)),
+        };
+        let mut picker = Picker::new(
+            "Settings",
+            vec![
+                item("HTTP idle timeout", "httpIdleTimeoutMs"),
+                item("Block images", "images.blockImages"),
+            ],
+        );
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let lines = picker.render(&theme, 80, 8, &keys);
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.text.contains("Maximum idle gap") && span.dim == theme.is_dim("dim")
+            })
+        }));
+        picker.paste("Block images");
+        let lines = picker.render(&theme, 24, 6, &keys);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Prevent images"), "{text}");
+        assert!(!text.contains("Maximum idle gap"), "{text}");
+        assert!(text.contains('…'), "truncation should be visible: {text}");
+        assert!(lines.len() <= 6, "{} lines: {text}", lines.len());
+        for width in 1..4 {
+            let tiny = picker.render(&theme, width, 6, &keys);
+            assert!(
+                !tiny
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text.contains("Prevent images"))
+            );
+        }
+        let description = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.text.contains("Prevent images"))
+            })
+            .unwrap();
+        assert!(
+            description
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+                .width()
+                <= 24
+        );
     }
 
     #[test]

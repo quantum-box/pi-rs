@@ -171,6 +171,9 @@ struct Cli {
     no_session: bool,
     #[arg(long, hide = true)]
     ephemeral_worker_session: bool,
+    /// Internal frontend worker: terminal interrupts are handled by the parent.
+    #[arg(long, hide = true)]
+    terminal_managed_worker: bool,
     /// Print the final answer and exit.
     #[arg(short = 'p', long)]
     print: bool,
@@ -1311,14 +1314,26 @@ fn main() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> i32 {
-    // Register before parsing or starting any operation, including auth commands.
+    // Terminal-owned workers receive the same foreground-group SIGINT as the
+    // frontend and editor. Their parent handles terminal interrupts and sends
+    // explicit cancel/shutdown commands; do not independently stop the worker.
+    // Worker::start places its internal flag first, before user arguments.
+    let terminal_managed = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--terminal-managed-worker");
     let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
     let mcp_login_cancel = CancellationToken::new();
     let signal_cancel = mcp_login_cancel.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancel.cancel();
-            let _ = signal_tx.send(());
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            if !terminal_managed {
+                signal_cancel.cancel();
+                let _ = signal_tx.send(());
+                break;
+            }
         }
     });
     tokio::task::yield_now().await;

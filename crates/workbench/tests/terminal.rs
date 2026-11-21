@@ -504,6 +504,14 @@ fn delayed_color_reply_does_not_type_tail_or_open_editor() {
     );
     let master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    // Pi needs the slave on stdio but must not retain a copy of the master,
+    // which the test closes to release any blocked terminal write.
+    for fd in [master_fd, slave_fd] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
     let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
     assert_eq!(
         unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
@@ -1068,7 +1076,9 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         master.write_all(b"hello\r").unwrap();
         output_until(&mut master, |text| text.contains("live-stream-marker"));
         master.write_all(b"/settings\r").unwrap();
-        output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+        output_until(&mut master, |text| {
+            text.contains("HTTP idle timeout") && text.contains("Maximum idle gap")
+        });
         master.write_all(b" ").unwrap();
         output_until(&mut master, |text| {
             text.contains("HTTP idle timeout") && text.contains("disabled")
@@ -3498,4 +3508,374 @@ fn bedrock_login_selects_profile_chain_and_logout() {
     let auth: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
     assert!(auth.get("amazon-bedrock").is_none());
+}
+
+#[test]
+fn external_editor_ctrl_c_does_not_cancel_active_backend_shell() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let editor = root.path().join("editor");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\ntrap 'printf done > \"$PI_RS_HOME/editor-done\"; exit 130' INT\nprintf 'EDITOR_READY\\n'\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    // Declare the process guard first so the PTY master closes before the
+    // guard waits, including on assertion failure.
+    let mut process: Process;
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("EDITOR", &editor)
+        .env("TERM", "xterm-256color")
+        .args([
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--offline",
+            "--model",
+            "fixture",
+        ])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    process = Process(command.spawn().unwrap());
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master
+        .write_all(b"!echo WORKER_ACTIVE; while [ ! -f allow-worker ]; do sleep .1; done; echo survived > worker-marker\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("WORKER_ACTIVE"));
+    master.write_all(&[7]).unwrap();
+    output_until(&mut master, |text| text.contains("EDITOR_READY"));
+    master.write_all(&[3]).unwrap();
+    let editor_done = root.path().join("home/editor-done");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !editor_done.exists() && Instant::now() < deadline {
+        let mut bytes = [0; 8192];
+        let _ = master.read(&mut bytes);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        editor_done.exists(),
+        "editor did not observe terminal Ctrl+C"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::write(root.path().join("allow-worker"), "go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !root.path().join("worker-marker").exists() && Instant::now() < deadline {
+        let mut bytes = [0; 8192];
+        let _ = master.read(&mut bytes);
+        assert!(process.0.try_wait().unwrap().is_none(), "frontend exited");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = root.path().join("worker-marker").exists();
+    // Closing the PTY before waiting prevents terminal teardown from blocking
+    // the test's process guard on platforms that drain an open master.
+    drop(master);
+    let _ = process.0.kill();
+    let _ = process.0.wait();
+    assert!(survived, "editor Ctrl+C cancelled active worker operation");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn extension_editor_timeout_disconnects_reparented_terminal_reader() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("editor-extension.py");
+    let editor = root.path().join("editor.py");
+    std::fs::write(
+        &extension,
+        r#"#!/usr/bin/env python3
+import json, pathlib, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request = json.load(sys.stdin)
+    result = {
+        'id':'editor-fixture','dependencies':[],'commands':[],'host_calls':True,
+        'tools':[{'spec':{'name':'ask_editor','description':'Open an editor',
+                          'parameters':{'type':'object'}},
+                  'execution':'sequential','transactional':True}]
+    } if request['type'] == 'describe' else None
+    if request['type'] == 'before_request':
+        result = request['request']
+    elif request['type'] == 'before_tool':
+        result = {'allow':True,'reason':None}
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame = json.loads(sys.stdin.readline())
+    assert frame['request']['type'] == 'invoke'
+    print(json.dumps({'type':'ui','request':{
+        'method':'editor','title':'EDIT EXTENSION DRAFT','prefill':'original','timeout':6000
+    }}), flush=True)
+    response = json.loads(sys.stdin.readline())
+    pathlib.Path('ui-reply').write_text(json.dumps(response))
+    result = {'outcome':{'status':'succeeded','detail':'finished'}}
+    print(json.dumps({'type':'complete','response':{'Ok':result}}), flush=True)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &editor,
+        r#"#!/usr/bin/env python3
+import errno, os, pathlib, signal, sys
+try:
+    os.fstat(77)
+except OSError as error:
+    assert error.errno == errno.EBADF
+else:
+    raise RuntimeError('editor inherited an extra real terminal descriptor')
+child = os.fork()
+if child:
+    os.waitpid(child, 0)
+    sys.exit(0)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.alarm(20)
+# Escape the editor's session, but keep an inherited tty descriptor.
+os.setsid()
+assert os.isatty(0)
+size = os.get_terminal_size()
+print(f'EDITOR READY {size.columns}x{size.lines}', flush=True)
+assert sys.stdin.readline() == 'editor-input\n'
+size = os.get_terminal_size()
+print(f'EDITOR WAITING {size.columns}x{size.lines}', flush=True)
+try:
+    line = sys.stdin.readline()
+except OSError:
+    line = ''
+pathlib.Path('editor-end').write_text(line if line else 'disconnected')
+"#,
+    )
+    .unwrap();
+    for path in [&extension, &editor] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut sent_call = false;
+        while Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fixture model accept failed: {error}"),
+            };
+            prepare_gate(&socket);
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let is_post = line.starts_with("POST ");
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if !is_post {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let events = if sent_call {
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Fixture finished\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"editor-call\",\"type\":\"function\",\"function\":{\"name\":\"ask_editor\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            if sent_call {
+                return;
+            }
+            sent_call = true;
+        }
+        panic!("model fixture timed out");
+    });
+
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let mut baseline = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::tcgetattr(slave_fd, &mut baseline) }, 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    for fd in [master_fd, slave_fd] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("VISUAL", &editor)
+        .env("TERM", "xterm-256color")
+        .args([
+            "--no-session",
+            "--no-trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(extension)
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0
+                || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0
+                || libc::dup2(0, 77) < 0
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut process = BoundedProcess {
+        child: command.spawn().unwrap(),
+        master: Some(master),
+    };
+    let master = process.master.as_mut().unwrap();
+    output_until(master, |text| text.contains("Enter to send"));
+    master.write_all(b"exercise editor fixture\r").unwrap();
+    output_until(master, |text| text.contains("EDIT EXTENSION DRAFT"));
+    master.write_all(&[7]).unwrap();
+    output_until(master, |text| text.contains("EDITOR READY 110x32"));
+    size.ws_row = 34;
+    size.ws_col = 112;
+    assert_eq!(
+        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    // The relay copies window size before forwarding each input buffer.
+    master.write_all(b"editor-input\r").unwrap();
+    output_until(master, |text| text.contains("EDITOR WAITING 112x34"));
+
+    output_until(master, |text| text.contains("Fixture finished"));
+    server.join().unwrap();
+    let reply: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("ui-reply")).unwrap()).unwrap();
+    assert_eq!(reply, serde_json::json!({"Ok":null}));
+    master.write_all(b"frontend-kept-input").unwrap();
+    output_until(master, |text| text.contains("frontend-kept-input"));
+
+    let marker = root.path().join("editor-end");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "disconnected");
+    // A normal frontend shutdown must still restore the pre-editor tty modes.
+    assert_eq!(
+        unsafe { libc::kill(process.child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut bytes = [0; 8192];
+        let _ = master.read(&mut bytes);
+        if process.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "frontend did not shut down");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Darwin revokes the old slave descriptor when its session leader exits.
+    let mut restored = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::tcgetattr(master.as_raw_fd(), &mut restored) },
+        0
+    );
+    assert_eq!(restored.c_iflag, baseline.c_iflag);
+    assert_eq!(restored.c_oflag, baseline.c_oflag);
+    assert_eq!(restored.c_lflag, baseline.c_lflag);
+    assert_eq!(restored.c_cc, baseline.c_cc);
 }

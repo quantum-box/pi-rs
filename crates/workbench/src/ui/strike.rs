@@ -747,21 +747,178 @@ fn rewrite(
     result
 }
 
-pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Spanned> {
-    let parser = Parser::new_ext(parsed, options);
-    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !needs_inline_lexer(original) {
-        return parser
+pub(super) fn events(
+    original: &str,
+    parsed: &str,
+    options: Options,
+    reference_source: &str,
+) -> Vec<Spanned> {
+    if original == reference_source {
+        let parser = Parser::new_ext(parsed, options);
+        let events = parser
             .into_offset_iter()
-            .map(|(event, range)| (event.into_static(), range))
-            .collect();
+            .map(|(event, range)| (event.into_static(), range));
+        if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !needs_inline_lexer(original) {
+            return events.collect();
+        }
+        let references = Parser::new_ext(original, options);
+        let nodes = rewrite(
+            tree(events),
+            original,
+            references.reference_definitions(),
+            None,
+            &[],
+        );
+        let mut output = Vec::new();
+        for node in nodes {
+            node.flatten(&mut output);
+        }
+        return output;
     }
-    let references = Parser::new_ext(original, options);
+    let references = Parser::new_ext(reference_source, options);
+    let mut sanitized = None;
+    let mut scan_work = 0usize;
+    let mut scan_incomplete = false;
+    loop {
+        let input = sanitized.as_deref().unwrap_or(parsed);
+        scan_work = scan_work.saturating_add(input.len());
+        if scan_work > 1024 * 1024 || frame_expired() {
+            scan_incomplete = true;
+            break;
+        }
+        let local = Parser::new_ext(input, options);
+        let invalid: Vec<_> = local
+            .reference_definitions()
+            .iter()
+            .filter(|(label, _)| references.reference_definitions().get(label).is_none())
+            .map(|(_, definition)| definition.span.clone())
+            .collect();
+        if invalid.is_empty() {
+            break;
+        }
+        let mut bytes = input.as_bytes().to_vec();
+        for range in invalid {
+            for byte in &mut bytes[range] {
+                if !matches!(*byte, b'\n' | b'\r') {
+                    *byte = b' ';
+                }
+            }
+        }
+        sanitized = String::from_utf8(bytes).ok();
+        if sanitized.is_none() {
+            break;
+        }
+    }
+    let mut callback = |link: pulldown_cmark::BrokenLink<'_>| {
+        references
+            .reference_definitions()
+            .get(&link.reference)
+            .map(|definition| {
+                (
+                    definition.dest.clone().into_static(),
+                    definition
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "".into())
+                        .into_static(),
+                )
+            })
+    };
+    let parser = Parser::new_with_broken_link_callback(
+        sanitized.as_deref().unwrap_or(parsed),
+        options,
+        Some(&mut callback),
+    );
+    let events = parser
+        .into_offset_iter()
+        .map(|(event, range)| {
+            let mut event = event.into_static();
+            if let Event::Start(
+                Tag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }
+                | Tag::Image {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                },
+            ) = &mut event
+                && matches!(
+                    link_type,
+                    LinkType::Reference
+                        | LinkType::ReferenceUnknown
+                        | LinkType::Collapsed
+                        | LinkType::CollapsedUnknown
+                        | LinkType::Shortcut
+                        | LinkType::ShortcutUnknown
+                )
+                && let Some(definition) = references.reference_definitions().get(id)
+            {
+                *dest_url = definition.dest.clone().into_static();
+                *title = definition
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "".into())
+                    .into_static();
+            }
+            (event, range)
+        })
+        .collect::<Vec<_>>();
+    let events = if scan_incomplete {
+        // If the budget prevented removing all local definitions, do not let
+        // one select a destination absent from the authoritative map. Preserve
+        // its source text as a bounded fallback.
+        let mut safe = Vec::with_capacity(events.len());
+        let mut iter = events.into_iter();
+        while let Some((event, range)) = iter.next() {
+            let invalid = match &event {
+                Event::Start(
+                    Tag::Link { link_type, id, .. } | Tag::Image { link_type, id, .. },
+                ) => {
+                    matches!(
+                        link_type,
+                        LinkType::Reference
+                            | LinkType::ReferenceUnknown
+                            | LinkType::Collapsed
+                            | LinkType::CollapsedUnknown
+                            | LinkType::Shortcut
+                            | LinkType::ShortcutUnknown
+                    ) && references.reference_definitions().get(id).is_none()
+                }
+                _ => false,
+            };
+            if invalid && let Some(raw) = original.get(range.clone()) {
+                let mut level = 1usize;
+                for (child, _) in iter.by_ref() {
+                    match child {
+                        Event::Start(Tag::Link { .. } | Tag::Image { .. }) => level += 1,
+                        Event::End(TagEnd::Link | TagEnd::Image) => {
+                            level -= 1;
+                            if level == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                safe.push((Event::Text(raw.to_owned().into()), range));
+            } else {
+                safe.push((event, range));
+            }
+        }
+        safe
+    } else {
+        events
+    };
+    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !needs_inline_lexer(original) {
+        return events;
+    }
     let nodes = rewrite(
-        tree(
-            parser
-                .into_offset_iter()
-                .map(|(event, range)| (event.into_static(), range)),
-        ),
+        tree(events),
         original,
         references.reference_definitions(),
         None,
@@ -777,6 +934,20 @@ pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Span
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_reference_scan_never_uses_local_definitions() {
+        for len in [600_000, 1_100_000] {
+            let source = format!(
+                "[x][r]\n\n{}\n\n[r]: /first\n\n[r]: /second",
+                "a".repeat(len)
+            );
+            let actual = events(&source, &source, Options::empty(), "");
+            assert!(!actual.iter().any(|(event, _)| matches!(event,
+                Event::Start(Tag::Link { dest_url, .. }) if dest_url.as_ref() == "/first" || dest_url.as_ref() == "/second"
+            )));
+        }
+    }
 
     #[test]
     fn math_probe_skips_escaped_dollars_in_linear_time() {
@@ -805,7 +976,7 @@ mod tests {
     fn exhausted_frame_budget_applies_to_every_inline_run_and_is_restored() {
         let previous = FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now())));
         let text = "~~first~~\n\n~~second~~";
-        let result = events(text, text, Options::empty());
+        let result = events(text, text, Options::empty(), text);
         assert!(
             !result
                 .iter()
@@ -842,7 +1013,7 @@ mod tests {
                 .is_none()
         );
         let document = format!("~~ok~~\n\n{}", "x".repeat(MAX_DOCUMENT_BYTES));
-        let result = events(&document, &document, Options::empty());
+        let result = events(&document, &document, Options::empty(), &document);
         assert!(
             !result
                 .iter()

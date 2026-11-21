@@ -19,6 +19,9 @@ pub struct Dialog {
     selected: usize,
     scroll_max: Cell<usize>,
     error: Option<String>,
+    error_page: usize,
+    error_pages: Cell<usize>,
+    external_error: Option<String>,
     masked: bool,
 }
 impl Dialog {
@@ -56,6 +59,9 @@ impl Dialog {
             selected: 0,
             scroll_max: Cell::new(0),
             error: None,
+            error_page: 0,
+            error_pages: Cell::new(1),
+            external_error: None,
             masked: false,
         }
     }
@@ -82,6 +88,42 @@ impl Dialog {
     }
     pub fn set_error(&mut self, error: String) {
         self.error = Some(error);
+        self.error_page = 0;
+        self.error_pages.set(1);
+    }
+    pub fn external_editor_text(&self) -> &str {
+        &self.editor.text
+    }
+    pub fn supports_external_editor(&self) -> bool {
+        matches!(self.request, UiRequest::Editor { .. })
+    }
+    pub fn external_editor_requested(&self, key: KeyEvent, keys: &Keys) -> bool {
+        self.supports_external_editor()
+            && !keys.matches("tui.select.cancel", key)
+            && keys.matches("app.editor.external", key)
+    }
+    pub fn external_edit(&mut self, run: impl FnOnce(&mut Editor) -> Result<()>) {
+        if !matches!(self.request, UiRequest::Editor { .. }) {
+            return;
+        }
+        let mut draft = Editor::default();
+        draft.replace(self.editor.text.clone());
+        match run(&mut draft) {
+            Ok(())
+                if self
+                    .request
+                    .accepts_response(&UiResponse::Text(draft.text.clone())) =>
+            {
+                self.editor.replace(draft.text);
+                self.external_error = None;
+            }
+            Ok(()) => {
+                self.external_error =
+                    Some("External editor result exceeds 1 MiB; draft unchanged".into())
+            }
+            Err(Error::Config(message)) => self.external_error = Some(message),
+            Err(error) => self.external_error = Some(error.to_string()),
+        }
     }
     pub fn paste(&mut self, text: &str) {
         let text = match self.request {
@@ -178,6 +220,20 @@ impl Dialog {
                 {
                     return Some(UiResponse::Text(self.editor.text.clone()));
                 }
+                if multiline && self.error_pages.get() > 1 && key.modifiers.is_empty() {
+                    let page = self.error_page.min(self.error_pages.get() - 1);
+                    match key.code {
+                        KeyCode::PageUp => {
+                            self.error_page = page.saturating_sub(1);
+                            return None;
+                        }
+                        KeyCode::PageDown => {
+                            self.error_page = (page + 1).min(self.error_pages.get() - 1);
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
                 let action = keys.action(key, self.editor.text.is_empty()).unwrap_or("");
                 if action == "tui.editor.cursorUp" {
                     self.editor.vertical(false);
@@ -222,7 +278,11 @@ impl Dialog {
             width,
         )
         .len()
-        .min(height.saturating_sub(2).clamp(1, 4))
+        .min(
+            height
+                .saturating_sub(2 + usize::from(self.external_error.is_some()))
+                .clamp(1, 4),
+        )
     }
     pub fn cursor(&self, width: usize, height: usize) -> Option<(usize, usize)> {
         if !matches!(
@@ -240,9 +300,11 @@ impl Dialog {
             width,
         );
         let heading_height = self.heading_height(width, height);
-        let offset = prefix
-            .len()
-            .saturating_sub(height.saturating_sub(heading_height + 1).max(1));
+        let offset = prefix.len().saturating_sub(
+            height
+                .saturating_sub(heading_height + 1 + usize::from(self.external_error.is_some()))
+                .max(1),
+        );
         let column = prefix
             .last()
             .map_or(0, |line| {
@@ -257,10 +319,25 @@ impl Dialog {
             column,
         ))
     }
-    pub fn render(&self, theme: &Theme, width: usize, height: usize) -> Vec<Line> {
-        let mut lines = wrap(&[Span::themed(self.heading(), theme, "accent")], width);
-        lines.truncate(self.heading_height(width, height));
-        let available = height.saturating_sub(lines.len() + 1).max(1);
+    pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
+        let heading = wrap(&[Span::themed(self.heading(), theme, "accent")], width);
+        let heading_height = self.heading_height(width, height);
+        let pages = if self.error.is_some() && matches!(self.request, UiRequest::Editor { .. }) {
+            heading.len().div_ceil(heading_height)
+        } else {
+            1
+        };
+        self.error_pages.set(pages);
+        let start = (self.error_page.min(pages - 1) * heading_height)
+            .min(heading.len().saturating_sub(heading_height));
+        let mut lines: Vec<_> = heading
+            .into_iter()
+            .skip(start)
+            .take(heading_height)
+            .collect();
+        let available = height
+            .saturating_sub(lines.len() + 1 + usize::from(self.external_error.is_some()))
+            .max(1);
         match &self.request {
             UiRequest::Select { options, .. } => {
                 let start = self.selected.saturating_sub(available.saturating_sub(1));
@@ -357,7 +434,17 @@ impl Dialog {
             _ => {}
         }
         let hint = match &self.request {
-            UiRequest::Editor { .. } => Cow::Borrowed("Ctrl+S save · Esc cancel"),
+            UiRequest::Editor { .. } if pages > 1 => Cow::Owned(format!(
+                "PgUp/PgDn ({}/{pages}) · Ctrl+S save · {} cancel · {} external editor",
+                self.error_page.min(pages - 1) + 1,
+                keys.hint("tui.select.cancel"),
+                keys.hint("app.editor.external")
+            )),
+            UiRequest::Editor { .. } => Cow::Owned(format!(
+                "Ctrl+S save · {} external editor · {} cancel",
+                keys.hint("app.editor.external"),
+                keys.hint("tui.select.cancel")
+            )),
             UiRequest::Custom { actions, .. } => {
                 let keys = actions
                     .iter()
@@ -375,6 +462,13 @@ impl Dialog {
             }
             _ => Cow::Borrowed("Enter confirm · Esc cancel"),
         };
+        if let Some(error) = &self.external_error {
+            lines.extend(
+                wrap(&[Span::themed(error, theme, "warning")], width)
+                    .into_iter()
+                    .take(1),
+            );
+        }
         lines.push(Line::themed(&hint, theme, "dim"));
         lines.truncate(height);
         lines
@@ -384,6 +478,110 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_editor_shortcut_is_scoped_remappable_and_cancel_first() {
+        let mut keys = Keys::default();
+        let editor = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: None,
+                timeout: None,
+            },
+        );
+        let input = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Input {
+                title: "Secret".into(),
+                placeholder: None,
+                initial_value: None,
+                timeout: None,
+            },
+        );
+        let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(editor.external_editor_requested(ctrl_g, &keys));
+        assert!(!input.external_editor_requested(ctrl_g, &keys));
+        keys.set_test_binding("app.editor.external", "ctrl+e");
+        assert!(!editor.external_editor_requested(ctrl_g, &keys));
+        assert!(editor.external_editor_requested(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &keys
+        ));
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let lines = editor.render(&theme, 100, 8, &keys);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("Ctrl+E external editor"))
+        );
+        keys.set_test_binding("app.editor.external", "escape");
+        assert!(
+            !editor
+                .external_editor_requested(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys)
+        );
+    }
+
+    #[test]
+    fn external_editor_failure_and_oversize_keep_dialog_open_and_draft() {
+        let keys = Keys::default();
+        let mut dialog = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: Some("original".into()),
+                timeout: None,
+            },
+        );
+        dialog.external_edit(|draft| {
+            draft.replace("discarded".into());
+            Err(Error::Config("editor failed".into()))
+        });
+        assert_eq!(dialog.editor.text, "original");
+        assert!(
+            dialog
+                .external_error
+                .as_deref()
+                .unwrap()
+                .contains("editor failed")
+        );
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let lines = dialog.render(&theme, 100, 8, &keys);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("editor failed"))
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("external editor"))
+        );
+        dialog.external_edit(|draft| {
+            draft.replace("x".repeat(1024 * 1024 + 1));
+            Ok(())
+        });
+        assert_eq!(dialog.editor.text, "original");
+        assert!(dialog.external_error.as_deref().unwrap().contains("1 MiB"));
+        dialog.external_edit(|draft| {
+            draft.replace("edited".into());
+            Ok(())
+        });
+        assert!(dialog.external_error.is_none());
+        assert_eq!(
+            dialog.input(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &keys
+            ),
+            Some(UiResponse::Text("edited".into()))
+        );
+        assert_eq!(
+            dialog.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
+            Some(UiResponse::Cancelled)
+        );
+    }
     #[test]
     fn single_line_paste_removes_line_breaks_and_bounds_expanded_tabs() {
         let mut dialog = Dialog::new(
@@ -485,11 +683,55 @@ mod tests {
         );
         dialog.set_error("Invalid value for this setting".into());
         let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
-        let lines = dialog.render(&theme, 12, 8);
+        let lines = dialog.render(&theme, 12, 8, &Keys::default());
         let (row, column) = dialog.cursor(12, 8).unwrap();
         assert!(row >= 2 && row < lines.len());
         assert_eq!(column, 6);
         assert!(lines.len() <= 8);
+    }
+
+    #[test]
+    fn editor_pages_through_errors_without_changing_the_edit() {
+        let mut dialog = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit setting".into(),
+                initial_value: Some("pending edit".into()),
+                timeout: None,
+            },
+        );
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let keys = Keys::default();
+        let render = |dialog: &Dialog| {
+            dialog
+                .render(&theme, 60, 7, &keys)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.text)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        dialog.set_error("first\nsecond\nthird\nfourth\nfifth".into());
+        assert_eq!(render(&dialog)[0], "first");
+        let last = dialog.input(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &keys);
+        assert!(last.is_none());
+        let lines = render(&dialog);
+        assert!(lines.iter().any(|line| line == "fifth"));
+        assert!(lines.last().unwrap().contains("2/2"));
+        let (row, _) = dialog.cursor(60, 7).unwrap();
+        assert_eq!(lines[row], "pending edit");
+        dialog.input(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &keys);
+        assert_eq!(render(&dialog)[0], "first");
+        dialog.input(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &keys);
+        dialog.set_error("new error".into());
+        assert_eq!(render(&dialog)[0], "new error");
+        assert!(matches!(
+            dialog.input(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &keys),
+            Some(UiResponse::Text(text)) if text == "pending edit"
+        ));
     }
 
     #[test]

@@ -25,6 +25,35 @@ use crate::{
     ToolReply, ToolSpec, Usage, UsageReport,
 };
 
+/// A command callback failure is separate from host and session failures.
+#[derive(Debug)]
+pub enum CommandDispatchError {
+    Callback { id: String, message: String },
+    Other(Error),
+}
+
+impl From<Error> for CommandDispatchError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl CommandDispatchError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Callback { id, message } => Error::Extension { id, message },
+            Self::Other(error) => error,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CommandInvocation {
+    Host,
+    Trigger,
+    Rpc,
+}
+
 // Provider replay may contain private thinking and opaque signatures. Hooks and
 // observers receive portable messages; only unchanged messages regain replay.
 fn portable_request(request: &ModelRequest) -> ModelRequest {
@@ -3520,6 +3549,36 @@ impl Agent<'_> {
         .map(Some)
     }
 
+    /// Dispatch a command with a distinct callback failure for RPC projection.
+    pub fn try_extension_command_rpc(
+        &self,
+        session: &mut Session,
+        input: &str,
+        observer: &mut Observer<'_>,
+    ) -> std::result::Result<Option<bool>, CommandDispatchError> {
+        let (name, arguments) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+        let Some(name) = name.strip_prefix('/') else {
+            return Ok(None);
+        };
+        let Some(command) = self
+            .registry
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.invocation_name == name)
+        else {
+            return Ok(None);
+        };
+        self.extension_command_inner(
+            session,
+            &command.extension_id,
+            &command.name,
+            arguments.trim_start(),
+            observer,
+            CommandInvocation::Rpc,
+        )
+        .map(Some)
+    }
+
     /// Run a host-only extension command against this branch's durable state.
     pub fn extension_command(
         &self,
@@ -3529,7 +3588,15 @@ impl Agent<'_> {
         arguments: &str,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
-        self.extension_command_inner(session, extension_id, command, arguments, observer, false)?;
+        self.extension_command_inner(
+            session,
+            extension_id,
+            command,
+            arguments,
+            observer,
+            CommandInvocation::Host,
+        )
+        .map_err(CommandDispatchError::into_error)?;
         Ok(())
     }
 
@@ -3542,7 +3609,15 @@ impl Agent<'_> {
         arguments: &str,
         observer: &mut Observer<'_>,
     ) -> Result<bool> {
-        self.extension_command_inner(session, extension_id, command, arguments, observer, true)
+        self.extension_command_inner(
+            session,
+            extension_id,
+            command,
+            arguments,
+            observer,
+            CommandInvocation::Trigger,
+        )
+        .map_err(CommandDispatchError::into_error)
     }
 
     fn extension_command_inner(
@@ -3552,8 +3627,8 @@ impl Agent<'_> {
         command: &str,
         arguments: &str,
         observer: &mut Observer<'_>,
-        allow_trigger: bool,
-    ) -> Result<bool> {
+        invocation: CommandInvocation,
+    ) -> std::result::Result<bool, CommandDispatchError> {
         ensure_settled(session.operations())?;
         let extension = self
             .registry
@@ -3564,10 +3639,29 @@ impl Agent<'_> {
             })
             .ok_or_else(|| Error::Config("unknown or disabled extension command".into()))?;
         let states = self.migrate(session, observer)?;
-        let result = hook(
-            extension.as_ref(),
-            extension.command_effects(command, arguments, states.get(extension_id)),
-        )?;
+        let result = if matches!(invocation, CommandInvocation::Rpc) {
+            extension
+                .command_effects_classified(command, arguments, states.get(extension_id))
+                .map_err(|error| match error {
+                    crate::CommandCallbackFailure::Callback(message) => {
+                        CommandDispatchError::Callback {
+                            id: extension_id.into(),
+                            message,
+                        }
+                    }
+                    crate::CommandCallbackFailure::Transport(message) => {
+                        CommandDispatchError::Other(Error::Extension {
+                            id: extension_id.into(),
+                            message,
+                        })
+                    }
+                })?
+        } else {
+            hook(
+                extension.as_ref(),
+                extension.command_effects(command, arguments, states.get(extension_id)),
+            )?
+        };
         let mut trigger = false;
         for action in &result.actions {
             match action {
@@ -3583,10 +3677,11 @@ impl Agent<'_> {
                 trigger = true;
             }
         }
-        if trigger && !allow_trigger {
+        if trigger && matches!(invocation, CommandInvocation::Host) {
             return Err(Error::Config(
                 "extension command requires a host that supports triggering a model turn".into(),
-            ));
+            )
+            .into());
         }
         if let Some(state) = result.state {
             commit(
@@ -10585,6 +10680,51 @@ mod tree_tests {
             self.records.push(record.clone());
             Ok(())
         }
+    }
+
+    struct CommandWritesState;
+    #[async_trait::async_trait]
+    impl crate::Extension for CommandWritesState {
+        fn id(&self) -> &str {
+            "command-writer"
+        }
+        fn command_names(&self) -> Vec<&str> {
+            vec!["write"]
+        }
+        fn command_effects(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::ExtensionCommandEffects> {
+            Ok(crate::ExtensionCommandEffects {
+                state: Some(crate::ExtensionState {
+                    version: 1,
+                    data: serde_json::json!({}),
+                }),
+                actions: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn rpc_command_does_not_classify_journal_failure_as_callback() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(CommandWritesState)).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(FailAfterCreateStore { records: vec![] }).unwrap();
+        let error = agent
+            .try_extension_command_rpc(&mut session, "/write", &mut |_| {})
+            .unwrap_err();
+        assert!(
+            matches!(error, CommandDispatchError::Other(Error::Session(message)) if message.contains("fixture journal write failure"))
+        );
     }
 
     struct CompactionFailureMessage;
