@@ -443,12 +443,24 @@ async fn access_at(
     if no_refresh {
         return Ok(saved(&super::config::read_auth_object(path).await?)?.access);
     }
-    let guard = super::auth_lock::acquire_async(path).await?;
+    let minimum_ms = minimum.as_millis().min(u128::from(u64::MAX)) as u64;
+    let fresh =
+        |value: &Credential| value.expires > now_ms().saturating_add(minimum_ms.max(30_000));
+    let guard = match super::auth_lock::acquire_async(path).await {
+        Ok(guard) => guard,
+        Err(err) => {
+            let auth = super::config::read_readonly_auth(path, err)?;
+            let stored = saved(&auth)?;
+            if fresh(&stored) {
+                return Ok(stored.access);
+            }
+            return Err(error("cannot refresh credentials in a read-only store"));
+        }
+    };
     let auth = super::config::read_object_unlocked(path)?;
     let stored = saved(&auth)?;
     guard.check()?;
-    let minimum_ms = minimum.as_millis().min(u128::from(u64::MAX)) as u64;
-    if stored.expires > now_ms().saturating_add(minimum_ms.max(30_000)) {
+    if fresh(&stored) {
         return Ok(stored.access);
     }
     let path = path.to_path_buf();
@@ -632,6 +644,43 @@ mod tests {
         assert_eq!(data[PROVIDER]["accountId"], "fixture-account");
         assert_eq!(data[PROVIDER]["extra"], "preserved");
         assert_eq!(data["openai-chatgpt"]["access"], "fixture-placeholder");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_codex_tokens_work_in_a_read_only_auth_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let access = fake_jwt("read-only");
+        std::fs::write(
+            &path,
+            json!({"openai-codex":{
+                "type":"oauth",
+                "access":access,
+                "refresh":"fixture-refresh",
+                "expires":now_ms()+600_000
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(temp.path()).unwrap().permissions();
+        let original = permissions.clone();
+        permissions.set_mode(0o500);
+        std::fs::set_permissions(temp.path(), permissions).unwrap();
+        // Privileged test runners may bypass directory permissions.
+        if std::fs::write(temp.path().join("probe"), "").is_ok() {
+            std::fs::set_permissions(temp.path(), original).unwrap();
+            return;
+        }
+        let client = Client::builder().no_proxy().build().unwrap();
+        let endpoint = Url::parse("http://127.0.0.1:1/oauth/token").unwrap();
+        let fresh = access_at(&path, &client, &endpoint, Duration::ZERO, false).await;
+        let expired = access_at(&path, &client, &endpoint, Duration::from_secs(1800), false).await;
+        std::fs::set_permissions(temp.path(), original).unwrap();
+        assert_eq!(fresh.unwrap(), access);
+        assert!(expired.unwrap_err().to_string().contains("read-only store"));
     }
 
     #[test]
