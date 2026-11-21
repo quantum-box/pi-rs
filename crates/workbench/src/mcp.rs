@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
+use crate::mcp_resource_compat::ResourceCompatibility;
 use crate::process_cleanup::Children;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -630,12 +631,18 @@ impl McpExtension {
                 let service = match owned_stdio {
                     Some(owner) => {
                         NativeClient::default()
-                            .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
+                            .serve_with_lifecycle(
+                                ResourceCompatibility(owned_stdio_transport(wrapped, owner)?),
+                                lifecycle,
+                            )
                             .await
                     }
                     None => {
                         NativeClient::default()
-                            .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
+                            .serve_with_lifecycle(
+                                ResourceCompatibility(TokioChildProcess::new(wrapped)?),
+                                lifecycle,
+                            )
                             .await
                     }
                 };
@@ -1241,7 +1248,7 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
         let transport = StreamableHttpClientTransport::with_client(client.clone(), config.clone());
         let result = native
             .clone()
-            .serve_with_lifecycle(transport, lifecycle.clone())
+            .serve_with_lifecycle(ResourceCompatibility(transport), lifecycle.clone())
             .await;
         match (result, delay) {
             (Err(error), Some(delay)) if transient_http_initialization(&error) => {
