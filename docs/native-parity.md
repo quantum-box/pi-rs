@@ -406,10 +406,18 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
-### OpenCode Zen classifiers
+### OpenCode Zen and Go
 
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
+
+OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
+using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+Completions or Responses route. Session requests include `x-opencode-session`
+unless configuration supplies the header explicitly. Endpointless saved keys
+apply to the official routes for the corresponding provider. Gemini prepared
+requests also accept an empty tool list. Live inference
+with a Zen or Go account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
