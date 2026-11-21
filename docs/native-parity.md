@@ -157,6 +157,12 @@ in the future afterward. The probe preserved credentials on authorization
 failure; its successful refresh path was otherwise unchanged. New-account
 browser login, other account configurations and broader live acceptance remain
 open.
+The ChatGPT plan can also use Pi's flat OAuth entries in `auth.json`. Refresh
+preserves Pi's field names, millisecond expiry and rotated token, without
+creating a native account record. If Pi refreshes that same account while
+pi-rs waits for the auth lock, pi-rs reuses the currently stored token when
+its lifetime is sufficient. Saved plan credentials are bound to OpenAI's
+official endpoint. Live refresh of an imported Pi entry is unverified.
 
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
