@@ -223,7 +223,25 @@ impl Store {
             CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_insert AFTER INSERT ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END;
             CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_update AFTER UPDATE ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END;
             CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_delete AFTER DELETE ON durable_store_entries WHEN substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(OLD.key); END;
-            COMMIT;")?;
+            ")?;
+        // A pre-existing table or trigger with this name must implement the exact fence.
+        let history_schema: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='durable_graph_mutation_history'", [], |row| row.get(0)).optional()?;
+        if history_schema.as_deref() != Some("CREATE TABLE durable_graph_mutation_history (revision INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL)") {
+            conn.execute_batch("ROLLBACK;")?;
+            return Err(Error::InvalidSnapshot);
+        }
+        for (name, expected) in [
+            ("durable_graph_mutation_insert", "CREATE TRIGGER durable_graph_mutation_insert AFTER INSERT ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END"),
+            ("durable_graph_mutation_update", "CREATE TRIGGER durable_graph_mutation_update AFTER UPDATE ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END"),
+            ("durable_graph_mutation_delete", "CREATE TRIGGER durable_graph_mutation_delete AFTER DELETE ON durable_store_entries WHEN substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(OLD.key); END"),
+        ] {
+            let actual: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [name], |row| row.get(0)).optional()?;
+            if actual.as_deref() != Some(expected) {
+                conn.execute_batch("ROLLBACK;")?;
+                return Err(Error::InvalidSnapshot);
+            }
+        }
+        conn.execute_batch("COMMIT;")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS durable_task_document_owners (document_key BLOB PRIMARY KEY NOT NULL, owner BLOB NOT NULL) WITHOUT ROWID;")?;
         // The version boundary distinguishes pre-migration writes, whose commit
         // grouping is unknowable, from all subsequently recorded puts.
@@ -2729,6 +2747,19 @@ mod graph_mutation_revision_tests {
         )
         .unwrap();
         assert!(Store::initialize(readonly, true).is_err());
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        let installed: bool = probe.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_mutation_history')", [], |r| r.get(0)).unwrap();
+        assert!(!installed);
+    }
+
+    #[test]
+    fn migration_rejects_forged_existing_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forged.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID; CREATE TRIGGER durable_graph_mutation_delete AFTER DELETE ON durable_store_entries BEGIN SELECT 1; END;").unwrap();
+        drop(old);
+        assert!(matches!(Store::open(&path), Err(Error::InvalidSnapshot)));
         let probe = rusqlite::Connection::open(&path).unwrap();
         let installed: bool = probe.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_mutation_history')", [], |r| r.get(0)).unwrap();
         assert!(!installed);
