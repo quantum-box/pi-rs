@@ -282,9 +282,23 @@ fn protected_values<'a>(
         .map(String::as_str)
         .chain(
             request_headers
-                .values()
-                .filter(|value| value.is_sensitive())
-                .filter_map(|value| value.to_str().ok()),
+                .iter()
+                .filter_map(|(name, value)| {
+                    if value.is_sensitive() || crate::retry::is_provider_auth_header(name.as_str())
+                    {
+                        value.to_str().ok()
+                    } else {
+                        None
+                    }
+                })
+                .flat_map(|value| {
+                    let credential = value.split_once([' ', '\t']).and_then(|(scheme, value)| {
+                        (scheme.eq_ignore_ascii_case("bearer")
+                            || scheme.eq_ignore_ascii_case("basic"))
+                        .then_some(value)
+                    });
+                    [Some(value), credential].into_iter().flatten()
+                }),
         )
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -904,7 +918,14 @@ mod tests {
                 _: Option<&ExtensionState>,
             ) -> ExtensionResult<()> {
                 assert!(provider_header_session_id().is_none());
-                for hidden in ["authorization", "x-private", "x-combined", "x-reflected"] {
+                for hidden in [
+                    "authorization",
+                    "x-api-key",
+                    "x-private",
+                    "x-combined",
+                    "x-reflected",
+                    "x-gateway-echo",
+                ] {
                     assert!(!headers.contains_key(hidden));
                 }
                 match self.0 {
@@ -941,6 +962,11 @@ mod tests {
             "authorization",
             HeaderValue::from_static("Bearer credential"),
         );
+        headers.insert("x-api-key", HeaderValue::from_static("gateway-key"));
+        headers.insert(
+            "x-gateway-echo",
+            HeaderValue::from_static("reflected gateway-key"),
+        );
         headers.insert("x-trace", HeaderValue::from_static("initial"));
         headers.insert("x-delete", HeaderValue::from_static("delete"));
         headers.insert("x-reflected", HeaderValue::from_static("echo credential"));
@@ -956,7 +982,7 @@ mod tests {
                 provider_header_session_id().as_deref(),
                 Some(session.external_session_id().as_str())
             );
-            prepare_provider_headers(&headers, &["credential".into(), "first, second".into()])
+            prepare_provider_headers(&headers, &["first, second".into()])
                 .await
                 .unwrap()
         })
