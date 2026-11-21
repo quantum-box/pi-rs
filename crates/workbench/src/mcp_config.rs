@@ -581,11 +581,39 @@ pub(super) async fn discover_registered(
     if !mcp_enabled(args)? {
         return Ok(Discovery::default());
     }
-    let servers: BTreeMap<_, _> = registered
+    let servers = effective_registered_configs(registered, configured_namespaces);
+    discover_servers(
+        args,
+        servers,
+        false,
+        interactive,
+        share_services,
+        Vec::new(),
+        true,
+    )
+    .await
+}
+
+pub(super) fn effective_registered_configs(
+    registered: &[pi_rs::RegisteredMcpServer],
+    configured_namespaces: &BTreeSet<String>,
+) -> BTreeMap<String, Value> {
+    registered
         .iter()
         .filter(|entry| !configured_namespaces.contains(&entry.server.name.replace('-', "_")))
         .map(|entry| (entry.server.name.clone(), entry.server.config.clone()))
-        .collect();
+        .collect()
+}
+
+pub(super) fn registered_inspection(
+    args: &Cli,
+    registered: &[pi_rs::RegisteredMcpServer],
+    configured_namespaces: &BTreeSet<String>,
+) -> Result<Vec<Inspection>> {
+    if !mcp_enabled(args)? {
+        return Ok(Vec::new());
+    }
+    let servers = effective_registered_configs(registered, configured_namespaces);
     let mut inspection = inspection_entries(&servers, &BTreeSet::new(), &BTreeSet::new());
     for entry in &mut inspection {
         entry.scope = "extension";
@@ -598,18 +626,7 @@ pub(super) async fn discover_registered(
             entry.status = "disabled";
         }
     }
-    let mut discovery = discover_servers(
-        args,
-        servers,
-        false,
-        interactive,
-        share_services,
-        Vec::new(),
-        true,
-    )
-    .await?;
-    discovery.inspection = inspection;
-    Ok(discovery)
+    Ok(inspection)
 }
 
 fn uses_host_mcp_credentials(config: &Value) -> bool {

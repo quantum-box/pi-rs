@@ -1935,6 +1935,12 @@ pub struct RegistryUpdate {
 #[async_trait::async_trait]
 pub trait RegistryRefresher: Send + Sync {
     async fn refresh(&self, current: &Registry) -> Result<Option<RegistryUpdate>>;
+
+    /// Refresh before executing calls from a model reply.
+    /// A host can retire obsolete tools while preserving the request's tool identities.
+    async fn refresh_for_dispatch(&self, current: &Registry) -> Result<Option<RegistryUpdate>> {
+        self.refresh(current).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2773,6 +2779,13 @@ impl Registry {
         }
     }
 
+    pub(crate) async fn refreshed_for_dispatch(&self) -> Result<Option<RegistryUpdate>> {
+        match &self.refresher {
+            Some(refresher) => refresher.refresh_for_dispatch(self).await,
+            None => Ok(None),
+        }
+    }
+
     /// Resolve command collisions in extension registration order, as Pi does.
     pub fn registered_commands(&self) -> Vec<RegisteredCommand> {
         let mut commands = Vec::new();
@@ -3001,6 +3014,50 @@ impl Registry {
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
         })
+    }
+
+    /// Whether this snapshot contains the same registered extension instance.
+    pub fn contains_extension_instance(&self, extension: &Arc<dyn Extension>) -> bool {
+        self.extensions
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, extension))
+    }
+
+    /// Remove an extension and its tools after checking dependent extensions.
+    /// The caller owns shutdown of the removed extension's resources.
+    pub fn unregister(&mut self, id: &str) -> Result<bool> {
+        let Some(index) = self
+            .extensions
+            .iter()
+            .position(|extension| extension.id() == id)
+        else {
+            return Ok(false);
+        };
+        if let Some(dependent) = self
+            .extensions
+            .iter()
+            .find(|extension| extension.dependency_ids().contains(&id))
+        {
+            return Err(Error::Config(format!(
+                "extension {id:?} is required by {:?}",
+                dependent.id()
+            )));
+        }
+        self.extensions.remove(index);
+        self.tools.retain(|_, tool| tool.owner != id);
+        if let Some(active) = &mut self.active {
+            active.retain(|name| self.tools.contains_key(name));
+        }
+        if self
+            .registered_mcp_servers()
+            .iter()
+            .any(|server| server.extension_id == id)
+        {
+            let mut runtime = self.mcp_servers.copy_registrations();
+            runtime.registrations_mut().remove_owner(id);
+            self.mcp_servers = Arc::new(runtime);
+        }
+        Ok(true)
     }
 
     /// Replace one registered extension atomically, retaining its hook order and UI.

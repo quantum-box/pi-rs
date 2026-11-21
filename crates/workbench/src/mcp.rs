@@ -1052,13 +1052,23 @@ impl McpExtension {
             .filter(|tool| self.deferred.contains(&tool.name))
             .collect()
     }
-    pub async fn close(&self) {
-        self.connection.closed.store(true, Ordering::SeqCst);
+    /// Immediately prevent further requests to an obsolete catalog connection.
+    pub fn retire(&self) -> bool {
+        let was_closed = self.connection.closed.swap(true, Ordering::SeqCst);
         self.connection
             .page_outputs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        !was_closed
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.connection.closed.load(Ordering::SeqCst)
+    }
+
+    pub async fn close(&self) {
+        self.retire();
         let _ = self
             .connection
             .service

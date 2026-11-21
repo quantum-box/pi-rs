@@ -2267,7 +2267,7 @@ impl Agent<'_> {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Err(Error::Cancelled),
-                    update = platform_time::timeout(active.limits.model_timeout, active.registry.refreshed()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
+                    update = platform_time::timeout(active.limits.model_timeout, active.registry.refreshed_for_dispatch()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
                 }
             };
             let dispatch_update = match dispatch_update {

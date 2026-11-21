@@ -4422,6 +4422,15 @@ the running extension and delivers the resulting snapshots in mutation
 order. An executable negotiates this access through
 `mcp_registry_host_calls` and the duplex capability advertisement. SDK forks
 have their own snapshot of the active MCP registrations.
+Workbench reconciles these declarations at its next catalog refresh, before
+preparing the next model request. It reconnects changed definitions and
+retires the connections and tools for removed ones. A model reply keeps
+the tool identities advertised to its request. A retired endpoint cannot
+receive a queued call, and its replacement appears on the next request.
+MCP inspection shows
+the current declarations with cached connection status. An explicit
+Workbench refresh retries a disconnected declaration. Configured namespaces
+retain their precedence across refreshes.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
