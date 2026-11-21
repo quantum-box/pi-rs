@@ -84,7 +84,7 @@ impl FinalStrictPolicy {
                 self.profiles
                     .chat_compatibility(&self.provider, metadata.as_ref())
                     .supports_strict_mode()
-                    == Some(true)
+                    .unwrap_or(adapter == super::providers::Adapter::MistralConversations)
             },
         )
     }
@@ -92,6 +92,10 @@ impl FinalStrictPolicy {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    fn minimum_output_tokens(&self) -> u32 {
+        self.client.minimum_output_tokens()
+    }
+
     async fn stream_detailed_with_tool_declarations(
         &self,
         request_id: Uuid,
@@ -434,6 +438,10 @@ impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
 
 #[async_trait::async_trait]
 impl Model for PreparedWorkbenchModel {
+    fn minimum_output_tokens(&self) -> u32 {
+        self.inner.minimum_output_tokens()
+    }
+
     async fn prepare_context<'a>(
         &'a self,
         request: &ModelRequest,

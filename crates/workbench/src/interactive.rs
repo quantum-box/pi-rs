@@ -623,11 +623,25 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    CloudflareLogin(CloudflareLoginField),
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
     CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
+}
+
+enum CloudflareLoginField {
+    Key(super::Provider),
+    Account {
+        provider: super::Provider,
+        key: String,
+    },
+    Gateway {
+        provider: super::Provider,
+        key: String,
+        account: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2695,7 +2709,7 @@ impl View {
             ));
         }
         if let Some(picker) = &self.picker {
-            lines = picker.render(theme, width, body_height, keys);
+            lines = picker.render_in_terminal(theme, width, body_height, height, keys);
         }
         let dialog_cursor = self
             .dialog()
@@ -3155,8 +3169,13 @@ impl View {
                 active.extend(render_entry(&entry));
             }
             if let Some(picker) = &self.picker {
-                active =
-                    picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
+                active = picker.render_in_terminal(
+                    theme,
+                    width,
+                    height - prompt_height - 4 - below.len(),
+                    height,
+                    keys,
+                );
             }
         }
         let dialog_height = height - prompt_height - 4 - below.len();
@@ -3809,6 +3828,8 @@ fn slash(
                 if login {
                     if provider.id() == "amazon-bedrock" {
                         show_bedrock_methods(view);
+                    } else if uses_cloudflare_login(&provider, args) {
+                        edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
                     } else {
                         edit_provider_key(provider, view);
                     }
@@ -5584,6 +5605,9 @@ pub(super) async fn run(
                                             view.append("AWS profile saved for amazon-bedrock");
                                         })
                                 }
+                                LocalEditor::CloudflareLogin(field) => {
+                                    advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -6577,6 +6601,105 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
 fn edit_provider_key(provider: super::Provider, view: &mut View) {
     let dialog = crate::ui::dialog::Dialog::secret(format!("{} API key", provider.id()));
     view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
+}
+
+fn uses_cloudflare_login(provider: &super::Provider, args: &Cli) -> bool {
+    matches!(
+        provider.id(),
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+    ) && args.explicit_endpoint_for(provider).is_none()
+        && !args.model_profiles.has_fixed_cloudflare_endpoint(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+}
+
+fn edit_cloudflare_login(view: &mut View, field: CloudflareLoginField) {
+    use crate::ui::dialog::Dialog;
+    let dialog = match field {
+        CloudflareLoginField::Key(_) => Dialog::secret("Enter Cloudflare API key".into()),
+        _ => Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Input {
+                title: match field {
+                    CloudflareLoginField::Account { .. } => "Enter Cloudflare account ID",
+                    _ => "Enter Cloudflare AI Gateway ID",
+                }
+                .into(),
+                placeholder: None,
+                initial_value: None,
+                timeout: None,
+            },
+        ),
+    };
+    view.local_editor = Some((LocalEditor::CloudflareLogin(field), dialog));
+}
+
+fn cloudflare_login_matches_gateway_base(base: &str, account: &str, gateway: &str) -> bool {
+    super::cloudflare_gateway::Route::new(account, gateway).is_some_and(|route| {
+        super::cloudflare_gateway::Route::from_configured(base, Some(&route)) == Some(route)
+    })
+}
+
+fn advance_cloudflare_login(
+    field: &CloudflareLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    let (provider, key, account, gateway) = match field {
+        CloudflareLoginField::Key(provider) => {
+            if !super::model_auth::valid_key(text) {
+                return Err(Error::Config("Enter a valid Cloudflare API key".into()));
+            }
+            edit_cloudflare_login(
+                view,
+                CloudflareLoginField::Account {
+                    provider: provider.clone(),
+                    key: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        CloudflareLoginField::Account { provider, key } => {
+            if !super::operation_models::valid_cloudflare_account(text) {
+                return Err(Error::Config("Enter a valid Cloudflare account ID".into()));
+            }
+            if provider.id() == "cloudflare-ai-gateway" {
+                edit_cloudflare_login(
+                    view,
+                    CloudflareLoginField::Gateway {
+                        provider: provider.clone(),
+                        key: key.clone(),
+                        account: text.into(),
+                    },
+                );
+                return Ok(());
+            }
+            (provider, key.as_str(), text, None)
+        }
+        CloudflareLoginField::Gateway {
+            provider,
+            key,
+            account,
+        } => (provider, key.as_str(), account.as_str(), Some(text)),
+    };
+    if let Some(gateway) = gateway
+        && let Some(base) = args.model_profiles.cloudflare_configured_base(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+        && !cloudflare_login_matches_gateway_base(base, account, gateway)
+    {
+        return Err(Error::Config(
+            "Enter identifiers that match the configured Cloudflare route".into(),
+        ));
+    }
+    super::model_auth::save_cloudflare_login(provider, key, account, gateway)?;
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append(&format!("Cloudflare API key saved for {}", provider.id()));
+    Ok(())
 }
 
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
@@ -7971,6 +8094,9 @@ fn select(
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
+        Selection::LoginProvider(provider) if uses_cloudflare_login(&provider, args) => {
+            edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
+        }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
         Selection::BedrockProfile => {
@@ -9066,6 +9192,62 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
+        let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
+        assert!(cloudflare_login_matches_gateway_base(
+            base,
+            "fixed",
+            "other-gateway"
+        ));
+        assert!(!cloudflare_login_matches_gateway_base(
+            base,
+            "wrong",
+            "other-gateway"
+        ));
+    }
+
+    #[test]
+    fn cloudflare_login_preserves_key_entry_for_fixed_routes() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"http://127.0.0.1:31415/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"http://127.0.0.1:31416/v1"},
+            }}))
+            .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse(
+            &serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"https://gateway.ai.cloudflare.com/v1/fixture/gateway/compat"},
+            }}),
+        ).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse_with_cloudflare_routes(
+            &serde_json::json!({}),
+            Some("storedworker"),
+            super::super::cloudflare_gateway::Route::new("storedaccount", "storedgateway"),
+        )
+        .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!args.model_profiles.endpoint(&provider).is_empty());
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_listener_survives_interrupt_during_editor() {

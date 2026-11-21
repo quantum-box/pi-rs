@@ -38,6 +38,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
+        id: "cloudflare-ai-gateway",
+        endpoint: "",
+        env: "CLOUDFLARE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "cloudflare-workers-ai",
         endpoint: "",
         env: "CLOUDFLARE_API_KEY",
@@ -107,6 +113,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         endpoint: "https://api.minimaxi.com/anthropic/v1/messages",
         env: "MINIMAX_CN_API_KEY",
         compatibility: || json!({}),
+    },
+    Builtin {
+        id: "mistral",
+        endpoint: "https://api.mistral.ai/v1/chat/completions",
+        env: "MISTRAL_API_KEY",
+        compatibility: || json!({"supportsStrictMode":true}),
     },
     Builtin {
         id: "moonshotai",
@@ -262,6 +274,7 @@ impl Builtin {
             id: Arc::from(self.id),
             adapter: match self.id {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
+                "mistral" => Adapter::MistralConversations,
                 "openai-codex" => Adapter::CodexResponses,
                 "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
@@ -275,8 +288,13 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
+            (
+                Adapter::ChatCompletions | Adapter::Anthropic | Adapter::OpenAiResponses,
+                "cloudflare-ai-gateway",
+            ) => Some(""),
             (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
+            (Adapter::MistralConversations, "mistral") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
                 if !matches!(
                     id,
@@ -287,6 +305,7 @@ impl Builtin {
                         | "minimax"
                         | "minimax-cn"
                         | "vercel-ai-gateway"
+                        | "mistral"
                 ) =>
             {
                 Some(self.endpoint)
