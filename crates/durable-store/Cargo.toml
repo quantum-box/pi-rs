@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+experimental-graph-scope = []
+
 [dependencies]
 durable-task-schema = { path = "../durable-task-schema" }
 uuid = { version = "1", features = ["serde"] }

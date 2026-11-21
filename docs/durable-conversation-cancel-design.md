@@ -140,13 +140,16 @@ the original claim, attempt, owner, definition identity and both markers in one
 transaction. External cleanup work is deferred while the unsafe checkpointable
 root remains live. Direct writes to the store remain outside these API fences.
 
-If writer contention prevents a cancellation receipt commit, the completed
-callback result, selected after result, identity and lease remain pending for
-reconciliation and are returned on driver shutdown. The driver does not retry
-these receipts automatically: a later graph snapshot could include different
-children than the callback-start snapshot. Other independent graphs continue
-to run. Indeterminate commits also remain unresolved rather than being treated
-as uncommitted.
+If writer contention prevents a selected cancellation receipt commit, the
+completed callback result, selected after result, identity and lease stay pending.
+By default the driver does not retry that receipt and returns the result for
+reconciliation on shutdown. Indeterminate commits remain unresolved.
+
+The experimental `experimental-graph-scope` feature retries only a definitely
+unstarted write and never reruns the callback. It checks task, ownership and
+conversation mutations against the boundary captured before callback start.
+Changes in the affected graph leave the receipt pending; unrelated graphs can
+continue and do not invalidate it.
 
 Interrupted-woken cancellation drains foreground task descendants before the
 parent callback. Foreground owned conversations are not yet supported by this
@@ -400,3 +403,21 @@ current ancestry, and returns a host identity lease plus store checks. A
 separate Harness check binds an already-cancelled child to the current root and
 selection. Neither check is wired into parent settlement; a caller must hold
 the selection gate and the returned identity lease through the parent commit.
+
+The experimental `experimental-graph-scope` feature records before and after
+values for task, ownership-edge and conversation writes, including writes by
+older open SQLite connections. It checks the union of current and historical
+ownership paths so transient creation, deletion and reparenting are not lost.
+Malformed or oversized records and boundaries older than the last 100,000
+history entries fail closed. History values are limited to 64 KiB each and
+keys to 512 bytes; larger values also fail closed. Before loading graph data,
+the feature rejects scans exceeding 16 MiB or 100,000 current-plus-history
+records. These database-wide limits can conservatively hold a receipt even when
+only an unrelated graph is large. This feature is disabled by
+default pending broader compatibility and performance validation. Databases that already contain the older key-only history retain it without a
+size limit for compatibility with older readers, so their total database growth
+remains unbounded. New feature-enabled databases only install the bounded v2
+history.
+New databases opened without the experimental feature do not install either
+history. Existing v1 triggers are left in place: removing them while an older
+process is still using the database could invalidate that process's fences.

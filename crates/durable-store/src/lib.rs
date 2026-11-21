@@ -86,6 +86,15 @@ pub enum Expected {
     /// No put under this byte prefix after the observed database put version.
     /// Pair this with checks on observed keys to fence deletion.
     PrefixUnchangedSince(u64),
+    /// No insertion, update, or deletion under the tracked prefix since this mutation revision.
+    #[cfg(test)]
+    PrefixMutationsUnchangedSince(u64),
+    /// Experimental scope-aware check, not enabled in production.
+    #[cfg(any(test, feature = "experimental-graph-scope"))]
+    GraphUnchangedSince {
+        revision: u64,
+        root: uuid::Uuid,
+    },
     Version(u64),
     /// Version must match and the monotonic deadline must not have elapsed.
     VersionBefore(u64, Instant),
@@ -213,6 +222,135 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_store_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version>=0));
             INSERT OR IGNORE INTO durable_store_meta(id, version) VALUES(1, 0);
             CREATE TABLE IF NOT EXISTS durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;")?;
+        #[cfg(test)]
+        {
+            // Triggers cover writes from already-open older Store connections as well.
+            // History is append-only and its SQLite rowid survives reopen.
+            conn.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS durable_graph_mutation_history (revision INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL);
+            CREATE INDEX IF NOT EXISTS durable_graph_mutation_history_key ON durable_graph_mutation_history(key, revision);
+            CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_insert AFTER INSERT ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END;
+            CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_update AFTER UPDATE ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END;
+            CREATE TRIGGER IF NOT EXISTS durable_graph_mutation_delete AFTER DELETE ON durable_store_entries WHEN substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(OLD.key); END;
+            ")?;
+            // A pre-existing table or trigger with this name must implement the exact fence.
+            let history_schema: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='durable_graph_mutation_history'", [], |row| row.get(0)).optional()?;
+            if history_schema.as_deref() != Some("CREATE TABLE durable_graph_mutation_history (revision INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL)") {
+            conn.execute_batch("ROLLBACK;")?;
+            return Err(Error::InvalidSnapshot);
+        }
+            for (name, expected) in [
+            ("durable_graph_mutation_insert", "CREATE TRIGGER durable_graph_mutation_insert AFTER INSERT ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END"),
+            ("durable_graph_mutation_update", "CREATE TRIGGER durable_graph_mutation_update AFTER UPDATE ON durable_store_entries WHEN substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(NEW.key); END"),
+            ("durable_graph_mutation_delete", "CREATE TRIGGER durable_graph_mutation_delete AFTER DELETE ON durable_store_entries WHEN substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_mutation_history(key) VALUES(OLD.key); END"),
+        ] {
+            let actual: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [name], |row| row.get(0)).optional()?;
+            if actual.as_deref() != Some(expected) {
+                conn.execute_batch("ROLLBACK;")?;
+                return Err(Error::InvalidSnapshot);
+            }
+        }
+            conn.execute_batch("COMMIT;")?;
+        }
+        #[cfg(any(test, feature = "experimental-graph-scope"))]
+        {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let had_history: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_history_v2')", [], |r| r.get(0))?;
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS durable_graph_history_v2 (revision INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL, before_value BLOB, after_value BLOB);
+            CREATE INDEX IF NOT EXISTS durable_graph_history_v2_revision ON durable_graph_history_v2(revision);")?;
+            let table: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='durable_graph_history_v2'", [], |r| r.get(0)).optional()?;
+            if table.as_deref() != Some("CREATE TABLE durable_graph_history_v2 (revision INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL, before_value BLOB, after_value BLOB)") { conn.execute_batch("ROLLBACK;")?; return Err(Error::InvalidSnapshot); }
+            for (name, timing, action, row, before, after) in [
+                (
+                    "durable_graph_history_v2_insert",
+                    "BEFORE",
+                    "INSERT",
+                    "NEW",
+                    "(SELECT value FROM durable_store_entries WHERE key=NEW.key)",
+                    "NEW.value",
+                ),
+                (
+                    "durable_graph_history_v2_update",
+                    "AFTER",
+                    "UPDATE",
+                    "NEW",
+                    "OLD.value",
+                    "NEW.value",
+                ),
+                (
+                    "durable_graph_history_v2_delete",
+                    "AFTER",
+                    "DELETE",
+                    "OLD",
+                    "OLD.value",
+                    "NULL",
+                ),
+            ] {
+                let definition = format!("CREATE TRIGGER {name} {timing} {action} ON durable_store_entries WHEN substr({row}.key,1,13)=CAST('durable/task/' AS BLOB) OR substr({row}.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr({row}.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length({row}.key)>512 THEN X'' ELSE {row}.key END,CASE WHEN length({before})>65536 THEN X'' ELSE {before} END,CASE WHEN length({after})>65536 THEN X'' ELSE {after} END); END");
+                let existing: Option<String> = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                        [name],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match existing {
+                    Some(existing) if !had_history || existing != definition => {
+                        conn.execute_batch("ROLLBACK;")?;
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    Some(_) => (),
+                    None if had_history => {
+                        conn.execute_batch("ROLLBACK;")?;
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    None => conn.execute_batch(&definition)?,
+                }
+            }
+            let prune_name = "durable_graph_history_v2_prune";
+            let prune_definition = "CREATE TRIGGER durable_graph_history_v2_prune AFTER INSERT ON durable_graph_history_v2 WHEN NEW.revision > 100000 BEGIN DELETE FROM durable_graph_history_v2 WHERE revision <= NEW.revision - 100000; END";
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [prune_name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(existing) if !had_history || existing != prune_definition => {
+                    conn.execute_batch("ROLLBACK;")?;
+                    return Err(Error::InvalidSnapshot);
+                }
+                Some(_) => (),
+                None if had_history => {
+                    conn.execute_batch("ROLLBACK;")?;
+                    return Err(Error::InvalidSnapshot);
+                }
+                None => conn.execute_batch(prune_definition)?,
+            }
+            let move_name = "durable_graph_history_v2_move";
+            let move_definition = "CREATE TRIGGER durable_graph_history_v2_move BEFORE UPDATE OF key ON durable_store_entries WHEN OLD.key != NEW.key AND (substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) OR substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB)) BEGIN INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length(OLD.key)>512 THEN X'' ELSE OLD.key END,CASE WHEN length(OLD.value)>65536 THEN X'' ELSE OLD.value END,NULL); INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length(NEW.key)>512 THEN X'' ELSE NEW.key END,NULL,CASE WHEN length(NEW.value)>65536 THEN X'' ELSE NEW.value END); END";
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [move_name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(existing) if !had_history || existing != move_definition => {
+                    conn.execute_batch("ROLLBACK;")?;
+                    return Err(Error::InvalidSnapshot);
+                }
+                Some(_) => (),
+                None if had_history => {
+                    conn.execute_batch("ROLLBACK;")?;
+                    return Err(Error::InvalidSnapshot);
+                }
+                None => conn.execute_batch(move_definition)?,
+            }
+            conn.execute_batch("COMMIT;")?;
+        }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS durable_task_document_owners (document_key BLOB PRIMARY KEY NOT NULL, owner BLOB NOT NULL) WITHOUT ROWID;")?;
         // The version boundary distinguishes pre-migration writes, whose commit
         // grouping is unknowable, from all subsequently recorded puts.
@@ -387,6 +525,28 @@ impl Store {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         Ok(conn.query_row(
             "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Current append-only graph mutation revision (including deletes).
+    #[cfg(test)]
+    pub fn graph_mutation_revision(&self) -> Result<u64, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(revision),0) FROM durable_graph_mutation_history",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Sequence of graph history v2; older key-only revisions cannot be reused.
+    #[cfg(any(test, feature = "experimental-graph-scope"))]
+    pub fn graph_history_v2_revision(&self) -> Result<u64, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(revision),0) FROM durable_graph_history_v2",
             [],
             |r| r.get(0),
         )?)
@@ -1450,6 +1610,80 @@ impl Store {
                         tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND version>?2)", params![check.key, boundary], |r| r.get(0))?
                     };
                     !changed
+                }
+                #[cfg(test)]
+                Expected::PrefixMutationsUnchangedSince(boundary) => {
+                    if ![
+                        b"durable/task/".as_slice(),
+                        b"durable/conversation-owner/".as_slice(),
+                        b"runtime/conversation/".as_slice(),
+                    ]
+                    .contains(&check.key.as_slice())
+                    {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let current: u64 = tx.query_row(
+                        "SELECT COALESCE(MAX(revision),0) FROM durable_graph_mutation_history",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if boundary > current {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let changed: bool = if let Some(end) = prefix_end(&check.key) {
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_graph_mutation_history WHERE key>=?1 AND key<?2 AND revision>?3)", params![check.key,end,boundary], |r| r.get(0))?
+                    } else {
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_graph_mutation_history WHERE key>=?1 AND revision>?2)", params![check.key,boundary], |r| r.get(0))?
+                    };
+                    !changed
+                }
+                #[cfg(any(test, feature = "experimental-graph-scope"))]
+                Expected::GraphUnchangedSince { revision, root } => {
+                    let current_revision: u64 = tx.query_row(
+                        "SELECT COALESCE(MAX(revision),0) FROM durable_graph_history_v2",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if revision > current_revision {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let earliest: Option<u64> = tx.query_row(
+                        "SELECT MIN(revision) FROM durable_graph_history_v2",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if earliest.is_some_and(|first| revision < first.saturating_sub(1)) {
+                        return Err(Error::Conflict {
+                            key: check.key.clone(),
+                        });
+                    }
+                    // Check row and byte budgets while SQLite holds the same
+                    // transaction; never allocate the graph before this check.
+                    let (current_count, current_bytes): (u64, u64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(key)+length(value)),0) FROM durable_store_entries WHERE substr(key,1,13)=CAST('durable/task/' AS BLOB) OR substr(key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(key,1,21)=CAST('runtime/conversation/' AS BLOB)", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                    let (history_count, history_bytes): (u64, u64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(key)+COALESCE(length(before_value),0)+COALESCE(length(after_value),0)),0) FROM durable_graph_history_v2 WHERE revision>?1", [revision], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                    if current_count.saturating_add(history_count) > 100_000
+                        || current_bytes.saturating_add(history_bytes) > 16 * 1024 * 1024
+                    {
+                        return Err(Error::Conflict {
+                            key: check.key.clone(),
+                        });
+                    }
+                    let mut statement = tx.prepare("SELECT key,value FROM durable_store_entries WHERE substr(key,1,13)=CAST('durable/task/' AS BLOB) OR substr(key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(key,1,21)=CAST('runtime/conversation/' AS BLOB)")?;
+                    let current: Vec<(Vec<u8>, Vec<u8>)> = statement
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<_, _>>()?;
+                    let mut statement = tx.prepare("SELECT key,before_value,after_value FROM durable_graph_history_v2 WHERE revision>?1 ORDER BY revision")?;
+                    let changes: Vec<graph_scope_prototype::Change> = statement
+                        .query_map([revision], |r| {
+                            Ok(graph_scope_prototype::Change {
+                                key: r.get(0)?,
+                                before: r.get(1)?,
+                                after: r.get(2)?,
+                            })
+                        })?
+                        .collect::<Result<_, _>>()?;
+                    !graph_scope_prototype::changed_scope(root, &current, &changes)
+                        .map_err(|_| Error::InvalidSnapshot)?
                 }
                 Expected::Version(v) => version == Some(v),
                 Expected::DocumentRevision(revision) => {
@@ -2571,3 +2805,478 @@ mod document_history_tests {
         assert!(db.document_at_bounded(&key, deleted, 0).unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod graph_mutation_revision_tests {
+    use super::*;
+
+    #[test]
+    fn experimental_reopen_rejects_missing_v2_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-v2.sqlite");
+        drop(Store::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER durable_graph_history_v2_delete;")
+            .unwrap();
+        drop(conn);
+        assert!(matches!(Store::open(&path), Err(Error::InvalidSnapshot)));
+    }
+
+    #[test]
+    fn experimental_migration_rejects_forged_v2_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forged-v2.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID; CREATE TRIGGER durable_graph_history_v2_delete AFTER DELETE ON durable_store_entries BEGIN SELECT 1; END;").unwrap();
+        drop(old);
+        assert!(matches!(Store::open(&path), Err(Error::InvalidSnapshot)));
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        let installed: bool = probe
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_history_v2')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!installed);
+    }
+
+    #[test]
+    fn experimental_scope_rejects_large_history_before_allocation() {
+        use serde_json::json;
+        let store = Store::memory().unwrap();
+        let root = uuid::Uuid::from_u128(1);
+        let conv = uuid::Uuid::from_u128(2);
+        let key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+        let value = serde_json::to_vec(&json!({"id":root,"owner":{"Conversation":conv}})).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                }],
+            )
+            .unwrap();
+        let boundary = store.graph_history_v2_revision().unwrap();
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000) INSERT INTO durable_graph_history_v2(key,before_value,after_value) SELECT ?1,NULL,?2 FROM n",rusqlite::params![&key,&value]).unwrap();
+        }
+        assert!(matches!(
+            store.commit(
+                &[Check {
+                    key,
+                    expected: Expected::GraphUnchangedSince {
+                        revision: boundary,
+                        root
+                    }
+                }],
+                &[]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn experimental_scope_enforces_byte_budget_before_allocation() {
+        use serde_json::json;
+        const LIMIT: usize = 16 * 1024 * 1024;
+        let store = Store::memory().unwrap();
+        let root = uuid::Uuid::from_u128(1);
+        let conv = uuid::Uuid::from_u128(2);
+        let other = uuid::Uuid::from_u128(3);
+        let root_key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+        let root_value =
+            serde_json::to_vec(&json!({"id":root,"owner":{"Conversation":conv}})).unwrap();
+        let other_key = format!("runtime/conversation/{other}").into_bytes();
+        let prefix = format!("{{\"id\":\"{other}\",\"payload\":\"");
+        let suffix = "\"}";
+        let padding = LIMIT
+            - root_key.len()
+            - root_value.len()
+            - other_key.len()
+            - prefix.len()
+            - suffix.len();
+        let value = format!("{prefix}{}{suffix}", "x".repeat(padding)).into_bytes();
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: root_key.clone(),
+                        value: root_value,
+                    },
+                    Mutation::Put {
+                        key: other_key.clone(),
+                        value: value.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        let boundary = store.graph_history_v2_revision().unwrap();
+        let check = Check {
+            key: root_key,
+            expected: Expected::GraphUnchangedSince {
+                revision: boundary,
+                root,
+            },
+        };
+        assert!(store.commit(&[check.clone()], &[]).is_ok());
+        let mut larger = value;
+        larger.insert(larger.len() - 2, b'x');
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: other_key,
+                    value: larger,
+                }],
+            )
+            .unwrap();
+        let boundary = store.graph_history_v2_revision().unwrap();
+        let check = Check {
+            expected: Expected::GraphUnchangedSince {
+                revision: boundary,
+                root,
+            },
+            ..check
+        };
+        assert!(matches!(
+            store.commit(&[check], &[]),
+            Err(Error::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn experimental_history_pruning_rejects_old_boundaries() {
+        use serde_json::json;
+        let store = Store::memory().unwrap();
+        let root = uuid::Uuid::from_u128(1);
+        let conv = uuid::Uuid::from_u128(2);
+        let key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+        let value = serde_json::to_vec(&json!({"id":root,"owner":{"Conversation":conv}})).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                }],
+            )
+            .unwrap();
+        let old = store.graph_history_v2_revision().unwrap();
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute("INSERT INTO durable_graph_history_v2(revision,key,before_value,after_value) VALUES(100002,?1,NULL,?2)",rusqlite::params![&key,&value]).unwrap();
+        }
+        assert!(matches!(
+            store.commit(
+                &[Check {
+                    key,
+                    expected: Expected::GraphUnchangedSince {
+                        revision: old,
+                        root
+                    }
+                }],
+                &[]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn experimental_graph_history_tracks_legacy_insert_delete_and_reparent() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph-v2.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
+        let store = Store::open(&path).unwrap();
+        let root = uuid::Uuid::from_u128(1);
+        let other = uuid::Uuid::from_u128(2);
+        let child = uuid::Uuid::from_u128(3);
+        let conv = uuid::Uuid::from_u128(4);
+        let root_key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+        let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
+        let record = |id, owner| serde_json::to_vec(&json!({"id":id,"owner":owner})).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: root_key.clone(),
+                    value: record(root, json!({"Conversation":conv})),
+                }],
+            )
+            .unwrap();
+        let check = |revision| Check {
+            key: root_key.clone(),
+            expected: Expected::GraphUnchangedSince { revision, root },
+        };
+        let boundary = store.graph_history_v2_revision().unwrap();
+        let outside = record(child, json!({"Task":other}));
+        old.execute(
+            "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,9)",
+            rusqlite::params![&child_key, &outside],
+        )
+        .unwrap();
+        assert!(store.commit(&[check(boundary)], &[]).is_ok());
+        let owned = record(child, json!({"Task":root}));
+        old.execute(
+            "UPDATE durable_store_entries SET value=?2 WHERE key=?1",
+            rusqlite::params![&child_key, &owned],
+        )
+        .unwrap();
+        old.execute(
+            "UPDATE durable_store_entries SET value=?2 WHERE key=?1",
+            rusqlite::params![&child_key, &outside],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.commit(&[check(boundary)], &[]),
+            Err(Error::Conflict { .. })
+        ));
+        let boundary = store.graph_history_v2_revision().unwrap();
+        old.execute(
+            "UPDATE durable_store_entries SET value=?2 WHERE key=?1",
+            rusqlite::params![&child_key, &owned],
+        )
+        .unwrap();
+        old.execute(
+            "DELETE FROM durable_store_entries WHERE key=?1",
+            [&child_key],
+        )
+        .unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert!(matches!(
+            reopened.commit(&[check(boundary)], &[]),
+            Err(Error::Conflict { .. })
+        ));
+        old.execute(
+            "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,9)",
+            rusqlite::params![&child_key, &owned],
+        )
+        .unwrap();
+        let boundary = reopened.graph_history_v2_revision().unwrap();
+        old.execute(
+            "INSERT OR REPLACE INTO durable_store_entries(key,value,version) VALUES(?1,?2,10)",
+            rusqlite::params![&child_key, &outside],
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.commit(&[check(boundary)], &[]),
+            Err(Error::Conflict { .. })
+        ));
+        old.execute(
+            "UPDATE durable_store_entries SET value=?2 WHERE key=?1",
+            rusqlite::params![&child_key, &owned],
+        )
+        .unwrap();
+        let boundary = reopened.graph_history_v2_revision().unwrap();
+        old.execute(
+            "UPDATE durable_store_entries SET key=?2 WHERE key=?1",
+            rusqlite::params![&child_key, b"untracked".as_slice()],
+        )
+        .unwrap();
+        assert!(reopened.commit(&[check(boundary)], &[]).is_err());
+    }
+
+    #[test]
+    fn migration_tracks_writes_from_connection_opened_before_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
+        let key = b"durable/task/old".as_slice();
+        old.execute(
+            "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,1)",
+            rusqlite::params![key, b"initial".as_slice()],
+        )
+        .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get(key).unwrap().unwrap().value, b"initial");
+        let second = Store::open(&path).unwrap();
+        for sql in [
+            "UPDATE durable_store_entries SET value=X'31',version=2 WHERE key=?1",
+            "DELETE FROM durable_store_entries WHERE key=?1",
+            "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,X'32',3)",
+        ] {
+            let before = store.graph_mutation_revision().unwrap();
+            old.execute(sql, [key]).unwrap();
+            assert!(matches!(
+                second.commit(
+                    &[Check {
+                        key: b"durable/task/".to_vec(),
+                        expected: Expected::PrefixMutationsUnchangedSince(before)
+                    }],
+                    &[]
+                ),
+                Err(Error::Conflict { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn concurrent_open_installs_one_complete_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
+        drop(old);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(path)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(results.iter().any(Result::is_ok));
+        for result in results {
+            match result {
+                Ok(_) => (),
+                Err(Error::Storage(rusqlite::Error::SqliteFailure(code, _)))
+                    if matches!(
+                        code.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    ()
+                }
+                Err(error) => panic!("unexpected concurrent open error: {error}"),
+            }
+        }
+        let first = Store::open(&path).unwrap();
+        let second = Store::open(&path).unwrap();
+        let boundary = first.graph_mutation_revision().unwrap();
+        second
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"durable/task/race".to_vec(),
+                    value: vec![1],
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            first.commit(
+                &[Check {
+                    key: b"durable/task/".to_vec(),
+                    expected: Expected::PrefixMutationsUnchangedSince(boundary)
+                }],
+                &[]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn migration_fails_closed_on_read_only_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
+        drop(old);
+        let readonly = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert!(Store::initialize(readonly, true).is_err());
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        let installed: bool = probe.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_mutation_history')", [], |r| r.get(0)).unwrap();
+        assert!(!installed);
+    }
+
+    #[test]
+    fn migration_rejects_forged_existing_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forged.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID; CREATE TRIGGER durable_graph_mutation_delete AFTER DELETE ON durable_store_entries BEGIN SELECT 1; END;").unwrap();
+        drop(old);
+        assert!(matches!(Store::open(&path), Err(Error::InvalidSnapshot)));
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        let installed: bool = probe.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_mutation_history')", [], |r| r.get(0)).unwrap();
+        assert!(!installed);
+    }
+
+    #[test]
+    fn migration_rejects_incompatible_history_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE VIEW durable_graph_mutation_history AS SELECT 1 AS revision, X'00' AS key;",
+        )
+        .unwrap();
+        drop(old);
+        assert!(Store::open(&path).is_err());
+    }
+
+    #[test]
+    fn graph_fence_detects_deletes_and_aba_across_reopen_and_old_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.sqlite");
+        let store = Store::open(&path).unwrap();
+        let key = b"durable/task/example".to_vec();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: b"old".to_vec(),
+                }],
+            )
+            .unwrap();
+        let boundary = store.graph_mutation_revision().unwrap();
+        let old_connection = rusqlite::Connection::open(&path).unwrap();
+        old_connection
+            .execute("DELETE FROM durable_store_entries WHERE key=?1", [&key])
+            .unwrap();
+        let check = Check {
+            key: b"durable/task/".to_vec(),
+            expected: Expected::PrefixMutationsUnchangedSince(boundary),
+        };
+        assert!(matches!(
+            store.commit(&[check.clone()], &[]),
+            Err(Error::Conflict { .. })
+        ));
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert!(matches!(
+            reopened.commit(&[check], &[]),
+            Err(Error::Conflict { .. })
+        ));
+        let before_aba = reopened.graph_mutation_revision().unwrap();
+        reopened
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: b"same".to_vec(),
+                }],
+            )
+            .unwrap();
+        reopened.commit(&[], &[Mutation::Delete { key }]).unwrap();
+        assert!(matches!(
+            reopened.commit(
+                &[Check {
+                    key: b"durable/task/".to_vec(),
+                    expected: Expected::PrefixMutationsUnchangedSince(before_aba)
+                }],
+                &[]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+    }
+}
+
+#[cfg(any(test, feature = "experimental-graph-scope"))]
+mod graph_scope_prototype;

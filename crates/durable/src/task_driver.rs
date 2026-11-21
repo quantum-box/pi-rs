@@ -1908,10 +1908,12 @@ impl Shared {
                 hook();
             }
         }
-        if pending
-            .completed()
-            .is_some_and(|value| value.known_cancel_state().is_some())
-        {
+        if pending.completed().is_some_and(|value| {
+            value.known_cancel_state().is_some_and(|state| {
+                !cfg!(feature = "experimental-graph-scope")
+                    || state != task_scheduler::KnownCancelCommitState::Busy
+            })
+        }) {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
