@@ -36,7 +36,7 @@ pub struct Ollama {
     prompt_cache_long: bool,
     session_cache_key: Option<String>,
     reasoning_effort: Option<String>,
-    reasoning_effort_is_mapped: bool,
+    template_reasoning_effort: Option<String>,
     thinking_budget_level: Option<String>,
     thinking_budgets: Option<Value>,
     compatibility: ChatCompatibility,
@@ -224,7 +224,7 @@ impl Ollama {
                 && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long"),
             session_cache_key: None,
             reasoning_effort: None,
-            reasoning_effort_is_mapped: false,
+            template_reasoning_effort: None,
             thinking_budget_level: None,
             thinking_budgets: None,
             compatibility: ChatCompatibility::default(),
@@ -325,7 +325,7 @@ impl Ollama {
     /// Override provider thinking effort. None preserves the model default.
     pub fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         let local_ollama = self.endpoint.port_or_known_default() == Some(11434);
-        self.reasoning_effort_is_mapped = false;
+        self.template_reasoning_effort = effort.filter(|level| *level != "off").map(str::to_owned);
         self.reasoning_effort = effort.map(|effort| {
             match effort {
                 "off" => "none",
@@ -340,7 +340,7 @@ impl Ollama {
 
     /// Set an effort already resolved against the model's advertised controls.
     pub fn with_reported_reasoning_effort(mut self, effort: Option<&str>) -> Self {
-        self.reasoning_effort_is_mapped = false;
+        self.template_reasoning_effort = effort.filter(|level| *level != "off").map(str::to_owned);
         self.reasoning_effort =
             effort.map(|level| if level == "off" { "none" } else { level }.to_owned());
         self
@@ -348,17 +348,14 @@ impl Ollama {
 
     /// Apply the provider value from an explicit thinking-level map.
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
-        self.reasoning_effort_is_mapped = true;
+        self.template_reasoning_effort = effort.map(str::to_owned);
         self.reasoning_effort = effort.map(str::to_owned);
         self
     }
 
     fn chat_reasoning_effort(&self) -> Option<&str> {
-        if self.compatibility.uses_chat_template()
-            && !self.reasoning_enabled
-            && !self.reasoning_effort_is_mapped
-        {
-            None
+        if self.compatibility.uses_chat_template() {
+            self.template_reasoning_effort.as_deref()
         } else {
             self.reasoning_effort.as_deref()
         }
@@ -1940,9 +1937,12 @@ mod content_tests {
     #[test]
     fn chat_template_uses_only_explicitly_mapped_off_effort() {
         let compat = serde_json::from_value(json!({"thinkingFormat":"chat-template"})).unwrap();
-        let model = Ollama::new("http://localhost", None)
+        let model = Ollama::new("http://127.0.0.1:11434", None)
             .unwrap()
             .with_chat_compatibility(compat, Some(true), false, true);
+        let selected = model.clone().with_reasoning_effort(Some("minimal"));
+        assert_eq!(selected.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(selected.chat_reasoning_effort(), Some("minimal"));
         assert_eq!(
             model
                 .clone()
