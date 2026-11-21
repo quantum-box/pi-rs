@@ -1236,6 +1236,49 @@ impl Profiles {
             .supports_long_cache_retention
     }
 
+    pub fn responses_mid_conversation_system_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (bool, BTreeMap<String, bool>) {
+        let adapter = self.model_adapter(provider, selected);
+        let endpoint = |id: &str| {
+            explicit_endpoint
+                .or_else(|| self.model_endpoint(provider, id))
+                .unwrap_or_else(|| self.endpoint(provider))
+        };
+        let selected_endpoint = endpoint(selected);
+        let default = self
+            .chat_compatibility(provider, None)
+            .supports_mid_conversation_system_messages();
+        let overrides = self
+            .entries
+            .get(provider.id())
+            .into_iter()
+            .flat_map(|profile| profile.overrides.keys().cloned());
+        let ids: BTreeSet<_> = self
+            .model_ids(provider)
+            .into_iter()
+            .chain(overrides)
+            .chain(std::iter::once(selected.into()))
+            .collect();
+        let models = ids
+            .into_iter()
+            .map(|id| {
+                let same_route = self.model_adapter(provider, &id) == adapter
+                    && endpoint(&id) == selected_endpoint;
+                let supported = same_route
+                    && self
+                        .chat_compatibility(provider, self.model(provider, &id).as_ref())
+                        .supports_mid_conversation_system_messages();
+                (id, supported)
+            })
+            .filter(|(_, supported)| *supported != default)
+            .collect();
+        (default, models)
+    }
+
     pub fn anthropic_strict_tool_support(
         &self,
         provider: &Provider,
@@ -2407,6 +2450,47 @@ mod tests {
             profiles
                 .session_affinity(&chatgpt, "gpt", "https://example.test")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn responses_system_updates_follow_the_catalog_and_active_route() {
+        let profiles = Profiles::default();
+        let provider = Provider::named("openai").unwrap();
+        let (default, models) =
+            profiles.responses_mid_conversation_system_policy(&provider, "gpt-6-luna", None);
+        assert!(!default);
+        assert_eq!(models.get("gpt-6-luna"), Some(&true));
+        assert!(!models.contains_key("gpt-5-mini"));
+        let provider = Provider::named("openai-codex").unwrap();
+        let (_, codex) =
+            profiles.responses_mid_conversation_system_policy(&provider, "gpt-6.1-sol", None);
+        assert_eq!(codex.len(), 8);
+
+        let profiles = Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoSystemMessages":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMidConvoSystemMessages":false}},
+                {"id":"enabled"},
+                {"id":"other-api","api":"openai-completions"},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"}
+            ],
+            "modelOverrides":{"rewritten-unknown":{"compat":{"supportsMidConvoSystemMessages":false}}}
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("fixture").unwrap();
+        assert_eq!(
+            profiles.responses_mid_conversation_system_policy(&provider, "selected", None),
+            (
+                true,
+                BTreeMap::from([
+                    ("selected".into(), false),
+                    ("other-api".into(), false),
+                    ("other-endpoint".into(), false),
+                    ("rewritten-unknown".into(), false),
+                ])
+            )
         );
     }
 

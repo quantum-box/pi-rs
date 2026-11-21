@@ -1356,7 +1356,15 @@ impl Client {
                 } else {
                     client
                 };
+                let (system_default, system_models) = args
+                    .model_profiles
+                    .responses_mid_conversation_system_policy(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    );
                 let client = client
+                    .with_mid_conversation_system_policy(system_default, system_models)
                     .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_strict_tool_support(
