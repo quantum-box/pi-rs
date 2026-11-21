@@ -385,8 +385,9 @@ or a saved key. An explicit `models.json` provider base URL takes precedence
 over the environment. `AZURE_OPENAI_API_VERSION` configures the Responses
 query parameter, and `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` replaces the wire
 model name while preserving the catalog ID. Responses uses an `api-key`
-header and Chat Completions uses a bearer token, following Pi and the
-[Azure v1 Chat Completions API](https://learn.microsoft.com/en-us/rest/api/microsoft-foundry/azureopenai/chat?view=rest-microsoft-foundry-v1).
+header. For Chat Completions, Pi 1.6 sends the API key as `Authorization: Bearer`
+to `/openai/v1/chat/completions`. This is an accepted Azure v1 authentication
+form for Foundry models. [Microsoft Foundry endpoint authentication](https://learn.microsoft.com/en-us/azure/ai-studio/ai-services/concepts/endpoints).
 Model discovery on named Responses relays uses the same API key, version
 and URL prefix. A positive output budget under 16 tokens ends the run before
 an Azure Responses request is sent. The bundled
