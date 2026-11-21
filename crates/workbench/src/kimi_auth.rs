@@ -514,8 +514,11 @@ mod tests {
         let path = dir.path().join("auth.json");
         fixture(&path, now());
         let (service, started, reply, server) = refresh_server(3600).await;
-        let refresh = tokio::spawn(access_at(path.clone(), service.clone(), None, false));
-        started.await.unwrap();
+        let mut refresh = tokio::spawn(access_at(path.clone(), service.clone(), None, false));
+        tokio::select! {
+            started = started => started.unwrap(),
+            _ = &mut refresh => panic!("refresh did not reach the fixture before timing out"),
+        }
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(14)).await;
         assert!(!refresh.is_finished());
