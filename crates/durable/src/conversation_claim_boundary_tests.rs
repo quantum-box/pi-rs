@@ -8748,8 +8748,22 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 .unwrap();
             store.commit(&new_checks, &[]).unwrap();
             if graph_aba == 11 {
-                tasks
-                    .update(&running, |task| task.fail("interrupted".into()))
+                let mut forged = serde_json::to_value(&running.task).unwrap();
+                forged["state"] = json!({"Failed":"interrupted"});
+                forged["retired_attempt_id"] = json!(running.task.attempt_id().unwrap());
+                forged.as_object_mut().unwrap().remove("attempt_id");
+                let key = crate::task_store::key(root.task.id());
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(running.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&forged).unwrap(),
+                        }],
+                    )
                     .unwrap();
                 let failed = tasks.load(root.task.id()).unwrap().unwrap();
                 assert!(

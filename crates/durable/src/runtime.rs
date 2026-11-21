@@ -12730,12 +12730,7 @@ impl Harness {
                         None => None,
                     };
                     let reserved_attempt = reservation.running.attempt_id();
-                    let live_reservation = root.task.attempt_id() == reserved_attempt
-                        || root.task.retired_attempt_id() == reserved_attempt;
-                    if !live_reservation {
-                        if !matches!(root.task.state(), crate::task::TaskState::Failed(_)) {
-                            return Err(Error::Invalid("owned terminal state unavailable".into()));
-                        }
+                    if matches!(root.task.state(), crate::task::TaskState::Failed(_)) {
                         let terminal_key =
                             crate::task_scheduler::woken_conversation_terminal_key(root.task.id());
                         let terminal_entry = store.get(&terminal_key)?.ok_or(Error::NotFound)?;
@@ -12757,6 +12752,8 @@ impl Harness {
                             )
                             .map_err(Error::Invalid)?;
                         checks.extend(terminal_checks);
+                    } else if root.task.attempt_id() != reserved_attempt {
+                        return Err(Error::Invalid("owned live reservation changed".into()));
                     }
                     if reservation.version != 1
                         || reservation.graph_version != evidence_entry.version
