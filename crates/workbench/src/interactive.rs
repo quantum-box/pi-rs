@@ -2866,6 +2866,13 @@ impl View {
         Ok(path)
     }
 
+    fn show_debug_log(&mut self, args: &Cli, theme: &Theme) {
+        match self.write_debug_log(args, theme) {
+            Ok(path) => self.append(&format!("Debug log written\n{}", path.display())),
+            Err(error) => self.append(&format!("Debug log: {error}")),
+        }
+    }
+
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
         let output = self.transcript_options(args, false);
@@ -5068,6 +5075,15 @@ pub(super) async fn run(
             }
             _ => continue,
         };
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('d' | 'D'))
+        {
+            view.show_debug_log(&args, &theme);
+            dirty = true;
+            continue;
+        }
         if view
             .picker
             .as_ref()
@@ -5989,12 +6005,7 @@ pub(super) async fn run(
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/debug" {
-                            match view.write_debug_log(&args, &theme) {
-                                Ok(path) => {
-                                    view.append(&format!("Debug log written\n{}", path.display()))
-                                }
-                                Err(error) => view.append(&format!("Debug log: {error}")),
-                            }
+                            view.show_debug_log(&args, &theme);
                         } else if input.trim() == "/settings" {
                             view.picker = Some(Picker::new(
                                 "Settings",

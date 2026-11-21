@@ -557,7 +557,7 @@ fn delayed_color_reply_does_not_type_tail_or_open_editor() {
 }
 
 #[test]
-fn debug_command_writes_session_snapshot() {
+fn debug_command_and_global_shortcut_write_session_snapshots() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let mut master_fd = -1;
@@ -602,10 +602,22 @@ fn debug_command_writes_session_snapshot() {
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/debug\r").unwrap();
     output_until(&mut master, |text| text.contains("Debug log written"));
-    let output = std::fs::read_to_string(home.join("pi-debug.log")).unwrap();
+    let path = home.join("pi-debug.log");
+    let output = std::fs::read_to_string(&path).unwrap();
     assert!(output.contains("Terminal: 110x32"));
     assert!(output.contains("=== All rendered lines with visible widths ==="));
     assert!(output.contains("=== Agent messages (JSONL) ==="));
+    std::fs::remove_file(&path).unwrap();
+    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| text.contains("Settings"));
+    // Kitty CSI-u for Shift+Ctrl+D, delivered while the settings picker has focus.
+    master.write_all(b"\x1b[100;6u").unwrap();
+    output_until(&mut master, |_| {
+        std::fs::read_to_string(&path)
+            .is_ok_and(|snapshot| snapshot.contains("=== Agent messages (JSONL) ==="))
+    });
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("Enter to send"));
 }
 
 #[test]
