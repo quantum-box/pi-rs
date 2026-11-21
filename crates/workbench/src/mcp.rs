@@ -1038,6 +1038,10 @@ impl McpExtension {
         &self.server_tool_names
     }
 
+    pub fn remote_tool_exposure(&self, name: &str) -> &str {
+        tool_exposure(&self.connection.config, name)
+    }
+
     /// Whether the server advertised the resources capability at discovery.
     pub fn offers_resources(&self) -> bool {
         self.has_resources
