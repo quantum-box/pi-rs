@@ -2017,6 +2017,7 @@ fn markdown_plain_at_depth(
         .collect();
     definition_ranges.sort_unstable_by_key(|range| range.start);
     let mut item_prefixes = Vec::new();
+    let mut item_source_indents = Vec::new();
     let mut item_block_ends: Vec<Option<usize>> = Vec::new();
     let mut item_after_math = Vec::new();
     let mut item_reference_scan_work = 0usize;
@@ -2372,6 +2373,8 @@ fn markdown_plain_at_depth(
                 item_block_ends.push(None);
                 item_after_math.push(false);
                 item_prefixes.push(prefix.clone());
+                item_source_indents
+                    .push(super::strike::item_indent(parsed, range.start).unwrap_or(0));
                 spans.push(prefix);
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -2676,18 +2679,34 @@ fn markdown_plain_at_depth(
                 span.strikethrough = strikethrough > 0;
                 spans.push(span);
             }
-            Event::SoftBreak => {
-                if matches!(events.peek(), Some((Event::DisplayMath(_), _))) {
+            Event::SoftBreak | Event::HardBreak => {
+                let soft = matches!(event, Event::SoftBreak);
+                if soft && matches!(events.peek(), Some((Event::DisplayMath(_), _))) {
                     continue;
                 }
-                if let Some((_, label, _)) = links.last_mut() {
-                    label.push('\n');
+                let mut spaces = 0;
+                if !item_source_indents.is_empty()
+                    && !matches!(events.peek(), Some((Event::Text(value), _)) if value.starts_with(' '))
+                {
+                    spaces = list_continuation_spaces(&text[range.end..], &item_source_indents);
                 }
-                let mut span = Span::themed("\n", theme, "text");
-                span.hyperlink = links.last().and_then(|(url, _, _)| {
-                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                });
-                spans.push(span);
+                let mut continuation = String::new();
+                if soft {
+                    continuation.push('\n');
+                } else {
+                    flush(&mut spans, &mut lines, width, item_prefixes.last());
+                }
+                continuation.push_str(&" ".repeat(spaces));
+                if !continuation.is_empty() {
+                    if soft && let Some((_, label, _)) = links.last_mut() {
+                        label.push_str(&continuation);
+                    }
+                    let mut span = Span::themed(continuation, theme, "text");
+                    span.hyperlink = links.last().and_then(|(url, _, _)| {
+                        (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                    });
+                    spans.push(span);
+                }
             }
             Event::End(TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
@@ -2733,6 +2752,7 @@ fn markdown_plain_at_depth(
                     }
                 }
                 item_prefixes.pop();
+                item_source_indents.pop();
                 item_block_ends.pop();
                 item_after_math.pop();
             }
@@ -2744,7 +2764,6 @@ fn markdown_plain_at_depth(
                     *end = Some(range.end);
                 }
             }
-            Event::HardBreak => flush(&mut spans, &mut lines, width, item_prefixes.last()),
             Event::Rule => {
                 if let Some(prefix) = item_prefixes.last() {
                     if spans.as_slice() != [prefix.clone()] {
@@ -2797,6 +2816,20 @@ fn markdown_plain_at_depth(
     }
     lines
 }
+// Marked removes each list container's indent only when the source line
+// supplies it. Its text rule then removes up to one extra four-space indent.
+fn list_continuation_spaces(source: &str, indents: &[usize]) -> usize {
+    let trimmed = source.trim_start_matches(' ');
+    if trimmed.is_empty() || trimmed.starts_with(['\n', '\t']) {
+        return 0;
+    }
+    let spaces = source.len() - trimmed.len();
+    let remaining = indents.iter().fold(spaces, |spaces, &indent| {
+        spaces.checked_sub(indent).unwrap_or(spaces)
+    });
+    remaining.checked_sub(4).unwrap_or(remaining)
+}
+
 // Apply the same marker and continuation layout used for inline item text to
 // block renderers, preserving the individual themed spans and link metadata.
 fn prefix_item_block(
