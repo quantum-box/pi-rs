@@ -1114,7 +1114,6 @@ impl Picker {
         }
     }
 
-    #[cfg(test)]
     pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
         self.render_in_terminal(theme, width, height, height, keys)
     }
