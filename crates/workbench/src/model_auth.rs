@@ -216,10 +216,7 @@ impl Keys {
                     || anthropic)
                     && entry["type"] == "oauth";
                 let key = if chatgpt {
-                    serde_json::from_value::<pi_rs::openai::oauth::Credential>(
-                        entry["credential"].clone(),
-                    )
-                    .ok()?;
+                    super::chatgpt_auth::decode_entry(entry).ok()?;
                     Some(Credential::ChatGpt)
                 } else if anthropic {
                     let valid =
@@ -326,6 +323,9 @@ impl Keys {
                     })
                     .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
+                    return None;
+                }
+                if chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT) {
                     return None;
                 }
                 if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {
@@ -833,6 +833,26 @@ mod tests {
         ));
         assert!(
             keys.credential(&provider, "http://127.0.0.1:1234/v1/responses")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_pi_chatgpt_oauth_is_official_endpoint_only() {
+        let provider = Provider::named("openai-chatgpt").unwrap();
+        let mut entry = json!({"type":"oauth","access":"access","refresh":"refresh","expires":1000,
+            "clientId":"issued-client","scopes":["chatgpt.tokens.use.direct"]});
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(matches!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT),
+            Some(Credential::ChatGpt)
+        ));
+        let loopback = "http://127.0.0.1:1234/v1/responses";
+        entry["endpoint"] = json!(loopback);
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(keys.credential(&provider, loopback).is_none());
+        assert!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT)
                 .is_none()
         );
     }
