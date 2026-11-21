@@ -120,7 +120,10 @@ and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
-without `defaultProvider` are still accepted.
+without `defaultProvider` are still accepted. Cycling models shows the selected display
+name and the active thinking level for reasoning models. Consecutive notices
+reuse the trailing status in both fullscreen and regular mode, before it enters
+scrollback.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
