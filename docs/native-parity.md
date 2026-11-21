@@ -4626,6 +4626,20 @@ total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
 
+### Configured llama.cpp classifiers
+
+A `models.json` provider can declare an entry with `"type": "classifier"` and
+`"api": "llama-cpp-classify"`. Set the provider or model `baseUrl` to the
+llama-server URL. A trailing `/v1` is optional. The adapter accepts text
+classification questions and uses llama-server's tokenizer, chat template
+and next-token probabilities, including deeper readouts when necessary.
+It shares the classifier HTTP retry policy. An API key is optional, and
+configured keys and headers are scoped to their server. This adapter
+requires an explicit model entry and caches tokenizer results within each
+call. Automatic llama.cpp discovery and Pi's dynamic decision-model selection
+remain open. A local llama-server 1.0.0 run verified the classifier through
+Codemode against the published Pi adapter.
+
 ### OpenRouter image result checkpoint
 
 Codemode's non-chat model catalogue exposes declared image input limits and
