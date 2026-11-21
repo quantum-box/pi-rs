@@ -670,12 +670,18 @@ mod tests {
             ]}}]});
             let third = json!({"choices":[{"index":0,"delta":{
                 "tool_calls":[
-                    {"index":0,"id":"late-call","function":{"name":"read","arguments":"\"file\":\"doc\"}"}},
+                    {"index":0,"id":"late-","function":{"name":"read","arguments":"\"file\":\"doc\"}"}},
                     {"index":1,"function":{"name":"list"}}
                 ]
-            },"finish_reason":"tool_calls"}],
+            }}]});
+            let fourth = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call"},
+                {"index":0,"id":"late-call"}
+            ]},
+"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":12,"completion_tokens":3,"num_cached_tokens":7}});
-            let output = format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\n");
+            let output =
+                format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\ndata: {fourth}\n\n");
             write!(socket.get_mut(),
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{output}",
                 output.len()).unwrap();
@@ -705,7 +711,7 @@ mod tests {
         let mut metadata = None;
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut text = String::new();
-        let mut streamed_ids = Vec::new();
+        let mut streamed_ids = std::collections::BTreeMap::<u64, String>::new();
         while let Some(event) = stream.next().await {
             match event.unwrap() {
                 ModelEvent::Metadata(value) => metadata = Some(value),
@@ -735,7 +741,10 @@ mod tests {
         assert_eq!(calls[0].arguments, r#"{"file":"doc"}"#);
         assert_eq!(calls[1].name, "list");
         assert_ne!(calls[0].id, calls[1].id);
-        assert_eq!(streamed_ids, [calls[0].id.clone(), calls[1].id.clone()]);
+        assert_eq!(
+            streamed_ids.into_values().collect::<Vec<_>>(),
+            [calls[0].id.clone(), calls[1].id.clone()]
+        );
         let call_id = calls[0].id.clone();
         assert_eq!(call_id, "late-call");
         assert_eq!(calls[1].id, super::call_id("toolcall:1", 0));

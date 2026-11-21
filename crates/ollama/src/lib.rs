@@ -1433,7 +1433,11 @@ impl Ollama {
                                 name.clear();
                             }
                             if !call.id.is_empty() {
-                                id.clear();
+                                if id == call.id || delta.index.is_none() {
+                                    id.clear();
+                                } else if let Some(suffix) = id.strip_prefix(&call.id) {
+                                    id = suffix.to_owned();
+                                }
                             }
                         }
                         call.id.push_str(&id);
