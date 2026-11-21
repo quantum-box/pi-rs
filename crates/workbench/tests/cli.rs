@@ -1886,7 +1886,19 @@ fn qwen_token_plans_use_model_specific_thinking_and_tool_format() {
             assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), effort);
             assert!(body.get("store").is_none());
             assert_eq!(body["messages"][0]["role"], "system");
-            assert_eq!(body["tools"][0]["function"]["strict"], false);
+            let function = &body["tools"][0]["function"];
+            assert_eq!(function["strict"], true);
+            let required = function["parameters"]["required"].as_array().unwrap();
+            for field in ["path", "offset", "limit"] {
+                assert!(required.contains(&json!(field)), "missing {field}");
+            }
+            for field in ["offset", "limit"] {
+                let alternatives = function["parameters"]["properties"][field]["anyOf"]
+                    .as_array()
+                    .unwrap();
+                assert!(alternatives.contains(&json!({"type": "null"})));
+            }
+            assert_eq!(function["parameters"]["additionalProperties"], false);
             let events = concat!(
                 "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",

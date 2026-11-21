@@ -8,13 +8,18 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{model_profiles::ChatPrice, providers::Client};
+use super::{
+    model_profiles::ChatPrice,
+    providers::{Client, stream_with_declarations},
+};
 
 pub(super) const BLOCKED_IMAGE: &str = "Image reading is disabled.";
 const NON_VISION_USER_IMAGE: &str = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE: &str = "(tool image omitted: model does not support images)";
 
+#[derive(Clone)]
 pub(super) struct WorkbenchModel {
+    pub strict_policy: Option<std::sync::Arc<FinalStrictPolicy>>,
     pub client: Client,
     pub block_images: bool,
     pub supports_images: Option<bool>,
@@ -22,17 +27,178 @@ pub(super) struct WorkbenchModel {
     pub price: Option<ChatPrice>,
 }
 
+#[derive(Clone)]
+pub(super) struct FinalStrictPolicy {
+    pub profiles: super::model_profiles::Profiles,
+    pub provider: super::providers::Provider,
+    pub selected_model: String,
+    pub explicit_endpoint: bool,
+    pub bound_support: Option<bool>,
+}
+
+impl FinalStrictPolicy {
+    fn baseline(&self) -> Result<bool> {
+        match self.bound_support {
+            Some(value) => Ok(value),
+            None => self.support(&self.selected_model),
+        }
+    }
+    fn support(&self, model: &str) -> Result<bool> {
+        let metadata = self.profiles.model(&self.provider, model);
+        let adapter = self.profiles.model_adapter(&self.provider, model);
+        if adapter
+            != self
+                .profiles
+                .model_adapter(&self.provider, &self.selected_model)
+        {
+            return Err(pi_rs::Error::Config(
+                "final request model uses a different API route".into(),
+            ));
+        }
+        if !self.explicit_endpoint {
+            let endpoint = |name: &str| {
+                self.profiles
+                    .model_endpoint(&self.provider, name)
+                    .unwrap_or_else(|| self.profiles.endpoint(&self.provider))
+            };
+            if endpoint(model) != endpoint(&self.selected_model) {
+                return Err(pi_rs::Error::Config(
+                    "final request model uses a different endpoint route".into(),
+                ));
+            }
+        }
+        if model != self.selected_model
+            && !self.profiles.has_model_definition(&self.provider, model)
+        {
+            return Ok(false);
+        }
+        Ok(if adapter == super::providers::Adapter::OpenAiResponses {
+            self.profiles
+                .responses_strict_tool_support(&self.provider, metadata.as_ref())
+        } else {
+            self.profiles
+                .chat_compatibility(&self.provider, metadata.as_ref())
+                .supports_strict_mode()
+                == Some(true)
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: external_id.into(),
+                summary: false,
+            },
+        )
+        .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: session_id.to_string(),
+                summary: true,
+            },
+        )
+        .await
+    }
+
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch + 'a>>> {
+        if !self.client.supports_prepared_tool_dispatch() {
+            pi_rs::validate_legacy_tool_declarations(request, declarations)?;
+            return Ok(None);
+        }
+        let (client, headers) = if context.summary {
+            (self.client.clone(), HeaderMap::new())
+        } else {
+            self.affinity_headers(&context.external_id).await?
+        };
+        let client = self.final_client(client, &request.model).await?;
+        let filtered = self.filtered(request.clone());
+        let Some(inner) = client
+            .prepare_tool_dispatch_with_headers(&filtered, declarations, context, &headers, true)
+            .await?
+        else {
+            pi_rs::validate_legacy_tool_declarations(request, declarations)?;
+            return Ok(None);
+        };
+        pi_rs::validate_prepared_tool_dispatch(inner.as_ref(), context, &filtered, declarations)?;
+        let snapshot = pi_rs::ToolDecisionSnapshot::capture_dispatch(
+            context,
+            request,
+            inner.dispatch_request(),
+            declarations,
+            inner.effective_tools(),
+        )
+        .map_err(|error| pi_rs::Error::Config(error.to_string()))?;
+        Ok(Some(Box::new(PreparedWorkbenchToolDispatch {
+            inner,
+            owner: self.clone(),
+            snapshot,
+        })))
+    }
+
     async fn prepare_context<'a>(
         &'a self,
         request: &ModelRequest,
     ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        let support = self
+            .strict_policy
+            .as_ref()
+            .map(|policy| policy.support(&request.model))
+            .transpose()?;
         let Some((client, identity)) = self.client.prepare_for_context(&request.model).await?
         else {
             return Ok(None);
         };
+        let changed_support = match (&self.strict_policy, support) {
+            (Some(policy), Some(final_support)) => {
+                (policy.baseline()? != final_support).then_some(final_support)
+            }
+            _ => None,
+        };
+        let client = match changed_support {
+            Some(supported) => client.with_final_strict_support(supported).await?,
+            None => client,
+        };
         let identity = identity.and_then(|identity| {
+            let identity = match changed_support {
+                Some(supported) => {
+                    pi_rs::fingerprint_model_context(&("final-strict-v1", identity, supported))?
+                }
+                None => identity,
+            };
             pi_rs::fingerprint_model_context(&(
                 "workbench-policy-v2",
                 identity,
@@ -42,7 +208,13 @@ impl Model for WorkbenchModel {
             ))
         });
         Ok(Some(std::sync::Arc::new(PreparedWorkbenchModel {
+            bound_model: self.strict_policy.as_ref().map(|_| request.model.clone()),
             inner: WorkbenchModel {
+                strict_policy: self.strict_policy.as_ref().map(|policy| {
+                    let mut policy = (**policy).clone();
+                    policy.bound_support = support;
+                    std::sync::Arc::new(policy)
+                }),
                 client,
                 block_images: self.block_images,
                 supports_images: self.supports_images,
@@ -82,7 +254,10 @@ impl Model for WorkbenchModel {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
-        let stream = self.client.stream(self.filtered(request)).await?;
+        let client = self
+            .final_client(self.client.clone(), &request.model)
+            .await?;
+        let stream = client.stream(self.filtered(request)).await?;
         Ok(self.estimate_usage(stream))
     }
 
@@ -109,6 +284,7 @@ impl Model for WorkbenchModel {
         request: ModelRequest,
     ) -> Result<ModelStream> {
         let (client, headers) = self.affinity_headers(external_id).await?;
+        let client = self.final_client(client, &request.model).await?;
         let stream = client
             .stream_with_headers(self.filtered(request), &headers, false, Some(external_id))
             .await?;
@@ -120,8 +296,10 @@ impl Model for WorkbenchModel {
         _session_id: Uuid,
         request: ModelRequest,
     ) -> Result<ModelStream> {
-        let stream = self
-            .client
+        let client = self
+            .final_client(self.client.clone(), &request.model)
+            .await?;
+        let stream = client
             .stream_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
             .await?;
         Ok(self.estimate_usage(stream))
@@ -134,6 +312,7 @@ impl Model for WorkbenchModel {
         request: ModelRequest,
     ) -> Result<EnrichedModelStream> {
         let (client, headers) = self.affinity_headers(external_id).await?;
+        let client = self.final_client(client, &request.model).await?;
         let stream = client
             .stream_enriched_with_headers(
                 self.filtered(request),
@@ -153,6 +332,7 @@ impl Model for WorkbenchModel {
         request: ModelRequest,
     ) -> Result<pi_rs::DetailedModelStream> {
         let (client, headers) = self.affinity_headers(external_id).await?;
+        let client = self.final_client(client, &request.model).await?;
         let stream = client
             .stream_detailed_with_headers(
                 self.filtered(request),
@@ -169,8 +349,10 @@ impl Model for WorkbenchModel {
         _session_id: Uuid,
         request: ModelRequest,
     ) -> Result<pi_rs::DetailedModelStream> {
-        let stream = self
-            .client
+        let client = self
+            .final_client(self.client.clone(), &request.model)
+            .await?;
+        let stream = client
             .stream_detailed_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
             .await?;
         Ok(self.estimate_detailed_usage(stream))
@@ -182,8 +364,10 @@ impl Model for WorkbenchModel {
         _session_id: Uuid,
         request: ModelRequest,
     ) -> Result<EnrichedModelStream> {
-        let stream = self
-            .client
+        let client = self
+            .final_client(self.client.clone(), &request.model)
+            .await?;
+        let stream = client
             .stream_enriched_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
             .await?;
         Ok(self.estimate_enriched_usage(stream))
@@ -191,25 +375,146 @@ impl Model for WorkbenchModel {
 }
 
 struct PreparedWorkbenchModel {
+    bound_model: Option<String>,
     inner: WorkbenchModel,
     identity: Option<String>,
 }
 
+impl PreparedWorkbenchModel {
+    fn check_model(&self, model: &str) -> Result<()> {
+        if self
+            .bound_model
+            .as_deref()
+            .is_some_and(|bound| bound != model)
+        {
+            return Err(pi_rs::Error::Config(
+                "prepared context is bound to a different request model".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct PreparedWorkbenchToolDispatch {
+    inner: Box<dyn pi_rs::PreparedToolDispatch>,
+    owner: WorkbenchModel,
+    snapshot: pi_rs::ToolDecisionSnapshot,
+}
+
+#[async_trait::async_trait]
+impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
+    fn effective_tools(&self) -> &[pi_rs::EffectiveToolDeclaration] {
+        self.inner.effective_tools()
+    }
+
+    fn decision_snapshot(&self) -> &pi_rs::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+
+    fn dispatch_request(&self) -> &ModelRequest {
+        self.inner.dispatch_request()
+    }
+
+    fn reservation_request(&self) -> &ModelRequest {
+        self.inner.reservation_request()
+    }
+
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs::DetailedModelStream> {
+        Ok(self
+            .owner
+            .estimate_detailed_usage(self.inner.dispatch().await?))
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for PreparedWorkbenchModel {
+    async fn prepare_context<'a>(
+        &'a self,
+        request: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        self.inner.prepare_context(request).await
+    }
+
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.check_model(&request.model)?;
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: external_id.into(),
+                summary: false,
+            },
+        )
+        .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.check_model(&request.model)?;
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: session_id.to_string(),
+                summary: true,
+            },
+        )
+        .await
+    }
+
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch + 'a>>> {
+        self.check_model(&request.model)?;
+        self.inner
+            .prepare_tool_dispatch(request, declarations, context)
+            .await
+    }
+
     fn context_identity(&self) -> Option<String> {
         self.identity.clone()
     }
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        if self.check_model(&request.model).is_err() {
+            return u64::MAX;
+        }
         self.inner.estimate_request_tokens(request)
     }
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        if self.check_model(&request.model).is_err() {
+            return u64::MAX;
+        }
         self.inner.estimate_message_tokens(request, message)
     }
     async fn context_window(&self, model: &str) -> Option<u32> {
+        if self.check_model(model).is_err() {
+            return None;
+        }
         self.inner.context_window(model).await
     }
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        self.check_model(&request.model)?;
         self.inner.stream(request).await
     }
     async fn stream_in_session(
@@ -218,6 +523,7 @@ impl Model for PreparedWorkbenchModel {
         session_id: Uuid,
         request: ModelRequest,
     ) -> Result<ModelStream> {
+        self.check_model(&request.model)?;
         self.inner
             .stream_in_session(request_id, session_id, request)
             .await
@@ -229,6 +535,7 @@ impl Model for PreparedWorkbenchModel {
         external_id: &str,
         request: ModelRequest,
     ) -> Result<ModelStream> {
+        self.check_model(&request.model)?;
         self.inner
             .stream_in_session_with_identity(request_id, session_id, external_id, request)
             .await
@@ -239,6 +546,7 @@ impl Model for PreparedWorkbenchModel {
         session_id: Uuid,
         request: ModelRequest,
     ) -> Result<ModelStream> {
+        self.check_model(&request.model)?;
         self.inner
             .stream_for_summary(request_id, session_id, request)
             .await
@@ -250,6 +558,7 @@ impl Model for PreparedWorkbenchModel {
         external_id: &str,
         request: ModelRequest,
     ) -> Result<EnrichedModelStream> {
+        self.check_model(&request.model)?;
         self.inner
             .stream_enriched_in_session_with_identity(request_id, session_id, external_id, request)
             .await
@@ -262,6 +571,7 @@ impl Model for PreparedWorkbenchModel {
         external_id: &str,
         request: ModelRequest,
     ) -> Result<pi_rs::DetailedModelStream> {
+        self.check_model(&request.model)?;
         self.inner
             .stream_detailed_in_session_with_identity(request_id, session_id, external_id, request)
             .await
@@ -272,6 +582,7 @@ impl Model for PreparedWorkbenchModel {
         session_id: Uuid,
         request: ModelRequest,
     ) -> Result<pi_rs::DetailedModelStream> {
+        self.check_model(&request.model)?;
         self.inner
             .stream_detailed_for_summary(request_id, session_id, request)
             .await
@@ -283,6 +594,7 @@ impl Model for PreparedWorkbenchModel {
         session_id: Uuid,
         request: ModelRequest,
     ) -> Result<EnrichedModelStream> {
+        self.check_model(&request.model)?;
         self.inner
             .stream_enriched_for_summary(request_id, session_id, request)
             .await
@@ -290,6 +602,19 @@ impl Model for PreparedWorkbenchModel {
 }
 
 impl WorkbenchModel {
+    async fn final_client(&self, client: Client, model: &str) -> Result<Client> {
+        match &self.strict_policy {
+            Some(policy) => {
+                let support = policy.support(model)?;
+                if support != policy.baseline()? {
+                    client.with_final_strict_support(support).await
+                } else {
+                    Ok(client)
+                }
+            }
+            _ => Ok(client),
+        }
+    }
     async fn affinity_headers(&self, external_id: &str) -> Result<(Client, HeaderMap)> {
         let mut headers = HeaderMap::new();
         let (client, configured) = if !self.session_affinity.is_empty() && !external_id.is_empty() {
@@ -481,6 +806,7 @@ mod tests {
     async fn enriched_usage_estimation_preserves_reasoning_events() {
         use futures_util::StreamExt;
         let model = super::WorkbenchModel {
+            strict_policy: None,
             client: super::Client::Google(
                 pi_rs::google::Google::new("https://example.com", "key").unwrap(),
             ),
@@ -616,6 +942,7 @@ mod tests {
                     body
                 });
                 let model = WorkbenchModel {
+                    strict_policy: None,
                     client: Client::OpenAi(
                         pi_rs::openai::OpenAiResponses::new_api(
                             &format!("http://{address}/responses"),
@@ -707,6 +1034,7 @@ mod tests {
                 headers.insert("session-id", "explicit".parse().unwrap());
             }
             let model = WorkbenchModel {
+                strict_policy: None,
                 client: Client::OpenAi(
                     pi_rs::openai::OpenAiResponses::new_api(
                         &format!("http://{address}/responses"),
@@ -835,6 +1163,7 @@ mod tests {
                 bytes
             });
             let model = WorkbenchModel {
+                strict_policy: None,
                 client: Client::Ollama(
                     pi_rs::ollama::Ollama::new(
                         &format!("http://{address}"),
@@ -893,6 +1222,7 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
             let model = WorkbenchModel {
+                strict_policy: None,
                 client: Client::Ollama(
                     pi_rs::ollama::Ollama::new(
                         &format!("http://{address}"),
@@ -1037,6 +1367,7 @@ mod tests {
                 )
             };
             let model = WorkbenchModel {
+                strict_policy: None,
                 client,
                 block_images: false,
                 supports_images: None,
@@ -1099,6 +1430,7 @@ mod tests {
     #[test]
     fn effective_context_identity_includes_image_policy_and_adapter() {
         let make = |endpoint: &str, block_images, supports_images| WorkbenchModel {
+            strict_policy: None,
             client: Client::Google(pi_rs::google::Google::new(endpoint, "fixture-key").unwrap()),
             block_images,
             supports_images,
@@ -1229,5 +1561,605 @@ mod tests {
                 {"type":"text","text":"after"}
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod final_strict_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn chatgpt_responses_prepares_strict_tools_unless_profile_disables_them() {
+        use clap::Parser;
+
+        let endpoint = "http://127.0.0.1:1234/v1/responses";
+        let mut args = crate::Cli::parse_from(["pi"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse(&json!({"providers":{
+            "openai-chatgpt": { "api":"openai-responses", "baseUrl":endpoint,
+                "models":[{"id":"default"},{"id":"off","compat":{"supportsStrictMode":false}}]}
+        }}))
+        .unwrap();
+        args.provider = args.model_profiles.provider("openai-chatgpt").unwrap();
+        args.model = "default".into();
+        args.endpoint = endpoint.into();
+        args.api_key = Some("fixture".into());
+        let model = crate::runtime::model_client(&args, false, false).unwrap();
+        let tool = pi_rs::ToolSpec {
+            name: "pick".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","properties":{"name":{"type":"string"}}}),
+        };
+        let declaration = pi_rs::ToolDeclaration {
+            spec: tool.clone(),
+            constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                strict: pi_rs::StrictToolPolicy::Prefer,
+            }),
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            external_id: "fixture".into(),
+            summary: false,
+        };
+        for (id, strict) in [("default", true), ("off", false), ("unknown", false)] {
+            let request = ModelRequest {
+                model: id.into(),
+                messages: Vec::new(),
+                tools: vec![tool.clone()],
+                max_output_tokens: 10,
+            };
+            let prepared = model
+                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                ),
+                strict,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewritten_model_must_use_same_route() {
+        let profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-completions", "baseUrl":"http://127.0.0.1:1234/v1", "compat":{"supportsStrictMode":true},
+            "models":[{"id":"first"},{"id":"other-route","baseUrl":"http://127.0.0.1:5678/v1"},{"id":"other-api","api":"openai-responses"}],
+            "modelOverrides":{"partial":{"compat":{"supportsReasoningEffort":true}},"partial-true":{"compat":{"supportsStrictMode":true}}}
+        }}})).unwrap();
+        let policy = FinalStrictPolicy {
+            provider: profiles.provider("fixture").unwrap(),
+            profiles,
+            selected_model: "first".into(),
+            explicit_endpoint: false,
+            bound_support: None,
+        };
+        assert!(policy.support("first").unwrap());
+        assert!(policy.support("other-route").is_err());
+        assert!(policy.support("other-api").is_err());
+        assert!(!policy.support("unknown").unwrap());
+        assert!(policy.profiles.model(&policy.provider, "partial").is_some());
+        assert!(!policy.support("partial").unwrap());
+        assert!(!policy.support("partial-true").unwrap());
+        let other = FinalStrictPolicy {
+            selected_model: "other-route".into(),
+            ..policy.clone()
+        };
+        assert!(other.support("unknown").is_err());
+        assert!(other.support("partial").is_err());
+        let explicit = FinalStrictPolicy {
+            explicit_endpoint: true,
+            ..policy
+        };
+        assert!(explicit.support("other-route").unwrap());
+        assert!(explicit.support("other-api").is_err());
+    }
+}
+
+#[cfg(test)]
+mod final_stream_policy_tests {
+    use super::*;
+    use crate::model_auth::Credential;
+    use crate::model_profiles::RequestHeaders;
+    use crate::providers::{Adapter, Client};
+    use clap::Parser;
+    use std::{
+        io::{Read, Write},
+        sync::Arc,
+    };
+
+    #[tokio::test]
+    async fn final_model_applies_to_all_direct_streams() {
+        for deferred in [false, true] {
+            for prepared in [false, true] {
+                for target in ["yes", "no"] {
+                    for mode in 0..8 {
+                        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                        let endpoint = format!(
+                            "http://{}/v1/chat/completions",
+                            listener.local_addr().unwrap()
+                        );
+                        let mut args = crate::Cli::parse_from(["pi"]);
+                        args.model_profiles = crate::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{"api":"openai-completions","baseUrl":endpoint,"models":[{"id":"yes","compat":{"supportsStrictMode":true}},{"id":"no","compat":{"supportsStrictMode":false}}]}}})).unwrap();
+                        args.provider = args.model_profiles.provider("fixture").unwrap();
+                        args.model = if target == "yes" { "no" } else { "yes" }.into();
+                        let client = if deferred {
+                            Client::deferred(
+                                args.provider.clone(),
+                                Adapter::ChatCompletions,
+                                &endpoint,
+                                Some(Credential::Literal("fixture".into())),
+                                RequestHeaders::default(),
+                            )
+                        } else {
+                            Client::Ollama(
+                                pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                                    .unwrap()
+                                    .with_native_probes(false),
+                            )
+                        }
+                        .with_model_options(&args, false)
+                        .unwrap();
+                        let model = WorkbenchModel {
+                            strict_policy: Some(Arc::new(FinalStrictPolicy {
+                                profiles: args.model_profiles.clone(),
+                                provider: args.provider.clone(),
+                                selected_model: args.model.clone(),
+                                explicit_endpoint: false,
+                                bound_support: None,
+                            })),
+                            client,
+                            block_images: false,
+                            supports_images: None,
+                            session_affinity: &[],
+                            price: None,
+                        };
+                        let request = ModelRequest {
+                            model: target.into(),
+                            messages: vec![],
+                            tools: vec![pi_rs::ToolSpec {
+                                name: "t".into(),
+                                description: String::new(),
+                                parameters: json!({"type":"object"}),
+                            }],
+                            max_output_tokens: 10,
+                        };
+                        let resolved = if prepared {
+                            model.prepare_context(&request).await.unwrap()
+                        } else {
+                            None
+                        };
+                        let active: &dyn Model = resolved.as_deref().unwrap_or(&model);
+                        let server = std::thread::spawn(move || {
+                            let (mut stream, _) = listener.accept().unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                                .unwrap();
+                            let mut bytes = Vec::new();
+                            let (offset, len) = loop {
+                                let mut buf = [0; 4096];
+                                let n = stream.read(&mut buf).unwrap();
+                                assert!(n > 0);
+                                bytes.extend_from_slice(&buf[..n]);
+                                if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                                    let head = String::from_utf8_lossy(&bytes[..pos]);
+                                    let len = head
+                                        .lines()
+                                        .find_map(|line| {
+                                            line.to_ascii_lowercase()
+                                                .strip_prefix("content-length:")
+                                                .map(|x| x.trim().parse::<usize>().unwrap())
+                                        })
+                                        .unwrap();
+                                    break (pos + 4, len);
+                                }
+                            };
+                            while bytes.len() < offset + len {
+                                let mut buf = [0; 4096];
+                                let n = stream.read(&mut buf).unwrap();
+                                assert!(n > 0);
+                                bytes.extend_from_slice(&buf[..n]);
+                            }
+                            let body: Value =
+                                serde_json::from_slice(&bytes[offset..offset + len]).unwrap();
+                            stream.write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                            body
+                        });
+                        let id = Uuid::new_v4();
+                        match mode {
+                            0 => {
+                                let _ = active.stream(request).await;
+                            }
+                            1 => {
+                                let _ = active.stream_in_session(id, id, request).await;
+                            }
+                            2 => {
+                                let _ = active
+                                    .stream_in_session_with_identity(id, id, "s", request)
+                                    .await;
+                            }
+                            3 => {
+                                let _ = active.stream_for_summary(id, id, request).await;
+                            }
+                            4 => {
+                                let _ = active
+                                    .stream_enriched_in_session_with_identity(id, id, "s", request)
+                                    .await;
+                            }
+                            5 => {
+                                let _ = active
+                                    .stream_detailed_in_session_with_identity(id, id, "s", request)
+                                    .await;
+                            }
+                            6 => {
+                                let _ = active.stream_detailed_for_summary(id, id, request).await;
+                            }
+                            7 => {
+                                let _ = active.stream_enriched_for_summary(id, id, request).await;
+                            }
+                            _ => unreachable!(),
+                        }
+                        let body = server.join().unwrap();
+                        assert_eq!(body["model"], target);
+                        assert_eq!(
+                            body["tools"][0]["function"]
+                                .get("strict")
+                                .and_then(Value::as_bool),
+                            if target == "yes" { Some(false) } else { None },
+                            "mode={mode} deferred={deferred} prepared={prepared}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod measured_anchor_policy_tests {
+    use super::*;
+    use clap::Parser;
+    use std::{
+        io::{Read, Write},
+        sync::Arc,
+    };
+
+    #[tokio::test]
+    async fn unchanged_capability_preserves_legacy_identity_and_measured_anchor() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let (start, len) = loop {
+                    let mut block = [0; 4096];
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&block[..n]);
+                    if let Some(pos) = data.windows(4).position(|x| x == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..pos]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|x| x.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (pos + 4, len);
+                    }
+                };
+                while data.len() < start + len {
+                    let mut block = [0; 4096];
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&block[..n]);
+                }
+                let events = concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",events.len(),events).unwrap();
+            }
+        });
+        let mut args = crate::Cli::parse_from(["pi"]);
+        args.model_profiles=crate::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{"api":"openai-completions","baseUrl":endpoint,"models":[{"id":"m","compat":{"supportsStrictMode":true}}]}}})).unwrap();
+        args.provider = args.model_profiles.provider("fixture").unwrap();
+        args.model = "m".into();
+        let client = Client::Ollama(
+            pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                .unwrap()
+                .with_native_probes(false),
+        )
+        .with_model_options(&args, false)
+        .unwrap();
+        let policy = Arc::new(FinalStrictPolicy {
+            profiles: args.model_profiles.clone(),
+            provider: args.provider.clone(),
+            selected_model: "m".into(),
+            explicit_endpoint: false,
+            bound_support: None,
+        });
+        let model = WorkbenchModel {
+            strict_policy: Some(policy),
+            client,
+            block_images: false,
+            supports_images: None,
+            session_affinity: &[],
+            price: None,
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 10,
+        };
+        let (_, old_identity) = model
+            .client
+            .prepare_for_context("m")
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = pi_rs::fingerprint_model_context(&(
+            "workbench-policy-v2",
+            old_identity.unwrap(),
+            false,
+            Option::<bool>::None,
+            &[] as &[&str],
+        ));
+        let resolved = model.prepare_context(&request).await.unwrap().unwrap();
+        assert_eq!(resolved.context_identity(), expected);
+        let mut no_policy = model.clone();
+        no_policy.strict_policy = None;
+        assert_eq!(
+            no_policy
+                .prepare_context(&request)
+                .await
+                .unwrap()
+                .unwrap()
+                .context_identity(),
+            expected
+        );
+        let registry = pi_rs::Registry::default();
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let system = "long system ".repeat(1000);
+        for window in [10000, 100] {
+            let agent = pi_rs::Agent {
+                model: &model,
+                model_name: "m",
+                registry: &registry,
+                system_prompt: &system,
+                limits: pi_rs::Limits {
+                    context_window: Some(window),
+                    output_tokens_per_request: 10,
+                    ..Default::default()
+                },
+            };
+            let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+            assert_eq!(
+                agent
+                    .run(
+                        &mut session,
+                        Some("x".into()),
+                        &mut inputs,
+                        &pi_rs::CancellationToken::new(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .unwrap(),
+                "done"
+            );
+        }
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod route_binding_tests {
+    use super::*;
+    use crate::model_auth::Credential;
+    use crate::model_profiles::RequestHeaders;
+    use crate::providers::{Adapter, Client};
+    use clap::Parser;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn route_mismatch_and_prepared_identity_are_fail_closed() {
+        for api in ["openai-completions", "openai-responses"] {
+            for deferred in [false, true] {
+                let mut args = crate::Cli::parse_from(["pi"]);
+                args.model_profiles = crate::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+                    "api":api,"baseUrl":"http://127.0.0.1:9/v1","compat":{"supportsStrictMode":true},
+                    "models":[{"id":"a","compat":{"supportsStrictMode":true}},{"id":"b","compat":{"supportsStrictMode":false}},{"id":"other-route","baseUrl":"http://127.0.0.1:10/v1"},{"id":"other-api","api":if api=="openai-responses" {"openai-completions"} else {"openai-responses"}}],
+                    "modelOverrides":{"partial":{"reasoning":false}}
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("fixture").unwrap();
+                args.model = "a".into();
+                let adapter = if api == "openai-responses" {
+                    Adapter::OpenAiResponses
+                } else {
+                    Adapter::ChatCompletions
+                };
+                let endpoint = if api == "openai-responses" {
+                    "http://127.0.0.1:9/v1/responses"
+                } else {
+                    "http://127.0.0.1:9/v1/chat/completions"
+                };
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        adapter,
+                        endpoint,
+                        Some(Credential::Literal("fixture".into())),
+                        RequestHeaders::default(),
+                    )
+                } else if api == "openai-responses" {
+                    Client::OpenAi(
+                        pi_rs::openai::OpenAiResponses::new_api(endpoint, "fixture".into())
+                            .unwrap(),
+                    )
+                } else {
+                    Client::Ollama(
+                        pi_rs::ollama::Ollama::new(endpoint, Some("fixture".into()))
+                            .unwrap()
+                            .with_native_probes(false),
+                    )
+                }
+                .with_model_options(&args, false)
+                .unwrap();
+                let model = WorkbenchModel {
+                    strict_policy: Some(Arc::new(FinalStrictPolicy {
+                        profiles: args.model_profiles.clone(),
+                        provider: args.provider.clone(),
+                        selected_model: "a".into(),
+                        explicit_endpoint: false,
+                        bound_support: None,
+                    })),
+                    client,
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let spec = pi_rs::ToolSpec {
+                    name: "t".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                };
+                let make = |name: &str| ModelRequest {
+                    model: name.into(),
+                    messages: vec![],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 10,
+                };
+                let context = pi_rs::ToolDispatchContext {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::new_v4(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                let declaration = pi_rs::ToolDeclaration {
+                    spec: spec.clone(),
+                    constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                        strict: pi_rs::StrictToolPolicy::Prefer,
+                    }),
+                };
+                for name in ["other-route", "other-api"] {
+                    let request = make(name);
+                    assert!(model.prepare_context(&request).await.is_err());
+                    let error = model
+                        .prepare_tool_dispatch(
+                            &request,
+                            std::slice::from_ref(&declaration),
+                            &context,
+                        )
+                        .await
+                        .err()
+                        .unwrap();
+                    assert!(error.to_string().contains("route"));
+                    let error = model.stream(request).await.err().unwrap();
+                    assert!(error.to_string().contains("route"));
+                }
+                for name in ["unknown", "partial"] {
+                    let request = make(name);
+                    let dispatch = model
+                        .prepare_tool_dispatch(
+                            &request,
+                            std::slice::from_ref(&declaration),
+                            &context,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(matches!(
+                        dispatch.effective_tools()[0].sampling,
+                        pi_rs::EffectiveToolSampling::Unconstrained
+                    ));
+                }
+                let prepared = model.prepare_context(&make("a")).await.unwrap().unwrap();
+                let identity = prepared.context_identity();
+                assert!(identity.is_some());
+                for name in ["other-route", "other-api"] {
+                    let wrong = make(name);
+                    assert!(
+                        prepared
+                            .prepare_tool_dispatch(
+                                &wrong,
+                                std::slice::from_ref(&declaration),
+                                &context
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert!(prepared.stream(wrong).await.is_err());
+                }
+                let b = make("b");
+                assert!(
+                    prepared
+                        .prepare_tool_dispatch(&b, std::slice::from_ref(&declaration), &context)
+                        .await
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("bound")
+                );
+                assert!(
+                    prepared
+                        .stream(b.clone())
+                        .await
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("bound")
+                );
+                assert_eq!(prepared.estimate_request_tokens(&b), u64::MAX);
+                assert!(prepared.context_window("b").await.is_none());
+                assert_eq!(prepared.context_identity(), identity);
+                let prepared_b = model.prepare_context(&b).await.unwrap().unwrap();
+                assert_ne!(prepared_b.context_identity(), identity);
+                // A summary may use the selected model after a turn hook
+                // prepared the main request for a different model.
+                let summary_request = make("a");
+                let summary = prepared_b
+                    .prepare_context(&summary_request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let summary_context = pi_rs::ToolDispatchContext {
+                    summary: true,
+                    ..context.clone()
+                };
+                assert!(
+                    summary
+                        .prepare_tool_dispatch(
+                            &summary_request,
+                            std::slice::from_ref(&declaration),
+                            &summary_context,
+                        )
+                        .await
+                        .is_ok()
+                );
+                assert!(
+                    model
+                        .prepare_tool_dispatch(&b, std::slice::from_ref(&declaration), &context)
+                        .await
+                        .is_ok()
+                );
+            }
+        }
     }
 }

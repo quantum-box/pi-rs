@@ -1764,6 +1764,7 @@ mod tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             },
             Event::ModelFinished {
                 request_id,
@@ -1870,6 +1871,7 @@ mod tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             },
             Event::ModelFinished {
                 request_id,
@@ -2129,7 +2131,7 @@ mod tests {
             .records()
             .iter()
             .filter_map(|r| match &r.event {
-                Event::ToolStarted { operation_id } => Some(*operation_id),
+                Event::ToolStarted { operation_id, .. } => Some(*operation_id),
                 _ => None,
             })
             .collect();

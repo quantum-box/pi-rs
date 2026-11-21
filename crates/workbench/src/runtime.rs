@@ -1085,7 +1085,17 @@ pub(super) fn model_client(
         .connect_provider(&args.provider, Some(&args.model))?
         .with_context_probes(args.allow_model_probes())
         .with_model_options(args, reported)?;
+    let strict_policy = client.uses_final_strict_policy().then(|| {
+        Arc::new(super::image_policy::FinalStrictPolicy {
+            profiles: args.model_profiles.clone(),
+            provider: args.provider.clone(),
+            selected_model: args.model.clone(),
+            explicit_endpoint: args.explicit_endpoint_for(&args.provider).is_some(),
+            bound_support: None,
+        })
+    });
     Ok(super::image_policy::WorkbenchModel {
+        strict_policy,
         client: if observe { client.observe() } else { client },
         block_images: args.settings.block_model_images(),
         supports_images: args
@@ -1509,6 +1519,31 @@ mod standalone_share_tests {
 #[cfg(test)]
 mod resource_origin_tests {
     use super::*;
+
+    #[test]
+    fn runtime_final_strict_policy_is_limited_to_openai_adapters() {
+        use clap::Parser;
+        for (api, path, expected) in [
+            ("openai-responses", "v1", true),
+            ("openai-completions", "v1", true),
+            ("anthropic-messages", "v1/messages", false),
+            ("google-generative-ai", "v1", false),
+        ] {
+            let endpoint = format!("http://127.0.0.1:1234/{path}");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+                    "api":api, "baseUrl":endpoint, "models":[{"id":"a"}]
+                }}}))
+                .unwrap();
+            args.provider = args.model_profiles.provider("fixture").unwrap();
+            args.model = "a".into();
+            args.endpoint = endpoint;
+            args.api_key = Some("fixture".into());
+            let model = model_client(&args, false, false).unwrap();
+            assert_eq!(model.strict_policy.is_some(), expected, "{api}");
+        }
+    }
 
     struct InlineCommand;
     impl pi_rs::Extension for InlineCommand {

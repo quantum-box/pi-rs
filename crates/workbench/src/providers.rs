@@ -454,6 +454,48 @@ impl Deferred {
 }
 
 impl Client {
+    pub(super) fn uses_final_strict_policy(&self) -> bool {
+        match self {
+            Self::OpenAi(_) | Self::Ollama(_) => true,
+            Self::Deferred(client) => matches!(
+                client.adapter,
+                Adapter::OpenAiResponses | Adapter::ChatCompletions
+            ),
+            _ => false,
+        }
+    }
+
+    pub(super) async fn with_final_strict_support(self, supported: bool) -> Result<Self> {
+        Ok(match self {
+            Self::Ollama(client) => Self::Ollama(client.with_strict_tool_support(supported)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_strict_tool_support(supported)),
+            Self::Deferred(client)
+                if matches!(
+                    client.adapter,
+                    Adapter::OpenAiResponses | Adapter::ChatCompletions
+                ) =>
+            {
+                return Box::pin(client.resolve().await?.with_final_strict_support(supported))
+                    .await;
+            }
+            other => other,
+        })
+    }
+
+    pub fn supports_prepared_tool_dispatch(&self) -> bool {
+        match self {
+            Self::OpenAi(_) | Self::Ollama(_) | Self::Google(_) | Self::Anthropic(_) => true,
+            Self::Deferred(client) => matches!(
+                client.adapter,
+                Adapter::OpenAiResponses
+                    | Adapter::ChatCompletions
+                    | Adapter::Google
+                    | Adapter::Anthropic
+            ),
+            _ => false,
+        }
+    }
+
     /// Resolve dynamic credentials and request headers once before deciding
     /// which affinity defaults are actually needed.
     pub(super) async fn resolve_affinity_headers(&self) -> Result<(Self, HeaderMap)> {
@@ -781,6 +823,84 @@ impl Client {
         }
     }
 
+    pub async fn prepare_tool_dispatch_with_headers(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+        defaults: &HeaderMap,
+        workbench_routing: bool,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch>>> {
+        match self {
+            Self::Anthropic(client) => {
+                let client = if context.summary {
+                    client.clone().without_cache()
+                } else {
+                    client.clone().with_default_headers(defaults)
+                };
+                Ok(Some(client.prepare_bound_tool_dispatch(
+                    request,
+                    declarations,
+                    context,
+                )?))
+            }
+            Self::Ollama(client) => {
+                let client = if context.summary {
+                    client.clone()
+                } else {
+                    client.clone().with_default_headers(defaults)
+                };
+                Ok(Some(client.prepare_bound_tool_dispatch(
+                    request,
+                    declarations,
+                    context,
+                )?))
+            }
+            Self::Google(client) => Ok(Some(client.prepare_bound_tool_dispatch(
+                request,
+                declarations,
+                context,
+            )?)),
+            Self::OpenAi(client) => {
+                let client = client.clone().with_default_headers(defaults);
+                let client = if workbench_routing {
+                    client.with_session_affinity_format(
+                        pi_rs::openai::SessionAffinityFormat::Disabled,
+                    )
+                } else {
+                    client
+                };
+                Ok(Some(client.prepare_bound_tool_dispatch(
+                    request,
+                    declarations,
+                    context,
+                )?))
+            }
+            Self::Deferred(client)
+                if matches!(
+                    client.adapter,
+                    Adapter::OpenAiResponses
+                        | Adapter::ChatCompletions
+                        | Adapter::Google
+                        | Adapter::Anthropic
+                ) =>
+            {
+                Box::pin(client.resolve().await?.prepare_tool_dispatch_with_headers(
+                    request,
+                    declarations,
+                    context,
+                    defaults,
+                    workbench_routing,
+                ))
+                .await
+            }
+            _ => {
+                pi_rs::validate_legacy_tool_declarations(request, declarations)?;
+                Ok(None)
+            }
+        }
+    }
+
     pub fn aliases(&self) -> Vec<(String, String)> {
         match self {
             Self::PiMessages(client) => client.aliases(),
@@ -960,7 +1080,16 @@ impl Client {
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
                 let retention = cache_retention(supports_long);
+                let strict = args
+                    .model_profiles
+                    .anthropic_strict_tool_support(&args.provider, metadata.as_ref());
                 let mut client = client
+                    .with_strict_tool_support(strict)
+                    .with_strict_tool_models(args.model_profiles.anthropic_strict_tool_models(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    ))
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
                         args.settings.value().get("thinkingBudgets").cloned(),
@@ -1047,8 +1176,59 @@ impl Client {
                     } else {
                         None
                     };
+                let (strict_default, strict_models) = args
+                    .model_profiles
+                    .google_strict_tool_policy(&args.provider);
+                // The final model still dispatches on the selected client's route.
+                let selected_endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
+                let same_route = |id: &str| {
+                    args.model_profiles.model_adapter(&args.provider, id) == Adapter::Google
+                        && args.model_endpoint_for(&args.provider, Some(id)) == selected_endpoint
+                };
+                let unknown_route = args.provider.adapter() == Adapter::Google
+                    && args.model_endpoint_for(&args.provider, None) == selected_endpoint;
+                let configured_models: std::collections::BTreeSet<String> = args
+                    .model_profiles
+                    .model_ids(&args.provider)
+                    .into_iter()
+                    .collect();
+                let mut route_models = configured_models.clone();
+                route_models.extend(strict_models.keys().cloned());
+                let mut route_names = route_models.clone();
+                for id in &route_models {
+                    let canonical = id.strip_prefix("models/").unwrap_or(id);
+                    route_names.insert(canonical.to_owned());
+                    route_names.insert(format!("models/{canonical}"));
+                }
+                let routes = route_names
+                    .into_iter()
+                    .map(|id| {
+                        let canonical = id.strip_prefix("models/").unwrap_or(&id);
+                        let alias = if id == canonical {
+                            format!("models/{canonical}")
+                        } else {
+                            canonical.to_owned()
+                        };
+                        // A spelling without its own profile cannot bypass an explicit route
+                        // for the same wire model.
+                        let inherited_route_safe = configured_models.contains(&id)
+                            || !configured_models.contains(&alias)
+                            || same_route(&alias);
+                        // The adapter falls back to a canonical model-specific override;
+                        // that override must also belong to this route.
+                        let inherited_override_safe = id == canonical
+                            || strict_models.contains_key(&id)
+                            || !strict_models.contains_key(canonical)
+                            || same_route(canonical);
+                        let allowed =
+                            same_route(&id) && inherited_route_safe && inherited_override_safe;
+                        (id, allowed)
+                    })
+                    .collect();
                 Self::Google(
                     client
+                        .with_strict_tool_policy(strict_default, strict_models)
+                        .with_strict_tool_routes(unknown_route, routes)
                         .with_thinking(mapped.as_deref().or(selected))
                         .with_disabled_thinking_fallback(fallback.as_deref())
                         .with_reasoning_support(metadata.as_ref().and_then(|model| model.reasoning))
@@ -1097,6 +1277,10 @@ impl Client {
                 let client = client
                     .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
+                    .with_strict_tool_support(
+                        args.model_profiles
+                            .responses_strict_tool_support(&args.provider, metadata.as_ref()),
+                    )
                     .with_prompt_cache_key_enabled(
                         args.model_profiles
                             .responses_prompt_cache_key_enabled(&args.provider, metadata.as_ref()),
@@ -1207,8 +1391,112 @@ impl Client {
     }
 }
 
+/// Route declaration-aware streams through the same request-bound decisions as
+/// prepared dispatch, retaining the legacy fallback for unsupported adapters.
+pub(super) async fn stream_with_declarations(
+    model: &dyn Model,
+    request: ModelRequest,
+    declarations: &[pi_rs::ToolDeclaration],
+    context: pi_rs::ToolDispatchContext,
+) -> Result<pi_rs::DetailedModelStream> {
+    if let Some(prepared) = model
+        .prepare_tool_dispatch(&request, declarations, &context)
+        .await?
+    {
+        pi_rs::validate_prepared_tool_dispatch(
+            prepared.as_ref(),
+            &context,
+            &request,
+            declarations,
+        )?;
+        if prepared.effective_tools().iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
+        prepared.dispatch().await
+    } else if context.summary {
+        pi_rs::validate_legacy_tool_declarations(&request, declarations)?;
+        model
+            .stream_detailed_for_summary(context.request_id, context.session_id, request.clone())
+            .await
+    } else {
+        pi_rs::validate_legacy_tool_declarations(&request, declarations)?;
+        model
+            .stream_detailed_in_session_with_identity(
+                context.request_id,
+                context.session_id,
+                &context.external_id,
+                request.clone(),
+            )
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for Client {
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: external_id.into(),
+                summary: false,
+            },
+        )
+        .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+    ) -> Result<pi_rs::DetailedModelStream> {
+        stream_with_declarations(
+            self,
+            request,
+            declarations,
+            pi_rs::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: session_id.to_string(),
+                summary: true,
+            },
+        )
+        .await
+    }
+
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch + 'a>>> {
+        self.prepare_tool_dispatch_with_headers(
+            request,
+            declarations,
+            context,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+    }
+
     fn context_identity(&self) -> Option<String> {
         match self {
             Self::Ollama(c) => c.context_identity(),
@@ -1346,6 +1634,1806 @@ impl Model for Client {
 mod contention_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn final_strict_policy_only_applies_to_openai_adapters() {
+        let endpoint = "http://127.0.0.1:1234/v1";
+        for (adapter, expected) in [
+            (Adapter::OpenAiResponses, true),
+            (Adapter::ChatCompletions, true),
+            (Adapter::Anthropic, false),
+            (Adapter::Google, false),
+            (Adapter::Bedrock, false),
+            (Adapter::PiMessages, false),
+        ] {
+            let provider = Provider::Custom {
+                id: Arc::from("fixture"),
+                adapter,
+            };
+            let client =
+                Client::deferred(provider, adapter, endpoint, None, RequestHeaders::default());
+            assert_eq!(client.uses_final_strict_policy(), expected, "{adapter:?}");
+        }
+        assert!(
+            !Client::Anthropic(
+                Anthropic::new("http://127.0.0.1:1234/v1/messages", "fixture").unwrap()
+            )
+            .uses_final_strict_policy()
+        );
+        assert!(
+            !Client::Google(pi_rs::google::Google::new(endpoint, "fixture").unwrap())
+                .uses_final_strict_policy()
+        );
+        assert!(
+            Client::Ollama(Ollama::new(endpoint, Some("fixture".into())).unwrap())
+                .uses_final_strict_policy()
+        );
+        assert!(
+            Client::OpenAi(
+                pi_rs::openai::OpenAiResponses::new_api(endpoint, "fixture".into()).unwrap()
+            )
+            .uses_final_strict_policy()
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_rewrite_uses_explicit_endpoint_for_both_models() {
+        use clap::Parser;
+        let endpoint = "http://127.0.0.1:1234/v1/messages";
+        for deferred in [false, true] {
+            for (selected, rewritten, strict) in [("a", "b", false), ("b", "a", true)] {
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                    "api":"anthropic-messages", "baseUrl":"http://127.0.0.1:1235/v1/messages",
+                    "models":[
+                        {"id":"a", "baseUrl":"http://127.0.0.1:1236/v1/messages", "compat":{"supportsStrictTools":true}},
+                        {"id":"b", "baseUrl":"http://127.0.0.1:1237/v1/messages", "compat":{"supportsStrictTools":false}}
+                    ]
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("test").unwrap();
+                args.model = selected.into();
+                args.endpoint = endpoint.into();
+                args.endpoint_explicit = true;
+                args.initial_connection = Some((args.provider.clone(), endpoint.into()));
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Anthropic,
+                        endpoint,
+                        Some(Credential::Literal("fixture".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
+                }
+                .with_context_probes(false)
+                .with_model_options(&args, false)
+                .unwrap();
+                let spec = pi_rs::ToolSpec {
+                    name: "t".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                };
+                let request = ModelRequest {
+                    model: rewritten.into(),
+                    messages: vec![],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 1,
+                };
+                let declaration = pi_rs::ToolDeclaration {
+                    spec,
+                    constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                        strict: pi_rs::StrictToolPolicy::Prefer,
+                    }),
+                };
+                let context = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                let prepared = client
+                    .prepare_tool_dispatch(&request, &[declaration], &context)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    matches!(
+                        prepared.effective_tools()[0].sampling,
+                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                    ),
+                    strict,
+                    "deferred={deferred}, {selected} -> {rewritten}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_disabled_capability_preserves_workbench_context_fingerprint() {
+        use clap::Parser;
+        let endpoint = "http://127.0.0.1:1234/v1/messages";
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+            "api":"anthropic-messages","baseUrl":endpoint,"compat":{"supportsStrictTools":false},"models":[{"id":"known"}]
+        }}})).unwrap();
+        args.provider = args.model_profiles.provider("test").unwrap();
+        args.model = "selected-unknown".into();
+        let base = Anthropic::new(endpoint, "fixture")
+            .unwrap()
+            .with_context_probe(false);
+        let legacy = Client::Anthropic(
+            base.clone()
+                .with_thinking(args.provider_thinking())
+                .with_thinking_budget_settings(
+                    args.settings.value().get("thinkingBudgets").cloned(),
+                )
+                .with_cache_retention(cache_retention(true), true),
+        );
+        let current = Client::Anthropic(base)
+            .with_model_options(&args, false)
+            .unwrap();
+        assert!(legacy.context_identity().is_some());
+        assert_eq!(current.context_identity(), legacy.context_identity());
+        let wrap = |client| super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
+            client,
+            block_images: false,
+            supports_images: None,
+            session_affinity: &[],
+            price: None,
+        };
+        assert_eq!(
+            wrap(current).context_identity(),
+            wrap(legacy).context_identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_selected_unknown_uses_provider_default() {
+        use clap::Parser;
+        for (setting, supported) in [(None, false), (Some(false), false), (Some(true), true)] {
+            for deferred in [false, true] {
+                let endpoint = "http://127.0.0.1:1234/v1/messages";
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                    "api":"anthropic-messages", "baseUrl":endpoint, "compat":{"supportsStrictTools":setting}, "models":[{"id":"catalogued"}],
+                    "modelOverrides":{"another-unknown":{"name":"partial override"}}
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("test").unwrap();
+                args.model = "selected-unknown".into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Anthropic,
+                        endpoint,
+                        Some(Credential::Literal("fixture".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
+                };
+                let client = client
+                    .with_context_probes(false)
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let spec = pi_rs::ToolSpec {
+                    name: "lookup".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                };
+                let mut request = ModelRequest {
+                    model: args.model.clone(),
+                    messages: vec![pi_rs::Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 16,
+                };
+                let context = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::nil(),
+                    session_id: uuid::Uuid::nil(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                for policy in [
+                    pi_rs::StrictToolPolicy::Prefer,
+                    pi_rs::StrictToolPolicy::Require,
+                ] {
+                    let declaration = pi_rs::ToolDeclaration {
+                        spec: spec.clone(),
+                        constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                            strict: policy,
+                        }),
+                    };
+                    request.model = "selected-unknown".into();
+                    let result = client
+                        .prepare_tool_dispatch(
+                            &request,
+                            std::slice::from_ref(&declaration),
+                            &context,
+                        )
+                        .await;
+                    if !supported && policy == pi_rs::StrictToolPolicy::Require {
+                        assert!(result.is_err());
+                    } else {
+                        let prepared = result.unwrap().unwrap();
+                        pi_rs::validate_prepared_tool_dispatch(
+                            prepared.as_ref(),
+                            &context,
+                            &request,
+                            std::slice::from_ref(&declaration),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            matches!(
+                                prepared.effective_tools()[0].sampling,
+                                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                            ),
+                            supported
+                        );
+                    }
+                    request.model = "another-unknown".into();
+                    assert!(
+                        client
+                            .prepare_tool_dispatch(&request, &[declaration], &context)
+                            .await
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("cannot be resolved")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_resolves_model_rewrites_in_both_directions() {
+        use clap::Parser;
+        let endpoint = "http://127.0.0.1:1234/v1/messages";
+        for (configured, rewritten, supported) in
+            [("strict", "loose", true), ("loose", "strict", false)]
+        {
+            for deferred in [false, true] {
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles =
+                    super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                        "api":"anthropic-messages", "baseUrl":endpoint, "models":[
+                            {"id":"strict","compat":{"supportsStrictTools":true}},
+                            {"id":"loose","compat":{"supportsStrictTools":false}},
+                            {"id":"other-route","baseUrl":"http://127.0.0.1:1235/v1/messages","compat":{"supportsStrictTools":true}}]
+                    }}}))
+                    .unwrap();
+                args.provider = args.model_profiles.provider("test").unwrap();
+                args.model = configured.into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Anthropic,
+                        endpoint,
+                        Some(Credential::Literal("fixture".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
+                }
+                .with_context_probes(false)
+                .with_model_options(&args, false)
+                .unwrap();
+                let model = super::super::image_policy::WorkbenchModel {
+                    strict_policy: None,
+                    client,
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let spec = pi_rs::ToolSpec {
+                    name: "lookup".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                };
+                let mut request = ModelRequest {
+                    model: configured.into(),
+                    messages: vec![pi_rs::Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 16,
+                };
+                for summary in [false, true] {
+                    let context = pi_rs::ToolDispatchContext {
+                        request_id: uuid::Uuid::nil(),
+                        session_id: uuid::Uuid::nil(),
+                        external_id: "s".into(),
+                        summary,
+                    };
+                    for policy in [
+                        pi_rs::StrictToolPolicy::Prefer,
+                        pi_rs::StrictToolPolicy::Require,
+                    ] {
+                        let declaration = pi_rs::ToolDeclaration {
+                            spec: spec.clone(),
+                            constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                                strict: policy,
+                            }),
+                        };
+                        request.model = configured.into();
+                        let original = model
+                            .prepare_tool_dispatch(
+                                &request,
+                                std::slice::from_ref(&declaration),
+                                &context,
+                            )
+                            .await;
+                        if !supported && policy == pi_rs::StrictToolPolicy::Require {
+                            assert!(original.is_err());
+                        } else {
+                            let prepared = original.unwrap().unwrap();
+                            assert_eq!(
+                                matches!(
+                                    prepared.effective_tools()[0].sampling,
+                                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                ),
+                                supported
+                            );
+                        }
+                        // The final model determines the frozen sampling decision.
+                        request.model = rewritten.into();
+                        let rewritten_result = model
+                            .prepare_tool_dispatch(
+                                &request,
+                                std::slice::from_ref(&declaration),
+                                &context,
+                            )
+                            .await;
+                        if supported && policy == pi_rs::StrictToolPolicy::Require {
+                            assert!(rewritten_result.is_err());
+                        } else {
+                            let prepared = rewritten_result.unwrap().unwrap();
+                            pi_rs::validate_prepared_tool_dispatch(
+                                prepared.as_ref(),
+                                &context,
+                                &request,
+                                std::slice::from_ref(&declaration),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                matches!(
+                                    prepared.effective_tools()[0].sampling,
+                                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                ),
+                                !supported
+                            );
+                            assert_eq!(prepared.reservation_request().model, rewritten);
+                        }
+                        for unresolved in ["unknown", "other-route"] {
+                            request.model = unresolved.into();
+                            let error = model
+                                .prepare_tool_dispatch(
+                                    &request,
+                                    std::slice::from_ref(&declaration),
+                                    &context,
+                                )
+                                .await
+                                .err()
+                                .expect("unresolved model must fail closed");
+                            assert!(error.to_string().contains("cannot be resolved"), "{error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_dispatch_preserves_config_wire_and_routing() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        for (deferred, summary, direct) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|n| n.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/v1/messages");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"anthropic-messages","baseUrl":endpoint,"models":[{"id":"m-base","compat":{"supportsStrictTools":false}},{"id":"m","compat":{"supportsStrictTools":true}}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m-base".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::Anthropic,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::for_test("x-configured", "configured"),
+                )
+            } else {
+                Client::Anthropic(Anthropic::new(&endpoint, "fixture").unwrap().with_headers({
+                    let mut h = HeaderMap::new();
+                    h.insert("x-configured", "configured".parse().unwrap());
+                    h
+                }))
+            }
+            .with_context_probes(false)
+            .with_model_options(&args, false)
+            .unwrap();
+            let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
+                client: client.clone(),
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let decl = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: pi_rs::StrictToolPolicy::Require,
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::nil(),
+                session_id: uuid::Uuid::nil(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected: &dyn Model = if direct { &client } else { &model };
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&decl), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            pi_rs::validate_prepared_tool_dispatch(
+                prepared.as_ref(),
+                &context,
+                &req,
+                std::slice::from_ref(&decl),
+            )
+            .unwrap();
+            assert!(matches!(
+                prepared.effective_tools()[0].sampling,
+                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+            ));
+            let reserved = prepared.reservation_request().tools[0].parameters.clone();
+            let _ = prepared.dispatch().await;
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(body["model"], "m");
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(body["tools"][0]["input_schema"], reserved);
+            assert!(headers.contains("x-configured: configured"));
+            assert_eq!(
+                headers.contains("session-id: session-fixture"),
+                !summary && !direct
+            );
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_unknown_capability_falls_back_or_fails() {
+        let client =
+            Client::Anthropic(Anthropic::new("http://127.0.0.1:1234/v1/messages", "key").unwrap());
+        let spec = pi_rs::ToolSpec {
+            name: "x".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "unknown".into(),
+            messages: vec![pi_rs::Message::User {
+                content: "hi".into(),
+            }],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        for (policy, ok) in [
+            (pi_rs::StrictToolPolicy::Prefer, true),
+            (pi_rs::StrictToolPolicy::Require, false),
+        ] {
+            let decl = pi_rs::ToolDeclaration {
+                spec: spec.clone(),
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema { strict: policy }),
+            };
+            let result = client
+                .prepare_tool_dispatch(&request, &[decl], &context)
+                .await;
+            assert_eq!(result.is_ok(), ok);
+            if let Ok(Some(prepared)) = result {
+                assert!(matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::Unconstrained
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn google_strict_rewrites_require_matching_effective_route() {
+        use clap::Parser;
+        let route_a = "http://127.0.0.1:9876/v1beta";
+        let route_b = "http://127.0.0.1:9877/v1beta";
+        for deferred in [false, true] {
+            for explicit in [false, true] {
+                for (selected, other) in [("a", "b"), ("b", "a")] {
+                    let mut args = super::super::Cli::parse_from(["pi"]);
+                    args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+                        "api":"google-generative-ai", "baseUrl":route_a,
+                        "compat":{"supportsStrictMode":true},
+                        "models":[
+                            {"id":"a", "baseUrl":route_a, "compat":{"supportsStrictMode":false}},
+                            {"id":"b", "baseUrl":route_b, "compat":{"supportsStrictMode":true}},
+                            {"id":"b-default", "baseUrl":route_b},
+                            {"id":"models/c", "baseUrl":route_b},
+                            {"id":"chat", "api":"openai-completions", "baseUrl":route_a, "compat":{"supportsStrictMode":true}}
+                        ],
+                        "modelOverrides":{
+                            "unknown-partial":{"reasoning":false},
+                            "models/b-default":{"compat":{"supportsStrictMode":true}}
+                        }
+                    }}})).unwrap();
+                    args.provider = args.model_profiles.provider("fixture").unwrap();
+                    args.model = selected.into();
+                    args.endpoint = route_a.into();
+                    if explicit {
+                        args.endpoint_explicit = true;
+                        let endpoint = if selected == "b" { route_b } else { route_a };
+                        args.initial_connection = Some((args.provider.clone(), endpoint.into()));
+                    }
+                    let actual = args
+                        .model_endpoint_for(&args.provider, Some(selected))
+                        .to_owned();
+                    let client = if deferred {
+                        Client::deferred(
+                            args.provider.clone(),
+                            Adapter::Google,
+                            &actual,
+                            Some(Credential::Literal("key".into())),
+                            RequestHeaders::default(),
+                        )
+                    } else {
+                        Client::Google(pi_rs::google::Google::new(&actual, "key").unwrap())
+                    }
+                    .with_model_options(&args, false)
+                    .unwrap()
+                    .with_context_probes(false);
+                    let model = super::super::image_policy::WorkbenchModel {
+                        strict_policy: None,
+                        client,
+                        block_images: false,
+                        supports_images: None,
+                        session_affinity: &[],
+                        price: None,
+                    };
+                    let spec = pi_rs::ToolSpec {
+                        name: "t".into(),
+                        description: "".into(),
+                        parameters: json!({"type":"object"}),
+                    };
+                    for (target, allowed, strict) in [
+                        (selected, true, selected == "b"),
+                        (other, explicit, other == "b"),
+                        ("chat", false, false),
+                        ("unknown-partial", explicit || selected == "a", true),
+                        ("gemini-3-unknown", explicit || selected == "a", true),
+                        ("models/a", explicit || selected == "a", false),
+                        ("models/b", explicit, true),
+                        ("models/b-default", explicit, true),
+                        ("c", explicit, true),
+                    ] {
+                        let request = ModelRequest {
+                            model: target.into(),
+                            messages: vec![],
+                            tools: vec![spec.clone()],
+                            max_output_tokens: 10,
+                        };
+                        let context = pi_rs::ToolDispatchContext {
+                            request_id: uuid::Uuid::new_v4(),
+                            session_id: uuid::Uuid::new_v4(),
+                            external_id: "s".into(),
+                            summary: false,
+                        };
+                        let bound = model.prepare_context(&request).await.unwrap().unwrap();
+                        for policy in [
+                            pi_rs::StrictToolPolicy::Prefer,
+                            pi_rs::StrictToolPolicy::Require,
+                        ] {
+                            let decl = pi_rs::ToolDeclaration {
+                                spec: spec.clone(),
+                                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                                    strict: policy,
+                                }),
+                            };
+                            let result = bound
+                                .prepare_tool_dispatch(&request, &[decl], &context)
+                                .await;
+                            if !allowed {
+                                let error = result.err().expect("different route must fail closed");
+                                assert!(
+                                    error.to_string().contains("final request model and route")
+                                );
+                            } else if !strict && matches!(policy, pi_rs::StrictToolPolicy::Require)
+                            {
+                                assert!(result.is_err());
+                            } else {
+                                let prepared = result.unwrap().unwrap();
+                                assert_eq!(
+                                    matches!(
+                                        prepared.effective_tools()[0].sampling,
+                                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                    ),
+                                    strict,
+                                    "{selected}->{target} explicit={explicit} deferred={deferred}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn google_before_request_rewrite_resolves_final_model_strict_policy() {
+        use clap::Parser;
+        use pi_rs::Extension;
+        struct Rewrite(&'static str);
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite-model"
+            }
+            async fn before_request(
+                &self,
+                request: &mut pi_rs::ContextRequest<'_>,
+                _: pi_rs::RequestPurpose,
+                _: Option<&pi_rs::ExtensionState>,
+            ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
+                request.model = self.0.into();
+                Ok(pi_rs::ContextChange::Changed)
+            }
+        }
+        for deferred in [false, true] {
+            for (original, final_model, overrides, expected) in [
+                ("gemini-2-test", "gemini-3-test", json!({}), true),
+                ("gemini-3-test", "gemini-2-test", json!({}), false),
+                (
+                    "gemini-2-test",
+                    "gemini-3-test",
+                    json!({"gemini-2-test":{"compat":{"supportsStrictMode":true}}, "gemini-3-test":{"compat":{"supportsStrictMode":false}}}),
+                    false,
+                ),
+                (
+                    "gemini-3-test",
+                    "gemini-2-test",
+                    json!({"gemini-2-test":{"compat":{"supportsStrictMode":true}}, "gemini-3-test":{"compat":{"supportsStrictMode":false}}}),
+                    true,
+                ),
+                (
+                    "gemini-2-test",
+                    "gemini-3-test",
+                    json!({"gemini-2-test":{"compat":{"supportsStrictMode":false}}}),
+                    true,
+                ),
+                (
+                    "gemini-3-test",
+                    "gemini-2-test",
+                    json!({"gemini-3-test":{"compat":{"supportsStrictMode":true}}}),
+                    false,
+                ),
+            ] {
+                let endpoint = "http://localhost:9876";
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"together":{
+                    "api":"openai-completions", "baseUrl":endpoint,
+                    "models":[{"id":"gemini-2-test", "api":"google-generative-ai", "baseUrl":endpoint}, {"id":"gemini-3-test", "api":"google-generative-ai", "baseUrl":endpoint}],
+                    "modelOverrides":overrides
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("together").unwrap();
+                args.model = original.into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Google,
+                        endpoint,
+                        Some(Credential::Literal("key".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Google(pi_rs::google::Google::new(endpoint, "key").unwrap())
+                }
+                .with_model_options(&args, false)
+                .unwrap()
+                .with_context_probes(false);
+                let model = super::super::image_policy::WorkbenchModel {
+                    strict_policy: None,
+                    client,
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let spec = pi_rs::ToolSpec {
+                    name: "t".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                };
+                let mut request = ModelRequest {
+                    model: original.into(),
+                    messages: vec![],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 10,
+                };
+                Rewrite(final_model)
+                    .before_request(
+                        &mut pi_rs::ContextRequest::new(&mut request),
+                        pi_rs::RequestPurpose::Turn,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let ctx = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                let bound_model = model.prepare_context(&request).await.unwrap().unwrap();
+                for policy in [
+                    pi_rs::StrictToolPolicy::Prefer,
+                    pi_rs::StrictToolPolicy::Require,
+                ] {
+                    let decl = pi_rs::ToolDeclaration {
+                        spec: spec.clone(),
+                        constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                            strict: policy,
+                        }),
+                    };
+                    let result = bound_model
+                        .prepare_tool_dispatch(&request, &[decl], &ctx)
+                        .await;
+                    if !expected && matches!(policy, pi_rs::StrictToolPolicy::Require) {
+                        assert!(
+                            result.is_err(),
+                            "required strict must fail: {original} -> {final_model}, deferred={deferred}"
+                        );
+                    } else {
+                        let prepared = result.unwrap().unwrap();
+                        assert_eq!(
+                            matches!(
+                                prepared.effective_tools()[0].sampling,
+                                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                            ),
+                            expected,
+                            "{original} -> {final_model}, deferred={deferred}"
+                        );
+                        assert_eq!(prepared.dispatch_request().model, final_model);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn google_strict_support_uses_only_explicit_overrides_in_direct_and_deferred_clients() {
+        use clap::Parser;
+        for deferred in [false, true] {
+            for (provider_compat, model_compat, override_compat, expected) in [
+                (json!({}), json!({}), json!({}), true),
+                (
+                    json!({"supportsStrictMode":false}),
+                    json!({}),
+                    json!({}),
+                    false,
+                ),
+                (
+                    json!({"supportsStrictMode":false}),
+                    json!({"supportsStrictMode":true}),
+                    json!({}),
+                    true,
+                ),
+                (
+                    json!({"supportsStrictMode":true}),
+                    json!({"supportsStrictMode":true}),
+                    json!({"supportsStrictMode":false}),
+                    false,
+                ),
+            ] {
+                let endpoint = "http://localhost:9876";
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"together":{
+                    "api":"openai-completions", "baseUrl":endpoint, "compat":provider_compat,
+                    "models":[{"id":"gemini-3-test", "api":"google-generative-ai", "baseUrl":endpoint, "compat":model_compat}],
+                    "modelOverrides":{"gemini-3-test":{"compat":override_compat}}
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("together").unwrap();
+                args.model = "gemini-3-test".into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Google,
+                        endpoint,
+                        Some(Credential::Literal("key".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Google(pi_rs::google::Google::new(endpoint, "key").unwrap())
+                }
+                .with_model_options(&args, false)
+                .unwrap();
+                let spec = pi_rs::ToolSpec {
+                    name: "t".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                };
+                let request = ModelRequest {
+                    model: args.model.clone(),
+                    messages: vec![],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 10,
+                };
+                let declaration = pi_rs::ToolDeclaration {
+                    spec,
+                    constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                        strict: pi_rs::StrictToolPolicy::Prefer,
+                    }),
+                };
+                let context = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                let prepared = client
+                    .prepare_tool_dispatch(&request, &[declaration], &context)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    matches!(
+                        prepared.effective_tools()[0].sampling,
+                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                    ),
+                    expected,
+                    "deferred={deferred}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_responses_dispatch_preserves_capability_and_session_policy() {
+        use clap::Parser;
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        for (deferred, summary, direct) in [false, true].into_iter().flat_map(|deferred| {
+            [false, true].into_iter().flat_map(move |summary| {
+                [false, true]
+                    .into_iter()
+                    .map(move |direct| (deferred, summary, direct))
+            })
+        }) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/responses");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"openai-responses","baseUrl":endpoint,"compat":{"supportsStrictMode":true},"models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::OpenAiResponses,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap(),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let direct_client = client.clone();
+            let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
+                client,
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let declaration = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: pi_rs::StrictToolPolicy::Require,
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected = if direct {
+                None
+            } else {
+                model.prepare_context(&req).await.unwrap()
+            };
+            let selected: &dyn Model = selected.as_deref().unwrap_or(&direct_client);
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                prepared
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &req,
+                        prepared.dispatch_request(),
+                        std::slice::from_ref(&declaration)
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                prepared.decision_snapshot().request_sha256()
+                    != prepared.decision_snapshot().dispatch_sha256(),
+                !direct
+            );
+            assert!(matches!(
+                prepared.effective_tools()[0].sampling,
+                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+            ));
+            let _ = prepared.dispatch().await;
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session-fixture")
+            );
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: session-fixture"),
+                !summary
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_chat_dispatch_preserves_capability_cache_and_session_policy() {
+        use clap::Parser;
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        for (deferred, summary, path) in [false, true].into_iter().flat_map(|deferred| {
+            [false, true].into_iter().flat_map(move |summary| {
+                [0, 1, 2]
+                    .into_iter()
+                    .map(move |path| (deferred, summary, path))
+            })
+        }) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/v1/chat/completions");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"openai-completions","baseUrl":endpoint,"compat":{"supportsStrictMode":true,"promptCacheKeyMode":"enabled","cacheControlFormat":"anthropic","supportsLongCacheRetention":false},"models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::ChatCompletions,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                        .unwrap()
+                        .with_provider("test")
+                        .with_native_probes(false),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let direct_client = client.clone();
+            let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
+                client,
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object", "properties":{"optional":{"type":"string"}}}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let declaration = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: pi_rs::StrictToolPolicy::Require,
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected = if path == 2 {
+                model.prepare_context(&req).await.unwrap()
+            } else {
+                None
+            };
+            let selected: &dyn Model = match path {
+                0 => &direct_client,
+                1 => &model,
+                _ => selected.as_deref().unwrap(),
+            };
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                prepared
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &req,
+                        prepared.dispatch_request(),
+                        std::slice::from_ref(&declaration)
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                prepared.decision_snapshot().request_sha256()
+                    != prepared.decision_snapshot().dispatch_sha256(),
+                path != 0
+            );
+            assert!(matches!(
+                prepared.effective_tools()[0].sampling,
+                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+            ));
+            let expected_schema = prepared.reservation_request().tools[0].parameters.clone();
+            let _ = prepared.dispatch().await;
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(body["tools"][0]["function"]["strict"], true);
+            assert_eq!(body["tools"][0]["function"]["parameters"], expected_schema);
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+            assert!(body.get("prompt_cache_retention").is_none());
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session-fixture")
+            );
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: session-fixture"),
+                !summary && path != 0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn declaration_responses_stream_preserves_dispatch_policy() {
+        use clap::Parser;
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        for (deferred, summary, path, prefer, supported) in
+            [false, true].into_iter().flat_map(|deferred| {
+                [false, true].into_iter().flat_map(move |summary| {
+                    [0, 1, 2].into_iter().flat_map(move |path| {
+                        [false, true].into_iter().flat_map(move |prefer| {
+                            [false, true]
+                                .into_iter()
+                                .filter(move |supported| *supported || prefer)
+                                .map(move |supported| (deferred, summary, path, prefer, supported))
+                        })
+                    })
+                })
+            })
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/responses");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"openai-responses","baseUrl":endpoint,"compat":{"supportsStrictMode":supported},"models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::OpenAiResponses,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap(),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let direct_client = client.clone();
+            let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
+                client,
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let declaration = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: if prefer {
+                        pi_rs::StrictToolPolicy::Prefer
+                    } else {
+                        pi_rs::StrictToolPolicy::Require
+                    },
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected = if path == 2 {
+                model.prepare_context(&req).await.unwrap()
+            } else {
+                None
+            };
+            let selected: &dyn Model = match path {
+                0 => &direct_client,
+                1 => &model,
+                _ => selected.as_deref().unwrap(),
+            };
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                prepared
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &req,
+                        prepared.dispatch_request(),
+                        std::slice::from_ref(&declaration)
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                prepared.decision_snapshot().request_sha256()
+                    != prepared.decision_snapshot().dispatch_sha256(),
+                path != 0
+            );
+            assert_eq!(
+                matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                ),
+                supported
+            );
+            let result = if summary {
+                selected
+                    .stream_detailed_summary_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            } else {
+                selected
+                    .stream_detailed_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        &context.external_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            };
+            if supported {
+                assert!(
+                    matches!(result, Err(Error::Config(message)) if message.contains("requires prepared dispatch"))
+                );
+                let _ = prepared.dispatch().await;
+            } else {
+                assert!(result.is_err());
+            }
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(
+                body["tools"][0].get("strict").and_then(Value::as_bool),
+                supported.then_some(true)
+            );
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session-fixture")
+            );
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: session-fixture"),
+                !summary
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn declaration_chat_stream_preserves_dispatch_policy() {
+        use clap::Parser;
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        for (deferred, summary, path, prefer, supported) in
+            [false, true].into_iter().flat_map(|deferred| {
+                [false, true].into_iter().flat_map(move |summary| {
+                    [0, 1, 2].into_iter().flat_map(move |path| {
+                        [false, true].into_iter().flat_map(move |prefer| {
+                            [false, true]
+                                .into_iter()
+                                .filter(move |supported| *supported || prefer)
+                                .map(move |supported| (deferred, summary, path, prefer, supported))
+                        })
+                    })
+                })
+            })
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/v1/chat/completions");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"openai-completions","baseUrl":endpoint,"compat":{"supportsStrictMode":supported,"promptCacheKeyMode":"enabled","cacheControlFormat":"anthropic","supportsLongCacheRetention":false},"models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::ChatCompletions,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                        .unwrap()
+                        .with_provider("test")
+                        .with_native_probes(false),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let direct_client = client.clone();
+            let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
+                client,
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object", "properties":{"optional":{"type":"string"}}}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let declaration = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: if prefer {
+                        pi_rs::StrictToolPolicy::Prefer
+                    } else {
+                        pi_rs::StrictToolPolicy::Require
+                    },
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected = if path == 2 {
+                model.prepare_context(&req).await.unwrap()
+            } else {
+                None
+            };
+            let selected: &dyn Model = match path {
+                0 => &direct_client,
+                1 => &model,
+                _ => selected.as_deref().unwrap(),
+            };
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                prepared
+                    .decision_snapshot()
+                    .validate(
+                        &context,
+                        &req,
+                        prepared.dispatch_request(),
+                        std::slice::from_ref(&declaration)
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                prepared.decision_snapshot().request_sha256()
+                    != prepared.decision_snapshot().dispatch_sha256(),
+                path != 0
+            );
+            assert_eq!(
+                matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                ),
+                supported
+            );
+            let expected_schema = prepared.reservation_request().tools[0].parameters.clone();
+            let result = if summary {
+                selected
+                    .stream_detailed_summary_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            } else {
+                selected
+                    .stream_detailed_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        &context.external_id,
+                        req.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+            };
+            if supported {
+                assert!(
+                    matches!(result, Err(Error::Config(message)) if message.contains("requires prepared dispatch"))
+                );
+                let _ = prepared.dispatch().await;
+            } else {
+                assert!(result.is_err());
+            }
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(
+                body["tools"][0]["function"]
+                    .get("strict")
+                    .and_then(Value::as_bool),
+                supported.then_some(true)
+            );
+            assert_eq!(body["tools"][0]["function"]["parameters"], expected_schema);
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+            assert!(body.get("prompt_cache_retention").is_none());
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session-fixture")
+            );
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: session-fixture"),
+                !summary && path != 0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_legacy_preparation_does_not_resolve_credentials() {
+        let client = Client::deferred(
+            Provider::Radius,
+            Adapter::PiMessages,
+            "https://example.invalid/v1/messages",
+            None,
+            RequestHeaders::default(),
+        );
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        assert!(
+            client
+                .prepare_tool_dispatch(&request, &[], &context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
+            client,
+            block_images: false,
+            supports_images: None,
+            session_affinity: &["x-session-affinity"],
+            price: None,
+        };
+        assert!(
+            model
+                .prepare_tool_dispatch(&request, &[], &context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn deferred_radius_connect_waits_for_shared_credentials_and_can_cancel() {
@@ -1925,6 +4013,7 @@ mod estimation_tests {
             .with_model_options(&args, false)
             .unwrap();
             let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
                 client,
                 block_images: false,
                 supports_images: None,
@@ -2379,6 +4468,7 @@ mod estimation_tests {
             };
             let model = MeasuredFixture {
                 wrapped: super::super::image_policy::WorkbenchModel {
+                    strict_policy: None,
                     client,
                     block_images: false,
                     supports_images: Some(true),
@@ -2519,6 +4609,7 @@ mod estimation_tests {
                 .with_headers(headers),
         );
         let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
             client,
             block_images: false,
             supports_images: Some(true),
@@ -2660,6 +4751,7 @@ mod estimation_tests {
         )
         .with_context_probes(false);
         let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
             client,
             block_images: false,
             supports_images: Some(true),
@@ -3131,5 +5223,592 @@ mod bedrock_tests {
             requests[18]["additionalModelRequestFields"]["thinking"]["budget_tokens"],
             3456
         );
+    }
+}
+
+#[cfg(test)]
+mod final_model_strict_tests {
+    use super::*;
+    use clap::Parser;
+    use std::{
+        io::{Read, Write},
+        sync::Arc,
+    };
+
+    #[tokio::test]
+    async fn final_model_drives_strict_decision_for_resolved_and_deferred_clients() {
+        for api in ["openai-responses", "openai-completions"] {
+            for deferred in [false, true] {
+                for selected in ["yes", "no"] {
+                    for target in ["yes", "no", "unknown"] {
+                        for require in [false, true] {
+                            for prepared_context in [false, true] {
+                                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                                let endpoint = format!(
+                                    "http://{}/v1/{}",
+                                    listener.local_addr().unwrap(),
+                                    if api == "openai-responses" {
+                                        "responses"
+                                    } else {
+                                        "chat/completions"
+                                    }
+                                );
+                                let mut args = super::super::Cli::parse_from(["pi"]);
+                                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+                                    "api":api,"baseUrl":endpoint,"compat":{"supportsStrictMode":true},
+                                    "models":[{"id":"yes","compat":{"supportsStrictMode":true}},{"id":"no","compat":{"supportsStrictMode":false}}]
+                                }}})).unwrap();
+                                args.provider = args.model_profiles.provider("fixture").unwrap();
+                                args.model = selected.into();
+                                let adapter = if api == "openai-responses" {
+                                    Adapter::OpenAiResponses
+                                } else {
+                                    Adapter::ChatCompletions
+                                };
+                                let client = if deferred {
+                                    Client::deferred(
+                                        args.provider.clone(),
+                                        adapter,
+                                        &endpoint,
+                                        Some(Credential::Literal("fixture".into())),
+                                        RequestHeaders::default(),
+                                    )
+                                } else if api == "openai-responses" {
+                                    Client::OpenAi(
+                                        pi_rs::openai::OpenAiResponses::new_api(
+                                            &endpoint,
+                                            "fixture".into(),
+                                        )
+                                        .unwrap(),
+                                    )
+                                } else {
+                                    Client::Ollama(
+                                        pi_rs::ollama::Ollama::new(
+                                            &endpoint,
+                                            Some("fixture".into()),
+                                        )
+                                        .unwrap()
+                                        .with_native_probes(false),
+                                    )
+                                }
+                                .with_model_options(&args, false)
+                                .unwrap();
+                                let model = super::super::image_policy::WorkbenchModel {
+                                    strict_policy: Some(Arc::new(
+                                        super::super::image_policy::FinalStrictPolicy {
+                                            profiles: args.model_profiles.clone(),
+                                            provider: args.provider.clone(),
+                                            selected_model: selected.into(),
+                                            explicit_endpoint: false,
+                                            bound_support: None,
+                                        },
+                                    )),
+                                    client,
+                                    block_images: false,
+                                    supports_images: None,
+                                    session_affinity: &[],
+                                    price: None,
+                                };
+                                let spec = pi_rs::ToolSpec {
+                                    name: "read".into(),
+                                    description: String::new(),
+                                    parameters: json!({"type":"object","properties":{"x":{"type":"string"}}}),
+                                };
+                                let req = ModelRequest {
+                                    model: target.into(),
+                                    messages: vec![pi_rs::Message::User {
+                                        content: "test".into(),
+                                    }],
+                                    tools: vec![spec.clone()],
+                                    max_output_tokens: 10,
+                                };
+                                let declaration = pi_rs::ToolDeclaration {
+                                    spec,
+                                    constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                                        strict: if require {
+                                            pi_rs::StrictToolPolicy::Require
+                                        } else {
+                                            pi_rs::StrictToolPolicy::Prefer
+                                        },
+                                    }),
+                                };
+                                let context = pi_rs::ToolDispatchContext {
+                                    request_id: uuid::Uuid::new_v4(),
+                                    session_id: uuid::Uuid::new_v4(),
+                                    external_id: "fixture".into(),
+                                    summary: false,
+                                };
+                                let prepared_model = if prepared_context {
+                                    model.prepare_context(&req).await.unwrap()
+                                } else {
+                                    None
+                                };
+                                if prepared_context && selected == "yes" && target == "no" {
+                                    let mut other = req.clone();
+                                    other.model = "yes".into();
+                                    let yes = model.prepare_context(&other).await.unwrap().unwrap();
+                                    assert_ne!(
+                                        yes.context_identity(),
+                                        prepared_model.as_ref().unwrap().context_identity()
+                                    );
+                                }
+                                let active: &dyn Model =
+                                    prepared_model.as_deref().unwrap_or(&model);
+                                let result = active
+                                    .prepare_tool_dispatch(
+                                        &req,
+                                        std::slice::from_ref(&declaration),
+                                        &context,
+                                    )
+                                    .await;
+                                let supported = target == "yes";
+                                if require && !supported {
+                                    assert!(
+                                        result.is_err(),
+                                        "{api} {deferred} {selected}->{target}"
+                                    );
+                                    continue;
+                                }
+                                let dispatch = result.unwrap().unwrap();
+                                assert_eq!(
+                                    matches!(
+                                        dispatch.effective_tools()[0].sampling,
+                                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                    ),
+                                    supported
+                                );
+                                let reservation =
+                                    &dispatch.reservation_request().tools[0].parameters;
+                                if supported {
+                                    assert_eq!(reservation["additionalProperties"], false);
+                                } else {
+                                    assert_eq!(*reservation, declaration.spec.parameters);
+                                }
+                                let server = std::thread::spawn(move || {
+                                    let (mut stream, _) = listener.accept().unwrap();
+                                    stream
+                                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                                        .unwrap();
+                                    let mut data = Vec::new();
+                                    let (offset, length) = loop {
+                                        let mut buf = [0; 4096];
+                                        let n = stream.read(&mut buf).unwrap();
+                                        assert!(n > 0);
+                                        data.extend_from_slice(&buf[..n]);
+                                        if let Some(pos) =
+                                            data.windows(4).position(|v| v == b"\r\n\r\n")
+                                        {
+                                            let header = String::from_utf8_lossy(&data[..pos]);
+                                            let length = header
+                                                .lines()
+                                                .find_map(|line| {
+                                                    line.to_ascii_lowercase()
+                                                        .strip_prefix("content-length:")
+                                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                                })
+                                                .unwrap();
+                                            break (pos + 4, length);
+                                        }
+                                    };
+                                    while data.len() < offset + length {
+                                        let mut buf = [0; 4096];
+                                        let n = stream.read(&mut buf).unwrap();
+                                        assert!(n > 0);
+                                        data.extend_from_slice(&buf[..n]);
+                                    }
+                                    let body: serde_json::Value =
+                                        serde_json::from_slice(&data[offset..offset + length])
+                                            .unwrap();
+                                    stream.write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                                    body
+                                });
+                                let _ = dispatch.dispatch().await;
+                                let body = server.join().unwrap();
+                                assert_eq!(body["model"], target);
+                                let tool = if api == "openai-responses" {
+                                    &body["tools"][0]
+                                } else {
+                                    &body["tools"][0]["function"]
+                                };
+                                assert_eq!(
+                                    tool.get("strict").and_then(serde_json::Value::as_bool),
+                                    supported.then_some(true)
+                                );
+                                if supported {
+                                    assert_eq!(tool["parameters"]["additionalProperties"], false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod final_model_hook_tests {
+    use super::*;
+    use clap::Parser;
+    use std::sync::Arc;
+
+    struct RequiredTool;
+    #[async_trait::async_trait]
+    impl pi_rs::Tool for RequiredTool {
+        fn spec(&self) -> pi_rs::ToolSpec {
+            pi_rs::ToolSpec {
+                name: "required".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn constrained_sampling(&self) -> Option<pi_rs::ToolConstraint> {
+            Some(pi_rs::ToolConstraint::JsonSchema {
+                strict: pi_rs::StrictToolPolicy::Require,
+            })
+        }
+        async fn invoke(&self, _: serde_json::Value, _: pi_rs::ToolContext) -> pi_rs::Outcome {
+            panic!("must not dispatch")
+        }
+    }
+    struct Rewrite;
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for Rewrite {
+        fn id(&self) -> &str {
+            "rewrite"
+        }
+        fn tools(&self) -> Vec<Arc<dyn pi_rs::Tool>> {
+            vec![Arc::new(RequiredTool)]
+        }
+        async fn before_request(
+            &self,
+            request: &mut pi_rs::ContextRequest<'_>,
+            _: pi_rs::RequestPurpose,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
+            request.model = "no".into();
+            Ok(pi_rs::ContextChange::Changed)
+        }
+    }
+    struct RewriteTurnOnly {
+        calls: Arc<std::sync::Mutex<Vec<(pi_rs::RequestPurpose, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for RewriteTurnOnly {
+        fn id(&self) -> &str {
+            "rewrite-turn-only"
+        }
+        fn tools(&self) -> Vec<Arc<dyn pi_rs::Tool>> {
+            vec![Arc::new(RequiredTool)]
+        }
+        async fn before_request(
+            &self,
+            request: &mut pi_rs::ContextRequest<'_>,
+            purpose: pi_rs::RequestPurpose,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((purpose, request.model.clone()));
+            if purpose == pi_rs::RequestPurpose::Turn {
+                request.model = "b".into();
+                Ok(pi_rs::ContextChange::Changed)
+            } else {
+                Ok(pi_rs::ContextChange::Unchanged)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_model_hook_compaction_summary_uses_selected_model_then_resumes_turn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for text in ["old conversation summary", "turn answer"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (end, size) = loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let size = std::str::from_utf8(&bytes[..end])
+                            .unwrap()
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, size);
+                    }
+                };
+                while bytes.len() < end + size {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                bodies.push(
+                    serde_json::from_slice::<serde_json::Value>(&bytes[end..end + size]).unwrap(),
+                );
+                let events = [
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":text}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":text}]}}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":1}}}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":endpoint,
+            "models":[{"id":"a","compat":{"supportsStrictMode":false}}, {"id":"b","compat":{"supportsStrictMode":true}}]
+        }}})).unwrap();
+        args.provider = args.model_profiles.provider("fixture").unwrap();
+        args.model = "a".into();
+        let client = Client::OpenAi(
+            pi_rs::openai::OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap(),
+        )
+        .with_model_options(&args, false)
+        .unwrap();
+        let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: Some(Arc::new(super::super::image_policy::FinalStrictPolicy {
+                profiles: args.model_profiles.clone(),
+                provider: args.provider.clone(),
+                selected_model: "a".into(),
+                explicit_endpoint: false,
+                bound_support: None,
+            })),
+            client,
+            block_images: false,
+            supports_images: None,
+            session_affinity: &[],
+            price: None,
+        };
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = pi_rs::Registry::default();
+        registry
+            .register(Arc::new(RewriteTurnOnly {
+                calls: calls.clone(),
+            }))
+            .unwrap();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "a",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits {
+                context_window: Some(4096),
+                output_tokens_per_request: 64,
+                compaction_tokens: Some(pi_rs::CompactionTokens {
+                    reserve_tokens: Some(4096),
+                    keep_recent_tokens: None,
+                }),
+                model_timeout: std::time::Duration::from_secs(5),
+                ..pi_rs::Limits::default()
+            },
+        };
+        let mut seed = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        seed.append_user_with_images("earlier question".into(), vec![], None)
+            .unwrap();
+        let mut records = seed.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records.last().unwrap().version,
+            id: records.len() as u64 + 1,
+            parent: Some(seed.head()),
+            event: pi_rs::Event::Assistant {
+                content: "earlier answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            },
+        });
+        let mut session = pi_rs::Session::from_records(records).unwrap();
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run(
+                &mut session,
+                Some("new question".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .expect("agent timed out")
+        .unwrap();
+        assert_eq!(answer, "turn answer");
+        let bodies = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("loopback timed out")
+            .unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["model"], "a");
+        assert!(
+            bodies[0]
+                .get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+        );
+        assert!(
+            bodies[0]
+                .to_string()
+                .contains("Summarize only this older conversation")
+        );
+        assert_eq!(bodies[1]["model"], "b");
+        assert_eq!(bodies[1]["tools"][0]["name"], "required");
+        assert_eq!(bodies[1]["tools"][0]["strict"], true);
+        assert_eq!(
+            bodies[1]["tools"][0]["parameters"]["additionalProperties"],
+            false
+        );
+        let seen = calls.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|(purpose, model)| *purpose == pi_rs::RequestPurpose::Turn && model == "a")
+        );
+        assert!(
+            seen.iter()
+                .any(|(purpose, model)| *purpose == pi_rs::RequestPurpose::Summary && model == "a")
+        );
+        drop(seen);
+        assert!(session.records().iter().any(|record| matches!(&record.event, pi_rs::Event::Compacted { summary, .. } if summary == "old conversation summary")));
+        let requests: Vec<_> = session
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::ModelRequested {
+                    model,
+                    request_id: Some(id),
+                    ..
+                } => Some((record.id, model.as_str(), *id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].1, "a");
+        assert_eq!(requests[1].1, "b");
+        for (index, (record, model, id)) in requests.iter().enumerate() {
+            let resolved = session
+                .records()
+                .iter()
+                .find_map(|entry| match &entry.event {
+                    pi_rs::Event::ModelFinished {
+                        request_id,
+                        metadata,
+                        ..
+                    } if request_id == id => metadata.resolved_model.as_ref(),
+                    _ => None,
+                })
+                .expect("missing resolved model identity");
+            assert_eq!(resolved.model, *model);
+            let decision = session.recorded_tool_decision(*record).unwrap();
+            if index == 0 {
+                assert!(matches!(decision, pi_rs::RecordedToolDecision::Legacy));
+                continue;
+            }
+            let pi_rs::RecordedToolDecision::Current(snapshot) = decision else {
+                panic!("missing current decision")
+            };
+            assert_eq!(snapshot.context().request_id, *id);
+            assert_eq!(snapshot.context().session_id, session.session_id());
+            assert_eq!(snapshot.context().summary, index == 0);
+            let value = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(
+                value["effective"][0]["sampling"]["type"],
+                "strict_json_schema"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn final_model_hook_rejects_required_downgrade_before_journaling() {
+        for api in ["openai-responses", "openai-completions"] {
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{"api":api,"baseUrl":"http://127.0.0.1:9/v1","models":[{"id":"yes","compat":{"supportsStrictMode":true}},{"id":"no","compat":{"supportsStrictMode":false}}]}}})).unwrap();
+            args.provider = args.model_profiles.provider("fixture").unwrap();
+            args.model = "yes".into();
+            let client = if api == "openai-responses" {
+                Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(
+                        "http://127.0.0.1:9/v1/responses",
+                        "fixture".into(),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(
+                        "http://127.0.0.1:9/v1/chat/completions",
+                        Some("fixture".into()),
+                    )
+                    .unwrap()
+                    .with_native_probes(false),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: Some(Arc::new(super::super::image_policy::FinalStrictPolicy {
+                    profiles: args.model_profiles.clone(),
+                    provider: args.provider.clone(),
+                    selected_model: "yes".into(),
+                    explicit_endpoint: false,
+                    bound_support: None,
+                })),
+                client,
+                block_images: false,
+                supports_images: None,
+                session_affinity: &[],
+                price: None,
+            };
+            let mut registry = pi_rs::Registry::default();
+            registry.register(Arc::new(Rewrite)).unwrap();
+            let agent = pi_rs::Agent {
+                model: &model,
+                model_name: "yes",
+                registry: &registry,
+                system_prompt: "",
+                limits: pi_rs::Limits::default(),
+            };
+            let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let (_, mut input) = tokio::sync::mpsc::channel::<String>(1);
+            let error = agent
+                .run(
+                    &mut session,
+                    Some("hi".into()),
+                    &mut input,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("requires JSON-schema"),
+                "{error}"
+            );
+            assert!(
+                !session
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, pi_rs::Event::ModelRequested { .. }))
+            );
+        }
     }
 }

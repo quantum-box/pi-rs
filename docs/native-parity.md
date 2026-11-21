@@ -381,7 +381,9 @@ The international, China, and individual Qwen Token Plan providers expose the
 pinned Pi model catalogs, regional credentials, per-model reasoning maps, and
 image limits. Their chat-completions requests use Qwen's `enable_thinking`
 switch, with `reasoning_effort` only where the selected model supports it.
-Explicit strict-mode support emits the reference `strict: false` tool setting.
+For models declaring strict-mode support, unconstrained and preferred fallback
+tools use `strict: false`, while successfully prepared strict tools use
+`strict: true` with the transformed schema.
 Loopback CLI coverage does not replace live Token Plan acceptance.
 
 ### Xiaomi MiMo checkpoint
@@ -878,9 +880,18 @@ credentials, queries and fragments; failure messages are generic so these
 reports do not expose configured credentials through connection errors.
 Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
 
-`pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
-default is 300 seconds. Once credential persistence starts, it is allowed to
-finish even if the deadline passes, so its outcome can be reported reliably.
+`pi mcp login NAME` uses the effective HTTP server and OAuth settings from
+the user configuration and the trusted project. `--local` requires a full
+project definition. OAuth can be implicit for an HTTP server without an
+Authorization header or provider authentication. An explicit
+`"oauth": false` disables OAuth and must be changed before signing in.
+
+`--timeout SECONDS` bounds discovery, sign-in, and preparation to save
+(default 300 seconds). Before publishing credentials, login locks the
+configuration files against concurrent pi-rs writers and rechecks the
+selected server's authentication settings. Once credential persistence
+starts, it can finish even if the deadline passes. Login leaves
+`mcp.json` unchanged.
 
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project
@@ -2553,13 +2564,23 @@ and repeated `--scope` options select scopes. Pass `--local` to log in to a
 project-scoped definition.
 `pi mcp logout NAME` removes the saved credentials.
 
-Credentials are written atomically in the user agent directory, with owner-only
-file permissions on Unix. Refresh operations share a process-safe file lock that remains held until a
-blocking write finishes, including when its async caller is cancelled.
-Each successful login receives a new identifier, so old connections cannot load
-credentials from a later login. A failed browser launch preserves the prior
-credentials. Both expiring access tokens and rejected access tokens can refresh
-through the MCP SDK. Credential values are omitted from CLI output.
+Login publishes a single credential file using a synced temporary file and
+atomic replacement inside the user agent directory. A process interrupted
+before replacement leaves the prior credential file readable. After
+replacement, readers see the new credential generation. Unix also syncs the
+containing directory after replacement or logout and uses owner-only
+credential file permissions. On Windows the credential file inherits the
+agent directory's access controls. A power failure can affect filesystem
+durability, and a provider-side token rotation followed by a local failure
+can require signing in again.
+
+Login and refresh hold a process-safe credential lock until a blocking write
+finishes, including when its async caller is cancelled. OAuth requests use
+the authorized resource URL, and the transport checks that its credential
+generation is still current under the same lock when admitting a request.
+A later login or logout applies to new requests and leaves an already
+admitted request running. Both expiring and rejected access tokens can
+refresh through the MCP SDK. CLI output omits credential values.
 
 Local OAuth and MCP fixtures verified dynamic registration, pre-registered
 clients, PKCE verification, rejection of an incorrect callback state,
@@ -3897,6 +3918,109 @@ Loopback checks covered aliases, model overrides, unavailable discovery,
 actual request limits, and updated configuration in a real terminal picker.
 
 ### Compatible model sampling
+
+The core exposes strict tool-schema conversion and a tool declaration type
+matching the current Pi schema subset. The native agent records the actual
+strict-or-fallback decision before dispatch, normalizes a copy of strict tool
+arguments, and records authorized arguments before executing tools. Request
+hooks may change an advertised schema or description. Normalization follows
+the advertised schema, and execution and recovery use the registered tool
+contract. Pending strict calls are polled using the recorded arguments and
+require a stable backend recovery identity. Grammar tool execution remains
+unsupported.
+
+The OpenAI Responses SDK can send explicitly supplied tool declarations with JSON
+Schema constraints when its caller supplies the model's
+strict capability through prepared dispatch. Declaration-aware stream-only
+methods reject an effective strict decision before model dispatch because they
+cannot return that decision; preferred constraints may stream when they fall
+back to unconstrained sampling. Deferred preparation can resolve credentials,
+including running configured credential commands or refreshing credentials,
+before this rejection; authentication side effects are outside this guarantee.
+Callers must retain prepared decisions and normalize a copy of strict arguments
+before validation. Legacy model implementations reject required constraints and
+can fall back for preferred constraints.
+Native tools can declare a constraint when registered; the registry retains
+that declaration alongside the registered tool definition. As in Pi, the
+native `read`, `write`, `edit`, and `bash` tools request preferred JSON Schema
+constraints, including with injected backends. Required constraints fail when
+the provider cannot apply them, while preferred constraints can fall back.
+The Responses SDK can also prepare a request once and inspect the effective
+strict-or-fallback decision bound to its wire tools before dispatch.
+Workbench and AIP prepared-dispatch wrappers preserve that decision, routing,
+and budget the transformed tool schemas. Versioned snapshots bind the decision
+to its request and authorized tool arguments to their operation for recovery.
+The Anthropic SDK also supports explicitly prepared JSON Schema tool declarations
+when the caller enables `with_strict_tool_support(true)` for the selected model.
+Unknown capability defaults to unsupported; required constraints fail, while
+preferred constraints fall back. The adapter applies Anthropic's strict keyword
+limits, binds the effective decision and transformed schemas to the prepared
+dispatch, and exposes raw model tool arguments for caller normalization. The
+workbench enables it for bundled direct Anthropic catalog models, and resolves
+`compat.supportsStrictTools` through provider, model and model override settings;
+unknown and compatible models default to false. Resolved and deferred clients
+forward prepared requests with their effective decisions, transformed reservation
+schemas, configured headers, session affinity and summary cache policy. If a
+before-request hook changes the selected model, Anthropic prepared dispatch
+uses a frozen map of catalog and profile capabilities for models on the same
+route. An explicit endpoint applies to both the selected and rewritten model
+when comparing routes. An uncatalogued selected model uses its provider capability or the
+unsupported default; a rewrite to an unknown model or a model configured for
+another route fails closed. A partial model override alone does not establish a
+routable model for a rewrite. Direct Anthropic declaration-aware streams reject
+strict decisions that only prepared dispatch can retain; preferred fallback
+streams use their resolved unconstrained wire schema. A model capability
+map with no strict-capable entries keeps the legacy Anthropic model fingerprint.
+Existing usage anchors for constrained Anthropic requests can still be invalidated:
+the native agent records a separate prepared-tool configuration hash, and the
+new fallback projection can change the wire schema even with strict disabled
+(for example, it drops root annotations and adds missing defaults). The current
+hash also conservatively invalidates older anchors when the schemas happen to match.
+Unlike Pi v1.5/current, it does not retry a rejected
+preferred strict request without strict mode: changing the wire decision after
+preparation would invalidate the recorded decision. Current Pi also remembers a
+strict-limit rejection for the session and sends subsequent preferred tools
+non-strict; this prepared path does not implement that session memoization.
+Provider errors are returned until a safe decision-bound fallback is available.
+Root combinators fall back for preferred constraints or fail when required,
+since dropping them from a strict schema would change its meaning.
+
+The Chat Completions adapter also resolves explicitly supplied JSON Schema
+constraints for declaration-aware and prepared dispatch. It enables strict mode
+only when `supportsStrictMode` is explicitly true, preserves `strict: false`
+for unconstrained or preferred fallback tools when supported, and omits the
+field otherwise. Required constraints fail before model dispatch when unsupported
+or unsafe to normalize. Prepared session and summary dispatch, including through
+resolved and deferred Workbench clients, bind decisions and budget estimates to
+the transformed wire schemas. Declaration-aware session and summary streams use the same prepared
+decision resolution through Client, WorkbenchModel, and context-prepared
+WorkbenchModel for both Chat Completions and Responses, but reject strict
+decisions and direct callers to prepared dispatch. Session dispatch applies the
+configured prompt-cache policy and external session key; summary dispatch suppresses automatic cache controls,
+prompt-cache keys, and retention. Callers must normalize strict arguments
+before validation. Workbench resolves strict support for the final request model
+after request hooks, using its provider and model overlays; an unknown rewritten
+model on the same route is treated as unsupported, and a different adapter or
+endpoint is rejected. A prepared context is bound to its request model. Direct
+SDK capability settings apply to the client endpoint and must be valid for every
+model the caller dispatches through it. Grammar declarations in Chat Completions currently fall back to
+ordinary function tools; custom grammar tools and their streaming/replay remain
+unsupported. No provider-side strict-limit retry is implemented on this path.
+
+Workbench defaults to strict-tool support for the selected ChatGPT plan model,
+matching Pi's Codex Responses adapter. `compat.supportsStrictMode` can override
+that default. The Responses adapter explicitly sends `strict: false` for
+unconstrained calls on official OpenAI and ChatGPT plan routes so the server
+preserves the recorded decision. Compatible endpoints that lack strict-field
+support continue to omit it.
+
+Grammar declarations on this SDK path currently fall back to function tools.
+Responses accepts initial and finalized argument fragments that extend the
+streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
+tool arguments rather than revising already emitted deltas.
+As a temporary safety difference, strict-schema resolution
+falls back or fails for dynamic references or nested Schema dialects that the
+argument normalizer cannot safely evaluate.
 
 The chat-completions and OpenAI Responses adapters apply `samplingParams` and the effective
 thinking level's `samplingParamsByThinkingLevel`. Model overrides merge
@@ -5431,3 +5555,41 @@ Missing explicit skill paths also warn and leave other resources available.
 Unmatched explicit glob patterns remain errors as a native extension.
 For missing paths, glob metacharacters outside the working-directory prefix are
 interpreted as patterns; this preserves native glob precedence for ambiguous paths.
+
+### Google Generative AI constrained tools
+
+The native Google adapter resolves JSON Schema tool constraints before dispatch.
+Gemini 3 and later default to strict support; other model IDs default to no
+strict support. An explicit `compat.supportsStrictMode` provider or model
+setting overrides that inference in pi-rs (upstream Pi derives this capability
+from the model ID). A required constraint fails before dispatch when strict
+sampling or schema conversion is unavailable; a preferred constraint falls
+back to ordinary tool calling. When any tool is strict, the bound request uses
+`VALIDATED` mode and its transformed schemas are also used for budget
+reservation and recorded tool decisions. As in upstream Pi, string and numeric
+`const` schema values are rewritten to single-element `enum` values in both
+strict and ordinary Google tool declarations. pi-rs retains its existing
+explicit `AUTO` mode for ordinary calls.
+
+This comparison uses upstream Pi `463e17f8dc08a76a1e24e55db37f88de81b4b118`
+(`FETCH_HEAD`, 2026-11-15); the Google strict-mode and schema conversion logic
+is also present in its `v1.5.2` tag. pi-rs additionally rejects strict schemas
+that cannot be safely normalized for local tool execution; `prefer` falls back
+and `require` fails in that case.
+Declaration-only Google streams resolve constraints but reject an effective
+strict decision, because those APIs cannot retain it for tool normalization;
+callers that need strict sampling must use prepared dispatch. The Google context
+identity is versioned for the `const` wire conversion, so usage measured with
+the previous declaration format is not reused as a budget anchor.
+Google resolves provider and per-model strict-support overrides against the final
+request model after `before_request` hooks, including for deferred clients; an
+unconfigured final model on the selected route uses the provider default or
+Gemini-version inference.
+For a final model configured on a different API or endpoint, Workbench rejects
+constrained Google dispatch instead of applying that model's capability to the
+selected connection. Prefixed and bare model IDs cannot bypass an alternate
+route configured for the same wire model. An explicit endpoint is used when
+comparing effective routes. Unconfigured and override-only models must resolve
+to the selected route. When they do, they retain provider-default or
+Gemini-version inference. Standalone Google SDK capability overrides remain
+endpoint-wide.

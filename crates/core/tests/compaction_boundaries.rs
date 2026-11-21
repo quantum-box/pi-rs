@@ -308,7 +308,10 @@ async fn boundaries_cannot_split_images_or_tool_exchanges() {
                 usage: None,
                 request_id: None,
             },
-            Event::ToolStarted { operation_id },
+            Event::ToolStarted {
+                operation_id,
+                tool_execution: None,
+            },
             Event::ToolFinished {
                 operation_id,
                 outcome: Outcome::Succeeded("result".into()),

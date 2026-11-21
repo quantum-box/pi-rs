@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pi_rs::{
-    Error, Extension, Outcome, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolReply,
-    ToolSpec,
+    Error, Extension, Outcome, Result, StrictToolPolicy, Tool, ToolConstraint, ToolContext,
+    ToolExecution, ToolHost, ToolReply, ToolSpec,
 };
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -844,6 +844,9 @@ impl Tool for RemoteReadTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
     }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
     fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
         read_event_content(outcome)
     }
@@ -1229,6 +1232,9 @@ impl Tool for RemoteWriteTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
     }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
     fn execution(&self) -> ToolExecution {
         self.tool.execution()
     }
@@ -1480,6 +1486,9 @@ struct RemoteEditTool {
 impl Tool for RemoteEditTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
     }
     fn execution(&self) -> ToolExecution {
         self.tool.execution()
@@ -1983,6 +1992,9 @@ impl Tool for RemoteShellTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
     }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
     fn execution(&self) -> ToolExecution {
         self.tool.execution()
     }
@@ -2164,6 +2176,16 @@ impl Tool for CodingTool {
             description: description.into(),
             parameters,
         }
+    }
+
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        matches!(
+            self.kind,
+            Kind::Read { .. } | Kind::Write | Kind::Edit | Kind::Bash
+        )
+        .then_some(ToolConstraint::JsonSchema {
+            strict: StrictToolPolicy::Prefer,
+        })
     }
 
     fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
@@ -4345,6 +4367,45 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn coding_tool_sampling_declarations_survive_backend_wrappers() {
+        let root = tempfile::tempdir().unwrap();
+        for wrapped in [false, true] {
+            let mut tools = CodingTools::local(root.path()).unwrap();
+            if wrapped {
+                tools = tools
+                    .with_read_operations(Arc::new(LocalReadOperations))
+                    .unwrap()
+                    .with_write_operations(Arc::new(LocalWriteOperations))
+                    .unwrap()
+                    .with_edit_operations(Arc::new(LocalEditOperations))
+                    .unwrap()
+                    .with_bash_operations(create_local_bash_operations(None))
+                    .unwrap();
+            }
+            let mut registry = pi_rs::Registry::default();
+            registry.register(Arc::new(tools)).unwrap();
+            let declarations = registry.active_tool_declarations();
+            for declaration in &declarations {
+                let expected = matches!(
+                    declaration.spec.name.as_str(),
+                    "read" | "write" | "edit" | "bash"
+                )
+                .then_some(ToolConstraint::JsonSchema {
+                    strict: StrictToolPolicy::Prefer,
+                });
+                assert_eq!(
+                    declaration.constrained_sampling, expected,
+                    "{}",
+                    declaration.spec.name
+                );
+            }
+            for name in ["read", "write", "edit", "bash"] {
+                assert!(declarations.iter().any(|tool| tool.spec.name == name));
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

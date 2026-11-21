@@ -269,7 +269,7 @@ pub enum ClientRegistrationMode {
 }
 
 #[derive(Clone)]
-struct FileCredentials {
+pub(crate) struct FileCredentials {
     path: PathBuf,
     generation: Option<Uuid>,
     new_login: bool,
@@ -338,6 +338,40 @@ impl FileCredentials {
             lease: Arc::default(),
         })
     }
+    async fn lock_file(&self) -> std::result::Result<std::fs::File, AuthError> {
+        let path = self.path.with_extension("lock");
+        std::fs::create_dir_all(path.parent().ok_or_else(store_error)?)
+            .map_err(|_| store_error())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| store_error())?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                }
+                Err(std::fs::TryLockError::Error(_)) => return Err(store_error()),
+            }
+        }
+        Ok(file)
+    }
+
+    pub(crate) async fn dispatch_lease(&self) -> std::result::Result<std::fs::File, AuthError> {
+        let lease = self.lock_file().await?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.read()?.ok_or(AuthError::AuthorizationRequired)?;
+            Ok(lease)
+        })
+        .await
+        .map_err(|_| store_error())?
+    }
+
     fn read(&self) -> std::result::Result<Option<Envelope>, AuthError> {
         let file = match std::fs::File::open(&self.path) {
             Ok(file) => file,
@@ -429,14 +463,37 @@ impl FileCredentials {
         file.write_all(&bytes).map_err(|_| store_error())?;
         file.write_all(b"\n").map_err(|_| store_error())?;
         file.as_file().sync_all().map_err(|_| store_error())?;
+        #[cfg(test)]
+        credential_crash_checkpoint("before-publish");
         file.persist(&self.path).map_err(|_| store_error())?;
+        #[cfg(test)]
+        credential_crash_checkpoint("after-publish");
         #[cfg(unix)]
-        std::fs::File::open(parent)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| store_error())?;
+        // Sync the envelope's name and the store directory's own name on first use.
+        sync_store_directory(parent)
+            .and_then(|()| sync_store_directory(parent.parent().ok_or_else(store_error)?))
+            .map_err(|_| AuthError::CredentialStoreError(PUBLICATION_UNCERTAIN.into()))?;
         Ok(())
     }
 }
+const PUBLICATION_UNCERTAIN: &str =
+    "MCP credential change is visible but could not be confirmed durable";
+
+#[cfg(unix)]
+fn sync_store_directory(path: &std::path::Path) -> std::result::Result<(), AuthError> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| store_error())
+}
+
+#[cfg(test)]
+fn credential_crash_checkpoint(stage: &str) {
+    if std::env::var("PI_TEST_MCP_CREDENTIAL_CRASH").as_deref() == Ok(stage) {
+        // Simulate a process exit without running cleanup or dropping the temp file.
+        std::process::exit(70);
+    }
+}
+
 fn store_error() -> AuthError {
     AuthError::CredentialStoreError("could not access the private MCP credential store".into())
 }
@@ -455,6 +512,9 @@ fn auth_error(error: AuthError) -> Error {
         }
         AuthError::PkceUnsupported => "MCP authorization server does not support PKCE S256",
         AuthError::NoAuthorizationSupport => "MCP server does not advertise OAuth authorization",
+        AuthError::CredentialStoreError(message) if message == PUBLICATION_UNCERTAIN => {
+            PUBLICATION_UNCERTAIN
+        }
         AuthError::CredentialStoreError(_) => "could not access the private MCP credential store",
         _ => "MCP OAuth operation failed",
     };
@@ -499,8 +559,16 @@ impl CredentialStore for FileCredentials {
             .upgrade();
         tokio::task::spawn_blocking(move || {
             let _lease = lease;
-            match std::fs::remove_file(store.path) {
-                Ok(()) => Ok(()),
+            #[cfg(unix)]
+            let parent = store.path.parent().ok_or_else(store_error)?;
+            match std::fs::remove_file(&store.path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    sync_store_directory(parent).map_err(|_| {
+                        AuthError::CredentialStoreError(PUBLICATION_UNCERTAIN.into())
+                    })?;
+                    Ok(())
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(_) => Err(store_error()),
             }
@@ -511,25 +579,7 @@ impl CredentialStore for FileCredentials {
     async fn acquire_refresh_guard(
         &self,
     ) -> std::result::Result<Option<CredentialRefreshGuard>, AuthError> {
-        let path = self.path.with_extension("lock");
-        std::fs::create_dir_all(path.parent().ok_or_else(store_error)?)
-            .map_err(|_| store_error())?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|_| store_error())?;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await
-                }
-                Err(std::fs::TryLockError::Error(_)) => return Err(store_error()),
-            }
-        }
+        let file = self.lock_file().await?;
         let file = Arc::new(file);
         *self.lease.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&file);
         let guard = crate::mcp_refresh::guard(file).await?;
@@ -625,6 +675,35 @@ where
     C: FnOnce(FileCredentials, StoredCredentials) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    deadline_login_with_precommit(
+        deadline,
+        staged,
+        cancellation,
+        prepare,
+        |_| async { Ok(()) },
+        |store, credentials, ()| commit(store, credentials),
+    )
+    .await
+}
+
+// Wait for all cancellable preparation, including a caller's configuration
+// lock, before entering the non-interruptible commit section. The returned
+// guard stays alive until the credential write has completed.
+async fn deadline_login_with_precommit<F, P, PFut, G, C, Fut>(
+    deadline: tokio::time::Instant,
+    staged: Staging,
+    cancellation: &pi_rs::CancellationToken,
+    prepare: F,
+    precommit: P,
+    commit: C,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+    P: FnOnce(Arc<std::fs::File>) -> PFut,
+    PFut: std::future::Future<Output = Result<G>>,
+    C: FnOnce(FileCredentials, StoredCredentials, G) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     // Acquiring the lock is preparation too: expiry must never leave a queued
     // writer that can replace credentials later.
     let ready = async {
@@ -641,7 +720,14 @@ where
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
-        Ok::<_, Error>((store, credentials, guard))
+        let credential_file = store
+            .lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+            .ok_or_else(|| Error::Config("MCP OAuth credential lock handle is missing".into()))?;
+        let config_guard = precommit(credential_file).await?;
+        Ok::<_, Error>((store, credentials, guard, config_guard))
     };
     let ready = tokio::select! {
         biased;
@@ -650,10 +736,13 @@ where
             result.map_err(|_| Error::Config("MCP login timed out".into())).and_then(|result| result),
     };
     let result = match ready {
-        Ok((store, credentials, _guard)) if tokio::time::Instant::now() < deadline => {
+        Ok((store, credentials, _guard, config_guard))
+            if tokio::time::Instant::now() < deadline && !cancellation.is_cancelled() =>
+        {
             // The blocking write retains the lease even if the caller is dropped.
-            commit(store, credentials).await
+            commit(store, credentials, config_guard).await
         }
+        Ok(_) if cancellation.is_cancelled() => Err(Error::Cancelled),
         Ok(_) => Err(Error::Config("MCP login timed out".into())),
         Err(error) => Err(error),
     };
@@ -670,6 +759,9 @@ where
 }
 
 /// Restore a previously authorized client. Each connection is bound to one login generation.
+///
+/// The supplied HTTP client must disable redirects to keep the authorization
+/// header scoped to the configured resource.
 pub async fn client(
     name: &str,
     url: &str,
@@ -678,6 +770,8 @@ pub async fn client(
     client_with_http_options(name, url, client, None).await
 }
 
+/// Restore a client with OAuth discovery and token exchange using the given HTTP options.
+/// The supplied resource client must disable redirects, as in [client].
 pub async fn client_with_http_options(
     name: &str,
     url: &str,
@@ -693,7 +787,7 @@ pub async fn client_with_http_options(
     store.generation = Some(envelope.generation);
     let identity = envelope.generation.to_string();
     let mut manager = oauth_manager(url, options).await?;
-    manager.set_credential_store(store);
+    manager.set_credential_store(store.clone());
     if let Some(metadata_url) = envelope
         .registration
         .as_ref()
@@ -717,7 +811,7 @@ pub async fn client_with_http_options(
     }
     drop(guard);
     Ok((
-        crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(client, manager), Arc::default()),
+        crate::mcp_oauth_client::SafeAuthClient::new(AuthClient::new(client, manager), url, store)?,
         identity,
     ))
 }
@@ -996,6 +1090,118 @@ pub async fn login_configured_with_http_options_and_deadline(
             announce,
             Some(staged.clone()),
         ),
+    )
+    .await
+}
+
+/// OAuth client settings selected by the CLI.
+pub enum CliLoginClient<'a> {
+    Secret {
+        client_id: Option<&'a str>,
+        client_secret: Option<&'a str>,
+    },
+    Metadata(&'a str),
+    Configured(Option<&'a OAuthClientSettings>),
+}
+
+/// Save one credential envelope after revalidating the effective MCP configuration.
+#[allow(clippy::too_many_arguments)]
+pub async fn login_cli_with_precommit<C>(
+    name: &str,
+    url: &str,
+    client: CliLoginClient<'_>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+    config_paths: Vec<PathBuf>,
+    validate_config: C,
+) -> Result<()>
+where
+    C: FnOnce() -> Result<()> + Send + 'static,
+{
+    let staged = Staging::default();
+    let prepare = async {
+        match client {
+            CliLoginClient::Secret {
+                client_id,
+                client_secret,
+            } => authorize(
+                name,
+                url,
+                Registration::New(ClientOptions {
+                    client_id,
+                    client_secret,
+                    ..ClientOptions::default()
+                }),
+                scopes,
+                options,
+                announce,
+                Some(staged.clone()),
+            )
+            .await
+            .map(|_| ()),
+            CliLoginClient::Metadata(metadata_url) => authorize(
+                name,
+                url,
+                Registration::New(ClientOptions {
+                    metadata_url: Some(metadata_url),
+                    ..ClientOptions::default()
+                }),
+                scopes,
+                options,
+                announce,
+                Some(staged.clone()),
+            )
+            .await
+            .map(|_| ()),
+            CliLoginClient::Configured(settings) => {
+                login_configured_inner(
+                    name,
+                    url,
+                    settings,
+                    None,
+                    scopes,
+                    options,
+                    announce,
+                    Some(staged.clone()),
+                )
+                .await
+            }
+        }
+    };
+    let commit_cancellation = cancellation.clone();
+    deadline_login_with_precommit(
+        deadline,
+        staged.clone(),
+        cancellation,
+        prepare,
+        move |credential_lock| crate::mcp_login_config_lock::lock(config_paths, credential_lock),
+        move |store, credentials, locks| async move {
+            let lease = store
+                .lease
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .upgrade()
+                .ok_or_else(|| {
+                    Error::Config("MCP OAuth credential lock handle is missing".into())
+                })?;
+            tokio::task::spawn_blocking(move || {
+                let _locks = locks;
+                let _lease = lease;
+                validate_config()?;
+                if commit_cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Config("MCP login timed out".into()));
+                }
+                store.write(credentials).map_err(auth_error)
+            })
+            .await
+            .map_err(|_| Error::Config("MCP login finalization failed".into()))?
+        },
     )
     .await
 }
@@ -1565,11 +1771,13 @@ pub(crate) async fn test_oauth_client(
         "issuer":resource, "authorization_endpoint":resource, "token_endpoint":token_url, "response_types_supported":["code"]
     })).unwrap());
     manager.configure_client_id("fixture").unwrap();
-    manager.set_credential_store(store);
-    crate::mcp_oauth_client::SafeAuthClient(
+    manager.set_credential_store(store.clone());
+    crate::mcp_oauth_client::SafeAuthClient::new(
         AuthClient::new(reqwest_mcp::Client::new(), manager),
-        Arc::default(),
+        resource,
+        store,
     )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -1600,6 +1808,99 @@ mod tests {
             "client_id":"fixture", "token_response":{"access_token":"new", "token_type":"Bearer"}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn credential_publication_recovers_after_writer_exit() {
+        let store_path = "PI_TEST_MCP_CREDENTIAL_CRASH_PATH";
+        if let Some(path) = std::env::var_os(store_path) {
+            let (writer, _) = staged_fixture(path.into());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let _guard = writer.store.acquire_refresh_guard().await.unwrap().unwrap();
+                    writer.store.save(fixture_credentials()).await.unwrap();
+                });
+            panic!("fixture missed the process-exit checkpoint");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-auth").join("credentials.json");
+        let (writer, _) = staged_fixture(path.clone());
+        let old = serde_json::from_value(serde_json::json!({
+            "client_id": "fixture", "token_response": {"access_token":"old","token_type":"Bearer"}
+        }))
+        .unwrap();
+        writer.store.write(old).unwrap();
+        let mut reader = writer.store;
+        reader.new_login = false;
+        reader.generation = None;
+        let original = reader.read().unwrap().unwrap().generation;
+
+        for (checkpoint, token) in [("before-publish", "old"), ("after-publish", "new")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp_auth::tests::credential_publication_recovers_after_writer_exit",
+                ])
+                .env(store_path, &path)
+                .env("PI_TEST_MCP_CREDENTIAL_CRASH", checkpoint)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(70), "{checkpoint}");
+            let lock = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(path.with_extension("lock"))
+                .unwrap();
+            lock.try_lock().unwrap();
+            let envelope = reader.read().unwrap().unwrap();
+            assert_eq!(envelope.generation == original, token == "old");
+            use oauth2::TokenResponse;
+            assert_eq!(
+                envelope
+                    .credentials
+                    .token_response
+                    .unwrap()
+                    .access_token()
+                    .secret(),
+                token
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_lease_rejects_superseded_and_removed_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (writer, _) = staged_fixture(path.clone());
+        writer.store.write(fixture_credentials()).unwrap();
+        let mut reader = writer.store;
+        reader.new_login = false;
+        let lease = reader.dispatch_lease().await.unwrap();
+        let other = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(lease);
+        let (writer, _) = staged_fixture(path.clone());
+        writer.store.write(fixture_credentials()).unwrap();
+        assert!(matches!(
+            reader.dispatch_lease().await,
+            Err(AuthError::AuthorizationRequired)
+        ));
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(
+            reader.dispatch_lease().await,
+            Err(AuthError::AuthorizationRequired)
+        ));
     }
 
     async fn stage_fixture(store: &StagedCredentials) -> Result<()> {
@@ -2182,9 +2483,13 @@ mod tests {
                     "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
                 })).unwrap());
                 manager.configure_client_id("fixture").unwrap();
-                manager.set_credential_store(task_store);
-                let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager), Arc::default());
-                let manager = client.0.auth_manager.clone();
+                manager.set_credential_store(task_store.clone());
+                let client = crate::mcp_oauth_client::SafeAuthClient::new(
+                    AuthClient::new(reqwest_mcp::Client::new(), manager),
+                    &format!("{url}/mcp"),
+                    task_store,
+                ).unwrap();
+                let manager = client.client.auth_manager.clone();
                 let task = tokio::spawn(async move {
                     let result = client.call(reactive.then(|| "old".to_owned()), |_| {
                         let index = task_calls.fetch_add(1, Ordering::SeqCst);

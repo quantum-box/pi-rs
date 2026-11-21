@@ -2893,7 +2893,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
         } => {
             json!({"event":"tool_planned","operation_id":invocation.operation_id,"name":invocation.call.name,"parent_operation":parent_operation})
         }
-        Event::ToolStarted { operation_id } => {
+        Event::ToolStarted { operation_id, .. } => {
             json!({"event": "tool_started", "operation_id": operation_id})
         }
         Event::ToolFinished {
