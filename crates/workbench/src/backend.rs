@@ -11,7 +11,7 @@ use pi_rs::{
     QueuedMessage, Result, Session, SessionShutdownReason, SessionStartReason,
 };
 use pi_rs_workbench::coding::CodingTools;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -37,6 +37,12 @@ enum Request {
         session: PathBuf,
     },
     CacheWarmingChanged,
+    RenderTool {
+        id: Uuid,
+        operation: Uuid,
+        records: ToolRenderRecords,
+        options: ToolRenderOptions,
+    },
     RenderCustomMessage {
         id: Uuid,
         record_id: u64,
@@ -166,6 +172,22 @@ enum Request {
         target_session_file: Option<PathBuf>,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ToolRenderRecords {
+    pub invocation: u64,
+    pub started: Option<u64>,
+    pub result: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ToolRenderOptions {
+    pub expanded: bool,
+    pub show_images: bool,
+    pub output_pad: usize,
+    pub expand_key: Option<String>,
+    pub width: Option<usize>,
+}
+
 struct ReaderControls {
     snapshot: Arc<Mutex<SessionSnapshot>>,
     auto_compaction: pi_rs::AutoCompactionControl,
@@ -177,6 +199,7 @@ struct ReaderControls {
     registry: pi_rs::Registry,
     lifecycle_timeout: std::time::Duration,
     trace: bool,
+    terminal_managed: bool,
     shell: ShellRunner,
 }
 
@@ -235,6 +258,94 @@ impl SessionSnapshot {
             share_base: None,
             share_pending: false,
         }
+    }
+
+    fn tool_render_records(&self, records: ToolRenderRecords) -> [Option<Arc<pi_rs::Record>>; 3] {
+        let get = |id| {
+            self.share_records
+                .binary_search_by_key(&id, |record| record.id)
+                .ok()
+                .map(|index| self.share_records[index].clone())
+        };
+        [
+            get(records.invocation),
+            records.started.and_then(get),
+            records.result.and_then(get),
+        ]
+    }
+
+    fn tool_render_context(
+        operation: Uuid,
+        [invocation, started, result]: [Option<Arc<pi_rs::Record>>; 3],
+        options: ToolRenderOptions,
+        cwd: &std::path::Path,
+    ) -> Option<pi_rs::ToolRenderContext> {
+        let invocation = match &invocation.as_deref()?.event {
+            pi_rs::Event::Assistant { invocations, .. } => invocations
+                .iter()
+                .find(|call| call.operation_id == operation)?,
+            pi_rs::Event::ToolPlanned { invocation, .. }
+                if invocation.operation_id == operation =>
+            {
+                invocation
+            }
+            _ => return None,
+        };
+        let mut context = pi_rs::ToolRenderContext::new(
+            &invocation.call.name,
+            &invocation.call.id,
+            pi_rs::parse_tool_arguments(&invocation.call.arguments).unwrap_or_else(|_| json!({})),
+            cwd,
+        );
+        let started = started.as_deref().filter(|record| {
+            matches!(&record.event, pi_rs::Event::ToolStarted { operation_id, .. } if *operation_id == operation)
+        });
+        let timestamp = |record: &pi_rs::Record| {
+            chrono::DateTime::parse_from_rfc3339(record.timestamp.as_deref()?).ok()
+        };
+        context.execution_started = started.is_some();
+        context.args_complete = true;
+        context.expanded = options.expanded;
+        context.show_images = options.show_images;
+        context.output_pad = options.output_pad;
+        context.expand_key = options.expand_key;
+        context.width = options.width;
+        if let Some(record) = result.as_deref() {
+            let outcome = match &record.event {
+                pi_rs::Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    ..
+                }
+                | pi_rs::Event::ToolReconciled {
+                    operation_id,
+                    outcome,
+                } if *operation_id == operation => outcome,
+                _ => return None,
+            };
+            let mut result = super::rpc_events::tool_event_result_value(
+                &outcome.tool_content(),
+                Some(outcome),
+                Some(outcome.is_structured()),
+            );
+            let duration_ms =
+                started
+                    .and_then(timestamp)
+                    .zip(timestamp(record))
+                    .and_then(|(start, end)| {
+                        u64::try_from(end.signed_duration_since(start).num_milliseconds()).ok()
+                    });
+            context.result = Some(pi_rs::ToolRenderResult {
+                content: result["content"].take(),
+                details: result
+                    .as_object_mut()
+                    .and_then(|result| result.remove("details")),
+                is_partial: false,
+                is_error: outcome.is_error(),
+                duration_ms,
+            });
+        }
+        Some(context)
     }
 
     fn from_session(session: &Session, emit_entries: bool) -> Self {
@@ -833,6 +944,7 @@ async fn run_worker(
             registry: runtime.registry.clone(),
             lifecycle_timeout: args.tool_timeout(),
             trace: args.trace,
+            terminal_managed: args.terminal_managed_worker,
             shell: ShellRunner {
                 cwd: args.workspace.clone(),
                 tools: Arc::new(
@@ -908,7 +1020,8 @@ async fn run_worker(
         let renderers = runtime.registry.custom_message_renderers();
         output(json!({
             "type":"backend_ready",
-            "custom_message_renderers":renderers.types().collect::<Vec<_>>()
+            "custom_message_renderers":renderers.types().collect::<Vec<_>>(),
+            "tool_rendering":true,
         }));
     } else {
         output(json!({"type":"backend_ready"}));
@@ -1882,11 +1995,14 @@ fn read_requests(
         registry,
         lifecycle_timeout,
         trace,
+        terminal_managed,
         snapshot,
         shell,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
     let message_renderers = registry.custom_message_renderers();
+    let tool_renderers = registry.tool_renderers();
+    let tool_cwd = shell.cwd.clone();
     let prepare_in_background =
         registry.has_input_hooks() || registry.has_resource_discovery_hooks();
     let processor = Arc::new(queue::Processor {
@@ -1902,6 +2018,7 @@ fn read_requests(
     });
     let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let render_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let tool_render_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1920,6 +2037,40 @@ fn read_requests(
                 }
             };
             match request {
+                Request::RenderTool {
+                    id,
+                    operation,
+                    records,
+                    options,
+                } => {
+                    if !terminal_managed {
+                        continue;
+                    }
+                    if let Ok(slot) = tool_render_slots.clone().try_acquire_owned() {
+                        let source = snapshot
+                            .lock()
+                            .expect("session snapshot")
+                            .tool_render_records(records);
+                        let tool_cwd = tool_cwd.clone();
+                        let renderers = tool_renderers.clone();
+                        runtime.spawn(async move {
+                            let context = SessionSnapshot::tool_render_context(
+                                operation, source, options, &tool_cwd,
+                            );
+                            let (available, rendered) = match context {
+                                Some(context) => match renderers.resolve(&context.tool_name, &|| None) {
+                                    Some(renderers) => (Some(true), Some(renderers.render(&context, std::time::Duration::from_millis(500)).await)),
+                                    None => (Some(false), None),
+                                },
+                                None => (None, None),
+                            };
+                            drop(slot);
+                            output(json!({"type":"tool_rendered","id":id,"available":available,"rendered":rendered}));
+                        });
+                    } else {
+                        output(json!({"type":"tool_rendered","id":id,"rendered":null}));
+                    }
+                }
                 Request::RenderCustomMessage {
                     id,
                     record_id,
@@ -2247,6 +2398,97 @@ fn initialize_queue_modes_from_settings(
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn tool_renderer_uses_committed_call_details_and_checks_operation_identity() {
+        let operation = Uuid::new_v4();
+        let record = |id, timestamp: &str, event| pi_rs::Record {
+            timestamp: Some(timestamp.into()),
+            id,
+            version: 1,
+            parent: id.checked_sub(1).filter(|parent| *parent != 0),
+            run_id: None,
+            event,
+        };
+        let snapshot = SessionSnapshot::new(
+            vec![
+                record(
+                    1,
+                    "2026-11-21T00:00:00Z",
+                    Event::Assistant {
+                        content: String::new(),
+                        usage: None,
+                        request_id: None,
+                        invocations: vec![pi_rs::Invocation {
+                            operation_id: operation,
+                            call: pi_rs::ToolCall {
+                                id: "native-id".into(),
+                                name: "lookup".into(),
+                                arguments: r#"{"path":"example"}"#.into(),
+                            },
+                        }],
+                    },
+                ),
+                record(
+                    2,
+                    "2026-11-21T00:00:01Z",
+                    Event::ToolStarted {
+                        operation_id: operation,
+                        tool_execution: None,
+                    },
+                ),
+                record(
+                    3,
+                    "2026-11-21T00:00:01.425Z",
+                    Event::ToolFinished {
+                        operation_id: operation,
+                        outcome: pi_rs::Outcome::SucceededWithDetails {
+                            output: "output".into(),
+                            details: json!({"label":"from journal"}),
+                        },
+                        states: Default::default(),
+                    },
+                ),
+            ],
+            false,
+        );
+        let options = ToolRenderOptions {
+            expanded: true,
+            show_images: false,
+            output_pad: 2,
+            expand_key: Some("ctrl+o".into()),
+            width: Some(72),
+        };
+        let records = ToolRenderRecords {
+            invocation: 1,
+            started: Some(2),
+            result: Some(3),
+        };
+        let context = SessionSnapshot::tool_render_context(
+            operation,
+            snapshot.tool_render_records(records),
+            options.clone(),
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(context.tool_call_id, "native-id");
+        assert_eq!(context.args["path"], "example");
+        assert!(context.execution_started && context.args_complete && context.expanded);
+        let result = context.result.unwrap();
+        assert_eq!(result.content[0]["text"], "output");
+        assert_eq!(result.details.unwrap()["label"], "from journal");
+        assert_eq!(result.duration_ms, Some(425));
+
+        assert!(
+            SessionSnapshot::tool_render_context(
+                Uuid::new_v4(),
+                snapshot.tool_render_records(records),
+                options,
+                std::path::Path::new("."),
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn worker_queue_modes_use_its_settings_snapshot() {
