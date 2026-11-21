@@ -623,11 +623,25 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    CloudflareLogin(CloudflareLoginField),
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
     CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
+}
+
+enum CloudflareLoginField {
+    Key(super::Provider),
+    Account {
+        provider: super::Provider,
+        key: String,
+    },
+    Gateway {
+        provider: super::Provider,
+        key: String,
+        account: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3776,6 +3790,8 @@ fn slash(
                 if login {
                     if provider.id() == "amazon-bedrock" {
                         show_bedrock_methods(view);
+                    } else if is_cloudflare_login_provider(&provider) {
+                        edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
                     } else {
                         edit_provider_key(provider, view);
                     }
@@ -5503,6 +5519,9 @@ pub(super) async fn run(
                                             view.append("AWS profile saved for amazon-bedrock");
                                         })
                                 }
+                                LocalEditor::CloudflareLogin(field) => {
+                                    advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -6489,6 +6508,84 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
 fn edit_provider_key(provider: super::Provider, view: &mut View) {
     let dialog = crate::ui::dialog::Dialog::secret(format!("{} API key", provider.id()));
     view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
+}
+
+fn is_cloudflare_login_provider(provider: &super::Provider) -> bool {
+    matches!(
+        provider.id(),
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+    )
+}
+
+fn edit_cloudflare_login(view: &mut View, field: CloudflareLoginField) {
+    use crate::ui::dialog::Dialog;
+    let dialog = match field {
+        CloudflareLoginField::Key(_) => Dialog::secret("Enter Cloudflare API key".into()),
+        _ => Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Input {
+                title: match field {
+                    CloudflareLoginField::Account { .. } => "Enter Cloudflare account ID",
+                    _ => "Enter Cloudflare AI Gateway ID",
+                }
+                .into(),
+                placeholder: None,
+                initial_value: None,
+                timeout: None,
+            },
+        ),
+    };
+    view.local_editor = Some((LocalEditor::CloudflareLogin(field), dialog));
+}
+
+fn advance_cloudflare_login(
+    field: &CloudflareLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    let (provider, key, account, gateway) = match field {
+        CloudflareLoginField::Key(provider) => {
+            if !super::model_auth::valid_key(text) {
+                return Err(Error::Config("Enter a valid Cloudflare API key".into()));
+            }
+            edit_cloudflare_login(
+                view,
+                CloudflareLoginField::Account {
+                    provider: provider.clone(),
+                    key: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        CloudflareLoginField::Account { provider, key } => {
+            if !super::operation_models::valid_cloudflare_account(text) {
+                return Err(Error::Config("Enter a valid Cloudflare account ID".into()));
+            }
+            if provider.id() == "cloudflare-ai-gateway" {
+                edit_cloudflare_login(
+                    view,
+                    CloudflareLoginField::Gateway {
+                        provider: provider.clone(),
+                        key: key.clone(),
+                        account: text.into(),
+                    },
+                );
+                return Ok(());
+            }
+            (provider, key.as_str(), text, None)
+        }
+        CloudflareLoginField::Gateway {
+            provider,
+            key,
+            account,
+        } => (provider, key.as_str(), account.as_str(), Some(text)),
+    };
+    super::model_auth::save_cloudflare_login(provider, key, account, gateway)?;
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append(&format!("Cloudflare API key saved for {}", provider.id()));
+    Ok(())
 }
 
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
@@ -7856,6 +7953,9 @@ fn select(
         Selection::Completion { range, text, .. } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
+        }
+        Selection::LoginProvider(provider) if is_cloudflare_login_provider(&provider) => {
+            edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
         }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
