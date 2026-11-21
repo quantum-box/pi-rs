@@ -5367,6 +5367,13 @@ summary requests omit automatic keys and retention. Explicit sampling fields
 retain precedence. Native Ollama keeps long retention disabled by default as a
 pi-rs extension; its explicit compatibility setting can enable it.
 
+### Reported reasoning tokens
+
+OpenAI Responses and Chat Completions, Anthropic Messages, Gemini and Pi
+Messages retain provider-reported reasoning token counts. Pi JSON, RPC and
+session imports preserve the `usage.reasoning` field when available. Reasoning
+is part of total output and is counted once for budgets and cost estimates.
+
 ### Responses instruction role
 
 Responses requests use `developer` for models marked as reasoning-capable

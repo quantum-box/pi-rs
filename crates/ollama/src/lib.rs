@@ -1378,6 +1378,9 @@ impl Ollama {
                             .map(|cached| cached.min(stats.prompt_tokens));
                     }
                     metadata.cache_creation_input_tokens = details.cache_write_tokens;
+                    let nested = stats.completion_tokens_details.and_then(|details| details.reasoning_tokens);
+                    metadata.reasoning_output_tokens = nested.filter(|count| *count != 0)
+                        .or(stats.reasoning_tokens).or(nested);
                     if let Some(cost) = stats.accounting.total() {
                         metadata.cost_usd = Some(cost);
                         metadata.cost_from_provider = Some(true);
@@ -1797,6 +1800,8 @@ struct WireUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    completion_tokens_details: Option<CompletionTokenDetails>,
+    reasoning_tokens: Option<u64>,
     prompt_cache_hit_tokens: Option<u64>,
     cached_tokens: Option<u64>,
     #[serde(alias = "promptTokensDetails")]
@@ -1807,6 +1812,11 @@ struct WireUsage {
     mistral_prompt_details: Option<PromptTokenDetails>,
     #[serde(flatten)]
     accounting: ReportedUsageCost,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokenDetails {
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1977,7 +1987,9 @@ mod content_tests {
             let body = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                 json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}]}),
-                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":12,"completion_tokens":9,"reasoning_tokens":2,
+                        "completion_tokens_details":{"reasoning_tokens":4}}})
             );
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });
@@ -2001,11 +2013,24 @@ mod content_tests {
             .unwrap()
             .collect::<Vec<_>>()
             .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9
+                }),
+                ..
+            })
+        )));
         let replay = events
             .into_iter()
             .rev()
             .find_map(|event| match event.unwrap() {
-                ModelEvent::Metadata(metadata) => metadata.replay,
+                ModelEvent::Metadata(metadata) => {
+                    assert_eq!(metadata.reasoning_output_tokens, Some(4));
+                    metadata.replay
+                }
                 _ => None,
             })
             .expect("reasoning replay");

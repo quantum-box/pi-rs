@@ -77,6 +77,7 @@ fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage
             cost_breakdown: crate::UsageCostBreakdown::from_value(&value["cost"]),
             cost_from_provider: value["cost"]["totalFromProvider"].as_bool(),
             cache_write_1h_tokens: value["cacheWrite1h"].as_u64(),
+            reasoning_output_tokens: value["reasoning"].as_u64(),
             cached_input_tokens: Some(cache_read),
             cache_creation_input_tokens: Some(cache_write),
             ..Default::default()
@@ -1379,6 +1380,7 @@ pub fn convert(
                             cost_from_provider: message["usage"]["cost"]["totalFromProvider"]
                                 .as_bool(),
                             cache_write_1h_tokens: message["usage"]["cacheWrite1h"].as_u64(),
+                            reasoning_output_tokens: message["usage"]["reasoning"].as_u64(),
                             cached_input_tokens: message["usage"]["cacheRead"].as_u64(),
                             cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
                             provider_api: message["api"].as_str().and_then(crate::ModelApi::named),
@@ -1721,4 +1723,24 @@ pub fn convert(
         }
     }
     Ok(events)
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn pi_usage_retains_reasoning_without_increasing_output_tokens() {
+        let mut events = Vec::new();
+        let usage = append_imported_usage(
+            &mut events,
+            &serde_json::json!({
+                "input":12,"output":9,"reasoning":4
+            }),
+        )
+        .unwrap();
+        assert_eq!(usage.output_tokens, 9);
+        assert!(matches!(&events[0], Event::ModelFinished { metadata, .. }
+            if metadata.reasoning_output_tokens == Some(4)));
+    }
 }

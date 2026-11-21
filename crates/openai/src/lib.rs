@@ -1652,12 +1652,13 @@ impl OpenAiResponses {
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
                         let reasoning: String = reasoning.into_values().collect();
+                        let reasoning_output_tokens = response["usage"]["output_tokens_details"]["reasoning_tokens"].as_u64();
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
                             identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
                                 ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
                             } else { identity },
                             blocks:output.clone()
-                        })), ..Default::default() }));
+                        })), reasoning_output_tokens, ..Default::default() }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
@@ -4183,6 +4184,34 @@ mod tests {
             };
             assert!(body.get(other).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_usage_is_included_in_output_total() {
+        let response = json!({"type":"response.completed","response":{
+            "status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":9,
+                "output_tokens_details":{"reasoning_tokens":4}}
+        }});
+        let (client, server) = fixture(&format!("data: {response}\n\n")).await;
+        let events = client
+            .stream(request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(event,
+            Ok(ModelEvent::Metadata(metadata)) if metadata.reasoning_output_tokens == Some(4))));
+        assert!(matches!(
+            events.last(),
+            Some(Ok(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9
+                }),
+                ..
+            }))
+        ));
+        server.await.unwrap();
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {

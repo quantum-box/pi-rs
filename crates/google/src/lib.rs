@@ -1320,6 +1320,7 @@ impl Model for Google {
                         output_tokens: count("candidatesTokenCount").saturating_add(count("thoughtsTokenCount")),
                     });
                     metadata.cached_input_tokens = stats["cachedContentTokenCount"].as_u64();
+                    metadata.reasoning_output_tokens = stats["thoughtsTokenCount"].as_u64();
                 }
                 if value["promptFeedback"]["blockReason"].as_str().is_some_and(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED") {
                     Err(Error::Model("Google Gemini blocked the prompt".into()))?;
@@ -2952,7 +2953,10 @@ mod tests {
                     json!({"candidates":[{"content":{"parts":[part]}}]})
                 ));
             }
-            body.push_str("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n");
+            body.push_str(&format!("data: {}\n\n", json!({
+                "candidates":[{"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5,"thoughtsTokenCount":4}
+            })));
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         });
         let model = Google::new(&endpoint, "test")
@@ -2973,7 +2977,11 @@ mod tests {
             match event.unwrap() {
                 ModelEvent::Reasoning(s) => events.push(format!("thinking:{s}")),
                 ModelEvent::Text(s) => events.push(format!("text:{s}")),
-                ModelEvent::Metadata(metadata) => replay = metadata.replay,
+                ModelEvent::Metadata(metadata) => {
+                    assert_eq!(metadata.reasoning_output_tokens, Some(4));
+                    replay = metadata.replay;
+                }
+                ModelEvent::Complete { usage, .. } => assert_eq!(usage.unwrap().output_tokens, 9),
                 _ => {}
             }
         }
