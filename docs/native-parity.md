@@ -904,8 +904,10 @@ MCP server `notifications/message` entries append to `mcp.log` in the agent
 directory with the timestamp, configured server name, severity and logger.
 Multiline continuation lines are indented. The log rotates to `mcp.log.1`
 after 5 MiB, as in Pi. Native writers serialize appends and rotation across
-processes, escape control characters, and bound each record to 256 KiB.
-Log write failures leave the tools and CLI output available.
+processes, escape control characters, and bound each record to 256 KiB. On
+Unix, the client restricts existing log files to the current user before
+appending. The client bounds the time spent waiting for a log write so a
+busy or unavailable log does not hold up server requests.
 
 `pi mcp list --json` emits one JSON document with server state, source,
 transport, tool names, per-tool exposure overrides, and resource capability.

@@ -1,8 +1,10 @@
 //! Private, best-effort log of MCP server message notifications.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
@@ -10,6 +12,9 @@ use serde_json::Value;
 const ROTATE_AFTER: u64 = 5 * 1024 * 1024;
 const MAX_RECORD: usize = 256 * 1024;
 const TRUNCATED: &str = " [truncated]\n";
+const WRITE_BUDGET: Duration = Duration::from_millis(50);
+static WRITERS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
 
 fn push_safe(output: &mut String, input: &str) {
     for value in input.chars() {
@@ -97,13 +102,37 @@ fn open_private(path: &Path, append: bool) -> io::Result<File> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("MCP log path is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
-fn append_record(directory: &Path, line: &str) -> io::Result<()> {
+fn append_record(directory: &Path, line: &str, deadline: Instant) -> io::Result<()> {
     fs::create_dir_all(directory)?;
     let lock = open_private(&directory.join("mcp.log.lock"), false)?;
-    lock.lock()?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(left.min(Duration::from_millis(2)));
+            }
+            Err(TryLockError::Error(error)) => return Err(error),
+        }
+    }
     let path = directory.join("mcp.log");
     let mut file = open_private(&path, true)?;
     if file.metadata()?.len() > ROTATE_AFTER {
@@ -114,14 +143,21 @@ fn append_record(directory: &Path, line: &str) -> io::Result<()> {
     file.write_all(line.as_bytes())
 }
 
-pub(super) async fn record(
-    server: std::sync::Arc<str>,
-    level: &str,
-    logger: Option<String>,
-    data: Value,
-) {
-    let line = format_message(Utc::now(), &server, level, logger.as_deref(), &data);
-    let _ = tokio::task::spawn_blocking(move || append_record(&crate::agent_dir(), &line)).await;
+pub(super) async fn record(server: Arc<str>, level: &str, logger: Option<String>, data: Value) {
+    let Ok(permit) = WRITERS.clone().try_acquire_owned() else {
+        return;
+    };
+    let now = Utc::now();
+    let level = level.to_owned();
+    let deadline = Instant::now() + WRITE_BUDGET;
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let line = format_message(now, &server, &level, logger.as_deref(), &data);
+        if Instant::now() < deadline {
+            let _ = append_record(&crate::agent_dir(), &line, deadline);
+        }
+    });
+    let _ = tokio::time::timeout(WRITE_BUDGET, task).await;
 }
 
 #[cfg(test)]
@@ -172,9 +208,36 @@ mod tests {
             .unwrap()
             .set_len(ROTATE_AFTER + 1)
             .unwrap();
-        append_record(home.path(), "first\n").unwrap();
-        append_record(home.path(), "second\n").unwrap();
+        append_record(home.path(), "first\n", Instant::now() + WRITE_BUDGET).unwrap();
+        append_record(home.path(), "second\n", Instant::now() + WRITE_BUDGET).unwrap();
         assert_eq!(fs::metadata(previous).unwrap().len(), ROTATE_AFTER + 1);
         assert_eq!(fs::read_to_string(current).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn a_busy_log_lock_does_not_hold_up_notifications() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = open_private(&home.path().join("mcp.log.lock"), false).unwrap();
+        lock.lock().unwrap();
+        let error =
+            append_record(home.path(), "skip\n", Instant::now() + WRITE_BUDGET).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!home.path().join("mcp.log").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn makes_existing_logs_private_before_appending() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("mcp.log");
+        fs::write(&log, "existing\n").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        append_record(home.path(), "append\n", Instant::now() + WRITE_BUDGET).unwrap();
+        assert_eq!(
+            fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(log).unwrap(), "existing\nappend\n");
     }
 }
