@@ -88,6 +88,8 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
     let mut models = args.model_profiles.model_ids(&provider);
     let mut probe_details = false;
     let bundled = provider.id() == "azure"
+        || (provider.id() == "cloudflare-ai-gateway"
+            && super::cloudflare_gateway::Route::is_endpoint(args.endpoint_for(&provider)))
         || (provider.id() == "cloudflare-workers-ai"
             && super::model_profiles::cloudflare_workers_chat_account(
                 args.endpoint_for(&provider),

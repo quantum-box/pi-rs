@@ -17,6 +17,7 @@ pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
     revision: String,
     cloudflare_saved_account: Option<String>,
+    cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
     radius_endpoint: Option<String>,
     azure_api_version: Option<String>,
     azure_deployments: BTreeMap<String, String>,
@@ -854,6 +855,7 @@ impl Profiles {
         let mut profiles = Self::parse_with_provider_environment(
             &mut data,
             keys.cloudflare_chat_account().or(account.as_deref()),
+            keys.cloudflare_gateway_route(),
             |name| std::env::var(name).ok(),
         )?;
         profiles.cloudflare_saved_account = keys.cloudflare_chat_account().map(str::to_owned);
@@ -883,16 +885,17 @@ impl Profiles {
         data: &mut Value,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
-        Self::parse_with_provider_environment(data, None, env)
+        Self::parse_with_provider_environment(data, None, None, env)
     }
 
     fn parse_with_provider_environment(
         data: &mut Value,
         account: Option<&str>,
+        gateway: Option<super::cloudflare_gateway::Route>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         configure_azure(data, &env)?;
-        let mut profiles = Self::parse_with_cloudflare_account(data, account)?;
+        let mut profiles = Self::parse_with_cloudflare_routes(data, account, gateway)?;
         profiles.azure_api_version =
             env("AZURE_OPENAI_API_VERSION").filter(|value| !value.is_empty());
         if let Some(mapping) = env("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
@@ -907,10 +910,23 @@ impl Profiles {
 
     #[cfg(test)]
     pub(super) fn parse(data: &Value) -> Result<Self> {
-        Self::parse_with_cloudflare_account(data, None)
+        Self::parse_with_cloudflare_routes(data, None, None)
     }
 
+    #[cfg(test)]
     fn parse_with_cloudflare_account(data: &Value, account: Option<&str>) -> Result<Self> {
+        Self::parse_with_cloudflare_routes(data, account, None)
+    }
+
+    pub(super) fn cloudflare_gateway_route(&self) -> Option<&super::cloudflare_gateway::Route> {
+        self.cloudflare_gateway_route.as_ref()
+    }
+
+    pub(super) fn parse_with_cloudflare_routes(
+        data: &Value,
+        account: Option<&str>,
+        cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
+    ) -> Result<Self> {
         let empty = serde_json::Map::new();
         let providers = match data.get("providers") {
             Some(providers) => providers
@@ -922,6 +938,33 @@ impl Profiles {
         let operations = super::operation_models::Catalogue::parse(configured_providers)?;
         let mut providers = configured_providers.clone();
         configure_cloudflare_workers(&mut providers, account)?;
+        if let Some(route) = &cloudflare_gateway_route {
+            let name = providers
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case("cloudflare-ai-gateway"))
+                .cloned();
+            let entry = providers
+                .entry(name.unwrap_or_else(|| "cloudflare-ai-gateway".into()))
+                .or_insert_with(|| serde_json::json!({}));
+            let entry = entry
+                .as_object_mut()
+                .ok_or_else(|| Error::Config("invalid Cloudflare AI Gateway profile".into()))?;
+            let base = entry.get("baseUrl").and_then(Value::as_str);
+            let routed = match base {
+                None => Some(route.clone()),
+                Some(base) => super::cloudflare_gateway::Route::from_configured(base, Some(route)),
+            };
+            if let Some(route) = routed {
+                entry.insert(
+                    "baseUrl".into(),
+                    Value::String(
+                        route
+                            .endpoint(Adapter::ChatCompletions)
+                            .expect("supported gateway API"),
+                    ),
+                );
+            }
+        }
 
         let mut entries = BTreeMap::new();
         for (name, entry) in &providers {
@@ -1113,6 +1156,7 @@ impl Profiles {
             entries,
             revision,
             cloudflare_saved_account: None,
+            cloudflare_gateway_route,
             radius_endpoint: None,
             azure_api_version: None,
             azure_deployments: BTreeMap::new(),
@@ -1688,6 +1732,13 @@ fn parse_azure_deployments(mapping: &str) -> BTreeMap<String, String> {
 
 fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Result<String> {
     let invalid = || Error::Config(format!("invalid models.json baseUrl for {}", provider.id()));
+    if provider.id() == "cloudflare-ai-gateway"
+        && let Some(endpoint) = super::cloudflare_gateway::Route::from_endpoint(base)
+            .and_then(|route| route.endpoint(adapter))
+    {
+        return Ok(endpoint);
+    }
+
     let mut url = reqwest::Url::parse(base).map_err(|_| invalid())?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))

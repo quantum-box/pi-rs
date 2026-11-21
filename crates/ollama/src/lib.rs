@@ -292,10 +292,12 @@ impl Ollama {
     }
 
     fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = if let Some(token) = &self.token {
-            request.bearer_auth(token)
-        } else {
-            request
+        let request = match (&self.token, self.provider.as_ref()) {
+            (Some(token), "cloudflare-ai-gateway") => {
+                request.header("cf-aig-authorization", format!("Bearer {token}"))
+            }
+            (Some(token), _) => request.bearer_auth(token),
+            (None, _) => request,
         };
         request.headers(self.headers.clone())
     }

@@ -44,6 +44,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
+        id: "cloudflare-ai-gateway",
+        endpoint: "",
+        env: "CLOUDFLARE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "cloudflare-workers-ai",
         endpoint: "",
         env: "CLOUDFLARE_API_KEY",
@@ -283,6 +289,10 @@ impl Builtin {
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
             (_, "azure") => None,
+            (
+                Adapter::ChatCompletions | Adapter::Anthropic | Adapter::OpenAiResponses,
+                "cloudflare-ai-gateway",
+            ) => Some(""),
             (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)

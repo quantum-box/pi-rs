@@ -555,6 +555,10 @@ impl OpenAiResponses {
                 headers.insert("api-key", key);
             }
             Ok(request.headers(headers).query(&[("api-version", version)]))
+        } else if self.provider == "cloudflare-ai-gateway" {
+            Ok(request
+                .headers(headers)
+                .header("cf-aig-authorization", format!("Bearer {}", self.token)))
         } else {
             Ok(request.headers(headers).bearer_auth(&self.token))
         }

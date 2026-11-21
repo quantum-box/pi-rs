@@ -204,6 +204,11 @@ impl Provider {
                 )?))
             }
             Adapter::ChatCompletions => {
+                if self.id() == "cloudflare-ai-gateway" && endpoint.is_empty() {
+                    return Err(Error::Config(
+                        "set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_GATEWAY_ID for cloudflare-ai-gateway".into(),
+                    ));
+                }
                 if self.id() == "cloudflare-workers-ai" && endpoint.is_empty() {
                     return Err(Error::Config(
                         "set CLOUDFLARE_ACCOUNT_ID for cloudflare-workers-ai".into(),
@@ -212,6 +217,8 @@ impl Provider {
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
                     && (builtin.endpoint() == endpoint
+                        || (self.id() == "cloudflare-ai-gateway"
+                            && super::cloudflare_gateway::Route::is_endpoint(endpoint))
                         || (self.id() == "cloudflare-workers-ai"
                             && super::model_profiles::cloudflare_workers_chat_account(endpoint)
                                 .is_some()))
@@ -228,7 +235,9 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                let mut client = if self.id() == "cloudflare-ai-gateway" {
+                    Anthropic::with_cloudflare_gateway_token(endpoint, &token)?
+                } else if self == &Self::Anthropic && token.contains("sk-ant-oat") {
                     Anthropic::with_oauth_token(endpoint, &token)?
                 } else if bearer
                     || matches!(
