@@ -10,7 +10,7 @@ pub(super) enum TurnPreparation {
         state: Option<crate::ExtensionState>,
         guard: tokio_util::sync::DropGuard,
     },
-    Skipped(String),
+    Skipped(Outcome),
 }
 
 enum TurnNormalized {
@@ -18,7 +18,86 @@ enum TurnNormalized {
         tool: Arc<RegisteredTool>,
         args: serde_json::Value,
     },
-    Skipped(String),
+    Skipped(Outcome),
+}
+
+impl TurnNormalized {
+    fn skipped(reason: impl Into<String>) -> Self {
+        Self::Skipped(Outcome::Skipped(reason.into()))
+    }
+}
+
+fn pi_argument_diagnostic(
+    tool: &RegisteredTool,
+    input: &serde_json::Value,
+    prepared: &serde_json::Value,
+) -> String {
+    use jsonschema::error::{TypeKind, ValidationErrorKind as Kind};
+    use std::fmt::Write as _;
+
+    let mut output = format!("Validation failed for tool \"{}\":", tool.spec.name);
+    let mut errors: Vec<_> = tool.validator.iter_errors(prepared).collect();
+    errors.sort_by_key(|error| match error.kind {
+        Kind::Required { .. } => 0,
+        Kind::AdditionalProperties { .. } => 2,
+        _ => 1,
+    });
+    for error in errors {
+        let pointer = error.instance_path.to_string();
+        let path = pointer.strip_prefix('/').map(|pointer| {
+            pointer
+                .split('/')
+                .map(|part| part.replace("~1", "/").replace("~0", "~"))
+                .collect::<Vec<_>>()
+                .join(".")
+        });
+        let child_path = |key: &str| match &path {
+            Some(path) => format!("{path}.{key}"),
+            None => key.to_owned(),
+        };
+        let diagnostic = match &error.kind {
+            Kind::Required { property } => {
+                if let Some(property) = property.as_str() {
+                    let _ = write!(output, "\n  - {}: missing", child_path(property));
+                }
+                continue;
+            }
+            Kind::AdditionalProperties { unexpected } => {
+                for property in unexpected {
+                    let _ = write!(output, "\n  - {}: unknown field", child_path(property));
+                }
+                continue;
+            }
+            Kind::Type {
+                kind: TypeKind::Single(kind),
+            } => {
+                let actual = match error.instance.as_ref() {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                };
+                format!("expected {kind}, got {actual}")
+            }
+            Kind::Minimum { limit } => format!("expected >= {limit}"),
+            Kind::Maximum { limit } => format!("expected <= {limit}"),
+            Kind::ExclusiveMinimum { limit } => format!("expected > {limit}"),
+            Kind::ExclusiveMaximum { limit } => format!("expected < {limit}"),
+            Kind::MinLength { limit } => format!("expected at least {limit} characters"),
+            Kind::MinItems { limit } => format!("expected at least {limit} items"),
+            _ => error.masked().to_string(),
+        };
+        let _ = write!(
+            output,
+            "\n  - {}: {diagnostic}",
+            path.as_deref().unwrap_or("root")
+        );
+    }
+    let input = serde_json::to_string_pretty(input).expect("JSON argument values serialize");
+    let _ = write!(output, "\n\nReceived arguments:\n{input}");
+    output
 }
 
 // A validated decision alone is not sufficient authorization: callers must
@@ -1680,8 +1759,8 @@ impl Agent<'_> {
             .filter(|_| advertised.contains(&call.name))
             .cloned()
         else {
-            return Ok(TurnNormalized::Skipped(
-                "tool is not registered or advertised".into(),
+            return Ok(TurnNormalized::skipped(
+                "tool is not registered or advertised",
             ));
         };
         let validated = decision
@@ -1698,7 +1777,7 @@ impl Agent<'_> {
         let args = match turn_model_arguments(invocation, validated.as_ref()) {
             Ok(arguments) => arguments,
             Err(error) => {
-                return Ok(TurnNormalized::Skipped(format!(
+                return Ok(TurnNormalized::skipped(format!(
                     "Invalid arguments for tool \"{}\": {error}",
                     call.name
                 )));
@@ -1714,14 +1793,23 @@ impl Agent<'_> {
             _ = cancel.cancelled() => return Err(Error::Cancelled),
             result = platform_time::timeout(tool_timeout, tool.tool.prepare_arguments(args)) => match result {
                 Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
-                Ok(Ok(_)) => return Ok(TurnNormalized::Skipped("prepared arguments exceed size limit".into())),
-                Ok(Err(error)) => return Ok(TurnNormalized::Skipped(format!("argument preparation failed: {error}"))),
-                Err(_) => return Ok(TurnNormalized::Skipped("argument preparation timed out".into())),
+                Ok(Ok(_)) => return Ok(TurnNormalized::skipped("prepared arguments exceed size limit")),
+                Ok(Err(error)) => return Ok(TurnNormalized::skipped(format!("argument preparation failed: {error}"))),
+                Err(_) => return Ok(TurnNormalized::skipped("argument preparation timed out")),
             },
         };
         if !tool.validator.is_valid(&args) {
-            return Ok(TurnNormalized::Skipped(
-                "arguments do not match the tool's JSON Schema".into(),
+            if tool.tool.pi_argument_diagnostics()
+                && let Ok(input) = turn_model_arguments(invocation, None)
+            {
+                return Ok(TurnNormalized::Skipped(Outcome::TextResult {
+                    output: pi_argument_diagnostic(&tool, &input, &args),
+                    details: Some(serde_json::json!({})),
+                    is_error: true,
+                }));
+            }
+            return Ok(TurnNormalized::skipped(
+                "arguments do not match the tool's JSON Schema",
             ));
         }
         Ok(TurnNormalized::Ready { tool, args })
@@ -1738,7 +1826,7 @@ impl Agent<'_> {
     ) -> Result<TurnPreparation> {
         let (tool, mut args) = match normalized {
             TurnNormalized::Ready { tool, args } => (tool, args),
-            TurnNormalized::Skipped(reason) => return Ok(TurnPreparation::Skipped(reason)),
+            TurnNormalized::Skipped(outcome) => return Ok(TurnPreparation::Skipped(outcome)),
         };
         let call = &invocation.call;
         let cancellation = cancel.child_token();
@@ -1761,7 +1849,7 @@ impl Agent<'_> {
                 context,
                 guard,
             },
-            Decision::Deny(reason) => TurnPreparation::Skipped(reason),
+            Decision::Deny(reason) => TurnPreparation::Skipped(Outcome::Skipped(reason)),
         })
     }
 
@@ -1845,7 +1933,7 @@ impl Agent<'_> {
                 state,
                 guard,
             } => (tool, args, context, state, guard),
-            TurnPreparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
+            TurnPreparation::Skipped(outcome) => return outcome.into(),
         };
         let timeout = if omit_default_tool_timeout && !tool.tool.use_default_timeout() {
             None
@@ -2555,17 +2643,18 @@ impl Agent<'_> {
                             errors.push((extension.to_owned(), event, message.to_owned()));
                         }
                     };
-                    let replaced = Self::turn_transform(
-                        &registry,
-                        timeout,
-                        &invocation,
-                        &mut reply,
-                        &snapshot,
-                        &cancel,
-                        &mut collect,
-                        Some(hook_host),
-                    )
-                    .await;
+                    let replaced = duration.is_some()
+                        && Self::turn_transform(
+                            &registry,
+                            timeout,
+                            &invocation,
+                            &mut reply,
+                            &snapshot,
+                            &cancel,
+                            &mut collect,
+                            Some(hook_host),
+                        )
+                        .await;
                     TurnEvent::Transformed(index, reply, duration, errors, replaced)
                 }
                 .boxed();
@@ -2728,7 +2817,8 @@ impl Agent<'_> {
                     }
                     TurnEvent::Transformed(index, reply, duration, errors, replaced) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
-                        let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), !replaced, duration);
+                        let allow_event_metadata = duration.is_some() && !replaced;
+                        let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), allow_event_metadata, duration);
                         let outcome = session.operations().into_iter().find_map(|(invocation,state)| if invocation.operation_id == calls[index].invocation.operation_id { if let OperationState::Finished(outcome) = state { Some(outcome) } else { None } } else { None }).unwrap_or_else(|| Outcome::Unknown("tool produced no durable result".into()));
                         if matches!(&finished, Err(Error::PendingOperation(_)))
                             && let Outcome::Pending { reference } = &outcome

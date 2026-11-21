@@ -24,6 +24,13 @@ impl Model for Script {
                     json!({"path": "missing", "pattern": "match"}),
                 ),
                 ("read-offset", "read", json!({"path": "a", "offset": 9})),
+                ("ls-invalid", "ls", json!({"limit": " true "})),
+                ("read-missing", "read", json!({})),
+                (
+                    "grep-invalid",
+                    "grep",
+                    json!({"literal":"maybe","limit":"bad"}),
+                ),
                 ("find-float", "find", json!({"pattern":"*", "limit": 1.0})),
                 ("find-zero", "find", json!({"pattern":"*", "limit": 0})),
                 ("find-negative", "find", json!({"pattern":"*", "limit": -1})),
@@ -129,6 +136,38 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
             "{call_id}: {:?}",
             tool_results[call_id]
         );
+    }
+    for (call_id, diagnostic) in [
+        (
+            "ls-invalid",
+            "Validation failed for tool \"ls\":\n  - limit: expected number, got string\n\nReceived arguments:\n{\n  \"limit\": \" true \"\n}",
+        ),
+        (
+            "read-missing",
+            "Validation failed for tool \"read\":\n  - path: missing\n\nReceived arguments:\n{}",
+        ),
+        (
+            "grep-invalid",
+            "Validation failed for tool \"grep\":\n  - pattern: missing\n  - literal: expected boolean, got string\n  - limit: expected number, got string\n\nReceived arguments:\n{\n  \"literal\": \"maybe\",\n  \"limit\": \"bad\"\n}",
+        ),
+    ] {
+        let (invocation, state) = session
+            .operations()
+            .into_iter()
+            .find(|(invocation, _)| invocation.call.id == call_id)
+            .expect("the rejected call has a durable result");
+        assert_eq!(
+            state,
+            OperationState::Finished(Outcome::TextResult {
+                output: diagnostic.into(),
+                details: Some(json!({})),
+                is_error: true,
+            })
+        );
+        assert!(!session.records().iter().any(|record| matches!(
+            record.event,
+            Event::ToolStarted { operation_id, .. } if operation_id == invocation.operation_id
+        )));
     }
     let requests = model.0.lock().unwrap();
     let replies: std::collections::HashMap<_, _> = requests[1]

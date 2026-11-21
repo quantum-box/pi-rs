@@ -707,6 +707,11 @@ pub trait Tool: Send + Sync {
     fn output_limit(&self) -> usize {
         1024 * 1024
     }
+    /// Use Pi's field-level diagnostic when model arguments fail schema validation.
+    fn pi_argument_diagnostics(&self) -> bool {
+        false
+    }
+
     /// Normalize model arguments before schema validation and policy checks.
     async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
         Ok(arguments)
