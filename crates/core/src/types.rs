@@ -828,6 +828,12 @@ pub trait Model: Send + Sync {
     async fn context_window(&self, _model: &str) -> Option<u32> {
         None
     }
+
+    /// Smallest positive output budget accepted by this adapter.
+    fn minimum_output_tokens(&self) -> u32 {
+        1
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream>;
 
     /// Host adapters can reserve budget using this ID before calling a provider.

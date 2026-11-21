@@ -85,6 +85,7 @@ pub struct OpenAiResponses {
     session_affinity_format: Option<SessionAffinityFormat>,
     prompt_cache_key_enabled: bool,
     strict_tool_support: bool,
+    send_max_output_tokens: bool,
     grammar_tool_support: bool,
     use_developer_role: bool,
 }
@@ -339,6 +340,7 @@ impl OpenAiResponses {
             session_affinity_format: None,
             prompt_cache_key_enabled: true,
             strict_tool_support: false,
+            send_max_output_tokens: true,
             grammar_tool_support: false,
             use_developer_role: false,
         })
@@ -370,6 +372,12 @@ impl OpenAiResponses {
     pub fn with_cache_retention(mut self, retention: CacheRetention, explicit_mode: bool) -> Self {
         self.cache_retention = retention;
         self.explicit_cache_mode = explicit_mode;
+        self
+    }
+
+    /// Omit the output limit for Responses-compatible endpoints that reject it.
+    pub fn with_max_output_tokens_field(mut self, enabled: bool) -> Self {
+        self.send_max_output_tokens = enabled;
         self
     }
 
@@ -777,6 +785,9 @@ fn responses_payload(
     } else {
         json!({"model":request.model, "input":input, "store":false, "stream":true, "max_output_tokens":request.max_output_tokens})
     };
+    if codex && request.max_output_tokens != 0 {
+        body["max_output_tokens"] = json!(request.max_output_tokens);
+    }
     if !request.tools.is_empty() {
         let tools: Vec<_> = request.tools.iter().map(|tool| json!({"type":"function", "name":tool.name, "description":tool.description, "parameters":tool.parameters, "strict":false})).collect();
         body["tools"] = if provider == "openai-chatgpt" {
@@ -909,6 +920,14 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn minimum_output_tokens(&self) -> u32 {
+        if self.codex_account.is_some() && self.send_max_output_tokens {
+            16
+        } else {
+            1
+        }
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -989,6 +1008,16 @@ impl Model for OpenAiResponses {
             })
         } else {
             base
+        };
+        let base = if self.send_max_output_tokens {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "responses-without-max-output-tokens",
+                ))
+            })
         };
         let base = if self.prompt_cache_key_enabled {
             base
@@ -1154,6 +1183,75 @@ impl Model for OpenAiResponses {
     }
 }
 
+fn limit_visible_output(
+    mut stream: pi_rs_core::EnrichedModelStream,
+    allowance: u32,
+) -> pi_rs_core::EnrichedModelStream {
+    use pi_rs_core::EnrichedModelEvent::{
+        Legacy, ReasoningDelta, ReasoningEnd, TextDelta, TextEnd,
+    };
+    Box::pin(async_stream::try_stream! {
+        // The provider's tokenizer is unknown. This is a runaway output guard,
+        // not a token counter. The agent uses reported usage for accounting.
+        let limit = u64::from(allowance).saturating_mul(128);
+        let mut streamed_units = 0_u64;
+        let mut legacy_text_units = 0_u64;
+        let mut text = BTreeMap::new();
+        let mut reasoning = BTreeMap::new();
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            let units = |text: &str| text.encode_utf16().count() as u64;
+            let observe = |parts: &mut BTreeMap<u64, u64>, index, content: &str, final_block| {
+                let previous = parts.entry(index).or_default();
+                let observed = units(content);
+                let next = if final_block { observed } else { previous.saturating_add(observed) };
+                let added = next.saturating_sub(*previous);
+                *previous = next;
+                added
+            };
+            match &event {
+                TextDelta { index, delta } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut text, *index, delta, false));
+                }
+                TextEnd { index, content } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut text, *index, content, true));
+                }
+                ReasoningDelta { index, delta } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut reasoning, *index, delta, false));
+                }
+                ReasoningEnd { index, content } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut reasoning, *index, content, true));
+                }
+                Legacy(ModelEvent::Text(delta)) => {
+                    legacy_text_units = legacy_text_units.saturating_add(units(delta));
+                    streamed_units = streamed_units.saturating_add(units(delta));
+                }
+                Legacy(ModelEvent::Reasoning(delta)) => {
+                    streamed_units = streamed_units.saturating_add(units(delta));
+                }
+                Legacy(ModelEvent::ToolCallDelta(delta)) => {
+                    streamed_units = streamed_units
+                        .saturating_add(units(&delta.name))
+                        .saturating_add(units(&delta.arguments));
+                }
+                // Some relays omit usage. Before accepting their final output
+                // or any tool call, check the same estimate Pi uses for text.
+                Legacy(ModelEvent::Complete { calls, usage: None }) => {
+                    let text_units = text.values().fold(legacy_text_units, |sum, units| sum.saturating_add(*units));
+                    if pi_rs_core::estimate_assistant_output_tokens(text_units, calls) > u64::from(allowance) {
+                        Err(Error::Budget)?;
+                    }
+                }
+                _ => {}
+            }
+            if streamed_units > limit {
+                Err(Error::Budget)?;
+            }
+            yield event;
+        }
+    })
+}
+
 impl OpenAiResponses {
     fn stream_only_constrained_tools(
         &self,
@@ -1220,10 +1318,14 @@ impl OpenAiResponses {
         request: ModelRequest,
         tools: Option<ResponsesTools>,
     ) -> Result<pi_rs_core::EnrichedModelStream> {
+        let max_output_tokens = request.max_output_tokens;
         let model = request.model.clone();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
         let api = self.api();
+        if (1..self.minimum_output_tokens()).contains(&max_output_tokens) {
+            return Err(Error::Budget);
+        }
         let mut body = responses_payload(
             &request,
             &self.provider,
@@ -1273,6 +1375,11 @@ impl OpenAiResponses {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
+        if !self.send_max_output_tokens {
+            body.as_object_mut()
+                .expect("Responses request object")
+                .remove("max_output_tokens");
+        }
         self.apply_cache(&mut body);
         let error_secrets = pi_rs_core::provider_error_secrets(
             Some(self.token.as_str()),
@@ -1384,7 +1491,7 @@ impl OpenAiResponses {
             if !pending.is_empty() { yield Ok(pending); }
         };
         let mut source = Box::pin(bytes.eventsource());
-        Ok(Box::pin(async_stream::try_stream! {
+        let stream: pi_rs_core::EnrichedModelStream = Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
             let mut grammar_inputs: BTreeMap<u64, grammar::Input> = BTreeMap::new();
@@ -1577,7 +1684,12 @@ impl OpenAiResponses {
             } else {
                 Err(Error::Model("invalid OpenAI event stream".into()))?;
             }
-        }))
+        });
+        if self.send_max_output_tokens {
+            Ok(stream)
+        } else {
+            Ok(limit_visible_output(stream, max_output_tokens))
+        }
     }
 }
 
@@ -1627,7 +1739,7 @@ mod tests {
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
             assert_eq!(body["reasoning"], json!({"effort":"none"}));
             assert_eq!(body["tool_choice"], "auto");
-            assert!(body.get("max_output_tokens").is_none());
+            assert_eq!(body["max_output_tokens"], 16);
             let response = format!(
                 "data: {}\n\n",
                 json!({"type":"response.done", "response":{"status":"completed", "output":[]}})
@@ -1656,8 +1768,17 @@ mod tests {
                 },
             ],
             tools: vec![],
-            max_output_tokens: 64,
+            max_output_tokens: 16,
         };
+        assert!(matches!(
+            client
+                .stream(ModelRequest {
+                    max_output_tokens: 4,
+                    ..request.clone()
+                })
+                .await,
+            Err(Error::Budget)
+        ));
         let events = client
             .stream(request)
             .await
@@ -1675,6 +1796,143 @@ mod tests {
             Some(Ok(ModelEvent::Complete { .. }))
         ));
         worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_without_a_wire_limit_bound_runaway_output() {
+        use pi_rs_core::EnrichedModelEvent::{TextDelta, TextEnd};
+        let events = vec![
+            Ok(TextDelta {
+                index: 0,
+                delta: "four".into(),
+            }),
+            Ok(TextEnd {
+                index: 0,
+                content: "four".into(),
+            }),
+            Ok(TextDelta {
+                index: 1,
+                delta: "x".repeat(260),
+            }),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(events)), 2);
+        assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
+        assert!(matches!(stream.next().await, Some(Ok(TextEnd { .. }))));
+        assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let replaced_text = [
+            Ok(TextDelta {
+                index: 0,
+                delta: "moderately long".into(),
+            }),
+            Ok(TextEnd {
+                index: 0,
+                content: "yes".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream =
+            limit_visible_output(Box::pin(futures_util::stream::iter(replaced_text)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+
+        let with_thought = [
+            Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta {
+                index: 0,
+                delta: "reasoning summary".into(),
+            }),
+            Ok(TextDelta {
+                index: 0,
+                delta: "four".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream =
+            limit_visible_output(Box::pin(futures_util::stream::iter(with_thought)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+
+        let unreported = [
+            Ok(TextDelta {
+                index: 0,
+                delta: "moderately long".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(unreported)), 2);
+        assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
+        assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let call = ToolCall {
+            id: "fixture".into(),
+            name: "t".into(),
+            arguments: format!("{{{}}}", " ".repeat(40)),
+        };
+        let formatted = [
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::ToolCallDelta(ToolCallDelta {
+                    index: 0,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                }),
+            )),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![call],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(formatted)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+
+        let completion = pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+            calls: vec![],
+            usage: Some(Usage {
+                input_tokens: 1,
+                output_tokens: 32,
+            }),
+        });
+        let reported = [
+            Ok(TextDelta {
+                index: 0,
+                delta: "moderately long".into(),
+            }),
+            Ok(completion),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(reported)), 2);
+        assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    usage: Some(Usage {
+                        output_tokens: 32,
+                        ..
+                    }),
+                    ..
+                }
+            )))
+        ));
     }
 
     #[tokio::test]
