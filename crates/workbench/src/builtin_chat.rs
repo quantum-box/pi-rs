@@ -38,6 +38,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
+        id: "cloudflare-workers-ai",
+        endpoint: "",
+        env: "CLOUDFLARE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "deepseek",
         endpoint: "https://api.deepseek.com/chat/completions",
         env: "DEEPSEEK_API_KEY",
@@ -52,6 +58,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         endpoint: "https://api.fireworks.ai/inference/v1/chat/completions",
         env: "FIREWORKS_API_KEY",
         compatibility: standard,
+    },
+    Builtin {
+        id: "github-copilot",
+        endpoint: "https://api.individual.githubcopilot.com/chat/completions",
+        env: "COPILOT_GITHUB_TOKEN",
+        compatibility: || json!({}),
     },
     Builtin {
         id: "groq",
@@ -112,6 +124,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "nvidia",
         endpoint: "https://integrate.api.nvidia.com/v1/chat/completions",
         env: "NVIDIA_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
+        id: "openai-codex",
+        endpoint: pi_rs::openai::CODEX_ENDPOINT,
+        env: "",
         compatibility: || json!({}),
     },
     Builtin {
@@ -244,6 +262,7 @@ impl Builtin {
             id: Arc::from(self.id),
             adapter: match self.id {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
+                "openai-codex" => Adapter::CodexResponses,
                 "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
             },
@@ -256,11 +275,18 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
+            (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
                 if !matches!(
                     id,
-                    "openai" | "xai" | "meta" | "minimax" | "minimax-cn" | "vercel-ai-gateway"
+                    "openai"
+                        | "xai"
+                        | "meta"
+                        | "openai-codex"
+                        | "minimax"
+                        | "minimax-cn"
+                        | "vercel-ai-gateway"
                 ) =>
             {
                 Some(self.endpoint)
@@ -270,6 +296,12 @@ impl Builtin {
             }
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
+            }
+            (Adapter::Anthropic, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/v1/messages")
+            }
+            (Adapter::OpenAiResponses, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/responses")
             }
             (Adapter::OpenAiResponses, "opencode") => {
                 Some("https://opencode.ai/inference/openai/v1/responses")
@@ -293,14 +325,15 @@ impl Builtin {
     }
 
     pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
-        self.endpoint == endpoint
-            || [
-                Adapter::Anthropic,
-                Adapter::Google,
-                Adapter::OpenAiResponses,
-            ]
-            .into_iter()
-            .any(|adapter| self.endpoint_for(adapter) == Some(endpoint))
+        !endpoint.is_empty()
+            && (self.endpoint == endpoint
+                || [
+                    Adapter::Anthropic,
+                    Adapter::Google,
+                    Adapter::OpenAiResponses,
+                ]
+                .into_iter()
+                .any(|adapter| self.endpoint_for(adapter) == Some(endpoint)))
     }
 
     pub fn env(&self) -> &'static str {

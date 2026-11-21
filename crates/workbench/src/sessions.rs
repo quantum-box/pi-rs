@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use pi_rs::{Error, Event, Result, Session};
+use pi_rs::{Error, Event, Record, Result, Session};
 use serde::Serialize;
 
 pub fn validate_name(value: &str) -> std::result::Result<String, String> {
@@ -869,6 +869,58 @@ pub fn copy_last(session: &Session) -> Result<()> {
     copy_text(&text)
 }
 
+pub(super) fn tree_context_text(content: &pi_rs::ContextContent) -> std::borrow::Cow<'_, str> {
+    match content {
+        pi_rs::ContextContent::Text(text) => std::borrow::Cow::Borrowed(text),
+        pi_rs::ContextContent::Blocks(blocks) => std::borrow::Cow::Owned(
+            blocks
+                .iter()
+                .filter_map(|block| match block {
+                    pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        ),
+    }
+}
+
+pub(super) fn tree_assistant_completion<'a>(
+    session: &'a Session,
+    assistant: &Record,
+) -> Option<&'a Record> {
+    let Event::Assistant {
+        request_id: Some(request_id),
+        ..
+    } = &assistant.event
+    else {
+        return None;
+    };
+    let parent = tree_parent(session, assistant)?;
+    matches!(parent.event, Event::ModelFinished { request_id: id, .. } if id == *request_id)
+        .then_some(parent)
+}
+
+pub(super) fn tree_completion_error<'a>(
+    session: &'a Session,
+    completion: &Record,
+) -> Option<&'a str> {
+    let source = tree_parent(session, completion)?;
+    let Event::SourceEntry { format, entry } = &source.event else {
+        return None;
+    };
+    if format == "pi" && entry["message"]["role"] == "assistant" {
+        entry["message"]["errorMessage"].as_str()
+    } else {
+        None
+    }
+}
+
+fn tree_parent<'a>(session: &'a Session, record: &Record) -> Option<&'a Record> {
+    session
+        .records()
+        .get(record.parent?.checked_sub(1)? as usize)
+}
+
 pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
     use std::borrow::Cow;
 
@@ -877,9 +929,18 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
         .get(id.saturating_sub(1) as usize)
         .filter(|record| record.id == id)
         .and_then(|record| match &record.event {
-            Event::User { content, .. }
-            | Event::UserWithImages { content, .. }
-            | Event::Assistant { content, .. } => Some(Cow::Borrowed(content.as_str())),
+            Event::User { content, .. } | Event::UserWithImages { content, .. } => {
+                Some(Cow::Borrowed(content.as_str()))
+            }
+            Event::Assistant { content, .. } => {
+                if content.is_empty() {
+                    tree_assistant_completion(session, record)
+                        .and_then(|completion| tree_completion_error(session, completion))
+                        .map(Cow::Borrowed)
+                } else {
+                    Some(Cow::Borrowed(content.as_str()))
+                }
+            }
             Event::BashExecution { execution } => Some(Cow::Borrowed(execution.command.as_str())),
             Event::ToolFinished {
                 outcome:
@@ -901,7 +962,7 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                             .filter(|block| block["type"] == "text")
                             .filter_map(|block| block["text"].as_str())
                             .collect::<Vec<_>>()
-                            .join("\n"),
+                            .concat(),
                     )
                 })
                 .or_else(|| data["output"].as_str().map(Cow::Borrowed)),
@@ -909,26 +970,25 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                 Some(Cow::Owned(outcome.tool_content()))
             }
             Event::ImportedUnattributedToolResult { content, .. } => {
-                Some(Cow::Owned(match content {
-                    pi_rs::ContextContent::Text(text) => text.clone(),
-                    pi_rs::ContextContent::Blocks(blocks) => blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                }))
+                Some(tree_context_text(content))
+            }
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
+                Some(tree_context_text(&message.content))
             }
             Event::ModelFinished {
                 failure: Some(_),
                 partial,
                 ..
-            } => Some(Cow::Borrowed(partial.as_str())),
-            Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
-                Some(Cow::Borrowed(summary.as_str()))
+            } => {
+                if partial.is_empty() {
+                    tree_completion_error(session, record).map(Cow::Borrowed)
+                } else {
+                    Some(Cow::Borrowed(partial.as_str()))
+                }
             }
+            Event::Compacted { summary, .. }
+            | Event::CompactionSummaryMessage { summary, .. }
+            | Event::BranchSummary { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
             _ => None,
         })
         .filter(|text| !text.trim().is_empty())

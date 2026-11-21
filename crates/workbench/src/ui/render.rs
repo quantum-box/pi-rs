@@ -261,6 +261,7 @@ pub enum SummaryKind {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    ModelCycleStatus(String),
     Warning(String),
     User(String),
     Skill {
@@ -273,8 +274,10 @@ pub enum Entry {
         expanded: Option<bool>,
     },
     CustomMessage {
+        id: u64,
         custom_type: String,
         text: String,
+        rendered: Option<pi_rs::RenderedCustomMessage>,
     },
     Summary {
         id: u64,
@@ -326,6 +329,17 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
+            Self::ModelCycleStatus(text) => {
+                let mut lines = vec![Line::default()];
+                let inset = usize::from(width >= 3);
+                lines.extend(wrap(&[Span::themed(text, theme, "dim")], width - 2 * inset));
+                if inset != 0 {
+                    for line in &mut lines[1..] {
+                        line.spans.insert(0, Span::themed(" ", theme, "dim"));
+                    }
+                }
+                return lines;
+            }
             Self::Warning(text) => {
                 return wrap(&[Span::themed(text, theme, "warning")], width);
             }
@@ -384,7 +398,27 @@ impl Entry {
                 lines.push(Line::default());
                 lines
             }
-            Self::CustomMessage { custom_type, text } => {
+            Self::CustomMessage {
+                rendered: Some(rendered),
+                ..
+            } => {
+                let pad = rendered.padding.min(width.saturating_sub(1) / 2);
+                let inner = width.saturating_sub(2 * pad).max(1);
+                let mut lines = vec![Line::default()];
+                let padding = " ".repeat(pad);
+                let background = rendered.background.as_deref().map(|role| theme.color(role));
+                for mut row in component_lines(&rendered.lines, theme, inner) {
+                    if pad != 0 && !row.spans.is_empty() {
+                        row.spans.insert(0, Span::new(&padding, Color::Reset));
+                    }
+                    row.background = background;
+                    lines.push(row);
+                }
+                return lines;
+            }
+            Self::CustomMessage {
+                custom_type, text, ..
+            } => {
                 let mut label =
                     Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
                 label.bold = true;
@@ -606,6 +640,31 @@ impl Entry {
         lines
     }
 }
+pub(super) fn component_lines(
+    lines: &[Vec<pi_rs::UiComponentSpan>],
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line> {
+    lines
+        .iter()
+        .flat_map(|line| {
+            let spans: Vec<_> = line
+                .iter()
+                .map(|span| {
+                    let mut rendered =
+                        Span::themed(&span.text, theme, span.color.as_deref().unwrap_or("text"));
+                    rendered.bold = span.bold;
+                    rendered.italic = span.italic;
+                    rendered.underline = span.underline;
+                    rendered.inverse = span.inverse;
+                    rendered
+                })
+                .collect();
+            wrap(&spans, width)
+        })
+        .collect()
+}
+
 fn custom_message_base_style(lines: &mut [Line], theme: &Theme) {
     for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
         if span.base_text {
@@ -758,6 +817,140 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
         lines.last_mut().unwrap().spans.push(fragment);
     }
     lines
+}
+
+/// Wrap styled prose at word boundaries and at literal source breaks.
+pub(super) fn wrap_words(spans: &[Span], width: usize) -> Vec<Line> {
+    if spans.iter().any(|span| span.searchable() != span.text) {
+        return wrap(spans, width);
+    }
+    if !spans.iter().any(|span| span.text.contains('\n')) {
+        return wrap_word_row(spans, width);
+    }
+    let mut output = Vec::new();
+    let mut row = Vec::new();
+    for span in spans {
+        for (index, text) in span.text.split('\n').enumerate() {
+            if index > 0 {
+                output.extend(wrap_word_row(&row, width));
+                row.clear();
+            }
+            if !text.is_empty() {
+                let mut fragment = span.clone();
+                fragment.text = text.to_owned();
+                row.push(fragment);
+            }
+        }
+    }
+    output.extend(wrap_word_row(&row, width));
+    output
+}
+
+fn javascript_whitespace(ch: char) -> bool {
+    (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}'
+}
+
+fn wrap_word_row(spans: &[Span], width: usize) -> Vec<Line> {
+    let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+    // Preserve the existing source mapping for search-only controls and
+    // the existing behavior for raw rows that contain an embedded break.
+    if width < 2 || text.contains(['\n', '\r', '\t']) || text.width() <= width {
+        return wrap(spans, width);
+    }
+    let Some(ranges) = wrapped_ranges(&text, width) else {
+        return wrap(spans, width);
+    };
+    let mut span_start = 0;
+    let mut remaining = spans.iter().peekable();
+    ranges
+        .into_iter()
+        .map(|range| {
+            let mut line = Line::default();
+            while let Some(span) = remaining.peek() {
+                let span_end = span_start + span.text.len();
+                let start = range.start.max(span_start);
+                let end = range.end.min(span_end);
+                if start < end {
+                    let mut piece = (*span).clone();
+                    piece.text = span.text[start - span_start..end - span_start].into();
+                    line.spans.push(piece);
+                }
+                if span_end > range.end {
+                    break;
+                }
+                remaining.next();
+                span_start = span_end;
+            }
+            line
+        })
+        .collect()
+}
+
+// Pi's Text component wraps on spaces and CJK graphemes. Advance by
+// complete words first, then split a word wider than the available row.
+fn wrapped_ranges(text: &str, width: usize) -> Option<Vec<Range<usize>>> {
+    static CJK: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"[\p{scx:Han}\p{scx:Hiragana}\p{scx:Katakana}\p{scx:Hangul}\p{scx:Bopomofo}]",
+        )
+        .expect("valid CJK script classes")
+    });
+    let is_cjk = |grapheme: &str| !grapheme.is_ascii() && CJK.is_match(grapheme);
+    let trim = |start: usize, end: usize| {
+        start
+            ..start
+                + text[start..end]
+                    .trim_end_matches(javascript_whitespace)
+                    .len()
+    };
+    let mut glyphs = text.grapheme_indices(true).peekable();
+    let mut ranges = Vec::new();
+    let mut row_start = 0;
+    let mut used = 0;
+    while let Some((start, first)) = glyphs.next() {
+        let mut token_width = first.width();
+        if !is_cjk(first) {
+            let space = first == " ";
+            while let Some(&(_, next)) = glyphs.peek() {
+                if (next == " ") != space || is_cjk(next) {
+                    break;
+                }
+                token_width += next.width();
+                glyphs.next();
+            }
+        }
+        let end = glyphs.peek().map_or(text.len(), |&(index, _)| index);
+        let whitespace = text[start..end].chars().all(javascript_whitespace);
+        if used + token_width > width && used > 0 {
+            ranges.push(trim(row_start, start));
+            row_start = start;
+            used = 0;
+            if whitespace {
+                row_start = end;
+                continue;
+            }
+        }
+        if token_width > width && !whitespace {
+            for (offset, glyph) in text[start..end].grapheme_indices(true) {
+                let size = glyph.width();
+                if size > width {
+                    return None;
+                }
+                if used > 0 && used + size > width {
+                    ranges.push(row_start..start + offset);
+                    row_start = start + offset;
+                    used = 0;
+                }
+                used += size;
+            }
+        } else {
+            used += token_width;
+        }
+    }
+    if row_start < text.len() || ranges.is_empty() {
+        ranges.push(trim(row_start, text.len()));
+    }
+    Some(ranges)
 }
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -1513,18 +1706,14 @@ fn markdown_at_depth(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
-    if text.contains('\r') {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        return markdown_at_depth(
-            &normalized,
-            theme,
-            width,
-            depth,
-            mermaid,
-            hyperlinks,
-            preserve_source,
-        );
-    }
+    // Pi expands tabs before lexing Markdown, including fenced code. Use the
+    // same normalized text for block parsing and reference definitions.
+    let normalized = text
+        .contains('\r')
+        .then(|| text.replace("\r\n", "\n").replace('\r', "\n"));
+    let text = normalized.as_deref().unwrap_or(text);
+    let expanded = text.contains('\t').then(|| text.replace('\t', "   "));
+    let text = expanded.as_deref().unwrap_or(text);
     let sanitized = super::math_blocks::reference_source(text);
     let reference_source = sanitized.as_ref();
     markdown_at_depth_with_refs(
@@ -1883,6 +2072,7 @@ fn markdown_plain_at_depth(
         .collect();
     definition_ranges.sort_unstable_by_key(|range| range.start);
     let mut item_prefixes = Vec::new();
+    let mut item_source_indents = Vec::new();
     let mut item_block_ends: Vec<Option<usize>> = Vec::new();
     let mut item_after_math = Vec::new();
     let mut item_reference_scan_work = 0usize;
@@ -2238,6 +2428,8 @@ fn markdown_plain_at_depth(
                 item_block_ends.push(None);
                 item_after_math.push(false);
                 item_prefixes.push(prefix.clone());
+                item_source_indents
+                    .push(super::strike::item_indent(parsed, range.start).unwrap_or(0));
                 spans.push(prefix);
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -2542,18 +2734,34 @@ fn markdown_plain_at_depth(
                 span.strikethrough = strikethrough > 0;
                 spans.push(span);
             }
-            Event::SoftBreak => {
-                if matches!(events.peek(), Some((Event::DisplayMath(_), _))) {
+            Event::SoftBreak | Event::HardBreak => {
+                let soft = matches!(event, Event::SoftBreak);
+                if soft && matches!(events.peek(), Some((Event::DisplayMath(_), _))) {
                     continue;
                 }
-                if let Some((_, label, _)) = links.last_mut() {
-                    label.push(' ');
+                let mut spaces = 0;
+                if !item_source_indents.is_empty()
+                    && !matches!(events.peek(), Some((Event::Text(value), _)) if value.starts_with(' '))
+                {
+                    spaces = list_continuation_spaces(&text[range.end..], &item_source_indents);
                 }
-                let mut span = Span::themed(" ", theme, "text");
-                span.hyperlink = links.last().and_then(|(url, _, _)| {
-                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                });
-                spans.push(span);
+                let mut continuation = String::new();
+                if soft {
+                    continuation.push('\n');
+                } else {
+                    flush(&mut spans, &mut lines, width, item_prefixes.last());
+                }
+                continuation.push_str(&" ".repeat(spaces));
+                if !continuation.is_empty() {
+                    if soft && let Some((_, label, _)) = links.last_mut() {
+                        label.push_str(&continuation);
+                    }
+                    let mut span = Span::themed(continuation, theme, "text");
+                    span.hyperlink = links.last().and_then(|(url, _, _)| {
+                        (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                    });
+                    spans.push(span);
+                }
             }
             Event::End(TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
@@ -2599,6 +2807,7 @@ fn markdown_plain_at_depth(
                     }
                 }
                 item_prefixes.pop();
+                item_source_indents.pop();
                 item_block_ends.pop();
                 item_after_math.pop();
             }
@@ -2610,18 +2819,27 @@ fn markdown_plain_at_depth(
                     *end = Some(range.end);
                 }
             }
-            Event::HardBreak => flush(&mut spans, &mut lines, width, item_prefixes.last()),
             Event::Rule => {
-                flush(&mut spans, &mut lines, width, item_prefixes.last());
-                if lists.is_empty()
-                    && let Some(end) = previous_paragraph_end.take()
-                    && end <= range.start
-                    && text[end..range.start].trim().is_empty()
-                {
-                    lines.push(Line::default());
-                }
-                lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
-                if lists.is_empty() {
+                if let Some(prefix) = item_prefixes.last() {
+                    if spans.as_slice() != [prefix.clone()] {
+                        flush(&mut spans, &mut lines, width, Some(prefix));
+                    }
+                    let indent = prefix.text.width().min(width.saturating_sub(1));
+                    let rule_width = width.saturating_sub(indent).min(80);
+                    spans.push(Span::themed("─".repeat(rule_width), theme, "mdHr"));
+                    flush(&mut spans, &mut lines, width, Some(prefix));
+                    if let Some(end) = item_block_ends.last_mut() {
+                        *end = Some(range.end);
+                    }
+                } else {
+                    flush(&mut spans, &mut lines, width, None);
+                    if let Some(end) = previous_paragraph_end.take()
+                        && end <= range.start
+                        && text[end..range.start].trim().is_empty()
+                    {
+                        lines.push(Line::default());
+                    }
+                    lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
                     last_rule_separator = Some(lines.len());
                     lines.push(Line::default());
                 }
@@ -2653,6 +2871,20 @@ fn markdown_plain_at_depth(
     }
     lines
 }
+// Marked removes each list container's indent only when the source line
+// supplies it. Its text rule then removes up to one extra four-space indent.
+fn list_continuation_spaces(source: &str, indents: &[usize]) -> usize {
+    let trimmed = source.trim_start_matches(' ');
+    if trimmed.is_empty() || trimmed.starts_with(['\n', '\t']) {
+        return 0;
+    }
+    let spaces = source.len() - trimmed.len();
+    let remaining = indents.iter().fold(spaces, |spaces, &indent| {
+        spaces.checked_sub(indent).unwrap_or(spaces)
+    });
+    remaining.checked_sub(4).unwrap_or(remaining)
+}
+
 // Apply the same marker and continuation layout used for inline item text to
 // block renderers, preserving the individual themed spans and link metadata.
 fn prefix_item_block(
@@ -2692,7 +2924,7 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
         } else {
             spans.as_slice()
         };
-        for (index, mut line) in wrap(body, width.saturating_sub(indent))
+        for (index, mut line) in wrap_words(body, width.saturating_sub(indent))
             .into_iter()
             .enumerate()
         {
@@ -2706,7 +2938,7 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
             lines.push(line);
         }
     } else {
-        lines.extend(wrap(spans, width));
+        lines.extend(wrap_words(spans, width));
     }
     spans.clear();
 }
@@ -2901,6 +3133,40 @@ mod tests {
             .flat_map(|i| [format!("paragraph {i}"), String::new()])
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn markdown_expands_tabs_before_parsing_like_pinned_pi() {
+        let theme = Theme::system();
+        let rule = "─".repeat(80);
+        for (source, expected) in [
+            ("a\tb", vec!["a   b"]),
+            ("\t# heading", vec!["heading"]),
+            ("\n\n\t# heading", vec!["", "heading"]),
+            ("\t> quote", vec!["│ quote"]),
+            ("\t---", vec![rule.as_str()]),
+            ("\t```\nx\n```", vec!["```", "  x", "```"]),
+            ("`a\tb`", vec!["a   b"]),
+            ("```\na\tb\n```", vec!["```", "  a   b", "```"]),
+            ("> a\tb", vec!["│ a   b"]),
+            ("- a\tb", vec!["- a   b"]),
+            ("a\tb\r\nc\td", vec!["a   b", "c   d"]),
+            (
+                "[x][r]\n\n[r]:\thttps://example.org",
+                vec!["x (https://example.org)", ""],
+            ),
+        ] {
+            let lines = markdown(source, &theme, 80)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lines, expected, "{source:?}");
+        }
     }
 
     #[test]
@@ -3179,18 +3445,18 @@ mod tests {
             ("> - ~~`a\n>   b`~~", "a b"),
             ("1. ~~`a\n   b`~~", "a b"),
             ("- outer\n  - ~~`a\n    b`~~", "a b"),
-            ("> ~~`a\n>\tb`~~", "a b"),
-            ("-\t~~`a\n\tb`~~", "a b"),
-            ("1.\t~~`a\n\tb`~~", "a b"),
-            ("- ~~`a\n\tb`~~", "a   b"),
-            ("- ~~`a\n \tb`~~", "a    b"),
-            ("- ~~`a\n  \tb`~~", "a b"),
+            ("> ~~`a\n>\tb`~~", "a   b"),
+            ("-\t~~`a\n\tb`~~", "a    b"),
+            ("1.\t~~`a\n\tb`~~", "a    b"),
+            ("- ~~`a\n\tb`~~", "a  b"),
+            ("- ~~`a\n \tb`~~", "a   b"),
+            ("- ~~`a\n  \tb`~~", "a    b"),
             ("- ~~`a\n b`~~", "a  b"),
             (" - ~~`a\n   b`~~", "a b"),
             ("  - ~~`a\n    b`~~", "a b"),
             ("   - ~~`a\n     b`~~", "a b"),
-            ("  - ~~`a\n\tb`~~", "a b"),
-            ("  -\t~~`a\n\tb`~~", "a b"),
+            ("  - ~~`a\n\tb`~~", "a    b"),
+            ("  -\t~~`a\n\tb`~~", "a    b"),
             ("  1. ~~`a\n     b`~~", "a b"),
             ("  - outer\n    - ~~`a\n      b`~~", "a b"),
             (">   - ~~`a\n>     b`~~", "a b"),
@@ -4097,9 +4363,39 @@ mod tests {
     }
 
     #[test]
+    fn extension_message_renderer_controls_padding_colors_and_sanitized_rows() {
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let entry = Entry::CustomMessage {
+            id: 1,
+            custom_type: "card".into(),
+            text: "fallback".into(),
+            rendered: Some(pi_rs::RenderedCustomMessage {
+                lines: vec![vec![pi_rs::UiComponentSpan {
+                    text: "status\u{7}".into(),
+                    color: Some("accent".into()),
+                    bold: true,
+                    ..Default::default()
+                }]],
+                background: Some("customMessageBg".into()),
+                padding: 2,
+            }),
+        };
+        let rows = entry.render(&theme, 40, false, true, TranscriptOptions::default());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].background, None);
+        assert_eq!(rows[1].background, Some(theme.color("customMessageBg")));
+        assert_eq!(rows[1].spans[0].text, "  ");
+        assert_eq!(rows[1].spans[1].text, "status");
+        assert_eq!(rows[1].spans[1].color, theme.color("accent"));
+        assert!(rows[1].spans[1].bold);
+    }
+
+    #[test]
     fn custom_message_uses_markdown_theme_and_safe_terminal_output() {
         let theme = Theme::system();
         let entry = Entry::CustomMessage {
+            id: 1,
+            rendered: None,
             custom_type: "fixture\x1b]bad".into(),
             text: "**bold**\n\nplain \x1b]0;bad\x07text".into(),
         };
@@ -4154,6 +4450,8 @@ mod tests {
         json["colors"]["customMessageText"] = serde_json::json!("#ff0000");
         let theme = Theme::parse(&json.to_string(), None).unwrap();
         let entry = Entry::CustomMessage {
+            id: 1,
+            rendered: None,
             custom_type: "x".into(),
             text: "plain `code`".into(),
         };

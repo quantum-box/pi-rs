@@ -191,7 +191,7 @@ pub struct CustomEntryRecord {
     pub entry: CustomEntry,
 }
 
-fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<Value>, D::Error> {
     serde::Deserialize::deserialize(deserializer).map(Some)
@@ -1427,6 +1427,38 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Custom message types this extension can render in a native host.
+    fn custom_message_renderer_types(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Render a displayed message without a session host or model access.
+    async fn render_custom_message(
+        &self,
+        _message: &CustomMessage,
+        _options: &crate::CustomMessageRenderOptions,
+    ) -> ExtensionResult<Option<crate::RenderedCustomMessage>> {
+        Ok(None)
+    }
+
+    /// Observe when an extension starts and stops waiting on a native UI prompt.
+    fn handles_ui_prompt_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Opt in to observing HTTP metadata before consuming a provider response body.
+    fn handles_after_provider_response(&self) -> bool {
+        false
+    }
+
+    async fn after_provider_response(
+        &self,
+        _event: &crate::ProviderResponseEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Opt in to model and thinking-level selection events.
     fn handles_model_selection(&self) -> bool {
         false
@@ -1494,6 +1526,18 @@ pub trait Extension: Send + Sync {
 
     fn handles_cache_warming(&self) -> bool {
         false
+    }
+
+    fn handles_agent_before_settle(&self) -> bool {
+        false
+    }
+
+    async fn agent_before_settle(
+        &self,
+        _event: &crate::AgentBeforeSettle,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<crate::BoundaryDecision> {
+        Ok(crate::BoundaryDecision::default())
     }
 
     fn handles_tree_navigation(&self) -> bool {
@@ -1907,6 +1951,20 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Snapshot the first renderer registered for each custom message type.
+    pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
+        let mut renderers = crate::CustomMessageRenderers::default();
+        for extension in &self.extensions {
+            for custom_type in extension.custom_message_renderer_types() {
+                renderers
+                    .renderers
+                    .entry(custom_type.to_owned())
+                    .or_insert_with(|| extension.clone());
+            }
+        }
+        renderers
+    }
+
     /// Whether a registered extension without a source path is a host built-in.
     pub fn extension_source_is_builtin(&self, id: &str) -> bool {
         self.extensions

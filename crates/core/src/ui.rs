@@ -27,6 +27,97 @@ pub struct UiComponentSpan {
     pub inverse: bool,
 }
 
+/// Layout options for an extension's custom transcript message.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomMessageRenderOptions {
+    pub expanded: bool,
+    pub output_pad: usize,
+    pub expand_key: Option<String>,
+}
+
+/// The extension supplies semantic theme roles. The host applies its palette
+/// and wraps the rows to fit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderedCustomMessage {
+    pub lines: Vec<Vec<UiComponentSpan>>,
+    #[serde(default)]
+    pub padding: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+}
+
+impl RenderedCustomMessage {
+    fn within_limits(&self) -> bool {
+        component_lines_within_limits(&self.lines)
+            && self
+                .background
+                .as_ref()
+                .is_none_or(|role| role.len() <= 128)
+            && self
+                .lines
+                .iter()
+                .flatten()
+                .all(|span| span.color.as_ref().is_none_or(|color| color.len() <= 128))
+    }
+}
+
+fn component_lines_within_limits(lines: &[Vec<UiComponentSpan>]) -> bool {
+    lines.len() <= 256
+        && lines.iter().map(Vec::len).sum::<usize>() <= 1024
+        && lines
+            .iter()
+            .flatten()
+            .map(|span| span.text.len())
+            .sum::<usize>()
+            <= 64 * 1024
+}
+
+/// Resolved custom-message renderers in extension load order. Hosts can use the
+/// snapshot while a session runs, independently of its journal and model context.
+#[derive(Clone, Default)]
+pub struct CustomMessageRenderers {
+    pub(crate) renderers: std::collections::BTreeMap<String, std::sync::Arc<dyn crate::Extension>>,
+}
+
+impl CustomMessageRenderers {
+    pub fn types(&self) -> impl Iterator<Item = &str> {
+        self.renderers.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, custom_type: &str) -> bool {
+        self.renderers.contains_key(custom_type)
+    }
+
+    /// Invoke the first registered renderer for a visible message. An absent,
+    /// failed, oversized or timed-out response leaves fallback rendering to
+    /// the host.
+    pub async fn render(
+        &self,
+        message: &crate::CustomMessage,
+        options: &CustomMessageRenderOptions,
+        timeout: std::time::Duration,
+    ) -> Option<RenderedCustomMessage> {
+        use futures_util::FutureExt;
+
+        if !message.display {
+            return None;
+        }
+        let renderer = self.renderers.get(&message.custom_type)?;
+        let callback = std::panic::AssertUnwindSafe(async {
+            renderer.render_custom_message(message, options).await
+        })
+        .catch_unwind();
+        crate::runtime::time::timeout(timeout, callback)
+            .await
+            .ok()?
+            .ok()?
+            .ok()?
+            .filter(RenderedCustomMessage::within_limits)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiComponentAction {
     pub key: String,
@@ -143,15 +234,7 @@ impl UiRequest {
             return Err("extension widgets support at most 128 lines".into());
         }
         if let Self::Custom { lines, actions, .. } = self {
-            if lines.len() > 256
-                || lines.iter().map(Vec::len).sum::<usize>() > 1024
-                || lines
-                    .iter()
-                    .flatten()
-                    .map(|span| span.text.len())
-                    .sum::<usize>()
-                    > 64 * 1024
-            {
+            if !component_lines_within_limits(lines) {
                 return Err("extension component exceeds its rendering limits".into());
             }
             let mut keys = std::collections::BTreeSet::new();
@@ -219,6 +302,85 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn first_custom_message_renderer_wins_and_hidden_messages_do_not_run() {
+        struct Renderer(&'static str);
+        #[async_trait::async_trait]
+        impl crate::Extension for Renderer {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn custom_message_renderer_types(&self) -> Vec<&str> {
+                vec!["card"]
+            }
+            async fn render_custom_message(
+                &self,
+                message: &crate::CustomMessage,
+                options: &CustomMessageRenderOptions,
+            ) -> ExtensionResult<Option<RenderedCustomMessage>> {
+                assert!(message.display);
+                let label = match message.details.as_ref().and_then(serde_json::Value::as_str) {
+                    Some("fail") => return Err("renderer failure".into()),
+                    Some("oversize") => "x".repeat(64 * 1024 + 1),
+                    Some(value) if options.expanded => format!("{} {value}", self.0),
+                    _ => self.0.into(),
+                };
+                Ok(Some(RenderedCustomMessage {
+                    lines: vec![vec![UiComponentSpan {
+                        text: label,
+                        color: Some("accent".into()),
+                        ..Default::default()
+                    }]],
+                    padding: options.output_pad,
+                    background: None,
+                }))
+            }
+        }
+
+        let mut registry = crate::Registry::default();
+        registry
+            .register(std::sync::Arc::new(Renderer("first")))
+            .unwrap();
+        registry
+            .register(std::sync::Arc::new(Renderer("second")))
+            .unwrap();
+        let renderers = registry.custom_message_renderers();
+        assert!(renderers.contains("card"));
+        assert!(!renderers.contains("unregistered"));
+        let mut message = crate::CustomMessage {
+            custom_type: "card".into(),
+            content: crate::ContextContent::Text("model context".into()),
+            display: true,
+            details: Some(serde_json::json!("details")),
+        };
+        let options = CustomMessageRenderOptions {
+            expanded: true,
+            output_pad: 2,
+            expand_key: Some("Ctrl+O".into()),
+        };
+        let timeout = std::time::Duration::from_secs(1);
+        let rendered = renderers.render(&message, &options, timeout).await.unwrap();
+        assert_eq!(rendered.lines[0][0].text, "first details");
+        assert_eq!(rendered.lines[0][0].color.as_deref(), Some("accent"));
+        assert_eq!(rendered.padding, 2);
+        for details in ["fail", "oversize"] {
+            message.details = Some(serde_json::json!(details));
+            assert!(
+                renderers
+                    .render(&message, &options, timeout)
+                    .await
+                    .is_none()
+            );
+        }
+        message.display = false;
+        assert!(
+            renderers
+                .render(&message, &options, timeout)
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn rpc_fields_and_typed_responses_match_dialog_kinds() {
         let widget: UiRequest = serde_json::from_value(serde_json::json!({

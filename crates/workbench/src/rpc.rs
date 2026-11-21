@@ -984,7 +984,7 @@ mod jsonl_framing_tests {
             ("{\"n\":1.", "Unterminated fractional number in JSON"),
             ("[1,] -", "trailing comma"),
             ("{\"bad\":,\"n\":-", "expected value"),
-            ("[01,-", "invalid number"),
+            ("[01,-", "Unexpected number in JSON"),
             ("[1e400,-", "number out of range"),
             (r#"["\ud800",-"#, "unexpected end of hex escape"),
             ("{\"n\":\"-", "Unterminated string in JSON"),
@@ -1020,11 +1020,14 @@ mod jsonl_framing_tests {
         for (input, expected) in [
             ("[1,] 1.", "trailing comma"),
             ("{\"bad\":,\"n\":1.", "expected value"),
-            ("[01.", "invalid number"),
+            ("[01.", "Unexpected number in JSON"),
             ("[1e400,1.", "number out of range"),
             (r#"["\ud800",1."#, "unexpected end of hex escape"),
             ("{\"n\":\"1.", "Unterminated string in JSON"),
-            ("{\"n\":1.0", "EOF while parsing an object"),
+            (
+                "{\"n\":1.0",
+                "Expected ',' or '}' after property value in JSON",
+            ),
         ] {
             let error = parse_request(input).unwrap_err().to_string();
             assert!(error.contains(expected), "{input:?}: {error}");
@@ -1077,6 +1080,48 @@ mod jsonl_framing_tests {
     }
 
     #[test]
+    fn truncated_json_objects_and_nested_commas_report_pi_diagnostics() {
+        for (input, expected) in [
+            (
+                r#"{"x""#,
+                "Expected ':' after property name in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                r#"{"x": "y""#,
+                "Expected ',' or '}' after property value in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                r#"{"x": 1,"#,
+                "Expected double-quoted property name in JSON at position 8 (line 1 column 9)",
+            ),
+            (r#"{"x":[1,"#, "Unexpected end of JSON input"),
+            (r#"[{"x":0},"#, "Unexpected end of JSON input"),
+            (
+                r#"{"x":[{"nested""#,
+                "Expected ':' after property name in JSON at position 15 (line 1 column 16)",
+            ),
+            (
+                r#"{"a": { "b": 2 }"#,
+                "Expected ',' or '}' after property value in JSON at position 16 (line 1 column 17)",
+            ),
+            (
+                "{\"😀\":1,\r\n ",
+                "Expected double-quoted property name in JSON at position 11 (line 2 column 2)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+
+        let too_long = format!(r#"{{"{}""#, "x".repeat(super::JSON_DIAGNOSTIC_RETRY_LIMIT));
+        let error = parse_request(&too_long).unwrap_err().to_string();
+        assert!(error.contains("EOF while parsing an object"), "{error}");
+    }
+
+    #[test]
     fn malformed_json_structure_reports_pi_diagnostics() {
         for (input, expected) in [
             (
@@ -1114,6 +1159,54 @@ mod jsonl_framing_tests {
             (
                 r#""😀"🚧"#,
                 "Unexpected non-whitespace character after JSON at position 4 (line 1 column 5)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_numbers_report_pi_diagnostics_at_the_first_invalid_character() {
+        for (input, expected) in [
+            (
+                "-x",
+                "No number after minus sign in JSON at position 1 (line 1 column 2)",
+            ),
+            (
+                "[-\n1]",
+                "No number after minus sign in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"😀": -}"#,
+                "No number after minus sign in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "1. ",
+                "Unterminated fractional number in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"😀":1.💥}"#,
+                "Unterminated fractional number in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "1e--1",
+                "Exponent part is missing a number in JSON at position 3 (line 1 column 4)",
+            ),
+            (
+                "[\r\n1e+]",
+                "Exponent part is missing a number in JSON at position 6 (line 2 column 4)",
+            ),
+            (
+                "-01",
+                "Unexpected number in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"n":01}"#,
+                "Unexpected number in JSON at position 6 (line 1 column 7)",
             ),
         ] {
             let error = parse_request(input).unwrap_err().to_string();
@@ -1354,8 +1447,8 @@ mod jsonl_framing_tests {
         let prefix = "[\"\\ud800\",\"";
         let suffix = "\t\"]";
         for (size, mapped) in [
-            (super::SURROGATE_DIAGNOSTIC_LIMIT, true),
-            (super::SURROGATE_DIAGNOSTIC_LIMIT + 1, false),
+            (super::JSON_DIAGNOSTIC_RETRY_LIMIT, true),
+            (super::JSON_DIAGNOSTIC_RETRY_LIMIT + 1, false),
         ] {
             let input = format!(
                 "{prefix}{}{suffix}",
@@ -1406,41 +1499,44 @@ fn parse_request(line: &str) -> Result<Value> {
     }
 }
 
+fn json_number_error(line: &str, error: &serde_json::Error, message: &str) -> Option<String> {
+    // EOF already points after the last byte. For an invalid number with a
+    // following character, serde points at that character in one-based columns.
+    let end = if error.is_eof() && message.starts_with("EOF while parsing a value") {
+        let offset = serde_error_offset(line, error)?;
+        (offset == line.len()).then_some(offset)?
+    } else if message.starts_with("invalid number") {
+        serde_error_offset(line, error)?.checked_sub(1)?
+    } else {
+        return None;
+    };
+    let prefix = line.get(..end)?;
+    let bytes = prefix.as_bytes();
+    let mantissa = if matches!(bytes.last(), Some(b'+' | b'-')) {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    };
+    let reason = match bytes {
+        [.., digit, b'.'] if digit.is_ascii_digit() => "Unterminated fractional number in JSON",
+        _ if matches!(mantissa, [.., digit, b'e' | b'E'] if digit.is_ascii_digit()) => {
+            "Exponent part is missing a number in JSON"
+        }
+        [.., b'-'] => "No number after minus sign in JSON",
+        [.., b'0'] if line.as_bytes().get(end).is_some_and(u8::is_ascii_digit) => {
+            "Unexpected number in JSON"
+        }
+        _ => return None,
+    };
+    Some(json_error_at(reason, prefix))
+}
+
 // Preserve Pi/V8 diagnostics for common incomplete JSONL records. Other
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
-    // V8 distinguishes unfinished numbers at EOF. Only project these errors
-    // when serde reached the end while parsing a value, so earlier errors and
-    // number-like suffixes inside strings retain their own diagnostics.
-    if error.is_eof()
-        && message.starts_with("EOF while parsing a value")
-        && serde_error_offset(line, error) == Some(line.len())
-    {
-        let bytes = line.as_bytes();
-        let exponent_end = if matches!(bytes.last(), Some(b'+' | b'-')) {
-            bytes.len().saturating_sub(1)
-        } else {
-            bytes.len()
-        };
-        let reason = if bytes.len() >= 2
-            && bytes[bytes.len() - 1] == b'.'
-            && bytes[bytes.len() - 2].is_ascii_digit()
-        {
-            Some("Unterminated fractional number in JSON")
-        } else if exponent_end >= 2
-            && matches!(bytes[exponent_end - 1], b'e' | b'E')
-            && bytes[exponent_end - 2].is_ascii_digit()
-        {
-            Some("Exponent part is missing a number in JSON")
-        } else if bytes.last() == Some(&b'-') {
-            Some("No number after minus sign in JSON")
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            return json_error_at(reason, line);
-        }
+    if let Some(diagnostic) = json_number_error(line, error, &message) {
+        return diagnostic;
     }
     if let Some((offset, start)) = json_string_control_offset(line)
         && (message.starts_with("control character")
@@ -1489,6 +1585,8 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         Some("Expected ',' or ']' after array element in JSON")
     } else if message.starts_with("EOF while parsing an object") && tail.ends_with('{') {
         Some("Expected property name or '}' in JSON")
+    } else if let Some(diagnostic) = incomplete_json_structure(line, tail, &message) {
+        return diagnostic;
     } else if message.starts_with("EOF while parsing a value")
         && (tail.is_empty()
             || tail.ends_with(':')
@@ -1503,6 +1601,42 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         None
     };
     reason.map_or(message, |reason| json_error_at(reason, line))
+}
+
+fn incomplete_json_structure(line: &str, tail: &str, message: &str) -> Option<String> {
+    let in_object = message.starts_with("EOF while parsing an object");
+    let after_comma = message.starts_with("EOF while parsing a value") && tail.ends_with(',');
+    if line.len() > JSON_DIAGNOSTIC_RETRY_LIMIT || !(in_object || after_comma) {
+        return None;
+    }
+
+    // The closing brace distinguishes a missing colon from a missing object
+    // delimiter. After a comma, it distinguishes an object key from an array
+    // element even when requests contain nested objects and arrays.
+    let mut probe = String::with_capacity(line.len() + 1);
+    probe.push_str(line);
+    probe.push('}');
+    let separator = || json_error_at("Expected ',' or '}' after property value in JSON", line);
+    match serde_json::from_str::<Value>(&probe) {
+        Ok(_) if in_object => Some(separator()),
+        Err(error) if in_object && error.is_eof() => Some(separator()),
+        Err(error) if serde_error_offset(&probe, &error) == Some(probe.len()) => {
+            let diagnostic = error.to_string();
+            match diagnostic.split_once(" at line ")?.0 {
+                "expected `:`" if in_object => Some(json_error_at(
+                    "Expected ':' after property name in JSON",
+                    line,
+                )),
+                "trailing comma" if after_comma => Some(json_error_at(
+                    "Expected double-quoted property name in JSON",
+                    line,
+                )),
+                "expected value" if after_comma => Some("Unexpected end of JSON input".into()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn json_structure_error(line: &str, error: &serde_json::Error, message: &str) -> Option<String> {
@@ -1547,13 +1681,13 @@ fn json_error_at(reason: &str, prefix: &str) -> String {
     format!("{reason} at position {position} (line {row} column {column})")
 }
 
-// This is only a diagnostic retry; it never changes the JSON parsed by the
-// caller. Cap both the copy and the second parse for untrusted RPC input.
-const SURROGATE_DIAGNOSTIC_LIMIT: usize = 1024 * 1024;
+// Diagnostic retries never change the JSON parsed by the caller. Cap both
+// the copy and the second parse for untrusted RPC input.
+const JSON_DIAGNOSTIC_RETRY_LIMIT: usize = 1024 * 1024;
 
 fn surrogate_retry_control(line: &str, error: &serde_json::Error, offset: usize) -> bool {
     let message = error.to_string();
-    if line.len() > SURROGATE_DIAGNOSTIC_LIMIT
+    if line.len() > JSON_DIAGNOSTIC_RETRY_LIMIT
         || !(message.starts_with("lone leading surrogate in hex escape")
             || message.starts_with("unexpected end of hex escape"))
     {

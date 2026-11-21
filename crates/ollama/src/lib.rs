@@ -1025,6 +1025,8 @@ impl Ollama {
         if self.has_ambiguous_legacy_replay(&request) {
             return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
         }
+        let copilot = (self.provider == "github-copilot")
+            .then(|| pi_rs_core::copilot_request_headers(&request.messages).collect::<Vec<_>>());
         let requested_model = request.model.clone();
         let identity = self.replay_identity(&requested_model);
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
@@ -1101,9 +1103,15 @@ impl Ollama {
                 value.to_str().ok().map(|value| (name.as_str(), value))
             }),
         );
-        let builder = self
-            .authenticate(self.client.post(self.endpoint.clone()))
-            .json(&body);
+        let mut request = self.client.post(self.endpoint.clone());
+        if let Some(headers) = copilot {
+            for (name, value) in headers {
+                if !self.headers.contains_key(name) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        let builder = self.authenticate(request).json(&body);
         let monitor_loading = self.progress.is_some()
             && !requested_model.ends_with(":cloud")
             && self.endpoint.port_or_known_default() == Some(11434)
@@ -1128,6 +1136,13 @@ impl Ollama {
                 }
             }
         };
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &error_secrets,
+            &self.headers,
+        )
+        .await;
         if !response.status().is_success() {
             let status = response.status();
             let description = format!("HTTP status {status}");

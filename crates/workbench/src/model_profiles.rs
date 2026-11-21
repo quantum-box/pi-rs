@@ -5,7 +5,6 @@ use std::sync::{Arc, LazyLock};
 use pi_rs::ollama::ChatCompatibility;
 use pi_rs::{Error, Result};
 use pi_rs_workbench::image_profile::ImageResizeProfile;
-use regex::{Captures, Regex};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +16,7 @@ use super::{Provider, builtin_chat, config, model_auth::Credential, providers::A
 pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
     revision: String,
+    cloudflare_saved_account: Option<String>,
     radius_endpoint: Option<String>,
     operations: super::operation_models::Catalogue,
 }
@@ -587,6 +587,7 @@ impl ModelMetadata {
             Adapter::ChatCompletions
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
+                | Adapter::CodexResponses
                 | Adapter::Google
                 | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
@@ -718,11 +719,88 @@ static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLo
     models
 });
 
+fn configure_cloudflare_workers(
+    providers: &mut serde_json::Map<String, Value>,
+    account: Option<&str>,
+) -> Result<()> {
+    const PREFIX: &str = "https://api.cloudflare.com/client/v4/accounts/";
+    let account = account.filter(|id| super::operation_models::valid_cloudflare_account(id));
+    let name = providers
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case("cloudflare-workers-ai"))
+        .cloned();
+    if name.is_none() && account.is_none() {
+        return Ok(());
+    }
+    let entry = providers
+        .entry(name.unwrap_or_else(|| "cloudflare-workers-ai".into()))
+        .or_insert_with(|| serde_json::json!({}));
+    let entry = entry
+        .as_object_mut()
+        .ok_or_else(|| Error::Config("invalid Cloudflare Workers AI profile".into()))?;
+    let account_from_base = |base: &str| {
+        let (configured, route) = base
+            .trim_end_matches('/')
+            .strip_prefix(PREFIX)?
+            .split_once('/')?;
+        if !matches!(route, "ai" | "ai/run" | "ai/v1" | "ai/v1/chat/completions") {
+            return None;
+        }
+        if configured == "{CLOUDFLARE_ACCOUNT_ID}" {
+            return account.map(str::to_owned);
+        }
+        super::operation_models::valid_cloudflare_account(configured).then(|| configured.to_owned())
+    };
+    let configured_base = entry.get("baseUrl").filter(|value| !value.is_null());
+    let route_account = match configured_base {
+        None => account.map(str::to_owned),
+        Some(value) => value.as_str().and_then(account_from_base),
+    };
+    let classifier_api =
+        entry.get("api").and_then(Value::as_str) == Some("cloudflare-workers-ai-system-one");
+    let classifier_models_own_credentials = configured_base.is_none()
+        && entry.get("api").is_none_or(Value::is_null)
+        && entry
+            .get("models")
+            .and_then(Value::as_array)
+            .filter(|models| models.iter().all(|model| model["type"] == "classifier"))
+            .and_then(|models| super::operation_models::cloudflare_model_binding(models))
+            .is_some_and(|base| {
+                let bound_account = base.as_deref().and_then(account_from_base);
+                bound_account.is_none() || bound_account != route_account
+            });
+    let classifier_profile = classifier_api || classifier_models_own_credentials;
+    let route_account =
+        route_account.or_else(|| account.filter(|_| classifier_profile).map(str::to_owned));
+    if classifier_profile {
+        // Provider-level operations settings were consumed by the operation catalogue.
+        for field in ["api", "baseUrl", "apiKey", "authHeader", "headers"] {
+            entry.remove(field);
+        }
+    }
+    if let Some(account) = route_account {
+        let base = format!("{PREFIX}{account}/ai/v1");
+        entry.insert("baseUrl".into(), Value::String(base));
+    }
+    Ok(())
+}
+
+pub(super) fn cloudflare_workers_chat_account(endpoint: &str) -> Option<&str> {
+    let path = endpoint.strip_prefix("https://api.cloudflare.com/client/v4/accounts/")?;
+    let account = path.strip_suffix("/ai/v1/chat/completions")?;
+    super::operation_models::valid_cloudflare_account(account).then_some(account)
+}
+
 impl Profiles {
-    pub fn load() -> Result<Self> {
+    pub fn load(keys: &super::model_auth::Keys) -> Result<Self> {
         let path = config::agent_dir().join("models.json");
         let data = config::read_object(&path)?;
-        let mut profiles = Self::parse(&data)?;
+        let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
+        let mut profiles = Self::parse_with_cloudflare_account(
+            &data,
+            keys.cloudflare_chat_account().or(account.as_deref()),
+        )?;
+        profiles.cloudflare_saved_account = keys.cloudflare_chat_account().map(str::to_owned);
         if std::env::var_os("PI_RADIUS_GATEWAY").is_some() {
             let endpoint = super::radius_auth::model_endpoint(
                 &super::radius_auth::Gateway::configured_origin()?,
@@ -744,7 +822,16 @@ impl Profiles {
         Ok(profiles)
     }
 
+    pub(super) fn cloudflare_saved_account(&self) -> Option<&str> {
+        self.cloudflare_saved_account.as_deref()
+    }
+
+    #[cfg(test)]
     pub(super) fn parse(data: &Value) -> Result<Self> {
+        Self::parse_with_cloudflare_account(data, None)
+    }
+
+    fn parse_with_cloudflare_account(data: &Value, account: Option<&str>) -> Result<Self> {
         let empty = serde_json::Map::new();
         let providers = match data.get("providers") {
             Some(providers) => providers
@@ -752,9 +839,13 @@ impl Profiles {
                 .ok_or_else(|| Error::Config("models.json providers must be an object".into()))?,
             None => &empty,
         };
-        let operations = super::operation_models::Catalogue::parse(providers)?;
+        let configured_providers = providers;
+        let operations = super::operation_models::Catalogue::parse(configured_providers)?;
+        let mut providers = configured_providers.clone();
+        configure_cloudflare_workers(&mut providers, account)?;
+
         let mut entries = BTreeMap::new();
-        for (name, entry) in providers {
+        for (name, entry) in &providers {
             let builtin = Provider::named(name);
             let provider = if let Some(provider) = &builtin {
                 if provider.id() == "openai" && entry["api"] == "openai-completions" {
@@ -930,10 +1021,16 @@ impl Profiles {
                 return Err(Error::Config(format!("duplicate model provider {id}")));
             }
         }
-        let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(data)?));
+        let mut revision = Sha256::new();
+        revision.update(serde_json::to_vec(data)?);
+        if &providers != configured_providers {
+            revision.update(serde_json::to_vec(&providers)?);
+        }
+        let revision = format!("{:x}", revision.finalize());
         Ok(Self {
             entries,
             revision,
+            cloudflare_saved_account: None,
             radius_endpoint: None,
             operations,
         })
@@ -958,7 +1055,7 @@ impl Profiles {
         Provider::ALL
             .into_iter()
             .chain(std::iter::once(
-                Provider::named("openai-chatgpt").expect("ChatGPT provider"),
+                self.provider("openai-chatgpt").expect("ChatGPT provider"),
             ))
             .chain(builtin_chat::PROVIDERS.iter().map(|builtin| {
                 let provider = builtin.provider();
@@ -971,6 +1068,7 @@ impl Profiles {
                     .values()
                     .filter(|profile| {
                         matches!(profile.provider, Provider::Custom { .. })
+                            && profile.provider.id() != "openai-chatgpt"
                             && builtin_chat::find(profile.provider.id()).is_none()
                     })
                     .map(|profile| profile.provider.clone()),
@@ -1114,7 +1212,7 @@ impl Profiles {
     ) -> bool {
         self.chat_compatibility(provider, model)
             .supports_strict_mode()
-            .unwrap_or_else(|| provider.id() == "openai-chatgpt")
+            .unwrap_or_else(|| matches!(provider.id(), "openai-chatgpt" | "openai-codex"))
     }
 
     fn cache_compatibility(
@@ -1334,7 +1432,10 @@ impl Profiles {
         };
         if !matches!(
             adapter,
-            Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
+            Adapter::Anthropic
+                | Adapter::ChatCompletions
+                | Adapter::OpenAiResponses
+                | Adapter::CodexResponses
         ) || provider.id() == "openai-chatgpt"
         {
             return routing;
@@ -1371,7 +1472,9 @@ impl Profiles {
         let send = model_compat
             .and_then(|compat| compat.send_session_affinity_headers)
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
-            .unwrap_or(openrouter || adapter == Adapter::OpenAiResponses);
+            .unwrap_or(
+                openrouter || matches!(adapter, Adapter::OpenAiResponses | Adapter::CodexResponses),
+            );
         if !send {
             return routing;
         }
@@ -1404,10 +1507,13 @@ impl Profiles {
                 "x-session-affinity",
             ],
             (_, AffinityFormat::Openrouter) => &["x-session-id"],
-            (Adapter::OpenAiResponses, AffinityFormat::Openai) => {
+            (Adapter::OpenAiResponses | Adapter::CodexResponses, AffinityFormat::Openai) => {
                 &["session-id", "x-client-request-id"]
             }
-            (Adapter::OpenAiResponses, AffinityFormat::OpenaiNosession) => &["x-client-request-id"],
+            (
+                Adapter::OpenAiResponses | Adapter::CodexResponses,
+                AffinityFormat::OpenaiNosession,
+            ) => &["x-client-request-id"],
             (Adapter::Anthropic, _) => &["x-session-affinity"],
             (_, AffinityFormat::Openai) => {
                 &["session_id", "x-client-request-id", "x-session-affinity"]
@@ -1497,6 +1603,18 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
     }
 
     let suffix = match adapter {
+        Adapter::CodexResponses => {
+            let path = url.path().trim_end_matches('/');
+            let normalized = if path.ends_with("/codex/responses") || path.ends_with("/responses") {
+                path.to_owned()
+            } else if path.ends_with("/codex") {
+                format!("{path}/responses")
+            } else {
+                format!("{path}/codex/responses")
+            };
+            url.set_path(&normalized);
+            return Ok(url.to_string());
+        }
         Adapter::ChatCompletions => "/chat/completions",
         Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
@@ -1537,34 +1655,15 @@ pub(super) fn expand_value_with_env(
     value: &str,
     env: Option<&serde_json::Map<String, Value>>,
 ) -> Option<String> {
-    if value.starts_with('!') {
-        return None;
-    }
-    static ENVIRONMENT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$\$|\$!|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-            .expect("environment interpolation")
-    });
-    let mut missing = false;
-    let expanded = ENVIRONMENT.replace_all(value, |capture: &Captures<'_>| {
-        let token = capture.get(0).expect("matched environment token").as_str();
-        let Some(name) = capture.get(1).or_else(|| capture.get(2)) else {
-            return token[1..].to_owned();
-        };
-        env.and_then(|env| env.get(name.as_str()))
+    pi_rs_workbench::auth_factory::expand_config_value(value, usize::MAX, |name| {
+        env.and_then(|env| env.get(name))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .or_else(|| {
-                std::env::var(name.as_str())
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            })
-            .unwrap_or_else(|| {
-                missing = true;
-                String::new()
-            })
-    });
-    (!missing).then(|| expanded.into_owned())
+            .or_else(|| std::env::var(name).ok())
+    })
+    .ok()
+    .flatten()
 }
 
 fn validate_headers(headers: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
@@ -1607,6 +1706,241 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {
+        let keys = super::super::model_auth::Keys::parse(&json!({
+            "cloudflare-workers-ai":{
+                "type":"api_key", "key":"fixture","env":{"CLOUDFLARE_ACCOUNT_ID":"mine"}
+            }
+        }));
+        let profiles =
+            Profiles::parse_with_cloudflare_account(&json!({}), keys.cloudflare_chat_account())
+                .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(
+            endpoint,
+            "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
+        );
+        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        assert_eq!(
+            keys.custom_credential(&provider, endpoint, &profiles)
+                .and_then(|key| key.literal()),
+            Some("fixture")
+        );
+        assert!(
+            keys.operation_credential(
+                "cloudflare-workers-ai",
+                "https://api.cloudflare.com/client/v4/accounts/mine/ai/run",
+                true
+            )
+            .is_some()
+        );
+        assert!(
+            keys.operation_credential(
+                "cloudflare-workers-ai",
+                "https://api.cloudflare.com/client/v4/accounts/other/ai/run",
+                true
+            )
+            .is_some()
+        );
+
+        let other = Profiles::parse(&json!({"providers":{"cloudflare-workers-ai":{
+            "baseUrl":"https://api.cloudflare.com/client/v4/accounts/other/ai/v1"
+        }}}))
+        .unwrap();
+        assert!(
+            keys.custom_credential(&provider, other.endpoint(&provider), &other)
+                .is_none()
+        );
+        assert!(
+            keys.environment(&provider, other.endpoint(&provider), &other)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cloudflare_classifier_only_api_does_not_override_chat_api() {
+        let profiles = Profiles::parse(&json!({"providers":{"cloudflare-workers-ai":{
+            "baseUrl":"https://api.cloudflare.com/client/v4/accounts/mine/ai",
+            "api":"cloudflare-workers-ai-system-one","apiKey":"classifier-only",
+            "models":[{"id":"typesafe/jev","type":"classifier"}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(
+            endpoint,
+            "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
+        );
+        assert!(profiles.credential(&provider, endpoint).is_none());
+        assert_eq!(profiles.model_ids(&provider).len(), 19);
+    }
+
+    #[test]
+    fn cloudflare_chat_models_survive_a_custom_classifier_route() {
+        let profiles = Profiles::parse_with_cloudflare_account(
+            &json!({"providers":{"cloudflare-workers-ai":{
+                "baseUrl":"https://classifiers.example/v1",
+                "api":"cloudflare-workers-ai-system-one","apiKey":"classifier-only",
+                "models":[
+                    {"id":"typesafe/jev","type":"classifier"},
+                    {"id":"custom-chat","api":"openai-completions","name":"Custom chat"}
+                ]
+            }}}),
+            Some("mine"),
+        )
+        .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(
+            endpoint,
+            "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
+        );
+        assert!(profiles.credential(&provider, endpoint).is_none());
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .contains(&"custom-chat".to_owned())
+        );
+    }
+
+    #[test]
+    fn inferred_classifier_credentials_do_not_apply_to_official_chat() {
+        let profiles = Profiles::parse_with_cloudflare_account(
+            &json!({"providers":{"cloudflare-workers-ai":{
+                "api":null,"baseUrl":null,
+                "apiKey":"classified","headers":{"x-provider-secret":"value"},
+                "models":[{"id":"custom","type":"classifier",
+                    "api":"cloudflare-workers-ai-system-one",
+                    "baseUrl":"https://classifiers.example/v1"}]
+            }}}),
+            Some("mine"),
+        )
+        .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(cloudflare_workers_chat_account(endpoint), Some("mine"));
+        assert!(profiles.credential(&provider, endpoint).is_none());
+        let headers = profiles
+            .header_settings(&provider, endpoint, None)
+            .static_headers(&provider, None)
+            .unwrap();
+        assert!(!headers.contains_key("x-provider-secret"));
+    }
+
+    #[test]
+    fn matching_classifier_routes_keep_explicit_provider_chat_credentials() {
+        for base in [
+            Value::Null,
+            json!("https://api.cloudflare.com/client/v4/accounts/mine/ai/run"),
+            json!("https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai"),
+        ] {
+            let profiles = Profiles::parse_with_cloudflare_account(
+                &json!({"providers":{"cloudflare-workers-ai":{
+                    "apiKey":"fixture","headers":{"x-provider-setting":"value"},
+                    "models":[{"id":"custom","type":"classifier",
+                        "api":"cloudflare-workers-ai-system-one","baseUrl":base}]
+                }}}),
+                Some("mine"),
+            )
+            .unwrap();
+            let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+            let endpoint = profiles.endpoint(&provider);
+            assert_eq!(
+                profiles
+                    .credential(&provider, endpoint)
+                    .as_ref()
+                    .and_then(|key| key.literal()),
+                Some("fixture"),
+            );
+            let headers = profiles
+                .header_settings(&provider, endpoint, None)
+                .static_headers(&provider, None)
+                .unwrap();
+            assert_eq!(headers["x-provider-setting"], "value");
+        }
+    }
+
+    #[test]
+    fn implicit_cloudflare_keys_are_available_only_on_official_chat_routes() {
+        let keys = super::super::model_auth::Keys::parse(&json!({
+            "cloudflare-workers-ai":{"type":"api_key","key":"fixture"}
+        }));
+        for (base, expected) in [
+            ("https://example.org/client/v4/accounts/mine/ai/v1", false),
+            (
+                "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1",
+                true,
+            ),
+        ] {
+            let profiles = Profiles::parse(&json!({"providers":{"cloudflare-workers-ai":{
+                "baseUrl":base
+            }}}))
+            .unwrap();
+            let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+            let endpoint = profiles.endpoint(&provider);
+            assert_eq!(
+                keys.custom_credential(&provider, endpoint, &profiles)
+                    .is_some(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn chat_scoped_cloudflare_key_can_classify_in_same_account() {
+        let keys = super::super::model_auth::Keys::parse(&json!({
+            "cloudflare-workers-ai":{
+                "type":"api_key", "key":"fixture",
+                "endpoint":"https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
+            }
+        }));
+        assert_eq!(keys.cloudflare_operation_account(), Some("mine"));
+        assert_eq!(keys.cloudflare_chat_account(), Some("mine"));
+        for (host, account, official, available) in [
+            ("api.cloudflare.com", "mine", true, true),
+            ("api.cloudflare.com", "other", true, false),
+            ("example.org", "mine", false, false),
+        ] {
+            assert_eq!(
+                keys.operation_credential(
+                    "cloudflare-workers-ai",
+                    &format!("https://{host}/client/v4/accounts/{account}/ai/run"),
+                    official,
+                )
+                .is_some(),
+                available
+            );
+        }
+    }
+
+    #[test]
+    fn cloudflare_worker_chats_normalize_official_classifier_base_urls() {
+        let provider = Provider::named("cloudflare-workers-ai").unwrap();
+        for (base, account) in [
+            (
+                "https://api.cloudflare.com/client/v4/accounts/mine/ai/run/",
+                None,
+            ),
+            (
+                "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+                Some("mine"),
+            ),
+        ] {
+            let profiles = Profiles::parse_with_cloudflare_account(
+                &json!({"providers":{"cloudflare-workers-ai":{"baseUrl":base}}}),
+                account,
+            )
+            .unwrap();
+            assert_eq!(
+                profiles.endpoint(&provider),
+                "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
+            );
+        }
+    }
 
     #[test]
     fn anthropic_explicit_endpoint_overrides_model_endpoints() {
@@ -2301,7 +2635,7 @@ mod tests {
                 "opencode",
                 "/inference",
                 79,
-                "kimi-k2.7-code",
+                "kimi-k2.6",
                 "claude-fable-5",
                 "gpt-6-sol",
             ),
@@ -2309,7 +2643,7 @@ mod tests {
                 "opencode-go",
                 "/inference/go",
                 30,
-                "kimi-k3.1-pro",
+                "kimi-k3",
                 "claude-haiku-5-5",
                 "gpt-6-luna",
             ),

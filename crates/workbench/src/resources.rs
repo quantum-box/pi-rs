@@ -486,18 +486,12 @@ impl Resources {
             if let Some(skill) = self.skills.get(name) {
                 match read_resource(&skill.path).and_then(|text| frontmatter(&text)) {
                     Ok((_, body)) => {
-                        let location = skill.path.display();
-                        let directory = skill.path.parent().unwrap_or(Path::new(".")).display();
-                        let body = body.trim_matches(is_prompt_space);
-                        let mut text = format!(
-                            "<skill name=\"{name}\" location=\"{location}\">\nReferences are relative to {directory}.\n\n{body}\n</skill>"
-                        );
-                        let arguments = arguments.trim_matches(is_prompt_space);
-                        if !arguments.is_empty() {
-                            text.push_str("\n\n");
-                            text.push_str(arguments);
-                        }
-                        return Some(text);
+                        return Some(pi_rs_workbench::skill_resources::format_skill_invocation(
+                            name,
+                            &skill.path,
+                            &body,
+                            arguments,
+                        ));
                     }
                     Err(error) => {
                         eprintln!("Could not expand skill {}: {error}", skill.path.display())

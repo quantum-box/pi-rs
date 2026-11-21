@@ -58,7 +58,21 @@ or pass `false` to save the message without a turn. Native tools and supported
 callbacks can call `ToolHost::send_message` with steering, follow-up, next-turn,
 trigger-turn, or after-turn delivery. Supported callbacks and recovery behavior
 are listed in the [native parity details](native-parity.md#active-run-native-custom-messages).
-Custom message renderers are not yet supported.
+To render a displayed message in the terminal, advertise its type through
+`custom_message_renderer_types` and implement `render_custom_message`. The
+first extension in load order for that type receives the message including
+its details, the expansion state, the configured output padding and the
+host's expand-key label. Return `RenderedCustomMessage` with styled rows,
+horizontal padding and an optional background theme role. The terminal
+applies its active theme and wraps the rows to fit. The callback runs off the
+terminal paint path with a one-second deadline. A missing or failed
+renderer leaves the default transcript presentation in place.
+
+Rust SDK hosts can acquire the same renderer snapshot through
+`AgentSession::custom_message_renderers`, invoke it asynchronously with a
+host-defined deadline, and apply their own palette. RPC and HTML exports
+retain the original custom-message content. This API uses native styled
+rows. Pi extensions can return arbitrary interactive TypeScript components.
 
 Executable hosts advertising `command_failure_classification_v1` accept the
 `command_effects_classified_v1` request. Its successful protocol envelope
@@ -68,6 +82,16 @@ without this capability receives the existing command request; its untyped
 errors remain failures because their origin is unknown. The standard extension
 server advertises the capability and propagates typed errors from extensions it
 hosts, including executable extensions.
+
+## Observe extension UI prompts
+
+Opt in with `handles_lifecycle` and `handles_ui_prompt_lifecycle` to observe
+`ui_prompt_start` and `ui_prompt_end` while tools wait on a native interactive
+or SDK host. The payload has a prompt kind and optional opening title.
+Simultaneous prompts within one tool turn share the same pair of events.
+Cancellation ends the prompt even if the response is discarded. The UI
+does not wait for extension observers to finish. Notifications, status, and
+editor reads do not produce these events.
 
 ## Write another extension
 
@@ -170,6 +194,25 @@ emit a model selection event.
 Extensions that implement `handles_lifecycle` also receive `agent_settled`
 after `agent_end` when a run has finished its retries and automatic compaction.
 Its `aborted` field distinguishes cancellation from completion or failure.
+
+For an actionable callback before settlement, opt into
+`handles_agent_before_settle` and implement `agent_before_settle`.
+Handlers run in extension load order. Each can replace the proposed entries
+or continuation flag independently. The preview includes journal record IDs
+for projected messages and the next queued batch. Proposals can append
+custom entries, custom messages, context edits, or compaction summaries.
+The host validates the full list before writing its plan or any of its
+entries. A continuation runs within the original run's request and token
+limits. Cancelling during delivery of this callback preserves valid entries
+and suppresses continuation.
+
+Executable extensions negotiate the callback capability in their description.
+`AgentSession::resume` recovers a saved plan under the original run ID,
+including proposals interrupted partway through persistence. Hosts that drive
+`Agent` directly can inspect `Session::pending_extension_boundary_run` to
+select the run ID for explicit recovery.
+Tree navigation and forks can select the completed proposal as a unit.
+Forks retain the applied entries and start with their own run lifecycle.
 
 Before a model request, an extension may opt into `context_with_system` to
 transform the complete message list, including system messages. All ordinary

@@ -17,6 +17,13 @@ impl Model for Script {
                 ("ls-negative", "ls", json!({"limit": -2})),
                 ("ls-fraction", "ls", json!({"limit": 1.5})),
                 ("ls-huge", "ls", json!({"limit": 1e100})),
+                ("ls-missing", "ls", json!({"path": "missing"})),
+                (
+                    "grep-missing",
+                    "grep",
+                    json!({"path": "missing", "pattern": "match"}),
+                ),
+                ("read-offset", "read", json!({"path": "a", "offset": 9})),
                 ("find-float", "find", json!({"pattern":"*", "limit": 1.0})),
                 ("find-zero", "find", json!({"pattern":"*", "limit": 0})),
                 ("find-negative", "find", json!({"pattern":"*", "limit": -1})),
@@ -48,6 +55,13 @@ impl Model for Script {
                 ),
             ]
             .into_iter()
+            .chain(cfg!(unix).then(|| {
+                (
+                    "bash-timeout",
+                    "bash",
+                    json!({"command": "sleep 4", "timeout": 0.25}),
+                )
+            }))
             .map(|(id, name, args)| ToolCall {
                 id: id.into(),
                 name: name.into(),
@@ -94,6 +108,28 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         )
         .await
         .unwrap();
+    let tool_results: std::collections::HashMap<_, _> = session
+        .operations()
+        .into_iter()
+        .map(|(invocation, state)| (invocation.call.id, state))
+        .collect();
+    for call_id in ["ls-missing", "grep-missing", "read-offset", "find-fraction"]
+        .into_iter()
+        .chain(cfg!(unix).then_some("bash-timeout"))
+    {
+        assert!(
+            matches!(
+                &tool_results[call_id],
+                OperationState::Finished(Outcome::TextResult {
+                    details: Some(details),
+                    is_error: true,
+                    ..
+                }) if *details == json!({})
+            ),
+            "{call_id}: {:?}",
+            tool_results[call_id]
+        );
+    }
     let requests = model.0.lock().unwrap();
     let replies: std::collections::HashMap<_, _> = requests[1]
         .messages
@@ -125,6 +161,25 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         )
     );
     assert_eq!(replies["ls-huge"], ("a\nb\nc", false));
+    let missing = format!(
+        "Path not found: {}",
+        root.path()
+            .canonicalize()
+            .unwrap()
+            .join("missing")
+            .display()
+    );
+    assert_eq!(replies["ls-missing"], (missing.as_str(), true));
+    assert_eq!(replies["grep-missing"], (missing.as_str(), true));
+    #[cfg(unix)]
+    assert_eq!(
+        replies["bash-timeout"],
+        ("Command timed out after 0.25 seconds", true)
+    );
+    assert_eq!(
+        replies["read-offset"],
+        ("Offset 9 is beyond end of file (1 lines total)", true)
+    );
     assert_eq!(
         replies["find-float"],
         (

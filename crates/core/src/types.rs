@@ -299,6 +299,37 @@ pub enum Message {
     },
 }
 
+/// Headers required by Copilot for the initiator and capabilities of a turn.
+pub fn copilot_request_headers(
+    messages: &[Message],
+) -> impl Iterator<Item = (&'static str, &'static str)> {
+    let initiator = match messages.last() {
+        None | Some(Message::User { .. } | Message::UserWithImages { .. }) => "user",
+        Some(_) => "agent",
+    };
+    let images = messages.iter().any(|message| match message {
+        Message::UserWithImages { images, .. } => !images.is_empty(),
+        Message::Tool {
+            content,
+            is_structured,
+            ..
+        } if *is_structured != Some(false) => serde_json::from_str::<Value>(content)
+            .ok()
+            .is_some_and(|body| {
+                body.pointer("/data/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image"))
+            }),
+        _ => false,
+    });
+    [
+        ("x-initiator", initiator),
+        ("openai-intent", "conversation-edits"),
+    ]
+    .into_iter()
+    .chain(images.then_some(("copilot-vision-request", "true")))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
@@ -440,6 +471,7 @@ impl CacheRetention {
 pub enum ModelApi {
     OpenaiCompletions,
     OpenaiResponses,
+    OpenaiCodexResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
     BedrockConverseStream,
@@ -451,6 +483,7 @@ impl ModelApi {
         match name {
             "openai-completions" => Some(Self::OpenaiCompletions),
             "openai-responses" => Some(Self::OpenaiResponses),
+            "openai-codex-responses" => Some(Self::OpenaiCodexResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             "google-generative-ai" => Some(Self::GoogleGenerativeAi),
             "bedrock-converse-stream" => Some(Self::BedrockConverseStream),
@@ -463,6 +496,7 @@ impl ModelApi {
         match self {
             Self::OpenaiCompletions => "openai-completions",
             Self::OpenaiResponses => "openai-responses",
+            Self::OpenaiCodexResponses => "openai-codex-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
             Self::BedrockConverseStream => "bedrock-converse-stream",

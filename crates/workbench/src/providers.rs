@@ -31,6 +31,7 @@ pub(super) enum Provider {
 pub(super) enum Adapter {
     ChatCompletions,
     OpenAiResponses,
+    CodexResponses,
     Anthropic,
     Google,
     Bedrock,
@@ -42,6 +43,7 @@ impl Adapter {
         match api {
             "openai-completions" => Some(Self::ChatCompletions),
             "openai-responses" => Some(Self::OpenAiResponses),
+            "openai-codex-responses" => Some(Self::CodexResponses),
             "anthropic-messages" => Some(Self::Anthropic),
             "google-generative-ai" => Some(Self::Google),
             "bedrock-converse-stream" => Some(Self::Bedrock),
@@ -54,6 +56,7 @@ impl Adapter {
         match self {
             Self::ChatCompletions => "openai-completions",
             Self::OpenAiResponses => "openai-responses",
+            Self::CodexResponses => "openai-codex-responses",
             Self::Anthropic => "anthropic-messages",
             Self::Google => "google-generative-ai",
             Self::Bedrock => "bedrock-converse-stream",
@@ -172,6 +175,16 @@ impl Provider {
             })
         };
         match adapter {
+            Adapter::CodexResponses => {
+                let token = token.ok_or_else(|| {
+                    Error::Config("no Pi Codex OAuth credential for this endpoint".into())
+                })?;
+                Ok(Client::OpenAi(pi_rs::openai::OpenAiResponses::new_codex(
+                    endpoint,
+                    token,
+                    self.id(),
+                )?))
+            }
             Adapter::OpenAiResponses => {
                 let token = token.ok_or_else(missing_key)?;
                 Ok(Client::OpenAi(if self.id() == "openai-chatgpt" {
@@ -181,9 +194,17 @@ impl Provider {
                 }))
             }
             Adapter::ChatCompletions => {
+                if self.id() == "cloudflare-workers-ai" && endpoint.is_empty() {
+                    return Err(Error::Config(
+                        "set CLOUDFLARE_ACCOUNT_ID for cloudflare-workers-ai".into(),
+                    ));
+                }
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
-                    && builtin.endpoint() == endpoint
+                    && (builtin.endpoint() == endpoint
+                        || (self.id() == "cloudflare-workers-ai"
+                            && super::model_profiles::cloudflare_workers_chat_account(endpoint)
+                                .is_some()))
                 {
                     return Err(Error::Config(format!(
                         "set {} or pass --api-key for {}",
@@ -202,7 +223,7 @@ impl Provider {
                 } else if bearer
                     || matches!(
                         self.id(),
-                        "fireworks" | "openrouter" | "minimax" | "minimax-cn"
+                        "fireworks" | "openrouter" | "minimax" | "minimax-cn" | "github-copilot"
                     )
                 {
                     Anthropic::with_bearer_token(endpoint, &token)?
@@ -375,6 +396,28 @@ impl Deferred {
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
             ),
+            Some(Credential::Codex) => {
+                let settings = match &self.http_settings {
+                    Some(settings) => settings.clone(),
+                    None => super::config::Settings::load(&std::env::current_dir()?, false)?,
+                };
+                Some(
+                    super::codex_auth::access(
+                        auth_path,
+                        &settings,
+                        std::time::Duration::ZERO,
+                        false,
+                    )
+                    .await?,
+                )
+            }
+            Some(Credential::Copilot) => {
+                let settings = match &self.http_settings {
+                    Some(settings) => settings.clone(),
+                    None => super::config::Settings::load(&std::env::current_dir()?, false)?,
+                };
+                Some(super::copilot_auth::access_for_path(auth_path, &settings, None, false).await?)
+            }
             Some(Credential::Kimi) if self.http_settings.is_some() => Some(
                 super::kimi_auth::access(
                     self.http_settings.as_ref().expect("settings checked"),
@@ -422,9 +465,17 @@ impl Deferred {
                 radius_checked = true;
             }
         }
+        let endpoint = if matches!(self.credential, Some(Credential::Copilot)) {
+            super::copilot_auth::routed_endpoint(
+                &self.endpoint,
+                token.as_deref().expect("resolved Copilot access"),
+            )?
+        } else {
+            self.endpoint.clone()
+        };
         let mut client = self
             .provider
-            .connect_prechecked(self.adapter, &self.endpoint, token, bearer, radius_checked)?
+            .connect_prechecked(self.adapter, &endpoint, token, bearer, radius_checked)?
             .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         match (&self.credential, &mut client) {
@@ -459,7 +510,7 @@ impl Client {
             Self::OpenAi(_) | Self::Ollama(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
-                Adapter::OpenAiResponses | Adapter::ChatCompletions
+                Adapter::OpenAiResponses | Adapter::CodexResponses | Adapter::ChatCompletions
             ),
             _ => false,
         }
@@ -472,7 +523,7 @@ impl Client {
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
-                    Adapter::OpenAiResponses | Adapter::ChatCompletions
+                    Adapter::OpenAiResponses | Adapter::CodexResponses | Adapter::ChatCompletions
                 ) =>
             {
                 return Box::pin(client.resolve().await?.with_final_strict_support(supported))
@@ -488,6 +539,7 @@ impl Client {
             Self::Deferred(client) => matches!(
                 client.adapter,
                 Adapter::OpenAiResponses
+                    | Adapter::CodexResponses
                     | Adapter::ChatCompletions
                     | Adapter::Google
                     | Adapter::Anthropic
@@ -888,6 +940,7 @@ impl Client {
                 if matches!(
                     client.adapter,
                     Adapter::OpenAiResponses
+                        | Adapter::CodexResponses
                         | Adapter::ChatCompletions
                         | Adapter::Google
                         | Adapter::Anthropic
@@ -1254,7 +1307,12 @@ impl Client {
                     .unwrap_or_default();
                 let levels = metadata
                     .as_ref()
-                    .and_then(|model| model.levels(Adapter::OpenAiResponses))
+                    .and_then(|model| {
+                        model.levels(
+                            args.model_profiles
+                                .model_adapter(&args.provider, &args.model),
+                        )
+                    })
                     .unwrap_or_else(|| pi_rs::openai::thinking_levels(&args.model));
                 let thinking = if metadata
                     .as_ref()
@@ -1282,6 +1340,22 @@ impl Client {
                 let use_developer = metadata.as_ref().and_then(|model| model.reasoning)
                     == Some(true)
                     && supports_developer != Some(false);
+                let client = if args
+                    .model_profiles
+                    .model_adapter(&args.provider, &args.model)
+                    == Adapter::CodexResponses
+                {
+                    let off = metadata.as_ref().map_or(Some("none"), |model| {
+                        if model.reasoning == Some(false) {
+                            None
+                        } else {
+                            model.mapped_effort("off").unwrap_or(Some("none"))
+                        }
+                    });
+                    client.with_codex_off_effort(off)
+                } else {
+                    client
+                };
                 let client = client
                     .with_max_output_tokens_field(
                         args.model_profiles

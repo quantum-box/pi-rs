@@ -180,7 +180,8 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
     let mut plan = resource_declarations(args, false)?;
     plan.extend(resource_declarations(args, true)?);
     for declaration in plan {
-        let cached = if remote(&declaration.source) {
+        let is_remote = remote(&declaration.source);
+        let cached = if is_remote {
             installed.contains_key(&key(&declaration.source))
         } else {
             installed
@@ -191,13 +192,20 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                         .unwrap_or(true)
                 })
         };
-        if args.offline && remote(&declaration.source) {
+        if args.offline && is_remote {
             if !cached {
                 eprintln!(
                     "Package {}: skipped in offline mode",
                     display_source(&declaration.source)
                 );
             }
+            continue;
+        }
+        if declaration.transient
+            && cached
+            && let Some(value) = installed.get(&key(&declaration.source))
+            && cached_git_pin_matches(&declaration.source, value, cleanup).await
+        {
             continue;
         }
         if declaration.transient || !cached {
@@ -209,7 +217,11 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
-                Err(error) if cleanup.is_some() || (declaration.transient && !cached) => {
+                // Standalone share requires a complete runtime. Keep strict
+                // validation for explicitly requested native files and directories.
+                Err(error)
+                    if cleanup.is_some() || (!is_remote && declaration.transient && !cached) =>
+                {
                     return Err(error);
                 }
                 Err(error) => eprintln!("Package {}: {error}", display_source(&declaration.source)),
@@ -1142,6 +1154,24 @@ pub(crate) fn resource_matches(
     if let Some(name) = path.file_name() {
         candidates.push(name.to_string_lossy().into_owned());
     }
+    if let Some(Some(extglob)) = package_diagnostic::extglob_regex(&pattern) {
+        // The bounded translator matches ASCII paths. Leave dot-path and
+        // Unicode cases to the existing native matcher until their Node
+        // semantics can be reproduced.
+        let in_supported_subset = |candidate: &str| {
+            candidate.is_ascii() && !candidate.split('/').any(|part| part.starts_with('.'))
+        };
+        if candidates
+            .iter()
+            .any(|candidate| in_supported_subset(candidate) && extglob.is_match(candidate))
+        {
+            return true;
+        }
+        candidates.retain(|candidate| !in_supported_subset(candidate));
+        if candidates.is_empty() {
+            return false;
+        }
+    }
     let Ok(glob) = globset::GlobBuilder::new(&pattern)
         .literal_separator(true)
         .backslash_escape(false)
@@ -1151,11 +1181,56 @@ pub(crate) fn resource_matches(
     };
     let matcher = glob.compile_matcher();
     candidates.iter().any(|candidate| {
-        matcher.is_match(candidate)
+        (matcher.is_match(candidate)
+            && (directory_roots || matches_hidden_filter_segments(candidate, &pattern)))
             || (directory_roots
                 && !pattern.contains(['*', '?', '[', '{'])
                 && candidate.starts_with(&format!("{pattern}/")))
     })
+}
+
+// Minimatch requires a leading dot in the pattern segment that matches a
+// hidden component. A globstar can skip zero segments or consume visible ones.
+fn matches_hidden_filter_segments(candidate: &str, pattern: &str) -> bool {
+    if !candidate.split('/').any(|segment| segment.starts_with('.')) {
+        return true;
+    }
+    if pattern.contains('{') {
+        // Keep the existing glob match for brace combinations outside the
+        // bounded expansion. A leading dot can come from any alternative.
+        return package_diagnostic::expand_diagnostic_braces(pattern).is_none_or(|variants| {
+            variants
+                .iter()
+                .any(|variant| matches_hidden_filter_segments(candidate, variant))
+        });
+    }
+    let components: Vec<_> = candidate.split('/').collect();
+    let mut matched = vec![false; components.len() + 1];
+    matched[0] = true;
+    for segment in pattern.split('/') {
+        if segment == "**" {
+            for (index, component) in components.iter().enumerate() {
+                matched[index + 1] |= matched[index] && !component.starts_with('.');
+            }
+            continue;
+        }
+        let Ok(glob) = globset::GlobBuilder::new(segment)
+            .literal_separator(true)
+            .backslash_escape(false)
+            .build()
+        else {
+            return false;
+        };
+        let matcher = glob.compile_matcher();
+        let allows_dot = segment.starts_with('.') || segment.starts_with("[.]");
+        for (index, component) in components.iter().enumerate().rev() {
+            matched[index + 1] = matched[index]
+                && (allows_dot || !component.starts_with('.'))
+                && matcher.is_match(component);
+        }
+        matched[0] = false;
+    }
+    matched[components.len()]
 }
 
 fn source_field(value: &Value) -> Option<&str> {
@@ -1532,18 +1607,15 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
     Ok(resolve_source_path(&path)?.to_string_lossy().into_owned())
 }
 fn resolve_source_path(path: &Path) -> Result<PathBuf> {
-    let mut prefix = std::path::absolute(path)?;
+    // Pi resolves dot segments before asking the filesystem to compare
+    // package paths. A symlink followed by ".." therefore never redirects
+    // the package to the parent of the symlink target.
+    let mut prefix = normalize_filter_path(&std::path::absolute(path)?);
     let mut suffix = Vec::new();
     loop {
         match prefix.canonicalize() {
             Ok(mut resolved) => {
-                for component in suffix.into_iter().rev() {
-                    if component == std::ffi::OsStr::new("..") {
-                        resolved.pop();
-                    } else if component != std::ffi::OsStr::new(".") {
-                        resolved.push(component);
-                    }
-                }
+                resolved.extend(suffix.into_iter().rev());
                 return Ok(resolved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1632,6 +1704,47 @@ fn git_reference(source: &str) -> (&str, &str) {
         None => (source, "HEAD"),
     }
 }
+fn is_git_commit_prefix(reference: &str) -> bool {
+    (7..=64).contains(&reference.len()) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn cached_git_pin_matches(source: &str, cache: &Value, cleanup: Option<&Children>) -> bool {
+    let Some(specification) = source.strip_prefix("git:") else {
+        return false;
+    };
+    let (_, reference) = git_reference(specification);
+    if !is_git_commit_prefix(reference) {
+        return false;
+    }
+    let Ok(package) = serde_json::from_value::<Installed>(cache.clone()) else {
+        return false;
+    };
+    if package.source != source || !package.root.join(".git").is_dir() {
+        return false;
+    }
+    resolve_git_commit(&package.root, "HEAD", source, cleanup)
+        .await
+        .is_some_and(|commit| commit.starts_with(&reference.to_ascii_lowercase()))
+}
+
+async fn resolve_git_commit(
+    root: &Path,
+    reference: &str,
+    source: &str,
+    cleanup: Option<&Children>,
+) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{reference}^{{commit}}"));
+    let output = run(command, source, cleanup).await.ok()?;
+    let commit = std::str::from_utf8(&output).ok()?.trim();
+    (matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| commit.to_ascii_lowercase())
+}
+
 fn key(source: &str) -> String {
     format!("{:x}", Sha256::digest(source.as_bytes()))
 }
@@ -1756,24 +1869,38 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
             ));
         }
         root = generation.path().join("source");
-        if !root.exists() {
-            let mut command = tokio::process::Command::new("git");
-            command
-                .args(["clone", "--no-checkout", "--depth", "1", "--", url])
-                .arg(&root);
-            run(command, source, cleanup).await?;
+        let abbreviated = is_git_commit_prefix(reference) && !matches!(reference.len(), 40 | 64);
+        let mut command = tokio::process::Command::new("git");
+        command.args(["clone", "--no-checkout"]);
+        if !abbreviated {
+            command.args(["--depth", "1"]);
         }
-        let mut fetch = tokio::process::Command::new("git");
-        fetch
-            .arg("-C")
-            .arg(&root)
-            .args(["fetch", "--depth", "1", "--", "origin", reference]);
-        run(fetch, source, cleanup).await?;
+        command.args(["--", url]).arg(&root);
+        run(command, source, cleanup).await?;
+
+        let mut commit = None;
+        if abbreviated {
+            let prefix = reference.to_ascii_lowercase();
+            commit = resolve_git_commit(&root, &prefix, source, cleanup)
+                .await
+                .filter(|commit| commit.starts_with(&prefix));
+        }
+        let target = if let Some(commit) = commit.as_deref() {
+            commit
+        } else {
+            let mut fetch = tokio::process::Command::new("git");
+            fetch
+                .arg("-C")
+                .arg(&root)
+                .args(["fetch", "--depth", "1", "--", "origin", reference]);
+            run(fetch, source, cleanup).await?;
+            "FETCH_HEAD"
+        };
         let mut checkout = tokio::process::Command::new("git");
         checkout
             .arg("-C")
             .arg(&root)
-            .args(["reset", "--hard", "FETCH_HEAD"]);
+            .args(["reset", "--hard", target]);
         run(checkout, source, cleanup).await?;
     }
     if root.is_file() {
@@ -3665,6 +3792,44 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
     }
 
     #[test]
+    fn package_filters_match_bounded_positive_extglobs() {
+        let root = Path::new("package");
+        let candidates = [
+            "review",
+            "triage",
+            "audit",
+            "review-quick",
+            "@(review|triage)",
+        ]
+        .map(|name| root.join(format!("prompts/{name}.md")));
+        let filter = ResourceFilter::new(
+            &json!({"prompts":["prompts/@(review|triage).md", "!@(triage|audit).md", "+prompts/audit.md"]}),
+            "prompts",
+        ).unwrap();
+
+        assert_eq!(
+            filter.states(&candidates, root, false).unwrap(),
+            [
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false)
+            ]
+        );
+
+        let delta = ResourceFilter::new(
+            &json!({"autoload":false,"prompts":["prompts/review?(-quick).md"]}),
+            "prompts",
+        )
+        .unwrap();
+        assert_eq!(
+            delta.states(&candidates, root, false).unwrap(),
+            [Some(true), None, None, Some(true), None]
+        );
+    }
+
+    #[test]
     fn package_filter_reports_invalid_file_urls_when_evaluated() {
         let root = std::env::temp_dir();
         let path = root.join("prompts/review.md");
@@ -5078,6 +5243,53 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             &filters(&["skills/**", "!skills/demo", "+skills/demo"])
         ));
     }
+
+    #[test]
+    fn package_filter_globs_require_explicit_hidden_components() {
+        let root = Path::new("/package");
+        for (path, pattern, expected) in [
+            (".hidden.md", "*.md", false),
+            (".hidden.md", "?hidden.md", false),
+            (".hidden.md", "[a.]hidden.md", false),
+            (".hidden.md", "[.]hidden.md", true),
+            (".hidden.md", "{.hidden,visible}.md", true),
+            (".hidden.md", ".*.md", true),
+            (".hidden.md", "+./.hidden.md", true),
+            ("visible.md", "*.md", true),
+            ("prompts/open/sub.md", "prompts/**/*.md", true),
+            ("prompts/.nested/buried.md", "prompts/**/*.md", false),
+            ("prompts/.nested/buried.md", "prompts/.*/buried.md", true),
+            ("prompts/.nested/buried.md", "**/buried.md", true),
+            ("prompts/.nested/buried.md", "prompts/**/.nested/*.md", true),
+            ("prompts/.nested/buried.md", "prompts/**/.other/*.md", false),
+            (".hidden.md", "!*.md", true),
+            ("skills/.hidden/SKILL.md", "skills/*", false),
+            ("skills/.hidden/SKILL.md", "skills/.*", true),
+            ("skills/.hidden/SKILL.md", "+skills/.hidden", true),
+        ] {
+            let filter = ResourceFilter::new(&json!({"prompts": [pattern]}), "prompts").unwrap();
+            assert_eq!(
+                filter.includes(&root.join(path), root, false).unwrap(),
+                expected,
+                "{pattern} against {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_package_candidate_reaches_later_filter_diagnostics() {
+        let root = std::env::temp_dir();
+        let path = root.join(".hidden.md");
+        let base = reqwest::Url::from_directory_path(&root).unwrap();
+        let invalid = format!("{base}bad%2Fpath");
+        let ordinary =
+            ResourceFilter::new(&json!({"prompts": ["*.md", invalid]}), "prompts").unwrap();
+        assert!(ordinary.includes(&path, &root, false).is_err());
+        let explicit =
+            ResourceFilter::new(&json!({"prompts": [".*.md", invalid]}), "prompts").unwrap();
+        assert!(explicit.includes(&path, &root, false).unwrap());
+    }
+
     #[test]
     fn exact_filter_overrides_do_not_expand_globs_or_depend_on_order() {
         let root = Path::new("/package");
@@ -5120,5 +5332,30 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(source.contains("native-demo"));
         assert!(!source.contains("project_notes"));
         assert!(scaffold(&target, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_sources_resolve_parent_segments_before_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let work = directory.path().join("work");
+        let package = work.join("package");
+        let external = directory.path().join("external");
+        let via_symlink = external.join("package");
+        let target = external.join("target");
+        for path in [&package, &via_symlink, &target] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, work.join("link")).unwrap();
+
+        let resolved = normalize("./link/../package", &work).unwrap();
+        assert_eq!(Path::new(&resolved), package.canonicalize().unwrap());
+        let resolved = normalize("./link/../missing/package", &work).unwrap();
+        assert_eq!(
+            Path::new(&resolved),
+            work.canonicalize().unwrap().join("missing/package")
+        );
+        let resolved = normalize("./link", &work).unwrap();
+        assert_eq!(Path::new(&resolved), target.canonicalize().unwrap());
     }
 }
