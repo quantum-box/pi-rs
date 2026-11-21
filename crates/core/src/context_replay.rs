@@ -149,11 +149,12 @@ pub(crate) fn replacement_replay(
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .filter(|v| v["type"] == "reasoning"),
-            (ModelApi::OpenaiCompletions, ContentBlock::Text { text, .. }) => {
-                Some(json!({"type":"context_edit_text","text":text}))
-            }
             (
-                ModelApi::OpenaiCompletions,
+                ModelApi::OpenaiCompletions | ModelApi::MistralConversations,
+                ContentBlock::Text { text, .. },
+            ) => Some(json!({"type":"context_edit_text","text":text})),
+            (
+                ModelApi::OpenaiCompletions | ModelApi::MistralConversations,
                 ContentBlock::Thinking {
                     thinking,
                     thinking_signature,
