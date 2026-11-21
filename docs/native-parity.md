@@ -4794,6 +4794,22 @@ and headers inferred from classifier-only model URLs apply to those operations.
 When the inferred URL is on the configured official account, its provider
 credentials also apply to chat. Live Workers AI inference has not been verified.
 
+### Cloudflare AI Gateway
+
+Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
+credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
+selects the Chat Completions, Messages, or Responses path. All three send
+`cf-aig-authorization` for gateway authentication, and saved keys remain
+scoped to their account and gateway. A concrete provider `baseUrl` can
+supply missing route identifiers for an imported key when the configured
+route agrees with any saved or environment identifiers.
+
+The published Pi AI package and local fixtures cover each route and
+authentication header. Live gateway authentication was unverified because
+no gateway credentials were available.
+
 ### Configured llama.cpp classifiers
 
 A `models.json` provider can declare an entry with `"type": "classifier"` and
