@@ -860,6 +860,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_counts_a_configured_chatgpt_model_only_once() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {
+                "openai-chatgpt": {
+                    "api": "openai-responses",
+                    "models": [{"id": "chatgpt-custom"}]
+                }
+            }
+        }))
+        .unwrap();
+        let selected = super::cli_catalog_model(&args, "chatgpt-custom", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.qualified(), "openai-chatgpt/chatgpt-custom");
+    }
+
     fn split(value: &str, available: &[String]) -> pi_rs::Result<Choice> {
         super::split(value, available, "ollama")
     }
