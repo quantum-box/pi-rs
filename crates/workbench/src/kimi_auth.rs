@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Credential {
     pub access: String,
@@ -190,6 +191,12 @@ impl Service {
             .map_err(|_| error("device authorization expired"))?
     }
     async fn refresh(&self, refresh: &str) -> Result<Credential> {
+        tokio::time::timeout(REFRESH_TIMEOUT, self.refresh_with_retries(refresh))
+            .await
+            .map_err(|_| error("token refresh timed out"))?
+    }
+
+    async fn refresh_with_retries(&self, refresh: &str) -> Result<Credential> {
         for attempt in 0..4 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
@@ -490,6 +497,20 @@ mod tests {
             task,
         )
     }
+    #[tokio::test]
+    async fn refresh_deadline_covers_a_stalled_http_exchange() {
+        let (service, started, _reply, server) = refresh_server(3600).await;
+        let refresh = tokio::spawn(async move { service.refresh("fixture-refresh").await });
+        started.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(14)).await;
+        assert!(!refresh.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let err = refresh.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("token refresh timed out"));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn shared_pi_lock_serializes_refresh_and_api_key_writer() {
         let dir = tempfile::tempdir().unwrap();

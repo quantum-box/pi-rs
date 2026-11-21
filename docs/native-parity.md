@@ -482,8 +482,10 @@ The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
 and the six pinned Kimi chat models. Their image limits, prices, context windows,
 and per-model reasoning settings remain distinct; the high-speed coding model
 uses its DeepSeek-style thinking switch. Subscription OAuth supports device
-login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
-remains open.
+login, refresh, and Pi-compatible credential storage. A refresh has Pi's
+15-second deadline across network attempts and backoff. Once admitted, an
+in-flight refresh can still persist rotated credentials if its caller is
+cancelled. Live Kimi acceptance remains open.
 
 On terminals without OSC 8 support, Markdown links use the reference's text
 fallback: link text is underlined and destinations appear in parentheses only
