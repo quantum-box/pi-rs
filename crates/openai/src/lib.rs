@@ -755,7 +755,7 @@ fn responses_payload(
         json!({"model":request.model, "input":input, "store":false, "stream":true, "max_output_tokens":request.max_output_tokens})
     };
     if codex && request.max_output_tokens != 0 {
-        body["max_output_tokens"] = json!(request.max_output_tokens.max(16));
+        body["max_output_tokens"] = json!(request.max_output_tokens);
     }
     if !request.tools.is_empty() {
         let tools: Vec<_> = request.tools.iter().map(|tool| json!({"type":"function", "name":tool.name, "description":tool.description, "parameters":tool.parameters, "strict":false})).collect();
@@ -1253,6 +1253,12 @@ impl OpenAiResponses {
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
         let api = self.api();
+        if api == pi_rs_core::ModelApi::OpenaiCodexResponses
+            && self.send_max_output_tokens
+            && (1..16).contains(&max_output_tokens)
+        {
+            return Err(Error::Budget);
+        }
         let mut body = responses_payload(
             &request,
             &self.provider,
@@ -1651,8 +1657,17 @@ mod tests {
                 },
             ],
             tools: vec![],
-            max_output_tokens: 4,
+            max_output_tokens: 16,
         };
+        assert!(matches!(
+            client
+                .stream(ModelRequest {
+                    max_output_tokens: 4,
+                    ..request.clone()
+                })
+                .await,
+            Err(Error::Budget)
+        ));
         let events = client
             .stream(request)
             .await

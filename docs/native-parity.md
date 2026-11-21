@@ -4865,7 +4865,8 @@ their own adapters.
 `openai-codex` exposes the eight pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
-The output budget uses the current upstream minimum of 16 tokens for Codex.
+Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
+a smaller positive budget ends the run before a request goes to Codex.
 A model with `compat.supportsMaxOutputTokens: false` uses local output safeguards.
 `pi login openai-codex` uses browser PKCE, and `--device-code` selects
 device authorization. Browser sign-in also accepts a pasted code or redirect.
