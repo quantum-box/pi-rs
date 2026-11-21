@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use fluent_uri::Iri;
 use serde::{Deserialize, Serialize};
@@ -226,22 +230,23 @@ pub struct RegisteredMcpServer {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct McpServerRegistrations(Vec<RegisteredMcpServer>);
+pub(crate) struct McpServerRegistrations(Vec<Arc<RegisteredMcpServer>>);
 
 impl McpServerRegistrations {
-    pub(crate) fn servers(&self) -> &[RegisteredMcpServer] {
+    pub(crate) fn servers(&self) -> &[Arc<RegisteredMcpServer>] {
         &self.0
     }
 
-    pub(crate) fn put(&mut self, mut registration: RegisteredMcpServer) -> Result<()> {
+    pub(crate) fn put(&mut self, mut registration: RegisteredMcpServer) -> Result<bool> {
         registration.server.validate_and_normalize()?;
         let name = registration.server.name.as_str();
         let namespace = name.replace('-', "_");
-        if let Some(existing) = self
+        let existing_index = self
             .0
-            .iter_mut()
-            .find(|existing| existing.server.name.replace('-', "_") == namespace)
-        {
+            .iter()
+            .position(|existing| existing.server.name.replace('-', "_") == namespace);
+        if let Some(index) = existing_index {
+            let existing = self.0[index].as_ref();
             if existing.server.name != name {
                 return Err(Error::Config(format!(
                     "MCP server {name:?} conflicts with registered server {:?}",
@@ -254,11 +259,32 @@ impl McpServerRegistrations {
                     existing.extension_id
                 )));
             }
-            *existing = registration;
-        } else {
-            self.0.push(registration);
+            if *existing == registration {
+                return Ok(false);
+            }
         }
-        Ok(())
+
+        // Leave room in the 16 MiB native duplex frame for the response envelope.
+        let mut encoded = McpRegistrySize(2);
+        for item in self
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != existing_index)
+            .map(|(_, item)| item.as_ref())
+            .chain(std::iter::once(&registration))
+        {
+            serde_json::to_writer(&mut encoded, item)
+                .map_err(|_| Error::Config("MCP registry exceeds the native size limit".into()))?;
+            encoded.0 += 1;
+        }
+
+        if let Some(index) = existing_index {
+            self.0[index] = Arc::new(registration);
+        } else {
+            self.0.push(Arc::new(registration));
+        }
+        Ok(true)
     }
 
     pub(crate) fn remove(&mut self, owner: &str, name: &str) -> bool {
@@ -270,6 +296,252 @@ impl McpServerRegistrations {
 
     pub(crate) fn remove_owner(&mut self, owner: &str) {
         self.0.retain(|entry| entry.extension_id != owner);
+    }
+}
+
+struct McpRegistrySize(usize);
+
+impl std::io::Write for McpRegistrySize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        if self.0 > 8 * 1024 * 1024 {
+            return Err(std::io::Error::other(
+                "MCP registry exceeds native message size",
+            ));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// MCP operations scoped to the extension handling a lifecycle callback.
+#[async_trait::async_trait]
+pub trait McpRegistryHost: Send + Sync {
+    async fn mcp_servers(&self) -> crate::ExtensionResult<Vec<RegisteredMcpServer>>;
+    async fn register_mcp_server(&self, server: McpServerDeclaration)
+    -> crate::ExtensionResult<()>;
+    async fn unregister_mcp_server(&self, name: &str) -> crate::ExtensionResult<bool>;
+}
+
+#[derive(Default)]
+pub(crate) struct McpRuntime {
+    state: Mutex<McpRuntimeState>,
+}
+
+#[derive(Default)]
+struct McpRuntimeState {
+    registrations: McpServerRegistrations,
+    pending: VecDeque<Vec<Arc<RegisteredMcpServer>>>,
+    delivering: bool,
+}
+
+impl McpRuntime {
+    pub(crate) fn snapshot(&self) -> Vec<RegisteredMcpServer> {
+        self.state
+            .lock()
+            .expect("MCP registrations")
+            .registrations
+            .servers()
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect()
+    }
+
+    // Explicit host changes copy the current declarations into the modified
+    // registry. Callback changes share the runtime of that registry and its active snapshots.
+    pub(crate) fn copy_registrations(&self) -> Self {
+        let registrations = self
+            .state
+            .lock()
+            .expect("MCP registrations")
+            .registrations
+            .clone();
+        Self {
+            state: Mutex::new(McpRuntimeState {
+                registrations,
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub(crate) fn registrations_mut(&mut self) -> &mut McpServerRegistrations {
+        &mut self
+            .state
+            .get_mut()
+            .expect("MCP registrations")
+            .registrations
+    }
+
+    pub(crate) fn register(&self, registration: RegisteredMcpServer, publish: bool) -> Result<()> {
+        let mut state = self.state.lock().expect("MCP registrations");
+        if publish {
+            state.check_capacity()?;
+        }
+        if state.registrations.put(registration)? && publish {
+            state.record_change();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unregister(&self, extension_id: &str, name: &str, publish: bool) -> Result<bool> {
+        let mut state = self.state.lock().expect("MCP registrations");
+        if !state
+            .registrations
+            .servers()
+            .iter()
+            .any(|entry| entry.extension_id == extension_id && entry.server.name == name)
+        {
+            return Ok(false);
+        }
+        if publish {
+            state.check_capacity()?;
+        }
+        state.registrations.remove(extension_id, name);
+        if publish {
+            state.record_change();
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn begin_delivery(&self) -> Option<McpChangeDelivery<'_>> {
+        let mut state = self.state.lock().expect("MCP registrations");
+        if state.delivering || state.pending.is_empty() {
+            return None;
+        }
+        state.delivering = true;
+        Some(McpChangeDelivery {
+            runtime: self,
+            claimed: true,
+        })
+    }
+}
+
+pub(crate) struct McpChangeDelivery<'a> {
+    runtime: &'a McpRuntime,
+    claimed: bool,
+}
+
+impl McpChangeDelivery<'_> {
+    pub(crate) fn pop_change(&mut self) -> Option<Vec<RegisteredMcpServer>> {
+        let mut state = self.runtime.state.lock().expect("MCP registrations");
+        let change = state.pending.pop_front();
+        if change.is_none() {
+            state.delivering = false;
+            self.claimed = false;
+        }
+        change.map(|servers| servers.iter().map(|entry| entry.as_ref().clone()).collect())
+    }
+}
+
+impl Drop for McpChangeDelivery<'_> {
+    fn drop(&mut self) {
+        if self.claimed {
+            self.runtime
+                .state
+                .lock()
+                .expect("MCP registrations")
+                .delivering = false;
+        }
+    }
+}
+
+pub(crate) struct McpCallbackScope {
+    host: Arc<ScopedMcpRegistry>,
+}
+
+impl McpCallbackScope {
+    pub(crate) fn new(
+        runtime: Arc<McpRuntime>,
+        extension: &dyn crate::Extension,
+        publish_changes: bool,
+    ) -> Self {
+        Self {
+            host: Arc::new(ScopedMcpRegistry {
+                runtime,
+                extension_id: extension.id().into(),
+                extension_path: extension.command_source().map(std::path::Path::to_path_buf),
+                publish_changes,
+                open: Mutex::new(true),
+            }),
+        }
+    }
+
+    pub(crate) fn host(&self) -> Arc<dyn McpRegistryHost> {
+        self.host.clone()
+    }
+}
+
+impl Drop for McpCallbackScope {
+    fn drop(&mut self) {
+        *self.host.open.lock().expect("MCP callback scope") = false;
+    }
+}
+
+struct ScopedMcpRegistry {
+    runtime: Arc<McpRuntime>,
+    extension_id: String,
+    extension_path: Option<PathBuf>,
+    publish_changes: bool,
+    open: Mutex<bool>,
+}
+
+impl ScopedMcpRegistry {
+    fn admission(&self) -> crate::ExtensionResult<std::sync::MutexGuard<'_, bool>> {
+        let guard = self.open.lock().expect("MCP callback scope");
+        if !*guard {
+            return Err("MCP registry callback has finished".into());
+        }
+        Ok(guard)
+    }
+}
+
+impl McpRuntimeState {
+    fn check_capacity(&self) -> Result<()> {
+        // Like the other callback channels, pending notifications are bounded.
+        if self.pending.len() >= 32 {
+            return Err(Error::Config("MCP registry change queue is full".into()));
+        }
+        Ok(())
+    }
+
+    fn record_change(&mut self) {
+        self.pending
+            .push_back(self.registrations.servers().to_vec());
+    }
+}
+
+#[async_trait::async_trait]
+impl McpRegistryHost for ScopedMcpRegistry {
+    async fn mcp_servers(&self) -> crate::ExtensionResult<Vec<RegisteredMcpServer>> {
+        let _admission = self.admission()?;
+        Ok(self.runtime.snapshot())
+    }
+
+    async fn register_mcp_server(
+        &self,
+        server: McpServerDeclaration,
+    ) -> crate::ExtensionResult<()> {
+        let _admission = self.admission()?;
+        self.runtime
+            .register(
+                RegisteredMcpServer {
+                    server,
+                    extension_id: self.extension_id.clone(),
+                    extension_path: self.extension_path.clone(),
+                },
+                self.publish_changes,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    async fn unregister_mcp_server(&self, name: &str) -> crate::ExtensionResult<bool> {
+        let _admission = self.admission()?;
+        self.runtime
+            .unregister(&self.extension_id, name, self.publish_changes)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -491,6 +763,101 @@ mod tests {
         assert_eq!(
             *observe.0.lock().unwrap(),
             [vec!["first", "second"], vec!["second"]]
+        );
+    }
+    #[tokio::test]
+    async fn native_live_mcp_registration_is_scoped_and_emits_ordered_snapshots() {
+        struct NoModel;
+        #[async_trait::async_trait]
+        impl crate::Model for NoModel {
+            async fn stream(&self, _: crate::ModelRequest) -> Result<crate::ModelStream> {
+                panic!("registration must not request a model");
+            }
+        }
+
+        #[derive(Default)]
+        struct Owner {
+            scope: Mutex<Option<Arc<dyn McpRegistryHost>>>,
+            changes: Mutex<Vec<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl Extension for Owner {
+            fn id(&self) -> &str {
+                "owner"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_mcp_registry(&self) -> bool {
+                true
+            }
+            fn handles_mcp_servers_change(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_mcp_registry(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                _: Arc<dyn crate::ToolHost>,
+                mcp: Arc<dyn McpRegistryHost>,
+            ) -> crate::ExtensionResult<()> {
+                if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                    assert!(
+                        mcp.register_mcp_server(declaration("foreign", "changed"))
+                            .await
+                            .is_err()
+                    );
+                    assert!(!mcp.unregister_mcp_server("foreign").await.unwrap());
+                    mcp.register_mcp_server(declaration("active", "fixture"))
+                        .await
+                        .unwrap();
+                    assert_eq!(mcp.mcp_servers().await.unwrap()[1].server.name, "active");
+                    mcp.register_mcp_server(declaration("active", "fixture"))
+                        .await
+                        .unwrap();
+                    *self.scope.lock().unwrap() = Some(mcp);
+                }
+                if let crate::LifecycleEvent::McpServersChange { servers } = event {
+                    self.changes.lock().unwrap().push(
+                        servers
+                            .iter()
+                            .map(|server| server.server.name.clone())
+                            .collect(),
+                    );
+                    // Repeating the existing normalized declaration is a no-op.
+                    if servers.iter().any(|server| server.server.name == "active") {
+                        mcp.register_mcp_server(declaration("active", "fixture"))
+                            .await
+                            .unwrap();
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let owner = Arc::new(Owner::default());
+        let mut session = crate::SessionBuilder::new(Arc::new(NoModel), "fixture")
+            .extension(Arc::new(Declares(
+                "foreign-owner",
+                vec![declaration("foreign", "fixture")],
+            )))
+            .unwrap()
+            .extension(owner.clone())
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.start().await.unwrap();
+        assert_eq!(*owner.changes.lock().unwrap(), [vec!["foreign", "active"]]);
+        assert_eq!(session.registered_mcp_servers()[0].server.name, "foreign");
+        let scope = owner.scope.lock().unwrap().take().unwrap();
+        assert!(
+            scope
+                .register_mcp_server(declaration("too-late", "fixture"))
+                .await
+                .is_err()
         );
     }
 }

@@ -1469,6 +1469,22 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to scoped runtime MCP registration during lifecycle callbacks.
+    fn handles_mcp_registry(&self) -> bool {
+        false
+    }
+
+    /// A lifecycle callback with a scoped MCP registry for the current extension.
+    async fn lifecycle_with_mcp_registry(
+        &self,
+        event: &crate::LifecycleEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+        _mcp: Arc<dyn crate::McpRegistryHost>,
+    ) -> ExtensionResult<()> {
+        self.lifecycle_with_host(event, state, host).await
+    }
+
     /// Opt in to session start and shutdown events in addition to run and turn events.
     fn handles_session_lifecycle(&self) -> bool {
         false
@@ -1929,7 +1945,7 @@ pub struct Registry {
     pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
     refresher: Option<Arc<dyn RegistryRefresher>>,
     pub(crate) omit_default_tool_timeout: bool,
-    mcp_servers: Arc<crate::mcp_registration::McpServerRegistrations>,
+    pub(crate) mcp_servers: Arc<crate::mcp_registration::McpRuntime>,
     omit_mcp_declarations: bool,
     branch_models: Arc<RwLock<BranchModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
@@ -1937,8 +1953,27 @@ pub struct Registry {
 
 impl Registry {
     /// MCP server declarations in registration order.
-    pub fn registered_mcp_servers(&self) -> &[crate::RegisteredMcpServer] {
-        self.mcp_servers.servers()
+    pub fn registered_mcp_servers(&self) -> Vec<crate::RegisteredMcpServer> {
+        self.mcp_servers.snapshot()
+    }
+
+    pub(crate) fn isolate_mcp_runtime(&mut self) {
+        self.mcp_servers = Arc::new(self.mcp_servers.copy_registrations());
+    }
+
+    pub(crate) fn mcp_callback_scope(
+        &self,
+        extension: &dyn Extension,
+    ) -> Option<crate::mcp_registration::McpCallbackScope> {
+        (!self.omit_mcp_declarations && extension.handles_mcp_registry()).then(|| {
+            crate::mcp_registration::McpCallbackScope::new(
+                self.mcp_servers.clone(),
+                extension,
+                self.extensions
+                    .iter()
+                    .any(|extension| extension.handles_mcp_servers_change()),
+            )
+        })
     }
 
     fn insert_mcp_declarations(
@@ -1956,12 +1991,11 @@ impl Registry {
         Ok(())
     }
 
-    /// Register or update a declaration as a registered extension.
-    pub fn register_mcp_server(
-        &mut self,
+    fn owned_mcp_registration(
+        &self,
         extension_id: &str,
         server: crate::McpServerDeclaration,
-    ) -> Result<()> {
+    ) -> Result<crate::RegisteredMcpServer> {
         if self.omit_mcp_declarations {
             return Err(Error::Config(
                 "MCP declarations are disabled for this registry".into(),
@@ -1972,16 +2006,60 @@ impl Registry {
             .iter()
             .find(|extension| extension.id() == extension_id)
             .ok_or_else(|| Error::Config(format!("unknown extension {extension_id:?}")))?;
-        Arc::make_mut(&mut self.mcp_servers).put(crate::RegisteredMcpServer {
+        Ok(crate::RegisteredMcpServer {
             server,
             extension_id: extension_id.into(),
             extension_path: extension.command_source().map(std::path::Path::to_path_buf),
         })
     }
 
+    fn has_mcp_change_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.handles_mcp_servers_change())
+    }
+
+    pub(crate) fn register_live_mcp_server(
+        &self,
+        extension_id: &str,
+        server: crate::McpServerDeclaration,
+    ) -> Result<()> {
+        self.mcp_servers.register(
+            self.owned_mcp_registration(extension_id, server)?,
+            self.has_mcp_change_hooks(),
+        )
+    }
+
+    pub(crate) fn unregister_live_mcp_server(
+        &self,
+        extension_id: &str,
+        name: &str,
+    ) -> Result<bool> {
+        self.mcp_servers
+            .unregister(extension_id, name, self.has_mcp_change_hooks())
+    }
+
+    /// Register or update a declaration as a registered extension.
+    pub fn register_mcp_server(
+        &mut self,
+        extension_id: &str,
+        server: crate::McpServerDeclaration,
+    ) -> Result<()> {
+        let registration = self.owned_mcp_registration(extension_id, server)?;
+        let mut runtime = self.mcp_servers.copy_registrations();
+        runtime.registrations_mut().put(registration)?;
+        self.mcp_servers = Arc::new(runtime);
+        Ok(())
+    }
+
     /// Remove a declaration owned by the named extension.
     pub fn unregister_mcp_server(&mut self, extension_id: &str, name: &str) -> bool {
-        Arc::make_mut(&mut self.mcp_servers).remove(extension_id, name)
+        let mut runtime = self.mcp_servers.copy_registrations();
+        let removed = runtime.registrations_mut().remove(extension_id, name);
+        if removed {
+            self.mcp_servers = Arc::new(runtime);
+        }
+        removed
     }
 
     /// Whether a registered extension without a source path is a host built-in.
@@ -2918,7 +2996,7 @@ impl Registry {
             ui: self.ui.clone(),
             refresher: None,
             omit_default_tool_timeout: self.omit_default_tool_timeout,
-            mcp_servers: self.mcp_servers.clone(),
+            mcp_servers: Arc::new(self.mcp_servers.copy_registrations()),
             omit_mcp_declarations: self.omit_mcp_declarations,
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
@@ -2942,7 +3020,9 @@ impl Registry {
             .iter()
             .any(|server| server.extension_id == extension.id())
         {
-            Arc::make_mut(&mut candidate.mcp_servers).remove_owner(extension.id());
+            let mut runtime = candidate.mcp_servers.copy_registrations();
+            runtime.registrations_mut().remove_owner(extension.id());
+            candidate.mcp_servers = Arc::new(runtime);
         }
         candidate
             .tools
@@ -3018,9 +3098,13 @@ impl Registry {
         if !self.omit_mcp_declarations {
             let servers = extension.mcp_server_declarations();
             if !servers.is_empty() {
-                let mut registrations = self.mcp_servers.as_ref().clone();
-                Self::insert_mcp_declarations(&mut registrations, extension.as_ref(), servers)?;
-                self.mcp_servers = Arc::new(registrations);
+                let mut runtime = self.mcp_servers.copy_registrations();
+                Self::insert_mcp_declarations(
+                    runtime.registrations_mut(),
+                    extension.as_ref(),
+                    servers,
+                )?;
+                self.mcp_servers = Arc::new(runtime);
             }
         }
         self.tools.extend(tools);

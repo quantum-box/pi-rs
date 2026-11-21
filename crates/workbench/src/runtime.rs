@@ -381,7 +381,7 @@ impl Runtime {
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
         for (name, value) in
-            mcp_config::registered_configurations(args, self.registry.registered_mcp_servers())?
+            mcp_config::registered_configurations(args, &self.registry.registered_mcp_servers())?
         {
             if let Some(server) = servers.iter().find(|server| server.server_name == name) {
                 output(
@@ -429,11 +429,14 @@ impl Runtime {
         }) = self.mcp_sign_in.front().cloned()
         {
             let current = || {
-                mcp_config::registered_configurations(args, self.registry.registered_mcp_servers())?
-                    .remove(&name)
-                    .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
-                    .transpose()
-                    .map_err(pi_rs::Error::from)
+                mcp_config::registered_configurations(
+                    args,
+                    &self.registry.registered_mcp_servers(),
+                )?
+                .remove(&name)
+                .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
+                .transpose()
+                .map_err(pi_rs::Error::from)
             };
             if args
                 .disable_extension
@@ -1044,7 +1047,7 @@ async fn configure_after(
         ))?;
         let extra = mcp_config::discover_registered(
             args,
-            registry.registered_mcp_servers(),
+            &registry.registered_mcp_servers(),
             &discovered.configured_namespaces,
             interactive_mcp,
             share_services,
