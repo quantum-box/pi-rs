@@ -14277,11 +14277,21 @@ impl Scheduler {
                     if item.task.attempt_id() != Some(target) {
                         return Err(Error::Ownership);
                     }
-                    checks.extend(
-                        harness
-                            .checkpointable_conversation_checks(&item.task, &self.registry)
-                            .map_err(|e| Error::Handler(e.to_string()))?,
-                    );
+                    if matches!(item.task.owner(), TaskOwner::Task(_)) {
+                        let (_, nested_checks) = harness
+                            .checkpointable_nested_woken_candidate_checks(
+                                &item.task,
+                                &self.registry,
+                            )
+                            .map_err(|e| Error::Handler(e.to_string()))?;
+                        checks.extend(nested_checks);
+                    } else {
+                        checks.extend(
+                            harness
+                                .checkpointable_conversation_checks(&item.task, &self.registry)
+                                .map_err(|e| Error::Handler(e.to_string()))?,
+                        );
+                    }
                     // Mark the entire known foreground task graph before any
                     // cleanup can run. Background tasks remain independent.
                     // Owned conversations and damaged graphs stay fail closed.

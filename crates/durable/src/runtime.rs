@@ -11811,7 +11811,13 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<(Uuid, Vec<Check>), Error> {
-        self.checkpointable_nested_cancel_checks_inner(task, registry, false, &Default::default())
+        self.checkpointable_nested_cancel_checks_inner(
+            task,
+            registry,
+            false,
+            false,
+            &Default::default(),
+        )
     }
 
     /// Provisional root binding for an already-cancelled nested child. The
@@ -11822,7 +11828,13 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
     ) -> Result<(Uuid, Vec<Check>), Error> {
-        self.checkpointable_nested_cancel_checks_inner(task, registry, true, &Default::default())
+        self.checkpointable_nested_cancel_checks_inner(
+            task,
+            registry,
+            true,
+            false,
+            &Default::default(),
+        )
     }
 
     /// The caller must retain the checks and identity leases proving each
@@ -11837,7 +11849,24 @@ impl Harness {
             task,
             registry,
             true,
+            false,
             authenticated_ancestors,
+        )
+    }
+
+    /// Provisional binding for an interrupted running child before abort is marked.
+    /// The caller must atomically fence the original wake proof and graph abort.
+    pub(crate) fn checkpointable_nested_woken_candidate_checks(
+        &self,
+        task: &crate::task::Task,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<(Uuid, Vec<Check>), Error> {
+        self.checkpointable_nested_cancel_checks_inner(
+            task,
+            registry,
+            false,
+            true,
+            &Default::default(),
         )
     }
 
@@ -11846,9 +11875,10 @@ impl Harness {
         task: &crate::task::Task,
         registry: &crate::task_scheduler::Registry,
         terminal: bool,
+        candidate: bool,
         authenticated_ancestors: &std::collections::HashSet<Uuid>,
     ) -> Result<(Uuid, Vec<Check>), Error> {
-        if !task.abort_requested()
+        if task.abort_requested() == candidate
             || task.state()
                 != if terminal {
                     &crate::task::TaskState::Cancelled
@@ -11887,7 +11917,7 @@ impl Harness {
         checks.extend(self.checkpointable_conversation_checks_inner(
             task,
             registry,
-            true,
+            !candidate,
             false,
             terminal,
             authenticated_ancestors,
