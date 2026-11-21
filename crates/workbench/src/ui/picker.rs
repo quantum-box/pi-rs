@@ -35,6 +35,8 @@ pub enum Selection {
     LoginKimi,
     LoginMeta,
     LoginXai,
+    LoginCodex,
+    LoginCodexDevice,
     LoginCopilot,
     LoginChatGpt,
     LoginChatGptNew,

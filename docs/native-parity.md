@@ -440,6 +440,7 @@ Live acceptance with an Ant Ling account remains open.
 
 ### OpenCode Zen and Go
 
+The pinned Pi CLI defaults to Kimi K2.6 for Zen and Kimi K3 for Go.
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
 
@@ -1029,6 +1030,10 @@ Loopback RPC and PTY checks covered consent, decline, scope union, one retry,
 and credential generation changes. The existing OAuth and live catalog checks
 passed with the same implementation.
 
+Servers that return JSON-RPC Method not found for `resources/templates/list`
+produce an empty template list, including when a page cursor is supplied.
+Other template errors remain visible.
+
 ### Remote model read operations
 
 Native hosts can inject asynchronous `ReadOperations` through
@@ -1604,7 +1609,14 @@ extensions and session names.
 
 MCP `deferred` exposure now hides tool schemas until `tool_search` loads a
 match. A native BM25 ranker uses names, descriptions, schema fields and server
-metadata. Selection state follows the journal branch and survives reopening.
+metadata. As in Pi 1.6.0, `tool_search` and Codemode `searchTools` index
+reachable local schema references once. `describeTool` follows local input
+schema references and bounds recursive and oversized declarations. Neither
+operation fetches external schemas. Native resolution also accepts RFC 6901
+array indices, empty keys and encoded separators. The declaration retains
+supported input types stated alongside a reference. A depth bound limits
+reference chains while allowing independent fields to reuse a definition.
+Selection state follows the journal branch and survives reopening.
 Exact exposure overrides and wildcard matching are supported. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
@@ -1686,8 +1698,9 @@ Classifier results include their API and invocation timestamp even if the
 request fails early or is cancelled, as they do on successful requests.
 
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
-`Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
-server-delay cap still applies to the parsed value. GMT retry dates also accept
+`Retry-After-Ms`, including decimal and exponent forms. Values that overflow
+when converted to milliseconds use the usual backoff. The 60-second
+server-delay cap applies to finite values. GMT retry dates also accept
 the obsolete RFC 850 form with JavaScript's two-digit year interpretation.
 
 ### Resource selection checkpoint
@@ -2054,6 +2067,11 @@ same saved notes reached both requests.
 
 ### Streaming search checkpoint
 
+Unrestricted local built-in tools coerce model arguments to their declared
+string, number and boolean types before schema validation. Optional null fields
+are treated as omissions, and edit batches also normalize replacement fields.
+Scoped tools and injected operations retain their argument handling.
+
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 characters, and reports match
 and byte limits. Large text files remain searchable. Overlapping context ranges
@@ -2066,7 +2084,9 @@ zero, negative and fractional values. Local `find` reproduces fd's numeric
 argument parsing: zero means unlimited, while negative, fractional, and values
 outside fd's host-sized integer range produce fd-style errors before checking
 the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Notices and details retain the JavaScript numeric value. Scoped tools retain their positive
+without an added failure prefix. Generated local tool errors carry Pi's empty
+`details` object in JSON and RPC. Notices and details retain the JavaScript
+numeric value. Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
@@ -4459,6 +4479,21 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can subscribe to `after_provider_response` to observe the
+HTTP status and normalized headers from an agent turn. The OpenAI Responses,
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+await these callbacks in registration order before reading either a success or
+error body. This includes HTTP errors the native transports receive directly.
+Callback failures are reported as extension diagnostics. The
+callbacks share up to five seconds and at most half the remaining model time. The
+response remains under the adapter's control. Executable extensions advertise
+`after_provider_response_hook` and receive an `after_provider_response`
+request with `event.status`, `event.headers`, and their branch state. Response
+metadata is ephemeral. Credential headers, cookies, sensitive header values and
+reflected configured credentials are withheld. Bedrock and custom transports
+without response metadata reporting do not emit this event. Summary and catalog
+requests remain outside the turn hook.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
@@ -4831,6 +4866,24 @@ Baseten and NVIDIA's pinned chat-completions catalogs are also available,
 including model-specific compatibility, NVIDIA polling headers and Baseten's
 thinking template. Catalog entries that use other upstream APIs still need
 their own adapters.
+
+### OpenAI Codex
+
+`openai-codex` exposes the eight pinned models through the ChatGPT Codex
+Responses route. It supports native HTTP streaming, model-specific reasoning
+levels, image inputs, tool calls, and endpoint-bound response replay.
+`pi login openai-codex` uses browser PKCE, and `--device-code` selects
+device authorization. Browser sign-in also accepts a pasted code or redirect.
+The terminal offers both methods. Existing Pi Codex
+credentials can be read and refreshed in place. A refresh in flight saves
+rotated credentials even when the requesting turn is cancelled. They stay bound to the
+official Codex endpoint and are independent of native `openai-chatgpt` accounts.
+
+The native transport sends uncompressed JSON over HTTP SSE. The upstream
+WebSocket transport and specialized Codex
+grammar tools and tool search remain open. Authentication was exercised with
+fixtures. Live sign-in and inference were unverified because no account was
+available for acceptance.
 
 ### GitHub Copilot
 
@@ -5653,10 +5706,11 @@ Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
 escapes, invalid escape characters or Unicode digits, missing values, and numeric
-fractions, exponents, and leading minus signs cut off at EOF. Offsets
-and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
-For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
-control after a surrogate in another string if no other parse error occurs first.
+fractions, exponents, and leading minus signs cut off at EOF. Offsets and
+columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+For records up to 1 MiB, diagnostic retries distinguish incomplete object
+separators and commas in nested containers. They also identify a raw control
+after a surrogate in another string if no other parse error occurs first.
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
 position-aware wording. Other malformed records, including array trailing
