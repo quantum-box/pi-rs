@@ -5,7 +5,7 @@ use std::path::Path;
 use encoding_rs::{CoderResult, Encoding, UTF_8, UTF_16BE, UTF_16LE};
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use pi_rs::{CancellationToken, Error, Outcome, Result};
 use serde_json::{Map, Value, json};
 
@@ -19,7 +19,9 @@ pub(super) struct Grep {
 }
 impl Grep {
     pub fn with_numeric_limit(mut self, limit: f64) -> Self {
-        self.output.numeric_limit = Some(limit.max(1.0));
+        self.output.numeric_limit = Some(limit.floor().max(1.0));
+        self.context = self.context.min(9_007_199_254_740_991);
+        self.searcher = Self::build_searcher(self.context);
         self
     }
     pub fn new(args: &Value, limit: usize) -> Result<Self> {
@@ -52,11 +54,7 @@ impl Grep {
             .unwrap_or_else(|| args["context"].as_f64().unwrap_or(0.0).max(0.0) as u64);
         Ok(Self {
             matcher,
-            searcher: SearcherBuilder::new()
-                .line_number(true)
-                .binary_detection(BinaryDetection::quit(0))
-                .heap_limit(Some(64 * 1024 * 1024))
-                .build(),
+            searcher: Self::build_searcher(0),
             output: Output {
                 limit,
                 ..Output::default()
@@ -64,6 +62,17 @@ impl Grep {
             context,
         })
     }
+    fn build_searcher(context: u64) -> Searcher {
+        let context = usize::try_from(context).unwrap_or(usize::MAX);
+        SearcherBuilder::new()
+            .line_number(true)
+            .binary_detection(BinaryDetection::quit(0))
+            .heap_limit(Some(64 * 1024 * 1024))
+            .before_context(context)
+            .after_context(context)
+            .build()
+    }
+
     /// Ripgrep converts NUL bytes to line breaks for explicit file arguments.
     pub fn with_explicit_file(mut self) -> Self {
         self.searcher
@@ -81,6 +90,24 @@ impl Grep {
             file: std::fs::File::open(path)?,
             cancellation,
         };
+        if self.output.numeric_limit.is_some() {
+            let result = self.searcher.search_reader(
+                &self.matcher,
+                file,
+                PiMatchSink {
+                    display,
+                    output: &mut self.output,
+                    context: self.context,
+                    trailing_end: None,
+                    cancellation,
+                },
+            );
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            result?;
+            return Ok(!self.output.match_limit_exceeded);
+        }
         let mut matches = None;
         let result = self.searcher.search_reader(
             &self.matcher,
@@ -118,7 +145,8 @@ impl Grep {
         let text = output.lines.join("\n");
         let mut details = Map::new();
         let mut notices = Vec::new();
-        if output.limit_reached() {
+        if output.match_limit_exceeded || (output.numeric_limit.is_none() && output.limit_reached())
+        {
             let effective = output.numeric_limit.unwrap_or(output.limit as f64);
             details.insert(
                 "matchLimitReached".into(),
@@ -193,6 +221,7 @@ struct Output {
     matches: usize,
     limit: usize,
     numeric_limit: Option<f64>,
+    match_limit_exceeded: bool,
     long_lines: bool,
     kept_bytes: usize,
     prefix_full: bool,
@@ -259,6 +288,84 @@ impl ContextLine {
             text,
             truncated,
         }
+    }
+    fn from_rg(number: u64, bytes: &[u8]) -> Self {
+        let decoded = String::from_utf8_lossy(bytes);
+        let text = decoded.strip_suffix('\n').unwrap_or(&decoded);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        let mut units = 0;
+        let end = text.char_indices().find_map(|(offset, character)| {
+            units += character.len_utf16();
+            (units > 500).then_some(offset)
+        });
+        let text = match end {
+            Some(offset) => format!("{}... [truncated]", &text[..offset]),
+            None => text.to_owned(),
+        };
+        Self {
+            number,
+            text,
+            truncated: end.is_some(),
+        }
+    }
+}
+
+// Unrestricted Pi grep renders ripgrep's own context events. It looks
+// for one more match before reporting that the selected results were capped.
+struct PiMatchSink<'a> {
+    display: &'a str,
+    output: &'a mut Output,
+    context: u64,
+    trailing_end: Option<u64>,
+    cancellation: &'a CancellationToken,
+}
+
+impl PiMatchSink<'_> {
+    fn line(&mut self, number: u64, bytes: &[u8], matched: bool) -> io::Result<bool> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::other("Operation aborted"));
+        }
+
+        if self.output.limit_reached() {
+            let within_tail = self.trailing_end.is_some_and(|end| number <= end);
+            if within_tail {
+                self.output
+                    .line(self.display, &ContextLine::from_rg(number, bytes), false);
+            }
+            self.output.match_limit_exceeded |= matched;
+            return Ok(!self.output.match_limit_exceeded
+                || self.trailing_end.is_some_and(|end| number < end));
+        }
+
+        self.output
+            .line(self.display, &ContextLine::from_rg(number, bytes), matched);
+        if matched {
+            self.output.matches += 1;
+            if self.output.limit_reached() {
+                self.trailing_end = Some(number.saturating_add(self.context));
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Sink for PiMatchSink<'_> {
+    type Error = io::Error;
+
+    fn matched(&mut self, _: &Searcher, found: &SinkMatch<'_>) -> io::Result<bool> {
+        self.line(
+            found.line_number().expect("line numbers enabled"),
+            found.bytes(),
+            true,
+        )
+    }
+
+    fn context(&mut self, _: &Searcher, context: &SinkContext<'_>) -> io::Result<bool> {
+        self.line(
+            context.line_number().expect("line numbers enabled"),
+            context.bytes(),
+            false,
+        )
     }
 }
 
@@ -652,6 +759,7 @@ mod tests {
             .unwrap()
             .with_numeric_limit(9_007_199_254_740_992.0);
         grep.output.matches = 9_007_199_254_740_992;
+        grep.output.match_limit_exceeded = true;
         grep.output.lines.push("fixture:1: match".into());
         let output = grep.finish().tool_content();
         assert!(
@@ -847,6 +955,75 @@ mod tests {
         assert_eq!(
             grep.finish().tool_content(),
             "text-1- before\ntext:2: match one\ntext-3- match two\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]"
+        );
+    }
+
+    #[test]
+    fn pi_grep_merges_context_and_reports_only_an_exceeded_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for (input, context, limit, expected) in [
+            (
+                "before\nmatch one\nmatch two\nafter\n",
+                1,
+                100.0,
+                "text-1- before\ntext:2: match one\ntext:3: match two\ntext-4- after",
+            ),
+            (
+                "before\nmatch one\nmatch two\nafter\nlast\n",
+                2,
+                1.9,
+                "text-1- before\ntext:2: match one\ntext-3- match two\ntext-4- after\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]",
+            ),
+            (
+                "before\nmatch one\nafter\n",
+                2,
+                1.0,
+                "text-1- before\ntext:2: match one\ntext-3- after",
+            ),
+            (
+                "before\nmatch one\nafter\ngap\nmatch two\n",
+                1,
+                1.0,
+                "text-1- before\ntext:2: match one\ntext-3- after\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]",
+            ),
+            (
+                "before\rafter\r\nmatch\rinside\r\nlast\r",
+                2,
+                10.0,
+                "text-1- before\rafter\ntext:2: match\rinside\ntext-3- last",
+            ),
+        ] {
+            std::fs::write(file.path(), input).unwrap();
+            let mut grep = Grep::new(&json!({"pattern":"match","context":context}), 100)
+                .unwrap()
+                .with_numeric_limit(limit);
+            grep.search(file.path(), "text", &CancellationToken::new())
+                .unwrap();
+            assert_eq!(grep.finish().tool_content(), expected, "{input:?}");
+        }
+        let line = ContextLine::from_rg(1, format!("{}😀\n", "x".repeat(499)).as_bytes());
+        assert!(line.truncated);
+        assert_eq!(line.text, format!("{}... [truncated]", "x".repeat(499)));
+    }
+
+    #[test]
+    fn pi_grep_checks_for_more_matches_in_other_files() {
+        let first = tempfile::NamedTempFile::new().unwrap();
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let second = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(first.path(), "first match\nafter\n").unwrap();
+        std::fs::write(empty.path(), "unrelated\n").unwrap();
+        std::fs::write(second.path(), "before\nsecond match\n").unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match","context":1}), 100)
+            .unwrap()
+            .with_numeric_limit(1.0);
+        let token = CancellationToken::new();
+        assert!(grep.search(first.path(), "first", &token).unwrap());
+        assert!(grep.search(empty.path(), "empty", &token).unwrap());
+        assert!(!grep.search(second.path(), "second", &token).unwrap());
+        assert_eq!(
+            grep.finish().tool_content(),
+            "first:1: first match\nfirst-2- after\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]"
         );
     }
 

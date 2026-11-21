@@ -4976,7 +4976,7 @@ mod tests {
         {
             Outcome::SucceededWithDetails { details, .. } => {
                 assert!(details.get("matchLimitReached").is_none());
-                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+                assert_eq!(details["truncation"]["totalLines"], count);
             }
             other => panic!("expected truncated result with details, got {other:?}"),
         }
@@ -5020,9 +5020,9 @@ mod tests {
             ),
             (
                 json!(2.5),
-                3,
-                "2.5 matches limit reached. Use limit=5",
-                json!(2.5),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
             ),
         ] {
             let args = json!({"pattern":"needle", "limit":limit, "context":1});

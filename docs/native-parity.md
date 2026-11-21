@@ -1997,10 +1997,9 @@ same saved notes reached both requests.
 ### Streaming search checkpoint
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
-context lines, bounds long displayed lines at 500 characters, and reports match
-and byte limits. Large text files remain searchable. Overlapping context ranges
-are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
-radius is limited to 1,000 lines.
+context lines, bounds long displayed lines at 500 UTF-16 units, and reports
+match and byte limits. The unrestricted local tool uses ripgrep's context
+events as in Pi 1.6.0. Search memory retains the native 64 MiB cap.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
 JSON numbers as JavaScript doubles. `ls` compares the number directly, including
@@ -3131,24 +3130,19 @@ Malformed `glob` filters report the original glob with ripgrep's diagnostic
 before regex compilation. Unrestricted local `grep` and `ls` report the
 requested path as missing when an intermediate component is a regular file.
 
-Grep now emits a separate context block for each match, including repeated lines
-where adjacent matches overlap. The matching marker belongs to that block's
-center; a neighboring match uses the context marker. Pending blocks flush at EOF,
-including the final empty line when the file ends with a newline. The streaming
-implementation retains a bounded context window and bounded output.
+Unrestricted local grep emits each matching or context line once, keeps
+embedded carriage returns, and stops at the last real line of each file.
+Numeric match limits are floored and clamped to at least one. The notice
+is reported only when another match exceeds that effective limit, including
+in a different file. An extra match within the last selected match's trailing
+context uses the context marker. Long lines use Pi's 500 UTF-16-unit cutoff
+without splitting a surrogate pair. Match counting continues after the 50 KB
+output limit, so byte and line totals cover all selected output.
+Scoped tools retain their existing per-match context blocks and line truncation.
 
-Long lines use Pi's 500 UTF-16-unit cutoff. A split surrogate is rendered as a
-replacement character in native UTF-8 text. Match counting continues after the
-50 KB output limit, so combined match, byte and long-line notices reflect the
-same selected matches as the reference. Notice wording also matches Pi.
-
-Regression tests cover overlapping blocks, the final selected match's context,
-EOF with and without a trailing newline, surrogate boundaries, and combined
-limits. Direct execution of the pinned Pi tool confirmed the context output and
-the 101-line, 51,098-byte combined-limit result. A loopback CLI test also verified
-that invoking the native grep tool delivers those per-match context blocks to
-the next model request. Workspace tests and all-target Clippy passed. Other local-tool differences,
-including structured result details and find traversal, remain open.
+Regressions cover overlapping context, the final selected match's context,
+exact and exceeded limits, CRLF and embedded CR, and surrogate boundaries.
+The published Pi 1.6.0 tool produced the same representative results.
 
 ### Find traversal and glob checkpoint
 
