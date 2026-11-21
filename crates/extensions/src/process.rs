@@ -11,8 +11,9 @@ use pi_rs_core::{
     Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction,
     InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
     RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolRenderContext,
-    ToolRenderShell, ToolRenderers, ToolReply, ToolSectionRenderer, ToolSpec, TreeDecision,
-    TreePreparation,
+    ToolRenderShell, ToolRendererMatch, ToolRendererOverride, ToolRendererOverrideCallback,
+    ToolRendererOverrideMode, ToolRendererOverrideSection, ToolRenderers, ToolReply,
+    ToolSectionRenderer, ToolSpec, TreeDecision, TreePreparation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -215,6 +216,12 @@ enum ProtocolRequest {
         metadata: Option<Value>,
         state: Option<ExtensionState>,
     },
+    RenderToolOverride {
+        id: String,
+        section: ToolSection,
+        context: ToolRenderContext,
+        next: Option<RenderedExtensionRows>,
+    },
     RenderToolSection {
         section: ToolSection,
         context: ToolRenderContext,
@@ -355,6 +362,8 @@ struct Description {
     dependencies: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     custom_message_renderers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_renderer_overrides: Vec<DescriptionToolRendererOverride>,
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
@@ -654,6 +663,27 @@ enum ToolSection {
     Result,
 }
 
+#[derive(Serialize, Deserialize)]
+struct DescriptionToolRendererOverride {
+    id: String,
+    selector: ToolRendererMatch,
+    shell: Option<ToolRenderShell>,
+    call: Option<ToolRendererOverrideMode>,
+    result: Option<ToolRendererOverrideMode>,
+}
+
+impl From<ToolRendererOverride> for DescriptionToolRendererOverride {
+    fn from(rule: ToolRendererOverride) -> Self {
+        Self {
+            id: rule.id,
+            selector: rule.selector,
+            shell: rule.shell,
+            call: rule.call.map(|section| section.mode),
+            result: rule.result.map(|section| section.mode),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Serialize, Deserialize)]
 struct DescriptionToolRenderers {
     shell: ToolRenderShell,
@@ -761,6 +791,24 @@ impl ExecutableExtension {
     }
 
     fn from_description(endpoint: Endpoint, description: Description) -> Result<Self> {
+        if description.tool_renderer_overrides.len() > 64 {
+            return Err(Error::Config(
+                "too many executable tool renderer overrides".into(),
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for rule in &description.tool_renderer_overrides {
+            let valid_selector = match &rule.selector {
+                ToolRendererMatch::Exact(name) => !name.is_empty() && name.len() <= 512,
+                ToolRendererMatch::Prefix(prefix) => prefix.len() <= 512,
+            };
+            if !valid_selector || rule.id.is_empty() || rule.id.len() > 128 || !ids.insert(&rule.id)
+            {
+                return Err(Error::Config(
+                    "invalid or duplicate executable tool renderer override".into(),
+                ));
+            }
+        }
         let mut extension = Self {
             endpoint,
             description,
@@ -1068,6 +1116,30 @@ impl Extension for ExecutableExtension {
     fn handles_tool_execution_updates(&self) -> bool {
         self.description.tool_execution_update_hook
     }
+    fn tool_renderer_overrides(&self) -> Vec<ToolRendererOverride> {
+        self.description
+            .tool_renderer_overrides
+            .iter()
+            .map(|rule| {
+                let callback = |mode, section| ToolRendererOverrideSection {
+                    mode,
+                    renderer: Arc::new(ExecutableToolOverride {
+                        endpoint: self.endpoint.clone(),
+                        id: rule.id.clone(),
+                        section,
+                    }),
+                };
+                ToolRendererOverride {
+                    id: rule.id.clone(),
+                    selector: rule.selector.clone(),
+                    shell: rule.shell,
+                    call: rule.call.map(|mode| callback(mode, ToolSection::Call)),
+                    result: rule.result.map(|mode| callback(mode, ToolSection::Result)),
+                }
+            })
+            .collect()
+    }
+
     fn custom_message_renderer_types(&self) -> Vec<&str> {
         self.description
             .custom_message_renderers
@@ -2143,6 +2215,30 @@ impl ExecutableTool {
         }
     }
 }
+struct ExecutableToolOverride {
+    endpoint: Endpoint,
+    id: String,
+    section: ToolSection,
+}
+
+#[async_trait::async_trait]
+impl ToolRendererOverrideCallback for ExecutableToolOverride {
+    async fn render(
+        &self,
+        context: &ToolRenderContext,
+        next: Option<&RenderedExtensionRows>,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.endpoint
+            .request_async(ProtocolRequest::RenderToolOverride {
+                id: self.id.clone(),
+                section: self.section,
+                context: context.clone(),
+                next: next.cloned(),
+            })
+            .await
+    }
+}
+
 struct ExecutableToolRenderer {
     endpoint: Endpoint,
     tool_name: String,
@@ -3704,6 +3800,11 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            tool_renderer_overrides: extension
+                .tool_renderer_overrides()
+                .into_iter()
+                .map(DescriptionToolRendererOverride::from)
+                .collect(),
             custom_message_renderers: extension
                 .custom_message_renderer_types()
                 .into_iter()
@@ -3911,6 +4012,36 @@ async fn dispatch_inner(
                 )
                 .await,
         ),
+        ProtocolRequest::RenderToolOverride {
+            id,
+            section,
+            context,
+            next,
+        } => {
+            let Some(rule) = extension
+                .tool_renderer_overrides()
+                .into_iter()
+                .find(|rule| rule.id == id && rule.selector.matches(&context.tool_name))
+            else {
+                return Ok(Value::Null);
+            };
+            let section = match section {
+                ToolSection::Call => rule.call,
+                ToolSection::Result if context.result.is_some() => rule.result,
+                ToolSection::Result => None,
+            };
+            match section {
+                Some(section) => {
+                    let next = if section.mode == ToolRendererOverrideMode::Wrap {
+                        next.as_ref()
+                    } else {
+                        None
+                    };
+                    encode(section.renderer.render(&context, next).await)
+                }
+                None => Ok(Value::Null),
+            }
+        }
         ProtocolRequest::RenderToolSection { section, context } => {
             let renderers = extension
                 .tools()
@@ -5018,6 +5149,207 @@ esac
         let rows = rendered.call.unwrap();
         assert_eq!(rows.lines[0][0].text, "remote call");
         assert_eq!(rows.lines[0][0].color.as_deref(), Some("accent"));
+    }
+
+    #[cfg(unix)]
+    struct LabelRows;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl ToolSectionRenderer for LabelRows {
+        async fn render(
+            &self,
+            context: &ToolRenderContext,
+        ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+            Ok(Some(RenderedExtensionRows {
+                lines: vec![vec![pi_rs_core::UiComponentSpan {
+                    text: context.tool_name.clone(),
+                    ..Default::default()
+                }]],
+                ..Default::default()
+            }))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_tool_renderer_overrides_wrap_unregistered_calls_in_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = r#"#!/usr/bin/env python3
+import json, pathlib, sys
+
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = json.loads(pathlib.Path(__file__).with_suffix('.json').read_text())
+elif request['type'] == 'render_tool_override':
+    assert request['context']['toolName'] == 'mcp_archive_read'
+    text = request['id']
+    if request['next'] is not None:
+        text = text + '[' + request['next']['lines'][0][0]['text'] + ']'
+    result = {'lines': [[{'text': text, 'color': 'accent'}]]}
+else:
+    raise AssertionError(request['type'])
+print(json.dumps({'version': 1, 'response': {'Ok': result}}))
+"#;
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        for (id, overrides) in [
+            (
+                "outer",
+                serde_json::json!([{
+                    "id": "outer", "selector": {"kind": "prefix", "value": "mcp_archive_"},
+                    "call": "wrap", "result": "wrap", "shell": "self"
+                }]),
+            ),
+            (
+                "inner",
+                serde_json::json!([{
+                    "id": "inner", "selector": {"kind": "exact", "value": "mcp_archive_read"},
+                    "call": "replace"
+                }]),
+            ),
+        ] {
+            let path = root.path().join(format!("{id}.py"));
+            std::fs::write(&path, fixture).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(
+                path.with_extension("json"),
+                serde_json::json!({
+                    "id": id, "dependencies": [], "commands": [], "tools": [],
+                    "tool_renderer_overrides": overrides
+                })
+                .to_string(),
+            )
+            .unwrap();
+            registry
+                .register(Arc::new(
+                    ExecutableExtension::load_async(path).await.unwrap(),
+                ))
+                .unwrap();
+        }
+        let base = || {
+            Some(ToolRenderers {
+                call: Some(Arc::new(LabelRows)),
+                result: Some(Arc::new(LabelRows)),
+                ..Default::default()
+            })
+        };
+        let renderers = registry.tool_renderers();
+        let mut context =
+            ToolRenderContext::new("mcp_archive_read", "hidden-call", Value::Null, ".");
+        context.result = Some(pi_rs_core::ToolRenderResult {
+            content: serde_json::json!([{"type":"text","text":"result"}]),
+            details: None,
+            is_partial: false,
+            is_error: false,
+            duration_ms: None,
+        });
+        let rendered = renderers
+            .resolve("mcp_archive_read", &base)
+            .unwrap()
+            .render(&context, Duration::from_secs(2))
+            .await;
+        assert_eq!(rendered.shell, ToolRenderShell::SelfFramed);
+        assert_eq!(rendered.call.unwrap().lines[0][0].text, "outer[inner]");
+        assert_eq!(
+            rendered.result.unwrap().lines[0][0].text,
+            "outer[mcp_archive_read]"
+        );
+        assert!(renderers.resolve("mcp_live_read", &|| None).is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_renderer_override_only_dispatches_matching_advertised_sections() {
+        struct Rules;
+        struct Callback;
+
+        #[async_trait::async_trait]
+        impl ToolRendererOverrideCallback for Callback {
+            async fn render(
+                &self,
+                _: &ToolRenderContext,
+                next: Option<&RenderedExtensionRows>,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                assert!(
+                    next.is_none(),
+                    "a replacement must not receive downstream rows"
+                );
+                Ok(Some(RenderedExtensionRows {
+                    padding: 3,
+                    ..Default::default()
+                }))
+            }
+        }
+
+        impl Extension for Rules {
+            fn id(&self) -> &str {
+                "rules"
+            }
+
+            fn tool_renderer_overrides(&self) -> Vec<ToolRendererOverride> {
+                vec![ToolRendererOverride {
+                    id: "replace".into(),
+                    selector: ToolRendererMatch::Prefix("mcp_".into()),
+                    shell: None,
+                    call: Some(ToolRendererOverrideSection {
+                        mode: ToolRendererOverrideMode::Replace,
+                        renderer: Arc::new(Callback),
+                    }),
+                    result: None,
+                }]
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Rules);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["tool_renderer_overrides"][0]["call"], "replace");
+        assert_eq!(
+            description["tool_renderer_overrides"][0]["selector"]["kind"],
+            "prefix"
+        );
+        let request = |id: &str, name: &str, section| ProtocolRequest::RenderToolOverride {
+            id: id.into(),
+            section,
+            context: ToolRenderContext::new(name, "call", Value::Null, "."),
+            next: Some(RenderedExtensionRows::default()),
+        };
+        let output = dispatch(
+            extension.clone(),
+            request("replace", "mcp_read", ToolSection::Call),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output["padding"], 3);
+        assert!(
+            dispatch(
+                extension.clone(),
+                request("unknown", "mcp_read", ToolSection::Call)
+            )
+            .await
+            .unwrap()
+            .is_null()
+        );
+        assert!(
+            dispatch(
+                extension.clone(),
+                request("replace", "other", ToolSection::Call)
+            )
+            .await
+            .unwrap()
+            .is_null()
+        );
+        assert!(
+            dispatch(
+                extension,
+                request("replace", "mcp_read", ToolSection::Result)
+            )
+            .await
+            .unwrap()
+            .is_null()
+        );
     }
 
     #[tokio::test]

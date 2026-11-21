@@ -769,8 +769,17 @@ process requests. Workbench applies them to journaled calls and committed
 results, including restored transcript entries. Expansion and viewport
 changes rerender the active presentation with the host theme. Live tool
 calls render progressively parsed arguments and execution updates render
-partial content before the committed result. Executable cross-tool
-resolver registration remains pending.
+partial content before the committed result.
+
+### Executable cross-tool renderers
+
+Executable extensions advertise ordered exact and prefix matches for tool
+names, including historical calls without a registered tool. A matching
+declaration can replace a call or result callback, or receive and wrap the
+next callback's styled rows. Omitted sections inherit the remaining
+renderer chain. Pi's in-process resolvers also accept arbitrary predicates
+and can wrap live TypeScript components. The native executable protocol
+passes styled rows through isolated process requests.
 
 ### Native custom message renderers
 

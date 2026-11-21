@@ -1431,14 +1431,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Declarative cross-tool renderers, including for executable extensions.
+    fn tool_renderer_overrides(&self) -> Vec<crate::ToolRendererOverride> {
+        Vec::new()
+    }
+
     /// Override or wrap the tool's presentation, including for a tool owned by
     /// another extension. Delegate to `next` for tool names left alone.
     fn resolve_tool_renderers(
         &self,
-        _tool_name: &str,
+        tool_name: &str,
         next: &dyn Fn() -> Option<crate::ToolRenderers>,
     ) -> Option<crate::ToolRenderers> {
-        next()
+        crate::tool_render::resolve_tool_overrides(&self.tool_renderer_overrides(), tool_name, next)
     }
 
     /// Custom message types this extension can render in a native host.
