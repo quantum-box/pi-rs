@@ -931,6 +931,30 @@ stdio and streamable HTTP. It exposes namespaced server tools and resource
 listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
 and the CLI closes connections after each run.
+In the terminal, `/mcp` now opens a server list with each server's status,
+scope, tool count and exposure. Select one to inspect its description and
+the announced tools with their effective exposure. The view reflects the
+configuration loaded by the running session. Reconnect restarts the selected
+server and updates the available tools in the current session. The previous
+tools are withdrawn if reconnection fails. If the selected server changed
+on disk, reload the session before reconnecting. Terminal and loopback model
+checks covered a stale tool being replaced, a failed restart withdrawing that
+tool, and a later retry restoring access. Enable and Disable update the
+configuration scope shown for the server and take effect in the current
+session. The project-only action adds an override for a global server in a
+trusted project. Exposure changes between codemode, deferred and direct
+save to the server's effective configuration scope and update the model's
+tool declarations without restarting the connection. Per-tool overrides
+retain precedence. The manager offers Sign in for a server requiring OAuth
+and Sign out for a live OAuth connection. Sign-in opens the browser, checks
+the applied configuration before saving credentials, and reconnects the
+server. Sign-out clears the selected server's stored credentials and removes
+its live tools. The sign-in panel shows the authorization URL and can accept
+a pasted redirect URL if the browser cannot reach the loopback callback.
+Both routes validate the callback origin, path and OAuth state. Loopback
+tests covered nonstandard metadata discovery, browser and pasted callbacks,
+a rejected state, sign-out and a reconnect failure after sign-in. Hosted
+OAuth with a pi-rs client identity still requires live acceptance.
 
 Trusted project overrides of a global MCP server reject unknown fields and
 invalid values before applying any part of that override, so a typo or

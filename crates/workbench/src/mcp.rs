@@ -125,6 +125,10 @@ struct CatalogSnapshot {
     signal: Arc<CatalogSignal>,
     revision: u64,
     checked_at: Instant,
+    definitions: Vec<rmcp::model::Tool>,
+    has_resources: bool,
+    has_prompts: bool,
+    instructions: Option<String>,
 }
 
 const CATALOG_FALLBACK: Duration = Duration::from_secs(30);
@@ -438,14 +442,14 @@ pub struct McpExtension {
     id: String,
     tools: Vec<Arc<dyn Tool>>,
     server_tool_names: Vec<String>,
-    has_resources: bool,
     deferred: BTreeSet<String>,
     has_codemode: bool,
     has_deferred: bool,
     pub server_name: String,
     pub description: String,
     connection: Arc<Connection>,
-    catalog: CatalogSnapshot,
+    catalog: Arc<CatalogSnapshot>,
+    exposure: Option<String>,
 }
 
 /// HTTP transport settings supplied by an embedding host.
@@ -794,13 +798,13 @@ impl McpExtension {
             closed: AtomicBool::new(false),
             page_outputs: std::sync::Mutex::new(VecDeque::new()),
         });
-        Self::discover(connection).await
+        Self::discover(connection, config.exposure.clone()).await
     }
 
     /// Reload definitions while keeping the established transport and remote state.
     pub async fn refresh(&self) -> Result<Self> {
         drop(self.connection.active_service().await?);
-        Self::discover(self.connection.clone()).await
+        Self::discover(self.connection.clone(), self.exposure.clone()).await
     }
 
     /// Keep a notified catalog between turns and poll when notifications are unavailable.
@@ -819,12 +823,22 @@ impl McpExtension {
             }
         }
         drop(service);
-        Self::discover(self.connection.clone()).await.map(Some)
+        Self::discover(self.connection.clone(), self.exposure.clone())
+            .await
+            .map(Some)
     }
 
-    async fn discover(connection: Arc<Connection>) -> Result<Self> {
-        let name = connection.name.clone();
-        let config = connection.config.clone();
+    /// Rebuild the local declarations from the last catalog without restarting the server.
+    pub fn with_exposure(&self, exposure: String) -> Self {
+        Self::from_catalog(
+            self.connection.clone(),
+            self.catalog.clone(),
+            Some(exposure),
+        )
+    }
+
+    async fn discover(connection: Arc<Connection>, exposure: Option<String>) -> Result<Self> {
+        let name = &connection.name;
         let timeout = connection.timeout;
         let service = connection.service.lock().await;
         let info = service.peer_info();
@@ -844,29 +858,46 @@ impl McpExtension {
         } else {
             Vec::new()
         };
-        let server_tool_names = definitions
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
-        let has_resources = info
-            .as_ref()
-            .is_some_and(|info| info.capabilities.resources.is_some());
-        drop(service);
-        let catalog = CatalogSnapshot {
+        let catalog = Arc::new(CatalogSnapshot {
             signal,
             revision,
             checked_at: Instant::now(),
-        };
+            definitions,
+            has_resources: info
+                .as_ref()
+                .is_some_and(|info| info.capabilities.resources.is_some()),
+            has_prompts: info
+                .as_ref()
+                .is_some_and(|info| info.capabilities.prompts.is_some()),
+            instructions: info.and_then(|info| info.instructions.clone()),
+        });
+        drop(service);
+        Ok(Self::from_catalog(connection, catalog, exposure))
+    }
+
+    fn from_catalog(
+        connection: Arc<Connection>,
+        catalog: Arc<CatalogSnapshot>,
+        exposure: Option<String>,
+    ) -> Self {
+        let name = connection.name.clone();
+        let mut config = connection.config.clone();
+        config.exposure = exposure.clone();
+        let server_tool_names = catalog
+            .definitions
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
         let prefix = format!("mcp__{}__", normalize(&name));
         let mut counts = BTreeMap::<String, usize>::new();
-        for definition in &definitions {
+        for definition in &catalog.definitions {
             *counts.entry(normalize(&definition.name)).or_default() += 1;
         }
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut deferred = BTreeSet::new();
         let mut has_codemode = false;
         let mut has_deferred = false;
-        for definition in definitions {
+        for definition in &catalog.definitions {
             if !tool_enabled(&config, &definition.name) {
                 continue;
             }
@@ -880,7 +911,8 @@ impl McpExtension {
                 name: format!("{prefix}{normalized}{suffix}"),
                 description: definition
                     .description
-                    .map(|description| description.into_owned())
+                    .as_deref()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| definition.name.to_string()),
                 parameters: Value::Object((*definition.input_schema).clone()),
             };
@@ -894,15 +926,12 @@ impl McpExtension {
             }
             tools.push(Arc::new(McpTool {
                 connection: connection.clone(),
-                remote_name: definition.name.into_owned(),
+                remote_name: definition.name.to_string(),
                 spec,
                 resource: false,
             }));
         }
-        if info
-            .clone()
-            .is_some_and(|info| info.capabilities.resources.is_some())
-        {
+        if catalog.has_resources {
             for (name, policy, description, parameters) in [
                 (
                     "list_resources",
@@ -962,10 +991,7 @@ impl McpExtension {
                 }));
             }
         }
-        if info
-            .as_ref()
-            .is_some_and(|info| info.capabilities.prompts.is_some())
-        {
+        if catalog.has_prompts {
             for (name, description, parameters) in [
                 (
                     "list_prompts",
@@ -1007,23 +1033,19 @@ impl McpExtension {
         }
         let description = config
             .description
-            .clone()
             .or_else(|| {
-                info.clone()
-                    .and_then(|info| info.instructions.clone())
-                    .and_then(|instructions| {
-                        instructions
-                            .lines()
-                            .find(|line| !line.trim().is_empty())
-                            .map(str::to_owned)
-                    })
+                catalog.instructions.as_deref().and_then(|instructions| {
+                    instructions
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .map(str::to_owned)
+                })
             })
             .unwrap_or_default();
-        Ok(Self {
+        Self {
             id: format!("mcp-{}", normalize(&name)),
             tools,
             server_tool_names,
-            has_resources,
             deferred,
             has_codemode,
             has_deferred,
@@ -1031,16 +1053,26 @@ impl McpExtension {
             description,
             connection,
             catalog,
-        })
+            exposure,
+        }
     }
     /// Original server tool names from this discovery snapshot, including hidden tools.
     pub fn remote_tool_names(&self) -> &[String] {
         &self.server_tool_names
     }
 
+    pub fn remote_tool_exposure(&self, name: &str) -> &str {
+        tool_exposure_with_default(&self.connection.config, name, self.exposure.as_deref())
+    }
+
+    /// Whether the running HTTP connection uses saved MCP OAuth credentials.
+    pub fn uses_oauth(&self) -> bool {
+        self.connection.identity().oauth_generation.is_some()
+    }
+
     /// Whether the server advertised the resources capability at discovery.
     pub fn offers_resources(&self) -> bool {
-        self.has_resources
+        self.catalog.has_resources
     }
 
     pub fn has_deferred(&self) -> bool {
@@ -1694,6 +1726,14 @@ fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> R
 
 /// Returns the effective configured exposure for a remote tool name.
 pub fn tool_exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
+    tool_exposure_with_default(config, name, config.exposure.as_deref())
+}
+
+fn tool_exposure_with_default<'a>(
+    config: &'a ServerConfig,
+    name: &str,
+    default: Option<&'a str>,
+) -> &'a str {
     config
         .tool_exposure
         .get(name)
@@ -1711,8 +1751,8 @@ pub fn tool_exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
                 })
                 .map(|(_, value)| value)
         })
-        .or(config.exposure.as_ref())
         .map(String::as_str)
+        .or(default)
         .unwrap_or("codemode")
 }
 fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
