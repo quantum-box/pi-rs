@@ -2505,6 +2505,7 @@ while preserving theme styling.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label without changing its identity. Direct `/checkout` releases its
 journal lock before restoring the view.
+Tree search also matches the first 200 UTF-16 units of tool-result text.
 
 Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
 folding, search, labels, checkout and terminal restoration. Session and queue
