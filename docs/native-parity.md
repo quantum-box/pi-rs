@@ -5158,6 +5158,28 @@ strips one leading BOM and removes exactly one final LF. Failed editors leave
 the draft unchanged. As in Pi, the temporary draft is closed before the editor
 launches, allowing editors that require exclusive file access. Native shell-style
 command splitting remains supported.
+Multiline extension editor dialogs and local multiline editors use the same
+external-editor action and configured keybinding. Editor failures remain
+visible in the dialog without submitting or losing its draft. Escape cancels
+the dialog, and extension cancellation still removes the correlated request.
+On Unix, prompt and local editors inherit Pi's foreground process group and
+terminal, matching upstream shell job control, including orphan-group signal
+behavior. Extension editors on Linux and macOS run in a separate session with
+a private pseudoterminal. Pi relays input, output and window size while
+foregrounded. Cancellation or worker loss disconnects that terminal before
+Pi resumes drawing and reaps the direct editor. A wrapper descendant may
+survive, including one that has started a new session, but its inherited
+editor terminal can no longer receive input from Pi's terminal. The editor
+still runs with the user's permissions. The extension editor's Ctrl+Z does
+not suspend Pi's job in the invoking shell. If the direct extension editor
+stops, Pi closes it and returns to the dialog with its draft intact. If
+Pi's job is backgrounded by the shell, restoration and redraw wait until
+the job is foregrounded. On Windows the job object also terminates wrapper
+descendants. Terminal-owned workers leave terminal SIGINT handling to the
+frontend, which sends explicit cancel or shutdown controls. The frontend
+samples editor activity at signal delivery so an editor interrupt does not
+stop an active backend or cancel the session after the editor closes.
+The native 1 MiB extension response limit also applies to externally edited text.
 
 ### Editor kill ring checkpoint
 

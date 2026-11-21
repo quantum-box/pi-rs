@@ -698,6 +698,110 @@ impl AuthReload {
     }
 }
 
+static EXTERNAL_EDITOR_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static TERMINAL_SIGNAL_DELIVERIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+static TERMINAL_SIGNAL_READER_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    writer.set_nonblocking(true)?;
+    // Capture the editor state in the signal handler, not later on the reader
+    // thread. write(2) is async-signal-safe and the stream stays registered
+    // for the lifetime of the process.
+    let id = unsafe {
+        signal_hook_registry::register(libc::SIGINT, move || {
+            if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
+                let byte = [1_u8];
+                libc::write(writer.as_raw_fd(), byte.as_ptr().cast(), byte.len());
+            }
+            #[cfg(test)]
+            TERMINAL_SIGNAL_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+        })
+    }?;
+    if let Err(error) = std::thread::Builder::new()
+        .name("pi-terminal-signal".into())
+        .spawn(move || {
+            let mut buffer = [0_u8; 64];
+            loop {
+                #[cfg(test)]
+                while TERMINAL_SIGNAL_READER_PAUSED.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                        notify.notify_one();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    {
+        signal_hook_registry::unregister(id);
+        return Err(error.into());
+    }
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(windows)]
+static WINDOWS_TERMINAL_NOTIFY: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Weak<tokio::sync::Notify>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn terminal_console_signal(event: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+    if event != windows_sys::Win32::System::Console::CTRL_C_EVENT {
+        return 0;
+    }
+    if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
+        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+        if let Some(notify) = WINDOWS_TERMINAL_NOTIFY
+            .get()
+            .and_then(|slot| slot.lock().ok())
+            .and_then(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade))
+        {
+            notify.notify_one();
+        }
+    }
+    #[cfg(test)]
+    TERMINAL_SIGNAL_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+    1
+}
+
+#[cfg(windows)]
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let slot = WINDOWS_TERMINAL_NOTIFY.get_or_init(Default::default);
+    *slot.lock().expect("terminal notification lock") = Some(std::sync::Arc::downgrade(&notify));
+    // Console control callbacks run on a Windows-created thread, so the state
+    // is sampled when the event is delivered rather than by a later Tokio poll.
+    if unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(terminal_console_signal), 1)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -714,14 +818,43 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
                 }
             };
             runtime.block_on(async move {
-                super::install_ctrl_c(move || {
-                    super::process::TERMINAL_INTERRUPTED
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    notify.notify_one();
-                })
-                .await;
-                let _ = sender.send(Ok(()));
-                std::future::pending::<()>().await;
+                #[cfg(unix)]
+                let signals =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+                #[cfg(windows)]
+                let signals = tokio::signal::windows::ctrl_c();
+                #[cfg(any(unix, windows))]
+                {
+                    let mut signals = match signals {
+                        Ok(signals) => signals,
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            return;
+                        }
+                    };
+                    let _ = sender.send(Ok(()));
+                    while signals.recv().await.is_some() {
+                        if !EXTERNAL_EDITOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                            super::process::TERMINAL_INTERRUPTED
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            notify.notify_one();
+                        }
+                        #[cfg(test)]
+                        TERMINAL_SIGNAL_DELIVERIES
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let _ = sender.send(Ok(()));
+                    while tokio::signal::ctrl_c().await.is_ok() {
+                        if !EXTERNAL_EDITOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                            super::process::TERMINAL_INTERRUPTED
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            notify.notify_one();
+                        }
+                    }
+                }
             });
         })?;
     receiver
@@ -876,6 +1009,7 @@ struct View {
     regular: RegularState,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
+    pending_terminal_title: Option<String>,
     local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
     tree_confirmation: Option<u64>,
     tree_navigation: Option<(u64, bool)>,
@@ -1030,6 +1164,16 @@ impl View {
             .map(|(_, dialog)| dialog)
             .or_else(|| self.dialogs.front())
     }
+    fn dialog_mut(&mut self) -> Option<&mut crate::ui::dialog::Dialog> {
+        if let Some((_, dialog)) = &mut self.local_editor {
+            Some(dialog)
+        } else {
+            self.dialogs.front_mut()
+        }
+    }
+    fn cancel_extension_dialog(&mut self, id: &Value) {
+        self.dialogs.retain(|dialog| json!(dialog.id) != *id);
+    }
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
@@ -1066,15 +1210,10 @@ impl View {
                     self.widgets.push((key, lines, placement));
                 }
             }
-            pi_rs::UiRequest::SetTitle { title } => execute!(
-                std::io::stdout(),
-                crossterm::terminal::SetTitle(
-                    title
-                        .chars()
-                        .filter(|character| !character.is_control())
-                        .collect::<String>()
-                )
-            )?,
+            pi_rs::UiRequest::SetTitle { mut title } => {
+                title.retain(|character| !character.is_control());
+                self.pending_terminal_title = Some(title);
+            }
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
@@ -2375,7 +2514,7 @@ impl View {
             .dialog()
             .and_then(|dialog| dialog.cursor(width, body_height));
         if let Some(dialog) = self.dialog() {
-            lines = dialog.render(theme, width, body_height);
+            lines = dialog.render(theme, width, body_height, keys);
             if !hardware_cursor
                 && let Some((row, column)) = dialog_cursor
                 && let Some(line) = lines.get_mut(row)
@@ -2822,7 +2961,7 @@ impl View {
             .dialog()
             .and_then(|dialog| dialog.cursor(width, dialog_height));
         if let Some(dialog) = self.dialog() {
-            active = dialog.render(theme, width, dialog_height);
+            active = dialog.render(theme, width, dialog_height, keys);
             if !hardware_cursor
                 && let Some((row, column)) = dialog_cursor
                 && let Some(line) = active.get_mut(row)
@@ -4164,6 +4303,9 @@ pub(super) async fn run(
     let mut deferred_input = VecDeque::new();
     let mut thinking_level_input = VecDeque::new();
     let mut interrupted = false;
+    let mut external_editor: Option<RunningExternalEditor> = None;
+    #[cfg(any(unix, windows))]
+    let mut editor_colors = None;
     'interactive: loop {
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
             interrupted = true;
@@ -4455,8 +4597,8 @@ pub(super) async fn run(
                     continue;
                 }
                 if value["type"] == "extension_ui_cancelled" {
-                    view.dialogs
-                        .retain(|dialog| json!(dialog.id) != value["id"]);
+                    cancel_running_extension_editor(&mut external_editor, Some(&value));
+                    view.cancel_extension_dialog(&value["id"]);
                     dirty = true;
                     continue;
                 }
@@ -4516,6 +4658,7 @@ pub(super) async fn run(
                 }
                 if settled {
                     active.busy = false;
+                    cancel_running_extension_editor(&mut external_editor, None);
                     view.dialogs.clear();
                     view.settle();
                     if let Some((id, _)) = view.tree_navigation.take() {
@@ -4556,6 +4699,7 @@ pub(super) async fn run(
                 }
                 view.settle();
                 view.cache_warming_status = None;
+                cancel_running_extension_editor(&mut external_editor, None);
                 view.dialogs.clear();
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
@@ -4700,6 +4844,41 @@ pub(super) async fn run(
             }
             dirty = true;
         }
+        if let Some(editor) = &mut external_editor {
+            match editor.poll() {
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                outcome => {
+                    let editor = external_editor.take().expect("active editor");
+                    let result = if editor.cancelled {
+                        None
+                    } else {
+                        Some(match outcome {
+                            Ok(Some(status)) => editor.result(status),
+                            Err(error) => Err(error),
+                            Ok(None) => unreachable!(),
+                        })
+                    };
+                    let target = editor.target;
+                    drop(editor);
+                    finish_external_editor(
+                        &args,
+                        &mut view,
+                        &mut _terminal,
+                        #[cfg(any(unix, windows))]
+                        &mut editor_colors,
+                        target,
+                        result,
+                    )?;
+                    dirty = true;
+                }
+            }
+        }
+        if let Some(title) = view.pending_terminal_title.take() {
+            execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
+        }
         if (dirty && last_frame.elapsed() >= frame_interval)
             || ((is_busy(&worker) || view.remote_task.is_some() || view.pending_share.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
@@ -4737,6 +4916,11 @@ pub(super) async fn run(
         } else {
             next_thinking_level_input(&mut thinking_level_input, loading, ready, blocked)
         };
+        #[cfg(unix)]
+        input.read_for_handoff(
+            view.dialog()
+                .is_some_and(crate::ui::dialog::Dialog::supports_external_editor),
+        );
         let next_input = if let Some(event) = pending {
             Some(crate::ui::input::InputEvent::Event(event))
         } else if let Some(event) = deferred_input.pop_front() {
@@ -5052,6 +5236,20 @@ pub(super) async fn run(
                         }
                         continue;
                     }
+                }
+                if view
+                    .dialog()
+                    .is_some_and(|dialog| dialog.external_editor_requested(key, &keys))
+                {
+                    external_editor = open_external_editor(
+                        &args,
+                        &mut view,
+                        &mut _terminal,
+                        #[cfg(any(unix, windows))]
+                        &mut editor_colors,
+                        true,
+                    )?;
+                    continue;
                 }
                 if let Some((mut editor, mut dialog)) = view.local_editor.take() {
                     match dialog.input(key, &keys) {
@@ -5708,31 +5906,14 @@ pub(super) async fn run(
                     }
                     "app.exit" => break,
                     "app.editor.external" => {
-                        if args.tui_mode == Some(TuiMode::Regular) {
-                            view.finish_regular()?;
-                        }
-                        #[cfg(any(unix, windows))]
-                        let colors = _terminal.as_mut().map(|terminal| {
-                            let mut colors = std::mem::take(&mut terminal.colors);
-                            colors.disable_after_handoff();
-                            colors
-                        });
-                        drop(_terminal.take());
-                        let result = external_editor(&args, &mut view.editor);
-                        _terminal = Some(Terminal::enter(
-                            args.tui_mode,
-                            view.graphics.cleanup(),
+                        external_editor = open_external_editor(
+                            &args,
+                            &mut view,
+                            &mut _terminal,
                             #[cfg(any(unix, windows))]
-                            colors,
-                        )?);
-                        if view.graphics.enabled() {
-                            images::query_cell_size()?;
-                        }
-                        view.graphics.reset();
-                        if let Err(error) = result {
-                            view.append(&error.to_string());
-                        }
-                        view.regular.redraw = true;
+                            &mut editor_colors,
+                            false,
+                        )?;
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
                     "app.model.select" if !is_busy(&worker) => {
@@ -7818,13 +7999,414 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     Ok(())
 }
 
-fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
+#[cfg(unix)]
+mod editor_pty;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalEditorTarget {
+    Main,
+    Local(uuid::Uuid),
+    Extension(uuid::Uuid),
+}
+
+#[cfg(windows)]
+type ExternalEditorChild = Box<dyn process_wrap::std::ChildWrapper>;
+#[cfg(not(windows))]
+type ExternalEditorChild = std::process::Child;
+
+struct ExternalEditorFile {
+    _directory: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+impl ExternalEditorFile {
+    fn new(text: &str) -> std::io::Result<Self> {
+        let directory = external_editor_directory()?;
+        let path = directory.path().join("prompt.md");
+        // Close the file before launching the editor. Windows applications may
+        // open it without sharing access with an existing writable handle.
+        std::fs::write(&path, text)?;
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+struct RunningExternalEditor {
+    child: ExternalEditorChild,
+    file: ExternalEditorFile,
+    target: ExternalEditorTarget,
+    cancelled: bool,
+    #[cfg(unix)]
+    terminal_state: Option<EditorTerminalState>,
+    #[cfg(unix)]
+    pty: Option<editor_pty::EditorPty>,
+    #[cfg(unix)]
+    drain_deadline: Option<Instant>,
+}
+
+// The editor shares Pi's foreground process group. Capture terminal settings
+// before launch so an interrupted editor cannot leave the TUI in its raw mode.
+#[cfg(unix)]
+struct EditorTerminalState {
+    tty: std::fs::File,
+    baseline: libc::termios,
+    relaying: bool,
+}
+
+#[cfg(unix)]
+impl EditorTerminalState {
+    fn capture() -> std::io::Result<Option<Self>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tty = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/tty")
+        {
+            Ok(tty) => tty,
+            Err(_) => return Ok(None),
+        };
+        let mut baseline = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut baseline) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Some(Self {
+            tty,
+            baseline,
+            relaying: false,
+        }))
+    }
+
+    fn enter_relay_mode(&mut self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if !self.foreground()? {
+            return Err(std::io::Error::other(
+                "Pi must be foregrounded to open an extension editor",
+            ));
+        }
+        let mut raw = self.baseline;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.relaying = true;
+        Ok(())
+    }
+
+    fn foreground(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let group = unsafe { libc::tcgetpgrp(self.tty.as_raw_fd()) };
+        if group < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(group == unsafe { libc::getpgrp() })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EditorTerminalState {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.foreground().unwrap_or(false) {
+            let fd = self.tty.as_raw_fd();
+            unsafe {
+                if self.relaying {
+                    libc::tcflush(fd, libc::TCIFLUSH);
+                }
+                libc::tcsetattr(fd, libc::TCSANOW, &self.baseline);
+            }
+        }
+    }
+}
+
+impl RunningExternalEditor {
+    fn cancelled_by(&self, event: &Value) -> bool {
+        event["type"] == "extension_ui_cancelled"
+            && matches!(self.target, ExternalEditorTarget::Extension(id) if json!(id) == event["id"])
+    }
+    fn start(command: &str, text: &str, target: ExternalEditorTarget) -> Result<Self> {
+        #[cfg(unix)]
+        let terminal_state = EditorTerminalState::capture()?;
+        #[cfg(unix)]
+        if matches!(target, ExternalEditorTarget::Extension(_)) && terminal_state.is_none() {
+            return Err(Error::Config(
+                "External editing of an extension dialog requires a controlling terminal".into(),
+            ));
+        }
+        Self::start_with_terminal(
+            command,
+            text,
+            target,
+            #[cfg(unix)]
+            terminal_state,
+        )
+    }
+
+    fn start_with_terminal(
+        command: &str,
+        text: &str,
+        target: ExternalEditorTarget,
+        #[cfg(unix)] mut terminal_state: Option<EditorTerminalState>,
+    ) -> Result<Self> {
+        let parts =
+            shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
+        let Some((program, arguments)) = parts.split_first() else {
+            return Err(Error::Config("external editor is empty".into()));
+        };
+        let file = ExternalEditorFile::new(text)?;
+        let mut process = std::process::Command::new(program);
+        process.args(arguments).arg(file.path());
+        #[cfg(unix)]
+        let pty = if matches!(target, ExternalEditorTarget::Extension(_)) {
+            let pty = editor_pty::EditorPty::attach(
+                &mut process,
+                terminal_state.as_ref().map(|tty| (&tty.tty, &tty.baseline)),
+            )?;
+            if let Some(tty) = &mut terminal_state {
+                tty.enter_relay_mode()?;
+            }
+            Some(pty)
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        let child = {
+            let mut wrapped = process_wrap::std::CommandWrap::from(process);
+            wrapped.wrap(process_wrap::std::JobObject);
+            wrapped.spawn()
+        };
+        #[cfg(not(windows))]
+        let child = process.spawn();
+        let child = child
+            .map_err(|_| Error::Config(format!("Failed to launch external editor: {command}")))?;
+        Ok(Self {
+            child,
+            file,
+            target,
+            cancelled: false,
+            #[cfg(unix)]
+            terminal_state,
+            #[cfg(unix)]
+            pty,
+            #[cfg(unix)]
+            drain_deadline: None,
+        })
+    }
+
+    fn poll(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        // Do not redraw over the shell if an editor exits while the job is
+        // backgrounded. The shell will foreground this shared group again.
+        #[cfg(unix)]
+        if let Some(tty) = &self.terminal_state
+            && !tty.foreground()?
+        {
+            return Ok(None);
+        }
+        #[cfg(not(windows))]
+        let status = self.child.try_wait()?;
+        #[cfg(windows)]
+        let status = self.child.inner_mut().try_wait()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.pty.is_some() && status.is_none() && editor_pty::child_stopped(self.child.id())? {
+            // A session-local stop cannot suspend Pi's job in the outer
+            // shell. Release the dialog instead of relaying to a stopped editor.
+            return Err(Error::Config(
+                "External editor suspended. Draft unchanged".into(),
+            ));
+        }
+        #[cfg(unix)]
+        if let (Some(tty), Some(pty)) = (&self.terminal_state, &mut self.pty) {
+            let drained = pty.relay(&tty.tty, status.is_none())?;
+            if status.is_some() && !drained {
+                // Preserve final editor output when possible. A live
+                // descendant or stalled terminal must not hold the TUI.
+                let deadline = self
+                    .drain_deadline
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
+                if Instant::now() < *deadline {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(status)
+    }
+
+    fn cancel(&mut self) {
+        // Disconnect the private terminal even if the child already exited.
+        // Descendants may be alive but have no route to Pi's terminal.
+        #[cfg(unix)]
+        drop(self.pty.take());
+        #[cfg(not(windows))]
+        {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        #[cfg(windows)]
+        {
+            // Polling can already have consumed the final job notification.
+            // Terminate via the job and wait on the editor process handle.
+            let _ = self.child.start_kill();
+            let _ = self.child.inner_mut().wait();
+        }
+    }
+
+    fn result(&self, status: std::process::ExitStatus) -> Result<String> {
+        if !status.success() {
+            let exit = status
+                .code()
+                .map_or_else(|| status.to_string(), |code| format!("code {code}"));
+            return Err(Error::Config(format!(
+                "External editor exited with {exit}; prompt unchanged"
+            )));
+        }
+        if self.target == ExternalEditorTarget::Main {
+            return Ok(external_editor_text(&std::fs::read(self.file.path())?));
+        }
+        use std::io::Read;
+        // The decoder can remove a three-byte BOM and one final newline.
+        const MAX_DRAFT_BYTES: usize = 1024 * 1024 + 4;
+        let mut bytes = Vec::new();
+        std::fs::File::open(self.file.path())?
+            .take((MAX_DRAFT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_DRAFT_BYTES {
+            return Err(Error::Config(
+                "External editor result exceeds 1 MiB; draft unchanged".into(),
+            ));
+        }
+        Ok(external_editor_text(&bytes))
+    }
+}
+
+impl Drop for RunningExternalEditor {
+    fn drop(&mut self) {
+        // A wrapper can exit while its descendants keep running. The Windows
+        // job must be terminated even after the wrapper has been reaped.
+        #[cfg(windows)]
+        self.cancel();
+        #[cfg(unix)]
+        drop(self.pty.take());
+        #[cfg(not(windows))]
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.cancel();
+        }
+    }
+}
+
+// Cancel only an extension-owned editor. A worker exit invalidates all its
+// dialogs; an explicit cancellation is correlated to a single request.
+fn cancel_running_extension_editor(
+    running: &mut Option<RunningExternalEditor>,
+    event: Option<&Value>,
+) {
+    if let Some(editor) = running.as_mut()
+        && !editor.cancelled
+        && matches!(editor.target, ExternalEditorTarget::Extension(_))
+        && event.is_none_or(|event| editor.cancelled_by(event))
+    {
+        editor.cancel();
+        editor.cancelled = true;
+    }
+}
+
+fn open_external_editor(
+    args: &Cli,
+    view: &mut View,
+    terminal: &mut Option<Terminal>,
+    #[cfg(any(unix, windows))] editor_colors: &mut Option<ColorQueries>,
+    dialog: bool,
+) -> Result<Option<RunningExternalEditor>> {
+    if args.tui_mode == Some(TuiMode::Regular) {
+        view.finish_regular()?;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        *editor_colors = terminal.as_mut().map(|terminal| {
+            let mut colors = std::mem::take(&mut terminal.colors);
+            colors.disable_after_handoff();
+            colors
+        });
+    }
+    drop(terminal.take());
+    EXTERNAL_EDITOR_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (target, text) = if dialog {
+        let local = view.local_editor.is_some();
+        let dialog = view.dialog().expect("active editor dialog");
+        (
+            if local {
+                ExternalEditorTarget::Local(dialog.id)
+            } else {
+                ExternalEditorTarget::Extension(dialog.id)
+            },
+            dialog.external_editor_text().to_owned(),
+        )
+    } else {
+        (ExternalEditorTarget::Main, view.editor.text.clone())
+    };
     let command = external_editor_command(
         args.settings.string("externalEditor"),
         std::env::var("VISUAL").ok().as_deref(),
         std::env::var("EDITOR").ok().as_deref(),
     );
-    run_external_editor(&command, editor)
+    match RunningExternalEditor::start(&command, &text, target) {
+        Ok(editor) => Ok(Some(editor)),
+        Err(error) => {
+            finish_external_editor(
+                args,
+                view,
+                terminal,
+                #[cfg(any(unix, windows))]
+                editor_colors,
+                target,
+                Some(Err(error)),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn finish_external_editor(
+    args: &Cli,
+    view: &mut View,
+    terminal: &mut Option<Terminal>,
+    #[cfg(any(unix, windows))] editor_colors: &mut Option<ColorQueries>,
+    target: ExternalEditorTarget,
+    result: Option<Result<String>>,
+) -> Result<()> {
+    if let Some(result) = result {
+        match target {
+            ExternalEditorTarget::Main => match result {
+                Ok(text) => view.editor.replace(text),
+                Err(error) => view.append(&error.to_string()),
+            },
+            ExternalEditorTarget::Local(id) | ExternalEditorTarget::Extension(id) => {
+                if let Some(dialog) = view.dialog_mut().filter(|dialog| dialog.id == id) {
+                    dialog.external_edit(|draft| {
+                        draft.replace(result?);
+                        Ok(())
+                    });
+                }
+            }
+        }
+    }
+    *terminal = Some(Terminal::enter(
+        args.tui_mode,
+        view.graphics.cleanup(),
+        #[cfg(any(unix, windows))]
+        editor_colors.take(),
+    )?);
+    EXTERNAL_EDITOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    if view.graphics.enabled() {
+        images::query_cell_size()?;
+    }
+    view.graphics.reset();
+    view.regular.redraw = true;
+    Ok(())
 }
 
 fn external_editor_command(
@@ -7844,6 +8426,7 @@ fn external_editor_command(
         .to_owned()
 }
 
+#[cfg(test)]
 fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
     let parts = shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
     let Some((program, arguments)) = parts.split_first() else {
@@ -7872,7 +8455,6 @@ fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
 fn external_editor_directory() -> std::io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("pi-editor-");
-    // Match mkdtemp's private directory on Unix: the draft can contain secrets.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -8088,6 +8670,659 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn signal_listener_survives_interrupt_during_editor() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "PI_RS_EDITOR_SIGNAL_REARM_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::signal_listener_survives_interrupt_during_editor",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        super::EXTERNAL_EDITOR_ACTIVE.store(true, Ordering::SeqCst);
+        super::TERMINAL_SIGNAL_READER_PAUSED.store(true, Ordering::SeqCst);
+        super::install_terminal_signal(std::sync::Arc::new(tokio::sync::Notify::new())).unwrap();
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGINT);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::TERMINAL_SIGNAL_DELIVERIES.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "editor signal was not received");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
+        super::EXTERNAL_EDITOR_ACTIVE.store(false, Ordering::SeqCst);
+        super::TERMINAL_SIGNAL_READER_PAUSED.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst),
+            "editor SIGINT was processed after the editor closed"
+        );
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGINT);
+        }
+        while !crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "signal listener did not survive editor interrupt"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_signal_uses_editor_state_at_delivery() {
+        use std::sync::atomic::Ordering;
+        const CHILD: &str = "PI_RS_EDITOR_CONSOLE_SIGNAL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::console_signal_uses_editor_state_at_delivery",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        super::EXTERNAL_EDITOR_ACTIVE.store(true, Ordering::SeqCst);
+        assert_eq!(
+            unsafe {
+                super::terminal_console_signal(windows_sys::Win32::System::Console::CTRL_C_EVENT)
+            },
+            1
+        );
+        super::EXTERNAL_EDITOR_ACTIVE.store(false, Ordering::SeqCst);
+        assert!(!crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
+        assert_eq!(
+            unsafe {
+                super::terminal_console_signal(windows_sys::Win32::System::Console::CTRL_C_EVENT)
+            },
+            1
+        );
+        assert!(crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_editor_follows_shell_job_control() {
+        inherited_editor_shell_case(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_editor_follows_wrapped_shell_job_control() {
+        inherited_editor_shell_case(true);
+    }
+
+    #[cfg(unix)]
+    fn inherited_editor_shell_case(wrapped: bool) {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        let name = if wrapped {
+            "interactive::tests::inherited_editor_follows_wrapped_shell_job_control"
+        } else {
+            "interactive::tests::inherited_editor_follows_shell_job_control"
+        };
+        const CHILD: &str = "PI_RS_INHERITED_EDITOR_SHELL";
+        if let Some(program) = std::env::var_os(CHILD) {
+            let mut editor = super::RunningExternalEditor::start(
+                program.to_str().unwrap(),
+                "draft",
+                super::ExternalEditorTarget::Main,
+            )
+            .unwrap();
+            assert_eq!(
+                unsafe { libc::getpgid(editor.child.id() as libc::pid_t) },
+                unsafe { libc::getpgrp() }
+            );
+            while editor.poll().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(editor);
+            println!("RUNNER_FINISHED");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'EDITOR_READY\\n'\ntrap 'printf x >> \"${0}.signals\"' CONT\nwhile :; do IFS= read -r line; [ \"$line\" = finish ] && break; done\nprintf done > \"$1\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new("/bin/bash");
+        command
+            .args(["--noprofile", "--norc", "-i"])
+            .env("PS1", "PI_TEST_PROMPT> ")
+            .env("TERM", "dumb")
+            .env("HISTFILE", "/dev/null")
+            .env(CHILD, &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut shell = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        fn wait_for(master: &mut std::fs::File, expected: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut output = Vec::new();
+            loop {
+                let mut bytes = [0; 2048];
+                if let Ok(n) = master.read(&mut bytes) {
+                    output.extend_from_slice(&bytes[..n]);
+                }
+                if output
+                    .windows(expected.len())
+                    .any(|part| part == expected.as_bytes())
+                {
+                    return String::from_utf8_lossy(&output).into_owned();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "waiting for {expected}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        wait_for(&mut master, "PI_TEST_PROMPT> ");
+        let invocation = format!(
+            "{} --exact {} --nocapture",
+            shell_words::quote(&std::env::current_exe().unwrap().to_string_lossy()),
+            name
+        );
+        if wrapped {
+            writeln!(master, "sh -c {}", shell_words::quote(&invocation)).unwrap();
+        } else {
+            writeln!(master, "{invocation}").unwrap();
+        }
+        wait_for(&mut master, "EDITOR_READY");
+        master.write_all(&[26]).unwrap();
+        let stopped = wait_for(&mut master, "PI_TEST_PROMPT> ");
+        assert!(stopped.contains("Stopped"), "{stopped}");
+        for count in 1..=2 {
+            master.write_all(b"bg\n").unwrap();
+            wait_for(&mut master, "PI_TEST_PROMPT> ");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::fs::read(program.with_extension("signals")).map_or(0, |v| v.len()) < count {
+                assert!(
+                    Instant::now() < deadline,
+                    "editor did not resume after bg {count}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            master.write_all(b"jobs\n").unwrap();
+            let jobs = wait_for(&mut master, "PI_TEST_PROMPT> ");
+            assert!(jobs.contains("Stopped"), "{jobs}");
+        }
+        master.write_all(b"fg\n").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        master.write_all(b"finish\n").unwrap();
+        let finished = wait_for(&mut master, "PI_TEST_PROMPT> ");
+        assert!(finished.contains("RUNNER_FINISHED"), "{finished}");
+        master.write_all(b"exit\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut bytes = [0; 1024];
+            let _ = master.read(&mut bytes);
+            if let Some(status) = shell.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = shell.kill();
+                let _ = shell.wait();
+                panic!("interactive shell did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_editor_orphan_group_ignores_terminal_stop() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        const CHILD: &str = "PI_RS_INHERITED_EDITOR_ORPHAN";
+        if let Some(program) = std::env::var_os(CHILD) {
+            let mut editor = super::RunningExternalEditor::start(
+                program.to_str().unwrap(),
+                "draft",
+                super::ExternalEditorTarget::Main,
+            )
+            .unwrap();
+            assert_eq!(
+                unsafe { libc::getpgid(editor.child.id() as libc::pid_t) },
+                unsafe { libc::getpgrp() }
+            );
+            while editor.poll().unwrap().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(editor);
+            println!("RUNNER_FINISHED");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\ntrap '' TSTP\nprintf 'EDITOR_READY\\n'\nIFS= read -r line\nprintf done > \"$1\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "interactive::tests::inherited_editor_orphan_group_ignores_terminal_stop",
+                "--nocapture",
+            ])
+            .env(CHILD, &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut sent = false;
+        let status = loop {
+            let mut bytes = [0; 1024];
+            if let Ok(n) = master.read(&mut bytes) {
+                output.extend_from_slice(&bytes[..n]);
+            }
+            if !sent
+                && output
+                    .windows(b"EDITOR_READY".len())
+                    .any(|part| part == b"EDITOR_READY")
+            {
+                master.write_all(&[26]).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                master.write_all(b"finish\n").unwrap();
+                sent = true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                // The child is the unreaped session/group leader, so its PID
+                // remains reserved while cleaning up its editor on timeout.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "orphan editor test timed out: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut bytes = [0; 1024];
+        if let Ok(n) = master.read(&mut bytes) {
+            output.extend_from_slice(&bytes[..n]);
+        }
+        assert!(
+            sent && status.success(),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(String::from_utf8_lossy(&output).contains("RUNNER_FINISHED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_editor_receives_interrupt_without_killing_parent() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        const CHILD: &str = "PI_RS_FOREGROUND_EDITOR_TEST";
+        if let Some(program) = std::env::var_os(CHILD) {
+            let mut baseline: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut baseline) }, 0);
+            super::EXTERNAL_EDITOR_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+            super::install_terminal_signal(std::sync::Arc::new(tokio::sync::Notify::new()))
+                .unwrap();
+            let mut editor = super::RunningExternalEditor::start(
+                program.to_str().unwrap(),
+                "draft",
+                super::ExternalEditorTarget::Main,
+            )
+            .unwrap();
+            assert_eq!(
+                unsafe { libc::getpgid(editor.child.id() as libc::pid_t) },
+                unsafe { libc::getpgrp() }
+            );
+            let status = editor.child.wait().unwrap();
+            assert!(!status.success());
+            drop(editor);
+            let mut restored: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut restored) }, 0);
+            assert_eq!(
+                restored.c_lflag & (libc::ECHO | libc::ICANON),
+                baseline.c_lflag & (libc::ECHO | libc::ICANON)
+            );
+            println!("PARENT_SURVIVED");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nstty -echo -icanon\ntrap 'exit 130' INT\nprintf 'EDITOR_READY\\n'\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "interactive::tests::foreground_editor_receives_interrupt_without_killing_parent",
+                "--nocapture",
+            ])
+            .env(CHILD, &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut sent = false;
+        let status = loop {
+            let mut bytes = [0; 1024];
+            if let Ok(n) = master.read(&mut bytes) {
+                output.extend_from_slice(&bytes[..n]);
+            }
+            if !sent
+                && output
+                    .windows(b"EDITOR_READY".len())
+                    .any(|part| part == b"EDITOR_READY")
+            {
+                master.write_all(&[3]).unwrap();
+                sent = true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                // The child is the unreaped session/group leader, so its PID
+                // remains reserved while cleaning up its editor on timeout.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "editor test timed out: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut bytes = [0; 1024];
+        if let Ok(n) = master.read(&mut bytes) {
+            output.extend_from_slice(&bytes[..n]);
+        }
+        assert!(
+            sent && status.success(),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(String::from_utf8_lossy(&output).contains("PARENT_SURVIVED"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn running_external_editor_is_cancelled_only_by_its_request() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf started > \"$1\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut editor = super::RunningExternalEditor::start_with_terminal(
+            program.to_str().unwrap(),
+            "draft",
+            super::ExternalEditorTarget::Extension(id),
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read(editor.file.path()).unwrap() != b"started" {
+            assert!(std::time::Instant::now() < deadline, "editor did not start");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!editor.cancelled_by(
+            &serde_json::json!({"type":"extension_ui_cancelled", "id":uuid::Uuid::new_v4()})
+        ));
+        assert!(editor.child.try_wait().unwrap().is_none());
+        assert!(
+            editor.cancelled_by(&serde_json::json!({"type":"extension_ui_cancelled", "id":id}))
+        );
+        let started = std::time::Instant::now();
+        editor.cancel();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(editor.child.try_wait().unwrap().is_some());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn suspended_extension_editor_returns_to_dialog() {
+        let mut editor = super::RunningExternalEditor::start_with_terminal(
+            "/bin/sh -c 'kill -STOP $$'",
+            "draft",
+            super::ExternalEditorTarget::Extension(uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let error = loop {
+            match editor.poll() {
+                Err(error) => break error,
+                Ok(None) => {}
+                Ok(Some(status)) => panic!("editor exited before stopping: {status}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "editor did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(error.to_string().contains("External editor suspended"));
+        assert_eq!(std::fs::read(editor.file.path()).unwrap(), b"draft");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_exit_cancels_only_extension_editor_and_removes_tempfile() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let editor = super::RunningExternalEditor::start_with_terminal(
+            program.to_str().unwrap(),
+            "draft",
+            super::ExternalEditorTarget::Extension(id),
+            None,
+        )
+        .unwrap();
+        let pid = editor.child.id() as libc::pid_t;
+        let path = editor.file.path().to_owned();
+        let mut running = Some(editor);
+        super::cancel_running_extension_editor(
+            &mut running,
+            Some(&json!({"type":"extension_ui_cancelled", "id":uuid::Uuid::new_v4()})),
+        );
+        assert!(!running.as_ref().unwrap().cancelled);
+        super::cancel_running_extension_editor(&mut running, None);
+        assert!(running.as_ref().unwrap().cancelled);
+        assert!(running.as_mut().unwrap().poll().unwrap().is_some());
+        drop(running.take());
+        assert!(!path.exists());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        let main = super::RunningExternalEditor::start(
+            program.to_str().unwrap(),
+            "draft",
+            super::ExternalEditorTarget::Main,
+        )
+        .unwrap();
+        let mut running = Some(main);
+        super::cancel_running_extension_editor(&mut running, None);
+        assert!(!running.as_ref().unwrap().cancelled);
+    }
+
+    #[test]
+    fn external_editor_dialog_cancellation_removes_only_correlated_request() {
+        let id = uuid::Uuid::new_v4();
+        let next = uuid::Uuid::new_v4();
+        let mut view = super::View::default();
+        view.ui_request(&json!({"type":"extension_ui_request","id":id,"method":"editor","title":"Edit","prefill":"original"})).unwrap();
+        view.ui_request(
+            &json!({"type":"extension_ui_request","id":next,"method":"editor","title":"Next"}),
+        )
+        .unwrap();
+        view.dialog_mut().unwrap().external_edit(|draft| {
+            draft.replace("edited".into());
+            Ok(())
+        });
+        view.cancel_extension_dialog(&json!(id));
+        assert_eq!(view.dialogs.len(), 1);
+        assert_eq!(view.dialogs.front().unwrap().id, next);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_round_trip_from_extension_dialog() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '\\357\\273\\277dialog\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut dialog = super::super::ui::dialog::Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: Some("initial".into()),
+                timeout: None,
+            },
+        );
+        dialog
+            .external_edit(|editor| super::run_external_editor(program.to_str().unwrap(), editor));
+        std::fs::write(&program, "#!/bin/sh\nprintf bad > \"$1\"\nexit 1\n").unwrap();
+        dialog
+            .external_edit(|editor| super::run_external_editor(program.to_str().unwrap(), editor));
+        let keys = super::Keys::default();
+        assert_eq!(
+            dialog.input(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &keys
+            ),
+            Some(pi_rs::UiResponse::Text("dialog".into()))
+        );
+        assert_eq!(
+            dialog.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
+            Some(pi_rs::UiResponse::Cancelled)
+        );
+    }
+
     #[test]
     fn restored_unattributed_result_renders_image_parts_when_graphics_enabled() {
         use super::*;

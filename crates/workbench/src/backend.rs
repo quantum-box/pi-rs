@@ -839,12 +839,14 @@ async fn run_worker(
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
     let signal_notify = stop_notify.clone();
-    super::install_ctrl_c(move || {
-        signal_stopping.store(true, Ordering::SeqCst);
-        signal_notify.notify_one();
-        cancel_active(&signal_active);
-    })
-    .await;
+    if !args.terminal_managed_worker {
+        super::install_ctrl_c(move || {
+            signal_stopping.store(true, Ordering::SeqCst);
+            signal_notify.notify_one();
+            cancel_active(&signal_active);
+        })
+        .await;
+    }
     super::startup_ready(&mut ready);
     notify_session_lifecycle(
         &args,
