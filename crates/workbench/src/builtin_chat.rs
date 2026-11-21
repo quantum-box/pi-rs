@@ -54,6 +54,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: standard,
     },
     Builtin {
+        id: "github-copilot",
+        endpoint: "https://api.individual.githubcopilot.com/chat/completions",
+        env: "COPILOT_GITHUB_TOKEN",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "groq",
         endpoint: "https://api.groq.com/openai/v1/chat/completions",
         env: "GROQ_API_KEY",
@@ -259,13 +265,21 @@ impl Builtin {
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
             }
+            (Adapter::Anthropic, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/v1/messages")
+            }
+            (Adapter::OpenAiResponses, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/responses")
+            }
             (Adapter::Anthropic, "openrouter") => Some("https://openrouter.ai/api/v1/messages"),
             _ => None,
         }
     }
 
     pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
-        self.endpoint == endpoint || self.endpoint_for(Adapter::Anthropic) == Some(endpoint)
+        self.endpoint == endpoint
+            || self.endpoint_for(Adapter::Anthropic) == Some(endpoint)
+            || self.endpoint_for(Adapter::OpenAiResponses) == Some(endpoint)
     }
 
     pub fn env(&self) -> &'static str {

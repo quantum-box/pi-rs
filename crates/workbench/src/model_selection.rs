@@ -102,6 +102,12 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             Err(_) => {}
         }
     }
+    if let Some(available) = args
+        .model_keys
+        .available_model_ids(&provider, args.endpoint_for(&provider))
+    {
+        models.retain(|model| available.contains(model));
+    }
     let mut aliases = aliases(&args.model_profiles, &provider, &models);
     let configured: std::collections::HashSet<_> =
         aliases.iter().map(|(id, _)| id.clone()).collect();
@@ -180,6 +186,12 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
                 if !models.contains(model) {
                     models.push(model.clone());
                 }
+            }
+            if let Some(available) = args
+                .model_keys
+                .available_model_ids(&provider, args.endpoint_for(&provider))
+            {
+                models.retain(|model| available.contains(model));
             }
             if models.is_empty() {
                 return None;

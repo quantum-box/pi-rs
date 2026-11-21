@@ -3455,6 +3455,13 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
+            start_copilot_login(view, &args.settings)
+        }
+        "/login" if rest.eq_ignore_ascii_case("github-copilot api-key") => edit_provider_key(
+            super::Provider::named("github-copilot").expect("built-in Copilot provider"),
+            view,
+        ),
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -3487,6 +3494,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "github-copilot · Subscription OAuth".into(),
+                            selection: Selection::LoginCopilot,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -6495,6 +6509,29 @@ fn take_device_code_action(
     view.remote_task.as_mut()?.device_code.take()
 }
 
+fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to GitHub Copilot",
+        "GitHub Copilot login cancelled",
+        move |sender| async move {
+            super::copilot_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::DeviceCode {
+                    url: url.to_string(),
+                    code: code.to_owned(),
+                });
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to GitHub Copilot".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -7611,6 +7648,7 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),

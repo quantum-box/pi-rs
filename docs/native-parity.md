@@ -4581,6 +4581,24 @@ including model-specific compatibility, NVIDIA polling headers and Baseten's
 thinking template. Catalog entries that use other upstream APIs still need
 their own adapters.
 
+### GitHub Copilot
+
+The native catalog includes the pinned Pi AI release's 27 Copilot models across
+Chat Completions, Anthropic Messages, and OpenAI Responses.
+`COPILOT_GITHUB_TOKEN` supplies a short-lived Copilot API token.
+`pi login github-copilot` and `/login github-copilot` support GitHub.com's
+device authorization and store a Pi-compatible OAuth entry. pi-rs can also
+read an existing entry, refresh access, and filter the picker by the stored
+account catalog. Saved OAuth tokens can route to individual, business, or
+enterprise Copilot inference hosts. Requests carry the Copilot initiator and
+vision headers.
+
+Native sign-in leaves account model policies as configured. Authentication
+through private GitHub Enterprise domains remains unsupported. The published
+Pi AI package and local HTTP fixtures were used to compare the catalog and
+wire behavior. Live GitHub device authorization and Copilot inference were
+unverified because no subscription credentials were available.
+
 ### OpenRouter browser authorization
 
 `/login openrouter` and `pi login openrouter` use OpenRouter's browser
