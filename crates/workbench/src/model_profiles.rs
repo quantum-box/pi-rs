@@ -27,6 +27,7 @@ struct Profile {
     provider: Provider,
     endpoint: String,
     base_url: Option<String>,
+    configured_cloudflare_base: Option<String>,
     provider_endpoints: BTreeSet<String>,
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
@@ -782,6 +783,10 @@ fn configure_cloudflare_workers(
     Ok(())
 }
 
+fn fixed_cloudflare_base(base: &str) -> bool {
+    !base.contains("{CLOUDFLARE_ACCOUNT_ID}") && !base.contains("{CLOUDFLARE_GATEWAY_ID}")
+}
+
 pub(super) fn cloudflare_workers_chat_account(endpoint: &str) -> Option<&str> {
     let path = endpoint.strip_prefix("https://api.cloudflare.com/client/v4/accounts/")?;
     let account = path.strip_suffix("/ai/v1/chat/completions")?;
@@ -832,6 +837,27 @@ impl Profiles {
     #[cfg(test)]
     fn parse_with_cloudflare_account(data: &Value, account: Option<&str>) -> Result<Self> {
         Self::parse_with_cloudflare_routes(data, account, None)
+    }
+
+    pub(super) fn cloudflare_configured_base(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+    ) -> Option<&str> {
+        let profile = self.entries.get(provider.id())?;
+        model
+            .and_then(|id| profile.models.iter().find(|model| model.id == id))
+            .and_then(|model| model.base_url.as_deref())
+            .or(profile.configured_cloudflare_base.as_deref())
+    }
+
+    pub(super) fn has_fixed_cloudflare_endpoint(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+    ) -> bool {
+        self.cloudflare_configured_base(provider, model)
+            .is_some_and(fixed_cloudflare_base)
     }
 
     pub(super) fn cloudflare_gateway_route(&self) -> Option<&super::cloudflare_gateway::Route> {
@@ -1036,6 +1062,16 @@ impl Profiles {
                 metadata.validate(&provider, adapter, id)?;
                 metadata.headers = validate_headers(std::mem::take(&mut metadata.headers))?;
             }
+            let configured_cloudflare_base = configured_providers
+                .get(name)
+                .filter(|configured| {
+                    matches!(
+                        provider.id(),
+                        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+                    ) && configured["api"] != "cloudflare-workers-ai-system-one"
+                })
+                .and_then(|configured| configured["baseUrl"].as_str())
+                .map(str::to_owned);
             let id = provider.id().to_owned();
             if entries
                 .insert(
@@ -1044,6 +1080,7 @@ impl Profiles {
                         provider,
                         endpoint,
                         base_url: profile.base_url,
+                        configured_cloudflare_base,
                         provider_endpoints,
                         api_key: profile.api_key,
                         headers: validate_headers(profile.headers)?,
