@@ -5273,8 +5273,10 @@ workbench models, whose upstream capabilities cannot be inferred.
 Responses and Codex honor Pi's `supportsMidConvoSystemMessages` catalog
 setting and resolve overrides for the final request model. Compatible models
 keep later system instructions in place. Other models send one combined initial instruction.
-Codex sends the initial instruction in the top-level `instructions` field.
-Token estimates use the outgoing instruction text. Request fixtures covered
+As in Pi v1.6.0, Codex sends the initial instruction in the input transcript,
+using the same selected role as later instructions. This keeps the initial
+instruction at the start of the prompt for cache reuse. Token estimates use
+the outgoing instruction text. Request fixtures covered
 both projections and the Codex wire payload. Live authenticated requests
 with later system instructions were unverified.
 

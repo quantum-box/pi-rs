@@ -18,7 +18,6 @@ pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/response
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
-const CODEX_DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
 #[derive(Debug)]
 enum RawStreamError {
@@ -703,16 +702,8 @@ fn responses_payload(
 ) -> Value {
     let codex = api == pi_rs_core::ModelApi::OpenaiCodexResponses;
     let mut input = Vec::new();
-    let mut instructions = CODEX_DEFAULT_INSTRUCTIONS.to_owned();
-    for (index, message) in
-        responses_transcript(&request.messages, supports_mid_conversation_system).enumerate()
-    {
+    for message in responses_transcript(&request.messages, supports_mid_conversation_system) {
         match message.as_ref() {
-            Message::System { content } if codex && index == 0 => {
-                if !content.is_empty() {
-                    instructions.clone_from(content);
-                }
-            }
             Message::System { content } if content.is_empty() => {}
             Message::System { content } => {
                 input.push(json!({"role":instruction_role, "content": content}))
@@ -796,7 +787,7 @@ fn responses_payload(
     }
     let mut body = if codex {
         json!({"model":request.model, "input":input, "store":false, "stream":true,
-            "instructions":instructions, "text":{"verbosity":"low"}, "include":["reasoning.encrypted_content"],
+            "text":{"verbosity":"low"}, "include":["reasoning.encrypted_content"],
             "tool_choice":"auto", "parallel_tool_calls":true})
     } else {
         json!({"model":request.model, "input":input, "store":false, "stream":true, "max_output_tokens":request.max_output_tokens})
@@ -984,7 +975,7 @@ impl Model for OpenAiResponses {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(
                     base,
-                    "codex-sse-v1",
+                    "codex-sse-v2-inline-system",
                     &self.codex_off_effort,
                 ))
             })
@@ -1029,26 +1020,17 @@ impl Model for OpenAiResponses {
     }
 
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
-        let mut messages = responses_transcript(
-            &request.messages,
-            self.supports_mid_conversation_system(&request.model),
-        )
-        .peekable();
-        let codex_default = self.codex_account.is_some()
-            && !matches!(
-                messages.peek().map(Cow::as_ref),
-                Some(Message::System { content }) if !content.is_empty()
-            );
-        let default_instructions = codex_default.then(|| Message::System {
-            content: CODEX_DEFAULT_INSTRUCTIONS.into(),
-        });
         let overhead = pi_rs_core::estimate_request_tokens(&ModelRequest {
             model: request.model.clone(),
             max_output_tokens: request.max_output_tokens,
-            messages: default_instructions.into_iter().collect(),
+            messages: vec![],
             tools: request.tools.clone(),
         });
-        messages.filter(|message| {
+        responses_transcript(
+            &request.messages,
+            self.supports_mid_conversation_system(&request.model),
+        )
+        .filter(|message| {
             !matches!(message.as_ref(), Message::System { content } if content.is_empty())
         }).fold(overhead, |tokens, message| {
             tokens.saturating_add(self.estimate_message_tokens(request, message.as_ref()))
@@ -1613,11 +1595,14 @@ mod tests {
             let mut body = vec![0; length];
             socket.read_exact(&mut body).unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["instructions"], "fixture system");
-            assert_eq!(body["input"][0]["role"], "user");
+            assert!(body.get("instructions").is_none());
             assert_eq!(
-                body["input"][1],
-                json!({"role":"system","content":"fixture update"})
+                body["input"],
+                json!([
+                    {"role":"developer","content":"fixture system"},
+                    {"role":"user","content":"hello"},
+                    {"role":"developer","content":"fixture update"}
+                ])
             );
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
             assert_eq!(body["reasoning"], json!({"effort":"none"}));
@@ -1640,6 +1625,7 @@ mod tests {
             "openai-codex",
         )
         .unwrap()
+        .with_developer_role(true)
         .with_mid_conversation_system_policy(true, BTreeMap::new());
         let request = ModelRequest {
             model: "gpt-6.1-sol".into(),
@@ -1720,27 +1706,37 @@ mod tests {
             ])
         );
         let codex_default = make(pi_rs_core::ModelApi::OpenaiCodexResponses, false);
-        assert_eq!(
-            codex_default["instructions"],
-            "base instructions\n\nfollow-up instruction"
-        );
-        assert_eq!(
-            codex_default["input"],
-            json!([
-                {"role":"user","content":"first"},
-                {"role":"user","content":"second"},
-            ])
-        );
+        assert!(codex_default.get("instructions").is_none());
+        assert_eq!(codex_default["input"], folded["input"]);
         let codex_enabled = make(pi_rs_core::ModelApi::OpenaiCodexResponses, true);
-        assert_eq!(codex_enabled["instructions"], "base instructions");
-        assert_eq!(
-            codex_enabled["input"],
-            json!([
-                {"role":"user","content":"first"},
-                {"role":"developer","content":"follow-up instruction"},
-                {"role":"user","content":"second"},
-            ])
-        );
+        assert!(codex_enabled.get("instructions").is_none());
+        assert_eq!(codex_enabled["input"], retained["input"]);
+    }
+
+    #[test]
+    fn codex_preserves_the_selected_role_and_omits_an_unsupplied_instruction() {
+        let api = pi_rs_core::ModelApi::OpenaiCodexResponses;
+        let mut request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![
+                Message::System { content: "".into() },
+                Message::User {
+                    content: "ask".into(),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 64,
+        };
+        for support in [false, true] {
+            let body = responses_payload(&request, "openai-codex", "", "system", api, support);
+            assert!(body.get("instructions").is_none());
+            assert_eq!(body["input"], json!([{"role":"user","content":"ask"}]));
+        }
+        request.messages[0] = Message::System {
+            content: "rules".into(),
+        };
+        let body = responses_payload(&request, "openai-codex", "", "system", api, true);
+        assert_eq!(body["input"][0], json!({"role":"system","content":"rules"}));
     }
 
     #[test]
