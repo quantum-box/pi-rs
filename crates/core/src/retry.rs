@@ -104,7 +104,7 @@ pub fn provider_error_secrets<'a>(
 
 // Header sensitivity flags can be set on routing headers too. Use the
 // conventional authentication names so those values are always redacted.
-fn is_provider_auth_header(name: &str) -> bool {
+pub(crate) fn is_provider_auth_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     matches!(
         name.as_str(),

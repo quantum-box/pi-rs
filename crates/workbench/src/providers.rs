@@ -181,9 +181,17 @@ impl Provider {
                 }))
             }
             Adapter::ChatCompletions => {
+                if self.id() == "cloudflare-workers-ai" && endpoint.is_empty() {
+                    return Err(Error::Config(
+                        "set CLOUDFLARE_ACCOUNT_ID for cloudflare-workers-ai".into(),
+                    ));
+                }
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
-                    && builtin.endpoint() == endpoint
+                    && (builtin.endpoint() == endpoint
+                        || (self.id() == "cloudflare-workers-ai"
+                            && super::model_profiles::cloudflare_workers_chat_account(endpoint)
+                                .is_some()))
                 {
                     return Err(Error::Config(format!(
                         "set {} or pass --api-key for {}",

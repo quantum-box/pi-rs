@@ -150,7 +150,8 @@ impl SkillReadGrants {
             if total > MAX_TOTAL_BYTES {
                 return Err(Error::Config("skills exceed size limit".into()));
             }
-            let value = frontmatter(&text)
+            let normalized = normalize_skill_text(&text);
+            let (value, _) = split_skill_frontmatter(&normalized)
                 .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
             let declared = path.file_name().is_some_and(|name| name == "SKILL.md");
             let description = value
@@ -427,6 +428,38 @@ fn resolve_grant(path: &Path, base: Option<&Path>) -> Result<PathBuf> {
 }
 
 impl SkillResources {
+    /// Expand a known Pi-style `/skill:name` command using a current,
+    /// exact-file read grant. Discovery grants and previously loaded metadata
+    /// do not authorize reading the body. A recognized command with a read
+    /// failure returns an error; other input returns `None` for host handling.
+    /// Reads are synchronous and follow symlinks.
+    pub fn expand_command(&self, input: &str, grants: &SkillReadGrants) -> Result<Option<String>> {
+        let Some(command) = input.strip_prefix("/skill:") else {
+            return Ok(None);
+        };
+        let (name, arguments) = command.split_once(' ').unwrap_or((command, ""));
+        let Some(skill) = self.skills.iter().find(|skill| skill.name == name) else {
+            return Ok(None);
+        };
+        let path = resolve_grant(&skill.path, None)?;
+        if !grants.files.contains(&path) {
+            return Err(Error::Config(format!(
+                "skill file is not granted: {}",
+                path.display()
+            )));
+        }
+        let text = super::prompt_resources::read_optional(&path)?
+            .ok_or_else(|| Error::Config(format!("skill is missing: {}", path.display())))?;
+        let normalized = normalize_skill_text(&text);
+        let (_, body) = split_skill_frontmatter(&normalized)?;
+        Ok(Some(format_skill_invocation(
+            &skill.name,
+            &path,
+            body,
+            arguments,
+        )))
+    }
+
     /// Format the visible skills using Pi's prompt section. This formats paths
     /// for display only; it neither reads files nor changes session state.
     pub fn render(&self, reader: SkillReader) -> Result<String> {
@@ -462,17 +495,37 @@ impl SkillResources {
     }
 }
 
-fn frontmatter(text: &str) -> Result<serde_yaml::Value> {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+fn normalize_skill_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn split_skill_frontmatter(normalized: &str) -> Result<(serde_yaml::Value, &str)> {
     let Some(end) = normalized
         .strip_prefix("---")
         .and_then(|rest| rest.find("\n---"))
         .map(|index| index + 3)
     else {
-        return Ok(serde_yaml::Value::Null);
+        return Ok((serde_yaml::Value::Null, normalized));
     };
-    serde_yaml::from_str(normalized.get(4..=end).unwrap_or_default())
-        .map_err(|error| Error::Config(format!("invalid skill frontmatter: {error}")))
+    let metadata = serde_yaml::from_str(normalized.get(4..=end).unwrap_or_default())
+        .map_err(|error| Error::Config(format!("invalid skill frontmatter: {error}")))?;
+    Ok((metadata, &normalized[end + 4..]))
+}
+
+#[doc(hidden)]
+pub fn format_skill_invocation(name: &str, path: &Path, body: &str, arguments: &str) -> String {
+    let location = path.display();
+    let directory = path.parent().unwrap_or(Path::new(".")).display();
+    let body = body.trim_matches(is_js_space);
+    let mut text = format!(
+        "<skill name=\"{name}\" location=\"{location}\">\nReferences are relative to {directory}.\n\n{body}\n</skill>"
+    );
+    let arguments = arguments.trim_matches(is_js_space);
+    if !arguments.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(arguments);
+    }
+    text
 }
 
 fn is_js_space(ch: char) -> bool {
