@@ -1112,12 +1112,16 @@ impl OpenAiResponses {
                 value.to_str().ok().map(|value| (name.as_str(), value))
             }),
         );
+        let mut headers = self.headers.clone();
+        if provider == "github-copilot" {
+            for (name, value) in pi_rs_core::copilot_request_headers(&request.messages) {
+                headers
+                    .entry(name)
+                    .or_insert_with(|| reqwest::header::HeaderValue::from_static(value));
+            }
+        }
         let mut response = self
-            .authenticate(
-                self.client
-                    .post(self.endpoint.clone())
-                    .headers(self.headers.clone()),
-            )
+            .authenticate(self.client.post(self.endpoint.clone()).headers(headers))
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body)
             .send()

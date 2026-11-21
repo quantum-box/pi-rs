@@ -2,6 +2,55 @@ use pi_rs::{HostAuthBuilder, HostCredential, HostCredentialKind, ModelCatalogBui
 use pi_rs_workbench::model_factory::{ModelClientFactory, NativeModelApi};
 
 #[test]
+fn model_factory_builds_an_exact_catalog_with_host_metadata() {
+    use pi_rs::CatalogModelInfo;
+    use pi_rs_workbench::model_factory::NativeModelDefinition;
+
+    let endpoint = "https://api.example.test/v1/chat/completions";
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "example",
+        endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let factory = ModelClientFactory::new(auth.build());
+    let definition = NativeModelDefinition {
+        api: NativeModelApi::OpenAiChat,
+        provider: "example",
+        endpoint,
+        model: "demo",
+        info: Some(CatalogModelInfo {
+            display_name: Some("Demo model".into()),
+            ..Default::default()
+        }),
+    };
+    let catalog = factory.catalog([definition.clone()]).unwrap();
+    assert_eq!(
+        catalog
+            .info("example", "demo")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Demo model")
+    );
+    assert!(
+        factory
+            .catalog([definition.clone(), definition.clone()])
+            .is_err()
+    );
+    assert!(
+        factory
+            .catalog([NativeModelDefinition {
+                endpoint: "https://ungranted.example.test/v1/chat/completions",
+                ..definition
+            }])
+            .is_err()
+    );
+    assert!(catalog.session_builder("example", "demo").is_ok());
+}
+
+#[test]
 fn factory_uses_only_exact_host_authorized_routes_and_credential_kinds() {
     let mut auth = HostAuthBuilder::new();
     auth.register(
@@ -396,4 +445,92 @@ fn typed_chatgpt_client_enforces_provider_and_plan_endpoint() {
             .chatgpt_client("other", pi_rs::openai::DEFAULT_ENDPOINT)
             .is_err()
     );
+}
+
+#[test]
+fn auth_file_snapshot_binds_only_granted_routes() {
+    use pi_rs_workbench::auth_factory::{AuthFileReadGrants, AuthRoute};
+
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("auth.json");
+    let endpoint = "https://model.example.test/v1/chat/completions";
+    let other = "https://other.example.test/v1/chat/completions";
+    let keys = serde_json::json!({
+        "compatible": { "type": "api_key", "key": "prefix-${TOKEN}-$!$$", "env": { "TOKEN": "saved" } },
+        "bound": { "type": "api_key", "key": "$LITERAL", "literal": true, "endpoint": endpoint },
+        "command": { "type": "api_key", "key": "!printf should-not-be-read" },
+        "process_env": { "type": "api_key", "key": "$PATH" },
+        "login": { "type": "oauth", "access": "oauth-token", "refresh": "refresh-token", "expires": 9999999999999_u64 },
+        "ungranted": { "type": "api_key", "key": "private" },
+    });
+    std::fs::write(&file, format!("\u{feff}{keys}")).unwrap();
+    let grants = AuthFileReadGrants {
+        file: file.clone(),
+        routes: [
+            ("compatible", endpoint),
+            ("bound", endpoint),
+            ("bound", other),
+            ("command", endpoint),
+            ("process_env", endpoint),
+            ("login", endpoint),
+        ]
+        .into_iter()
+        .map(|(provider, endpoint)| AuthRoute {
+            provider: provider.into(),
+            endpoint: endpoint.into(),
+        })
+        .collect(),
+    };
+    let auth = grants.load().unwrap();
+    assert_eq!(
+        auth.get("compatible", endpoint).unwrap().secret(),
+        "prefix-saved-!$"
+    );
+    assert_eq!(auth.get("bound", endpoint).unwrap().secret(), "$LITERAL");
+    for provider in ["command", "process_env", "login", "ungranted"] {
+        assert!(auth.get(provider, endpoint).is_none());
+    }
+    assert!(auth.get("bound", other).is_none());
+    assert!(auth.get("compatible", other).is_none());
+
+    let factory = ModelClientFactory::new(auth.clone());
+    assert!(
+        factory
+            .client(NativeModelApi::OpenAiChat, "compatible", endpoint)
+            .is_ok()
+    );
+    assert!(
+        factory
+            .client(NativeModelApi::OpenAiChat, "bound", other)
+            .is_err()
+    );
+
+    // A malformed replacement cannot disclose credentials through errors or
+    // invalidate the key previously supplied to a host.
+    std::fs::write(
+        &file,
+        r#"{"compatible": {"type":"api_key","key":"private value"}}"#,
+    )
+    .unwrap();
+    let error = grants.load().err().unwrap().to_string();
+    assert!(error.contains("invalid saved API key"));
+    assert!(!error.contains("private value"));
+    assert_eq!(
+        auth.get("compatible", endpoint).unwrap().secret(),
+        "prefix-saved-!$"
+    );
+    let too_large = serde_json::json!({
+        "compatible": { "type": "api_key", "key": "${A}".repeat(100), "env": { "A": "x".repeat(100) } }
+    });
+    std::fs::write(&file, too_large.to_string()).unwrap();
+    assert!(
+        grants
+            .load()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("exceeds limit")
+    );
+    std::fs::remove_file(&file).unwrap();
+    assert!(grants.load().unwrap().get("compatible", endpoint).is_none());
 }

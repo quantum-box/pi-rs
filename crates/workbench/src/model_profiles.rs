@@ -5,7 +5,6 @@ use std::sync::{Arc, LazyLock};
 use pi_rs::ollama::ChatCompatibility;
 use pi_rs::{Error, Result};
 use pi_rs_workbench::image_profile::ImageResizeProfile;
-use regex::{Captures, Regex};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1670,34 +1669,15 @@ pub(super) fn expand_value_with_env(
     value: &str,
     env: Option<&serde_json::Map<String, Value>>,
 ) -> Option<String> {
-    if value.starts_with('!') {
-        return None;
-    }
-    static ENVIRONMENT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$\$|\$!|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-            .expect("environment interpolation")
-    });
-    let mut missing = false;
-    let expanded = ENVIRONMENT.replace_all(value, |capture: &Captures<'_>| {
-        let token = capture.get(0).expect("matched environment token").as_str();
-        let Some(name) = capture.get(1).or_else(|| capture.get(2)) else {
-            return token[1..].to_owned();
-        };
-        env.and_then(|env| env.get(name.as_str()))
+    pi_rs_workbench::auth_factory::expand_config_value(value, usize::MAX, |name| {
+        env.and_then(|env| env.get(name))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .or_else(|| {
-                std::env::var(name.as_str())
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            })
-            .unwrap_or_else(|| {
-                missing = true;
-                String::new()
-            })
-    });
-    (!missing).then(|| expanded.into_owned())
+            .or_else(|| std::env::var(name).ok())
+    })
+    .ok()
+    .flatten()
 }
 
 fn validate_headers(headers: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {

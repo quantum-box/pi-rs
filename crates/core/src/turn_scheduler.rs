@@ -2140,6 +2140,9 @@ impl Agent<'_> {
         let observe_tools = self.registry.extensions.iter().any(|extension| {
             extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
         });
+        let ui = (!invocations.is_empty())
+            .then(|| crate::ui_prompt::for_turn(self.registry, states, self.limits.tool_timeout))
+            .flatten();
         let (requests, mut incoming) = mpsc::channel::<Vec<NestedRequest>>(32);
         let observe_progress = self.registry.extensions.iter().any(|extension| {
             extension.handles_lifecycle()
@@ -2687,7 +2690,7 @@ impl Agent<'_> {
                                 let progress_worker = tokio::spawn(progress_worker);
                                 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                                 let progress_worker = async move { progress_worker.await.unwrap_or_else(|error| vec![("tool-progress".into(), "tool_execution_update", error.to_string())]) };
-                                let host = Arc::new(NestedHost { ui: self.registry.ui.clone(), requests: requests.clone(), specs: specs.clone(), parent_operation: calls[index].invocation.operation_id, cancellation, depth: calls[index].depth, call_count: calls[index].call_count.clone(), progress: Some(ProgressReporter { sender: ProgressSink::Turn(updates.clone()), tool_call_id: calls[index].invocation.call.id.clone(), tool_name: calls[index].invocation.call.name.clone(), args: crate::parse_tool_arguments(&calls[index].invocation.call.arguments).unwrap_or(serde_json::Value::Null), parent_tool_call_id: calls[index].parent.clone() }) });
+                                let host = Arc::new(NestedHost { ui: ui.clone(), requests: requests.clone(), specs: specs.clone(), parent_operation: calls[index].invocation.operation_id, cancellation, depth: calls[index].depth, call_count: calls[index].call_count.clone(), progress: Some(ProgressReporter { sender: ProgressSink::Turn(updates.clone()), tool_call_id: calls[index].invocation.call.id.clone(), tool_name: calls[index].invocation.call.name.clone(), args: crate::parse_tool_arguments(&calls[index].invocation.call.arguments).unwrap_or(serde_json::Value::Null), parent_tool_call_id: calls[index].parent.clone() }) });
                                 let cancel = calls[index].cancellation.clone(); let programmatic = calls[index].depth > 0;
                                 let omit = self.registry.omit_default_tool_timeout; let timeout = self.limits.tool_timeout;
                                 calls[index].phase = TurnPhase::Running;

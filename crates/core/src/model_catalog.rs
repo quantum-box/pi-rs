@@ -157,6 +157,36 @@ impl ModelCatalog {
             .historical_model_resolver(Arc::new(self.clone())))
     }
 
+    /// Restore an exact catalog model when available. If a provider-qualified
+    /// historical model is absent, use this explicitly authorized default and
+    /// report the fallback through `AgentSession::model_fallback`.
+    pub fn session_builder_with_fallback(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<SessionBuilder> {
+        let client = self.get(provider, model).ok_or_else(|| {
+            Error::Config("fallback model is not registered in the catalog".into())
+        })?;
+        let catalog = self.clone();
+        let fallback_provider = provider.to_owned();
+        let fallback_model = model.to_owned();
+        let fallback_client = client.clone();
+        let resolver = move |provider: &str, model: &str| {
+            Ok(match catalog.get(provider, model) {
+                Some(exact) => HistoricalModelResolution::Historical(exact),
+                None => HistoricalModelResolution::Fallback {
+                    provider: fallback_provider.clone(),
+                    model: fallback_model.clone(),
+                    client: fallback_client.clone(),
+                },
+            })
+        };
+        Ok(SessionBuilder::new(client, model)
+            .provider(provider)?
+            .historical_model_resolver(Arc::new(resolver)))
+    }
+
     /// Explicitly bind a legacy, provider-less model name to a trusted client.
     /// Use only when the host knows which provider owned that historical name.
     pub fn session_builder_with_legacy_model(
@@ -513,6 +543,49 @@ mod tests {
         assert_eq!(reopened.prompt("two").await.unwrap(), "first");
         assert_eq!(reopened.prompt("three").await.unwrap(), "first");
         reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_fallback_restores_exact_clients_and_reports_missing_models() {
+        let mut builder = ModelCatalogBuilder::new();
+        builder
+            .register("other", "shared", Arc::new(NamedModel("historical")))
+            .unwrap();
+        builder
+            .register("default", "shared", Arc::new(NamedModel("fallback")))
+            .unwrap();
+        let catalog = builder.build();
+        assert!(
+            catalog
+                .session_builder_with_fallback("absent", "shared")
+                .is_err()
+        );
+
+        for (provider, response) in [("other", "historical"), ("absent", "fallback")] {
+            let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+            journal
+                .select_provider_model(Some(provider), "shared", Some("high"))
+                .unwrap();
+            let mut session = catalog
+                .session_builder_with_fallback("default", "shared")
+                .unwrap()
+                .build(journal)
+                .unwrap();
+            if provider == "absent" {
+                let fallback = session.model_fallback().unwrap();
+                assert_eq!(fallback.requested_provider, "absent");
+                assert_eq!(fallback.provider, "default");
+                assert_eq!(
+                    session.journal().unwrap().model_selection(),
+                    Some(("shared".into(), None))
+                );
+            } else {
+                assert!(session.model_fallback().is_none());
+                assert_eq!(session.model_provider().unwrap(), Some("other"));
+            }
+            assert_eq!(session.prompt("hello").await.unwrap(), response);
+            session.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

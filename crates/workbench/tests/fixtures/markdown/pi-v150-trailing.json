@@ -10,6 +10,136 @@
         "  b",
         "  c"
       ]
+    },
+    {
+      "source": "alpha beta gamma",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "beta",
+        "gamma"
+      ]
+    },
+    {
+      "source": "alpha **beta** gamma",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "beta",
+        "gamma"
+      ]
+    },
+    {
+      "source": "alpha beta\ngamma delta",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "beta",
+        "gamma",
+        "delta"
+      ]
+    },
+    {
+      "source": "- alpha beta gamma",
+      "width": 11,
+      "lines": [
+        "- alpha",
+        "  beta",
+        "  gamma"
+      ]
+    },
+    {
+      "source": "- [x] alpha beta gamma",
+      "width": 14,
+      "lines": [
+        "- [x] alpha",
+        "      beta",
+        "      gamma"
+      ]
+    },
+    {
+      "source": "> alpha beta gamma",
+      "width": 11,
+      "lines": [
+        "│ alpha",
+        "│ beta",
+        "│ gamma"
+      ]
+    },
+    {
+      "source": "alpha chartreuse",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "chartreus",
+        "e"
+      ]
+    },
+    {
+      "source": "abc 日本語 test",
+      "width": 8,
+      "lines": [
+        "abc 日本",
+        "語 test"
+      ]
+    },
+    {
+      "source": "paint 🧑‍💻 next",
+      "width": 8,
+      "lines": [
+        "paint 🧑‍💻",
+        "next"
+      ]
+    },
+    {
+      "source": "- one\n\n  ***",
+      "width": 14,
+      "lines": [
+        "- one",
+        "",
+        "  ────────────"
+      ]
+    },
+    {
+      "source": "1. before\n\n   ***\n\n   after",
+      "width": 14,
+      "lines": [
+        "1. before",
+        "",
+        "   ───────────",
+        "",
+        "   after"
+      ]
+    },
+    {
+      "source": "- a\n  - b\n\n    ***\n  - c",
+      "width": 14,
+      "lines": [
+        "- a",
+        "    - b",
+        "",
+        "      ────────",
+        "",
+        "    - c"
+      ]
+    },
+    {
+      "source": "- one\n  ***\n  two",
+      "width": 14,
+      "lines": [
+        "- one",
+        "  ────────────",
+        "  two"
+      ]
+    },
+    {
+      "source": "- ***\n\n- two",
+      "width": 14,
+      "lines": [
+        "- ────────────",
+        "",
+        "- two"
+      ]
     }
   ],
   "cases": [
@@ -1278,6 +1408,203 @@
         {
           "type": "space",
           "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "one\ntwo",
+      "lines": [
+        "one",
+        "two"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "one\ntwo"
+        }
+      ]
+    },
+    {
+      "source": "one  \ntwo",
+      "lines": [
+        "one",
+        "two"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "one  \ntwo"
+        }
+      ]
+    },
+    {
+      "source": "one\r\ntwo",
+      "lines": [
+        "one",
+        "two"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "one\ntwo"
+        }
+      ]
+    },
+    {
+      "source": "one\rtwo",
+      "lines": [
+        "one",
+        "two"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "one\ntwo"
+        }
+      ]
+    },
+    {
+      "source": "> one\n> two",
+      "lines": [
+        "│ one",
+        "│ two"
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> one\n> two"
+        }
+      ]
+    },
+    {
+      "source": "- one\n  two",
+      "lines": [
+        "- one",
+        "  two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n  two"
+        }
+      ]
+    },
+    {
+      "source": "- one\ntwo",
+      "lines": [
+        "- one",
+        "  two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\ntwo"
+        }
+      ]
+    },
+    {
+      "source": "- one  \n  two",
+      "lines": [
+        "- one",
+        "  two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one  \n  two"
+        }
+      ]
+    },
+    {
+      "source": "- **a\n  b**",
+      "lines": [
+        "- a",
+        "  b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- **a\n  b**"
+        }
+      ]
+    },
+    {
+      "source": "- one\n    two",
+      "lines": [
+        "- one",
+        "    two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n    two"
+        }
+      ]
+    },
+    {
+      "source": "- one\n two",
+      "lines": [
+        "- one",
+        "   two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n two"
+        }
+      ]
+    },
+    {
+      "source": "-   a\n    b",
+      "lines": [
+        "- a",
+        "  b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "-   a\n    b"
+        }
+      ]
+    },
+    {
+      "source": "- a\n   **b**",
+      "lines": [
+        "- a",
+        "   b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n   **b**"
+        }
+      ]
+    },
+    {
+      "source": "- a  \n    b",
+      "lines": [
+        "- a",
+        "    b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a  \n    b"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n  - inner\n       second\n  tail",
+      "lines": [
+        "- outer",
+        "    - inner",
+        "         second",
+        "      tail"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n       second\n  tail"
         }
       ]
     },
