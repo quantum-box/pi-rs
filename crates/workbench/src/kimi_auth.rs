@@ -514,17 +514,21 @@ mod tests {
         let path = dir.path().join("auth.json");
         fixture(&path, now());
         let (service, started, reply, server) = refresh_server(3600).await;
-        let refresh = tokio::spawn(access_at(path.clone(), service.clone(), None, false));
-        started.await.unwrap();
+        let mut refresh = tokio::spawn(access_at(path.clone(), service.clone(), None, false));
+        tokio::select! {
+            started = started => started.unwrap(),
+            _ = &mut refresh => panic!("refresh did not reach the fixture before timing out"),
+        }
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(14)).await;
         assert!(!refresh.is_finished());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(matches!(
-            refresh.await.unwrap(),
-            Err(err) if err.to_string().contains("token refresh timed out")
-        ));
+        tokio::time::advance(Duration::from_secs(2)).await;
         tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(5), refresh)
+            .await
+            .expect("caller must stop waiting before the server replies")
+            .unwrap();
+        assert!(matches!(result, Err(err) if err.to_string().contains("token refresh timed out")));
         reply.send(()).unwrap();
         server.await.unwrap();
         let late = tokio::time::timeout(
