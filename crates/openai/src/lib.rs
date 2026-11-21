@@ -1125,6 +1125,13 @@ impl OpenAiResponses {
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &error_secrets,
+            &self.headers,
+        )
+        .await;
         if !response.status().is_success() {
             let status = response.status();
             if status.as_u16() == 413 {
@@ -3369,6 +3376,99 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn provider_response_hook_runs_before_openai_reads_an_error_body() {
+        use pi_rs_core::{
+            Agent, CancellationToken, Extension, ExtensionResult, ExtensionState, Limits,
+            MemoryStore, ProviderResponseEvent, Registry, Session,
+        };
+
+        struct Observer(tokio::sync::Notify);
+        #[async_trait::async_trait]
+        impl Extension for Observer {
+            fn id(&self) -> &str {
+                "http-observer"
+            }
+            fn handles_after_provider_response(&self) -> bool {
+                true
+            }
+            async fn after_provider_response(
+                &self,
+                event: &ProviderResponseEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(event.status, 401);
+                assert_eq!(event.headers["x-request-id"], "request-1");
+                self.0.notify_one();
+                Ok(())
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = OpenAiResponses::new_api(
+            &format!("http://{}/responses", listener.local_addr().unwrap()),
+            "fixture".into(),
+        )
+        .unwrap();
+        let callback = std::sync::Arc::new(Observer(tokio::sync::Notify::new()));
+        let mut registry = Registry::default();
+        registry.register(callback.clone()).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let length: usize = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .unwrap()
+                .1
+                .trim()
+                .parse()
+                .unwrap();
+            while request.len() < header_end + length {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nX-Request-ID: request-1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), callback.0.notified())
+                .await
+                .expect("observer must run before the provider releases the body");
+            socket.write_all(b"{}").await.unwrap();
+        });
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (_tx, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let error = agent
+            .run(
+                &mut session,
+                Some("question".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, Error::Model(_)));
     }
 
     #[tokio::test]
