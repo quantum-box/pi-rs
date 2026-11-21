@@ -120,13 +120,41 @@ enum ConfigurationRead {
     Runtime,
     Share,
     Report,
+    TextReport,
+}
+
+fn validate_mcp_file_fields(
+    file: &Value,
+    path: &std::path::Path,
+    mode: ConfigurationRead,
+    errors: &mut Vec<String>,
+) {
+    if matches!(mode, ConfigurationRead::Share | ConfigurationRead::Report)
+        && file
+            .get("mcpServers")
+            .is_some_and(|value| !value.is_object())
+    {
+        errors.push(format!("{}: mcpServers must be an object", path.display()));
+    }
+    if matches!(
+        mode,
+        ConfigurationRead::Report | ConfigurationRead::TextReport
+    ) && file
+        .get("autoEnableCodemode")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        errors.push(format!(
+            "{}: autoEnableCodemode must be a boolean",
+            path.display()
+        ));
+    }
 }
 
 fn configurations_with_project_scope(
     args: &Cli,
     mode: ConfigurationRead,
 ) -> Result<ScopedConfigurations> {
-    let validate_shape = mode != ConfigurationRead::Runtime;
+    let validate_shape = matches!(mode, ConfigurationRead::Share | ConfigurationRead::Report);
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
         return Ok((
             BTreeMap::new(),
@@ -149,16 +177,7 @@ fn configurations_with_project_scope(
         }
         Err(error) => return Err(error),
     };
-    if validate_shape
-        && user
-            .get("mcpServers")
-            .is_some_and(|value| !value.is_object())
-    {
-        configuration_errors.push(format!(
-            "{}: mcpServers must be an object",
-            user_path.display()
-        ));
-    }
+    validate_mcp_file_fields(&user, &user_path, mode, &mut configuration_errors);
     let mut servers = user
         .get("mcpServers")
         .and_then(Value::as_object)
@@ -193,16 +212,7 @@ fn configurations_with_project_scope(
             }
             Err(error) => return Err(error),
         };
-        if validate_shape
-            && project
-                .get("mcpServers")
-                .is_some_and(|value| !value.is_object())
-        {
-            configuration_errors.push(format!(
-                "{}: mcpServers must be an object",
-                project_path.display()
-            ));
-        }
+        validate_mcp_file_fields(&project, &project_path, mode, &mut configuration_errors);
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
             let mut entries = entries.clone();
             if mode == ConfigurationRead::Report {
@@ -474,16 +484,13 @@ pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
     Ok(value)
 }
 
-pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtension>>> {
-    Ok(discover(args, report, false, None).await?.connected)
-}
-
 #[derive(Default)]
 pub(super) struct Discovery {
     pub connected: Vec<Arc<McpExtension>>,
     pub sign_in: Vec<PendingSignIn>,
     pub skipped_disabled: BTreeSet<String>,
     pub inspection: Vec<Inspection>,
+    failed: bool,
 }
 
 #[derive(Clone)]
@@ -502,12 +509,14 @@ pub(super) async fn discover(
     let require_complete = share_services.is_some();
     let mode = if require_complete {
         ConfigurationRead::Share
+    } else if report {
+        ConfigurationRead::TextReport
     } else {
         ConfigurationRead::Runtime
     };
     let (servers, project, overrides, _, configuration_errors) =
         configurations_with_project_scope(args, mode)?;
-    if !configuration_errors.is_empty() {
+    if !configuration_errors.is_empty() && require_complete {
         return Err(Error::Config(format!(
             "Invalid MCP configuration for Radius share: {}",
             configuration_errors.join("\n"),
@@ -517,7 +526,12 @@ pub(super) async fn discover(
         inspection: inspection_entries(&servers, &project, &overrides),
         ..Discovery::default()
     };
-    let mut failed = false;
+    let mut failed = report && !configuration_errors.is_empty();
+    if report {
+        for error in configuration_errors {
+            eprintln!("config error: {error}");
+        }
+    }
     let mut normalized = BTreeSet::new();
     let mut pending = Vec::new();
     for (name, value) in servers {
@@ -610,6 +624,7 @@ pub(super) async fn discover(
             "MCP discovery failed while preparing Radius share".into(),
         ));
     }
+    discovery.failed = failed;
     Ok(discovery)
 }
 
@@ -877,7 +892,7 @@ async fn list_json(args: &Cli) -> Result<()> {
     writeln!(stdout)?;
     if failed {
         return Err(Error::Config(
-            "one or more MCP servers failed to connect".into(),
+            "MCP configuration or connection check failed".into(),
         ));
     }
     Ok(())
@@ -1112,18 +1127,13 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             return list_json(args).await;
         }
         McpCommand::List { json: false } => {
-            let expected = configurations(args)?
-                .values()
-                .filter(|value| value["enabled"] != false)
-                .count();
-            let connected = connect_all(args, true).await?;
-            let count = connected.len();
-            for connection in connected {
+            let discovery = discover(args, true, false, None).await?;
+            for connection in discovery.connected {
                 connection.close().await;
             }
-            if count != expected {
+            if discovery.failed {
                 return Err(Error::Config(
-                    "one or more MCP servers failed to connect".into(),
+                    "MCP configuration or connection check failed".into(),
                 ));
             }
         }

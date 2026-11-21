@@ -877,8 +877,10 @@ expanding a quoted prompt argument before the model request.
 
 `pi mcp list --json` emits one JSON document with server state, source,
 transport, tool names, per-tool exposure overrides, and resource capability.
-Invalid entries are reported in `errors`; enabled connection failures cause a
-nonzero exit. An invalid trusted project override currently fails the merged
+Invalid entries are reported in `errors`. Both forms of `pi mcp list` report
+a non-boolean `autoEnableCodemode` with its configuration file path, keep
+listing the servers, and exit with a failure status. Enabled connection
+failures also cause a nonzero exit. An invalid trusted project override currently fails the merged
 configuration as a whole, preserving pi-rs's existing override validation.
 Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
