@@ -1077,6 +1077,54 @@ mod jsonl_framing_tests {
     }
 
     #[test]
+    fn malformed_json_structure_reports_pi_diagnostics() {
+        for (input, expected) in [
+            (
+                "{x:1}",
+                "Expected property name or '}' in JSON at position 1 (line 1 column 2)",
+            ),
+            (
+                r#"{"é":0, bad:1}"#,
+                "Expected double-quoted property name in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "{\r\n \"😀\":1,\r  }",
+                "Expected double-quoted property name in JSON at position 14 (line 3 column 3)",
+            ),
+            (
+                r#"{"😀":1,}"#,
+                "Expected double-quoted property name in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                r#"{"a" 1}"#,
+                "Expected ':' after property name in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                r#"{"a":1 "b":2}"#,
+                "Expected ',' or '}' after property value in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "[\r\n 1 2]",
+                "Expected ',' or ']' after array element in JSON at position 6 (line 2 column 4)",
+            ),
+            (
+                "true false",
+                "Unexpected non-whitespace character after JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                r#""😀"🚧"#,
+                "Unexpected non-whitespace character after JSON at position 4 (line 1 column 5)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn truncated_json_reports_pi_eof_diagnostics() {
         for (input, expected) in [
             ("[", "Unexpected end of JSON input"),
@@ -1391,19 +1439,7 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
             None
         };
         if let Some(reason) = reason {
-            let position = line.encode_utf16().count();
-            let row = line.bytes().filter(|byte| *byte == b'\r').count()
-                + line.bytes().filter(|byte| *byte == b'\n').count()
-                - line.matches("\r\n").count()
-                + 1;
-            let column = line
-                .rsplit(['\r', '\n'])
-                .next()
-                .unwrap_or_default()
-                .encode_utf16()
-                .count()
-                + 1;
-            return format!("{reason} at position {position} (line {row} column {column})");
+            return json_error_at(reason, line);
         }
     }
     if let Some((offset, start)) = json_string_control_offset(line)
@@ -1415,62 +1451,21 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
                     .is_some_and(|position| position >= start && position <= offset + 1))
             || surrogate_retry_control(line, error, offset))
     {
-        let prefix = &line[..offset];
-        let position = prefix.encode_utf16().count();
-        let row = prefix.bytes().filter(|byte| *byte == b'\r').count()
-            + prefix.bytes().filter(|byte| *byte == b'\n').count()
-            - prefix.matches("\r\n").count()
-            + 1;
-        let column = prefix
-            .rsplit(['\r', '\n'])
-            .next()
-            .unwrap_or_default()
-            .encode_utf16()
-            .count()
-            + 1;
-        return format!(
-            "Bad control character in string literal in JSON at position {position} (line {row} column {column})"
+        return json_error_at(
+            "Bad control character in string literal in JSON",
+            &line[..offset],
         );
     }
     if (message.starts_with("invalid escape")
         || error.is_eof() && message.starts_with("EOF while parsing a string"))
         && let Some((reason, offset)) = invalid_json_escape(line)
     {
-        let prefix = &line[..offset];
-        let position = prefix.encode_utf16().count();
-        let row = prefix.bytes().filter(|byte| *byte == b'\r').count()
-            + prefix.bytes().filter(|byte| *byte == b'\n').count()
-            - prefix.matches("\r\n").count()
-            + 1;
-        let column = prefix
-            .rsplit(['\r', '\n'])
-            .next()
-            .unwrap_or_default()
-            .encode_utf16()
-            .count()
-            + 1;
-        return format!("{reason} at position {position} (line {row} column {column})");
+        return json_error_at(reason, &line[..offset]);
     }
     if error.is_eof() && message.starts_with("EOF while parsing a string") {
         match unfinished_json_escape(line) {
             Some(false) => return "Unexpected end of JSON input".into(),
-            Some(true) => {
-                let position = line.encode_utf16().count();
-                let row = line.bytes().filter(|byte| *byte == b'\r').count()
-                    + line.bytes().filter(|byte| *byte == b'\n').count()
-                    - line.matches("\r\n").count()
-                    + 1;
-                let column = line
-                    .rsplit(['\r', '\n'])
-                    .next()
-                    .unwrap_or_default()
-                    .encode_utf16()
-                    .count()
-                    + 1;
-                return format!(
-                    "Bad Unicode escape in JSON at position {position} (line {row} column {column})"
-                );
-            }
+            Some(true) => return json_error_at("Bad Unicode escape in JSON", line),
             None => {}
         }
     }
@@ -1478,7 +1473,7 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         || message.starts_with("unexpected end of hex escape"))
         && unterminated_surrogate_string(line, error);
     if !error.is_eof() && !surrogate_eof {
-        return error.to_string();
+        return json_structure_error(line, error, &message).unwrap_or(message);
     }
     let tail = line.trim_end_matches([' ', '\t', '\n', '\r']);
     // The remaining unterminated-string case has complete escapes; incomplete
@@ -1507,24 +1502,49 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     } else {
         None
     };
-    match reason {
-        Some(reason) => {
-            let position = line.encode_utf16().count();
-            let row = line.bytes().filter(|byte| *byte == b'\r').count()
-                + line.bytes().filter(|byte| *byte == b'\n').count()
-                - line.matches("\r\n").count()
-                + 1;
-            let column = line
-                .rsplit(['\r', '\n'])
-                .next()
-                .unwrap_or_default()
-                .encode_utf16()
-                .count()
-                + 1;
-            format!("{reason} at position {position} (line {row} column {column})")
+    reason.map_or(message, |reason| json_error_at(reason, line))
+}
+
+fn json_structure_error(line: &str, error: &serde_json::Error, message: &str) -> Option<String> {
+    // For these syntax errors, serde reports the one-based byte column of the
+    // unexpected character. Pi reports zero-based UTF-16 positions.
+    let offset = serde_error_offset(line, error)?.checked_sub(1)?;
+    let prefix = line.get(..offset)?;
+    let reason = match message.split_once(" at line ")?.0 {
+        "expected `:`" => "Expected ':' after property name in JSON",
+        "expected `,` or `]`" => "Expected ',' or ']' after array element in JSON",
+        "expected `,` or `}`" => "Expected ',' or '}' after property value in JSON",
+        "trailing characters" => "Unexpected non-whitespace character after JSON",
+        "key must be a string"
+            if prefix
+                .trim_end_matches([' ', '\t', '\r', '\n'])
+                .ends_with('{') =>
+        {
+            "Expected property name or '}' in JSON"
         }
-        None => message,
-    }
+        "key must be a string" => "Expected double-quoted property name in JSON",
+        "trailing comma" if line.as_bytes().get(offset) == Some(&b'}') => {
+            "Expected double-quoted property name in JSON"
+        }
+        _ => return None,
+    };
+    Some(json_error_at(reason, prefix))
+}
+
+fn json_error_at(reason: &str, prefix: &str) -> String {
+    let position = prefix.encode_utf16().count();
+    let row = prefix.bytes().filter(|byte| *byte == b'\r').count()
+        + prefix.bytes().filter(|byte| *byte == b'\n').count()
+        - prefix.matches("\r\n").count()
+        + 1;
+    let column = prefix
+        .rsplit(['\r', '\n'])
+        .next()
+        .unwrap_or_default()
+        .encode_utf16()
+        .count()
+        + 1;
+    format!("{reason} at position {position} (line {row} column {column})")
 }
 
 // This is only a diagnostic retry; it never changes the JSON parsed by the

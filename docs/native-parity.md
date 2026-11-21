@@ -45,6 +45,8 @@ streamed reasoning and replay it as text before the answer for the same model.
 
 Gemini streaming retains the first nonempty, bounded response ID for the turn
 and reports it before completion so a handled interruption can record it.
+Gemini sends failed tool results in `functionResponse.response.error` and
+successful results in `functionResponse.response.output`, matching Pi.
 
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
@@ -174,7 +176,9 @@ without storing its value in that configuration file.
 Local package sources expand `~` using a nonempty `HOME` or the platform
 home-directory fallback, including `~\` on Windows. On Unix an explicitly
 empty `HOME` remains empty. Relative home values resolve from the source
-settings scope, matching Pi.
+settings scope, matching Pi. On Windows, local package sources and resource
+filters accept Git Bash/MSYS, Cygwin, and WSL drive spellings such as `/c/...`,
+`/cygdrive/c/...`, and `/mnt/c/...`.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
@@ -404,10 +408,18 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
-### OpenCode Zen classifiers
+### OpenCode Zen and Go
 
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
+
+OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
+using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+Completions or Responses route. Session requests include `x-opencode-session`
+unless configuration supplies the header explicitly. Endpointless saved keys
+apply to the official routes for the corresponding provider. Gemini prepared
+requests also accept an empty tool list. Live inference
+with a Zen or Go account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
@@ -2227,7 +2239,10 @@ editor for implemented model defaults, resource lists, native packages, tool
 selection, trust defaults, terminal mode and codemode settings. Ctrl+S validates
 and saves, Escape discards the edit. Invalid values keep the editor open and
 show the failing settings path. The selected setting includes an explanatory
-hint below the searchable list. Unrecognized extension-owned keys survive
+hint below the searchable list. Values stay in the same column as the list
+is filtered. On narrow terminals, short rows can use less padding to keep
+their values visible. The selected row uses Pi's arrow and accent color, and other
+values use the muted theme color. Unrecognized extension-owned keys survive
 updates. Runtime/resource changes take effect on reload or the next startup,
 and theme changes apply immediately.
 
@@ -3527,7 +3542,9 @@ new-file numbers for insertions, and four context lines on either side of a
 change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
 and uses the existing word highlighting for single-line changes. Added, removed
-and context rows use the corresponding Pi theme roles.
+and context rows use the corresponding Pi theme roles. Numbered rows wrap at
+word and CJK grapheme boundaries, with the diff coloring and inverse highlights
+carried into subsequent rows. Long words split at grapheme boundaries.
 Previously stored unified patches still render through the existing path.
 
 The CLI comparison checks exact numbered and unified diffs for two separate
@@ -5404,8 +5421,10 @@ fractions, exponents, and leading minus signs cut off at EOF. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
 For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
 control after a surrogate in another string if no other parse error occurs first.
-Other malformed JSON retains the native parser's diagnostics; full
-malformed-input parity remains open.
+Malformed object property names and separators, object trailing commas, missing
+array separators and trailing text after a complete JSON value also use Pi's
+position-aware wording. Other malformed records, including array trailing
+commas, retain the native parser's diagnostics.
 
 ### Shell execution transcript checkpoint
 

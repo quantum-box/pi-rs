@@ -1757,7 +1757,9 @@ impl Anthropic {
         }
         let error_secrets = self.error_secrets();
         let request = self.client.post(self.endpoint.clone()).json(&body);
-        let request = if self.auth.0 == "cf-aig-authorization" {
+        let request = if self.auth.0 == "cf-aig-authorization"
+            || matches!(self.provider.as_ref(), "opencode" | "opencode-go")
+        {
             request.query(&[("beta", "true")])
         } else {
             request
