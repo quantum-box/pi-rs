@@ -10507,6 +10507,27 @@ async fn nested_woken_evidence_worker() {
     };
     let mut scheduler =
         Scheduler::open_with_extensions(dir.join("db"), options, extensions).unwrap();
+    #[cfg(feature = "experimental-graph-revision")]
+    if std::env::var_os("PI_TEST_NESTED_OWNED_GRAPH_PROBE").is_some() {
+        let harness = scheduler.subagent_harness();
+        let store = harness.owner.store();
+        let child = crate::task_store::TaskStore::new(store)
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                matches!(record.task.owner(), crate::task::TaskOwner::Task(_))
+                    && record.task.state() == &TaskState::Running
+            })
+            .unwrap();
+        assert!(matches!(
+            harness.authenticated_scoped_woken_abort_graph(&child, &registry, &[]),
+            Err(crate::runtime::Error::TaskScheduler(
+                crate::task_scheduler::Error::Busy
+            ))
+        ));
+        return;
+    }
     let _driver = scheduler.start_tasks(registry).unwrap();
     if std::env::var_os("PI_TEST_NESTED_WOKEN_RESUME").is_some() {
         std::future::pending::<()>().await;
@@ -11043,6 +11064,19 @@ async fn exercise_nested_woken_owned_rejection(selected: bool) {
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
     drop(store);
     drop(harness);
+    #[cfg(feature = "experimental-graph-revision")]
+    {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+            ])
+            .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+            .env("PI_TEST_NESTED_OWNED_GRAPH_PROBE", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
     let mut resumed = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
