@@ -115,6 +115,15 @@ border theme. Retries, summaries, and standalone shell runs keep their own
 status. Overrides apply across turns and reset with the extension worker or
 a new session.
 
+## Customize the collapsed thinking label
+
+Send `SetHiddenThinkingLabel` (wire method `setHiddenThinkingLabel`) to
+change the label for collapsed thinking blocks in the visible transcript,
+including streamed thinking. A blank or whitespace-only label removes the
+block from the view. Omit `label` to restore `Thinking...`. The override
+uses the theme's thinking style, wraps to at most 16 terminal rows and
+resets with the extension worker or session.
+
 ## Observe extension UI prompts
 
 Opt in with `handles_lifecycle` and `handles_ui_prompt_lifecycle` to observe

@@ -223,6 +223,12 @@ pub enum UiRequest {
         #[serde(default)]
         options: Option<WorkingIndicatorOptions>,
     },
+    /// Change the collapsed thinking label. A blank label hides the block.
+    /// Omit the label to restore the default.
+    SetHiddenThinkingLabel {
+        #[serde(default)]
+        label: Option<String>,
+    },
     SetTitle {
         title: String,
     },
@@ -299,6 +305,14 @@ impl UiRequest {
         {
             return Err("extension working indicator supports 64 single-line frames of at most 256 bytes each".into());
         }
+        if let Self::SetHiddenThinkingLabel { label: Some(label) } = self
+            && (label.len() > 4096
+                || label
+                    .chars()
+                    .any(|ch| ch.is_control() && ch != '\n' && ch != '\t'))
+        {
+            return Err("extension hidden thinking label exceeds its rendering limits".into());
+        }
         if let Self::Custom { lines, actions, .. } = self {
             if !component_lines_within_limits(lines) {
                 return Err("extension component exceeds its rendering limits".into());
@@ -368,6 +382,27 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_thinking_label_accepts_blank_and_reset_without_a_response() {
+        for label in [
+            serde_json::json!({}),
+            serde_json::json!({"label":null}),
+            serde_json::json!({"label":""}),
+            serde_json::json!({"label":"Still thinking\nPlease wait"}),
+        ] {
+            let mut value = label;
+            value["method"] = serde_json::json!("setHiddenThinkingLabel");
+            let request: UiRequest = serde_json::from_value(value).unwrap();
+            assert!(request.validate().is_ok());
+            assert!(!request.needs_response());
+        }
+
+        for label in ["a".repeat(4097), "\x1b[31m".into()] {
+            let request = UiRequest::SetHiddenThinkingLabel { label: Some(label) };
+            assert!(request.validate().is_err());
+        }
+    }
+
     #[test]
     fn working_indicator_uses_pi_fields_and_validates_single_line_frames() {
         let value = serde_json::json!({

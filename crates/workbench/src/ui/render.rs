@@ -298,10 +298,11 @@ pub enum Entry {
     },
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct TranscriptOptions {
+pub struct TranscriptOptions<'a> {
     pub image_width: Option<usize>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
+    pub hidden_thinking_label: Option<&'a str>,
     pub expand_key: Option<crossterm::event::KeyEvent>,
 }
 
@@ -323,7 +324,7 @@ impl Entry {
         width: usize,
         expand_tools: bool,
         show_thinking: bool,
-        options: TranscriptOptions,
+        options: TranscriptOptions<'_>,
     ) -> Vec<Line> {
         let padding = options.padding.min(width.saturating_sub(1) / 2);
         let inner = width.saturating_sub(2 * padding).max(1);
@@ -510,9 +511,16 @@ impl Entry {
                     return vec![];
                 }
                 let mut lines = if !expanded.unwrap_or(show_thinking) {
-                    let mut span = Span::themed("Thinking...", theme, "thinkingText");
+                    let label = options.hidden_thinking_label.unwrap_or("Thinking...");
+                    if label
+                        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
+                        .is_empty()
+                    {
+                        return Vec::new();
+                    }
+                    let mut span = Span::themed(label, theme, "thinkingText");
                     span.italic = true;
-                    wrap(&[span], inner)
+                    wrap_bounded(&[span], inner, 16)
                 } else {
                     // Pi renders thinking as Markdown, but deliberately excludes it
                     // from the Mermaid transformer. Only default text inherits the
@@ -1273,7 +1281,12 @@ impl Table {
     }
 }
 
-fn user_lines(text: &str, theme: &Theme, width: usize, options: TranscriptOptions) -> Vec<Line> {
+fn user_lines(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    options: TranscriptOptions<'_>,
+) -> Vec<Line> {
     let mut lines = markdown_at_depth(text, theme, width, 0, options.mermaid, *HYPERLINKS, true);
     for line in &mut lines {
         line.background = Some(theme.color("userMessageBg"));
@@ -4336,6 +4349,41 @@ mod tests {
         assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
         let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
         assert!(!Span::themed("muted", &custom, "muted").dim);
+    }
+
+    #[test]
+    fn hidden_thinking_label_uses_theme_and_skips_blank_blocks() {
+        let theme = Theme::system();
+        let entry = Entry::Thinking {
+            text: "internal text".into(),
+            expanded: None,
+        };
+        let options = TranscriptOptions {
+            padding: 1,
+            hidden_thinking_label: Some("Extension\nlabel"),
+            ..Default::default()
+        };
+        let rows = entry.render(&theme, 20, false, false, options);
+        assert_eq!(rows.len(), 3);
+        for (line, text) in rows.iter().zip(["Extension", "label"]) {
+            assert!(line.spans.iter().any(|span| {
+                span.text == text && span.italic && span.color == theme.color("thinkingText")
+            }));
+        }
+        let options = TranscriptOptions {
+            hidden_thinking_label: Some(" \n \u{feff}"),
+            ..options
+        };
+        assert!(entry.render(&theme, 20, false, false, options).is_empty());
+        assert!(!entry.render(&theme, 20, false, true, options).is_empty());
+
+        let long_label = "wide label\n".repeat(128);
+        let options = TranscriptOptions {
+            hidden_thinking_label: Some(&long_label),
+            ..options
+        };
+        // The label is clipped to 16 visual rows, followed by transcript spacing.
+        assert_eq!(entry.render(&theme, 20, false, false, options).len(), 17);
     }
 
     #[test]
