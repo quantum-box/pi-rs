@@ -55,6 +55,13 @@ impl Model for Script {
                 ),
             ]
             .into_iter()
+            .chain(cfg!(unix).then(|| {
+                (
+                    "bash-timeout",
+                    "bash",
+                    json!({"command": "sleep 4", "timeout": 0.25}),
+                )
+            }))
             .map(|(id, name, args)| ToolCall {
                 id: id.into(),
                 name: name.into(),
@@ -142,6 +149,11 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
     );
     assert_eq!(replies["ls-missing"], (missing.as_str(), true));
     assert_eq!(replies["grep-missing"], (missing.as_str(), true));
+    #[cfg(unix)]
+    assert_eq!(
+        replies["bash-timeout"],
+        ("Command timed out after 0.25 seconds", true)
+    );
     assert_eq!(
         replies["read-offset"],
         ("Offset 9 is beyond end of file (1 lines total)", true)

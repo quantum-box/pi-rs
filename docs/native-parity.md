@@ -3077,7 +3077,7 @@ existing tighter output bound.
 
 ### Local file-path input checkpoint
 
-Unrestricted local file tools pass failures to the model and JSON/RPC clients
+Unrestricted local tools pass failures to the model and JSON/RPC clients
 as error-marked text with the tool's diagnostic. Direct and programmatic calls
 keep their native outcome representation.
 

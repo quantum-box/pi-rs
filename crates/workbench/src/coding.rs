@@ -2299,19 +2299,20 @@ impl Tool for CodingTool {
         _state: Option<&pi_rs::ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> Outcome {
-        if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
+        let outcome = if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
             self.bash_with_host(&args, &context.cancellation, Some(host))
                 .await
         } else {
-            // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
-            match self.invoke(args, context).await {
-                Outcome::Failed(output) if self.unrestricted => Outcome::TextResult {
-                    output,
-                    details: None,
-                    is_error: true,
-                },
-                outcome => outcome,
-            }
+            self.invoke(args, context).await
+        };
+        // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
+        match outcome {
+            Outcome::Failed(output) if self.unrestricted => Outcome::TextResult {
+                output,
+                details: None,
+                is_error: true,
+            },
+            outcome => outcome,
         }
     }
 
