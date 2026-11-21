@@ -559,6 +559,10 @@ turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
 `toolcall_start` includes the ID and tool name available at that point.
+JSON and RPC emit `tool_execution_start` before preparation and authorization,
+including for rejected attempts. As in Pi, unparseable or non-object arguments
+appear as an empty object. The native `ToolStarted` journal record is reserved
+for dispatch.
 JSON and RPC `message_update` events include Pi's top-level `usage` object.
 Its counters start at zero and use the reported totals once the provider
 finishes. Providers that report usage incrementally in Pi can therefore expose
@@ -1892,6 +1896,12 @@ Settings filter globs require an explicit leading dot to match a hidden path
 component. A visible basename can still match independently of its hidden
 parent path. Native manifest discovery and brace combinations outside the
 bounded expansion retain native glob matching.
+Settings filters treat an unclosed character class as literal text and ignore
+ordinary glob patterns that start with `#`. Exact overrides can select a path
+containing `#`.
+Each leading `!` after the filter exclusion prefix toggles glob negation.
+The resulting glob is evaluated against relative paths, absolute paths and
+basenames, as in Pi.
 
 ### Resource discovery checkpoint
 
@@ -2073,10 +2083,11 @@ are treated as omissions, and edit batches also normalize replacement fields.
 Scoped tools and injected operations retain their argument handling.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
-context lines, bounds long displayed lines at 500 characters, and reports match
-and byte limits. Large text files remain searchable. Overlapping context ranges
-are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
-radius is limited to 1,000 lines.
+context lines, bounds long displayed lines at 500 UTF-16 units, and reports
+match and byte limits. The unrestricted local tool uses ripgrep's context
+events as in Pi 1.6.0. When the context exceeds the native searcher's 64 MiB
+buffer, it indexes matches on disk and streams the selected context from the
+same open file.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
 JSON numbers as JavaScript doubles. `ls` compares the number directly, including
@@ -2184,6 +2195,15 @@ remote-workspace resumption, filters, path display and terminal restoration.
 The Rust 1.89 CI matrix passed formatting, all-target Clippy and workspace tests
 on Linux, macOS and Windows at commit `706a249`. Subsequent changes receive the
 same matrix on main.
+
+### SDK extension event bus
+
+`pi_rs_extensions::ExtensionEventBus` provides an in-process Pi-style channel
+bus for native SDK hosts and extensions. One subscription can be removed
+without affecting other listeners, and the host can clear the bus. The
+embedding host shares the bus and owns subscription lifetime. Rust handlers
+run synchronously with JSON values, and failures are returned to the emitter.
+Executable extensions use a separate process protocol.
 
 ### Native extension host calls
 
@@ -2615,11 +2635,19 @@ so descendants attach to their nearest visible ancestor. Deep trees pan
 horizontally to keep the selected entry visible while retaining the selection
 gutter; clipping skips partially visible wide characters at either boundary
 while preserving theme styling.
+The tree centers the selected row when possible. It shows up to half the
+terminal height, with a five-row minimum when space allows, and uses the
+visible row capacity for page movement.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
 journal lock before restoring the view.
 After tree navigation, the selected user message fills an empty editor. A draft
-already in the editor keeps its text and any native image attachments.
+already in the editor keeps its text and any native image attachments. While
+a response streams, `/tree` and its shortcut read the committed journal without
+interrupting the response. Confirming another branch restores queued prompts
+and images to the editor, stops the response, and navigates after the worker
+settles. An active compaction prevents navigation. Label edits remain subject
+to the native journal's exclusive write lock.
 
 Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
 folding, search, labels, checkout and terminal restoration. Session and queue
@@ -2630,6 +2658,8 @@ theme roles. Native record IDs remain searchable for direct checkout. Custom
 messages and imported compaction summaries can be copied from the tree.
 Copying an imported assistant failure with empty content uses its original
 error message, including line breaks.
+The all-entries filter shows thinking-level changes as separate bookkeeping
+rows, including imported changes made before a model was selected.
 Message preview and navigation gaps remain in the Sessions row.
 
 ### Package identity checkpoint
@@ -3229,24 +3259,19 @@ Malformed `glob` filters report the original glob with ripgrep's diagnostic
 before regex compilation. Unrestricted local `grep` and `ls` report the
 requested path as missing when an intermediate component is a regular file.
 
-Grep now emits a separate context block for each match, including repeated lines
-where adjacent matches overlap. The matching marker belongs to that block's
-center; a neighboring match uses the context marker. Pending blocks flush at EOF,
-including the final empty line when the file ends with a newline. The streaming
-implementation retains a bounded context window and bounded output.
+Unrestricted local grep emits each matching or context line once, keeps
+embedded carriage returns, and stops at the last real line of each file.
+Numeric match limits are floored and clamped to at least one. The notice
+is reported only when another match exceeds that effective limit, including
+in a different file. An extra match within the last selected match's trailing
+context uses the context marker. Long lines use Pi's 500 UTF-16-unit cutoff
+without splitting a surrogate pair. Match counting continues after the 50 KB
+output limit, so byte and line totals cover all selected output.
+Scoped tools retain their existing per-match context blocks and line truncation.
 
-Long lines use Pi's 500 UTF-16-unit cutoff. A split surrogate is rendered as a
-replacement character in native UTF-8 text. Match counting continues after the
-50 KB output limit, so combined match, byte and long-line notices reflect the
-same selected matches as the reference. Notice wording also matches Pi.
-
-Regression tests cover overlapping blocks, the final selected match's context,
-EOF with and without a trailing newline, surrogate boundaries, and combined
-limits. Direct execution of the pinned Pi tool confirmed the context output and
-the 101-line, 51,098-byte combined-limit result. A loopback CLI test also verified
-that invoking the native grep tool delivers those per-match context blocks to
-the next model request. Workspace tests and all-target Clippy passed. Other local-tool differences,
-including structured result details and find traversal, remain open.
+Regressions cover overlapping context, the final selected match's context,
+exact and exceeded limits, CRLF and embedded CR, and surrogate boundaries.
+The published Pi 1.6.0 tool produced the same representative results.
 
 ### Find traversal and glob checkpoint
 
@@ -3722,9 +3747,10 @@ Workspace tests, the imported-details regression and all-target Clippy pass.
 ### Numbered edit diff checkpoint
 
 Native edit results preserve a numbered display diff alongside the unified
-patch. The display diff uses old-file numbers for deletions and context,
-new-file numbers for insertions, and four context lines on either side of a
-change. Omitted ranges appear as ellipses. The terminal prefers the numbered
+patch. Unified hunk headers use Pi's explicit line counts, including for a
+single line and zero-length ranges. The display diff uses old-file numbers for
+deletions and context, new-file numbers for insertions, and four context lines
+on either side of a change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
 and uses the existing word highlighting for single-line changes. Added, removed
 and context rows use the corresponding Pi theme roles. Numbered rows wrap at
@@ -4768,6 +4794,22 @@ and headers inferred from classifier-only model URLs apply to those operations.
 When the inferred URL is on the configured official account, its provider
 credentials also apply to chat. Live Workers AI inference has not been verified.
 
+### Cloudflare AI Gateway
+
+Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
+credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
+selects the Chat Completions, Messages, or Responses path. All three send
+`cf-aig-authorization` for gateway authentication, and saved keys remain
+scoped to their account and gateway. A concrete provider `baseUrl` can
+supply missing route identifiers for an imported key when the configured
+route agrees with any saved or environment identifiers.
+
+The published Pi AI package and local fixtures cover each route and
+authentication header. Live gateway authentication was unverified because
+no gateway credentials were available.
+
 ### Configured llama.cpp classifiers
 
 A `models.json` provider can declare an entry with `"type": "classifier"` and
@@ -5685,6 +5727,7 @@ nearest visible ancestors for navigation. Search matches every whitespace-separa
 term regardless of order or case. Editing or clearing the search unfolds branches
 and retains the selected entry or its nearest visible ancestor, including when
 the search temporarily finds no entries.
+Tree search also matches the first 200 UTF-16 units of tool-result text.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
 

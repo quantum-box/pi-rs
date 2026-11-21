@@ -539,15 +539,20 @@ impl OpenAiResponses {
         }
     }
 
+    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.provider == "cloudflare-ai-gateway" {
+            request.header("cf-aig-authorization", format!("Bearer {}", self.token))
+        } else {
+            request.bearer_auth(&self.token)
+        }
+    }
+
     /// Return the signed-in account's displayable models in server order.
     pub async fn models(&self) -> Result<Vec<String>> {
         let mut endpoint = self.endpoint.clone();
         endpoint.set_path("/v1/models");
         let mut response = self
-            .client
-            .get(endpoint)
-            .headers(self.headers.clone())
-            .bearer_auth(&self.token)
+            .authenticate(self.client.get(endpoint).headers(self.headers.clone()))
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI model listing failed".into()))?;
@@ -1216,9 +1221,8 @@ impl OpenAiResponses {
                 request = request.header("originator", "pi");
             }
         }
-        let mut response = request
-            .headers(headers)
-            .bearer_auth(&self.token)
+        let mut response = self
+            .authenticate(request.headers(headers))
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(body)
             .send()
