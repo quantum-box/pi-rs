@@ -809,6 +809,7 @@ impl Profiles {
         self.cloudflare_saved_account.as_deref()
     }
 
+    #[cfg(test)]
     pub(super) fn parse(data: &Value) -> Result<Self> {
         Self::parse_with_cloudflare_account(data, None)
     }
@@ -1663,7 +1664,7 @@ mod tests {
         assert_eq!(profiles.model_ids(&provider).len(), 19);
         assert_eq!(
             profiles.model_ids(&provider)[0],
-            "@cf/moonshotai/kimi-k2.7-code"
+            "@cf/moonshotai/kimi-k2.6"
         );
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
