@@ -1744,11 +1744,13 @@ impl Anthropic {
             progress(Progress::WaitingForModel);
         }
         let error_secrets = self.error_secrets();
-        let response = send(
-            self.authenticate(self.client.post(self.endpoint.clone()).json(&body)),
-            &error_secrets,
-        )
-        .await?;
+        let request = self.client.post(self.endpoint.clone()).json(&body);
+        let request = if matches!(self.provider.as_ref(), "opencode" | "opencode-go") {
+            request.query(&[("beta", "true")])
+        } else {
+            request
+        };
+        let response = send(self.authenticate(request), &error_secrets).await?;
         if !response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
