@@ -4601,6 +4601,10 @@ the configured classifier through Codemode against the published Pi adapter.
 Native snapshots the router catalog at Codemode startup from the Pi-format
 `llama.cpp` API-key entry in `auth.json` or from `LLAMA_BASE_URL`. A saved URL
 takes precedence, and the optional key is scoped to its configured router.
+Native Codemode applies its existing transport policy to these endpoints.
+Use HTTPS for remote servers. Plain HTTP is supported on loopback.
+Single-model servers can be registered explicitly. Automatic discovery
+requires the router catalog, as in Pi.
 Loaded and sleeping models, and unloaded presets eligible for router
 autoload, can appear as classifiers.
 Models advertising `decisions` output use `/v1/systemone`; other models use
