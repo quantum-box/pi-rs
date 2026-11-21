@@ -6,8 +6,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use base64::Engine;
 use crossterm::{
-    cursor::{MoveToColumn, MoveUp, RestorePosition, SavePosition},
+    cursor::{MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
     queue,
+    terminal::{Clear, ClearType},
 };
 
 use super::render::Line;
@@ -293,8 +294,27 @@ impl Renderer {
         self.placed.clear();
         self.crops.clear();
     }
-    pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        self.clear_region(out, None)
+    pub fn clear_fullscreen_frame(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.clear_region(out, None)?;
+        // Kitty's erase-entire-display also frees image data with no placements.
+        // Erasing from the origin clears the text while preserving cached uploads.
+        let clear = if self.protocol == Some(Protocol::Kitty) {
+            ClearType::FromCursorDown
+        } else {
+            ClearType::All
+        };
+        queue!(out, MoveTo(0, 0), Clear(clear))
+    }
+    pub fn purge_regular_transcript(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.clear_region(out, None)?;
+        queue!(
+            out,
+            Clear(ClearType::All),
+            MoveTo(0, 0),
+            Clear(ClearType::Purge)
+        )?;
+        self.uploaded.clear();
+        Ok(())
     }
     pub fn clear_active(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         self.clear_region(out, Some(2))
@@ -645,13 +665,51 @@ mod tests {
         renderer.paint(&line, &mut duplicate, 1, 1).unwrap();
         assert!(duplicate.is_empty());
         let mut next = Vec::new();
-        renderer.clear_placements(&mut next).unwrap();
+        renderer.clear_region(&mut next, None).unwrap();
         renderer.paint(&line, &mut next, 2, 2).unwrap();
         let next = String::from_utf8(next).unwrap();
         assert!(next.contains("a=d,d=i"));
         assert!(!next.contains("a=t,f=100"));
         assert!(next.contains("C=1,q=2"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_fullscreen_clear_preserves_uploads_and_scrollback_purge_reloads_them() {
+        let mut renderer = renderer(Protocol::Kitty);
+        let line = Line {
+            image: Some(Placement {
+                image: fixture(),
+                columns: 2,
+                column: 0,
+                rows: 2,
+                offset: 1,
+            }),
+            ..Default::default()
+        };
+        renderer.paint(&line, &mut Vec::new(), 0, 1).unwrap();
+
+        let mut next = Vec::new();
+        renderer.clear_fullscreen_frame(&mut next).unwrap();
+        renderer.paint(&line, &mut next, 0, 1).unwrap();
+        let next = String::from_utf8(next).unwrap();
+        assert!(next.contains("\x1b[1;1H\x1b[J"));
+        assert!(!next.contains("\x1b[2J"));
+        assert!(!next.contains("a=t,f=100"));
+        assert!(next.contains("r=1,y=18,h=18"));
+
+        let mut rebuilt = Vec::new();
+        renderer.purge_regular_transcript(&mut rebuilt).unwrap();
+        renderer.paint(&line, &mut rebuilt, usize::MAX, 1).unwrap();
+        let rebuilt = String::from_utf8(rebuilt).unwrap();
+        assert!(rebuilt.contains("\x1b[2J\x1b[1;1H\x1b[3J"));
+        assert!(
+            rebuilt.contains("a=t,f=100"),
+            "scrollback purge discarded the terminal's uploaded image"
+        );
+        assert!(rebuilt.contains("a=p,"));
+    }
+
     #[test]
     fn active_placements_preserve_committed_scrollback_images() {
         let mut renderer = renderer(Protocol::Kitty);
@@ -684,7 +742,7 @@ mod tests {
             .paint(&line, &mut unchanged, usize::MAX, 2)
             .unwrap();
         assert!(unchanged.is_empty());
-        renderer.clear_placements(&mut unchanged).unwrap();
+        renderer.clear_region(&mut unchanged, None).unwrap();
         assert!(
             String::from_utf8(unchanged)
                 .unwrap()
