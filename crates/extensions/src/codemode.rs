@@ -1927,31 +1927,40 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn unbounded_script_honors_cancellation() {
+    async fn unbounded_script_honors_cancellation_during_host_call() {
         let cancellation = pi_rs_core::CancellationToken::new();
-        let trigger = cancellation.clone();
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            trigger.cancel();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: true,
         });
-        let reply = tokio::time::timeout(
-            Duration::from_secs(1),
-            ScriptTool { timeout: None }.invoke_transaction(
-                json!({"code":"await new Promise(() => {})"}),
-                ToolContext {
-                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
-                    cancellation,
-                },
-                None,
-                Arc::new(Host),
-            ),
-        )
+        let run = ScriptTool { timeout: None };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run.invoke_transaction(
+                    json!({"code":"await tools.started({})"}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: cancellation.clone(),
+                    },
+                    None,
+                    host,
+                ),
+                async {
+                    started.notified().await;
+                    cancellation.cancel();
+                }
+            )
+        })
         .await
-        .unwrap();
-        task.await.unwrap();
+        .expect("expected pending host call to be cancelled");
         assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
     }
-    struct StartedHost(Arc<tokio::sync::Notify>);
+
+    struct StartedHost {
+        started: Arc<tokio::sync::Notify>,
+        wait_for_cancellation: bool,
+    }
     #[async_trait::async_trait]
     impl ToolHost for StartedHost {
         fn cancellation_safe_calls(&self) -> bool {
@@ -1965,7 +1974,10 @@ mod tests {
             }]
         }
         async fn call(&self, _: &str, _: Value) -> Outcome {
-            self.0.notify_one();
+            self.started.notify_one();
+            if self.wait_for_cancellation {
+                std::future::pending::<()>().await;
+            }
             Outcome::Succeeded("ready".into())
         }
     }
@@ -1991,7 +2003,10 @@ mod tests {
             })
         };
         let script_cancel = cancellation.clone();
-        let host = Arc::new(StartedHost(started.clone()));
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
         let script = tokio::spawn(async move {
             ScriptTool { timeout: None }.invoke_transaction(
                 json!({"code":"await tools.started({}); store('uncommitted', true); while (true) {}"}),
@@ -2019,7 +2034,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_invocation_stops_busy_worker() {
         let started = Arc::new(tokio::sync::Notify::new());
-        let host = Arc::new(StartedHost(started.clone()));
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
         let weak_host = Arc::downgrade(&host);
         let cancellation = pi_rs_core::CancellationToken::new();
         let watchdog_cancel = cancellation.clone();
