@@ -422,6 +422,7 @@ pub(super) async fn open(
     Ok(Some(Box::pin(async_stream::try_stream! {
         let mut seen = 0usize;
         let mut has_output = false;
+        let mut retried_connection_limit = false;
         loop {
             let event = match next(&mut socket, timeout).await? {
                 Message::Text(text) => text,
@@ -440,9 +441,12 @@ pub(super) async fn open(
                 .or_else(|| event["response"]["error"]["code"].as_str());
             let refused = matches!(kind, "error" | "response.failed")
                 || (kind == "response.done" && event["response"]["status"] == "failed");
-            if sent_continuation && !has_output && refused
-                && failure_code == Some("previous_response_not_found")
-            {
+            let missing_continuation =
+                sent_continuation && failure_code == Some("previous_response_not_found");
+            let connection_limit = !retried_connection_limit
+                && failure_code == Some("websocket_connection_limit_reached");
+            if !has_output && refused && (missing_continuation || connection_limit) {
+                retried_connection_limit |= connection_limit;
                 socket = handshake.connect().await?;
                 connected = Instant::now();
                 send(&mut socket, body.clone(), timeout).await?;
@@ -582,6 +586,70 @@ mod tests {
             serde_json::from_str::<Value>(&arguments.unwrap()).unwrap(),
             json!({"path":"hello"})
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_preserves_error_status_and_retries_connection_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let rejection = json!({
+                "type":"error", "status":429, "code":"websocket_connection_limit_reached"
+            });
+            let response = json!({
+                "type":"response.completed",
+                "response":{"id":"replacement","status":"completed","output":[]}
+            });
+            for event in [
+                json!({"type":"error","status":429,"error":{"code":"unclassified"}}),
+                json!({"type":"error","status":503,"error":{"code":"unclassified"}}),
+                json!({"type":"error","status":429,"error":{"code":"insufficient_quota"}}),
+                rejection,
+                response,
+            ] {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let body = read_request(&mut socket).await;
+                assert_eq!(body["input"][0]["content"], "test request");
+                assert!(body.get("previous_response_id").is_none());
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let model = client(
+            format!("http://{address}/backend-api/codex/responses"),
+            CodexTransport::WebSocket,
+        );
+        for expected_retryable in [true, true, false] {
+            let events = model
+                .stream(request(vec![prompt("test request")]))
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            let error = events.last().unwrap().as_ref().unwrap_err();
+            assert_eq!(
+                matches!(error, Error::RetryableModel(_)),
+                expected_retryable
+            );
+        }
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(5),
+            model
+                .stream(request(vec![prompt("test request")]))
+                .await
+                .unwrap()
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recovered.last(),
+            Some(Ok(ModelEvent::Complete { .. }))
+        ));
         server.await.unwrap();
     }
 

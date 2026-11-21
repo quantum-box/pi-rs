@@ -941,6 +941,9 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
         Some("subscription_sharing_usage_unavailable") => {
             Error::RetryableModel("ChatGPT plan usage is temporarily unavailable".into())
         }
+        _ if status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
+            Error::RetryableModel("OpenAI rate limit reached".into())
+        }
         _ if status.is_some_and(|status| status.is_server_error()) => {
             Error::RetryableModel("OpenAI service temporarily unavailable".into())
         }
@@ -1656,11 +1659,17 @@ impl OpenAiResponses {
                         return;
                     }
                     "response.failed" | "error" => {
-                        let error = event["response"].get("error").filter(|error| !error.is_null()).or_else(|| event.get("error")).unwrap_or(&Value::Null);
+                        let error = event["response"].get("error").filter(|error| !error.is_null())
+                            .or_else(|| event.get("error").filter(|error| !error.is_null()))
+                            .unwrap_or(&event);
+                        let status = event["status"].as_u64()
+                            .and_then(|status| u16::try_from(status).ok())
+                            .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                            .filter(|status| status.is_client_error() || status.is_server_error());
                         let safe_error = pi_rs_core::sanitized_provider_error(error, &error_secrets);
                         let code = safe_error["code"].as_str();
                         Err(if matches!(code, Some("subscription_sharing_usage_limit_exceeded" | "subscription_sharing_user_not_eligible" | "subscription_sharing_usage_unavailable")) {
-                            response_error(code, None)
+                            response_error(code, status)
                         } else if pi_rs_core::permanent_provider_error(error, &error_secrets) {
                             Error::Model("OpenAI account quota or billing limit reached".into())
                         } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
@@ -1668,7 +1677,7 @@ impl OpenAiResponses {
                         } else if pi_rs_core::provider_context_overflow(error, &error_secrets) {
                             Error::Model("context window exceeded".into())
                         } else {
-                            response_error(code, None)
+                            response_error(code, status)
                         })?;
                     },
                     _ => {}

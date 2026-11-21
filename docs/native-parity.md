@@ -4921,7 +4921,9 @@ next request and replaces the connection if the check fails.
 As in Pi v1.6.0, a socket can be reused for up to 45 minutes after connecting,
 with a five-minute idle timeout. An ongoing response can finish on its
 existing connection.
-The native HTTP fallback sends uncompressed JSON.
+An explicit connection-limit rejection before output opens a new connection
+once. Stream error statuses distinguish retryable service failures from
+terminal account limits. The native HTTP fallback sends uncompressed JSON.
 
 OpenAI Responses
 and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
