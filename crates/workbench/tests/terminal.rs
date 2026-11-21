@@ -1988,6 +1988,25 @@ fn settings_switches_terminal_modes_and_restores_input() {
         }
         master.write_all(b"draft survives").unwrap();
         output_until(&mut master, |text| text.contains("draft survives"));
+        let mut previous = None;
+        for (key, notice) in [
+            (b"\x0f", "Tool output: expanded"),
+            (b"\x14", "Thinking blocks: hidden"),
+            (b"\x0f", "Tool output: collapsed"),
+            (b"\x14", "Thinking blocks: visible"),
+        ] {
+            master.write_all(key).unwrap();
+            output_until(&mut master, |text| {
+                text.contains(notice)
+                    && text.contains("draft survives")
+                    && previous.is_none_or(|previous| !text.contains(previous))
+            });
+            previous = Some(notice);
+        }
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["hideThinkingBlock"], false);
     }
 }
 
@@ -2646,9 +2665,13 @@ fn save_default_model_persists_provider_and_extends_scope() {
     output_until(&mut master, |text| {
         text.contains("Switched to First Fixture (thinking: high)")
     });
+    master.write_all(b"\x1b[Z").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Thinking level: off") && !text.contains("Switched to First Fixture")
+    });
     master.write_all(b"\x10").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Switched to second") && !text.contains("Switched to First Fixture")
+        text.contains("Switched to second") && !text.contains("Thinking level: off")
     });
     let mut restart = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", &home)

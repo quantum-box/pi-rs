@@ -123,7 +123,8 @@ that scope and to a configured `enabledModels` list. Legacy qualified defaults
 without `defaultProvider` are still accepted. Cycling models shows the selected display
 name and the active thinking level for reasoning models. Consecutive notices
 reuse the trailing status in both fullscreen and regular mode, before it enters
-scrollback.
+scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
+report the new state using the same status row, as in Pi.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
