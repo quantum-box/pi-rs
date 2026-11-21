@@ -237,9 +237,25 @@ pub(super) fn stream_call_index(
             {
                 return Ok(*index);
             }
-            return Err(Error::Model(
-                "ambiguous Mistral tool call ID without an index".into(),
-            ));
+            let starts_new_call = function
+                .and_then(|function| function.name.as_deref())
+                .filter(|name| !name.is_empty())
+                .is_some_and(|name| {
+                    calls
+                        .values()
+                        .filter(|call| call.id.is_empty())
+                        .all(|call| {
+                            !call.name.is_empty()
+                                && call.name != name
+                                && serde_json::from_str::<Value>(&call.arguments)
+                                    .is_ok_and(|args| args.is_object())
+                        })
+                });
+            if !starts_new_call {
+                return Err(Error::Model(
+                    "ambiguous Mistral tool call ID without an index".into(),
+                ));
+            }
         }
         return Ok((position..64)
             .find(|index| !calls.contains_key(index))
@@ -435,6 +451,11 @@ mod tests {
         .into_iter()
         .collect();
         assert!(stream_call_index(Some("late"), Some(&read_delta), 0, true, &complete).is_err());
+        assert_eq!(
+            stream_call_index(Some("new"), Some(&other_delta), 0, true, &complete).unwrap(),
+            1
+        );
+
         assert_eq!(
             stream_call_index(Some("late"), Some(&named_id), 0, true, &complete).unwrap(),
             0
