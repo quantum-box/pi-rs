@@ -7954,6 +7954,97 @@ async fn live_woken_root_drains_any_loser_before_cancel() {
     }
 }
 
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn woken_claim_rejects_owned_edge_added_before_first_poll() {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let mut initial = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+        ])
+        .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("any-woken").exists() {
+            assert!(initial.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    initial.kill().unwrap();
+    initial.wait().unwrap();
+    let path = dir.path().join("db");
+    let (options, _, _) = build_woken_any(&path);
+    let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    let idle = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let root = crate::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            matches!(item.task.owner(), crate::task::TaskOwner::Conversation(_))
+                && item.task.state() == &TaskState::Running
+        })
+        .unwrap();
+    let edge = crate::ownership_edge::Edge {
+        task: root.task.id(),
+        task_owner: root.task.owner().clone(),
+        child: idle,
+        mode: crate::ownership_edge::Mode::Foreground,
+    };
+    let observed = Arc::new(AtomicBool::new(false));
+    let observed_hook = observed.clone();
+    let writer = path.clone();
+    crate::task_scheduler::on_conversation_claim_after_commit(root.task.id(), move || {
+        let store = durable_store::Store::open(writer).unwrap();
+        let key = crate::ownership_edge::edge_key(idle);
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Missing,
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&edge).unwrap(),
+                }],
+            )
+            .unwrap();
+        observed_hook.store(true, Ordering::SeqCst);
+    });
+    drop(store);
+    drop(harness);
+    let (scheduler, driver) = start_woken_any_scheduler(&path);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !observed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !dir.path().join("parent-cancel").exists(),
+        "callback ran with unrecorded owned work"
+    );
+    assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    scheduler.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_together() {
     exercise_woken_owned_graph_receipt(false, 0).await;

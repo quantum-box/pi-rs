@@ -4876,6 +4876,8 @@ impl AdmissionHandle<'_> {
             )
             .map_err(|e| e.to_string());
         commit?;
+        #[cfg(test)]
+        invoke_boundary(conversation_claim_finished_hooks(), current.task.id());
         Ok(record)
     }
 
@@ -19071,17 +19073,10 @@ fn provisional_woken_owned_checks(
     root: &task_store::StoredTask,
     boundary: u64,
 ) -> Result<Vec<durable_store::Check>, Error> {
-    let key = crate::runtime::woken_owned_graph_key(root.task.id());
-    if store
-        .first_commit_for_key(&key)
-        .map_err(task_store::Error::from)?
-        .is_none()
-    {
-        return Ok(vec![durable_store::Check {
-            key,
-            expected: durable_store::Expected::MissingUnchangedSince(boundary),
-        }]);
-    }
+    // Even when no owned-graph record has ever existed, a foreground edge
+    // may already have been admitted. The Harness walks the current graph and
+    // fences the relevant prefixes together with the missing evidence key.
+    let _ = store;
     harness
         .woken_owned_graph_checks_if_required(root, boundary)
         .map_err(|e| Error::Handler(e.to_string()))
