@@ -4121,18 +4121,23 @@ mod tests {
             "role":"assistant","stopReason":"aborted",
             "content":[{"type":"thinking","thinking":"partial reasoning"}]
         }});
+        let empty_reply = json!({"type":"message","id":"d","parentId":"c","message":{
+            "role":"assistant","stopReason":"stop","content":[]
+        }});
         let entries = [
             json!({"type":"session","version":3}),
             answer,
             aborted,
             thinking_only,
+            empty_reply,
         ];
         let mut args = Cli::try_parse_from(["pi"]).unwrap();
         for (length, expected) in [
             (1, json!({})),
             (2, json!({"text":"Hello world"})),
             (3, json!({"text":"Hello world"})),
-            (4, json!({})),
+            (4, json!({"text":"Hello world"})),
+            (5, json!({})),
         ] {
             let body = entries[..length]
                 .iter()
