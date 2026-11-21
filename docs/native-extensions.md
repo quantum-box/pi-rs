@@ -111,8 +111,7 @@ because the initial capability check runs before configured flags take
 effect. Return `null` when a callback should opt out for a particular call.
 
 Call and result requests run in separate processes, so executable renderers
-should use the supplied context for their inputs. Resolver wrappers for
-other tools use the in-process API.
+should use the supplied context for their inputs.
 
 Workbench uses these callbacks for journaled tool calls and their committed
 results, including when a session is resumed. It runs the callbacks off
@@ -123,6 +122,33 @@ While a call streams, the call renderer receives the current parsed arguments
 with `argsComplete: false`. Execution progress uses the newest content and
 details with `result.isPartial: true`. The terminal coalesces updates while
 drawing and replaces partial output when the journal commits a final result.
+
+## Wrap or replace another tool's renderer
+
+Native extensions can declare an ordered set of `ToolRendererOverride`
+entries through `Extension::tool_renderer_overrides`. Each entry has an
+extension-local ID and an exact or prefix tool-name selector. Selectors
+also match historical tools that are no longer registered. The first
+matching entry takes precedence and can inherit the shell or either
+section from the rest of the chain. A `replace` section renders on its
+own. A `wrap` section receives styled rows from the next callback, when
+one exists. Missing or invalid wrapper output leaves valid downstream rows
+in place. Each section shares a deadline across the whole chain, so a
+downstream timeout can end the section before an outer wrapper runs.
+The original tool result and its journal are unaffected.
+
+An executable advertises these declarations in the optional
+`tool_renderer_overrides` array of its `Describe` response. Keep IDs,
+selectors, sections and modes stable across flag configurations. Each
+declaration provides
+`id`, `selector` (a `kind` of `exact` or `prefix` with a string `value`),
+and optional `shell`, `call` and `result` fields. `call` and `result` use
+`wrap` or `replace`. The host sends `render_tool_override` with the
+declaration `id`, the `section`, the current `context`, and `next` rows
+or `null`. The callback returns styled rows or `null` in the v1 response
+envelope. A missing downstream callback leaves the Workbench's ordinary
+tool presentation as the fallback. In-process extensions can use the
+resolver method for arbitrary name predicates and callback composition.
 
 ## Observe extension UI prompts
 

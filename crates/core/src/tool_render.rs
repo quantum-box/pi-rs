@@ -95,26 +95,35 @@ pub struct RenderedTool {
     pub result: Option<RenderedExtensionRows>,
 }
 
+async fn render_tool_section(
+    renderer: Option<&dyn ToolSectionRenderer>,
+    context: &ToolRenderContext,
+) -> Option<RenderedExtensionRows> {
+    use futures_util::FutureExt;
+
+    let renderer = renderer?;
+    std::panic::AssertUnwindSafe(async { renderer.render(context).await })
+        .catch_unwind()
+        .await
+        .ok()?
+        .ok()?
+        .filter(RenderedExtensionRows::within_limits)
+}
+
 impl ToolRenderers {
-    /// Render the call before the result with a deadline for each callback.
-    /// The host can fall back for any section whose callback is absent or fails.
+    /// Render the call before the result. Each section has one deadline shared
+    /// by its entire renderer chain. The host can fall back if a section
+    /// produces no usable rows.
     pub async fn render(&self, context: &ToolRenderContext, timeout: Duration) -> RenderedTool {
         async fn section(
             renderer: Option<&dyn ToolSectionRenderer>,
             context: &ToolRenderContext,
             timeout: Duration,
         ) -> Option<RenderedExtensionRows> {
-            use futures_util::FutureExt;
-
-            let renderer = renderer?;
-            let callback = std::panic::AssertUnwindSafe(async { renderer.render(context).await })
-                .catch_unwind();
-            crate::runtime::time::timeout(timeout, callback)
+            crate::runtime::time::timeout(timeout, render_tool_section(renderer, context))
                 .await
-                .ok()?
-                .ok()?
-                .ok()?
-                .filter(RenderedExtensionRows::within_limits)
+                .ok()
+                .flatten()
         }
 
         let call = section(self.call.as_deref(), context, timeout).await;
@@ -126,6 +135,144 @@ impl ToolRenderers {
             result,
         }
     }
+}
+
+/// Name selection that can be advertised by an executable before rendering.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ToolRendererMatch {
+    Exact(String),
+    Prefix(String),
+}
+
+impl ToolRendererMatch {
+    pub fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Exact(value) => name == value,
+            Self::Prefix(value) => name.starts_with(value),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRendererOverrideMode {
+    Replace,
+    Wrap,
+}
+
+/// Render one section, optionally receiving the styled rows from the next
+/// callback. The input is absent when no downstream callback produced rows.
+#[async_trait::async_trait]
+pub trait ToolRendererOverrideCallback: Send + Sync {
+    async fn render(
+        &self,
+        context: &ToolRenderContext,
+        next: Option<&RenderedExtensionRows>,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>>;
+}
+
+#[derive(Clone)]
+pub struct ToolRendererOverrideSection {
+    pub mode: ToolRendererOverrideMode,
+    pub renderer: Arc<dyn ToolRendererOverrideCallback>,
+}
+
+/// An ordered cross-tool presentation registration. The ID is stable within
+/// its extension. Missing sections and shell delegate to later registrations.
+#[derive(Clone)]
+pub struct ToolRendererOverride {
+    pub id: String,
+    pub selector: ToolRendererMatch,
+    pub shell: Option<ToolRenderShell>,
+    pub call: Option<ToolRendererOverrideSection>,
+    pub result: Option<ToolRendererOverrideSection>,
+}
+
+struct OverriddenToolSection {
+    tool_name: String,
+    renderer: Arc<dyn ToolRendererOverrideCallback>,
+    next: Option<Arc<dyn ToolSectionRenderer>>,
+}
+
+#[async_trait::async_trait]
+impl ToolSectionRenderer for OverriddenToolSection {
+    async fn render(
+        &self,
+        context: &ToolRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        use futures_util::FutureExt;
+
+        if context.tool_name != self.tool_name {
+            return Err("tool renderer override received a different tool name".into());
+        }
+        let next = render_tool_section(self.next.as_deref(), context).await;
+        let rows = std::panic::AssertUnwindSafe(async {
+            self.renderer.render(context, next.as_ref()).await
+        })
+        .catch_unwind()
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .filter(RenderedExtensionRows::within_limits);
+        Ok(rows.or(next))
+    }
+}
+
+pub(crate) fn resolve_tool_overrides(
+    overrides: &[ToolRendererOverride],
+    tool_name: &str,
+    next: &dyn Fn() -> Option<ToolRenderers>,
+) -> Option<ToolRenderers> {
+    fn apply(
+        tool_name: &str,
+        section: Option<&ToolRendererOverrideSection>,
+        next: Option<Arc<dyn ToolSectionRenderer>>,
+    ) -> Option<Arc<dyn ToolSectionRenderer>> {
+        let Some(section) = section else {
+            return next;
+        };
+        Some(Arc::new(OverriddenToolSection {
+            tool_name: tool_name.to_owned(),
+            renderer: section.renderer.clone(),
+            next: if section.mode == ToolRendererOverrideMode::Wrap {
+                next
+            } else {
+                None
+            },
+        }))
+    }
+
+    let replaces = |section: &Option<ToolRendererOverrideSection>| {
+        section
+            .as_ref()
+            .is_some_and(|section| section.mode == ToolRendererOverrideMode::Replace)
+    };
+    let mut selected = Vec::new();
+    let mut replaces_base = false;
+    for rule in overrides
+        .iter()
+        .filter(|rule| rule.selector.matches(tool_name))
+    {
+        if rule.shell.is_none() && rule.call.is_none() && rule.result.is_none() {
+            continue;
+        }
+        selected.push(rule);
+        if rule.shell.is_some() && replaces(&rule.call) && replaces(&rule.result) {
+            replaces_base = true;
+            break;
+        }
+    }
+    let base = if replaces_base { None } else { next() };
+    selected.into_iter().rev().fold(base, |remaining, rule| {
+        let remaining = remaining.unwrap_or_default();
+        Some(ToolRenderers {
+            shell: rule.shell.unwrap_or(remaining.shell),
+            call: apply(tool_name, rule.call.as_ref(), remaining.call),
+            result: apply(tool_name, rule.result.as_ref(), remaining.result),
+        })
+    })
 }
 
 /// Presentation-only snapshot. Resolve for any tool name, including historical
@@ -346,6 +493,61 @@ mod tool_renderer_tests {
                 .result
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn tool_override_preserves_valid_downstream_rows_when_wrapper_fails() {
+        struct BrokenWrapper(bool);
+
+        #[async_trait::async_trait]
+        impl ToolRendererOverrideCallback for BrokenWrapper {
+            async fn render(
+                &self,
+                _: &ToolRenderContext,
+                next: Option<&RenderedExtensionRows>,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                assert!(next.is_some());
+                if self.0 {
+                    Ok(Some(RenderedExtensionRows {
+                        lines: vec![vec![]; 257],
+                        ..Default::default()
+                    }))
+                } else {
+                    Err("wrapper failed".into())
+                }
+            }
+        }
+
+        for oversized in [false, true] {
+            let rule = ToolRendererOverride {
+                id: "failure".into(),
+                selector: ToolRendererMatch::Exact("tool".into()),
+                shell: None,
+                call: Some(ToolRendererOverrideSection {
+                    mode: ToolRendererOverrideMode::Wrap,
+                    renderer: Arc::new(BrokenWrapper(oversized)),
+                }),
+                result: None,
+            };
+            let renderers = resolve_tool_overrides(&[rule], "tool", &|| {
+                Some(ToolRenderers {
+                    call: Some(Arc::new(Label("base"))),
+                    ..Default::default()
+                })
+            })
+            .unwrap();
+            let rendered = renderers
+                .render(&context("tool"), Duration::from_secs(1))
+                .await;
+            assert_eq!(rendered.call.unwrap().lines[0][0].text, "base: \"example\"");
+            assert!(
+                renderers
+                    .render(&context("wrong"), Duration::from_secs(1))
+                    .await
+                    .call
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
