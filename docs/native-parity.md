@@ -2077,13 +2077,13 @@ radius is limited to 1,000 lines.
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
 JSON numbers as JavaScript doubles. As in Pi 1.6.0, `ls` rounds its limit down
 to a whole number and uses at least one entry. Notices and details use the
-effective limit. Local `find` reproduces fd's numeric
-argument parsing: zero means unlimited, while negative, fractional, and values
-outside fd's host-sized integer range produce fd-style errors before checking
-the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Generated local tool errors carry Pi's empty
-`details` object in JSON and RPC. Notices and details retain the JavaScript
-numeric value. Scoped tools retain their positive
+effective limit. Local `find` applies the same rounding, passes the
+effective limit plus one through fd-style numeric parsing, and reports a limit
+only when an extra result exists. Values outside fd's host-sized integer range
+produce fd-style errors before checking the search path. These diagnostics
+retain error status and reach the model without an added failure prefix.
+Generated local tool errors carry Pi's empty `details` object in JSON and RPC.
+Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the

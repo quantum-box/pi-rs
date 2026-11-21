@@ -2647,21 +2647,14 @@ fn local_numeric_limit(args: &Value, default: f64) -> f64 {
     args.get("limit").and_then(Value::as_f64).unwrap_or(default)
 }
 
-// fd receives String(limit), and its --max-results parser accepts usize. Zero
-// is fd's unlimited sentinel; the original number remains relevant to notices.
+// Pi passes String(limit + 1) to fd to detect when the result set exceeds the displayed limit.
 fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
     let text = js_number(value);
-    let reason = if text.starts_with('-') {
-        return Err("error: a value is required for '--max-results <count>' but none was supplied\n\nFor more information, try '--help'.".into());
-    } else {
-        match text.parse::<usize>() {
-            Ok(limit) => return Ok(limit),
-            Err(error) => error.to_string(),
-        }
-    };
-    Err(format!(
-        "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
-    ))
+    text.parse::<usize>().map_err(|reason| {
+        format!(
+            "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
+        )
+    })
 }
 
 fn grep_glob_overrides(
@@ -3266,10 +3259,10 @@ impl CodingTool {
             return Err(Error::Cancelled);
         }
         let is_find = matches!(self.kind, Kind::Find);
-        let numeric_find_limit = local_numeric_limit(args, 1000.0);
+        let numeric_find_limit = local_numeric_limit(args, 1000.0).floor().max(1.0);
         // fd parses its arguments before checking the search path.
         let unrestricted_find_limit = if is_find && self.unrestricted {
-            match fd_numeric_limit(numeric_find_limit) {
+            match fd_numeric_limit(numeric_find_limit + 1.0) {
                 Ok(limit) => Some(limit),
                 Err(output) => return Ok(pi_tool_failure(output)),
             }
@@ -3388,6 +3381,7 @@ impl CodingTool {
         let mut find_count = 0usize;
         let mut find_listing = crate::tool_output::Listing::new();
         let mut find_line_count = 0usize;
+        let mut find_limit_exceeded = false;
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -3420,7 +3414,7 @@ impl CodingTool {
             walker.overrides(grep_glob_overrides(&self.root, glob, false)?);
         }
         let mut find_error = None;
-        for entry in walker.build() {
+        'entries: for entry in walker.build() {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -3474,6 +3468,10 @@ impl CodingTool {
                 let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
                 if self.unrestricted {
                     for line in find_pi_lines(&base, entry.path(), is_directory) {
+                        if find_line_count as f64 >= numeric_find_limit {
+                            find_limit_exceeded = true;
+                            break 'entries;
+                        }
                         find_listing.push(&line);
                         find_line_count += 1;
                     }
@@ -3487,7 +3485,7 @@ impl CodingTool {
                     results.push(path);
                 }
                 find_count += 1;
-                if find_count >= limit && !(self.unrestricted && limit == 0) {
+                if find_count >= limit {
                     break;
                 }
             }
@@ -3504,7 +3502,7 @@ impl CodingTool {
             }
             let mut details = Map::new();
             let mut notices = Vec::new();
-            if (find_line_count as f64) >= numeric_find_limit {
+            if find_limit_exceeded {
                 details.insert("resultLimitReached".into(), json!(numeric_find_limit));
                 notices.push(format!(
                     "{} results limit reached. Use limit={} for more, or refine pattern",
@@ -7325,20 +7323,18 @@ mod tests {
             .search(&json!({"pattern":"*", "limit": 0.0}), &token)
             .unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(0.0))
+            matches!(&outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(1.0))
         );
-        let failed = tool
+        let rounded = tool
             .search(&json!({"pattern":"*", "limit":1.5}), &token)
             .unwrap();
-        assert!(failed.is_error());
-        assert_eq!(
-            failed.tool_content(),
-            "error: invalid value '1.5' for '--max-results <count>': invalid digit found in string\n\nFor more information, try '--help'."
-        );
+        assert_eq!(rounded.tool_content(), outcome.tool_content());
         let missing = json!({"pattern":"*", "path":"missing", "limit":1.5});
-        let missing_outcome = tool.search(&missing, &token).unwrap();
-        assert!(missing_outcome.is_error());
-        assert_eq!(missing_outcome.tool_content(), failed.tool_content());
+        let missing_error = tool.search(&missing, &token).unwrap_err().to_string();
+        assert!(
+            missing_error.contains("is not a directory."),
+            "{missing_error}"
+        );
         tool.unrestricted = false;
         assert!(tool.search(&missing, &token).is_err());
         assert_eq!(js_number(9007199254740993_u64 as f64), "9007199254740992");
@@ -7401,21 +7397,20 @@ mod tests {
             shell: ShellConfig::default(),
             kind: Kind::Find,
         };
-        for limit in [1, 2] {
-            let output = tool
+        for (limit, expected) in [
+            (
+                1,
+                "foo\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]",
+            ),
+            (2, "foo\nbar"),
+        ] {
+            let outcome = tool
                 .search(
                     &json!({"pattern":"*","limit":limit}),
                     &pi_rs::CancellationToken::new(),
                 )
-                .unwrap()
-                .tool_content();
-            assert_eq!(
-                output,
-                format!(
-                    "foo\nbar\n\n[{limit} results limit reached. Use limit={} for more, or refine pattern]",
-                    limit * 2
-                )
-            );
+                .unwrap();
+            assert_eq!(outcome.tool_content(), expected);
         }
     }
 
