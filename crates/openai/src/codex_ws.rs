@@ -447,6 +447,8 @@ pub(super) async fn open(
                 && failure_code == Some("websocket_connection_limit_reached");
             if !has_output && refused && (missing_continuation || connection_limit) {
                 retried_connection_limit |= connection_limit;
+                // Release the rejected connection before asking the service for another slot.
+                drop(socket);
                 socket = handshake.connect().await?;
                 connected = Instant::now();
                 send(&mut socket, body.clone(), timeout).await?;
@@ -601,13 +603,16 @@ mod tests {
                 "type":"response.completed",
                 "response":{"id":"replacement","status":"completed","output":[]}
             });
-            for event in [
+            for (index, event) in [
                 json!({"type":"error","status":429,"error":{"code":"unclassified"}}),
                 json!({"type":"error","status":503,"error":{"code":"unclassified"}}),
                 json!({"type":"error","status":429,"error":{"code":"insufficient_quota"}}),
                 rejection,
                 response,
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
                 let body = read_request(&mut socket).await;
@@ -617,6 +622,12 @@ mod tests {
                     .send(Message::Text(event.to_string().into()))
                     .await
                     .unwrap();
+                if index == 3 {
+                    assert!(matches!(
+                        socket.next().await,
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+                    ));
+                }
             }
         });
         let model = client(
