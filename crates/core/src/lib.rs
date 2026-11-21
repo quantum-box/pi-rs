@@ -62,8 +62,8 @@ pub use strict_tool_schema::{
     strict_tool_schema, validate_effective_tool_declarations,
 };
 pub use tokens::{
-    ContextUsageEstimate, estimate_message_tokens, estimate_replay_tokens, estimate_request_tokens,
-    fingerprint_model_context,
+    ContextUsageEstimate, estimate_assistant_output_tokens, estimate_message_tokens,
+    estimate_replay_tokens, estimate_request_tokens, fingerprint_model_context,
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};
