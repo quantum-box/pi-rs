@@ -704,11 +704,12 @@ async fn deliver_mcp_changes(
     let Some(mut delivery) = runtime.begin_delivery() else {
         return;
     };
-    let deadline = platform_time::Instant::now() + timeout.min(Duration::from_secs(10));
+    let began = platform_time::Instant::now();
+    let budget = timeout.min(Duration::from_secs(10));
     // A callback can enqueue new changes while processing a notification.
     // Limit one delivery wave even when the runtime clock is paused.
     for _ in 0..32 {
-        let remaining = deadline.saturating_duration_since(platform_time::Instant::now());
+        let remaining = budget.saturating_sub(began.elapsed());
         if remaining.is_zero() {
             return;
         }
