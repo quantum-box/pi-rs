@@ -177,7 +177,8 @@ impl Policy {
             Adapter::Google
             | Adapter::Bedrock
             | Adapter::OpenAiResponses
-            | Adapter::CodexResponses => {
+            | Adapter::CodexResponses
+            | Adapter::MistralConversations => {
                 return Err("cache lifetime unavailable");
             }
         };

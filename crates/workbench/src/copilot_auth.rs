@@ -363,15 +363,16 @@ async fn access_at(
     if no_refresh {
         return Ok(read(&super::config::read_auth_object(path).await?)?.access);
     }
-    let min_ms = minimum
+    let window_ms = minimum
         .unwrap_or_default()
+        .max(super::model_auth::PI_OAUTH_MINIMUM_VALIDITY)
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
-    let window = min_ms;
+    let fresh = |expires: u64| expires > now().saturating_add(window_ms);
     let guard = super::auth_lock::acquire_async(path).await?;
     let mut credential = read(&super::config::read_auth_object_locked(&guard)?)?;
     guard.check()?;
-    if credential.expires <= now().saturating_add(window) {
+    if !fresh(credential.expires) {
         credential = service.refresh(&credential).await?;
         super::config::update_object_locked(path, Some(&guard), |data| {
             let entry = data
@@ -386,7 +387,7 @@ async fn access_at(
             );
             Ok(())
         })?;
-        if minimum.is_some() && credential.expires <= now().saturating_add(min_ms) {
+        if minimum.is_some() && !fresh(credential.expires) {
             return Err(error("refreshed token expires too soon"));
         }
     }
@@ -493,7 +494,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let auth = root.path().join("auth.json");
         let original = json!({"github-copilot":{
-            "type":"oauth","access":"expired","refresh":"long-lived-fixture","expires":1,
+            "type":"oauth","access":"expired","refresh":"long-lived-fixture","expires":now()+120_000,
             "extra":{"preserve":true},
         },"another":{"type":"api_key","key":"other"}});
         std::fs::write(&auth, serde_json::to_vec(&original).unwrap()).unwrap();
@@ -509,6 +510,31 @@ mod tests {
         assert_eq!(credential["extra"], original[PROVIDER]["extra"]);
         assert_eq!(credential["availableModelIds"], json!(["gpt-6.1-sol"]));
         assert_eq!(saved["another"], original["another"]);
+    }
+
+    #[tokio::test]
+    async fn short_copilot_refresh_is_saved_before_explicit_validity_is_enforced() {
+        for minimum in [None, Some(Duration::ZERO)] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("auth.json");
+            let original = json!({"github-copilot":{
+                "type":"oauth","access":"old","refresh":"long-lived-fixture","expires":now()+120_000
+            }});
+            std::fs::write(&path, original.to_string()).unwrap();
+            let mut exchanges = token_and_catalogue();
+            exchanges[0].response["expires_at"] = json!(now() / 1000 + 480);
+            let (service, worker) = fixture(exchanges);
+            let result = access_at(&path, service, minimum, false).await;
+            if minimum.is_some() {
+                assert!(result.unwrap_err().to_string().contains("expires too soon"));
+            } else {
+                assert_eq!(endpoint_host(&result.unwrap()).unwrap(), API);
+            }
+            worker.join().unwrap();
+            let saved = crate::config::read_auth_object(&path).await.unwrap();
+            assert_ne!(saved[PROVIDER]["access"], "old");
+            assert_eq!(saved[PROVIDER]["availableModelIds"], json!(["gpt-6.1-sol"]));
+        }
     }
 
     #[tokio::test]
