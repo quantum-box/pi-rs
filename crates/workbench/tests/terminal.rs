@@ -1288,7 +1288,31 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
 
 #[test]
 fn resize_and_suspend_preserve_input_and_restore_terminal() {
+    exercise_terminal_suspend("fullscreen", SuspendTrigger::Key);
+}
+
+#[test]
+fn external_suspend_restores_the_terminal_and_preserves_the_draft() {
+    for mode in ["regular", "fullscreen"] {
+        exercise_terminal_suspend(mode, SuspendTrigger::Signal);
+    }
+}
+
+#[test]
+fn external_suspend_interrupts_the_wait_during_reload_without_losing_preparation() {
+    exercise_terminal_suspend("fullscreen", SuspendTrigger::Reload);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuspendTrigger {
+    Key,
+    Signal,
+    Reload,
+}
+
+fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
     let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {
@@ -1341,8 +1365,10 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
                 "--no-trust",
                 "--no-mcp",
                 "--no-extensions",
+                "--tui-mode",
+                mode,
             ])
-            .env("PI_RS_HOME", root.path().join("home"))
+            .env("PI_RS_HOME", &home)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -1366,12 +1392,53 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
         output_until(&mut master, |text| text.contains(&marker));
         master.write_all(b"\x15").unwrap();
     }
-    master.write_all(b"resume-draft").unwrap();
-    output_until(&mut master, |text| text.contains("resume-draft"));
-    master.write_all(b"\x1a").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    if trigger == SuspendTrigger::Reload {
+        use std::os::unix::fs::PermissionsExt;
+        let package = root.path().join("slow-package.sh");
+        std::fs::write(
+            &package,
+            r#"#!/bin/sh
+: > "$PI_RS_HOME/probe-started"
+for i in $(seq 1 160); do
+    if [ -f "$PI_RS_HOME/probe-release" ]; then
+        printf '%s\n' '{"version":1,"response":{"Ok":{"id":"probe","dependencies":[],"commands":[],"tools":[]}}}'
+        exit 0
+    fi
+    sleep .1
+done
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[package]}).to_string(),
+        )
+        .unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |_| home.join("probe-started").exists());
+    } else {
+        master.write_all(b"resume-draft").unwrap();
+        output_until(&mut master, |text| text.contains("resume-draft"));
+    }
+    if trigger == SuspendTrigger::Key {
+        master.write_all(b"\x1a").unwrap();
+    } else {
+        assert_eq!(
+            unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGTSTP) },
+            0
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut stopped = false;
+    let mut before_stop = Vec::new();
+    let mut buffer = [0; 8192];
     while Instant::now() < deadline {
+        while let Ok(count @ 1..) = master.read(&mut buffer) {
+            before_stop.extend_from_slice(&buffer[..count]);
+        }
         let mut status = 0;
         let observed = unsafe {
             libc::waitpid(
@@ -1386,11 +1453,18 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
             stopped = true;
             break;
         }
-        let mut buffer = [0; 8192];
-        let _ = master.read(&mut buffer);
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(stopped, "foreground job did not suspend");
+    while let Ok(count @ 1..) = master.read(&mut buffer) {
+        before_stop.extend_from_slice(&buffer[..count]);
+    }
+    let before_stop = String::from_utf8_lossy(&before_stop);
+    assert!(before_stop.contains("\x1b[?2004l"), "{before_stop:?}");
+    if mode == "fullscreen" {
+        assert!(before_stop.contains("\x1b[?1049l"), "{before_stop:?}");
+        assert!(before_stop.contains("\x1b[?1006l"), "{before_stop:?}");
+    }
     let mut paused = std::mem::MaybeUninit::<libc::termios>::uninit();
     assert_eq!(
         unsafe { libc::tcgetattr(slave.as_raw_fd(), paused.as_mut_ptr()) },
@@ -1405,9 +1479,15 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
         unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
         0
     );
+    let expected_after_resume = if trigger == SuspendTrigger::Reload {
+        std::fs::File::create(home.join("probe-release")).unwrap();
+        "Reloaded settings"
+    } else {
+        "resume-draft"
+    };
     output_until(&mut master, |text| {
         assert!(!text.contains("\x1b]11;?"));
-        text.contains("resume-draft") && text.contains("\x1b[>4;2m")
+        text.contains(expected_after_resume) && text.contains("\x1b[>4;2m")
     });
     // An old or foreign DA1 and late OSC must not launch another query after
     // the shell owned the terminal, and ordinary input must still be usable.
