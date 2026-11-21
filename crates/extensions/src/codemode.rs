@@ -1448,7 +1448,10 @@ impl Output {
             (None, None)
         } else {
             let (location, path, transcript) = self.spill_report(&header, error, cancellation);
-            content.push(json!({"type":"text","text":format!("[{location}]")}));
+            // Publication updates the spill location in the first text block
+            // if keeping the temporary file fails.
+            let report = content[0]["text"].as_str().unwrap_or_default();
+            content[0]["text"] = json!(format!("{report}\n\n[{location}]"));
             (path, transcript)
         };
         if cancellation.is_cancelled() {
@@ -2946,6 +2949,12 @@ mod tests {
                     .is_some_and(|line| line.contains("and their locations omitted"))
             }));
             let transcript_path = result["full_output_path"].as_str().unwrap();
+            assert!(
+                content[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("[Full output: {transcript_path}]"))
+            );
             let transcript = std::fs::read_to_string(transcript_path).unwrap();
             assert_eq!(transcript.matches(&path).count(), images);
             std::fs::remove_file(transcript_path).unwrap();
