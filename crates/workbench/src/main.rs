@@ -469,8 +469,15 @@ impl Cli {
                     return None;
                 }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    return builtin
-                        .is_official_endpoint(endpoint)
+                    let official = if provider.id() == "cloudflare-workers-ai" {
+                        model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
+                            && self
+                                .model_profiles
+                                .has_provider_endpoint(provider, endpoint)
+                    } else {
+                        builtin.is_official_endpoint(endpoint)
+                    };
+                    return official
                         .then(|| std::env::var(builtin.env()).ok())
                         .flatten()
                         .filter(|key| !key.trim().is_empty())
@@ -588,7 +595,7 @@ impl Cli {
     }
 
     fn reload_model_profiles(&mut self) -> Result<()> {
-        let profiles = model_profiles::Profiles::load()?;
+        let profiles = model_profiles::Profiles::load(&self.model_keys)?;
         let provider = profiles.provider(self.provider.id()).ok_or_else(|| {
             Error::Config(format!(
                 "model provider {} is no longer configured",
@@ -1487,11 +1494,11 @@ async fn run_cli() -> i32 {
                 eprintln!("{warning}");
             }
         }
-        args.model_profiles = model_profiles::Profiles::load()?;
         args.model_keys = tokio::select! {
             result = model_auth::Keys::load_async() => result?,
             _ = &mut signal_rx => return Err(Error::Cancelled),
         };
+        args.model_profiles = model_profiles::Profiles::load(&args.model_keys)?;
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model

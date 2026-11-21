@@ -4512,6 +4512,15 @@ total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
 
+### Cloudflare Workers AI chat checkpoint
+
+Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+`CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
+requests. Pi-format saved credentials may declare an account through their
+`env` field. A stored account scopes the key to that account's chat route.
+For classifier models, existing rules for explicitly configured official
+endpoints still apply. Live Workers AI inference has not been verified.
+
 ### OpenRouter image result checkpoint
 
 Codemode's non-chat model catalogue exposes declared image input limits and

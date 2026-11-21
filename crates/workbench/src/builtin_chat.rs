@@ -38,6 +38,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
+        id: "cloudflare-workers-ai",
+        endpoint: "",
+        env: "CLOUDFLARE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "deepseek",
         endpoint: "https://api.deepseek.com/chat/completions",
         env: "DEEPSEEK_API_KEY",
@@ -265,7 +271,9 @@ impl Builtin {
     }
 
     pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
-        self.endpoint == endpoint || self.endpoint_for(Adapter::Anthropic) == Some(endpoint)
+        !self.endpoint.is_empty()
+            && (self.endpoint == endpoint
+                || self.endpoint_for(Adapter::Anthropic) == Some(endpoint))
     }
 
     pub fn env(&self) -> &'static str {
