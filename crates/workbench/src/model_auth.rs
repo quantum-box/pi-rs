@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 
 use super::{Provider, config};
 
+pub(super) const PI_OAUTH_MINIMUM_VALIDITY: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
 #[derive(Clone)]
 pub(super) enum Credential {
     Literal(String),
@@ -120,7 +123,7 @@ impl Credential {
                 return super::codex_auth::access(
                     &config::agent_dir().join("auth.json"),
                     &settings,
-                    std::time::Duration::ZERO,
+                    None,
                     false,
                 )
                 .await;
