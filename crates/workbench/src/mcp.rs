@@ -43,7 +43,9 @@ pub struct ServerConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    pub timeout: Option<u64>,
+    /// Per-request timeout. JSON configuration expresses it in seconds.
+    #[serde(default, deserialize_with = "deserialize_server_timeout")]
+    pub timeout: Option<Duration>,
     pub protocol_version: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
@@ -573,7 +575,11 @@ impl McpExtension {
         } else {
             None
         };
-        let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
+        let timeout = match config.timeout {
+            None => Duration::from_secs(60),
+            Some(Duration::ZERO) => Duration::from_secs(1),
+            Some(timeout) => timeout.clamp(MIN_MCP_TIMEOUT, MAX_MCP_TIMEOUT),
+        };
         let lifecycle = match config.protocol_version.as_deref() {
             None => ClientLifecycleMode::Initialize,
             Some("2026-07-28") => ClientLifecycleMode::Discover {
@@ -1854,6 +1860,32 @@ fn normalize(name: &str) -> String {
         })
         .collect()
 }
+const MIN_MCP_TIMEOUT: Duration = Duration::from_millis(1);
+const MAX_MCP_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn deserialize_server_timeout<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer)?
+        .map(|seconds| {
+            if !seconds.is_finite() || seconds < 0.0 {
+                return Err(serde::de::Error::custom(
+                    "MCP timeout must be a finite, non-negative number of seconds",
+                ));
+            }
+            let seconds = if seconds == 0.0 {
+                0.0
+            } else {
+                seconds.clamp(MIN_MCP_TIMEOUT.as_secs_f64(), MAX_MCP_TIMEOUT.as_secs_f64())
+            };
+            Ok(Duration::from_secs_f64(seconds))
+        })
+        .transpose()
+}
+
 fn expand_home(value: &str) -> String {
     value
         .strip_prefix("~/")
@@ -2546,6 +2578,27 @@ mod tests {
         assert!(!tool_enabled(&config, "list_resources"));
         assert!(!tool_enabled(&config, "list_prompts"));
         assert!(tool_enabled(&config, "get_prompt"));
+    }
+    #[test]
+    fn mcp_server_timeout_accepts_fractional_seconds() {
+        let parse = |timeout: Value| {
+            serde_json::from_value::<ServerConfig>(json!({"command":"server","timeout":timeout}))
+                .map(|config| config.timeout)
+        };
+        for (seconds, duration) in [
+            (json!(0.25), Duration::from_millis(250)),
+            (json!(1.5), Duration::from_millis(1500)),
+            (json!(30), Duration::from_secs(30)),
+            (json!(0), Duration::ZERO),
+            (json!(0.00001), MIN_MCP_TIMEOUT),
+            (json!(1e100), MAX_MCP_TIMEOUT),
+        ] {
+            assert_eq!(parse(seconds).unwrap(), Some(duration));
+        }
+        assert_eq!(parse(Value::Null).unwrap(), None);
+        for invalid in [json!(-0.25), json!("0.25"), json!(true)] {
+            assert!(parse(invalid).is_err());
+        }
     }
     #[test]
     fn normalizes_mcp_names_and_preserves_configuration_defaults() {
