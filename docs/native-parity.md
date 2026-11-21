@@ -1515,6 +1515,10 @@ does not distinguish this report from a simultaneous notification.
 These restrictions differ from Pi's behavior. The boundary assumes the terminal sends each query's color responses before its
 DA1; arbitrary reordering or unrelated DA1 replies cannot be disambiguated,
 because these protocols contain no request identifiers.
+When appearance notifications are enabled again, the first report before the
+associated color query's DA1 can answer the explicit appearance probe. The
+already requested color query handles that report. Later notifications can
+request fresh colors, including on terminals that ignore the probe.
 On an appearance notification, the last reported foreground, background, and
 complete palette remain in effect until replacement replies arrive, as in Pi.
 The reported appearance is used when no background is known.
