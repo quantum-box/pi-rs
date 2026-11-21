@@ -1,6 +1,6 @@
 //! Codex WebSocket transport over the same TLS and proxy settings as Responses SSE.
 use base64::Engine;
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use pi_rs_core::{Error, Result};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode, Url, Version};
@@ -18,6 +18,7 @@ use tokio_tungstenite::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_SOCKET_AGE: Duration = Duration::from_secs(55 * 60);
 const MAX_IDLE_CONNECTIONS: usize = 8;
@@ -303,6 +304,32 @@ async fn next(socket: &mut Socket, timeout: Option<Duration>) -> Result<Message>
     .map_err(|_| disconnected())
 }
 
+async fn probe_idle_socket(socket: &mut Socket, timeout: Option<Duration>) -> bool {
+    let nonce = uuid::Uuid::new_v4().as_bytes().to_vec();
+    let timeout = timeout.map_or(IDLE_PROBE_TIMEOUT, |timeout| {
+        timeout.min(IDLE_PROBE_TIMEOUT)
+    });
+    tokio::time::timeout(timeout, async {
+        if socket
+            .send(Message::Ping(nonce.clone().into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        while let Some(Ok(message)) = socket.next().await {
+            match message {
+                Message::Pong(payload) if payload.as_ref() == nonce => return true,
+                Message::Ping(_) | Message::Pong(_) => {}
+                _ => return false,
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
 pub(super) async fn open(
     options: Request<'_>,
     body: &Value,
@@ -342,17 +369,15 @@ pub(super) async fn open(
     let cached = pool_key
         .as_deref()
         .filter(|_| options.reuse_connection)
-        .and_then(take_connection)
-        .and_then(|mut entry| {
-            // Check for a close or other pending frame before sending any inference.
-            // The idle socket has no outstanding request, so replace it if it is readable.
-            entry
-                .socket
-                .next()
-                .now_or_never()
-                .is_none()
-                .then_some(entry)
-        });
+        .and_then(take_connection);
+    let cached = if let Some(mut entry) = cached {
+        // Confirm the idle connection before sending billable inference.
+        probe_idle_socket(&mut entry.socket, options.timeout)
+            .await
+            .then_some(entry)
+    } else {
+        None
+    };
     let (mut socket, mut connected, previous) = match cached {
         Some(entry) => (entry.socket, entry.connected, entry.previous),
         None => match handshake.connect().await {
@@ -460,6 +485,16 @@ mod tests {
         }
     }
 
+    async fn read_request(socket: &mut WebSocketStream<tokio::net::TcpStream>) -> Value {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                Message::Text(text) => return serde_json::from_str(text.as_str()).unwrap(),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                message => panic!("unexpected request frame: {message:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn codex_websocket_reuses_transport_and_sends_the_compatible_input_suffix() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -484,8 +519,7 @@ mod tests {
             .await
             .unwrap();
             for turn in 0..2 {
-                let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
-                let body: Value = serde_json::from_str(text.as_str()).unwrap();
+                let body = read_request(&mut socket).await;
                 assert_eq!(body["type"], "response.create");
                 assert!(body.get("stream").is_none());
                 assert_eq!(body["store"], false);
@@ -521,8 +555,7 @@ mod tests {
             drop(socket);
             let (tcp, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
-            let body: Value = serde_json::from_str(text.as_str()).unwrap();
+            let body = read_request(&mut socket).await;
             assert_eq!(body["input"].as_array().unwrap().len(), 3);
             assert!(body.get("previous_response_id").is_none());
             let completion = json!({"type":"response.completed","response":{
@@ -580,8 +613,7 @@ mod tests {
             for turn in 0..2 {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
-                let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
-                let body: Value = serde_json::from_str(text.as_str()).unwrap();
+                let body = read_request(&mut socket).await;
                 assert!(body.get("previous_response_id").is_none());
                 assert_eq!(body["input"].as_array().unwrap().len(), turn + 1);
                 let completion = json!({"type":"response.completed","response":{
