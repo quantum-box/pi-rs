@@ -1138,6 +1138,24 @@ pub(crate) fn resource_matches(
     if let Some(name) = path.file_name() {
         candidates.push(name.to_string_lossy().into_owned());
     }
+    if let Some(Some(extglob)) = package_diagnostic::extglob_regex(&pattern) {
+        // The bounded translator matches ASCII paths. Leave dot-path and
+        // Unicode cases to the existing native matcher until their Node
+        // semantics can be reproduced.
+        let in_supported_subset = |candidate: &str| {
+            candidate.is_ascii() && !candidate.split('/').any(|part| part.starts_with('.'))
+        };
+        if candidates
+            .iter()
+            .any(|candidate| in_supported_subset(candidate) && extglob.is_match(candidate))
+        {
+            return true;
+        }
+        candidates.retain(|candidate| !in_supported_subset(candidate));
+        if candidates.is_empty() {
+            return false;
+        }
+    }
     let Ok(glob) = globset::GlobBuilder::new(&pattern)
         .literal_separator(true)
         .backslash_escape(false)
@@ -5068,5 +5086,43 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(source.contains("native-demo"));
         assert!(!source.contains("project_notes"));
         assert!(scaffold(&target, None).is_err());
+    }
+
+    #[test]
+    fn package_filters_match_bounded_positive_extglobs() {
+        let root = Path::new("package");
+        let candidates = [
+            "review",
+            "triage",
+            "audit",
+            "review-quick",
+            "@(review|triage)",
+        ]
+        .map(|name| root.join(format!("prompts/{name}.md")));
+        let filter = ResourceFilter::new(
+            &json!({"prompts":["prompts/@(review|triage).md", "!@(triage|audit).md", "+prompts/audit.md"]}),
+            "prompts",
+        ).unwrap();
+
+        assert_eq!(
+            filter.states(&candidates, root, false).unwrap(),
+            [
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false)
+            ]
+        );
+
+        let delta = ResourceFilter::new(
+            &json!({"autoload":false,"prompts":["prompts/review?(-quick).md"]}),
+            "prompts",
+        )
+        .unwrap();
+        assert_eq!(
+            delta.states(&candidates, root, false).unwrap(),
+            [Some(true), None, None, Some(true), None]
+        );
     }
 }
