@@ -1986,7 +1986,11 @@ count lines and rewind the same file while keeping memory bounded. Scoped and
 injected read tools retain positive integer paging parameters.
 
 Text reads now scan files with bounded memory, including files larger than
-4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next
+4 MiB. Unrestricted local reads with integer offsets and nonnegative integer
+limits scan regular files up to the size observed when opened, as in Pi. Files
+that report a size of zero are read to EOF. The snapshot bound also applies to
+the total lines used in continuation notices. Pages retain complete lines and
+UTF-8 boundaries, report the next
 `offset`, reject offsets beyond the file, and explain when a single line
 exceeds the byte limit. Explicit line limits report remaining lines. Image
 normalization and the separate write-size limit retain their existing bounds.
