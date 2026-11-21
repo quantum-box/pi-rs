@@ -33,16 +33,47 @@ pub(super) struct FinalStrictPolicy {
     pub provider: super::providers::Provider,
     pub selected_model: String,
     pub explicit_endpoint: bool,
-    pub bound_support: Option<bool>,
+    pub bound_support: Option<(bool, bool)>,
 }
 
 impl FinalStrictPolicy {
     fn baseline(&self) -> Result<bool> {
         match self.bound_support {
-            Some(value) => Ok(value),
+            Some((strict, _)) => Ok(strict),
             None => self.support(&self.selected_model),
         }
     }
+    fn grammar_support(&self, model: &str) -> bool {
+        if model != self.selected_model
+            && !self.profiles.has_model_definition(&self.provider, model)
+        {
+            return false;
+        }
+        let metadata = self.profiles.model(&self.provider, model);
+        self.profiles
+            .chat_compatibility(&self.provider, metadata.as_ref())
+            .supports_openai_grammar_tools()
+            .unwrap_or(false)
+    }
+
+    fn tool_support(&self, model: &str) -> Result<(bool, bool)> {
+        Ok((self.support(model)?, self.grammar_support(model)))
+    }
+
+    fn changed_support(
+        &self,
+        (strict, grammar): (bool, bool),
+    ) -> Result<(Option<bool>, Option<bool>)> {
+        let baseline_grammar = self.bound_support.map_or_else(
+            || self.grammar_support(&self.selected_model),
+            |(_, grammar)| grammar,
+        );
+        Ok((
+            (strict != self.baseline()?).then_some(strict),
+            (grammar != baseline_grammar).then_some(grammar),
+        ))
+    }
+
     fn support(&self, model: &str) -> Result<bool> {
         let metadata = self.profiles.model(&self.provider, model);
         let adapter = self.profiles.model_adapter(&self.provider, model);
@@ -186,29 +217,30 @@ impl Model for WorkbenchModel {
         let support = self
             .strict_policy
             .as_ref()
-            .map(|policy| policy.support(&request.model))
+            .map(|policy| policy.tool_support(&request.model))
             .transpose()?;
+        let (strict, grammar) = match (&self.strict_policy, support) {
+            (Some(policy), Some(support)) => policy.changed_support(support)?,
+            _ => (None, None),
+        };
         let Some((client, identity)) = self.client.prepare_for_context(&request.model).await?
         else {
             return Ok(None);
         };
-        let changed_support = match (&self.strict_policy, support) {
-            (Some(policy), Some(final_support)) => {
-                (policy.baseline()? != final_support).then_some(final_support)
+        let client = if strict.is_some() || grammar.is_some() {
+            client.with_final_tool_support(strict, grammar).await?
+        } else {
+            client
+        };
+        let identity = identity.and_then(|mut identity| {
+            if let Some(supported) = strict {
+                identity =
+                    pi_rs::fingerprint_model_context(&("final-strict-v1", identity, supported))?;
             }
-            _ => None,
-        };
-        let client = match changed_support {
-            Some(supported) => client.with_final_strict_support(supported).await?,
-            None => client,
-        };
-        let identity = identity.and_then(|identity| {
-            let identity = match changed_support {
-                Some(supported) => {
-                    pi_rs::fingerprint_model_context(&("final-strict-v1", identity, supported))?
-                }
-                None => identity,
-            };
+            if let Some(supported) = grammar {
+                identity =
+                    pi_rs::fingerprint_model_context(&("final-grammar-v1", identity, supported))?;
+            }
             pi_rs::fingerprint_model_context(&(
                 "workbench-policy-v2",
                 identity,
@@ -619,9 +651,9 @@ impl WorkbenchModel {
     async fn final_client(&self, client: Client, model: &str) -> Result<Client> {
         match &self.strict_policy {
             Some(policy) => {
-                let support = policy.support(model)?;
-                if support != policy.baseline()? {
-                    client.with_final_strict_support(support).await
+                let (strict, grammar) = policy.changed_support(policy.tool_support(model)?)?;
+                if strict.is_some() || grammar.is_some() {
+                    client.with_final_tool_support(strict, grammar).await
                 } else {
                     Ok(client)
                 }
