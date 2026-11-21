@@ -727,7 +727,23 @@ mod tests {
         use super::super::{Provider, model_auth::Keys, model_profiles::Profiles};
         let profile = Profiles::parse(&json!({})).unwrap();
         let provider = Provider::named(PROVIDER).unwrap();
-        assert_eq!(profile.model_ids(&provider).len(), 27);
+        assert_eq!(profile.model_ids(&provider).len(), 35);
+        for (model, adapter) in [
+            (
+                "gemini-4-carbon",
+                crate::providers::Adapter::ChatCompletions,
+            ),
+            ("claude-fable-5.2", crate::providers::Adapter::Anthropic),
+            ("gpt-6.2-sol", crate::providers::Adapter::OpenAiResponses),
+            ("mai-code-2", crate::providers::Adapter::OpenAiResponses),
+        ] {
+            assert!(profile.model_ids(&provider).iter().any(|id| id == model));
+            assert_eq!(profile.model_adapter(&provider, model), adapter);
+        }
+        let claude = profile.model(&provider, "claude-fable-5.2").unwrap();
+        assert!(profile.anthropic_strict_tool_support(&provider, Some(&claude)));
+        let gpt = profile.model(&provider, "gpt-6.2-sol").unwrap();
+        assert!(profile.responses_strict_tool_support(&provider, Some(&gpt)));
         let keys = Keys::parse(&json!({"github-copilot": {
             "type":"oauth","access":"fixture","refresh":"refresh-fixture","expires":1,
         }}));
