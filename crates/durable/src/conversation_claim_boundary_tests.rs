@@ -10510,7 +10510,8 @@ async fn nested_woken_evidence_worker() {
     #[cfg(feature = "experimental-graph-revision")]
     if std::env::var_os("PI_TEST_NESTED_OWNED_GRAPH_PROBE").is_some() {
         let harness = scheduler.subagent_harness();
-        let store = harness.owner.store();
+        let owner = harness.owner.clone();
+        let store = owner.store();
         let child = crate::task_store::TaskStore::new(store)
             .list()
             .unwrap()
@@ -10526,6 +10527,48 @@ async fn nested_woken_evidence_worker() {
                 crate::task_scheduler::Error::Busy
             ))
         ));
+        if std::env::var_os("PI_TEST_NESTED_OWNED_GRAPH_MARK").is_some() {
+            let crate::task::TaskOwner::Task(parent) = child.task.owner() else {
+                unreachable!()
+            };
+            let parent = crate::task_store::TaskStore::new(store)
+                .load(*parent)
+                .unwrap()
+                .unwrap();
+            let crate::task::TaskOwner::Conversation(conversation) = parent.task.owner() else {
+                unreachable!()
+            };
+            let owned = crate::ownership_edge::EdgeStore::new(store)
+                .children(child.task.id())
+                .unwrap();
+            let mut targets = vec![*conversation];
+            targets.extend(owned.iter().map(|edge| edge.edge.child));
+            let owner = harness.owner.clone();
+            for id in &targets {
+                owner.conversation_controls().get(*id);
+            }
+            let result = owner
+                .conversation_controls()
+                .try_fence_targets(&targets, || {
+                    harness.authenticated_scoped_woken_abort_graph(&child, &registry, &targets)
+                })
+                .unwrap()
+                .unwrap();
+            assert!(!result.is_empty());
+            let marked = crate::task_store::TaskStore::new(owner.store())
+                .load(child.task.id())
+                .unwrap()
+                .unwrap();
+            assert_eq!(marked.task.state(), &TaskState::Ready);
+            assert!(marked.task.abort_requested());
+            assert!(
+                owner
+                    .store()
+                    .get(&crate::runtime::woken_owned_graph_key(child.task.id()))
+                    .unwrap()
+                    .is_some()
+            );
+        }
         return;
     }
     let _driver = scheduler.start_tasks(registry).unwrap();
@@ -10993,12 +11036,12 @@ async fn nested_woken_real_callback_records_receipt_once() {
 #[cfg(unix)]
 #[tokio::test]
 async fn nested_woken_with_owned_conversation_remains_fail_closed() {
-    exercise_nested_woken_owned_rejection(false).await;
-    exercise_nested_woken_owned_rejection(true).await;
+    exercise_nested_woken_owned_rejection(false, false).await;
+    exercise_nested_woken_owned_rejection(true, false).await;
 }
 
 #[cfg(unix)]
-async fn exercise_nested_woken_owned_rejection(selected: bool) {
+async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
     if selected {
@@ -11066,16 +11109,21 @@ async fn exercise_nested_woken_owned_rejection(selected: bool) {
     drop(harness);
     #[cfg(feature = "experimental-graph-revision")]
     {
-        let status = Command::new(std::env::current_exe().unwrap())
+        let mut probe = Command::new(std::env::current_exe().unwrap());
+        probe
             .args([
                 "--exact",
                 "conversation_claim_boundary_tests::nested_woken_evidence_worker",
             ])
             .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
-            .env("PI_TEST_NESTED_OWNED_GRAPH_PROBE", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+            .env("PI_TEST_NESTED_OWNED_GRAPH_PROBE", "1");
+        if mark {
+            probe.env("PI_TEST_NESTED_OWNED_GRAPH_MARK", "1");
+        }
+        assert!(probe.status().unwrap().success());
+        if mark {
+            return;
+        }
     }
     let mut resumed = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -11151,6 +11199,13 @@ async fn exercise_nested_woken_owned_rejection(selected: bool) {
     assert!(!dir.path().join("child-after").exists());
     reopened.kill().unwrap();
     reopened.wait().unwrap();
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn nested_woken_owned_graph_mark_requires_ancestor_fence() {
+    exercise_nested_woken_owned_rejection(false, true).await;
+    exercise_nested_woken_owned_rejection(true, true).await;
 }
 
 #[cfg(unix)]
