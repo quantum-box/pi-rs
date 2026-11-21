@@ -4907,11 +4907,19 @@ credentials can be read and refreshed in place. A refresh in flight saves
 rotated credentials even when the requesting turn is cancelled. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
 
-The native transport sends uncompressed JSON over HTTP SSE. The upstream
-WebSocket transport and specialized Codex
-grammar tools and tool search remain open. Authentication was exercised with
-fixtures. Live sign-in and inference were unverified because no account was
-available for acceptance.
+The native transport sends uncompressed JSON over HTTP SSE. OpenAI Responses
+and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
+tools as custom tools. They choose a nonempty Lark definition before a regex
+definition and map streamed input onto the single required string argument.
+Replay uses the matching call and result item types for the tools advertised
+on the current request. Historical function arguments retain their full JSON
+when they cannot be represented as a single string. Models without the
+capability and the pi-rs ChatGPT plan namespace use function tools.
+
+OpenAI Codex WebSocket transport and provider tool search remain open.
+Authentication and grammar tool streaming were exercised with fixtures.
+Live sign-in and inference were unverified because no account was available
+for acceptance.
 
 ### GitHub Copilot
 
