@@ -759,6 +759,17 @@ retain the details supplied by the tool.
 - Compare each remaining surface against the pinned reference before marking
   that row complete. Existing core acceptance is recorded in [acceptance.md](acceptance.md).
 
+### Native extension header and footer
+
+In-process Rust and executable extensions can set, hide or reset the
+session header and footer using bounded styled rows. Both terminal modes
+use the active theme. Fullscreen layout and mouse offsets include the
+actual header height, and footer rows leave room for the editor. Reload
+and session transitions reset the overrides. Upstream Pi can also mount
+arbitrary live components and passes a footer data provider to its
+factory. Native extensions supply updated rows through non-blocking host UI
+requests, including in terminal session and selection callbacks.
+
 ### Native custom message renderers
 
 Native Rust and executable extensions can match a visible custom message by

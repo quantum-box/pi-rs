@@ -188,6 +188,16 @@ pub enum UiRequest {
         #[serde(default, rename = "widgetPlacement")]
         placement: WidgetPlacement,
     },
+    /// Replace the session header with styled rows. Clear it with `None`.
+    SetHeader {
+        #[serde(default)]
+        lines: Option<Vec<Vec<UiComponentSpan>>>,
+    },
+    /// Replace the session footer with styled rows. Clear it with `None`.
+    SetFooter {
+        #[serde(default)]
+        lines: Option<Vec<Vec<UiComponentSpan>>>,
+    },
     SetTitle {
         title: String,
     },
@@ -232,6 +242,17 @@ impl UiRequest {
             && lines.len() > 128
         {
             return Err("extension widgets support at most 128 lines".into());
+        }
+        if let Self::SetHeader { lines: Some(lines) } | Self::SetFooter { lines: Some(lines) } =
+            self
+            && (lines.len() > 16
+                || !component_lines_within_limits(lines)
+                || lines
+                    .iter()
+                    .flatten()
+                    .any(|span| span.color.as_ref().is_some_and(|color| color.len() > 128)))
+        {
+            return Err("extension header or footer exceeds its rendering limits".into());
         }
         if let Self::Custom { lines, actions, .. } = self {
             if !component_lines_within_limits(lines) {
@@ -302,6 +323,33 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn header_footer_updates_are_bounded_and_do_not_open_prompts() {
+        let rows = vec![vec![UiComponentSpan {
+            text: "header".into(),
+            ..Default::default()
+        }]];
+        let request = UiRequest::SetHeader {
+            lines: Some(rows.clone()),
+        };
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+        assert!(request.timeout().is_none());
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["method"], "setHeader");
+        assert_eq!(json["lines"][0][0]["text"], "header");
+        let clear: UiRequest =
+            serde_json::from_value(serde_json::json!({"method": "setFooter"})).unwrap();
+        assert!(matches!(clear, UiRequest::SetFooter { lines: None }));
+        assert!(
+            UiRequest::SetFooter {
+                lines: Some(vec![rows[0].clone(); 17])
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn first_custom_message_renderer_wins_and_hidden_messages_do_not_run() {
         struct Renderer(&'static str);

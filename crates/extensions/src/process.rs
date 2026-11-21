@@ -3797,7 +3797,8 @@ async fn dispatch_inner(
             }
         }
         ProtocolRequest::Lifecycle { event, state } => {
-            if host.supports_custom_messages()
+            if host.has_ui()
+                || host.supports_custom_messages()
                 || host.supports_custom_entries()
                 || host.supports_custom_entry_read()
             {
@@ -4666,6 +4667,78 @@ mod tests {
             serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
             DuplexFrame::Progress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_dispatch_exposes_a_ui_only_host() {
+        struct UiHost;
+        #[async_trait::async_trait]
+        impl ToolHost for UiHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("read-only lifecycle must not invoke tools");
+            }
+
+            fn has_ui(&self) -> bool {
+                true
+            }
+
+            async fn ui(
+                &self,
+                request: pi_rs_core::UiRequest,
+            ) -> ExtensionResult<pi_rs_core::UiResponse> {
+                assert!(matches!(
+                    request,
+                    pi_rs_core::UiRequest::SetFooter { lines: None }
+                ));
+                Ok(pi_rs_core::UiResponse::Cancelled)
+            }
+        }
+
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "chrome"
+            }
+
+            async fn lifecycle(
+                &self,
+                _: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                Err("lifecycle selected the detached path".into())
+            }
+
+            async fn lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<()> {
+                host.ui(pi_rs_core::UiRequest::SetFooter { lines: None })
+                    .await?;
+                Ok(())
+            }
+        }
+
+        let response = dispatch_with_host(
+            Arc::new(Hook),
+            ProtocolRequest::Lifecycle {
+                event: LifecycleEvent::SessionStart {
+                    reason: pi_rs_core::SessionStartReason::Startup,
+                    previous_session_file: None,
+                },
+                state: None,
+            },
+            Arc::new(UiHost),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_null());
     }
 
     #[tokio::test]

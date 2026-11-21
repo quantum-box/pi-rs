@@ -645,24 +645,36 @@ pub(super) fn component_lines(
     theme: &Theme,
     width: usize,
 ) -> Vec<Line> {
-    lines
-        .iter()
-        .flat_map(|line| {
-            let spans: Vec<_> = line
-                .iter()
-                .map(|span| {
-                    let mut rendered =
-                        Span::themed(&span.text, theme, span.color.as_deref().unwrap_or("text"));
-                    rendered.bold = span.bold;
-                    rendered.italic = span.italic;
-                    rendered.underline = span.underline;
-                    rendered.inverse = span.inverse;
-                    rendered
-                })
-                .collect();
-            wrap(&spans, width)
-        })
-        .collect()
+    component_lines_bounded(lines, theme, width, usize::MAX)
+}
+
+pub(crate) fn component_lines_bounded(
+    lines: &[Vec<pi_rs::UiComponentSpan>],
+    theme: &Theme,
+    width: usize,
+    limit: usize,
+) -> Vec<Line> {
+    let mut output = Vec::new();
+    for line in lines {
+        let remaining = limit - output.len();
+        if remaining == 0 {
+            break;
+        }
+        let spans: Vec<_> = line
+            .iter()
+            .map(|span| {
+                let mut rendered =
+                    Span::themed(&span.text, theme, span.color.as_deref().unwrap_or("text"));
+                rendered.bold = span.bold;
+                rendered.italic = span.italic;
+                rendered.underline = span.underline;
+                rendered.inverse = span.inverse;
+                rendered
+            })
+            .collect();
+        output.extend(wrap_bounded(&spans, width, remaining));
+    }
+    output
 }
 
 fn custom_message_base_style(lines: &mut [Line], theme: &Theme) {
@@ -773,14 +785,22 @@ pub(crate) fn strip_shell_ansi(text: &str) -> String {
     result
 }
 pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
+    wrap_bounded(spans, width, usize::MAX)
+}
+
+fn wrap_bounded(spans: &[Span], width: usize, limit: usize) -> Vec<Line> {
     let width = width.max(1);
     let mut lines = vec![Line::default()];
     let mut used = 0;
+    let mut full = false;
     for span in spans {
         let mut fragment = span.clone();
         fragment.text.clear();
         fragment.search_text = span.search_text.as_ref().map(|_| String::new());
         search_graphemes(span.searchable(), |range, grapheme| {
+            if full {
+                return;
+            }
             let size = UnicodeWidthStr::width(grapheme);
             let source = &span.searchable()[range];
             let (before_newline, after_newline) = if grapheme == "\n" {
@@ -793,6 +813,10 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
             }
             if grapheme == "\n" || (used + size > width && used > 0) {
                 lines.last_mut().unwrap().spans.push(fragment.clone());
+                if lines.len() == limit {
+                    full = true;
+                    return;
+                }
                 fragment.text.clear();
                 if let Some(raw) = &mut fragment.search_text {
                     raw.clear();
@@ -814,6 +838,9 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
                 used += size;
             }
         });
+        if full {
+            break;
+        }
         lines.last_mut().unwrap().spans.push(fragment);
     }
     lines
@@ -4360,6 +4387,22 @@ mod tests {
         assert!(spans.iter().any(|s| s.text.contains("value")
             && !s.italic
             && s.color != theme.color("thinkingText")));
+    }
+
+    #[test]
+    fn bounded_component_lines_preserve_the_wrapped_prefix() {
+        let theme = Theme::system();
+        let lines = vec![vec![pi_rs::UiComponentSpan {
+            text: "◆ab\ncd".repeat(512),
+            ..Default::default()
+        }]];
+        assert!(component_lines_bounded(&lines, &theme, 2, 0).is_empty());
+        let expected = component_lines(&lines, &theme, 2);
+        let actual = component_lines_bounded(&lines, &theme, 2, 3);
+        assert_eq!(actual.len(), 3);
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.spans, expected.spans);
+        }
     }
 
     #[test]

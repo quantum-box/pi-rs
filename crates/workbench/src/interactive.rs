@@ -1044,6 +1044,12 @@ struct CustomMessageRenderPending {
 }
 
 #[derive(Default)]
+struct ExtensionChrome {
+    header: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
+    footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
+}
+
+#[derive(Default)]
 struct View {
     async_transitions: bool,
     pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
@@ -1057,6 +1063,7 @@ struct View {
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
+    extension_chrome: ExtensionChrome,
     lines: Vec<Entry>,
     custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
     custom_render_attempted: BTreeSet<u64>,
@@ -1100,6 +1107,7 @@ struct View {
     mouse: MouseSelection,
     wheel: Wheel,
     fullscreen_width: usize,
+    fullscreen_header_rows: usize,
     scrollbar_activity: Option<Instant>,
     scrollbar_dragging: bool,
     flash: Option<(String, Instant)>,
@@ -1255,6 +1263,13 @@ impl View {
                     self.widgets.push((key, lines, placement));
                 }
             }
+            pi_rs::UiRequest::SetHeader { lines } => {
+                if self.extension_chrome.header != lines {
+                    self.extension_chrome.header = lines;
+                    self.regular.redraw = true;
+                }
+            }
+            pi_rs::UiRequest::SetFooter { lines } => self.extension_chrome.footer = lines,
             pi_rs::UiRequest::SetTitle { mut title } => {
                 title.retain(|character| !character.is_control());
                 self.pending_terminal_title = Some(title);
@@ -1274,6 +1289,72 @@ impl View {
         }
         Ok(None)
     }
+    fn clear_extension_chrome(&mut self) -> bool {
+        let header_changed = self.extension_chrome.header.take().is_some();
+        self.regular.redraw |= header_changed;
+        self.extension_chrome.footer.take().is_some() || header_changed
+    }
+
+    fn header_lines(
+        &self,
+        args: &Cli,
+        theme: &Theme,
+        width: usize,
+        max: usize,
+        fullscreen: bool,
+    ) -> Vec<Line> {
+        if let Some(lines) = &self.extension_chrome.header {
+            return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
+        }
+        if !show_startup_header(args) {
+            return Vec::new();
+        }
+        let version = env!("CARGO_PKG_VERSION");
+        let title = if fullscreen {
+            format!(
+                "pi v{version} · {} · /help",
+                self.session_name.as_deref().unwrap_or("new session")
+            )
+        } else {
+            format!("pi v{version} · /help")
+        };
+        vec![Line::themed(&title, theme, "accent")]
+    }
+
+    fn footer_lines(
+        &self,
+        args: &Cli,
+        theme: &Theme,
+        width: usize,
+        max: usize,
+        fullscreen: bool,
+    ) -> Vec<Line> {
+        if let Some(lines) = &self.extension_chrome.footer {
+            return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
+        }
+        let model = format!(
+            "{} · {}",
+            args.configured_model_name(&args.model),
+            args.thinking.as_deref().unwrap_or("default")
+        );
+        let usage = if fullscreen {
+            let model_width = UnicodeWidthStr::width(model.as_str());
+            let usage = clip(
+                &format!("↑↓ 確定 {} tokens", self.tokens),
+                width.saturating_sub(model_width + 1),
+            );
+            let padding =
+                width.saturating_sub(UnicodeWidthStr::width(usage.as_str()) + model_width);
+            format!("{usage}{}{model}", " ".repeat(padding))
+        } else {
+            format!("↑↓ {} tokens · {model}", self.tokens)
+        };
+        vec![
+            Line::themed(&args.workspace.display().to_string(), theme, "dim"),
+            Line::themed(&usage, theme, "dim"),
+        ]
+    }
+
     fn widget_lines(
         &self,
         theme: &Theme,
@@ -2579,14 +2660,38 @@ impl View {
         let hardware_cursor = args.settings.show_hardware_cursor();
         let (prompt, cursor_row, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let min_body = if modal { 3 } else { 1 };
+        let chrome_space = height.saturating_sub(prompt_height + 2 + min_body);
+        let footer_limit = chrome_space.saturating_sub(usize::from(!modal));
+        let mut footer = self.footer_lines(args, theme, width, footer_limit, true);
+        if modal {
+            footer.truncate(footer_limit);
+        }
+        let header_limit = chrome_space.saturating_sub(footer.len());
+        let mut header = self.header_lines(args, theme, width, header_limit, true);
+        if modal {
+            header.truncate(header_limit);
+        }
+        let header_rows = header.len();
+        if self.fullscreen_header_rows != header_rows
+            && let Some(picker) = &mut self.picker
+        {
+            picker.clear_mouse_press();
+        }
+        self.fullscreen_header_rows = header_rows;
+        let available = height.saturating_sub(prompt_height + 2 + header_rows + footer.len());
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
-        below.truncate(height.saturating_sub(prompt_height + 6));
+        below.truncate(
+            height
+                .saturating_sub(prompt_height + 4 + footer.len())
+                .min(available.saturating_sub(min_body)),
+        );
         if self.dialog().is_some() {
             below.clear();
         }
         let output = self.transcript_options(args, false);
-        let header_rows = usize::from(show_startup_header(args));
-        let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
+        let body_height = available.saturating_sub(below.len());
         let mut lines = Vec::new();
         let mut prompts = Vec::new();
         let mut panels = Vec::new();
@@ -2664,7 +2769,8 @@ impl View {
         }
         let dialog_cursor = self
             .dialog()
-            .and_then(|dialog| dialog.cursor(width, body_height));
+            .and_then(|dialog| dialog.cursor(width, body_height))
+            .filter(|(row, _)| *row < body_height);
         if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height, keys);
             if !hardware_cursor
@@ -2676,7 +2782,6 @@ impl View {
         } else {
             lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
         }
-        let modal = self.picker.is_some() || self.dialog().is_some();
         let start = if modal {
             0
         } else {
@@ -2743,17 +2848,9 @@ impl View {
         );
         queue!(out, Hide)?;
         self.graphics.clear_fullscreen_frame(&mut out)?;
-        if header_rows != 0 {
-            Line::themed(
-                &format!(
-                    "pi v{} · {} · /help",
-                    env!("CARGO_PKG_VERSION"),
-                    self.session_name.as_deref().unwrap_or("new session")
-                ),
-                theme,
-                "accent",
-            )
-            .draw(&mut out, width)?;
+        for (row, line) in header.iter().enumerate() {
+            queue!(out, MoveTo(0, row as u16))?;
+            line.draw(&mut out, width)?;
         }
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
@@ -2789,7 +2886,7 @@ impl View {
                 Line::themed(glyph, theme, role).draw(&mut out, 1)?;
             }
         }
-        let border_row = height - prompt_height - 4 - below.len();
+        let border_row = height - prompt_height - 2 - footer.len() - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
         Line::themed(
             &format!(
@@ -2816,26 +2913,13 @@ impl View {
             )?;
             line.draw(&mut out, width)?;
         }
-        queue!(out, MoveTo(0, (height - 3) as u16))?;
+        let footer_row = height - footer.len();
+        queue!(out, MoveTo(0, (footer_row - 1) as u16))?;
         Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
-        queue!(out, MoveTo(0, (height - 2) as u16))?;
-        Line::themed(&args.workspace.display().to_string(), theme, "dim").draw(&mut out, width)?;
-        queue!(out, MoveTo(0, (height - 1) as u16))?;
-        let model = format!(
-            "{} · {}",
-            args.configured_model_name(&args.model),
-            args.thinking.as_deref().unwrap_or("default")
-        );
-        let model_width = UnicodeWidthStr::width(model.as_str());
-        let usage = format!("↑↓ 確定 {} tokens", self.tokens);
-        let usage = clip(&usage, width.saturating_sub(model_width + 1));
-        let padding = width.saturating_sub(UnicodeWidthStr::width(usage.as_str()) + model_width);
-        Line::themed(
-            &format!("{usage}{}{model}", " ".repeat(padding)),
-            theme,
-            "dim",
-        )
-        .draw(&mut out, width)?;
+        for (row, line) in footer.iter().enumerate() {
+            queue!(out, MoveTo(0, (footer_row + row) as u16))?;
+            line.draw(&mut out, width)?;
+        }
         if !modal && let Some(search) = &self.search {
             let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
             let left = width.saturating_sub(search_width + 1);
@@ -3069,15 +3153,22 @@ impl View {
         }
         let (prompt, cursor, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let min_body = if modal { 3 } else { 1 };
+        let footer_limit = height.saturating_sub(prompt_height + 2 + min_body);
+        let mut footer = self.footer_lines(args, theme, width, footer_limit, false);
+        if modal {
+            footer.truncate(footer_limit);
+        }
+        let editor_region = prompt_height + 2 + footer.len();
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
-        below.truncate(height.saturating_sub(prompt_height + 6));
+        below.truncate(height.saturating_sub(editor_region + min_body.max(2)));
         if self.dialog().is_some() {
             below.clear();
         }
         let render_entry = |entry: &Entry| {
             entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
-        let modal = self.picker.is_some() || self.dialog().is_some();
         let committing = !busy && !modal;
         // A trailing cycle notice can still be replaced by another cycle.
         let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
@@ -3120,14 +3211,14 @@ impl View {
                 active.extend(render_entry(&entry));
             }
             if let Some(picker) = &self.picker {
-                active =
-                    picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
+                active = picker.render(theme, width, height - editor_region - below.len(), keys);
             }
         }
-        let dialog_height = height - prompt_height - 4 - below.len();
+        let dialog_height = height - editor_region - below.len();
         let dialog_cursor = self
             .dialog()
-            .and_then(|dialog| dialog.cursor(width, dialog_height));
+            .and_then(|dialog| dialog.cursor(width, dialog_height))
+            .filter(|(row, _)| *row < dialog_height);
         if let Some(dialog) = self.dialog() {
             active = dialog.render(theme, width, dialog_height, keys);
             if !hardware_cursor
@@ -3136,8 +3227,11 @@ impl View {
             {
                 line.mark_cursor(column);
             }
+        }
+        if modal {
+            active.truncate(dialog_height);
         } else {
-            let available = height - prompt_height - 4 - below.len();
+            let available = dialog_height;
             let mut widgets = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
             widgets.truncate(available);
             let keep = available.saturating_sub(widgets.len());
@@ -3146,7 +3240,7 @@ impl View {
             }
             active.extend(widgets);
         }
-        let region_height = active.len() + prompt_height + 4 + below.len();
+        let region_height = active.len() + editor_region + below.len();
         let rows_to_match = self
             .regular
             .max_rows
@@ -3177,14 +3271,11 @@ impl View {
             )?;
         } else {
             queue!(out, Print("\r\n"))?;
-            if (self.regular.committed == 0 || redraw) && show_startup_header(args) {
-                Line::themed(
-                    &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
-                    theme,
-                    "accent",
-                )
-                .draw(&mut out, width)?;
-                queue!(out, Print("\r\n"))?;
+            if self.regular.committed == 0 || redraw {
+                for line in self.header_lines(args, theme, width, 16, false) {
+                    line.draw(&mut out, width)?;
+                    queue!(out, Print("\r\n"))?;
+                }
             }
         }
         if redraw {
@@ -3260,24 +3351,11 @@ impl View {
             line.draw(&mut out, width)?;
             queue!(out, Print("\r\n"))?;
         }
-        for line in [
-            Line::themed(&"─".repeat(width), theme, "border"),
-            Line::themed(&args.workspace.display().to_string(), theme, "dim"),
-        ] {
-            line.draw(&mut out, width)?;
+        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
+        for line in &footer {
             queue!(out, Print("\r\n"))?;
+            line.draw(&mut out, width)?;
         }
-        Line::themed(
-            &format!(
-                "↑↓ {} tokens · {} · {}",
-                self.tokens,
-                args.configured_model_name(&args.model),
-                args.thinking.as_deref().unwrap_or("default")
-            ),
-            theme,
-            "dim",
-        )
-        .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = region_height;
         let (column, show_cursor) = if self.dialog().is_some() {
@@ -3488,6 +3566,7 @@ fn slash(
             args.session = destination;
             args.restore_session_model(&Session::open(&args.session)?)?;
             view.restore(args)?;
+            view.clear_extension_chrome();
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
                 view.editor.replace(input);
@@ -3824,6 +3903,7 @@ fn slash(
             }
             initialize_session(&mut next)?;
             view.restore(&next)?;
+            view.clear_extension_chrome();
             next.session_transition = Some(pi_rs::SessionStartReason::New);
             *args = next;
         }
@@ -4486,14 +4566,6 @@ pub(super) async fn run(
                 dirty = true;
             }
         }
-        if !is_busy(&worker) {
-            for event in std::mem::take(&mut args.selection_events) {
-                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
-                    view.append(&format!("Extension selection notification: {error}"));
-                    dirty = true;
-                }
-            }
-        }
         if let Some(terminal) = &mut _terminal {
             let alternate = args.tui_mode != Some(TuiMode::Regular);
             if terminal.alternate != alternate {
@@ -4545,6 +4617,10 @@ pub(super) async fn run(
                 view.custom_render_pending = None;
                 dirty |= view.invalidate_custom_message_renderings();
             }
+            if view.clear_extension_chrome() {
+                startup_extensions = None;
+                dirty = true;
+            }
             for warning in old.take_pending_warnings() {
                 view.append(&warning);
                 dirty = true;
@@ -4562,6 +4638,14 @@ pub(super) async fn run(
                     });
             }
             view.pending_thinking = None;
+        }
+        if !is_busy(&worker) {
+            for event in std::mem::take(&mut args.selection_events) {
+                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+                    view.append(&format!("Extension selection notification: {error}"));
+                    dirty = true;
+                }
+            }
         }
         if (view.picker.is_none()
             || view
@@ -4851,6 +4935,7 @@ pub(super) async fn run(
                 {
                     view.append(&error.to_string());
                 }
+                view.clear_extension_chrome();
                 if !status.success() {
                     view.append(&format!(
                         "Run stopped ({status}). Use /session to inspect its saved journal."
@@ -5272,7 +5357,7 @@ pub(super) async fn run(
                     && view.picker.is_some() =>
             {
                 let mut picker = view.picker.take().expect("picker checked above");
-                let header_rows = usize::from(show_startup_header(&args));
+                let header_rows = view.fullscreen_header_rows;
                 let action = if usize::from(mouse.column) < view.fullscreen_width
                     && let Some(row) = usize::from(mouse.row).checked_sub(header_rows)
                 {
@@ -6224,6 +6309,7 @@ pub(super) async fn run(
                             view.dialogs.clear();
                             view.ui_status.clear();
                             view.widgets.clear();
+                            view.clear_extension_chrome();
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
                             for warning in args.settings.diagnostics() {
@@ -8088,6 +8174,7 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
         initialize_session(&mut next)?;
     }
     view.restore(&next)?;
+    view.clear_extension_chrome();
     for warning in next.settings.diagnostics() {
         view.append(warning);
     }
@@ -11369,6 +11456,53 @@ exit {exit}
         assert!(output.contains("=== Agent messages (JSONL) ==="));
         assert!(output.contains("\"role\":\"user\""));
         assert!(output.contains("question"));
+    }
+
+    #[test]
+    fn extension_header_footer_follow_theme_and_restore_independently() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi"]);
+        let directory = tempfile::tempdir().unwrap();
+        args.session = directory.path().join("session.jsonl");
+        let theme = super::Theme::system();
+        let mut view = super::View::default();
+        let id = uuid::Uuid::new_v4();
+        let apply = |view: &mut super::View, method, lines| {
+            assert!(
+                view.ui_request(&json!({"id":id,"method":method,"lines":lines}))
+                    .unwrap()
+                    .is_none()
+            );
+        };
+        let header = json!([[{"text":"heading","color":"accent","bold":true}]]);
+        let footer = json!([[{"text":"first"}],[{"text":"second"}]]);
+        apply(&mut view, "setHeader", header.clone());
+        assert!(view.regular.redraw);
+        view.regular.redraw = false;
+        apply(&mut view, "setHeader", header);
+        assert!(!view.regular.redraw);
+        apply(&mut view, "setFooter", footer);
+
+        for fullscreen in [false, true] {
+            let header = view.header_lines(&args, &theme, 7, 2, fullscreen);
+            assert_eq!(header[0].spans[0].text, "heading");
+            assert_eq!(header[0].spans[0].color, theme.color("accent"));
+            assert!(header[0].spans[0].bold);
+            let short_footer = view.footer_lines(&args, &theme, 8, 1, fullscreen);
+            assert_eq!(short_footer.len(), 1);
+            assert_eq!(short_footer[0].spans[0].text, "first");
+        }
+
+        apply(&mut view, "setFooter", json!([]));
+        assert!(view.footer_lines(&args, &theme, 80, 5, false).is_empty());
+        apply(&mut view, "setFooter", Value::Null);
+        assert_eq!(view.footer_lines(&args, &theme, 80, 5, false).len(), 2);
+        assert!(view.extension_chrome.header.is_some());
+        view.restore(&args).unwrap();
+        assert!(view.extension_chrome.header.is_some());
+        assert!(view.clear_extension_chrome());
+        assert!(view.extension_chrome.header.is_none());
+        assert!(!view.clear_extension_chrome());
     }
 
     #[test]

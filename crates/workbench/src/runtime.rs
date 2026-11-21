@@ -535,21 +535,38 @@ impl Runtime {
     ) -> bool {
         let mut failed = false;
         if self.registry.has_session_lifecycle_hooks() && session.host_binding().is_none() {
-            pi_rs::notify_extension_lifecycle_filtered(
-                &self.registry,
-                event,
-                &session.extension_states(),
-                args.tool_timeout(),
-                &mut |notification| {
-                    failed |= matches!(
-                        notification,
-                        pi_rs::Notification::ExtensionLifecycleError { .. }
-                    );
-                    super::observe(notification, args.trace);
-                },
-                include,
-            )
-            .await;
+            let mut observer = |notification: pi_rs::Notification<'_>| {
+                failed |= matches!(
+                    notification,
+                    pi_rs::Notification::ExtensionLifecycleError { .. }
+                );
+                super::observe(notification, args.trace);
+            };
+            let states = session.extension_states();
+            let timeout = args.tool_timeout();
+            if args.terminal_managed_worker
+                && !matches!(event, pi_rs::LifecycleEvent::SessionShutdown { .. })
+            {
+                pi_rs::notify_extension_lifecycle_filtered_with_ui(
+                    &self.registry,
+                    event,
+                    &states,
+                    timeout,
+                    &mut observer,
+                    include,
+                )
+                .await;
+            } else {
+                pi_rs::notify_extension_lifecycle_filtered(
+                    &self.registry,
+                    event,
+                    &states,
+                    timeout,
+                    &mut observer,
+                    include,
+                )
+                .await;
+            }
         }
         failed
     }
