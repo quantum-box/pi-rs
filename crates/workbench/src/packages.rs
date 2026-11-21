@@ -1524,18 +1524,15 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
     Ok(resolve_source_path(&path)?.to_string_lossy().into_owned())
 }
 fn resolve_source_path(path: &Path) -> Result<PathBuf> {
-    let mut prefix = std::path::absolute(path)?;
+    // Pi resolves dot segments before asking the filesystem to compare
+    // package paths. A symlink followed by ".." therefore never redirects
+    // the package to the parent of the symlink target.
+    let mut prefix = normalize_filter_path(&std::path::absolute(path)?);
     let mut suffix = Vec::new();
     loop {
         match prefix.canonicalize() {
             Ok(mut resolved) => {
-                for component in suffix.into_iter().rev() {
-                    if component == std::ffi::OsStr::new("..") {
-                        resolved.pop();
-                    } else if component != std::ffi::OsStr::new(".") {
-                        resolved.push(component);
-                    }
-                }
+                resolved.extend(suffix.into_iter().rev());
                 return Ok(resolved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -4681,6 +4678,31 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(package.iter().any(|source| source.ends_with("#v1")));
         assert!(package.iter().any(|source| source.ends_with("#v2")));
     }
+    #[cfg(unix)]
+    #[test]
+    fn package_sources_resolve_parent_segments_before_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let work = directory.path().join("work");
+        let package = work.join("package");
+        let external = directory.path().join("external");
+        let via_symlink = external.join("package");
+        let target = external.join("target");
+        for path in [&package, &via_symlink, &target] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, work.join("link")).unwrap();
+
+        let resolved = normalize("./link/../package", &work).unwrap();
+        assert_eq!(Path::new(&resolved), package.canonicalize().unwrap());
+        let resolved = normalize("./link/../missing/package", &work).unwrap();
+        assert_eq!(
+            Path::new(&resolved),
+            work.canonicalize().unwrap().join("missing/package")
+        );
+        let resolved = normalize("./link", &work).unwrap();
+        assert_eq!(Path::new(&resolved), target.canonicalize().unwrap());
+    }
+
     #[test]
     fn package_sources_normalize_file_urls_and_git_transports() {
         let root = tempfile::tempdir().unwrap();
