@@ -1,11 +1,12 @@
 //! OpenAI Responses transport for ChatGPT plan OAuth credentials.
 //!
 //! Credential acquisition and renewal are the responsibility of the caller.
+mod codex_ws;
 pub mod oauth;
 
 use base64::Engine;
 use eventsource_stream::{EventStreamError, Eventsource};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::BoxStream};
 use pi_rs_core::{
     CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
     ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
@@ -18,6 +19,39 @@ pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/response
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
+
+type ResponseEvents = BoxStream<'static, Result<Value>>;
+
+/// Transport policy for native ChatGPT Codex inference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodexTransport {
+    #[default]
+    Auto,
+    Sse,
+    WebSocket,
+    WebSocketCached,
+}
+
+impl CodexTransport {
+    pub fn named(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "sse" => Some(Self::Sse),
+            "websocket" => Some(Self::WebSocket),
+            "websocket-cached" => Some(Self::WebSocketCached),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Sse => "sse",
+            Self::WebSocket => "websocket",
+            Self::WebSocketCached => "websocket-cached",
+        }
+    }
+}
 
 #[derive(Debug)]
 enum RawStreamError {
@@ -72,6 +106,8 @@ pub struct OpenAiResponses {
     endpoint_source: String,
     token: String,
     codex_account: Option<String>,
+    codex_transport: CodexTransport,
+    idle_timeout: Option<std::time::Duration>,
     codex_off_effort: Option<String>,
     thinking: Option<String>,
     provider: String,
@@ -229,6 +265,7 @@ impl OpenAiResponses {
         for proxy in proxies {
             builder = builder.proxy(proxy.clone());
         }
+        self.idle_timeout = timeout;
         self.identity_safe_transport = proxies.is_empty();
         self.client = builder
             .build()
@@ -263,6 +300,11 @@ impl OpenAiResponses {
         client.codex_off_effort = Some("none".into());
         client.strict_tool_support = true;
         Ok(client)
+    }
+
+    pub fn with_codex_transport(mut self, transport: CodexTransport) -> Self {
+        self.codex_transport = transport;
+        self
     }
 
     pub fn with_codex_off_effort(mut self, effort: Option<&str>) -> Self {
@@ -312,6 +354,8 @@ impl OpenAiResponses {
             endpoint_source,
             token,
             codex_account: None,
+            codex_transport: CodexTransport::default(),
+            idle_timeout: None,
             codex_off_effort: None,
             thinking: None,
             identity_safe_transport: true,
@@ -931,6 +975,7 @@ impl Model for OpenAiResponses {
                     base,
                     "codex-sse-v1",
                     &self.codex_off_effort,
+                    self.codex_transport.as_str(),
                 ))
             })
         } else {
@@ -1153,6 +1198,135 @@ impl OpenAiResponses {
         self.stream_enriched_with_tools(request, None).await
     }
 
+    async fn open_sse(
+        &self,
+        body: &Value,
+        mut headers: reqwest::header::HeaderMap,
+        error_secrets: &[String],
+    ) -> Result<(ResponseEvents, bool)> {
+        let mut request = self.client.post(self.endpoint.clone());
+        if let Some(account) = &self.codex_account {
+            headers.remove("chatgpt-account-id");
+            headers.remove("openai-beta");
+            headers.remove(reqwest::header::AUTHORIZATION);
+            request = request
+                .header("chatgpt-account-id", account)
+                .header("openai-beta", "responses=experimental");
+            if !self.headers.contains_key("originator") {
+                request = request.header("originator", "pi");
+            }
+        }
+        let mut response = request
+            .headers(headers)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &error_secrets,
+            &self.headers,
+        )
+        .await;
+        if !response.status().is_success() {
+            let status = response.status();
+            if status.as_u16() == 413 {
+                return Err(Error::Model("413 request too large".into()));
+            }
+            if status.as_u16() == 429 || status.is_server_error() {
+                let info =
+                    pi_rs_core::provider_limit_info(response.bytes_stream(), error_secrets).await;
+                return Err(if info.permanent {
+                    if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
+                        response_error(info.recognized_code, Some(status))
+                    } else {
+                        Error::Model("OpenAI account quota or billing limit reached".into())
+                    }
+                } else if info.recognized_code.is_some() {
+                    response_error(info.recognized_code, Some(status))
+                } else {
+                    Error::RetryableModel(format!("OpenAI request failed ({status})"))
+                });
+            }
+            let mut bytes = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                if bytes.len() + chunk.len() > 64 * 1024 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let body = pi_rs_core::sanitized_provider_error(&body, error_secrets);
+            if pi_rs_core::provider_context_overflow(&body, &[]) {
+                return Err(Error::Model("context window exceeded".into()));
+            }
+            return Err(response_error(body["error"]["code"].as_str(), Some(status)));
+        }
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
+        // ChatGPT plan responses can be valid SSE without a Content-Type header.
+        // The event parser still requires a valid response.completed event.
+        let declared_sse = content_type
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        if !(declared_sse || (content_type.is_none() && self.provider == "openai-chatgpt")) {
+            return Err(Error::Model("expected OpenAI event stream".into()));
+        }
+        // Bound wire bytes before the SSE parser sees them. Coalesce incomplete
+        // lines so its parser does not repeatedly rescan a growing line.
+        let bytes = async_stream::stream! {
+            let mut source = response.bytes_stream();
+            let mut bytes_seen = 0usize;
+            let mut pending = Vec::new();
+            while let Some(chunk) = source.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => { yield Err(RawStreamError::Transport); return; }
+                };
+                bytes_seen = bytes_seen.saturating_add(chunk.len());
+                if bytes_seen > MAX_STREAM {
+                    yield Err(RawStreamError::LimitExceeded);
+                    return;
+                }
+                if let Some(end) = chunk.iter().rposition(|byte| matches!(byte, b'\n' | b'\r')) {
+                    pending.extend_from_slice(&chunk[..=end]);
+                    yield Ok(std::mem::take(&mut pending));
+                    pending.extend_from_slice(&chunk[end + 1..]);
+                } else {
+                    pending.extend_from_slice(&chunk);
+                }
+            }
+            if !pending.is_empty() { yield Ok(pending); }
+        };
+        let source = bytes.eventsource();
+        let events = Box::pin(source.filter_map(|item| async move {
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    return Some(Err(match error {
+                        EventStreamError::Transport(RawStreamError::LimitExceeded) => {
+                            Error::Model("OpenAI stream exceeds 32 MiB".into())
+                        }
+                        EventStreamError::Transport(RawStreamError::Transport) => {
+                            Error::RetryableModel("OpenAI stream interrupted".into())
+                        }
+                        _ => Error::Model("invalid OpenAI event stream".into()),
+                    }));
+                }
+            };
+            if item.data == "[DONE]" {
+                return None;
+            }
+            Some(
+                serde_json::from_str(&item.data)
+                    .map_err(|_| Error::Model("invalid OpenAI stream event".into())),
+            )
+        }));
+        Ok((events, declared_sse))
+    }
+
     async fn stream_enriched_with_tools(
         &self,
         request: ModelRequest,
@@ -1221,116 +1395,44 @@ impl OpenAiResponses {
                     .or_insert_with(|| reqwest::header::HeaderValue::from_static(value));
             }
         }
-        let mut request = self.client.post(self.endpoint.clone());
-        if let Some(account) = &self.codex_account {
-            headers.remove("chatgpt-account-id");
-            headers.remove("openai-beta");
-            headers.remove(reqwest::header::AUTHORIZATION);
-            request = request
-                .header("chatgpt-account-id", account)
-                .header("openai-beta", "responses=experimental");
-            if !self.headers.contains_key("originator") {
-                request = request.header("originator", "pi");
-            }
-        }
-        let mut response = request
-            .headers(headers)
-            .bearer_auth(&self.token)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
-        pi_rs_core::observe_provider_response(
-            response.status(),
-            response.headers(),
-            &error_secrets,
-            &self.headers,
-        )
-        .await;
-        if !response.status().is_success() {
-            let status = response.status();
-            if status.as_u16() == 413 {
-                return Err(Error::Model("413 request too large".into()));
-            }
-            if status.as_u16() == 429 || status.is_server_error() {
-                let info =
-                    pi_rs_core::provider_limit_info(response.bytes_stream(), &error_secrets).await;
-                return Err(if info.permanent {
-                    if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
-                        response_error(info.recognized_code, Some(status))
-                    } else {
-                        Error::Model("OpenAI account quota or billing limit reached".into())
-                    }
-                } else if info.recognized_code.is_some() {
-                    response_error(info.recognized_code, Some(status))
-                } else {
-                    Error::RetryableModel(format!("OpenAI request failed ({status})"))
-                });
-            }
-            let mut bytes = Vec::new();
-            while let Ok(Some(chunk)) = response.chunk().await {
-                if bytes.len() + chunk.len() > 64 * 1024 {
-                    break;
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let body = pi_rs_core::sanitized_provider_error(&body, &error_secrets);
-            if pi_rs_core::provider_context_overflow(&body, &[]) {
-                return Err(Error::Model("context window exceeded".into()));
-            }
-            return Err(response_error(body["error"]["code"].as_str(), Some(status)));
-        }
-        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
-        // ChatGPT plan responses can be valid SSE without a Content-Type header.
-        // The event parser still requires a valid response.completed event.
-        let declared_sse = content_type
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"));
-        if !(declared_sse || (content_type.is_none() && provider == "openai-chatgpt")) {
-            return Err(Error::Model("expected OpenAI event stream".into()));
-        }
-        // Bound wire bytes before the SSE parser sees them. Coalesce incomplete
-        // lines so its parser does not repeatedly rescan a growing line.
-        let bytes = async_stream::stream! {
-            let mut source = response.bytes_stream();
-            let mut bytes_seen = 0usize;
-            let mut pending = Vec::new();
-            while let Some(chunk) = source.next().await {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(_) => { yield Err(RawStreamError::Transport); return; }
-                };
-                bytes_seen = bytes_seen.saturating_add(chunk.len());
-                if bytes_seen > MAX_STREAM {
-                    yield Err(RawStreamError::LimitExceeded);
-                    return;
-                }
-                if let Some(end) = chunk.iter().rposition(|byte| matches!(byte, b'\n' | b'\r')) {
-                    pending.extend_from_slice(&chunk[..=end]);
-                    yield Ok(std::mem::take(&mut pending));
-                    pending.extend_from_slice(&chunk[end + 1..]);
-                } else {
-                    pending.extend_from_slice(&chunk);
-                }
-            }
-            if !pending.is_empty() { yield Ok(pending); }
+        let ws = if self.codex_transport != CodexTransport::Sse
+            && let Some(account) = &self.codex_account
+        {
+            let session = (self.cache_retention != CacheRetention::None)
+                .then_some(self.session_cache_key.as_deref())
+                .flatten();
+            codex_ws::open(
+                codex_ws::Request {
+                    client: &self.client,
+                    endpoint: &self.endpoint,
+                    headers: &self.headers,
+                    token: &self.token,
+                    account,
+                    session,
+                    timeout: self.idle_timeout,
+                    reuse_connection: self.identity_safe_transport,
+                    cache_context: matches!(
+                        self.codex_transport,
+                        CodexTransport::Auto | CodexTransport::WebSocketCached
+                    ),
+                },
+                &body,
+            )
+            .await?
+        } else {
+            None
         };
-        let mut source = Box::pin(bytes.eventsource());
+        let (mut source, declared_sse) = match ws {
+            Some(source) => (source, true),
+            None => self.open_sse(&body, headers, &error_secrets).await?,
+        };
         Ok(Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
             let mut reasoning: BTreeMap<u64, String> = BTreeMap::new();
             let mut text_items: BTreeMap<u64, String> = BTreeMap::new();
             while let Some(item) = source.next().await {
-                let item = item.map_err(|error| match error {
-                    EventStreamError::Transport(RawStreamError::LimitExceeded) => Error::Model("OpenAI stream exceeds 32 MiB".into()),
-                    EventStreamError::Transport(RawStreamError::Transport) => Error::RetryableModel("OpenAI stream interrupted".into()),
-                    _ => Error::Model("invalid OpenAI event stream".into()),
-                })?;
-                if item.data == "[DONE]" { continue; }
-                let event: Value = serde_json::from_str(&item.data).map_err(|_| Error::Model("invalid OpenAI stream event".into()))?;
+                let event = item?;
                 let kind = field(&event, "type")?;
                 let kind = if api == pi_rs_core::ModelApi::OpenaiCodexResponses && kind == "response.done" {
                     match event["response"]["status"].as_str() {
@@ -1538,7 +1640,8 @@ mod tests {
             format!("e30.{payload}.fixture"),
             "openai-codex",
         )
-        .unwrap();
+        .unwrap()
+        .with_codex_transport(CodexTransport::Sse);
         let request = ModelRequest {
             model: "gpt-6.1-sol".into(),
             messages: vec![
