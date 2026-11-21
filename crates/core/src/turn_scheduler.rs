@@ -23,22 +23,32 @@ enum TurnNormalized {
     ArgumentRejected(String),
 }
 
+const MAX_PI_ARGUMENT_ISSUES: usize = 32;
+const MAX_PI_ARGUMENT_PREVIEW_BYTES: usize = 64 * 1024;
+
 fn pi_argument_diagnostic(
-    tool: &RegisteredTool,
+    name: &str,
+    validator: &jsonschema::Validator,
     input: &serde_json::Value,
     prepared: &serde_json::Value,
 ) -> String {
     use jsonschema::error::{TypeKind, ValidationErrorKind as Kind};
     use std::fmt::Write as _;
 
-    let mut output = format!("Validation failed for tool \"{}\":", tool.spec.name);
-    let mut errors: Vec<_> = tool.validator.iter_errors(prepared).collect();
+    let mut output = format!("Validation failed for tool \"{name}\":");
+    let mut errors: Vec<_> = validator
+        .iter_errors(prepared)
+        .take(MAX_PI_ARGUMENT_ISSUES + 1)
+        .collect();
+    let mut omitted = errors.len() > MAX_PI_ARGUMENT_ISSUES;
+    errors.truncate(MAX_PI_ARGUMENT_ISSUES);
+    let mut remaining = MAX_PI_ARGUMENT_ISSUES;
     errors.sort_by_key(|error| match error.kind {
         Kind::Required { .. } => 0,
         Kind::AdditionalProperties { .. } => 2,
         _ => 1,
     });
-    for error in errors {
+    'errors: for error in errors {
         let pointer = error.instance_path.to_string();
         let path = pointer.strip_prefix('/').map(|pointer| {
             pointer
@@ -53,14 +63,30 @@ fn pi_argument_diagnostic(
         };
         let diagnostic = match &error.kind {
             Kind::Required { property } => {
-                if let Some(property) = property.as_str() {
-                    let _ = write!(output, "\n  - {}: missing", child_path(property));
+                if let Some(property) = property.as_str()
+                    && !append_pi_argument_issue(
+                        &mut output,
+                        &mut remaining,
+                        &child_path(property),
+                        "missing",
+                    )
+                {
+                    omitted = true;
+                    break;
                 }
                 continue;
             }
             Kind::AdditionalProperties { unexpected } => {
                 for property in unexpected {
-                    let _ = write!(output, "\n  - {}: unknown field", child_path(property));
+                    if !append_pi_argument_issue(
+                        &mut output,
+                        &mut remaining,
+                        &child_path(property),
+                        "unknown field",
+                    ) {
+                        omitted = true;
+                        break 'errors;
+                    }
                 }
                 continue;
             }
@@ -85,15 +111,61 @@ fn pi_argument_diagnostic(
             Kind::MinItems { limit } => format!("expected at least {limit} items"),
             _ => error.masked().to_string(),
         };
-        let _ = write!(
-            output,
-            "\n  - {}: {diagnostic}",
-            path.as_deref().unwrap_or("root")
-        );
+        if !append_pi_argument_issue(
+            &mut output,
+            &mut remaining,
+            path.as_deref().unwrap_or("root"),
+            &diagnostic,
+        ) {
+            omitted = true;
+            break;
+        }
     }
-    let input = serde_json::to_string_pretty(input).expect("JSON argument values serialize");
+    if omitted {
+        output.push_str("\n  [Additional validation issues omitted]");
+    }
+    let mut preview = ArgumentPreview::default();
+    let truncated = serde_json::to_writer_pretty(&mut preview, input).is_err();
+    let input = String::from_utf8_lossy(&preview.0);
     let _ = write!(output, "\n\nReceived arguments:\n{input}");
+    if truncated {
+        output.push_str("\n[Received arguments truncated]");
+    }
     output
+}
+
+fn append_pi_argument_issue(
+    output: &mut String,
+    remaining: &mut usize,
+    path: &str,
+    message: &str,
+) -> bool {
+    use std::fmt::Write as _;
+    if *remaining == 0
+        || output.len() + path.len() + message.len() + 6 > MAX_PI_ARGUMENT_PREVIEW_BYTES
+    {
+        return false;
+    }
+    let _ = write!(output, "\n  - {path}: {message}");
+    *remaining -= 1;
+    true
+}
+
+#[derive(Default)]
+struct ArgumentPreview(Vec<u8>);
+
+impl std::io::Write for ArgumentPreview {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes
+            .len()
+            .min(MAX_PI_ARGUMENT_PREVIEW_BYTES - self.0.len());
+        self.0.extend_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // A validated decision alone is not sufficient authorization: callers must
@@ -445,6 +517,51 @@ fn turn_poll_snapshot(
 mod strict_argument_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pi_argument_diagnostics_bound_issue_count_and_preview() {
+        let schema = jsonschema::validator_for(&json!({
+            "type":"object",
+            "properties":{"edits":{"type":"array","items":{
+                "type":"object","required":["oldText","newText"]
+            }}},
+            "additionalProperties":false
+        }))
+        .unwrap();
+        let many_edits = json!({"edits":vec![json!({}); 1000]});
+        let output = pi_argument_diagnostic("edit", &schema, &many_edits, &many_edits);
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("  - "))
+                .count(),
+            MAX_PI_ARGUMENT_ISSUES
+        );
+        assert!(output.contains("[Additional validation issues omitted]"));
+        assert!(!output.contains("[Received arguments truncated]"));
+
+        let many_unknown_fields = serde_json::Value::Object(
+            (0..1000)
+                .map(|i| (format!("field{i:04}"), json!(null)))
+                .collect(),
+        );
+        let output =
+            pi_argument_diagnostic("edit", &schema, &many_unknown_fields, &many_unknown_fields);
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.ends_with(": unknown field"))
+                .count(),
+            MAX_PI_ARGUMENT_ISSUES
+        );
+        assert!(output.contains("[Additional validation issues omitted]"));
+
+        let large_input = json!({"subject":"界".repeat(MAX_PI_ARGUMENT_PREVIEW_BYTES)});
+        let output = pi_argument_diagnostic("edit", &schema, &large_input, &large_input);
+        assert!(output.contains("subject: unknown field"));
+        assert!(output.ends_with("[Received arguments truncated]"));
+        assert!(output.len() < MAX_PI_ARGUMENT_PREVIEW_BYTES + 256);
+    }
 
     struct FixtureTool {
         pollable: bool,
@@ -1802,7 +1919,10 @@ impl Agent<'_> {
                 && let Ok(input) = turn_model_arguments(invocation, None)
             {
                 return Ok(TurnNormalized::ArgumentRejected(pi_argument_diagnostic(
-                    &tool, &input, &args,
+                    &tool.spec.name,
+                    &tool.validator,
+                    &input,
+                    &args,
                 )));
             }
             return Ok(TurnNormalized::Skipped(
