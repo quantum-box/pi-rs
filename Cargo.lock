@@ -3035,6 +3035,7 @@ dependencies = [
  "icu_segmenter",
  "ignore",
  "image",
+ "indexmap",
  "jsonschema",
  "libc",
  "oauth2",

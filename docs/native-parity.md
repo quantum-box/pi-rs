@@ -1562,7 +1562,8 @@ extensions and session names.
 MCP `deferred` exposure now hides tool schemas until `tool_search` loads a
 match. A native BM25 ranker uses names, descriptions, schema fields and server
 metadata. Selection state follows the journal branch and survives reopening.
-Exact exposure overrides and wildcard matching are supported. CLI allowlists
+An exact `toolExposure` name takes precedence over wildcard patterns. Among
+matching patterns, the first in the configuration wins. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
 hook; existing implementations continue through the original hook.
