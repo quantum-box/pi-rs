@@ -18,7 +18,6 @@ pub enum Selection {
     CheckoutWithoutSummary(u64),
     CheckoutWithSummary(u64),
     EditBranchSummary(u64),
-    Label(u64, String),
     Fork(u64),
     Model(String),
     Completion {
@@ -38,6 +37,7 @@ pub enum Selection {
     LoginXai,
     LoginCodex,
     LoginCodexDevice,
+    LoginCopilot,
     LoginChatGpt,
     LoginChatGptNew,
     LoginChatGptAccount(String),
@@ -195,7 +195,7 @@ enum SessionSort {
 enum SessionAction {
     Rename(PathBuf),
     Delete(PathBuf),
-    Label(u64),
+    Label(u64, String),
 }
 pub enum Input {
     Continue,
@@ -203,6 +203,7 @@ pub enum Input {
     Select(Selection),
     Save(Selection),
     CopyTreeRecord(u64),
+    SetTreeLabel(u64, String),
     UpdateModelScope { save: bool },
 }
 pub enum MouseInput {
@@ -618,6 +619,18 @@ impl Picker {
             tree.label_timestamps = timestamps;
         }
     }
+    pub fn refresh_tree(&mut self, mut replacement: Self, record: u64) {
+        let (Some(previous), Some(next)) = (&mut self.tree, &mut replacement.tree) else {
+            return;
+        };
+        next.filter = previous.filter;
+        next.collapsed = std::mem::take(&mut previous.collapsed);
+        next.show_label_timestamps = previous.show_label_timestamps;
+        next.rebuild_visible();
+        replacement.query = std::mem::take(&mut self.query);
+        replacement.focus_record(record);
+        *self = replacement;
+    }
     pub fn focus_thinking(&mut self, current: &str) {
         if let Some(index) = self.items.iter().position(
             |item| matches!(&item.selection, Selection::Thinking(level) if level == current),
@@ -793,8 +806,13 @@ impl Picker {
         if let Some(action) = self.session_action.clone() {
             if cancel {
                 self.session_action = None;
-                if matches!(action, SessionAction::Rename(_) | SessionAction::Label(_)) {
-                    self.query.clear();
+                match action {
+                    SessionAction::Rename(_) => self.query.clear(),
+                    SessionAction::Label(id, search) => {
+                        self.query = search;
+                        self.focus_record(id);
+                    }
+                    SessionAction::Delete(_) => {}
                 }
                 return Input::Continue;
             }
@@ -809,10 +827,13 @@ impl Picker {
                 SessionAction::Rename(path) if confirm => {
                     return Input::Select(Selection::RenameSession(path, self.query.clone()));
                 }
-                SessionAction::Label(id) if confirm => {
-                    return Input::Select(Selection::Label(id, self.query.clone()));
+                SessionAction::Label(id, search) if confirm => {
+                    let label = std::mem::replace(&mut self.query, search);
+                    self.session_action = None;
+                    self.focus_record(id);
+                    return Input::SetTreeLabel(id, label);
                 }
-                SessionAction::Rename(_) | SessionAction::Label(_) => {}
+                SessionAction::Rename(_) | SessionAction::Label(..) => {}
             }
         } else if self.active_session.is_some() {
             if keys.matches("tui.input.tab", key) {
@@ -893,13 +914,9 @@ impl Picker {
                     return Input::CopyTreeRecord(id);
                 }
                 if keys.matches("app.tree.editLabel", key) {
-                    self.query = self
-                        .tree
-                        .as_ref()
-                        .and_then(|tree| tree.labels.get(&id))
-                        .cloned()
-                        .unwrap_or_default();
-                    self.session_action = Some(SessionAction::Label(id));
+                    let label = tree.labels.get(&id).cloned().unwrap_or_default();
+                    let search = std::mem::replace(&mut self.query, label);
+                    self.session_action = Some(SessionAction::Label(id, search));
                     return Input::Continue;
                 }
                 if keys.matches("app.tree.foldOrUp", key) {
@@ -1126,7 +1143,7 @@ impl Picker {
                     format!("Rename session · {}", self.query),
                     format!("Type the new name · {confirm} to save · {cancel} to cancel"),
                 ),
-                SessionAction::Label(id) => (
+                SessionAction::Label(id, _) => (
                     format!("Label record {id} · {}", self.query),
                     format!(
                         "Type the label · {confirm} to save · Empty to remove · {cancel} to cancel"
@@ -2591,15 +2608,33 @@ mod tests {
             picker.matches()[picker.selected].selection,
             Selection::Checkout(1)
         ));
+        let edit_label = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let confirm = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        picker.paste("node 1");
         picker.input(
-            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
             &keys,
         );
+        picker.input(
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &keys,
+        );
+        picker.input(edit_label, &keys);
         assert_eq!(picker.query, "root");
+        assert!(matches!(picker.input(escape, &keys), Input::Continue));
+        assert_eq!(picker.query, "node 1");
+        assert!(matches!(picker.selected(), Some(Selection::Checkout(1))));
+        picker.input(edit_label, &keys);
         picker.query = "updated".into();
         assert!(
-            matches!(picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys), Input::Select(Selection::Label(1, value)) if value == "updated")
+            matches!(picker.input(confirm, &keys), Input::SetTreeLabel(1, value) if value == "updated")
         );
+        assert_eq!(picker.query, "node 1");
+        assert!(matches!(picker.selected(), Some(Selection::Checkout(1))));
+        let tree = picker.tree.as_ref().unwrap();
+        assert_eq!(tree.filter.name(), "labeled-only");
+        assert!(tree.show_label_timestamps);
     }
 
     #[test]

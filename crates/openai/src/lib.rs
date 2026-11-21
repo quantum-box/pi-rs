@@ -1201,9 +1201,9 @@ impl OpenAiResponses {
     async fn open_sse(
         &self,
         body: &Value,
+        mut headers: reqwest::header::HeaderMap,
         error_secrets: &[String],
     ) -> Result<(ResponseEvents, bool)> {
-        let mut headers = self.headers.clone();
         let mut request = self.client.post(self.endpoint.clone());
         if let Some(account) = &self.codex_account {
             headers.remove("chatgpt-account-id");
@@ -1380,6 +1380,14 @@ impl OpenAiResponses {
                 value.to_str().ok().map(|value| (name.as_str(), value))
             }),
         );
+        let mut headers = self.headers.clone();
+        if provider == "github-copilot" {
+            for (name, value) in pi_rs_core::copilot_request_headers(&request.messages) {
+                headers
+                    .entry(name)
+                    .or_insert_with(|| reqwest::header::HeaderValue::from_static(value));
+            }
+        }
         let ws = if self.codex_transport != CodexTransport::Sse
             && let Some(account) = &self.codex_account
         {
@@ -1409,7 +1417,7 @@ impl OpenAiResponses {
         };
         let (mut source, declared_sse) = match ws {
             Some(source) => (source, true),
-            None => self.open_sse(&body, &error_secrets).await?,
+            None => self.open_sse(&body, headers, &error_secrets).await?,
         };
         Ok(Box::pin(async_stream::try_stream! {
             let mut started = false;

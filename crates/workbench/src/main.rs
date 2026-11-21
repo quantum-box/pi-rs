@@ -26,6 +26,7 @@ mod cli_compat;
 mod clipboard;
 mod codex_auth;
 mod config;
+mod copilot_auth;
 mod extension_ui;
 mod http_proxy;
 mod image_policy;
@@ -1157,7 +1158,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1176,7 +1177,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1932,6 +1933,13 @@ async fn execute(
                             }
                         },
                     ).await
+                } else if provider == "github-copilot" {
+                    copilot_auth::login(
+                        &args.settings,
+                        meta_auth::LoginControl::default(),
+                        |url, code| eprintln!("Enter code {code} at {url}"),
+                    )
+                    .await
                 } else if provider == "xai" {
                     xai_auth::login(
                         &args.settings,
@@ -1985,11 +1993,9 @@ async fn execute(
                 kimi_auth::logout().await?
             } else if matches!(
                 provider.as_str(),
-                "openrouter" | "anthropic" | "openai-codex"
+                "openrouter" | "anthropic" | "github-copilot" | "openai-codex"
             ) {
-                model_auth::remove(
-                    &Provider::named(provider).expect("built-in OpenRouter provider"),
-                )?
+                model_auth::remove(&Provider::named(provider).expect("built-in login provider"))?
             } else {
                 radius_auth::Gateway::configured_with_settings(&args.settings)?
                     .logout()
