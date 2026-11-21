@@ -1308,6 +1308,7 @@ impl Ollama {
             }).eventsource();
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
+            let mut reported_cached_input = None;
             let mut metadata = ModelMetadata {
                 provider_api: Some(if mistral { ModelApi::MistralConversations } else { ModelApi::OpenaiCompletions }),
                 replay_identity: Some(identity.clone()),
@@ -1373,14 +1374,15 @@ impl Ollama {
                     let cached = details.cached_tokens
                         .or(stats.prompt_cache_hit_tokens)
                         .or(stats.cached_tokens);
-                    metadata.cached_input_tokens = if mistral {
+                    let cached = if mistral {
                         cached.or(stats.mistral_cached_tokens)
                             .or_else(|| stats.mistral_prompt_details.and_then(|details| details.cached_tokens))
-                            .or(metadata.cached_input_tokens)
-                            .map(|cached| cached.min(input_tokens))
                     } else {
-                        cached.or(metadata.cached_input_tokens)
+                        cached
                     };
+                    reported_cached_input = cached.or(reported_cached_input);
+                    metadata.cached_input_tokens = reported_cached_input
+                        .map(|cached| if mistral { cached.min(input_tokens) } else { cached });
                     metadata.cache_creation_input_tokens = details.cache_write_tokens
                         .or(metadata.cache_creation_input_tokens);
                     let nested = stats.completion_tokens_details.and_then(|details| details.reasoning_tokens);
