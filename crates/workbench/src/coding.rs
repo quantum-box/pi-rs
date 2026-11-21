@@ -3191,7 +3191,7 @@ impl CodingTool {
             &crate::coding_paths::normalize(requested_path)?,
         );
         let path = self.path(requested_path)?;
-        let numeric_limit = local_numeric_limit(args, 500.0);
+        let numeric_limit = local_numeric_limit(args, 500.0).floor().max(1.0);
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
@@ -7318,7 +7318,7 @@ mod tests {
         let token = pi_rs::CancellationToken::new();
         let outcome = tool.list(&json!({"limit": 1.5}), &token).unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.5))
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.0))
         );
         tool.kind = Kind::Find;
         let outcome = tool

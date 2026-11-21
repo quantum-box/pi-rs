@@ -16,6 +16,8 @@ impl Model for Script {
                 ("ls-zero", "ls", json!({"limit": 0})),
                 ("ls-negative", "ls", json!({"limit": -2})),
                 ("ls-fraction", "ls", json!({"limit": 1.5})),
+                ("ls-fraction-two", "ls", json!({"limit": 2.99})),
+                ("ls-exact", "ls", json!({"limit": 3})),
                 ("ls-huge", "ls", json!({"limit": 1e100})),
                 ("ls-missing", "ls", json!({"path": "missing"})),
                 (
@@ -144,22 +146,23 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
             _ => None,
         })
         .collect();
+    for id in ["ls-float", "ls-zero", "ls-negative", "ls-fraction"] {
+        assert_eq!(
+            replies[id],
+            (
+                "a\n\n[1 entries limit reached. Use limit=2 for more]",
+                false
+            )
+        );
+    }
     assert_eq!(
-        replies["ls-float"],
+        replies["ls-fraction-two"],
         (
-            "a\n\n[1 entries limit reached. Use limit=2 for more]",
+            "a\nb\n\n[2 entries limit reached. Use limit=4 for more]",
             false
         )
     );
-    assert_eq!(replies["ls-zero"], ("(empty directory)", false));
-    assert_eq!(replies["ls-negative"], ("(empty directory)", false));
-    assert_eq!(
-        replies["ls-fraction"],
-        (
-            "a\nb\n\n[1.5 entries limit reached. Use limit=3 for more]",
-            false
-        )
-    );
+    assert_eq!(replies["ls-exact"], ("a\nb\nc", false));
     assert_eq!(replies["ls-huge"], ("a\nb\nc", false));
     let missing = format!(
         "Path not found: {}",

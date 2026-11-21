@@ -2075,8 +2075,9 @@ are repeated for each match. Search memory is bounded at 64 MiB, and the configu
 radius is limited to 1,000 lines.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
-JSON numbers as JavaScript doubles. `ls` compares the number directly, including
-zero, negative and fractional values. Local `find` reproduces fd's numeric
+JSON numbers as JavaScript doubles. As in Pi 1.6.0, `ls` rounds its limit down
+to a whole number and uses at least one entry. Notices and details use the
+effective limit. Local `find` reproduces fd's numeric
 argument parsing: zero means unlimited, while negative, fractional, and values
 outside fd's host-sized integer range produce fd-style errors before checking
 the search path. These diagnostics retain error status and reach the model
