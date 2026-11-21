@@ -57,7 +57,7 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
                         json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"fixture","version":"1"}}),
                     ),
                     Some("tools/list") => Some(
-                        json!({"tools":[{"name":"Public","inputSchema":{"type":"object"}},{"name":"Private","inputSchema":{"type":"object"}}]}),
+                        json!({"tools":[{"name":"Public","inputSchema":{"type":"object"}},{"name":"Private","inputSchema":{"type":"object"}}],"nextCursor":""}),
                     ),
                     _ => None,
                 };
