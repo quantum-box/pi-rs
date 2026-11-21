@@ -10,6 +10,7 @@ use futures_util::FutureExt;
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::time::{Instant, timeout};
 use crate::{Extension, ExtensionState, Notification, Observer, Registry, Session};
 
 /// HTTP metadata from an agent's provider response, before its body is consumed.
@@ -25,7 +26,8 @@ tokio::task_local! {
 
 pub(crate) struct ResponseHooks {
     handlers: Vec<(Arc<dyn Extension>, Option<ExtensionState>)>,
-    handler_timeout: Duration,
+    started: Instant,
+    model_timeout: Duration,
     errors: Mutex<Vec<(String, String)>>,
 }
 
@@ -44,9 +46,6 @@ impl ResponseHooks {
         if handlers.is_empty() {
             return None;
         }
-        // Reserve part of the request timeout for reading and decoding the response.
-        let handler_timeout = (model_timeout / 2).min(Duration::from_secs(5))
-            / u32::try_from(handlers.len()).unwrap_or(u32::MAX);
         let mut states = session.extension_states();
         Some(Arc::new(Self {
             handlers: handlers
@@ -56,7 +55,8 @@ impl ResponseHooks {
                     (extension, state)
                 })
                 .collect(),
-            handler_timeout,
+            started: Instant::now(),
+            model_timeout,
             errors: Mutex::default(),
         }))
     }
@@ -95,10 +95,19 @@ pub async fn observe_provider_response(
         return;
     };
     let mut visible = BTreeMap::<String, String>::new();
-    let sensitive_values = request_headers
-        .values()
-        .filter(|value| value.is_sensitive())
-        .filter_map(|value| value.to_str().ok());
+    let secrets: Vec<_> = request_secrets
+        .iter()
+        .map(String::as_str)
+        .chain(
+            request_headers
+                .values()
+                .filter(|value| value.is_sensitive())
+                .filter_map(|value| value.to_str().ok()),
+        )
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    let contains_secret = |text: &str| secrets.iter().any(|&secret| text.contains(secret));
     for (name, value) in headers {
         let name = name.as_str();
         if value.is_sensitive()
@@ -110,14 +119,6 @@ pub async fn observe_provider_response(
         let Ok(value) = value.to_str() else {
             continue;
         };
-        if request_secrets
-            .iter()
-            .map(String::as_str)
-            .chain(sensitive_values.clone())
-            .any(|secret| !secret.is_empty() && (name.contains(secret) || value.contains(secret)))
-        {
-            continue;
-        }
         let value = value.trim();
         visible
             .entry(name.to_owned())
@@ -127,10 +128,16 @@ pub async fn observe_provider_response(
             })
             .or_insert_with(|| value.to_owned());
     }
+    // Repeated response fields can become a secret only after they are joined.
+    visible.retain(|name, value| !contains_secret(name) && !contains_secret(value));
     let event = ProviderResponseEvent {
         status: status.as_u16(),
         headers: visible,
     };
+    // Reserve part of the remaining request time for reading and decoding the body.
+    let remaining = hooks.model_timeout.saturating_sub(hooks.started.elapsed());
+    let handler_timeout = (remaining / 2).min(Duration::from_secs(5))
+        / u32::try_from(hooks.handlers.len()).unwrap_or(u32::MAX);
     for (extension, state) in &hooks.handlers {
         let callback = AssertUnwindSafe(async {
             extension
@@ -138,11 +145,7 @@ pub async fn observe_provider_response(
                 .await
         })
         .catch_unwind();
-        let outcome = crate::runtime::time::timeout(
-            hooks.handler_timeout,
-            RESPONSE_HOOKS.scope(None, callback),
-        )
-        .await;
+        let outcome = timeout(handler_timeout, RESPONSE_HOOKS.scope(None, callback)).await;
         let message = match outcome {
             Ok(Ok(Ok(()))) => continue,
             Ok(Ok(Err(message))) => message,
@@ -229,16 +232,18 @@ mod tests {
             headers.insert("x-private", sensitive);
 
             let mut request_headers = HeaderMap::new();
-            let mut sensitive = HeaderValue::from_static("rate limit");
+            let mut sensitive = HeaderValue::from_static(" rate limit ");
             sensitive.set_sensitive(true);
             request_headers.insert("x-private-input", sensitive);
             headers.insert("x-custom-echo", HeaderValue::from_static("rate limit"));
+            headers.append("x-split-echo", HeaderValue::from_static("split"));
+            headers.append("x-split-echo", HeaderValue::from_static("token"));
             let calls = self.0.clone();
             let stream = futures_util::stream::once(async move {
                 observe_provider_response(
                     StatusCode::OK,
                     &headers,
-                    &["test-token".into()],
+                    &["test-token".into(), "split, token".into()],
                     &request_headers,
                 )
                 .await;

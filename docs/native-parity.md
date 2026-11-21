@@ -4347,7 +4347,7 @@ OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
 await these callbacks in registration order before reading either a success or
 error body. This includes HTTP errors the native transports receive directly.
 Callback failures are reported as extension diagnostics. The
-callbacks share up to five seconds and at most half the model timeout. The
+callbacks share up to five seconds and at most half the remaining model time. The
 response remains under the adapter's control. Executable extensions advertise
 `after_provider_response_hook` and receive an `after_provider_response`
 request with `event.status`, `event.headers`, and their branch state. Response
