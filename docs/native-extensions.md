@@ -83,6 +83,23 @@ errors remain failures because their origin is unknown. The standard extension
 server advertises the capability and propagates typed errors from extensions it
 hosts, including executable extensions.
 
+## Customize the header and footer
+
+Extensions can send `UiRequest::SetHeader` and `UiRequest::SetFooter` through
+`ExtensionUi`. Each takes `lines` of styled `UiComponentSpan` rows. The
+executable protocol accepts the same requests as `setHeader` and `setFooter`.
+A missing or null `lines` restores the built-in section. An empty array hides
+it. Updates do not open a dialog or wait for terminal input.
+
+Workbench uses the active theme and available width to display the rows in
+regular and fullscreen terminals. The header uses the startup banner slot.
+The footer replaces the working directory and model/usage rows. An extension
+can supply updated rows from terminal session and selection callbacks. These
+callbacks can publish UI updates without waiting for input. Overrides reset
+when switching sessions or replacing the extension worker. Pi's arbitrary
+live components and footer data provider remain specific to its TypeScript UI
+API.
+
 ## Observe extension UI prompts
 
 Opt in with `handles_lifecycle` and `handles_ui_prompt_lifecycle` to observe

@@ -1051,10 +1051,18 @@ async fn run_worker(
                 let mut observer =
                     |notification: pi_rs::Notification<'_>| observe(notification, args.trace);
                 tokio::select! {
-                    _ = pi_rs::notify_extension_lifecycle(
-                        &runtime.registry, event, &states, args.tool_timeout(),
-                        &mut observer,
-                    ) => (),
+                    _ = async {
+                        if args.terminal_managed_worker {
+                            pi_rs::notify_extension_lifecycle_filtered_with_ui(
+                                &runtime.registry, event, &states, args.tool_timeout(),
+                                &mut observer, |_| true,
+                            ).await;
+                        } else {
+                            pi_rs::notify_extension_lifecycle(
+                                &runtime.registry, event, &states, args.tool_timeout(), &mut observer,
+                            ).await;
+                        }
+                    } => (),
                     _ = async {
                         while !stopping.load(Ordering::SeqCst) {
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
