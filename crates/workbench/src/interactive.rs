@@ -627,6 +627,7 @@ enum LocalEditor {
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
+    CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -684,6 +685,7 @@ enum RemoteEvent {
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
     AnthropicCode(tokio::sync::oneshot::Sender<String>),
+    CodexCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -1037,6 +1039,13 @@ struct StreamingTool {
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
+struct TreeNavigationHandoff {
+    id: u64,
+    summarize: bool,
+    instructions: Option<String>,
+    clear_id: Option<uuid::Uuid>,
+}
+
 struct CustomMessageRenderPending {
     request: uuid::Uuid,
     record: u64,
@@ -1054,6 +1063,7 @@ struct View {
     local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
     tree_confirmation: Option<u64>,
     tree_navigation: Option<(u64, bool)>,
+    tree_handoff: Option<TreeNavigationHandoff>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
@@ -2108,20 +2118,45 @@ impl View {
             *finished = true;
         }
     }
+    fn restore_queue(&mut self, response: &Value) -> Result<()> {
+        if response["success"] != true {
+            return Err(Error::Config(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("Queue restore failed")
+                    .into(),
+            ));
+        }
+        let messages: Vec<pi_rs::QueuedMessage> =
+            serde_json::from_value(response["data"]["messages"].clone())?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut text: Vec<_> = messages
+            .iter()
+            .map(|message| message.input.content.as_str())
+            .filter(|text| !text.is_empty())
+            .collect();
+        if !self.editor.text.is_empty() {
+            text.push(&self.editor.text);
+        }
+        self.editor.replace(text.join("\n\n"));
+        let mut images: Vec<_> = messages
+            .into_iter()
+            .flat_map(|message| message.images)
+            .collect();
+        images.append(&mut self.draft_images);
+        self.draft_images = images;
+        Ok(())
+    }
+
     fn receive(&mut self, value: &Value) {
         match value["type"].as_str() {
             Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
                 self.restoring_queue = false;
-                if value["success"] == true {
-                    if let Ok(messages) = serde_json::from_value::<Vec<pi_rs::QueuedMessage>>(value["data"]["messages"].clone()) {
-                        let mut text: Vec<_> = messages.iter().map(|message| message.input.content.clone()).filter(|text| !text.is_empty()).collect();
-                        if !self.editor.text.is_empty() { text.push(self.editor.text.clone()); }
-                        self.editor.replace(text.join("\n\n"));
-                        let mut images: Vec<_> = messages.into_iter().flat_map(|message| message.images).collect();
-                        images.append(&mut self.draft_images);
-                        self.draft_images = images;
-                    }
-                } else { self.append(value["error"].as_str().unwrap_or("Queue restore failed")); }
+                if let Err(error) = self.restore_queue(value) {
+                    self.append(&error.to_string());
+                }
             }
             Some("bash_execution_start") => {
                 self.shell_running = true;
@@ -3617,6 +3652,15 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login"
+            if rest.eq_ignore_ascii_case("openai-codex")
+                || rest.eq_ignore_ascii_case("openai-codex browser") =>
+        {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
         "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
             start_copilot_login(view, &args.settings)
         }
@@ -3656,6 +3700,20 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Browser authorization".into(),
+                            selection: Selection::LoginCodex,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Device authorization".into(),
+                            selection: Selection::LoginCodexDevice,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -4018,7 +4076,7 @@ fn slash(
             );
         }
         "/tree" => {
-            let session = Session::open(&args.session)?;
+            let session = Session::snapshot(&args.session)?;
             let filter =
                 TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
             view.picker = Some(session_tree::picker(&session, filter));
@@ -4749,6 +4807,32 @@ pub(super) async fn run(
                 {
                     view.append(&error);
                 }
+                if value["type"] == "response"
+                    && value["command"] == "clear_queue"
+                    && let Some(handoff) = &view.tree_handoff
+                    && handoff.clear_id.is_some_and(|id| value["id"] == json!(id))
+                {
+                    let result = view.restore_queue(&value).and_then(|()| {
+                        if active.busy && (active.compacting || view.summarizing) {
+                            return Err(tree_compaction_in_progress());
+                        }
+                        if active.busy {
+                            active.send(json!({"type":"cancel"}))?;
+                        }
+                        Ok(())
+                    });
+                    match result {
+                        Ok(()) => {
+                            view.tree_handoff.as_mut().expect("active handoff").clear_id = None
+                        }
+                        Err(error) => {
+                            view.tree_handoff = None;
+                            view.append(&error.to_string());
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 let settled = value["type"] == "agent_settled";
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
@@ -4846,6 +4930,9 @@ pub(super) async fn run(
                 view.cache_warming_status = None;
                 cancel_running_extension_editor(&mut external_editor, None);
                 view.dialogs.clear();
+                if view.tree_handoff.take().is_some() {
+                    view.append("Branch navigation stopped when the active worker exited");
+                }
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
                 {
@@ -4861,6 +4948,25 @@ pub(super) async fn run(
                 view.shell_running = false;
                 dirty = true;
             }
+        }
+        if !is_busy(&worker)
+            && view
+                .tree_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.clear_id.is_none())
+        {
+            let handoff = view.tree_handoff.take().expect("acknowledged tree handoff");
+            if let Err(error) = start_tree_navigation(
+                &args,
+                &mut view,
+                &mut worker,
+                handoff.id,
+                handoff.summarize,
+                handoff.instructions,
+            ) {
+                view.append(&error.to_string());
+            }
+            dirty = true;
         }
         if view
             .custom_render_redraw_at
@@ -4899,6 +5005,15 @@ pub(super) async fn run(
                     view.local_editor = Some((
                         LocalEditor::OpenRouterCode(Some(sender)),
                         crate::ui::dialog::Dialog::secret("OpenRouter code or redirect URL".into()),
+                    ));
+                    dirty = true;
+                }
+                Ok(RemoteEvent::CodexCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::CodexCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret(
+                            "OpenAI Codex code or redirect URL".into(),
+                        ),
                     ));
                     dirty = true;
                 }
@@ -5453,7 +5568,7 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
-                                LocalEditor::AnthropicCode(sender) => {
+                                LocalEditor::AnthropicCode(sender) | LocalEditor::CodexCode(sender) => {
                                     if let Some(sender) = sender.take() { let _ = sender.send(text); }
                                     Ok(())
                                 }
@@ -5498,7 +5613,10 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
-                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                            } else if matches!(
+                                editor,
+                                LocalEditor::AnthropicCode(_) | LocalEditor::CodexCode(_)
+                            ) {
                                 interrupt_remote_task(&mut view);
                             }
                         }
@@ -5593,7 +5711,7 @@ pub(super) async fn run(
                         }
                         Input::CopyTreeRecord(id) => {
                             picker.show_feedback(
-                                Session::open(&args.session)
+                                Session::snapshot(&args.session)
                                     .and_then(|session| sessions::tree_record_text(&session, id))
                                     .and_then(|text| sessions::copy_text(&text))
                                     .map(|()| "Copied entry".into())
@@ -5983,6 +6101,7 @@ pub(super) async fn run(
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
+                    "app.message.dequeue" | "app.interrupt" if view.tree_handoff.is_some() => {}
                     "app.message.dequeue" => {
                         match Worker::control(&mut worker, &args, json!({"type":"clear_queue"})) {
                             Ok(()) => view.restoring_queue = true,
@@ -6035,13 +6154,19 @@ pub(super) async fn run(
                             }
                         }
                     }
-                    "app.session.new" | "app.session.tree" | "app.session.fork"
-                    | "app.session.resume"
-                        if !is_busy(&worker) =>
+                    "app.session.tree"
+                        if view.tree_handoff.is_none() && view.tree_navigation.is_none() =>
+                    {
+                        if let Err(error) = slash("/tree", &mut args, &mut view, Some(&mut worker))
+                        {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.session.new" | "app.session.fork" | "app.session.resume"
+                        if !is_busy(&worker) && view.tree_handoff.is_none() =>
                     {
                         let command = match action {
                             "app.session.new" => "/new",
-                            "app.session.tree" => "/tree",
                             "app.session.fork" => "/fork",
                             _ => "/resume",
                         };
@@ -6105,7 +6230,7 @@ pub(super) async fn run(
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
-                        if view.tree_navigation.is_some() {
+                        if view.tree_navigation.is_some() || view.tree_handoff.is_some() {
                             continue;
                         }
                         if view.clipboard.is_some() {
@@ -6192,7 +6317,7 @@ pub(super) async fn run(
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if matches!(input.trim(), "/session" | "/share")
+                        } else if matches!(input.trim(), "/session" | "/share" | "/tree")
                             && view.draft_images.is_empty()
                         {
                             if let Err(error) =
@@ -6697,6 +6822,41 @@ fn take_device_code_action(
     view.remote_task.as_mut()?.device_code.take()
 }
 
+fn start_codex_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::codex_auth::Method,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to OpenAI Codex",
+        "OpenAI Codex login cancelled",
+        move |sender| async move {
+            super::codex_auth::login(&settings, task_control, method, |notice| match notice {
+                super::codex_auth::Notice::Device { url, code } => {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_owned(),
+                        code,
+                    });
+                }
+                super::codex_auth::Notice::Browser(url, input) => {
+                    let _ = sender.send(RemoteEvent::Notice(format!(
+                        "Continue in your browser: {url}"
+                    )));
+                    let _ = sender.send(RemoteEvent::CodexCode(input));
+                }
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenAI Codex".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -6870,6 +7030,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to OpenAI Codex" {
+            "OpenAI Codex sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to GitHub Copilot" {
             "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
@@ -6886,7 +7048,9 @@ fn clear_openrouter_editor(view: &mut View) {
     if matches!(
         view.local_editor,
         Some((
-            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            LocalEditor::OpenRouterCode(_)
+                | LocalEditor::AnthropicCode(_)
+                | LocalEditor::CodexCode(_),
             _
         ))
     ) {
@@ -7073,6 +7237,10 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
     Ok(())
 }
 
+fn tree_compaction_in_progress() -> Error {
+    Error::Config("Wait for the current compaction or tree navigation to finish before navigating the session tree".into())
+}
+
 fn start_tree_navigation(
     args: &Cli,
     view: &mut View,
@@ -7081,6 +7249,28 @@ fn start_tree_navigation(
     summarize: bool,
     instructions: Option<String>,
 ) -> Result<()> {
+    if view.tree_handoff.is_some() || view.tree_navigation.is_some() {
+        return Err(tree_compaction_in_progress());
+    }
+    if let Some(active) = worker.as_mut() {
+        if active.bashing {
+            return Err(Error::Config("Wait for the shell command to finish".into()));
+        }
+        if active.busy {
+            if active.compacting || view.summarizing {
+                return Err(tree_compaction_in_progress());
+            }
+            let clear_id = uuid::Uuid::new_v4();
+            active.send(json!({"type":"clear_queue", "id": clear_id}))?;
+            view.tree_handoff = Some(TreeNavigationHandoff {
+                id,
+                summarize,
+                instructions,
+                clear_id: Some(clear_id),
+            });
+            return Ok(());
+        }
+    }
     let configured_reserve = &args.settings.value()["branchSummary"]["reserveTokens"];
     let reserve_tokens = configured_reserve
         .as_u64()
@@ -7746,7 +7936,7 @@ fn select(
             )?;
         }
         Selection::Checkout(id) => {
-            if id == Session::open(&args.session)?.head() {
+            if id == Session::snapshot(&args.session)?.head() {
                 view.append("Already at this point");
             } else if args.settings.value()["branchSummary"]["skipPrompt"] == true {
                 start_tree_navigation(args, view, worker, id, false, None)?;
@@ -7806,6 +7996,12 @@ fn select(
                 },
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
+        }
+        Selection::LoginCodex => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        Selection::LoginCodexDevice => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
         Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),

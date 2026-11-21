@@ -2338,16 +2338,27 @@ impl Agent<'_> {
                     } else {
                         None
                     };
+                    // Pi exposes an attempt before preparation or authorization.
+                    // The durable ToolStarted record still marks actual dispatch.
+                    let start = (observe_tools || registry.publish_tool_attempts).then(|| {
+                        crate::LifecycleEvent::ToolExecutionStart {
+                            tool_call_id: invocation.call.id.clone(),
+                            tool_name: invocation.call.name.clone(),
+                            args: crate::parse_tool_arguments(&invocation.call.arguments)
+                                .unwrap_or(serde_json::Value::Null),
+                            parent_tool_call_id: parent,
+                        }
+                    });
+                    if registry.publish_tool_attempts
+                        && let Some(event) = &start
+                    {
+                        with_tool_attempt(invocation.operation_id, || {
+                            observer(Notification::ToolProgress(event));
+                        });
+                    }
                     futures.push(async move {
                         let mut errors = Vec::new();
-                        if observe_tools {
-                            // Upstream Pi emits raw model arguments here before
-                            // prepareToolCall; strict normalization is for execution.
-                            let event = crate::LifecycleEvent::ToolExecutionStart {
-                                tool_call_id: invocation.call.id.clone(), tool_name: invocation.call.name.clone(),
-                                args: crate::parse_tool_arguments(&invocation.call.arguments).unwrap_or(serde_json::Value::Null),
-                                parent_tool_call_id: parent,
-                            };
+                        if observe_tools && let Some(event) = start {
                             let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
                             tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&registry, event, &state_snapshot, model_timeout, &mut collect, hook_host) => {} }
                         }

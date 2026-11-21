@@ -471,6 +471,7 @@ impl CacheRetention {
 pub enum ModelApi {
     OpenaiCompletions,
     OpenaiResponses,
+    OpenaiCodexResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
     BedrockConverseStream,
@@ -482,6 +483,7 @@ impl ModelApi {
         match name {
             "openai-completions" => Some(Self::OpenaiCompletions),
             "openai-responses" => Some(Self::OpenaiResponses),
+            "openai-codex-responses" => Some(Self::OpenaiCodexResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             "google-generative-ai" => Some(Self::GoogleGenerativeAi),
             "bedrock-converse-stream" => Some(Self::BedrockConverseStream),
@@ -494,6 +496,7 @@ impl ModelApi {
         match self {
             Self::OpenaiCompletions => "openai-completions",
             Self::OpenaiResponses => "openai-responses",
+            Self::OpenaiCodexResponses => "openai-codex-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
             Self::BedrockConverseStream => "bedrock-converse-stream",

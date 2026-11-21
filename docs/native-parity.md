@@ -559,6 +559,10 @@ turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
 `toolcall_start` includes the ID and tool name available at that point.
+JSON and RPC emit `tool_execution_start` before preparation and authorization,
+including for rejected attempts. As in Pi, unparseable or non-object arguments
+appear as an empty object. The native `ToolStarted` journal record is reserved
+for dispatch.
 JSON and RPC `message_update` events include Pi's top-level `usage` object.
 Its counters start at zero and use the reported totals once the provider
 finishes. Providers that report usage incrementally in Pi can therefore expose
@@ -1029,6 +1033,10 @@ discovery uses the scopes granted through `pi mcp login`.
 Loopback RPC and PTY checks covered consent, decline, scope union, one retry,
 and credential generation changes. The existing OAuth and live catalog checks
 passed with the same implementation.
+
+Servers that return JSON-RPC Method not found for `resources/templates/list`
+produce an empty template list, including when a page cursor is supplied.
+Other template errors remain visible.
 
 ### Remote model read operations
 
@@ -2069,10 +2077,11 @@ are treated as omissions, and edit batches also normalize replacement fields.
 Scoped tools and injected operations retain their argument handling.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
-context lines, bounds long displayed lines at 500 characters, and reports match
-and byte limits. Large text files remain searchable. Overlapping context ranges
-are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
-radius is limited to 1,000 lines.
+context lines, bounds long displayed lines at 500 UTF-16 units, and reports
+match and byte limits. The unrestricted local tool uses ripgrep's context
+events as in Pi 1.6.0. When the context exceeds the native searcher's 64 MiB
+buffer, it indexes matches on disk and streams the selected context from the
+same open file.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
 JSON numbers as JavaScript doubles. `ls` compares the number directly, including
@@ -2080,7 +2089,9 @@ zero, negative and fractional values. Local `find` reproduces fd's numeric
 argument parsing: zero means unlimited, while negative, fractional, and values
 outside fd's host-sized integer range produce fd-style errors before checking
 the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Notices and details retain the JavaScript numeric value. Scoped tools retain their positive
+without an added failure prefix. Generated local tool errors carry Pi's empty
+`details` object in JSON and RPC. Notices and details retain the JavaScript
+numeric value. Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
@@ -2178,6 +2189,15 @@ remote-workspace resumption, filters, path display and terminal restoration.
 The Rust 1.89 CI matrix passed formatting, all-target Clippy and workspace tests
 on Linux, macOS and Windows at commit `706a249`. Subsequent changes receive the
 same matrix on main.
+
+### SDK extension event bus
+
+`pi_rs_extensions::ExtensionEventBus` provides an in-process Pi-style channel
+bus for native SDK hosts and extensions. One subscription can be removed
+without affecting other listeners, and the host can clear the bus. The
+embedding host shares the bus and owns subscription lifetime. Rust handlers
+run synchronously with JSON values, and failures are returned to the emitter.
+Executable extensions use a separate process protocol.
 
 ### Native extension host calls
 
@@ -2613,7 +2633,12 @@ Searching includes records inside folded branches. Shift+L edits or removes a
 record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
 journal lock before restoring the view.
 After tree navigation, the selected user message fills an empty editor. A draft
-already in the editor keeps its text and any native image attachments.
+already in the editor keeps its text and any native image attachments. While
+a response streams, `/tree` and its shortcut read the committed journal without
+interrupting the response. Confirming another branch restores queued prompts
+and images to the editor, stops the response, and navigates after the worker
+settles. An active compaction prevents navigation. Label edits remain subject
+to the native journal's exclusive write lock.
 
 Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
 folding, search, labels, checkout and terminal restoration. Session and queue
@@ -2624,6 +2649,8 @@ theme roles. Native record IDs remain searchable for direct checkout. Custom
 messages and imported compaction summaries can be copied from the tree.
 Copying an imported assistant failure with empty content uses its original
 error message, including line breaks.
+The all-entries filter shows thinking-level changes as separate bookkeeping
+rows, including imported changes made before a model was selected.
 Message preview and navigation gaps remain in the Sessions row.
 
 ### Package identity checkpoint
@@ -3223,24 +3250,19 @@ Malformed `glob` filters report the original glob with ripgrep's diagnostic
 before regex compilation. Unrestricted local `grep` and `ls` report the
 requested path as missing when an intermediate component is a regular file.
 
-Grep now emits a separate context block for each match, including repeated lines
-where adjacent matches overlap. The matching marker belongs to that block's
-center; a neighboring match uses the context marker. Pending blocks flush at EOF,
-including the final empty line when the file ends with a newline. The streaming
-implementation retains a bounded context window and bounded output.
+Unrestricted local grep emits each matching or context line once, keeps
+embedded carriage returns, and stops at the last real line of each file.
+Numeric match limits are floored and clamped to at least one. The notice
+is reported only when another match exceeds that effective limit, including
+in a different file. An extra match within the last selected match's trailing
+context uses the context marker. Long lines use Pi's 500 UTF-16-unit cutoff
+without splitting a surrogate pair. Match counting continues after the 50 KB
+output limit, so byte and line totals cover all selected output.
+Scoped tools retain their existing per-match context blocks and line truncation.
 
-Long lines use Pi's 500 UTF-16-unit cutoff. A split surrogate is rendered as a
-replacement character in native UTF-8 text. Match counting continues after the
-50 KB output limit, so combined match, byte and long-line notices reflect the
-same selected matches as the reference. Notice wording also matches Pi.
-
-Regression tests cover overlapping blocks, the final selected match's context,
-EOF with and without a trailing newline, surrogate boundaries, and combined
-limits. Direct execution of the pinned Pi tool confirmed the context output and
-the 101-line, 51,098-byte combined-limit result. A loopback CLI test also verified
-that invoking the native grep tool delivers those per-match context blocks to
-the next model request. Workspace tests and all-target Clippy passed. Other local-tool differences,
-including structured result details and find traversal, remain open.
+Regressions cover overlapping context, the final selected match's context,
+exact and exceeded limits, CRLF and embedded CR, and surrogate boundaries.
+The published Pi 1.6.0 tool produced the same representative results.
 
 ### Find traversal and glob checkpoint
 
@@ -3716,9 +3738,10 @@ Workspace tests, the imported-details regression and all-target Clippy pass.
 ### Numbered edit diff checkpoint
 
 Native edit results preserve a numbered display diff alongside the unified
-patch. The display diff uses old-file numbers for deletions and context,
-new-file numbers for insertions, and four context lines on either side of a
-change. Omitted ranges appear as ellipses. The terminal prefers the numbered
+patch. Unified hunk headers use Pi's explicit line counts, including for a
+single line and zero-length ranges. The display diff uses old-file numbers for
+deletions and context, new-file numbers for insertions, and four context lines
+on either side of a change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
 and uses the existing word highlighting for single-line changes. Added, removed
 and context rows use the corresponding Pi theme roles. Numbered rows wrap at
@@ -4860,6 +4883,24 @@ Baseten and NVIDIA's pinned chat-completions catalogs are also available,
 including model-specific compatibility, NVIDIA polling headers and Baseten's
 thinking template. Catalog entries that use other upstream APIs still need
 their own adapters.
+
+### OpenAI Codex
+
+`openai-codex` exposes the eight pinned models through the ChatGPT Codex
+Responses route. It supports native HTTP streaming, model-specific reasoning
+levels, image inputs, tool calls, and endpoint-bound response replay.
+`pi login openai-codex` uses browser PKCE, and `--device-code` selects
+device authorization. Browser sign-in also accepts a pasted code or redirect.
+The terminal offers both methods. Existing Pi Codex
+credentials can be read and refreshed in place. A refresh in flight saves
+rotated credentials even when the requesting turn is cancelled. They stay bound to the
+official Codex endpoint and are independent of native `openai-chatgpt` accounts.
+
+The native transport sends uncompressed JSON over HTTP SSE. The upstream
+WebSocket transport and specialized Codex
+grammar tools and tool search remain open. Authentication was exercised with
+fixtures. Live sign-in and inference were unverified because no account was
+available for acceptance.
 
 ### GitHub Copilot
 
