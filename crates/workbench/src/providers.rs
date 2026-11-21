@@ -30,6 +30,7 @@ pub(super) enum Provider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Adapter {
     ChatCompletions,
+    MistralConversations,
     OpenAiResponses,
     CodexResponses,
     Anthropic,
@@ -42,6 +43,7 @@ impl Adapter {
     pub fn named(api: &str) -> Option<Self> {
         match api {
             "openai-completions" => Some(Self::ChatCompletions),
+            "mistral-conversations" => Some(Self::MistralConversations),
             "openai-responses" => Some(Self::OpenAiResponses),
             "openai-codex-responses" => Some(Self::CodexResponses),
             "anthropic-messages" => Some(Self::Anthropic),
@@ -55,6 +57,7 @@ impl Adapter {
     pub fn api(self) -> &'static str {
         match self {
             Self::ChatCompletions => "openai-completions",
+            Self::MistralConversations => "mistral-conversations",
             Self::OpenAiResponses => "openai-responses",
             Self::CodexResponses => "openai-codex-responses",
             Self::Anthropic => "anthropic-messages",
@@ -193,6 +196,11 @@ impl Provider {
                     pi_rs::openai::OpenAiResponses::new_api_provider(endpoint, token, self.id())?
                 }))
             }
+            Adapter::MistralConversations => Ok(Client::Ollama(
+                Ollama::new(endpoint, Some(token.ok_or_else(missing_key)?))?
+                    .with_provider(self.id())
+                    .with_mistral(false, false, None),
+            )),
             Adapter::ChatCompletions => {
                 if self.id() == "cloudflare-ai-gateway" && endpoint.is_empty() {
                     return Err(Error::Config(
@@ -519,7 +527,10 @@ impl Client {
             Self::OpenAi(_) | Self::Ollama(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
-                Adapter::OpenAiResponses | Adapter::CodexResponses | Adapter::ChatCompletions
+                Adapter::OpenAiResponses
+                    | Adapter::CodexResponses
+                    | Adapter::ChatCompletions
+                    | Adapter::MistralConversations
             ),
             _ => false,
         }
@@ -532,7 +543,10 @@ impl Client {
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
-                    Adapter::OpenAiResponses | Adapter::CodexResponses | Adapter::ChatCompletions
+                    Adapter::OpenAiResponses
+                        | Adapter::CodexResponses
+                        | Adapter::ChatCompletions
+                        | Adapter::MistralConversations
                 ) =>
             {
                 return Box::pin(client.resolve().await?.with_final_strict_support(supported))
@@ -550,6 +564,7 @@ impl Client {
                 Adapter::OpenAiResponses
                     | Adapter::CodexResponses
                     | Adapter::ChatCompletions
+                    | Adapter::MistralConversations
                     | Adapter::Google
                     | Adapter::Anthropic
             ),
@@ -951,6 +966,7 @@ impl Client {
                     Adapter::OpenAiResponses
                         | Adapter::CodexResponses
                         | Adapter::ChatCompletions
+                        | Adapter::MistralConversations
                         | Adapter::Google
                         | Adapter::Anthropic
                 ) =>
@@ -1095,6 +1111,40 @@ impl Client {
         Ok(match self {
             Self::Ollama(client) => {
                 let configured = args.model_profiles.model(&args.provider, &args.model);
+                let mistral = args
+                    .model_profiles
+                    .model_adapter(&args.provider, &args.model)
+                    == Adapter::MistralConversations;
+                let client = if mistral {
+                    let thinking_enabled = thinking.is_some_and(|level| level != "off");
+                    let reasoning_allowed = configured
+                        .as_ref()
+                        .is_some_and(|model| model.reasoning == Some(true));
+                    let has_map = configured
+                        .as_ref()
+                        .is_some_and(|model| model.has_thinking_map());
+                    let effort = configured
+                        .as_ref()
+                        .filter(|_| reasoning_allowed && has_map)
+                        .and_then(|model| {
+                            let level = thinking.unwrap_or("off");
+                            model
+                                .mapped_effort(level)
+                                .flatten()
+                                .or(thinking_enabled.then_some("high"))
+                        });
+                    let images = configured
+                        .as_ref()
+                        .and_then(|model| model.supports_images())
+                        == Some(true);
+                    client.with_mistral(
+                        images,
+                        reasoning_allowed && !has_map && thinking_enabled,
+                        effort,
+                    )
+                } else {
+                    client
+                };
                 let retention = args
                     .model_profiles
                     .chat_cache_support(&args.provider, &args.model, configured.as_ref())
@@ -1109,7 +1159,7 @@ impl Client {
                 );
                 let client = client
                     .with_cache_retention(retention)
-                    .with_prompt_cache_policy(key_enabled, long);
+                    .with_prompt_cache_policy(key_enabled || mistral, long && !mistral);
                 let mapped = configured.as_ref().and_then(|model| {
                     let level = thinking.or((model.reasoning == Some(true)).then_some("off"))?;
                     model.mapped_effort(level)
@@ -1124,6 +1174,8 @@ impl Client {
                 let compatibility = args
                     .model_profiles
                     .chat_compatibility(&args.provider, configured.as_ref());
+                let default_mistral_strict =
+                    mistral && compatibility.supports_strict_mode().is_none();
                 let client = client.with_chat_compatibility(
                     compatibility,
                     super::thinking::adopted_reasoning(args),
@@ -1132,6 +1184,11 @@ impl Client {
                         .as_ref()
                         .is_none_or(|model| model.mapped_effort("off") != Some(None)),
                 );
+                let client = if default_mistral_strict {
+                    client.with_strict_tool_support(true)
+                } else {
+                    client
+                };
                 let sampling = configured
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();

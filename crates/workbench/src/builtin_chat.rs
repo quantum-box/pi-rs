@@ -115,6 +115,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({}),
     },
     Builtin {
+        id: "mistral",
+        endpoint: "https://api.mistral.ai/v1/chat/completions",
+        env: "MISTRAL_API_KEY",
+        compatibility: || json!({"supportsStrictMode":true}),
+    },
+    Builtin {
         id: "moonshotai",
         endpoint: "https://api.moonshot.ai/v1/chat/completions",
         env: "MOONSHOT_API_KEY",
@@ -268,6 +274,7 @@ impl Builtin {
             id: Arc::from(self.id),
             adapter: match self.id {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
+                "mistral" => Adapter::MistralConversations,
                 "openai-codex" => Adapter::CodexResponses,
                 "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
@@ -287,6 +294,7 @@ impl Builtin {
             ) => Some(""),
             (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
+            (Adapter::MistralConversations, "mistral") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
                 if !matches!(
                     id,
@@ -297,6 +305,7 @@ impl Builtin {
                         | "minimax"
                         | "minimax-cn"
                         | "vercel-ai-gateway"
+                        | "mistral"
                 ) =>
             {
                 Some(self.endpoint)

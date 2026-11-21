@@ -84,7 +84,7 @@ impl FinalStrictPolicy {
                 self.profiles
                     .chat_compatibility(&self.provider, metadata.as_ref())
                     .supports_strict_mode()
-                    == Some(true)
+                    .unwrap_or(adapter == super::providers::Adapter::MistralConversations)
             },
         )
     }
