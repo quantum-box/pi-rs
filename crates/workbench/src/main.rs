@@ -469,8 +469,15 @@ impl Cli {
                     return None;
                 }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    return builtin
-                        .is_official_endpoint(endpoint)
+                    let eligible = if provider.id() == "azure" {
+                        !endpoint.is_empty()
+                            && self
+                                .model_profiles
+                                .has_provider_endpoint(provider, endpoint)
+                    } else {
+                        builtin.is_official_endpoint(endpoint)
+                    };
+                    return eligible
                         .then(|| std::env::var(builtin.env()).ok())
                         .flatten()
                         .filter(|key| !key.trim().is_empty())

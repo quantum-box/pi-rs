@@ -26,6 +26,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","thinkingFormat":"ant-ling","supportsStrictMode":true}),
     },
     Builtin {
+        id: "azure",
+        endpoint: "",
+        env: "AZURE_OPENAI_API_KEY",
+        compatibility: standard,
+    },
+    Builtin {
         id: "baseten",
         endpoint: "https://inference.baseten.co/v1/chat/completions",
         env: "BASETEN_API_KEY",
@@ -232,6 +238,7 @@ impl Builtin {
             id: Arc::from(self.id),
             adapter: match self.id {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
+                "azure" => Adapter::AzureResponses,
                 "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
             },
@@ -244,6 +251,7 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
+            (_, "azure") => None,
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
                 if !matches!(

@@ -342,6 +342,18 @@ execution time. Rust tools with a host can emit bounded progress while running;
 the built-in shell tool emits bounded cumulative output updates. Other built-in
 tool progress and completion-order notifications remain open.
 
+### Azure OpenAI checkpoint
+
+Azure exposes the 45 pinned chat models and chooses Responses or Chat
+Completions per model. Configure the account with `AZURE_OPENAI_BASE_URL`
+or `AZURE_OPENAI_RESOURCE_NAME` and authenticate with `AZURE_OPENAI_API_KEY`
+or a saved key. An explicit `models.json` provider base URL takes precedence
+over the environment. `AZURE_OPENAI_API_VERSION` configures the Responses
+query parameter, and `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` replaces the wire
+model name while preserving the catalog ID. Responses uses an `api-key`
+header and Chat Completions uses a bearer token. Live Azure inference
+has not been verified.
+
 ### Meta Responses API-key checkpoint
 
 The `meta` provider includes Pi v1.5.0's six Muse models, including their

@@ -18,6 +18,8 @@ pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
     revision: String,
     radius_endpoint: Option<String>,
+    azure_api_version: Option<String>,
+    azure_deployments: BTreeMap<String, String>,
     operations: super::operation_models::Catalogue,
 }
 
@@ -583,6 +585,7 @@ impl ModelMetadata {
             Adapter::ChatCompletions
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
+                | Adapter::AzureResponses
                 | Adapter::Google
                 | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
@@ -714,11 +717,54 @@ static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLo
     models
 });
 
+fn configure_azure(data: &mut Value, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+    let explicit = env("AZURE_OPENAI_BASE_URL").filter(|base| !base.trim().is_empty());
+    let base = if let Some(base) = explicit {
+        base.trim().to_owned()
+    } else if let Some(resource) = env("AZURE_OPENAI_RESOURCE_NAME").filter(|name| !name.is_empty())
+    {
+        if !resource
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || resource.starts_with('-')
+            || resource.ends_with('-')
+            || resource.len() > 63
+        {
+            return Err(Error::Config("invalid AZURE_OPENAI_RESOURCE_NAME".into()));
+        }
+        format!("https://{resource}.openai.azure.com")
+    } else {
+        return Ok(());
+    };
+    let providers = data
+        .as_object_mut()
+        .and_then(|data| {
+            data.entry("providers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        })
+        .ok_or_else(|| Error::Config("models.json providers must be an object".into()))?;
+    let name = providers
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("azure"))
+        .cloned();
+    let azure = providers
+        .entry(name.unwrap_or_else(|| "azure".into()))
+        .or_insert_with(|| serde_json::json!({}));
+    let azure = azure
+        .as_object_mut()
+        .ok_or_else(|| Error::Config("invalid models.json profile for azure".into()))?;
+    azure
+        .entry("baseUrl")
+        .or_insert_with(|| serde_json::json!(base));
+    Ok(())
+}
+
 impl Profiles {
     pub fn load() -> Result<Self> {
         let path = config::agent_dir().join("models.json");
-        let data = config::read_object(&path)?;
-        let mut profiles = Self::parse(&data)?;
+        let mut data = config::read_object(&path)?;
+        let mut profiles = Self::parse_with_azure_env(&mut data, |key| std::env::var(key).ok())?;
         if std::env::var_os("PI_RADIUS_GATEWAY").is_some() {
             let endpoint = super::radius_auth::model_endpoint(
                 &super::radius_auth::Gateway::configured_origin()?,
@@ -736,6 +782,20 @@ impl Profiles {
                 profile.provider_endpoints.insert(endpoint.clone());
             }
             profiles.radius_endpoint = Some(endpoint);
+        }
+        Ok(profiles)
+    }
+
+    pub(super) fn parse_with_azure_env(
+        data: &mut Value,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        configure_azure(data, &env)?;
+        let mut profiles = Self::parse(data)?;
+        profiles.azure_api_version =
+            env("AZURE_OPENAI_API_VERSION").filter(|value| !value.is_empty());
+        if let Some(mapping) = env("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
+            profiles.azure_deployments = parse_azure_deployments(&mapping);
         }
         Ok(profiles)
     }
@@ -788,7 +848,7 @@ impl Profiles {
             if profile
                 .api
                 .as_deref()
-                .is_some_and(|api| api != provider.api())
+                .is_some_and(|api| Adapter::named(api) != Some(provider.adapter()))
             {
                 return Err(Error::Config(format!(
                     "models.json profile {} requires the {} API",
@@ -881,13 +941,16 @@ impl Profiles {
                     let Some(adapter) = model.api.as_deref().and_then(Adapter::named) else {
                         continue;
                     };
-                    let Some(official) = builtin.endpoint_for(adapter) else {
-                        continue;
-                    };
-                    let endpoint = profile.base_url.as_deref().map_or_else(
-                        || Ok(official.to_owned()),
-                        |base| endpoint_from_base(&provider, adapter, base),
-                    )?;
+                    let endpoint =
+                        match (profile.base_url.as_deref(), builtin.endpoint_for(adapter)) {
+                            (Some(base), official)
+                                if official.is_some() || provider.id() == "azure" =>
+                            {
+                                endpoint_from_base(&provider, adapter, base)?
+                            }
+                            (_, Some(official)) => official.to_owned(),
+                            _ => continue,
+                        };
                     provider_endpoints.insert(endpoint.clone());
                     model_endpoints.insert(model.id.clone(), endpoint);
                 }
@@ -931,8 +994,18 @@ impl Profiles {
             entries,
             revision,
             radius_endpoint: None,
+            azure_api_version: None,
+            azure_deployments: BTreeMap::new(),
             operations,
         })
+    }
+
+    pub fn azure_api_version(&self) -> &str {
+        self.azure_api_version.as_deref().unwrap_or("v1")
+    }
+
+    pub fn azure_deployments(&self) -> &BTreeMap<String, String> {
+        &self.azure_deployments
     }
 
     pub fn operations(&self) -> &super::operation_models::Catalogue {
@@ -1106,11 +1179,14 @@ impl Profiles {
     pub(super) fn responses_strict_tool_support(
         &self,
         provider: &Provider,
+        adapter: Adapter,
         model: Option<&ModelMetadata>,
     ) -> bool {
         self.chat_compatibility(provider, model)
             .supports_strict_mode()
-            .unwrap_or_else(|| provider.id() == "openai-chatgpt")
+            .unwrap_or_else(|| {
+                provider.id() == "openai-chatgpt" || adapter == Adapter::AzureResponses
+            })
     }
 
     fn cache_compatibility(
@@ -1315,7 +1391,7 @@ impl Profiles {
         if !matches!(
             adapter,
             Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
-        ) || provider.id() == "openai-chatgpt"
+        ) || matches!(provider.id(), "openai-chatgpt" | "azure")
         {
             return &[];
         }
@@ -1443,6 +1519,18 @@ impl Profiles {
     }
 }
 
+fn parse_azure_deployments(mapping: &str) -> BTreeMap<String, String> {
+    mapping
+        .split(',')
+        .filter_map(|entry| {
+            let mut pair = entry.split('=').map(str::trim);
+            let model = pair.next()?;
+            let deployment = pair.next()?;
+            (!model.is_empty() && !deployment.is_empty()).then(|| (model.into(), deployment.into()))
+        })
+        .collect()
+}
+
 fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Result<String> {
     let invalid = || Error::Config(format!("invalid models.json baseUrl for {}", provider.id()));
     let mut url = reqwest::Url::parse(base).map_err(|_| invalid())?;
@@ -1459,7 +1547,7 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
 
     let suffix = match adapter {
         Adapter::ChatCompletions => "/chat/completions",
-        Adapter::OpenAiResponses => "/responses",
+        Adapter::OpenAiResponses | Adapter::AzureResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Bedrock => return Ok(url.to_string()),
         Adapter::Google => {
@@ -1470,7 +1558,19 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
         }
     };
     let path = url.path().trim_end_matches('/');
-    let path = if path.ends_with(suffix) {
+    let azure_host = (provider.id() == "azure" || adapter == Adapter::AzureResponses)
+        && url.host_str().is_some_and(|host| {
+            [
+                ".openai.azure.com",
+                ".cognitiveservices.azure.com",
+                ".ai.azure.com",
+            ]
+            .into_iter()
+            .any(|domain| host.ends_with(domain))
+        });
+    let path = if azure_host && matches!(path, "" | "/openai" | "/openai/v1/responses") {
+        format!("/openai/v1{suffix}")
+    } else if path.ends_with(suffix) {
         path.to_owned()
     } else if path.is_empty()
         && provider.id() == "deepseek"
@@ -2244,6 +2344,68 @@ mod tests {
             assert!(levels.contains(&"high".into()));
             assert!(!levels.contains(&"off".into()));
         }
+    }
+
+    #[test]
+    fn azure_profiles_scope_credentials_to_configured_resource_routes() {
+        let mut data = json!({});
+        let profiles = Profiles::parse_with_azure_env(&mut data, |key| match key {
+            "AZURE_OPENAI_RESOURCE_NAME" => Some("configured-account".into()),
+            "AZURE_OPENAI_API_VERSION" => Some("preview".into()),
+            "AZURE_OPENAI_DEPLOYMENT_NAME_MAP" => Some("o4-mini = deployment,invalid".into()),
+            _ => None,
+        })
+        .unwrap();
+        let azure = profiles.provider("azure").unwrap();
+        assert_eq!(profiles.model_ids(&azure).len(), 45);
+        assert_eq!(profiles.model_ids(&azure)[0], "chat-latest");
+        assert_eq!(profiles.azure_api_version(), "preview");
+        assert_eq!(
+            profiles
+                .azure_deployments()
+                .get("o4-mini")
+                .map(String::as_str),
+            Some("deployment")
+        );
+
+        let keys = super::super::model_auth::Keys::parse(
+            &json!({"azure":{"type":"api_key","key":"fixture"}}),
+        );
+        for (model, adapter, endpoint) in [
+            (
+                "o4-mini",
+                Adapter::AzureResponses,
+                "https://configured-account.openai.azure.com/openai/v1/responses",
+            ),
+            (
+                "deepseek-v4-pro",
+                Adapter::ChatCompletions,
+                "https://configured-account.openai.azure.com/openai/v1/chat/completions",
+            ),
+        ] {
+            assert_eq!(profiles.model_adapter(&azure, model), adapter);
+            assert_eq!(profiles.model_endpoint(&azure, model), Some(endpoint));
+            assert!(profiles.has_provider_endpoint(&azure, endpoint));
+            assert_eq!(
+                keys.custom_credential(&azure, endpoint, &profiles)
+                    .and_then(|key| key.literal()),
+                Some("fixture")
+            );
+        }
+        assert!(
+            keys.custom_credential(
+                &azure,
+                "https://other.openai.azure.com/openai/v1/responses",
+                &profiles
+            )
+            .is_none()
+        );
+        assert!(
+            Profiles::parse_with_azure_env(&mut json!({}), |key| {
+                (key == "AZURE_OPENAI_RESOURCE_NAME").then(|| "other.example/path".into())
+            })
+            .is_err()
+        );
     }
 
     #[test]

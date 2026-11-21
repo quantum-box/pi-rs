@@ -72,15 +72,24 @@ impl FinalStrictPolicy {
         {
             return Ok(false);
         }
-        Ok(if adapter == super::providers::Adapter::OpenAiResponses {
-            self.profiles
-                .responses_strict_tool_support(&self.provider, metadata.as_ref())
-        } else {
-            self.profiles
-                .chat_compatibility(&self.provider, metadata.as_ref())
-                .supports_strict_mode()
-                == Some(true)
-        })
+        Ok(
+            if matches!(
+                adapter,
+                super::providers::Adapter::OpenAiResponses
+                    | super::providers::Adapter::AzureResponses
+            ) {
+                self.profiles.responses_strict_tool_support(
+                    &self.provider,
+                    adapter,
+                    metadata.as_ref(),
+                )
+            } else {
+                self.profiles
+                    .chat_compatibility(&self.provider, metadata.as_ref())
+                    .supports_strict_mode()
+                    == Some(true)
+            },
+        )
     }
 }
 
