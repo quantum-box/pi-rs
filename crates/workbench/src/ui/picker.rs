@@ -1147,7 +1147,7 @@ impl Picker {
     fn settings_heading(&self, prefix: &str, theme: &Theme, width: usize) -> Line {
         let query = super::render::clean(&self.query.text);
         let available = width.saturating_sub(prefix.width());
-        if available == 0 || query.is_empty() {
+        if available == 0 {
             return Line::themed(prefix, theme, "accent");
         }
         let before_cursor = &self.query.text[..self.query.cursor.min(self.query.text.len())];
@@ -2557,6 +2557,13 @@ mod tests {
         let keys = Keys::default();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
+        let empty = picker.render(&Theme::system(), 80, 20, &keys);
+        assert!(
+            empty[0]
+                .spans
+                .iter()
+                .any(|span| span.inverse && span.text == " ")
+        );
         picker.paste("ttp timeout");
         picker.input(key(KeyCode::Home), &keys);
         picker.input(key(KeyCode::Char('h')), &keys);
