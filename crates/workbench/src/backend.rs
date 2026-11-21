@@ -37,7 +37,7 @@ enum Request {
         session: PathBuf,
     },
     CacheWarmingChanged,
-    RenderCustomMessage {
+    RenderTranscriptExtension {
         id: Uuid,
         record_id: u64,
         options: pi_rs::CustomMessageRenderOptions,
@@ -168,6 +168,7 @@ enum Request {
 }
 struct ReaderControls {
     snapshot: Arc<Mutex<SessionSnapshot>>,
+    render_transcript: bool,
     auto_compaction: pi_rs::AutoCompactionControl,
     retry: pi_rs::RetryControl,
     command_catalog: Arc<Mutex<serde_json::Value>>,
@@ -824,6 +825,7 @@ async fn run_worker(
         ui.clone(),
         ReaderControls {
             snapshot: snapshot.clone(),
+            render_transcript: args.terminal_managed_worker,
             auto_compaction: runtime.auto_compaction.clone(),
             retry: runtime.retry.clone(),
             command_catalog: command_catalog.clone(),
@@ -905,10 +907,12 @@ async fn run_worker(
         output(json!({"type":"resources_discovered","resources":discovered}));
     }
     if args.terminal_managed_worker {
-        let renderers = runtime.registry.custom_message_renderers();
+        let messages = runtime.registry.custom_message_renderers();
+        let entries = runtime.registry.custom_entry_renderers();
         output(json!({
             "type":"backend_ready",
-            "custom_message_renderers":renderers.types().collect::<Vec<_>>()
+            "custom_message_renderers":messages.types().collect::<Vec<_>>(),
+            "custom_entry_renderers":entries.types().collect::<Vec<_>>()
         }));
     } else {
         output(json!({"type":"backend_ready"}));
@@ -1864,6 +1868,52 @@ fn observe_snapshot(
     }
 }
 
+enum TranscriptRenderRecord {
+    Message(pi_rs::CustomMessage),
+    Entry(pi_rs::CustomEntryRecord),
+}
+
+impl TranscriptRenderRecord {
+    async fn render(
+        self,
+        messages: &pi_rs::CustomMessageRenderers,
+        entries: &pi_rs::CustomEntryRenderers,
+        options: &pi_rs::CustomMessageRenderOptions,
+    ) -> Option<pi_rs::RenderedExtensionContent> {
+        let deadline = std::time::Duration::from_secs(1);
+        match self {
+            Self::Message(message) => messages.render(&message, options, deadline).await,
+            Self::Entry(entry) => {
+                let entry_options = pi_rs::CustomEntryRenderOptions {
+                    expanded: options.expanded,
+                    expand_key: options.expand_key.clone(),
+                };
+                entries
+                    .render(&entry, &entry_options, deadline)
+                    .await
+                    .unwrap_or_else(|error| {
+                        let error: String = error.chars().take(512).collect();
+                        let label =
+                            format!("[{}] renderer failed: {error}", entry.entry.custom_type);
+                        Some(pi_rs::RenderedExtensionContent {
+                            padding: options.output_pad,
+                            background: Some("customMessageBg".into()),
+                            lines: vec![
+                                vec![],
+                                vec![pi_rs::UiComponentSpan {
+                                    text: label,
+                                    color: Some("error".into()),
+                                    ..Default::default()
+                                }],
+                                vec![],
+                            ],
+                        })
+                    })
+            }
+        }
+    }
+}
+
 fn read_requests(
     commands: mpsc::Sender<Request>,
     inputs: mpsc::Sender<AgentInput>,
@@ -1883,10 +1933,12 @@ fn read_requests(
         lifecycle_timeout,
         trace,
         snapshot,
+        render_transcript,
         shell,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
     let message_renderers = registry.custom_message_renderers();
+    let entry_renderers = registry.custom_entry_renderers();
     let prepare_in_background =
         registry.has_input_hooks() || registry.has_resource_discovery_hooks();
     let processor = Arc::new(queue::Processor {
@@ -1920,12 +1972,18 @@ fn read_requests(
                 }
             };
             match request {
-                Request::RenderCustomMessage {
+                Request::RenderTranscriptExtension {
                     id,
                     record_id,
                     options,
                 } => {
-                    let message = {
+                    if !render_transcript {
+                        output(
+                            json!({"type":"input_rejected","reason":"terminal presentation unavailable"}),
+                        );
+                        continue;
+                    }
+                    let record = {
                         let snapshot = snapshot.lock().expect("session snapshot");
                         snapshot
                             .records
@@ -1937,22 +1995,31 @@ fn read_requests(
                                     if message.display
                                         && message_renderers.contains(&message.custom_type) =>
                                 {
-                                    Some(message.clone())
+                                    Some(TranscriptRenderRecord::Message(message.clone()))
+                                }
+                                pi_rs::Event::CustomEntry { entry }
+                                    if entry_renderers.contains(&entry.custom_type) =>
+                                {
+                                    Some(TranscriptRenderRecord::Entry(pi_rs::CustomEntryRecord {
+                                        id: record_id,
+                                        entry: entry.clone(),
+                                    }))
                                 }
                                 _ => None,
                             })
                     };
-                    match (message, render_slots.clone().try_acquire_owned()) {
-                        (Some(message), Ok(slot)) => {
-                            let renderers = message_renderers.clone();
+                    match (record, render_slots.clone().try_acquire_owned()) {
+                        (Some(record), Ok(slot)) => {
+                            let messages = message_renderers.clone();
+                            let entries = entry_renderers.clone();
                             runtime.spawn(async move {
-                                let rendered = renderers.render(&message, &options, std::time::Duration::from_secs(1)).await;
+                                let rendered = record.render(&messages, &entries, &options).await;
                                 drop(slot);
-                                output(json!({"type":"custom_message_rendered","id":id,"rendered":rendered}));
+                                output(json!({"type":"transcript_extension_rendered","id":id,"rendered":rendered}));
                             });
                         }
                         _ => output(
-                            json!({"type":"custom_message_rendered","id":id,"rendered":null}),
+                            json!({"type":"transcript_extension_rendered","id":id,"rendered":null}),
                         ),
                     }
                 }
