@@ -4350,6 +4350,8 @@ mod estimation_tests {
             ("azure", "o4-mini", true, "off"),
             ("azure", "o4-mini", true, "high"),
             ("azure", "gpt-6-luna", true, "off"),
+            ("azure", "gpt-daybreak-blue-latest", true, "high"),
+            ("azure", "gpt-daybreak-red-latest", true, "minimal"),
             ("azure", "deepseek-v4-pro", false, "off"),
             ("azure-relay", "o4-mini", true, "off"),
         ] {
@@ -4383,6 +4385,12 @@ mod estimation_tests {
                 assert_eq!(
                     super::super::thinking::available(&mut args),
                     ["off", "low", "medium", "high"]
+                );
+            }
+            if model.starts_with("gpt-daybreak-") {
+                assert_eq!(
+                    super::super::thinking::available(&mut args),
+                    ["off", "minimal", "low", "medium", "high"]
                 );
             }
             args.thinking = Some(thinking.into());
@@ -4510,8 +4518,11 @@ mod estimation_tests {
                 );
                 assert!(!headers.contains("authorization:"), "{headers}");
                 assert_eq!(body["max_output_tokens"], 16);
-                if thinking == "high" {
-                    assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+                if thinking != "off" {
+                    assert_eq!(
+                        body["reasoning"],
+                        json!({"effort":thinking,"summary":"auto"})
+                    );
                 } else if model == "gpt-6-luna" {
                     assert_eq!(body["reasoning"], json!({"effort":"none"}));
                 } else {

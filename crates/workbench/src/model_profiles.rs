@@ -576,7 +576,7 @@ impl ModelMetadata {
         }
         // Pi exposes the default five levels for a reasoning model even when
         // its configuration does not specify a thinkingLevelMap.
-        if adapter == Adapter::Anthropic
+        if matches!(adapter, Adapter::Anthropic | Adapter::AzureResponses)
             && self.reasoning == Some(true)
             && self.thinking_level_map.is_empty()
         {
