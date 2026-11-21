@@ -500,9 +500,9 @@ advertise a 1,048,576-token output limit, and K3 256K advertises 262,144.
 Image limits, prices, context windows and reasoning settings remain
 model-specific. The high-speed coding model uses its DeepSeek-style thinking
 switch. Subscription OAuth supports device login, refresh, and Pi-compatible
-credential storage. A refresh has Pi's 15-second deadline across network
-attempts and backoff. Once admitted, an in-flight refresh can still persist
-rotated credentials if its caller is cancelled. Live Kimi acceptance remains
+credential storage. A caller can wait for refresh for up to Pi's 15-second
+deadline. After the deadline the worker cannot start a new attempt. An admitted
+request can still persist a rotated credential after timeout or cancellation. Live Kimi acceptance remains
 open.
 
 On terminals without OSC 8 support, Markdown links use the reference's text
@@ -4142,8 +4142,10 @@ tool results, records measured usage including thought tokens, and preserves
 ordered signed response parts for the same model across tools and journal
 reopening. Gemini 2.5 and newer model families use their budget or level
 controls. Host-prefixed Gemini IDs use the same version checks for thinking,
-tool call IDs, and tool-result images as in current Pi. A response ending in
-`CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
+tool call IDs, and tool-result images as in current Pi. The adapter folds
+nonempty system updates into `systemInstruction`. Consecutive tool results
+and their follow-up image turn on Gemini 2.5 stay together. A response ending
+in `CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
 and ends with a length stop. The native adapter does not consume continuation
 tokens.
 
@@ -5113,11 +5115,11 @@ The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
 Pi sets a 15-second OAuth refresh deadline after acquiring the credential
-lock. Kimi Code and Radius apply it to the provider exchange. Radius keeps
-its recovery marker when an admitted exchange has an unknown outcome.
-Anthropic, Codex, xAI and imported Pi ChatGPT credentials apply the deadline
-to the caller's wait. Their native refresh workers can persist a successful
-rotation that arrives after the caller times out. Copilot gives its
+lock. Radius applies it to the provider exchange and keeps its recovery marker
+when an admitted exchange has an unknown outcome. Kimi Code, Anthropic, Codex,
+xAI and imported Pi ChatGPT credentials apply the deadline to the caller's
+wait. Their native workers can persist a successful rotation that arrives
+after the caller times out. Copilot gives its
 short-lived token request 15 seconds and handles its best-effort model
 discovery separately. Native ChatGPT enrollment and Meta key minting retain
 their own timeouts. Fixtures cover renewal and cancellation. Live credential

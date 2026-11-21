@@ -3,10 +3,11 @@ use pi_rs::{Error, Result};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Credential {
     pub access: String,
@@ -189,19 +190,20 @@ impl Service {
             .await
             .map_err(|_| error("device authorization expired"))?
     }
-    async fn refresh(&self, refresh: &str) -> Result<Credential> {
-        super::model_auth::with_oauth_refresh_deadline(
-            "kimi-coding",
-            self.refresh_with_retries(refresh),
-        )
-        .await
-    }
-
-    async fn refresh_with_retries(&self, refresh: &str) -> Result<Credential> {
+    async fn refresh(&self, refresh: &str, deadline: Instant) -> Result<Credential> {
         for attempt in 0..4 {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+                let backoff = Duration::from_secs(1 << (attempt - 1));
+                if deadline.saturating_duration_since(Instant::now()) <= backoff {
+                    return Err(error("token refresh timed out"));
+                }
+                tokio::time::sleep(backoff).await;
             }
+            if Instant::now() >= deadline {
+                return Err(error("token refresh timed out"));
+            }
+            // Once the POST is admitted, a late response can be the only
+            // copy of a rotated credential. Use the HTTP request's timeout.
             let response = self
                 .post(
                     "api/oauth/token",
@@ -326,7 +328,8 @@ async fn access_at(
     }
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
     // runtime keeps the exchange alive even when the caller's runtime stops.
-    tokio::task::spawn_blocking(move || {
+    let deadline = Instant::now() + REFRESH_TIMEOUT;
+    let worker = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -334,7 +337,7 @@ async fn access_at(
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
         let previous = serde_json::to_value(&value)?;
-        let value = runtime.block_on(service.refresh(&value.refresh))?;
+        let value = runtime.block_on(service.refresh(&value.refresh, deadline))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let unchanged = data.get("kimi-coding").is_some_and(|current| {
                 ["type", "access", "refresh", "expires"]
@@ -353,9 +356,11 @@ async fn access_at(
             return Err(error("refreshed token expires too soon"));
         }
         Ok(value.access)
-    })
-    .await
-    .map_err(|_| error("refresh task failed"))?
+    });
+    tokio::time::timeout_at(deadline.into(), worker)
+        .await
+        .map_err(|_| error("token refresh timed out"))?
+        .map_err(|_| error("refresh task failed"))?
 }
 pub(super) async fn access(
     settings: &super::config::Settings,
@@ -427,7 +432,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.access, "first");
-        let updated = service.refresh(&token.refresh).await.unwrap();
+        let updated = service
+            .refresh(&token.refresh, Instant::now() + REFRESH_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(updated.refresh, "rotate-2");
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("POST /api/oauth/device_authorization "));
@@ -501,9 +509,12 @@ mod tests {
         )
     }
     #[tokio::test]
-    async fn refresh_deadline_covers_a_stalled_http_exchange() {
-        let (service, started, _reply, server) = refresh_server(3600).await;
-        let refresh = tokio::spawn(async move { service.refresh("fixture-refresh").await });
+    async fn caller_deadline_preserves_a_late_rotating_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fixture(&path, now());
+        let (service, started, reply, server) = refresh_server(3600).await;
+        let refresh = tokio::spawn(access_at(path.clone(), service.clone(), None, false));
         started.await.unwrap();
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(14)).await;
@@ -513,7 +524,18 @@ mod tests {
             refresh.await.unwrap(),
             Err(err) if err.to_string().contains("token refresh timed out")
         ));
-        server.abort();
+        tokio::time::resume();
+        reply.send(()).unwrap();
+        server.await.unwrap();
+        let late = tokio::time::timeout(
+            Duration::from_secs(5),
+            access_at(path.clone(), service, None, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(late, "new");
+        assert_eq!(load(&path).unwrap().unwrap().refresh, "rotated");
     }
 
     #[tokio::test]
