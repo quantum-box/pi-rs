@@ -880,9 +880,18 @@ credentials, queries and fragments; failure messages are generic so these
 reports do not expose configured credentials through connection errors.
 Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
 
-`pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
-default is 300 seconds. Once credential persistence starts, it is allowed to
-finish even if the deadline passes, so its outcome can be reported reliably.
+`pi mcp login NAME` uses the effective HTTP server and OAuth settings from
+the user configuration and the trusted project. `--local` requires a full
+project definition. OAuth can be implicit for an HTTP server without an
+Authorization header or provider authentication. An explicit
+`"oauth": false` disables OAuth and must be changed before signing in.
+
+`--timeout SECONDS` bounds discovery, sign-in, and preparation to save
+(default 300 seconds). Before publishing credentials, login locks the
+configuration files against concurrent pi-rs writers and rechecks the
+selected server's authentication settings. Once credential persistence
+starts, it can finish even if the deadline passes. Login leaves
+`mcp.json` unchanged.
 
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project
@@ -2555,13 +2564,23 @@ and repeated `--scope` options select scopes. Pass `--local` to log in to a
 project-scoped definition.
 `pi mcp logout NAME` removes the saved credentials.
 
-Credentials are written atomically in the user agent directory, with owner-only
-file permissions on Unix. Refresh operations share a process-safe file lock that remains held until a
-blocking write finishes, including when its async caller is cancelled.
-Each successful login receives a new identifier, so old connections cannot load
-credentials from a later login. A failed browser launch preserves the prior
-credentials. Both expiring access tokens and rejected access tokens can refresh
-through the MCP SDK. Credential values are omitted from CLI output.
+Login publishes a single credential file using a synced temporary file and
+atomic replacement inside the user agent directory. A process interrupted
+before replacement leaves the prior credential file readable. After
+replacement, readers see the new credential generation. Unix also syncs the
+containing directory after replacement or logout and uses owner-only
+credential file permissions. On Windows the credential file inherits the
+agent directory's access controls. A power failure can affect filesystem
+durability, and a provider-side token rotation followed by a local failure
+can require signing in again.
+
+Login and refresh hold a process-safe credential lock until a blocking write
+finishes, including when its async caller is cancelled. OAuth requests use
+the authorized resource URL, and the transport checks that its credential
+generation is still current under the same lock when admitting a request.
+A later login or logout applies to new requests and leaves an already
+admitted request running. Both expiring and rejected access tokens can
+refresh through the MCP SDK. CLI output omits credential values.
 
 Local OAuth and MCP fixtures verified dynamic registration, pre-registered
 clients, PKCE verification, rejection of an incorrect callback state,

@@ -22,10 +22,12 @@ type Headers = HashMap<HeaderName, HeaderValue>;
 type EventStream = BoxStream<'static, std::result::Result<Sse, SseError>>;
 
 #[derive(Clone)]
-pub struct SafeAuthClient(
-    pub(crate) AuthClient<reqwest_mcp::Client>,
-    pub(crate) Arc<Mutex<DispatchState>>,
-);
+pub struct SafeAuthClient {
+    pub(crate) client: AuthClient<reqwest_mcp::Client>,
+    pub(crate) dispatch_state: Arc<Mutex<DispatchState>>,
+    endpoint: reqwest_mcp::Url,
+    store: crate::mcp_auth::FileCredentials,
+}
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
@@ -38,14 +40,48 @@ pub(crate) struct DispatchState {
 }
 
 impl SafeAuthClient {
-    async fn dispatch<T>(
+    pub(crate) fn new(
+        client: AuthClient<reqwest_mcp::Client>,
+        url: &str,
+        store: crate::mcp_auth::FileCredentials,
+    ) -> pi_rs::Result<Self> {
+        let endpoint = reqwest_mcp::Url::parse(url)
+            .map_err(|_| pi_rs::Error::Config("invalid MCP OAuth resource URL".into()))?;
+        Ok(Self {
+            client,
+            dispatch_state: Arc::default(),
+            endpoint,
+            store,
+        })
+    }
+
+    fn check_endpoint(&self, uri: &str) -> Result<(), HttpError> {
+        if reqwest_mcp::Url::parse(uri).is_ok_and(|url| url == self.endpoint) {
+            Ok(())
+        } else {
+            Err(HttpError::UnexpectedServerResponse(
+                "MCP OAuth request destination differs from the authorized resource".into(),
+            ))
+        }
+    }
+
+    async fn dispatch<T, Fut>(
         &self,
-        future: impl std::future::Future<Output = Result<T, HttpError>>,
-    ) -> Result<T, HttpError> {
-        dispatch(&self.1, future).await
+        token: Option<String>,
+        call: impl FnOnce(Option<String>) -> Fut,
+    ) -> Result<T, HttpError>
+    where
+        Fut: std::future::Future<Output = Result<T, HttpError>>,
+    {
+        let lease = if token.is_some() {
+            Some(self.store.dispatch_lease().await?)
+        } else {
+            None
+        };
+        dispatch(&self.dispatch_state, lease, call(token)).await
     }
     async fn token(&self, force: bool) -> Result<String, AuthError> {
-        let client = self.0.clone();
+        let client = self.client.clone();
         crate::mcp_refresh::run(async move {
             if !force {
                 return client.get_access_token().await;
@@ -66,6 +102,7 @@ impl SafeAuthClient {
 
 async fn dispatch<T>(
     gate: &Mutex<DispatchState>,
+    mut lease: Option<std::fs::File>,
     future: impl std::future::Future<Output = Result<T, HttpError>>,
 ) -> Result<T, HttpError> {
     let mut future = std::pin::pin!(future);
@@ -103,7 +140,11 @@ async fn dispatch<T>(
                 hook();
             }
         }
-        future.as_mut().poll(cx)
+        let result = future.as_mut().poll(cx);
+        // A later login or logout may proceed once the HTTP operation starts.
+        // Do not hold the store lock while waiting for the network.
+        drop(lease.take());
+        result
     })
     .await
 }
@@ -128,13 +169,13 @@ impl SafeAuthClient {
         };
         // Only the token transaction outlives this future. The actual call and
         // retry stay on the caller's task, so dropping it cannot dispatch them.
-        match self.dispatch(call(token.clone())).await {
+        match self.dispatch(token.clone(), &call).await {
             Err(HttpError::AuthRequired(challenge)) => {
                 let Some(sent) = token else {
                     return Err(HttpError::AuthRequired(challenge));
                 };
                 match self.token(true).await {
-                    Ok(fresh) if fresh != sent => self.dispatch(call(Some(fresh))).await,
+                    Ok(fresh) if fresh != sent => self.dispatch(Some(fresh), &call).await,
                     Ok(_) | Err(AuthError::AuthorizationRequired) => {
                         Err(HttpError::AuthRequired(challenge))
                     }
@@ -155,8 +196,9 @@ impl StreamableHttpClient for SafeAuthClient {
         token: Option<String>,
         headers: Headers,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
+        self.check_endpoint(&uri)?;
         self.call(token, |token| {
-            self.0.http_client.post_message(
+            self.client.http_client.post_message(
                 uri.clone(),
                 message.clone(),
                 session_id.clone(),
@@ -175,15 +217,18 @@ impl StreamableHttpClient for SafeAuthClient {
         headers: Headers,
         max: usize,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
+        self.check_endpoint(&uri)?;
         self.call(token, |token| {
-            self.0.http_client.post_message_with_max_sse_event_size(
-                uri.clone(),
-                message.clone(),
-                session_id.clone(),
-                token,
-                headers.clone(),
-                max,
-            )
+            self.client
+                .http_client
+                .post_message_with_max_sse_event_size(
+                    uri.clone(),
+                    message.clone(),
+                    session_id.clone(),
+                    token,
+                    headers.clone(),
+                    max,
+                )
         })
         .await
     }
@@ -195,8 +240,9 @@ impl StreamableHttpClient for SafeAuthClient {
         token: Option<String>,
         headers: Headers,
     ) -> Result<EventStream, HttpError> {
+        self.check_endpoint(&uri)?;
         self.call(token, |token| {
-            self.0.http_client.get_stream(
+            self.client.http_client.get_stream(
                 uri.clone(),
                 session_id.clone(),
                 last.clone(),
@@ -215,8 +261,9 @@ impl StreamableHttpClient for SafeAuthClient {
         headers: Headers,
         max: usize,
     ) -> Result<EventStream, HttpError> {
+        self.check_endpoint(&uri)?;
         self.call(token, |token| {
-            self.0.http_client.get_stream_with_max_sse_event_size(
+            self.client.http_client.get_stream_with_max_sse_event_size(
                 uri.clone(),
                 session_id.clone(),
                 last.clone(),
@@ -234,8 +281,9 @@ impl StreamableHttpClient for SafeAuthClient {
         token: Option<String>,
         headers: Headers,
     ) -> Result<(), HttpError> {
+        self.check_endpoint(&uri)?;
         self.call(token, |token| {
-            self.0.http_client.delete_session(
+            self.client.http_client.delete_session(
                 uri.clone(),
                 session_id.clone(),
                 token,
@@ -251,6 +299,31 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn oauth_transport_rejects_a_different_resource_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let resource = "http://127.0.0.1:12345/mcp";
+        let client = crate::mcp_auth::test_oauth_client(
+            dir.path().join("credentials.json"),
+            resource,
+            "http://127.0.0.1:12345/token",
+        )
+        .await;
+        client.check_endpoint(resource).unwrap();
+        let result = client
+            .delete_session(
+                Arc::from("http://127.0.0.1:12345/other"),
+                Arc::from("fixture-session"),
+                None,
+                Headers::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(HttpError::UnexpectedServerResponse(message))
+            if message.contains("differs from the authorized resource"))
+        );
+    }
 
     #[test]
     fn cancellation_and_dispatch_have_a_defined_start_boundary() {
@@ -281,7 +354,7 @@ mod tests {
                     .enable_all()
                     .build()
                     .unwrap();
-                runtime.block_on(dispatch(&gate, async move {
+                runtime.block_on(dispatch(&gate, None, async move {
                     worker_polls.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }))
