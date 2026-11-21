@@ -1321,7 +1321,10 @@ mod jsonl_framing_tests {
     fn incomplete_escape_does_not_hide_earlier_syntax_errors() {
         let input = "[false,] \"x\\u1";
         let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
-        assert_eq!(super::rpc_json_error(input, &error), error.to_string());
+        assert_eq!(
+            super::json_syntax_diagnostic(input, &error),
+            error.to_string()
+        );
     }
 
     #[test]
@@ -1365,7 +1368,7 @@ mod jsonl_framing_tests {
         for input in ["[false,] \"x\\q\"", "\"\\uDC00\\x\""] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
-                super::rpc_json_error(input, &error),
+                super::json_syntax_diagnostic(input, &error),
                 error.to_string(),
                 "{input:?}"
             );
@@ -1413,7 +1416,7 @@ mod jsonl_framing_tests {
         let input = r#"{"type":"\ud800"}"#;
         let original = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
         assert_eq!(
-            super::rpc_json_error(input, &original),
+            super::json_syntax_diagnostic(input, &original),
             original.to_string()
         );
         assert!(parse_request(input).is_err());
@@ -1432,7 +1435,7 @@ mod jsonl_framing_tests {
         ] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
-                super::rpc_json_error(input, &error),
+                super::json_syntax_diagnostic(input, &error),
                 error.to_string(),
                 "{input:?}"
             );
@@ -1443,7 +1446,10 @@ mod jsonl_framing_tests {
             "]".repeat(130)
         );
         let error = serde_json::from_str::<serde_json::Value>(&deep).unwrap_err();
-        assert_eq!(super::rpc_json_error(&deep, &error), error.to_string());
+        assert_eq!(
+            super::json_syntax_diagnostic(&deep, &error),
+            error.to_string()
+        );
         let prefix = "[\"\\ud800\",\"";
         let suffix = "\t\"]";
         for (size, mapped) in [
@@ -1455,7 +1461,7 @@ mod jsonl_framing_tests {
                 "a".repeat(size - prefix.len() - suffix.len())
             );
             let error = serde_json::from_str::<serde_json::Value>(&input).unwrap_err();
-            let actual = super::rpc_json_error(&input, &error);
+            let actual = super::json_syntax_diagnostic(&input, &error);
             assert_eq!(
                 actual.contains("Bad control character"),
                 mapped,
@@ -1478,7 +1484,7 @@ mod jsonl_framing_tests {
         ] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
-                super::rpc_json_error(input, &error),
+                super::json_syntax_diagnostic(input, &error),
                 error.to_string(),
                 "{input:?}"
             );
@@ -1494,7 +1500,7 @@ fn parse_request(line: &str) -> Result<Value> {
         Ok(request) => Ok(request),
         Err(error) => Err(Error::Config(format!(
             "Failed to parse command: {}",
-            rpc_json_error(line, &error)
+            json_syntax_diagnostic(line, &error)
         ))),
     }
 }
@@ -1531,9 +1537,9 @@ fn json_number_error(line: &str, error: &serde_json::Error, message: &str) -> Op
     Some(json_error_at(reason, prefix))
 }
 
-// Preserve Pi/V8 diagnostics for common incomplete JSONL records. Other
+// Preserve Pi/V8 diagnostics for common malformed JSON. Other
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
-fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
+pub(super) fn json_syntax_diagnostic(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
     if let Some(diagnostic) = json_number_error(line, error, &message) {
         return diagnostic;

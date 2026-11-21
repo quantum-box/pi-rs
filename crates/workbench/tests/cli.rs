@@ -1317,16 +1317,21 @@ fn malformed_settings_keep_other_scope_package_resources_in_rpc() {
         )
         .unwrap();
         let valid = json!({"packages":[package]}).to_string();
-        std::fs::write(
-            home.join("settings.json"),
-            if bad_global { "{" } else { &valid },
-        )
-        .unwrap();
-        std::fs::write(
-            project.join(".pi/settings.json"),
-            if bad_global { &valid } else { "{" },
-        )
-        .unwrap();
+        let (broken, expected_reason) = if bad_global {
+            (
+                r#"{"theme""#,
+                "Expected ':' after property name in JSON at position 8 (line 1 column 9)",
+            )
+        } else {
+            (
+                "\u{feff}{\r\n  \"🐈\" 1\r\n}",
+                "Expected ':' after property name in JSON at position 10 (line 2 column 8)",
+            )
+        };
+        let user_settings = home.join("settings.json");
+        let project_settings = project.join(".pi/settings.json");
+        std::fs::write(&user_settings, if bad_global { broken } else { &valid }).unwrap();
+        std::fs::write(&project_settings, if bad_global { &valid } else { broken }).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
             .current_dir(&project)
             .env("PI_RS_HOME", &home)
@@ -1352,11 +1357,23 @@ fn malformed_settings_keep_other_scope_package_resources_in_rpc() {
         let output = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stderr}");
+        let broken_path = if bad_global {
+            user_settings
+        } else {
+            project_settings
+        };
+        let canonical_path = broken_path.canonicalize().unwrap();
+        let expected = format!(
+            "Warning: Invalid settings file {}: {expected_reason}",
+            canonical_path.display()
+        );
+        assert!(stderr.lines().any(|line| line == expected), "{stderr}");
         assert_eq!(
             stderr.matches("Invalid settings file").count(),
             1,
             "{stderr}"
         );
+        assert_eq!(std::fs::read_to_string(broken_path).unwrap(), broken);
         let replies: Vec<Value> = String::from_utf8(output.stdout)
             .unwrap()
             .lines()
