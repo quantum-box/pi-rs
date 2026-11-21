@@ -2741,8 +2741,8 @@ impl View {
                 .as_ref()
                 .map_or(String::new(), |(message, _)| format!("{message} ")),
         );
-        self.graphics.clear_placements(&mut out)?;
-        queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+        queue!(out, Hide)?;
+        self.graphics.clear_fullscreen_frame(&mut out)?;
         if header_rows != 0 {
             Line::themed(
                 &format!(
@@ -3163,13 +3163,7 @@ impl View {
             synchronized_updates_supported(),
         )?;
         if redraw {
-            self.graphics.clear_placements(&mut out)?;
-            queue!(
-                out,
-                Clear(ClearType::All),
-                MoveTo(0, 0),
-                Clear(ClearType::Purge)
-            )?;
+            self.graphics.purge_regular_transcript(&mut out)?;
         }
         if !redraw {
             self.graphics.clear_active(&mut out)?;

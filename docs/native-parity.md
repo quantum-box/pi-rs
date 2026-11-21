@@ -140,7 +140,7 @@ or custom models through the native fallback.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor with word-aware wrapping, visual movement, character jumps and kill ring, text/image clipboard paste, fullscreen transcript search and semantic prompt jumps, configurable scrolling and scrollbar, mouse text selection with clipboard copy, exit transcript or resume hint, prompt history, Markdown, aligned tables, links, syntax highlighting and native Mermaid diagrams, configurable transcript padding and hardware or software cursor, optional regular-screen clear on shrink, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings for editor and selectors, model and thinking default selection, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and real-terminal image clipping verification |
+| Terminal | Default `pi` startup, Unicode multiline editor with word-aware wrapping, visual movement, character jumps and kill ring, text/image clipboard paste, fullscreen transcript search and semantic prompt jumps, configurable scrolling and scrollbar, mouse text selection with clipboard copy, exit transcript or resume hint, prompt history, Markdown, aligned tables, links, syntax highlighting and native Mermaid diagrams, configurable transcript padding and hardware or software cursor, optional regular-screen clear on shrink, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings for editor and selectors, model and thinking default selection, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and visual clipping verification in iTerm2 |
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, configurable Bash and Windows PowerShell with session metadata and Pi-style exit and truncation text, structured read, search, listing and shell truncation details, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks |
@@ -2279,7 +2279,20 @@ prompt to a loopback model in regular and fullscreen mode. The model received
 the original 320×480 PNG dimensions, both modes exited cleanly, and the pasteboard
 contents were restored after each run. PTY captures verified the cropped Kitty
 placements and the cropped PNG dimensions from the iTerm2 protocol in both
-modes. Visual clipping in a running terminal emulator still needs acceptance.
+modes.
+
+Fullscreen redraws retain Kitty image data while clearing the text viewport.
+If regular mode purges scrollback to rebuild the transcript, it uploads the
+images again. Kitty can discard stored image data when the screen is erased,
+even after pi-rs removes the placements. Placements use the visible source
+rectangle and distinct IDs for the active view and committed transcript.
+
+A Kitty 0.41.1 window in an isolated Linux X11 session displayed the macOS
+pi-rs process through a terminal relay. Ctrl+V read the system pasteboard and
+the loopback model received the 320×480 PNG in both modes. At 72×20 cells,
+pixel checks verified the visible lower portion of the image after fullscreen
+redraws settled and after regular mode purged and rebuilt the transcript.
+The iTerm2 visual check remains open.
 
 ### Edit matching checkpoint
 
