@@ -58,8 +58,8 @@ pub use strict_tool_schema::{
     EffectiveToolDeclaration, EffectiveToolSampling, STRICT_TOOL_NORMALIZATION_VERSION,
     StrictSchemaError, StrictToolPolicy, ToolConstraint, ToolDecisionSnapshot, ToolDeclaration,
     ToolGrammarSyntax, ToolGrammarVariants, ValidatedToolDecisionSnapshot,
-    normalize_strict_tool_arguments, resolve_openai_tool_grammar, resolve_strict_tool_schema,
-    strict_tool_schema, validate_effective_tool_declarations,
+    lossless_openai_grammar_input, normalize_strict_tool_arguments, resolve_openai_tool_grammar,
+    resolve_strict_tool_schema, strict_tool_schema, validate_effective_tool_declarations,
 };
 pub use tokens::{
     ContextUsageEstimate, estimate_message_tokens, estimate_replay_tokens, estimate_request_tokens,
