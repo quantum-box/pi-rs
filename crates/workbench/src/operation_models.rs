@@ -172,7 +172,7 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 fn classifier_retry_asctime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
+    use chrono::{Local, LocalResult, TimeZone};
 
     let explicit_zone = value
         .rsplit_once(char::is_whitespace)
@@ -187,17 +187,19 @@ fn classifier_retry_asctime(value: &str) -> Option<chrono::DateTime<chrono::Utc>
         Some(date.and_utc())
     } else {
         // Pi's Date.parse treats an asctime value with no zone as local time.
-        let offset = chrono::Local
-            .offset_from_local_datetime(&date)
-            .earliest()
-            .or_else(|| {
+        let offset = match Local.offset_from_local_datetime(&date) {
+            LocalResult::Single(offset) => offset,
+            LocalResult::Ambiguous(first, second) => {
+                // The larger offset maps the repeated wall time to its first instant.
+                std::cmp::max_by_key(first, second, |offset| offset.local_minus_utc())
+            }
+            LocalResult::None => {
                 // JavaScript moves through forward clock changes using the
                 // offset from before the gap. Look up that offset the day before.
                 let previous = date.checked_sub_days(chrono::Days::new(1))?;
-                chrono::Local
-                    .offset_from_local_datetime(&previous)
-                    .earliest()
-            })?;
+                Local.offset_from_local_datetime(&previous).earliest()?
+            }
+        };
         offset
             .from_local_datetime(&date)
             .single()
