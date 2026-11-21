@@ -119,7 +119,10 @@ results, including when a session is resumed. It runs the callbacks off
 the terminal paint path and supplies expansion state, viewport width and
 the configured output padding. The active theme maps the returned
 semantic roles. Each section can fall back to the standard presentation.
-Streaming argument and partial result redraws use the standard presentation.
+While a call streams, the call renderer receives the current parsed arguments
+with `argsComplete: false`. Execution progress uses the newest content and
+details with `result.isPartial: true`. The terminal coalesces updates while
+drawing and replaces partial output when the journal commits a final result.
 
 ## Observe extension UI prompts
 

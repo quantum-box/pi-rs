@@ -42,6 +42,15 @@ enum Request {
         operation: Uuid,
         records: ToolRenderRecords,
         options: ToolRenderOptions,
+        #[serde(default)]
+        partial: Option<pi_rs::ToolRenderResult>,
+    },
+    RenderToolPreview {
+        id: Uuid,
+        tool_name: String,
+        tool_call_id: String,
+        args: serde_json::Value,
+        options: ToolRenderOptions,
     },
     RenderCustomMessage {
         id: Uuid,
@@ -177,6 +186,8 @@ pub(super) struct ToolRenderRecords {
     pub invocation: u64,
     pub started: Option<u64>,
     pub result: Option<u64>,
+    #[serde(default)]
+    pub progress: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +197,16 @@ pub(super) struct ToolRenderOptions {
     pub output_pad: usize,
     pub expand_key: Option<String>,
     pub width: Option<usize>,
+}
+
+impl ToolRenderOptions {
+    fn apply(self, context: &mut pi_rs::ToolRenderContext) {
+        context.expanded = self.expanded;
+        context.show_images = self.show_images;
+        context.output_pad = self.output_pad;
+        context.expand_key = self.expand_key;
+        context.width = self.width;
+    }
 }
 
 struct ReaderControls {
@@ -305,11 +326,7 @@ impl SessionSnapshot {
         };
         context.execution_started = started.is_some();
         context.args_complete = true;
-        context.expanded = options.expanded;
-        context.show_images = options.show_images;
-        context.output_pad = options.output_pad;
-        context.expand_key = options.expand_key;
-        context.width = options.width;
+        options.apply(&mut context);
         if let Some(record) = result.as_deref() {
             let outcome = match &record.event {
                 pi_rs::Event::ToolFinished {
@@ -1977,6 +1994,30 @@ fn observe_snapshot(
     }
 }
 
+async fn render_tool_response(
+    id: Uuid,
+    renderers: pi_rs::ToolRendererRegistry,
+    context: Option<pi_rs::ToolRenderContext>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    let (available, rendered) = match context {
+        Some(context) => match renderers.resolve(&context.tool_name, &|| None) {
+            Some(renderers) => (
+                Some(true),
+                Some(
+                    renderers
+                        .render(&context, std::time::Duration::from_millis(500))
+                        .await,
+                ),
+            ),
+            None => (Some(false), None),
+        },
+        None => (None, None),
+    };
+    drop(slot);
+    output(json!({"type":"tool_rendered","id":id,"available":available,"rendered":rendered}));
+}
+
 fn read_requests(
     commands: mpsc::Sender<Request>,
     inputs: mpsc::Sender<AgentInput>,
@@ -2042,6 +2083,7 @@ fn read_requests(
                     operation,
                     records,
                     options,
+                    partial,
                 } => {
                     if !terminal_managed {
                         continue;
@@ -2051,22 +2093,51 @@ fn read_requests(
                             .lock()
                             .expect("session snapshot")
                             .tool_render_records(records);
-                        let tool_cwd = tool_cwd.clone();
+                        let cwd = tool_cwd.clone();
                         let renderers = tool_renderers.clone();
                         runtime.spawn(async move {
-                            let context = SessionSnapshot::tool_render_context(
-                                operation, source, options, &tool_cwd,
-                            );
-                            let (available, rendered) = match context {
-                                Some(context) => match renderers.resolve(&context.tool_name, &|| None) {
-                                    Some(renderers) => (Some(true), Some(renderers.render(&context, std::time::Duration::from_millis(500)).await)),
-                                    None => (Some(false), None),
-                                },
-                                None => (None, None),
+                            let missing = records.started.is_some() && source[1].is_none()
+                                || records.result.is_some() && source[2].is_none();
+                            let mut context = if missing {
+                                None
+                            } else {
+                                SessionSnapshot::tool_render_context(
+                                    operation, source, options, &cwd,
+                                )
                             };
-                            drop(slot);
-                            output(json!({"type":"tool_rendered","id":id,"available":available,"rendered":rendered}));
+                            if let Some(context) = &mut context
+                                && context.execution_started
+                                && context.result.is_none()
+                                && records.result.is_none()
+                            {
+                                context.result = partial;
+                            }
+                            render_tool_response(id, renderers, context, slot).await;
                         });
+                    } else {
+                        output(json!({"type":"tool_rendered","id":id,"rendered":null}));
+                    }
+                }
+                Request::RenderToolPreview {
+                    id,
+                    tool_name,
+                    tool_call_id,
+                    args,
+                    options,
+                } => {
+                    if !terminal_managed {
+                        continue;
+                    }
+                    if let Ok(slot) = tool_render_slots.clone().try_acquire_owned() {
+                        let mut context =
+                            pi_rs::ToolRenderContext::new(tool_name, tool_call_id, args, &tool_cwd);
+                        options.apply(&mut context);
+                        runtime.spawn(render_tool_response(
+                            id,
+                            tool_renderers.clone(),
+                            Some(context),
+                            slot,
+                        ));
                     } else {
                         output(json!({"type":"tool_rendered","id":id,"rendered":null}));
                     }
@@ -2463,6 +2534,7 @@ mod share_context_tests {
             invocation: 1,
             started: Some(2),
             result: Some(3),
+            progress: 0,
         };
         let context = SessionSnapshot::tool_render_context(
             operation,
