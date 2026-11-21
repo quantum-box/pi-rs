@@ -2520,6 +2520,8 @@ while preserving theme styling.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
 journal lock before restoring the view.
+After tree navigation, the selected user message fills an empty editor. A draft
+already in the editor keeps its text and any native image attachments.
 
 Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
 folding, search, labels, checkout and terminal restoration. Session and queue
