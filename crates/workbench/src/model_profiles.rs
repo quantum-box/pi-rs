@@ -735,36 +735,40 @@ fn configure_cloudflare_workers(
     let entry = entry
         .as_object_mut()
         .ok_or_else(|| Error::Config("invalid Cloudflare Workers AI profile".into()))?;
-    let route_account = match entry.get("baseUrl") {
-        None => account,
-        Some(value) => value.as_str().and_then(|base| {
-            let (configured, route) = base
-                .trim_end_matches('/')
-                .strip_prefix(PREFIX)?
-                .split_once('/')?;
-            if !matches!(route, "ai" | "ai/run" | "ai/v1" | "ai/v1/chat/completions") {
-                return None;
-            }
-            if configured == "{CLOUDFLARE_ACCOUNT_ID}" {
-                return account;
-            }
-            super::operation_models::valid_cloudflare_account(configured).then_some(configured)
-        }),
+    let account_from_base = |base: &str| {
+        let (configured, route) = base
+            .trim_end_matches('/')
+            .strip_prefix(PREFIX)?
+            .split_once('/')?;
+        if !matches!(route, "ai" | "ai/run" | "ai/v1" | "ai/v1/chat/completions") {
+            return None;
+        }
+        if configured == "{CLOUDFLARE_ACCOUNT_ID}" {
+            return account.map(str::to_owned);
+        }
+        super::operation_models::valid_cloudflare_account(configured).then(|| configured.to_owned())
     };
-    let classifier_profile = entry.get("api").and_then(Value::as_str)
-        == Some("cloudflare-workers-ai-system-one")
-        || (!entry.contains_key("api")
-            && !entry.contains_key("baseUrl")
-            && entry
-                .get("models")
-                .and_then(Value::as_array)
-                .is_some_and(|models| {
-                    models.iter().all(|model| model["type"] == "classifier")
-                        && models.iter().any(|model| model["baseUrl"].is_string())
-                }));
-    let route_account = route_account
-        .or(account.filter(|_| classifier_profile))
-        .map(str::to_owned);
+    let configured_base = entry.get("baseUrl").filter(|value| !value.is_null());
+    let route_account = match configured_base {
+        None => account.map(str::to_owned),
+        Some(value) => value.as_str().and_then(account_from_base),
+    };
+    let classifier_api =
+        entry.get("api").and_then(Value::as_str) == Some("cloudflare-workers-ai-system-one");
+    let classifier_models_own_credentials = configured_base.is_none()
+        && entry.get("api").is_none_or(Value::is_null)
+        && entry
+            .get("models")
+            .and_then(Value::as_array)
+            .filter(|models| models.iter().all(|model| model["type"] == "classifier"))
+            .and_then(|models| super::operation_models::cloudflare_model_binding(models))
+            .is_some_and(|base| {
+                let bound_account = base.as_deref().and_then(account_from_base);
+                bound_account.is_none() || bound_account != route_account
+            });
+    let classifier_profile = classifier_api || classifier_models_own_credentials;
+    let route_account =
+        route_account.or_else(|| account.filter(|_| classifier_profile).map(str::to_owned));
     if classifier_profile {
         // Provider-level operations settings were consumed by the operation catalogue.
         for field in ["api", "baseUrl", "apiKey", "authHeader", "headers"] {
@@ -1841,6 +1845,7 @@ mod tests {
     fn inferred_classifier_credentials_do_not_apply_to_official_chat() {
         let profiles = Profiles::parse_with_cloudflare_account(
             &json!({"providers":{"cloudflare-workers-ai":{
+                "api":null,"baseUrl":null,
                 "apiKey":"classified","headers":{"x-provider-secret":"value"},
                 "models":[{"id":"custom","type":"classifier",
                     "api":"cloudflare-workers-ai-system-one",
@@ -1861,30 +1866,36 @@ mod tests {
     }
 
     #[test]
-    fn classifiers_on_the_default_route_keep_explicit_provider_chat_credentials() {
-        let profiles = Profiles::parse_with_cloudflare_account(
-            &json!({"providers":{"cloudflare-workers-ai":{
-                "apiKey":"fixture","headers":{"x-provider-setting":"value"},
-                "models":[{"id":"custom","type":"classifier",
-                    "api":"cloudflare-workers-ai-system-one"}]
-            }}}),
-            Some("mine"),
-        )
-        .unwrap();
-        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
-        let endpoint = profiles.endpoint(&provider);
-        assert_eq!(
-            profiles
-                .credential(&provider, endpoint)
-                .as_ref()
-                .and_then(|key| key.literal()),
-            Some("fixture"),
-        );
-        let headers = profiles
-            .header_settings(&provider, endpoint, None)
-            .static_headers(&provider, None)
+    fn matching_classifier_routes_keep_explicit_provider_chat_credentials() {
+        for base in [
+            Value::Null,
+            json!("https://api.cloudflare.com/client/v4/accounts/mine/ai/run"),
+            json!("https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai"),
+        ] {
+            let profiles = Profiles::parse_with_cloudflare_account(
+                &json!({"providers":{"cloudflare-workers-ai":{
+                    "apiKey":"fixture","headers":{"x-provider-setting":"value"},
+                    "models":[{"id":"custom","type":"classifier",
+                        "api":"cloudflare-workers-ai-system-one","baseUrl":base}]
+                }}}),
+                Some("mine"),
+            )
             .unwrap();
-        assert_eq!(headers["x-provider-setting"], "value");
+            let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+            let endpoint = profiles.endpoint(&provider);
+            assert_eq!(
+                profiles
+                    .credential(&provider, endpoint)
+                    .as_ref()
+                    .and_then(|key| key.literal()),
+                Some("fixture"),
+            );
+            let headers = profiles
+                .header_settings(&provider, endpoint, None)
+                .static_headers(&provider, None)
+                .unwrap();
+            assert_eq!(headers["x-provider-setting"], "value");
+        }
     }
 
     #[test]

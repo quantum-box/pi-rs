@@ -4537,7 +4537,8 @@ requests. Pi-format saved credentials may declare an account through their
 `env` field. A stored account scopes the key to that account's chat route.
 An unscoped saved key works only on official Workers AI routes. Credentials
 and headers inferred from classifier-only model URLs apply to those operations.
-Live Workers AI inference has not been verified.
+When the inferred URL is on the configured official account, its provider
+credentials also apply to chat. Live Workers AI inference has not been verified.
 
 ### Cloudflare AI Gateway
 
