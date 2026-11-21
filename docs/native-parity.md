@@ -209,8 +209,10 @@ filters accept Git Bash/MSYS, Cygwin, and WSL drive spellings such as `/c/...`,
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
 Positive extglobs such as `prompts/@(review|triage).md` work in package filters
-for bounded ASCII patterns and paths without dot-prefixed components. Filters
-continue to support the existing exact path and force-inclusion rules.
+for bounded ASCII patterns and paths without dot-prefixed components. Package
+settings filters also support a single negated group with literal alternatives
+and a supported suffix, such as `prompts/!(review|triage).md`. Exact path and
+force-inclusion rules still apply.
 
 An invalid file URL in a package settings filter reports an error when
 reached against an available native or Pi manifest diagnostic candidate. For a local directory
