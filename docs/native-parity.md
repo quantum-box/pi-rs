@@ -3114,6 +3114,9 @@ with chunked multibyte output; other local-tool parity gaps remain open.
 Invalid regular expressions in unrestricted local `grep` include the `rg:`
 prefix used by Pi's ripgrep diagnostic. Unsupported look-around and
 backreferences include ripgrep's PCRE2 suggestion.
+Malformed `glob` filters report the original glob with ripgrep's diagnostic
+before regex compilation. Unrestricted local `grep` and `ls` report the
+requested path as missing when an intermediate component is a regular file.
 
 Grep now emits a separate context block for each match, including repeated lines
 where adjacent matches overlap. The matching marker belongs to that block's
