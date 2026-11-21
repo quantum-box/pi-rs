@@ -1022,6 +1022,10 @@ async fn configure_after(
         let mut registry =
             Registry::compose_with_mcp_declarations(extensions, &disabled, mcp_enabled)?;
         registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
+        registry.publish_tool_attempts(matches!(
+            args.mode,
+            Some(super::OutputMode::Json | super::OutputMode::Rpc)
+        ));
         registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,
         })))?;

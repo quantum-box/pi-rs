@@ -1958,6 +1958,7 @@ pub struct Registry {
     pub(crate) omit_default_tool_timeout: bool,
     mcp_servers: Arc<crate::mcp_registration::McpServerRegistrations>,
     omit_mcp_declarations: bool,
+    pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
@@ -2370,6 +2371,12 @@ impl Registry {
     /// Explicitly configured host timeouts should leave this disabled.
     pub fn omit_default_tool_timeout(&mut self, omit: bool) {
         self.omit_default_tool_timeout = omit;
+    }
+
+    /// Publish transient tool starts before argument preparation. Enabled by
+    /// hosts that expose Pi's tool execution event stream.
+    pub fn publish_tool_attempts(&mut self, publish: bool) {
+        self.publish_tool_attempts = publish;
     }
     pub fn has_resource_discovery_hooks(&self) -> bool {
         self.extensions
@@ -2961,6 +2968,7 @@ impl Registry {
             omit_default_tool_timeout: self.omit_default_tool_timeout,
             mcp_servers: self.mcp_servers.clone(),
             omit_mcp_declarations: self.omit_mcp_declarations,
+            publish_tool_attempts: self.publish_tool_attempts,
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
         })

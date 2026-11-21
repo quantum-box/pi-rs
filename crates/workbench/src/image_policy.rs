@@ -72,15 +72,21 @@ impl FinalStrictPolicy {
         {
             return Ok(false);
         }
-        Ok(if adapter == super::providers::Adapter::OpenAiResponses {
-            self.profiles
-                .responses_strict_tool_support(&self.provider, metadata.as_ref())
-        } else {
-            self.profiles
-                .chat_compatibility(&self.provider, metadata.as_ref())
-                .supports_strict_mode()
-                == Some(true)
-        })
+        Ok(
+            if matches!(
+                adapter,
+                super::providers::Adapter::OpenAiResponses
+                    | super::providers::Adapter::CodexResponses
+            ) {
+                self.profiles
+                    .responses_strict_tool_support(&self.provider, metadata.as_ref())
+            } else {
+                self.profiles
+                    .chat_compatibility(&self.provider, metadata.as_ref())
+                    .supports_strict_mode()
+                    == Some(true)
+            },
+        )
     }
 }
 
@@ -1623,6 +1629,26 @@ mod final_strict_policy_tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn codex_final_model_policy_uses_the_responses_strict_default() {
+        let profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"openai-codex":{
+                "models":[{"id":"without-strict","compat":{"supportsStrictMode":false}}]
+            }}
+        }))
+        .unwrap();
+        let policy = FinalStrictPolicy {
+            provider: profiles.provider("openai-codex").unwrap(),
+            profiles,
+            selected_model: "gpt-6.1-sol".into(),
+            explicit_endpoint: false,
+            bound_support: None,
+        };
+        assert!(policy.baseline().unwrap());
+        assert!(!policy.support("without-strict").unwrap());
+        assert!(!policy.support("unknown").unwrap());
     }
 
     #[test]

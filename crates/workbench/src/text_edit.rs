@@ -28,6 +28,40 @@ fn lf(text: &str) -> String {
 pub(super) fn normalized_content(text: &str) -> String {
     lf(text.strip_prefix('\u{feff}').unwrap_or(text))
 }
+pub(super) fn unified_patch<'a>(
+    path: &str,
+    diff: &'a similar::TextDiff<'a, 'a, 'a, str>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut patch = format!("--- {path}\n+++ {path}\n");
+    for hunk in diff.unified_diff().context_radius(4).iter_hunks() {
+        let first = hunk.ops().first().expect("hunk has operations");
+        let last = hunk.ops().last().expect("hunk has operations");
+        let old_start = first.old_range().start;
+        let new_start = first.new_range().start;
+        let old_count = last.old_range().end - old_start;
+        let new_count = last.new_range().end - new_start;
+        // Pi prints both counts, even for a single line. Empty ranges use the
+        // preceding line number, including zero at the start of a file.
+        let _ = writeln!(
+            patch,
+            "@@ -{},{} +{},{} @@",
+            old_start + usize::from(old_count > 0),
+            old_count,
+            new_start + usize::from(new_count > 0),
+            new_count,
+        );
+        // Reuse similar's line prefixes and missing-final-newline markers.
+        let rendered = hunk.to_string();
+        let (_, changes) = rendered
+            .split_once('\n')
+            .expect("hunk header ends in a newline");
+        patch.push_str(changes);
+    }
+    patch
+}
+
 pub(super) fn numbered_diff(diff: &similar::TextDiff<'_, '_, '_, str>, digits: usize) -> String {
     use std::fmt::Write as _;
     let mut output = String::new();
@@ -384,6 +418,37 @@ pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_patch_matches_pi_single_line_range_and_newline_markers() {
+        for (before, after, expected) in [
+            ("old\n", "new\n", "@@ -1,1 +1,1 @@\n-old\n+new\n"),
+            ("old\n", "", "@@ -1,1 +0,0 @@\n-old\n"),
+            ("", "new\n", "@@ -0,0 +1,1 @@\n+new\n"),
+            (
+                "old",
+                "new",
+                "@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+            ),
+            (
+                "old",
+                "old\n",
+                "@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+old\n",
+            ),
+            (
+                "one\ntwo\n",
+                "one\nnew\n",
+                "@@ -1,2 +1,2 @@\n one\n-two\n+new\n",
+            ),
+        ] {
+            let diff = similar::TextDiff::from_lines(before, after);
+            assert_eq!(
+                unified_patch("fixture", &diff),
+                format!("--- fixture\n+++ fixture\n{expected}"),
+                "{before:?} -> {after:?}"
+            );
+        }
+    }
     #[test]
     fn fuzzy_edits_use_ecmascript_trailing_whitespace() {
         let arguments = json!({"path":"example","oldText":"alpha\nbeta","newText":"changed"});
