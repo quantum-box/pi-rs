@@ -596,9 +596,7 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
     Ok(removed)
 }
 
-pub(super) fn valid_key(key: &str) -> bool {
-    !key.is_empty() && key.len() <= 4096 && key.bytes().all(|byte| byte.is_ascii_graphic())
-}
+pub(super) use pi_rs_workbench::auth_factory::valid_api_key as valid_key;
 
 #[cfg(test)]
 mod tests {
