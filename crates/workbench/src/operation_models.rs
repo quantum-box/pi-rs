@@ -429,7 +429,9 @@ impl Catalogue {
                         .find(|(key, _)| key.eq_ignore_ascii_case(&name))
                         .and_then(|(_, configured)| {
                             if name == "cloudflare-workers-ai" {
-                                cloudflare_model_binding(configured)
+                                configured["models"]
+                                    .as_array()
+                                    .and_then(|models| cloudflare_model_binding(models))
                             } else {
                                 configured["models"]
                                     .as_array()
@@ -640,8 +642,7 @@ impl Catalogue {
 
 // None means no model-level endpoint was configured. Some(None) means that
 // endpoints were configured but cannot be bound unambiguously.
-fn cloudflare_model_binding(provider: &Value) -> Option<Option<String>> {
-    let models = provider["models"].as_array()?;
+pub(super) fn cloudflare_model_binding(models: &[Value]) -> Option<Option<String>> {
     if !models
         .iter()
         .any(|model| model["baseUrl"].as_str().is_some())

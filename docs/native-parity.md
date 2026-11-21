@@ -4722,6 +4722,17 @@ total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
 
+### Cloudflare Workers AI chat checkpoint
+
+Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+`CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
+requests. Pi-format saved credentials may declare an account through their
+`env` field. A stored account scopes the key to that account's chat route.
+An unscoped saved key works only on official Workers AI routes. Credentials
+and headers inferred from classifier-only model URLs apply to those operations.
+When the inferred URL is on the configured official account, its provider
+credentials also apply to chat. Live Workers AI inference has not been verified.
+
 ### Configured llama.cpp classifiers
 
 A `models.json` provider can declare an entry with `"type": "classifier"` and
