@@ -490,3 +490,130 @@ fn explicit_prompt_inputs_enforce_aggregate_limits() {
         .push(PromptInput::Literal(String::new()));
     assert!(factory.load(&grants, &[]).is_err());
 }
+
+#[tokio::test]
+async fn combined_resource_snapshot_reaches_the_model_in_pi_section_order() {
+    use pi_rs_workbench::resource_factory::{ResourceFactory, ResourceReadGrants};
+    use pi_rs_workbench::skill_resources::SkillReader;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".pi")).unwrap();
+    fs::write(root.join(".pi/SYSTEM.md"), "custom preamble").unwrap();
+    fs::write(root.join(".pi/APPEND_SYSTEM.md"), "extra guidance").unwrap();
+    fs::write(root.join("AGENTS.md"), "repository context").unwrap();
+    let skills = root.join("skills");
+    for (name, visibility) in [
+        ("visible", ""),
+        ("manual", "disable-model-invocation: true\n"),
+    ] {
+        let directory = skills.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: A & B\n{visibility}---\nSkill instructions"),
+        )
+        .unwrap();
+    }
+    let templates = root.join("templates");
+    fs::create_dir(&templates).unwrap();
+    fs::write(templates.join("review.md"), "Review $1").unwrap();
+    let theme = root.join("dark.json");
+    fs::write(&theme, include_str!("../assets/themes/dark.json")).unwrap();
+    let mut grants = ResourceReadGrants::default();
+    grants.prompts.project = Some(root.to_owned());
+    grants.context.directories = vec![root.to_owned()];
+    grants.skill_directories = vec![skills];
+    grants.template_directories = vec![templates];
+    grants.themes.files = vec![theme.clone()];
+
+    let factory = ResourceFactory::default();
+    let snapshot = factory.load(&grants).unwrap();
+    assert_eq!(snapshot.skills.skills.len(), 2);
+    assert_eq!(snapshot.templates[0].name, "review");
+    assert_eq!(snapshot.templates[0].body, "Review $1");
+    assert_eq!(snapshot.themes.themes()[0].path(), theme);
+    let without_reader = format!(
+        "custom preamble\n\n<addendum>\nextra guidance\n</addendum>\n\n<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"{}\">\nrepository context\n</project_instructions>\n</project_context>\n\n<cwd>\n{}\n</cwd>",
+        root.join("AGENTS.md").display(),
+        root.to_string_lossy().replace('\\', "/"),
+    );
+    assert_eq!(
+        snapshot.system_prompt("default", root, None).unwrap(),
+        without_reader
+    );
+    let with_reader = snapshot
+        .system_prompt("default", root, Some(SkillReader::Read))
+        .unwrap();
+    assert!(with_reader.contains("</project_context>\n\n<skills>\nThe following skills"));
+    assert!(with_reader.contains("<description>A &amp; B</description>"));
+    assert!(with_reader.contains("<name>visible</name>"));
+    assert!(!with_reader.contains("<name>manual</name>"));
+    assert!(with_reader.contains("</skills>\n\n<cwd>"));
+
+    let model = std::sync::Arc::new(Capture::default());
+    let mut session = snapshot
+        .apply(
+            pi_rs::SessionBuilder::new(model.clone(), "fixture"),
+            "default",
+            root,
+            Some(SkillReader::Read),
+        )
+        .unwrap()
+        .in_memory()
+        .unwrap();
+    fs::write(root.join(".pi/SYSTEM.md"), "new preamble").unwrap();
+    assert!(
+        factory
+            .load(&grants)
+            .unwrap()
+            .system_prompt("default", root, None)
+            .unwrap()
+            .starts_with("new preamble")
+    );
+    fs::write(theme, "malformed").unwrap();
+    assert!(factory.load(&grants).is_err());
+    session.prompt("hello").await.unwrap();
+    assert!(model.0.lock().unwrap()[0].messages.iter().any(
+        |message| matches!(message, pi_rs::Message::System { content } if content == &with_reader)
+    ));
+
+    // Validate paths before the broken theme or any earlier resource can be read.
+    grants
+        .template_directories
+        .push("relative-directory".into());
+    let error = factory.load(&grants).unwrap_err().to_string();
+    assert!(error.contains("resource grant must be absolute"));
+}
+
+#[test]
+fn combined_prompt_distinguishes_empty_append_literals_and_files() {
+    use pi_rs_workbench::prompt_resources::{ExplicitPromptResourceFactory, PromptInput};
+    use pi_rs_workbench::resource_factory::{ResourceFactory, ResourceReadGrants};
+
+    let temp = tempfile::tempdir().unwrap();
+    let empty = temp.path().join("empty.md");
+    fs::write(&empty, "").unwrap();
+    let factory = ResourceFactory {
+        prompts: ExplicitPromptResourceFactory {
+            system: None,
+            append: Some(vec![
+                PromptInput::Literal(String::new()),
+                PromptInput::File(empty.clone()),
+                PromptInput::Literal("guidance".into()),
+            ]),
+        },
+    };
+    let snapshot = factory
+        .load(&ResourceReadGrants {
+            prompt_files: vec![empty],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .system_prompt("default", std::path::Path::new(""), None)
+            .unwrap(),
+        "default\n\n<addendum>\n\n\nguidance\n</addendum>\n\n<cwd>\n\n</cwd>"
+    );
+}
