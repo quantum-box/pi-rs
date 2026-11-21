@@ -765,7 +765,8 @@ fn install_globals(
                     {
                         json!({"ok":false,"error":"This tool is not callable from a script"})
                     }
-                    Ok(arguments) => tool_value(
+                    Ok(arguments) => nested_tool_value(
+                        &name,
                         host.call_with_cancellation(&name, arguments, cancellation)
                             .await,
                     ),
@@ -796,6 +797,21 @@ fn install_globals(
     ctx.eval::<(), _>(include_str!("codemode-bootstrap.js"))?;
     Ok(())
 }
+fn nested_tool_value(name: &str, outcome: Outcome) -> Value {
+    // MCP call errors can carry recovery data. Transport errors and native
+    // tool errors still reject their promises through the standard path.
+    if name.starts_with("mcp__")
+        && let Outcome::TextResultWithStructuredContent {
+            structured_content, ..
+        } = &outcome
+        && structured_content["content"].is_array()
+        && structured_content["isError"] == true
+    {
+        return json!({"ok":true,"value":structured_content});
+    }
+    tool_value(outcome)
+}
+
 fn tool_value(outcome: Outcome) -> Value {
     if outcome.is_error() {
         return json!({"ok":false,"error":outcome.tool_content()});
@@ -1640,6 +1656,78 @@ mod tests {
             assert!(!error.contains("private metadata"));
         }
     }
+    #[tokio::test]
+    async fn codemode_resolves_mcp_tool_errors_but_rejects_transport_errors() {
+        struct McpHost;
+        #[async_trait::async_trait]
+        impl ToolHost for McpHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["mcp__fixture__check", "mcp__fixture__offline"]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: "fixture".into(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                if name.ends_with("offline") {
+                    return Outcome::Unknown("connection closed".into());
+                }
+                Outcome::TextResultWithStructuredContent {
+                    output: "Tool failed: not ready".into(),
+                    details: None,
+                    is_error: true,
+                    structured_content: json!({
+                        "isError":true,
+                        "content":[{"type":"text","text":"not ready"}],
+                        "structuredContent":{"retryable":true}
+                    }),
+                }
+            }
+        }
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(3)),
+        }
+        .invoke_transaction(
+            json!({"code":r#"
+                const result = await tools.mcp__fixture__check({});
+                if (!result.isError || !result.structuredContent.retryable) {
+                    throw new Error("missing MCP error data");
+                }
+                text(result.content[0].text);
+                try {
+                    await tools.mcp__fixture__offline({});
+                    text("unexpected transport success");
+                } catch (error) {
+                    text(error.message);
+                }
+            "#}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(McpHost),
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!(
+                "script should handle both MCP outcomes: {:?}",
+                reply.outcome
+            );
+        };
+        assert_eq!(data["isError"], false);
+        let report = data["content"].to_string();
+        assert!(report.contains("not ready"), "{report}");
+        assert!(report.contains("connection closed"), "{report}");
+        assert!(!report.contains("unexpected transport success"), "{report}");
+    }
+
     #[tokio::test]
     async fn patched_text_results_reach_scripts_with_independent_status() {
         struct PatchedHost;

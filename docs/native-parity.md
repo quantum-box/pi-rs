@@ -1649,7 +1649,12 @@ is saved to a local file.
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
 `autoEnableCodemode` MCP setting controls automatic activation. Explicit tool
-exclusions also prevent script access. Programmatic shell calls return output,
+exclusions also prevent script access. Codemode receives the MCP call result,
+including `content`, `structuredContent`, and `isError` when a server returns
+a tool error. Connection and transport failures reject the script's call.
+The client's tool result omits the server's top-level `_meta`.
+
+Programmatic shell calls return output,
 exit status, truncation and elapsed time, including nonzero exit statuses.
 Nested calls retain their own validation, policy checks and journal entries.
 
