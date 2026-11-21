@@ -1185,3 +1185,129 @@ async fn custom_http02_sdk_client_keeps_extensions_with_and_without_headers() {
         );
     }
 }
+
+#[tokio::test]
+async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
+    use pi_rs_core::{
+        Agent, CancellationToken, Extension, ExtensionResult, ExtensionState, Limits, MemoryStore,
+        ProviderResponseEvent, Registry, Session,
+    };
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Notify;
+
+    struct Observer(Arc<Notify>);
+    #[async_trait::async_trait]
+    impl Extension for Observer {
+        fn id(&self) -> &str {
+            "bedrock-response"
+        }
+
+        fn handles_after_provider_response(&self) -> bool {
+            true
+        }
+
+        async fn after_provider_response(
+            &self,
+            event: &ProviderResponseEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            assert_eq!(event.status, 200);
+            assert_eq!(event.headers["x-amzn-requestid"], "request-1");
+            assert_eq!(event.headers["x-gateway"], "first, second");
+            for protected in ["set-cookie", "x-echo-token", "x-echo-key"] {
+                assert!(!event.headers.contains_key(protected));
+            }
+            self.0.notify_one();
+            Ok(())
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let released = Arc::new(Notify::new());
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Observer(released.clone())))
+        .unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut data = Vec::new();
+        let mut buffer = [0; 4096];
+        let header_end = loop {
+            let received = socket.read(&mut buffer).await.unwrap();
+            assert!(received != 0);
+            data.extend_from_slice(&buffer[..received]);
+            if let Some(end) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-amz-security-token: fixture-session")
+        );
+        let length: usize = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .unwrap()
+            .1
+            .trim()
+            .parse()
+            .unwrap();
+        while data.len() < header_end + length {
+            let received = socket.read(&mut buffer).await.unwrap();
+            assert!(received != 0);
+            data.extend_from_slice(&buffer[..received]);
+        }
+        let frames = [
+            event("messageStart", json!({"role": "assistant"})),
+            event("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"text": "hello"}})),
+            event("contentBlockStop", json!({"contentBlockIndex": 0})),
+            event("messageStop", json!({"stopReason": "end_turn"})),
+            event("metadata", json!({"usage": {"inputTokens": 2, "outputTokens": 1, "totalTokens": 3}, "metrics": {"latencyMs": 1}})),
+        ].concat();
+        socket.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nContent-Length: {}\r\nX-Amzn-Requestid: request-1\r\nX-Gateway: first\r\nX-Gateway: second\r\nSet-Cookie: session=private\r\nX-Echo-Token: fixture-session\r\nX-Echo-Key: FIXTUREACCESSKEY\r\nConnection: close\r\n\r\n",
+            frames.len(),
+        ).as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), released.notified())
+            .await
+            .expect("extension must observe headers before the first event frame");
+        socket.write_all(&frames).await.unwrap();
+    });
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+        .credentials_provider(aws_credential_types::Credentials::new(
+            "FIXTUREACCESSKEY",
+            "fixture-secret",
+            Some("fixture-session".into()),
+            None,
+            "fixture",
+        ))
+        .endpoint_url(format!("http://{address}"))
+        .build();
+    let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config));
+    let agent = Agent {
+        model: &model,
+        model_name: "test-model",
+        registry: &registry,
+        system_prompt: "",
+        limits: Limits::default(),
+    };
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_tx, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+    let answer = agent
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await;
+    server.await.unwrap();
+    assert_eq!(answer.unwrap(), "hello");
+}
