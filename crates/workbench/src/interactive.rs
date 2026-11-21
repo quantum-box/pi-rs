@@ -9192,7 +9192,6 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     #[test]
     fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
         let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
@@ -9249,6 +9248,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn signal_listener_survives_interrupt_during_editor() {
         use std::sync::atomic::Ordering;
