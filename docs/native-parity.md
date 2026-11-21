@@ -3984,6 +3984,13 @@ model the caller dispatches through it. Grammar declarations in Chat Completions
 ordinary function tools; custom grammar tools and their streaming/replay remain
 unsupported. No provider-side strict-limit retry is implemented on this path.
 
+Workbench defaults to strict-tool support for the selected ChatGPT plan model,
+matching Pi's Codex Responses adapter. `compat.supportsStrictMode` can override
+that default. The Responses adapter explicitly sends `strict: false` for
+unconstrained calls on official OpenAI and ChatGPT plan routes so the server
+preserves the recorded decision. Compatible endpoints that lack strict-field
+support continue to omit it.
+
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier

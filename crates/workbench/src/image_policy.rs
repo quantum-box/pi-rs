@@ -45,7 +45,8 @@ impl FinalStrictPolicy {
     }
     fn support(&self, model: &str) -> Result<bool> {
         let metadata = self.profiles.model(&self.provider, model);
-        if self.profiles.model_adapter(&self.provider, model)
+        let adapter = self.profiles.model_adapter(&self.provider, model);
+        if adapter
             != self
                 .profiles
                 .model_adapter(&self.provider, &self.selected_model)
@@ -71,11 +72,15 @@ impl FinalStrictPolicy {
         {
             return Ok(false);
         }
-        Ok(self
-            .profiles
-            .chat_compatibility(&self.provider, metadata.as_ref())
-            .supports_strict_mode()
-            == Some(true))
+        Ok(if adapter == super::providers::Adapter::OpenAiResponses {
+            self.profiles
+                .responses_strict_tool_support(&self.provider, metadata.as_ref())
+        } else {
+            self.profiles
+                .chat_compatibility(&self.provider, metadata.as_ref())
+                .supports_strict_mode()
+                == Some(true)
+        })
     }
 }
 
@@ -1563,6 +1568,62 @@ mod tests {
 mod final_strict_policy_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn chatgpt_responses_prepares_strict_tools_unless_profile_disables_them() {
+        use clap::Parser;
+
+        let endpoint = "http://127.0.0.1:1234/v1/responses";
+        let mut args = crate::Cli::parse_from(["pi"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse(&json!({"providers":{
+            "openai-chatgpt": { "api":"openai-responses", "baseUrl":endpoint,
+                "models":[{"id":"default"},{"id":"off","compat":{"supportsStrictMode":false}}]}
+        }}))
+        .unwrap();
+        args.provider = args.model_profiles.provider("openai-chatgpt").unwrap();
+        args.model = "default".into();
+        args.endpoint = endpoint.into();
+        args.api_key = Some("fixture".into());
+        let model = crate::runtime::model_client(&args, false, false).unwrap();
+        let tool = pi_rs::ToolSpec {
+            name: "pick".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","properties":{"name":{"type":"string"}}}),
+        };
+        let declaration = pi_rs::ToolDeclaration {
+            spec: tool.clone(),
+            constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                strict: pi_rs::StrictToolPolicy::Prefer,
+            }),
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            external_id: "fixture".into(),
+            summary: false,
+        };
+        for (id, strict) in [("default", true), ("off", false), ("unknown", false)] {
+            let request = ModelRequest {
+                model: id.into(),
+                messages: Vec::new(),
+                tools: vec![tool.clone()],
+                max_output_tokens: 10,
+            };
+            let prepared = model
+                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                ),
+                strict,
+                "{id}"
+            );
+        }
+    }
 
     #[test]
     fn rewritten_model_must_use_same_route() {

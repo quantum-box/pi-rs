@@ -1279,9 +1279,7 @@ impl Client {
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_strict_tool_support(
                         args.model_profiles
-                            .chat_compatibility(&args.provider, metadata.as_ref())
-                            .supports_strict_mode()
-                            .unwrap_or(false),
+                            .responses_strict_tool_support(&args.provider, metadata.as_ref()),
                     )
                     .with_prompt_cache_key_enabled(
                         args.model_profiles

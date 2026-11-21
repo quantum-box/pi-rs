@@ -188,8 +188,12 @@ impl OpenAiResponses {
         request: ModelRequest,
         declarations: &[pi_rs_core::ToolDeclaration],
     ) -> Result<PreparedResponsesRequest> {
-        let (wire_tools, effective_tools) =
-            resolved_constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let (wire_tools, effective_tools) = resolved_constrained_tools(
+            &request,
+            declarations,
+            self.strict_tool_support,
+            self.has_implicit_strict_tools(),
+        )?;
         let mut reservation_request = request.clone();
         for (spec, wire) in reservation_request.tools.iter_mut().zip(&wire_tools) {
             spec.parameters = wire["parameters"].clone();
@@ -202,6 +206,11 @@ impl OpenAiResponses {
             effective_tools,
         })
     }
+    fn has_implicit_strict_tools(&self) -> bool {
+        // OpenAI Responses may enable strict sampling when the field is omitted.
+        self.provider == "openai-chatgpt" || self.endpoint.host_str() == Some("api.openai.com")
+    }
+
     pub fn with_http_options(
         mut self,
         timeout: Option<std::time::Duration>,
@@ -671,6 +680,7 @@ fn resolved_constrained_tools(
     request: &ModelRequest,
     declarations: &[pi_rs_core::ToolDeclaration],
     supports_strict: bool,
+    implicit_strict_tools: bool,
 ) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
     if request.tools.len() != declarations.len()
         || request
@@ -703,7 +713,7 @@ fn resolved_constrained_tools(
             _ => None,
         };
         let mut tool = json!({"type":"function","name":spec.name,"description":spec.description,"parameters":strict_schema.as_ref().unwrap_or(&spec.parameters)});
-        if supports_strict {
+        if supports_strict || implicit_strict_tools {
             tool["strict"] = json!(strict_schema.is_some());
         }
         let sampling = if strict_schema.is_some() {
@@ -731,24 +741,7 @@ fn constrained_tools(
     declarations: &[pi_rs_core::ToolDeclaration],
     supports_strict: bool,
 ) -> Result<Vec<Value>> {
-    resolved_constrained_tools(request, declarations, supports_strict).map(|(wire, _)| wire)
-}
-
-fn stream_only_constrained_tools(
-    request: &ModelRequest,
-    declarations: &[pi_rs_core::ToolDeclaration],
-    supports_strict: bool,
-) -> Result<Vec<Value>> {
-    let (wire, effective) = resolved_constrained_tools(request, declarations, supports_strict)?;
-    if effective.iter().any(|tool| {
-        matches!(
-            tool.sampling,
-            pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
-        )
-    }) {
-        return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
-    }
-    Ok(wire)
+    resolved_constrained_tools(request, declarations, supports_strict, false).map(|(wire, _)| wire)
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -980,7 +973,7 @@ impl Model for OpenAiResponses {
         declarations: &[pi_rs_core::ToolDeclaration],
     ) -> Result<pi_rs_core::DetailedModelStream> {
         let tools =
-            stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
+            self.stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
         let stream = self
             .clone()
             .with_session_cache_key(external_id)
@@ -998,7 +991,7 @@ impl Model for OpenAiResponses {
         declarations: &[pi_rs_core::ToolDeclaration],
     ) -> Result<pi_rs_core::DetailedModelStream> {
         let tools =
-            stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
+            self.stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
         let stream = self
             .clone()
             .without_cache()
@@ -1009,6 +1002,29 @@ impl Model for OpenAiResponses {
 }
 
 impl OpenAiResponses {
+    fn stream_only_constrained_tools(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        supports_strict: bool,
+    ) -> Result<Vec<Value>> {
+        let (wire, effective) = resolved_constrained_tools(
+            request,
+            declarations,
+            supports_strict,
+            self.has_implicit_strict_tools(),
+        )?;
+        if effective.iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
+        Ok(wire)
+    }
+
     /// Stream with explicit per-tool declarations and strict capability.
     ///
     /// Strict decisions require the prepared-dispatch API; unconstrained
@@ -1019,7 +1035,7 @@ impl OpenAiResponses {
         declarations: &[pi_rs_core::ToolDeclaration],
         supports_strict: bool,
     ) -> Result<ModelStream> {
-        let tools = stream_only_constrained_tools(&request, declarations, supports_strict)?;
+        let tools = self.stream_only_constrained_tools(&request, declarations, supports_strict)?;
         let stream = self
             .stream_enriched_with_tools(request, Some(tools))
             .await?;
@@ -2068,8 +2084,37 @@ mod tests {
         assert!(supported.prepare_tool_request(req, &[declaration]).is_err());
     }
 
+    #[test]
+    fn official_responses_explicitly_disables_implicit_strict_sampling() {
+        let model = OpenAiResponses::new_api(DEFAULT_ENDPOINT, "fixture".into()).unwrap();
+        let req = request();
+        let declarations = [pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        }];
+        let prepared = model
+            .prepare_tool_request(req.clone(), &declarations)
+            .unwrap();
+        assert_eq!(prepared.wire_tools[0]["strict"], false);
+        assert_eq!(
+            prepared.wire_tools[0]["parameters"],
+            req.tools[0].parameters
+        );
+        let stream_tools = model
+            .stream_only_constrained_tools(&req, &declarations, false)
+            .unwrap();
+        assert_eq!(stream_tools, prepared.wire_tools);
+    }
+
     #[tokio::test]
     async fn prepared_fallback_session_sends_the_reported_unconstrained_tool() {
+        assert_prepared_fallback_session(false).await;
+        assert_prepared_fallback_session(true).await;
+    }
+
+    async fn assert_prepared_fallback_session(plan: bool) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2130,9 +2175,12 @@ mod tests {
                 strict: pi_rs_core::StrictToolPolicy::Prefer,
             }),
         };
-        let model =
-            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
-                .unwrap();
+        let endpoint = format!("http://{address}/responses");
+        let model = if plan {
+            OpenAiResponses::new(&endpoint, "fixture".into()).unwrap()
+        } else {
+            OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap()
+        };
         let mut context = pi_rs_core::ToolDispatchContext {
             request_id: uuid::Uuid::nil(),
             session_id: uuid::Uuid::nil(),
@@ -2152,14 +2200,22 @@ mod tests {
         ));
         let _ = prepared.dispatch().await;
         let (headers, body) = server.join().unwrap();
-        assert!(
-            headers
-                .lines()
-                .any(|line| line == "session-id: prepared-session")
-        );
+        let tool = if plan {
+            let tool = &body["tools"][0]["tools"][0];
+            assert_eq!(tool["strict"], false);
+            tool
+        } else {
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: prepared-session")
+            );
+            let tool = &body["tools"][0];
+            assert!(tool.get("strict").is_none());
+            tool
+        };
         assert_eq!(body["prompt_cache_key"], "prepared-session");
-        assert!(body["tools"][0].get("strict").is_none());
-        assert_eq!(body["tools"][0]["parameters"], req.tools[0].parameters);
+        assert_eq!(tool["parameters"], req.tools[0].parameters);
     }
 
     #[tokio::test]

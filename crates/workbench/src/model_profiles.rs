@@ -1103,6 +1103,16 @@ impl Profiles {
         )
     }
 
+    pub(super) fn responses_strict_tool_support(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.chat_compatibility(provider, model)
+            .supports_strict_mode()
+            .unwrap_or_else(|| provider.id() == "openai-chatgpt")
+    }
+
     fn cache_compatibility(
         &self,
         provider: &Provider,
