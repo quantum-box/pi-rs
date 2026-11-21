@@ -1257,6 +1257,24 @@ off the UI thread. Unresolved variable or command references and OAuth entries
 leave the route unconfigured. The SDK host controls ambient environment access,
 OAuth, and any credential writes.
 
+### Native SDK model file catalogs
+
+Embedded hosts can build an immutable catalog with
+`pi_rs_workbench::model_file::ModelFileReadGrants`. An explicit file path and
+exact provider, API, and declared base URL grants select custom chat models
+from strict Pi-format JSON. Provider fields are inherited unless the model
+overrides them. The grant supplies the actual request endpoint and the model
+factory supplies its exact credential. The import applies descriptive
+`modelOverrides` to selected declarations, including partial prices. Transport options such as
+configuration headers, provider compatibility and command-based keys stay
+under host control.
+
+Hosts may resolve saved key variables with
+`AuthFileReadGrants::load_with_variables`. The resolver receives the exact
+route and variable name after checking saved inline values, and the loader
+never consults process environment variables itself. Catalog and key reloads
+produce independent snapshots.
+
 ### Regular terminal checkpoint
 
 `--tui-mode regular` (or `tuiMode` in settings) keeps completed messages in
