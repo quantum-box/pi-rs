@@ -82,8 +82,19 @@ for (const source of extras) if (!sources.includes(source)) sources.push(source)
 const fixture = {
   reference: `Pi v1.5.0 ${commit} packages/tui/src/components/markdown.ts`,
   width: 80,
-  narrowCases: ['- > abc'].map(source => ({
-    source, width: 3, lines: new Markdown(source, 0, 0, theme).render(3).map(line => line.trimEnd()),
+  narrowCases: [
+    ['- > abc', 3],
+    ['alpha beta gamma', 9],
+    ['alpha **beta** gamma', 9],
+    ['alpha beta\ngamma delta', 9],
+    ['- alpha beta gamma', 11],
+    ['- [x] alpha beta gamma', 14],
+    ['> alpha beta gamma', 11],
+    ['alpha chartreuse', 9],
+    ['abc 日本語 test', 8],
+    ['paint 🧑‍💻 next', 8],
+  ].map(([source, width]) => ({
+    source, width, lines: new Markdown(source, 0, 0, theme).render(width).map(line => line.trimEnd()),
   })),
   cases: sources.map(source => ({
     source,

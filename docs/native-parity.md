@@ -2069,9 +2069,9 @@ have native work limits; inputs that exceed them use the existing bounded
 renderer and can differ in spacing from Pi.
 Nested list spacing follows source block boundaries. Source soft breaks
 produce separate rows in paragraphs, quotes, and list items, with list
-continuation prefixes, matching Pi. Extra source indentation, width-based
-wrapping, some numbered nested lists, and list-contained horizontal rules
-can still differ.
+continuation prefixes, matching Pi. Prose wraps at words and CJK graphemes
+and preserves inline styles across the wrap. Extra source indentation, some
+numbered nested lists, and list-contained horizontal rules can still differ.
 If nested-math scanning exceeds its resource limit, reference links may remain
 unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
