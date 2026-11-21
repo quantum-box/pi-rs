@@ -4906,8 +4906,13 @@ available for acceptance.
 
 ### GitHub Copilot
 
-The native catalog includes the pinned Pi AI release's 27 Copilot models across
-Chat Completions, Anthropic Messages, and OpenAI Responses.
+The native catalog includes Pi AI v1.6.0's 35 Copilot chat models across
+Chat Completions, Anthropic Messages, and OpenAI Responses. Models that
+advertise thinking effort on Chat Completions use its reasoning-effort field.
+Copilot Messages and Responses expose strict sampling for supported tools.
+Ordinary Responses function declarations explicitly send `strict: false` to
+prevent Copilot from imposing strict sampling and filling optional fields.
+Projection of Copilot's transcript-level `additional_tools` remains open.
 `COPILOT_GITHUB_TOKEN` supplies a short-lived Copilot API token.
 `pi login github-copilot` and `/login github-copilot` support GitHub.com's
 device authorization and store a Pi-compatible OAuth entry. pi-rs can also
