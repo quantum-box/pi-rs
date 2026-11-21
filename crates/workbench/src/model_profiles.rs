@@ -2061,6 +2061,36 @@ mod tests {
     }
 
     #[test]
+    fn fireworks_catalog_distinguishes_messages_and_chat_model_routes() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("fireworks").unwrap();
+        let deepseek = "accounts/fireworks/routers/deepseek-v4p1-flash-1017-ultrafast";
+        let kimi = "accounts/fireworks/models/kimi-k3p1-pro";
+        assert_eq!(profiles.model_ids(&provider).len(), 27);
+        assert!(
+            profiles
+                .model(&provider, "accounts/fireworks/models/gpt-oss-120b")
+                .is_none()
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, deepseek),
+            Adapter::Anthropic
+        );
+        let model = profiles.model(&provider, deepseek).unwrap();
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.mapped_effort("off"), Some(Some("none")));
+        assert_eq!(
+            profiles.model_adapter(&provider, kimi),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, kimi).unwrap();
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.mapped_effort("medium"), Some(None));
+    }
+
+    #[test]
     fn vercel_gateway_catalog_and_endpoint() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let provider = profiles.provider("vercel-ai-gateway").unwrap();

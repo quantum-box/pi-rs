@@ -5098,14 +5098,20 @@ endpoint-bound keys and headers, and route-bound signed Messages replay.
 
 ### Fireworks and OpenRouter Messages catalogs checkpoint
 
-The offline catalog includes 19 Fireworks and 19 OpenRouter models using
-Messages alongside the existing Chat Completions models. The official
-Messages routes use bearer authentication. Environment credentials and
+The offline Fireworks catalog matches the Pi 1.6.0 release. It includes
+16 Messages models and 11 Chat Completions models. DeepSeek V4.1 Flash
+1017 Ultra-fast uses adaptive thinking and image input on the Messages
+route. Kimi K3.1 Pro uses Chat Completions with model-specific reasoning
+and image support. The offline OpenRouter catalog includes 19 Messages
+models alongside Chat Completions. The official Messages routes use
+bearer authentication. Environment credentials and
 imported provider-wide keys or OpenRouter OAuth work on the official routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
 covered adaptive thinking, effort mapping and replay with Fireworks empty
-signatures and OpenRouter signed blocks. Additional cache warming and
-mid-conversation options remain to be matched.
+signatures and OpenRouter signed blocks. Fireworks Kimi models retain
+mid-conversation system messages. Tool additions within those messages
+and additional cache warming remain open. Live Fireworks inference was
+unverified.
 
 ### Terminal output padding checkpoint
 
