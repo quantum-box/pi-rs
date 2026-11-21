@@ -4454,11 +4454,12 @@ rejected before any credentials are sent there.
 Local acceptance covered both authentication methods, model filtering,
 inference against the catalog route, the advertised output cap and
 rejection of an unrelated endpoint. The built-in gateway ships the
-public chat model metadata from Pi 1.5.0. An authenticated catalog
-replaces that baseline and is cached privately for the gateway and
-credential. Offline startup and transient discovery failures can use
-the matching cache. Successful empty catalogs remain authoritative.
-[Pi AI 1.5.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0)
+39 public chat models from Pi 1.6. An authenticated catalog replaces that
+baseline and is cached privately for the gateway and credential. Offline
+startup and transient discovery failures can use the matching cache.
+Successful empty catalogs remain authoritative. Live authenticated Radius
+discovery for this release was unverified.
+[Pi AI 1.6.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.6.0)
 
 ### Single-shot JSON event stream
 
