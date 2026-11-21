@@ -2543,9 +2543,9 @@ impl View {
         width: usize,
         height: usize,
     ) -> (Vec<String>, usize, usize) {
-        let padding = (args.settings.value()["editorPaddingX"]
-            .as_u64()
-            .unwrap_or(0) as usize)
+        let padding = args
+            .settings
+            .editor_padding()
             .min(width.saturating_sub(1) / 2);
         self.editor_width = width - 2 * padding;
         self.editor_page = (height * 3 / 10).max(5).min(height - 5);
@@ -7318,9 +7318,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
     };
     let tree_filter =
         TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
-    let padding = args.settings.value()["editorPaddingX"]
-        .as_u64()
-        .unwrap_or(0);
+    let padding = args.settings.editor_padding();
     let exit_output = args
         .settings
         .string("fullscreenExitOutput")
