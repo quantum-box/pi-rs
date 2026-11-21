@@ -11084,6 +11084,25 @@ async fn exercise_nested_woken_owned_rejection(selected: bool) {
             .is_none()
     );
     assert!(!matches!(child.task.state(), TaskState::Succeeded(_)));
+    drop(store);
+    let mut reopened = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+        ])
+        .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+        .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+        .env("PI_TEST_WOKEN_REAL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(reopened.try_wait().unwrap().is_none());
+    assert!(!dir.path().join("nested-cancelled").exists());
+    assert!(!dir.path().join("child-after").exists());
+    reopened.kill().unwrap();
+    reopened.wait().unwrap();
 }
 
 #[cfg(unix)]
