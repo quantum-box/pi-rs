@@ -2233,7 +2233,23 @@ mod tests {
         assert_eq!(provider.adapter(), Adapter::OpenAiResponses);
         let endpoint = args.model_profiles.endpoint(&provider);
         assert_eq!(endpoint, "https://api.meta.ai/v1/responses");
-        assert_eq!(args.model_profiles.model_ids(&provider).len(), 6);
+        assert_eq!(args.model_profiles.model_ids(&provider).len(), 7);
+        let ember = args
+            .model_profiles
+            .model(&provider, "muse-ember-1.0")
+            .unwrap();
+        assert_eq!(ember.context_window, Some(1_048_576));
+        assert_eq!(ember.max_tokens, Some(524_288));
+        assert_eq!(ember.supports_images(), Some(true));
+        assert_eq!(ember.mapped_effort("max"), Some(Some("max")));
+        let mut metadata = json!({});
+        ember.apply_catalog_metadata(&mut metadata);
+        assert_eq!(metadata["cost"]["input"], 0.1);
+        assert_eq!(
+            metadata["cost"]["tiers"][0],
+            json!({"inputTokensAbove":200_000,"input":0.3,"output":1.5,
+                "cacheRead":0.012,"cacheWrite":0.0})
+        );
         let model = args
             .model_profiles
             .model(&provider, "muse-spark-1.3")
@@ -2394,6 +2410,17 @@ mod tests {
         );
         assert_eq!(profiles.model_ids(&provider).len(), 6);
         let model = profiles.model(&provider, "k3.1-pro").unwrap();
+        for (id, output) in [
+            ("k3", 1_048_576),
+            ("k3-256k", 262_144),
+            ("k3.1-pro", 1_048_576),
+            ("k3.1-pro-highspeed", 1_048_576),
+        ] {
+            assert_eq!(
+                profiles.model(&provider, id).unwrap().max_tokens,
+                Some(output)
+            );
+        }
         assert_eq!(
             model.levels(Adapter::ChatCompletions).unwrap(),
             ["low", "high", "max"]
@@ -2600,27 +2627,37 @@ mod tests {
         for (name, endpoint, key, count) in [
             (
                 "qwen-token-plan",
-                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_API_KEY",
-                21,
+                "token-plan.maas.qwencloudapi.com",
+                "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+                20,
             ),
             (
                 "qwen-token-plan-cn",
-                "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_CN_API_KEY",
-                21,
+                "token-plan.maas.qianwenaiapi.com",
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                20,
             ),
             (
                 "qwen-token-plan-individual",
-                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_API_KEY",
-                9,
+                "token-plan.maas.qwencloudapi.com",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+                13,
+            ),
+            (
+                "qwen-token-plan-individual-cn",
+                "token-plan.maas.qianwenaiapi.com",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+                13,
             ),
         ] {
             let provider = profiles.provider(name).unwrap();
             assert_eq!(provider.adapter(), Adapter::ChatCompletions);
-            assert_eq!(profiles.endpoint(&provider), endpoint);
-            assert_eq!(builtin_chat::find(name).unwrap().env(), key);
+            assert_eq!(
+                profiles.endpoint(&provider),
+                format!("https://{endpoint}/compatible-mode/v1/chat/completions")
+            );
+            let builtin = builtin_chat::find(name).unwrap();
+            assert_eq!(builtin.env(), key);
             assert_eq!(profiles.model_ids(&provider).len(), count);
             let model = profiles.model(&provider, "qwen3.8-max").unwrap();
             assert_eq!(model.supports_images(), Some(true));
@@ -2628,16 +2665,117 @@ mod tests {
                 model.levels(Adapter::ChatCompletions).unwrap(),
                 ["low", "medium", "xhigh"]
             );
+            assert!(profiles.model(&provider, "qwen4-max-preview").is_some());
             assert!(profiles.model(&provider, "qwen3.8-max-preview").is_none());
+            assert!(profiles.model(&provider, "deepseek-v3.2").is_none());
+            assert!(profiles.model(&provider, "deepseek-v4-flash").is_none());
         }
-        assert!(
-            profiles
-                .model(
-                    &profiles.provider("qwen-token-plan-individual").unwrap(),
-                    "deepseek-v3.2"
-                )
-                .is_none()
-        );
+    }
+
+    #[test]
+    fn qwen_token_plan_environment_keys_are_ordered_and_scoped() {
+        const CHILD: &str = "PI_RS_TEST_QWEN_TOKEN_PLAN_KEYS";
+        let entries = [
+            (
+                "qwen-token-plan",
+                "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "international-legacy",
+            ),
+            (
+                "qwen-token-plan-cn",
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                "china-legacy",
+            ),
+            (
+                "qwen-token-plan-individual",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "international-legacy",
+            ),
+            (
+                "qwen-token-plan-individual-cn",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                "china-legacy",
+            ),
+        ];
+        let Ok(scenario) = std::env::var(CHILD) else {
+            for scenario in ["preferred", "fallback", "blank"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "model_profiles::tests::qwen_token_plan_environment_keys_are_ordered_and_scoped"])
+                    .env(CHILD, scenario);
+                for (provider, primary, fallback, legacy) in entries {
+                    command.env(fallback, legacy).env_remove(primary);
+                    match scenario {
+                        "preferred" => {
+                            command.env(primary, provider);
+                        }
+                        "blank" => {
+                            command.env(primary, " ");
+                        }
+                        _ => {}
+                    }
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        };
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = Profiles::parse(&json!({})).unwrap();
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({}));
+        let international_old = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+        let china_old =
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+        for (name, _, _, fallback) in entries {
+            let provider = args.model_profiles.provider(name).unwrap();
+            let official = args.model_profiles.endpoint(&provider);
+            let (legacy, foreign) = if name.ends_with("-cn") {
+                (china_old, international_old)
+            } else {
+                (international_old, china_old)
+            };
+            let expected = if scenario == "preferred" {
+                name
+            } else {
+                fallback
+            };
+            for endpoint in [official, legacy] {
+                assert_eq!(
+                    args.configured_model_credential(&provider, endpoint)
+                        .unwrap()
+                        .literal(),
+                    Some(expected)
+                );
+            }
+            for endpoint in [
+                foreign,
+                "https://token-plan.maas.qwencloudapi.com:444/compatible-mode/v1/chat/completions",
+                "https://relay.example/compatible-mode/v1/chat/completions",
+            ] {
+                assert!(
+                    args.configured_model_credential(&provider, endpoint)
+                        .is_none()
+                );
+            }
+            let saved = super::super::model_auth::Keys::parse(
+                &json!({(name):{"type":"api_key", "key":"old-route-key", "endpoint":legacy}}),
+            );
+            assert!(saved.credential(&provider, official).is_none());
+            assert_eq!(
+                saved.credential(&provider, legacy).unwrap().literal(),
+                Some("old-route-key")
+            );
+        }
     }
 
     #[test]
@@ -2817,7 +2955,13 @@ mod tests {
         let baseten = profiles.provider("baseten").unwrap();
         let nvidia = profiles.provider("nvidia").unwrap();
         assert_eq!(profiles.model_ids(&baseten).len(), 14);
-        assert_eq!(profiles.model_ids(&nvidia).len(), 21);
+        assert_eq!(profiles.model_ids(&nvidia).len(), 12);
+        assert!(
+            !profiles
+                .model_ids(&nvidia)
+                .iter()
+                .any(|id| id == "deepseek-ai/deepseek-v4.1-flash")
+        );
         let model = profiles.model(&baseten, "zai-org/GLM-5.2").unwrap();
         assert_eq!(model.reasoning, Some(true));
         assert_eq!(
@@ -2829,7 +2973,7 @@ mod tests {
             .request_headers(
                 &nvidia,
                 endpoint,
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 Some("fixture"),
             )
             .unwrap();
@@ -2838,20 +2982,20 @@ mod tests {
             .request_headers(
                 &nvidia,
                 "https://relay.example/v1/chat/completions",
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
         assert!(untrusted.get("nvcf-poll-seconds").is_none());
         let configured = Profiles::parse(&json!({"providers":{"nvidia":{
             "baseUrl":"https://relay.example/v1",
-            "modelOverrides":{"deepseek-ai/deepseek-v4.1-flash":{"headers":{"X-Relay-Secret":"private"}}}
+            "modelOverrides":{"nvidia/nemotron-3.5-super-vl-120b-a12b":{"headers":{"X-Relay-Secret":"private"}}}
         }}})).unwrap();
         let official = configured
             .request_headers(
                 &nvidia,
                 endpoint,
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
@@ -2861,11 +3005,33 @@ mod tests {
             .request_headers(
                 &nvidia,
                 "https://relay.example/v1/chat/completions",
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
         assert_eq!(relay["x-relay-secret"], "private");
+    }
+
+    #[test]
+    fn huggingface_catalog_uses_text_and_vision_metadata_from_the_router() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("huggingface").unwrap();
+        assert_eq!(profiles.model_ids(&provider).len(), 87);
+        let model = profiles
+            .model(&provider, "moonshotai/Kimi-K3.1-Pro")
+            .unwrap();
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(
+            profiles
+                .chat_compatibility(&provider, Some(&model))
+                .supports_developer_role(),
+            None
+        );
+        assert_eq!(model.image_resize().unwrap().max_width, Some(2000));
+        let llama = profiles
+            .model(&provider, "meta-llama/Llama-3.2-1B-Instruct")
+            .unwrap();
+        assert_eq!(llama.supports_images(), Some(false));
     }
 
     #[test]
@@ -3274,6 +3440,25 @@ mod tests {
             .unwrap();
         assert_eq!(model.mapped_effort("high"), Some(Some("high")));
         assert_eq!(model.mapped_effort("off"), Some(Some("none")));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(
+            model.image_resize(),
+            Some(ImageResizeProfile {
+                max_width: Some(2000),
+                max_height: Some(2000),
+                max_bytes: Some(4_718_592),
+                jpeg_quality: Some(80),
+            })
+        );
+
+        let ministral = profiles.model(&provider, "ministral-3b-2512").unwrap();
+        assert_eq!(ministral.max_tokens, Some(131_072));
+
+        let large = profiles.model(&provider, "mistral-large-latest").unwrap();
+        assert_eq!(large.context_window, Some(1_048_576));
+        assert_eq!(large.reasoning, Some(true));
+        assert_eq!(large.mapped_effort("medium"), Some(Some("medium")));
+        assert_eq!(large.mapped_effort("off"), Some(None));
     }
 
     #[test]

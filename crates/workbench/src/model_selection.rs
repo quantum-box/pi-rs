@@ -95,7 +95,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             )
             .is_some())
         || super::builtin_chat::find(provider.id())
-            .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
+            .is_some_and(|builtin| builtin.is_default_endpoint(args.endpoint_for(&provider)));
     let mut complete = false;
     if (probe && !bundled) || provider == Provider::Radius {
         match client.models().await {
@@ -758,6 +758,29 @@ mod tests {
             .await
             .unwrap();
         assert!(!catalog.complete);
+    }
+
+    #[test]
+    fn copilot_cached_catalog_filters_new_models_by_subscription() {
+        use clap::Parser;
+        use serde_json::json;
+        let mut args = super::Cli::parse_from(["pi"]);
+        let provider = super::Provider::named("github-copilot").unwrap();
+        args.provider = provider.clone();
+        args.endpoint = args.model_profiles.endpoint(&provider).into();
+        args.model = "gpt-6.2-sol".into();
+        args.model_keys = crate::model_auth::Keys::parse(&json!({
+            "github-copilot": {
+                "type": "oauth", "access": "fixture", "refresh": "other-fixture",
+                "expires": 4_000_000_000_000_u64,
+                "availableModelIds": ["gemini-4-neon", "gpt-6.2-sol", "unknown"]
+            }
+        }));
+        let selected = super::cached_catalogs(&args)
+            .into_iter()
+            .find(|catalog| catalog.provider == provider)
+            .unwrap();
+        assert_eq!(selected.models, ["gemini-4-neon", "gpt-6.2-sol"]);
     }
 
     #[test]
