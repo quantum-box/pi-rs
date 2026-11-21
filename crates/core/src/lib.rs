@@ -48,7 +48,9 @@ pub use lifecycle::{
     notify_in_session as notify_extension_lifecycle_in_session,
 };
 pub use model_catalog::*;
-pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
+pub use pi_rs_tool_arguments::{
+    JSON_DIAGNOSTIC_RETRY_LIMIT, StreamingJson, json_syntax_diagnostic, parse_tool_arguments,
+};
 pub use provider_response::{ProviderResponseEvent, observe_provider_response};
 pub use resource::Resource;
 pub use retry::*;
