@@ -2491,6 +2491,41 @@ fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
     ))
 }
 
+fn grep_glob_overrides(
+    root: &Path,
+    glob: &str,
+    unrestricted: bool,
+) -> Result<ignore::overrides::Override> {
+    let normalized = if unrestricted {
+        // Directory globs are rooted at the search directory. Strip explicit
+        // current-directory markers after any negation marker as well.
+        let (negation, pattern) = glob
+            .strip_prefix('!')
+            .map_or(("", glob), |pattern| ("!", pattern));
+        let pattern = pattern.trim_start_matches("./");
+        if negation.is_empty() {
+            std::borrow::Cow::Borrowed(pattern)
+        } else {
+            std::borrow::Cow::Owned(format!("{negation}{pattern}"))
+        }
+    } else {
+        std::borrow::Cow::Borrowed(glob)
+    };
+    let mut builder = ignore::overrides::OverrideBuilder::new(root);
+    builder
+        .add(&normalized)
+        .and_then(|builder| builder.build())
+        .map_err(|error| {
+            Error::Config(match error {
+                ignore::Error::Glob { glob: Some(_), err } if unrestricted => {
+                    format!("rg: error parsing glob '{glob}': {err}")
+                }
+                error if unrestricted => format!("rg: {error}"),
+                error => error.to_string(),
+            })
+        })
+}
+
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
         let input = crate::coding_paths::normalize(value)?;
@@ -2533,8 +2568,8 @@ impl CodingTool {
                     "EACCES: permission denied, access '{}'",
                     path.display()
                 ))
-            } else if error.kind() == std::io::ErrorKind::NotFound
-                && matches!(self.kind, Kind::Grep | Kind::List)
+            } else if matches!(self.kind, Kind::Grep | Kind::List)
+                && (self.unrestricted || error.kind() == std::io::ErrorKind::NotFound)
             {
                 Error::Config(format!("Path not found: {}", path.display()))
             } else {
@@ -3109,6 +3144,20 @@ impl CodingTool {
         } else {
             None
         };
+        let grep_glob = (!is_find).then(|| args["glob"].as_str()).flatten();
+        let overrides = if self.unrestricted
+            && let Some(glob) = grep_glob.filter(|glob| !glob.is_empty())
+        {
+            // Ripgrep builds its glob filter before compiling the regex.
+            let root = if grep_file_name.is_some() {
+                Path::new(".")
+            } else {
+                &base
+            };
+            Some(grep_glob_overrides(root, glob, true)?)
+        } else {
+            None
+        };
         let mut grep = if is_find {
             None
         } else {
@@ -3166,34 +3215,12 @@ impl CodingTool {
                 // next sibling: this is the same global order as sorting the
                 // selected full paths afterwards.
                 .sort_by_file_path(std::path::Path::cmp);
-        } else if let Some(glob) = args["glob"].as_str() {
-            // Pi runs directory searches from the search directory and strips
-            // leading ./ components, including after a negation marker. File
-            // searches retain ripgrep's existing explicit-file behavior.
-            let glob_root = match (self.unrestricted, grep_file_name.is_some()) {
-                (false, _) => &self.root,
-                (true, true) => Path::new("."),
-                (true, false) => &base,
-            };
-            let glob = if self.unrestricted {
-                let (negation, pattern) = glob
-                    .strip_prefix('!')
-                    .map_or(("", glob), |pattern| ("!", pattern));
-                let pattern = pattern.trim_start_matches("./");
-                if negation.is_empty() {
-                    std::borrow::Cow::Borrowed(pattern)
-                } else {
-                    std::borrow::Cow::Owned(format!("{negation}{pattern}"))
-                }
-            } else {
-                std::borrow::Cow::Borrowed(glob)
-            };
-            let mut overrides = ignore::overrides::OverrideBuilder::new(glob_root);
-            let overrides = overrides
-                .add(&glob)
-                .and_then(|builder| builder.build())
-                .map_err(|error| Error::Config(error.to_string()))?;
+        } else if let Some(overrides) = overrides {
             walker.overrides(overrides);
+        } else if !self.unrestricted
+            && let Some(glob) = grep_glob
+        {
+            walker.overrides(grep_glob_overrides(&self.root, glob, false)?);
         }
         let mut find_error = None;
         for entry in walker.build() {
@@ -5024,11 +5051,15 @@ mod tests {
         assert!(!output.contains("file.txt:2:"));
         for kind in [Kind::Grep, Kind::List] {
             tool.kind = kind;
-            let output = tool
-                .invoke(json!({"pattern": "match", "path": "missing"}), context())
-                .await;
-            assert!(matches!(output, Outcome::Failed(message)
-                    if message == format!("Path not found: {}", root.join("missing").display())));
+            for path in ["missing", "file.txt/child"] {
+                let mut args = json!({"path": path});
+                if matches!(kind, Kind::Grep) {
+                    args["pattern"] = json!("match");
+                }
+                let output = tool.invoke(args, context()).await;
+                assert!(matches!(output, Outcome::Failed(message)
+                        if message == format!("Path not found: {}", root.join(path).display())));
+            }
         }
         tool.kind = Kind::Read {
             auto_resize: true,
@@ -5054,6 +5085,43 @@ mod tests {
             tool.kind = kind;
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_grep_reports_ripgrep_glob_errors_before_regex_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "needle").unwrap();
+        let grep = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        for (glob, path, pattern) in [
+            ("[abc", ".", "needle"),
+            ("![abc", ".", "needle"),
+            ("./[abc", ".", "needle"),
+            ("[abc", "file.txt", "needle"),
+            ("[abc", ".", "["),
+        ] {
+            let outcome = grep
+                .invoke(
+                    json!({"pattern":pattern, "path":path, "glob":glob}),
+                    context(),
+                )
+                .await;
+            let expected =
+                format!("rg: error parsing glob '{glob}': unclosed character class; missing ']'");
+            assert!(
+                matches!(&outcome, Outcome::Failed(message) if *message == expected),
+                "{outcome:?}"
+            );
         }
     }
 
