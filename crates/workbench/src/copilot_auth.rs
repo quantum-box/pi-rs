@@ -369,7 +369,7 @@ async fn access_at(
         .min(u128::from(u64::MAX)) as u64;
     let window = min_ms;
     let guard = super::auth_lock::acquire_async(path).await?;
-    let mut credential = read(&super::config::read_object_unlocked(path)?)?;
+    let mut credential = read(&super::config::read_auth_object_locked(&guard)?)?;
     guard.check()?;
     if credential.expires <= now().saturating_add(window) {
         credential = service.refresh(&credential).await?;
