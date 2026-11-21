@@ -13,11 +13,15 @@ use rmcp::{
     RoleClient,
     model::{CallToolResponse, ProtocolVersion, SubscriptionFilter},
     service::{
-        ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService, ServiceError,
+        ClientInitializeError, ClientLifecycleMode, ClientServiceExt, NotificationContext,
+        RunningService, ServiceError,
     },
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::{InsufficientScopeError, StreamableHttpClientTransportConfig},
+        streamable_http_client::{
+            InsufficientScopeError, StreamableHttpClient, StreamableHttpClientTransportConfig,
+            StreamableHttpError,
+        },
     },
 };
 use serde::{Deserialize, Serialize};
@@ -745,33 +749,21 @@ impl McpExtension {
                         Some(Uuid::parse_str(&generation).map_err(|_| {
                             Error::Config("invalid MCP credential generation".into())
                         })?);
-                    NativeClient {
+                    let native = NativeClient {
                         dispatch_closed: client.dispatch_state.clone(),
                         ..Default::default()
-                    }
-                    .serve_with_lifecycle(
-                        StreamableHttpClientTransport::with_client(client, transport_config),
-                        lifecycle,
-                    )
-                    .await
+                    };
+                    start_http_service(native, client, transport_config, lifecycle).await
                 } else if let Some(resolver) = provider_token.clone() {
                     let client = ProviderClient {
                         client,
                         endpoint: Arc::from(url.as_str()),
                         resolver,
                     };
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
+                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
                         .await
                 } else {
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
+                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
                         .await
                 }
                 .map_err(|error| {
@@ -1065,6 +1057,10 @@ impl McpExtension {
         &self.server_tool_names
     }
 
+    pub fn remote_tool_exposure(&self, name: &str) -> &str {
+        tool_exposure(&self.connection.config, name)
+    }
+
     /// Whether the server advertised the resources capability at discovery.
     pub fn offers_resources(&self) -> bool {
         self.has_resources
@@ -1212,6 +1208,7 @@ fn publish_page_output(
 
 enum CallError {
     Other(String),
+    TransientHttp(String),
     Scope(Option<String>),
 }
 
@@ -1227,12 +1224,74 @@ impl From<serde_json::Error> for CallError {
     }
 }
 
+fn transient_http_status(error: &StreamableHttpError<reqwest_mcp::Error>) -> Option<u16> {
+    let status = match error {
+        StreamableHttpError::HttpStatus(error) => Some(error.status),
+        StreamableHttpError::Client(error) => error.status().map(|status| status.as_u16()),
+        // rmcp 3.9 only preserves typed status metadata for 429 and 5xx.
+        StreamableHttpError::UnexpectedServerResponse(detail)
+            if detail.starts_with("HTTP 408 Request Timeout: ") =>
+        {
+            Some(408)
+        }
+        _ => None,
+    };
+    status.filter(|status| matches!(status, 408 | 429 | 500 | 502..=599))
+}
+
+fn transient_http_initialization(error: &ClientInitializeError) -> bool {
+    let transport = match error {
+        ClientInitializeError::TransportError { error, .. } => error,
+        ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
+            return transient_http_initialization(fallback);
+        }
+        _ => return false,
+    };
+    let mut cause = Some(transport.error.as_ref() as &dyn std::error::Error);
+    while let Some(error) = cause {
+        if let Some(error) = error.downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>() {
+            return transient_http_status(error).is_some()
+                || matches!(error, StreamableHttpError::Client(error) if error.is_connect() || error.is_timeout() || error.is_request());
+        }
+        cause = error.source();
+    }
+    false
+}
+
+async fn start_http_service<C: StreamableHttpClient + Clone>(
+    native: NativeClient,
+    client: C,
+    config: StreamableHttpClientTransportConfig,
+    lifecycle: ClientLifecycleMode,
+) -> std::result::Result<RunningService<RoleClient, NativeClient>, ClientInitializeError> {
+    for delay in [Some(250), Some(1000), None] {
+        let transport = StreamableHttpClientTransport::with_client(client.clone(), config.clone());
+        let result = native
+            .clone()
+            .serve_with_lifecycle(transport, lifecycle.clone())
+            .await;
+        match (result, delay) {
+            (Err(error), Some(delay)) if transient_http_initialization(&error) => {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            (result, _) => return result,
+        }
+    }
+    unreachable!("last initialization attempt has no retry")
+}
+
 fn call_error(error: ServiceError) -> CallError {
     if let ServiceError::TransportSend(transport) = &error {
         let mut cause = Some(transport.error.as_ref() as &dyn std::error::Error);
         while let Some(error) = cause {
             if let Some(scope) = error.downcast_ref::<InsufficientScopeError>() {
                 return CallError::Scope(scope.get_required_scope().map(str::to_owned));
+            }
+            if let Some(status) = error
+                .downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>()
+                .and_then(transient_http_status)
+            {
+                return CallError::TransientHttp(format!("MCP request returned HTTP {status}"));
             }
             cause = error.source();
         }
@@ -1304,22 +1363,45 @@ impl McpTool {
                 result = self.call_once(&arguments, &context, host.as_ref(), &dispatch_cancel) => result,
             }
         };
-        let mut result = attempt().await;
-        if let Err(CallError::Scope(required)) = &result {
-            let Some(scopes) = required.as_deref().and_then(scope_tokens) else {
-                return Outcome::Failed("MCP server requires additional OAuth scopes but did not supply a valid scope list".into());
-            };
-            let authorized = tokio::select! {
-                _ = context.cancellation.cancelled() => Err(Error::Cancelled),
-                result = self.authorize_scopes(&scopes, host.as_deref()) => result,
-            };
-            if let Err(error) = authorized {
-                return Outcome::Failed(error.to_string());
+        let mut may_retry_read = self.resource
+            && matches!(
+                self.remote_name.as_str(),
+                "list_resources"
+                    | "list_resource_templates"
+                    | "list_resources_page"
+                    | "list_resource_templates_page"
+                    | "read_resource"
+            );
+        let mut may_upgrade_scope = true;
+        let result = loop {
+            match attempt().await {
+                Err(CallError::TransientHttp(_)) if may_retry_read => {
+                    may_retry_read = false;
+                    tokio::select! {
+                        biased;
+                        _ = context.cancellation.cancelled() => {
+                            return Outcome::Failed("MCP resource retry cancelled".into());
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+                }
+                Err(CallError::Scope(required)) if may_upgrade_scope => {
+                    may_upgrade_scope = false;
+                    let Some(scopes) = required.as_deref().and_then(scope_tokens) else {
+                        return Outcome::Failed("MCP server requires additional OAuth scopes but did not supply a valid scope list".into());
+                    };
+                    let authorized = tokio::select! {
+                        _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                        result = self.authorize_scopes(&scopes, host.as_deref()) => result,
+                    };
+                    if let Err(error) = authorized {
+                        return Outcome::Failed(error.to_string());
+                    }
+                    // The 403 rejected dispatch. Keep the original operation ID.
+                }
+                result => break result,
             }
-            // The typed HTTP 403 rejected the request before tool dispatch.
-            // Retry once with the same operation identifier and new authorization.
-            result = attempt().await;
-        }
+        };
         match result {
             Ok(CallResult::Data(data)) if data["isError"] == true => {
                 Outcome::Failed(data.to_string())
@@ -1342,7 +1424,9 @@ impl McpTool {
             Err(CallError::Scope(_)) => Outcome::Failed(
                 "MCP server still requires additional OAuth scopes after reauthorization".into(),
             ),
-            Err(CallError::Other(error)) => Outcome::Unknown(error),
+            Err(CallError::Other(error) | CallError::TransientHttp(error)) => {
+                Outcome::Unknown(error)
+            }
         }
     }
 

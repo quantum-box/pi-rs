@@ -37,6 +37,11 @@ enum Request {
         session: PathBuf,
     },
     CacheWarmingChanged,
+    RenderCustomMessage {
+        id: Uuid,
+        record_id: u64,
+        options: pi_rs::CustomMessageRenderOptions,
+    },
     CheckSessionTransition {
         id: Uuid,
         event: pi_rs::BeforeSessionTransition,
@@ -104,7 +109,10 @@ enum Request {
         resume: bool,
         task: String,
     },
-    McpStatus,
+    McpStatus {
+        #[serde(default)]
+        inspect: bool,
+    },
     Bash {
         command: String,
         #[serde(default)]
@@ -896,7 +904,15 @@ async fn run_worker(
     if runtime.registry.has_resource_discovery_hooks() {
         output(json!({"type":"resources_discovered","resources":discovered}));
     }
-    output(json!({"type":"backend_ready"}));
+    if args.terminal_managed_worker {
+        let renderers = runtime.registry.custom_message_renderers();
+        output(json!({
+            "type":"backend_ready",
+            "custom_message_renderers":renderers.types().collect::<Vec<_>>()
+        }));
+    } else {
+        output(json!({"type":"backend_ready"}));
+    }
     let mut continue_queue = false;
     let mut pending_discovery_trigger = startup_trigger;
     let cache = super::cache_warming::Controller::default();
@@ -1192,7 +1208,7 @@ async fn run_worker(
         let mut operation = Box::pin(async {
             if matches!(
                 &request,
-                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus
+                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus { .. }
             ) {
                 tokio::select! {
                     biased;
@@ -1529,7 +1545,13 @@ async fn run_worker(
                     ))
                     .await?;
                 }
-                Request::McpStatus => runtime.mcp_status(&args)?,
+                Request::McpStatus { inspect } => {
+                    if inspect {
+                        runtime.inspect_mcp(ui.as_ref(), &cancel).await?;
+                    } else {
+                        runtime.mcp_status(&args)?;
+                    }
+                }
                 Request::Review {
                     child,
                     from_record,
@@ -1864,6 +1886,7 @@ fn read_requests(
         shell,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
+    let message_renderers = registry.custom_message_renderers();
     let prepare_in_background =
         registry.has_input_hooks() || registry.has_resource_discovery_hooks();
     let processor = Arc::new(queue::Processor {
@@ -1878,6 +1901,7 @@ fn read_requests(
         trace,
     });
     let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let render_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1896,6 +1920,42 @@ fn read_requests(
                 }
             };
             match request {
+                Request::RenderCustomMessage {
+                    id,
+                    record_id,
+                    options,
+                } => {
+                    let message = {
+                        let snapshot = snapshot.lock().expect("session snapshot");
+                        snapshot
+                            .records
+                            .binary_search_by_key(&record_id, |record| record.id)
+                            .ok()
+                            .and_then(|index| match &snapshot.records[index].event {
+                                pi_rs::Event::CustomMessage { message }
+                                | pi_rs::Event::CustomMessageDelivered { message, .. }
+                                    if message.display
+                                        && message_renderers.contains(&message.custom_type) =>
+                                {
+                                    Some(message.clone())
+                                }
+                                _ => None,
+                            })
+                    };
+                    match (message, render_slots.clone().try_acquire_owned()) {
+                        (Some(message), Ok(slot)) => {
+                            let renderers = message_renderers.clone();
+                            runtime.spawn(async move {
+                                let rendered = renderers.render(&message, &options, std::time::Duration::from_secs(1)).await;
+                                drop(slot);
+                                output(json!({"type":"custom_message_rendered","id":id,"rendered":rendered}));
+                            });
+                        }
+                        _ => output(
+                            json!({"type":"custom_message_rendered","id":id,"rendered":null}),
+                        ),
+                    }
+                }
                 Request::ReadSession {
                     request,
                     path,

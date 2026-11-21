@@ -414,7 +414,7 @@ impl Keys {
         lines.join("\n")
     }
 }
-pub(super) fn binding_hint(key: Option<KeyEvent>) -> String {
+pub(crate) fn binding_hint(key: Option<KeyEvent>) -> String {
     let Some(key) = key else {
         return "—".into();
     };
