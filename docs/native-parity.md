@@ -4876,7 +4876,8 @@ transient upgrade failure suppresses new attempts for a minute. A server
 that loses the previous response ID receives the full transcript on retry.
 The client checks an idle connection with a WebSocket ping before sending the
 next request and replaces the connection if the check fails.
-The native HTTP fallback sends uncompressed JSON. Specialized Codex
+Native HTTP SSE uses a zstd-compressed JSON body when compression succeeds.
+The WebSocket request stays a JSON text frame. Specialized Codex
 grammar tools and tool search remain open. Authentication was exercised with
 fixtures. Live sign-in and inference were unverified because no account was
 available for acceptance.
@@ -5266,8 +5267,9 @@ supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
 overrides can disable long retention. Summary requests remove configured cache
 fields and, for explicit-mode models, request explicit caching with no
 breakpoints. ChatGPT plan requests omit these API-specific options. Responses requests use the active session ID as their prompt cache key,
-clamped to 64 Unicode characters, and omit it for summary requests. Pi’s
-Responses session-routing headers remain unsupported.
+clamped to 64 Unicode characters, and omit it for summary requests. Responses
+session-routing headers follow the provider or model's session-affinity format
+and are omitted for summary requests.
 
 ### Native Messages cache control checkpoint
 
