@@ -1011,8 +1011,7 @@ impl Picker {
             return Input::Continue;
         }
         if self.title == "Settings"
-            && let Some(action) = keys.action(key, false)
-            && action.starts_with("tui.editor.")
+            && let Some(action) = keys.editor_action(key)
         {
             let previous = self.query.text.clone();
             if self.query.settings_search_action(action) {
@@ -2599,6 +2598,20 @@ mod tests {
                 .sum::<usize>()
                 <= 27
         );
+    }
+
+    #[test]
+    fn settings_search_prefers_editor_bindings_over_app_shortcuts() {
+        let mut picker = Picker::new("Settings", vec![]);
+        let mut keys = Keys::default();
+        keys.set_test_binding("tui.editor.cursorLeft", "ctrl+l");
+        picker.paste("hte");
+        picker.input(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        picker.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &keys);
+        assert_eq!(picker.query.text, "htre");
     }
 
     #[test]
