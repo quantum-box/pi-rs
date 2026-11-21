@@ -24,6 +24,7 @@ mod cache_warming;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+mod codex_auth;
 mod config;
 mod copilot_auth;
 mod extension_ui;
@@ -467,6 +468,9 @@ impl Cli {
                             .filter(|key| !key.trim().is_empty())
                             .map(model_auth::Credential::Literal);
                     }
+                    return None;
+                }
+                if provider.id() == "openai-codex" {
                     return None;
                 }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
@@ -1171,7 +1175,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1190,7 +1194,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1949,6 +1953,28 @@ async fn execute(
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "openai-codex" {
+                    let method = if *device_code {
+                        codex_auth::Method::Device
+                    } else {
+                        codex_auth::Method::Browser
+                    };
+                    codex_auth::login(
+                        &args.settings, meta_auth::LoginControl::default(), method,
+                        |notice| match notice {
+                            codex_auth::Notice::Device {url, code} => eprintln!("Enter code {code} at {url}"),
+                            codex_auth::Notice::Browser(url, sender) => {
+                                eprintln!("Continue in your browser: {url}");
+                                eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+                                std::thread::spawn(move || {
+                                    let mut line = String::new();
+                                    if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) {
+                                        let _ = sender.send(line);
+                                    }
+                                });
+                            }
+                        },
+                    ).await
                 } else if provider == "github-copilot" {
                     copilot_auth::login(
                         &args.settings,
@@ -2009,7 +2035,7 @@ async fn execute(
                 kimi_auth::logout().await?
             } else if matches!(
                 provider.as_str(),
-                "openrouter" | "anthropic" | "github-copilot"
+                "openrouter" | "anthropic" | "github-copilot" | "openai-codex"
             ) {
                 model_auth::remove(&Provider::named(provider).expect("built-in login provider"))?
             } else {

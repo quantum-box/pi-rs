@@ -4853,6 +4853,24 @@ including model-specific compatibility, NVIDIA polling headers and Baseten's
 thinking template. Catalog entries that use other upstream APIs still need
 their own adapters.
 
+### OpenAI Codex
+
+`openai-codex` exposes the eight pinned models through the ChatGPT Codex
+Responses route. It supports native HTTP streaming, model-specific reasoning
+levels, image inputs, tool calls, and endpoint-bound response replay.
+`pi login openai-codex` uses browser PKCE, and `--device-code` selects
+device authorization. Browser sign-in also accepts a pasted code or redirect.
+The terminal offers both methods. Existing Pi Codex
+credentials can be read and refreshed in place. A refresh in flight saves
+rotated credentials even when the requesting turn is cancelled. They stay bound to the
+official Codex endpoint and are independent of native `openai-chatgpt` accounts.
+
+The native transport sends uncompressed JSON over HTTP SSE. The upstream
+WebSocket transport and specialized Codex
+grammar tools and tool search remain open. Authentication was exercised with
+fixtures. Live sign-in and inference were unverified because no account was
+available for acceptance.
+
 ### GitHub Copilot
 
 The native catalog includes the pinned Pi AI release's 27 Copilot models across
