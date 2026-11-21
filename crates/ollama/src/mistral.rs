@@ -205,6 +205,7 @@ impl CallIds {
 
 pub(super) fn stream_call_index(
     id: Option<&str>,
+    name: Option<&str>,
     position: usize,
     had_calls: bool,
     calls: &std::collections::BTreeMap<usize, super::CallDelta>,
@@ -217,7 +218,7 @@ pub(super) fn stream_call_index(
             return Ok(index);
         }
         if had_calls && calls.values().any(|call| call.id.is_empty()) {
-            if calls.len() == 1 && position == 0 {
+            if calls.len() == 1 && position == 0 && name.is_none_or(str::is_empty) {
                 return Ok(*calls.first_key_value().expect("one active tool call").0);
             }
             return Err(Error::Model(
@@ -378,12 +379,13 @@ mod tests {
             .collect();
         let anonymous = [(0, crate::CallDelta::default())].into_iter().collect();
         assert_eq!(
-            stream_call_index(Some("late"), 0, true, &anonymous).unwrap(),
+            stream_call_index(Some("late"), None, 0, true, &anonymous).unwrap(),
             0
         );
-        assert!(stream_call_index(None, 0, true, &calls).is_err());
+        assert!(stream_call_index(Some("late"), Some("other"), 0, true, &anonymous).is_err());
+        assert!(stream_call_index(None, None, 0, true, &calls).is_err());
         assert_eq!(
-            stream_call_index(Some("fixture-1"), 0, true, &calls).unwrap(),
+            stream_call_index(Some("fixture-1"), None, 0, true, &calls).unwrap(),
             1
         );
     }
@@ -432,11 +434,11 @@ mod tests {
                 {"type":"thinking","thinking":[{"type":"text","text":"sider"}]},
                 {"type":"text","text":"a tool"}
             ],"tool_calls":[
-                {"id":"null","function":{"name":"re","arguments":"{"}},
+                {"id":"null","function":{"name":"read","arguments":"{"}},
                 {"function":{"name":"list","arguments":{}}}
             ]}}]});
             let third = json!({"choices":[{"index":0,"delta":{
-                "tool_calls":[{"index":0,"id":"late-call","function":{"name":"ad","arguments":"\"file\":\"doc\"}"}}]
+                "tool_calls":[{"index":0,"id":"late-call","function":{"name":"read","arguments":"\"file\":\"doc\"}"}}]
             },"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":12,"completion_tokens":3,"num_cached_tokens":7}});
             let output = format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\n");
@@ -462,6 +464,7 @@ mod tests {
         let mut metadata = None;
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut text = String::new();
+        let mut streamed_ids = Vec::new();
         while let Some(event) = stream.next().await {
             match event.unwrap() {
                 ModelEvent::Metadata(value) => metadata = Some(value),
@@ -473,6 +476,9 @@ mod tests {
                     assert_eq!(usage.unwrap().input_tokens, 12);
                 }
                 ModelEvent::Text(delta) => text.push_str(&delta),
+                ModelEvent::ToolCallDelta(delta) if !delta.id.is_empty() => {
+                    streamed_ids.push(delta.id)
+                }
                 _ => {}
             }
         }
@@ -488,6 +494,7 @@ mod tests {
         assert_eq!(calls[0].arguments, r#"{"file":"doc"}"#);
         assert_eq!(calls[1].name, "list");
         assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(streamed_ids, [calls[0].id.clone(), calls[1].id.clone()]);
         let call_id = calls[0].id.clone();
         assert_eq!(call_id, "late-call");
         assert_eq!(calls[1].id, super::call_id("toolcall:1", 0));

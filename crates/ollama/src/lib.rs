@@ -1377,7 +1377,7 @@ impl Ollama {
                         let index = if let Some(index) = delta.index {
                             index
                         } else if mistral {
-                            mistral::stream_call_index(delta.id.as_deref(), position, had_calls, &calls)?
+                            mistral::stream_call_index(delta.id.as_deref(), delta.function.as_ref().and_then(|function| function.name.as_deref()), position, had_calls, &calls)?
                         } else {
                             Err(Error::Model("missing tool call index".into()))?;
                             unreachable!();
@@ -1401,10 +1401,10 @@ impl Ollama {
                             if id == "null" {
                                 id.clear();
                             }
+                            if !id.is_empty() && name == call.name {
+                                name.clear();
+                            }
                             if !call.id.is_empty() {
-                                if id == call.id && name == call.name {
-                                    name.clear();
-                                }
                                 id.clear();
                             }
                         }
@@ -1446,9 +1446,18 @@ impl Ollama {
             if !mistral_segments.is_empty() {
                 replay_blocks.push(mistral::replay_block(mistral_segments));
             }
-            let calls = calls.into_iter().map(|(index, call)| ToolCall {
-                id: if mistral && call.id.is_empty() { mistral::call_id(&format!("toolcall:{index}"), 0) } else { call.id },
-                name: call.name, arguments: if mistral && call.arguments.is_empty() { "{}".into() } else { call.arguments },
+            if mistral {
+                for (index, call) in &mut calls {
+                    if call.id.is_empty() {
+                        call.id = mistral::call_id(&format!("toolcall:{index}"), 0);
+                        yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                            index: *index as u64, id: call.id.clone(), name: String::new(), arguments: String::new(),
+                        });
+                    }
+                }
+            }
+            let calls = calls.into_values().map(|call| ToolCall {
+                id: call.id, name: call.name, arguments: if mistral && call.arguments.is_empty() { "{}".into() } else { call.arguments },
             }).collect();
             if preserve_reasoning && !reasoning_text.is_empty() {
                 replay_blocks.push(json!({"type":"reasoning_content","text":reasoning_text}));
