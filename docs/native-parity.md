@@ -2155,8 +2155,12 @@ continuation prefixes, matching Pi. Prose wraps at words and CJK graphemes
 and preserves inline styles across the wrap. Thematic breaks within an item
 use its continuation indentation and available width. List continuation rows
 retain extra source spaces after stripping the applicable marker indents.
-Tab-indented continuations, some numbered nested lists, and ambiguous list
-marker and rule syntax can still differ.
+Numbered child lists can interrupt item text at any valid starting number.
+The renderer keeps original user-message markers and counts assistant lists
+from the first marker. The parser repair preserves byte offsets and falls
+back to its standard list parsing when it exhausts the scan budget.
+Tab-indented continuations and ambiguous list marker and rule syntax can
+still differ.
 If nested-math scanning exceeds its resource limit, reference links may remain
 unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
