@@ -100,6 +100,18 @@ impl Anthropic {
         Self::connect(endpoint, AUTHORIZATION, &format!("Bearer {token}"))
     }
 
+    /// Authenticate to Cloudflare AI Gateway without an origin API key.
+    pub fn with_cloudflare_gateway_token(endpoint: &str, token: &str) -> Result<Self> {
+        if token.trim().is_empty() {
+            return Err(Error::Config("missing Cloudflare AI Gateway token".into()));
+        }
+        Self::connect(
+            endpoint,
+            HeaderName::from_static("cf-aig-authorization"),
+            &format!("Bearer {token}"),
+        )
+    }
+
     /// Connect using Anthropic subscription OAuth credentials.
     pub fn with_oauth_token(endpoint: &str, token: &str) -> Result<Self> {
         let mut client = Self::with_bearer_token(endpoint, token)?;
@@ -1744,11 +1756,13 @@ impl Anthropic {
             progress(Progress::WaitingForModel);
         }
         let error_secrets = self.error_secrets();
-        let response = send(
-            self.authenticate(self.client.post(self.endpoint.clone()).json(&body)),
-            &error_secrets,
-        )
-        .await?;
+        let request = self.client.post(self.endpoint.clone()).json(&body);
+        let request = if self.auth.0 == "cf-aig-authorization" {
+            request.query(&[("beta", "true")])
+        } else {
+            request
+        };
+        let response = send(self.authenticate(request), &error_secrets).await?;
         if !response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)

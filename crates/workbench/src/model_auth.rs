@@ -305,7 +305,11 @@ impl Keys {
                     }
                 };
                 let endpoint = match entry.get("endpoint") {
-                    None if name.eq_ignore_ascii_case("cloudflare-workers-ai") => None,
+                    None if name.eq_ignore_ascii_case("cloudflare-workers-ai")
+                        || name.eq_ignore_ascii_case("cloudflare-ai-gateway") =>
+                    {
+                        None
+                    }
                     None => Provider::named(name)
                         .map(|provider| provider.default_endpoint())
                         .or_else(|| {
@@ -372,10 +376,22 @@ impl Keys {
         let legacy_radius = provider == &Provider::Radius
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
             && entry.endpoint.as_deref() == Some("https://radius.pi.dev/messages");
+        let gateway_scoped_route = provider.id() == "cloudflare-ai-gateway"
+            && super::cloudflare_gateway::Route::is_endpoint(endpoint)
+            && entry
+                .endpoint
+                .as_deref()
+                .and_then(super::cloudflare_gateway::Route::from_endpoint)
+                .is_some_and(|route| {
+                    Some(route) == super::cloudflare_gateway::Route::from_endpoint(endpoint)
+                });
         let builtin_route = entry.official_routes
             && super::builtin_chat::find(provider.id())
                 .is_some_and(|builtin| builtin.is_official_endpoint(endpoint));
-        (entry.endpoint.as_deref() == Some(endpoint) || legacy_radius || builtin_route)
+        (entry.endpoint.as_deref() == Some(endpoint)
+            || legacy_radius
+            || builtin_route
+            || gateway_scoped_route)
             .then_some(entry)
     }
 
@@ -405,9 +421,14 @@ impl Keys {
             || self.cloudflare_chat_account().is_some_and(|account| {
                 super::model_profiles::cloudflare_workers_chat_account(endpoint) == Some(account)
             });
+        let gateway_match = provider.id() != "cloudflare-ai-gateway"
+            || (super::cloudflare_gateway::Route::is_endpoint(endpoint)
+                && super::cloudflare_gateway::Route::from_endpoint(endpoint)
+                    .is_some_and(|route| route.matches_environment(entry.env.as_ref())));
         (entry.endpoint.is_none()
             && profiles.has_provider_endpoint(provider, endpoint)
-            && cloudflare_match)
+            && cloudflare_match
+            && gateway_match)
             .then_some(entry)
     }
 
@@ -451,6 +472,28 @@ impl Keys {
         self.operation_entry(provider, endpoint, official)?
             .env
             .as_ref()
+    }
+
+    pub(super) fn cloudflare_gateway_route(&self) -> Option<super::cloudflare_gateway::Route> {
+        let entry = self.entries.get("cloudflare-ai-gateway");
+        if let Some(endpoint) = entry.and_then(|entry| entry.endpoint.as_deref()) {
+            return super::cloudflare_gateway::Route::from_endpoint(endpoint).filter(|route| {
+                route.matches_environment(entry.and_then(|entry| entry.env.as_ref()))
+            });
+        }
+        let get = |name: &str| {
+            entry
+                .and_then(|entry| entry.env.as_ref())
+                .and_then(|env| env.get(name))
+                .map_or_else(
+                    || std::env::var(name).ok(),
+                    |value| value.as_str().map(str::to_owned),
+                )
+        };
+        super::cloudflare_gateway::Route::new(
+            &get("CLOUDFLARE_ACCOUNT_ID")?,
+            &get("CLOUDFLARE_GATEWAY_ID")?,
+        )
     }
 
     fn cloudflare_worker_account_entry(&self) -> Option<(&SavedKey, &str)> {

@@ -4521,6 +4521,20 @@ requests. Pi-format saved credentials may declare an account through their
 For classifier models, existing rules for explicitly configured official
 endpoints still apply. Live Workers AI inference has not been verified.
 
+### Cloudflare AI Gateway
+
+Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
+credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
+selects the Chat Completions, Messages, or Responses path. All three send
+`cf-aig-authorization` for gateway authentication, and saved keys remain
+scoped to their account and gateway.
+
+The published Pi AI package and local fixtures cover each route and
+authentication header. Live gateway authentication was unverified because
+no gateway credentials were available.
+
 ### OpenRouter image result checkpoint
 
 Codemode's non-chat model catalogue exposes declared image input limits and
