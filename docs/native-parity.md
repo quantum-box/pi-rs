@@ -5202,6 +5202,13 @@ RPC model selection and Codemode catalog use the model's effective API.
 A loopback session verified switching between Chat Completions and Messages,
 endpoint-bound keys and headers, and route-bound signed Messages replay.
 
+Anthropic Messages uses per-tool `eager_input_streaming` by default.
+Models with `compat.supportsEagerToolInputStreaming: false` use the legacy
+fine-grained streaming beta when tools are present. An explicit
+`anthropic-beta` header takes precedence over automatic beta selection.
+The native request fixtures and the published Pi runtime cover both forms.
+Live provider acceptance was unverified.
+
 ### Fireworks and OpenRouter Messages catalogs checkpoint
 
 The offline catalog includes 19 Fireworks and 19 OpenRouter models using

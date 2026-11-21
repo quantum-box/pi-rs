@@ -1227,7 +1227,14 @@ impl Client {
                 let strict = args
                     .model_profiles
                     .anthropic_strict_tool_support(&args.provider, metadata.as_ref());
+                let (eager_default, eager_models) =
+                    args.model_profiles.anthropic_eager_tool_input_policy(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    );
                 let mut client = client
+                    .with_eager_tool_input_streaming(eager_default, eager_models)
                     .with_strict_tool_support(strict)
                     .with_strict_tool_models(args.model_profiles.anthropic_strict_tool_models(
                         &args.provider,

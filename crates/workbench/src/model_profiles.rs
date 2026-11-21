@@ -213,6 +213,7 @@ struct ModelCompatibility {
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
+    supports_eager_tool_input_streaming: Option<bool>,
     cache_control_format: Option<CacheControlFormat>,
 }
 
@@ -244,6 +245,9 @@ impl ModelCompatibility {
             supports_cache_control_on_tools: newer
                 .supports_cache_control_on_tools
                 .or(self.supports_cache_control_on_tools),
+            supports_eager_tool_input_streaming: newer
+                .supports_eager_tool_input_streaming
+                .or(self.supports_eager_tool_input_streaming),
             cache_control_format: newer.cache_control_format.or(self.cache_control_format),
         }
     }
@@ -1342,6 +1346,18 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> BTreeMap<String, bool> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.anthropic_strict_tool_support(provider, metadata)
+        })
+    }
+
+    fn anthropic_route_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        capability: impl Fn(Option<&ModelMetadata>) -> bool,
+    ) -> BTreeMap<String, bool> {
         let endpoint = explicit_endpoint
             .or_else(|| self.model_endpoint(provider, selected))
             .unwrap_or_else(|| self.endpoint(provider));
@@ -1359,7 +1375,7 @@ impl Profiles {
                     return None;
                 }
                 let metadata = self.model(provider, &id)?;
-                let supported = self.anthropic_strict_tool_support(provider, Some(&metadata));
+                let supported = capability(Some(&metadata));
                 Some((id, supported))
             })
             .collect();
@@ -1367,9 +1383,27 @@ impl Profiles {
         // capability (or the default false) still applies to that selection.
         models.entry(selected.to_owned()).or_insert_with(|| {
             let metadata = self.model(provider, selected);
-            self.anthropic_strict_tool_support(provider, metadata.as_ref())
+            capability(metadata.as_ref())
         });
         models
+    }
+
+    pub fn anthropic_eager_tool_input_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (bool, BTreeMap<String, bool>) {
+        let capability = |model: Option<&ModelMetadata>| {
+            self.cache_compatibility(provider, model)
+                .supports_eager_tool_input_streaming
+                .unwrap_or(true)
+        };
+        let default = capability(None);
+        let mut models =
+            self.anthropic_route_models(provider, selected, explicit_endpoint, capability);
+        models.retain(|_, supported| *supported != default);
+        (default, models)
     }
 
     pub fn messages_cache_support(
@@ -2167,6 +2201,23 @@ mod tests {
         let model = profiles.model(&provider, "amazon.nova-lite-v1:0").unwrap();
         assert_eq!(model.context_window, Some(300_000));
         assert_eq!(model.max_tokens, Some(10_000));
+    }
+
+    #[test]
+    fn anthropic_tool_input_streaming_uses_the_selected_model_configuration() {
+        let profiles = Profiles::parse(&json!({"providers":{"fireworks":{"modelOverrides":{
+            "accounts/fireworks/models/deepseek-v4p1-flash":{"compat":{"supportsEagerToolInputStreaming":true}}
+        }}}})).unwrap();
+        let provider = profiles.provider("fireworks").unwrap();
+        let forced_eager = "accounts/fireworks/models/deepseek-v4p1-flash";
+        let (default, models) =
+            profiles.anthropic_eager_tool_input_policy(&provider, forced_eager, None);
+        assert!(default);
+        assert_eq!(models.get(forced_eager), None);
+        assert_eq!(
+            models.get("accounts/fireworks/models/gpt-oss-120b"),
+            Some(&false)
+        );
     }
 
     #[test]
