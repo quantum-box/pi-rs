@@ -415,10 +415,21 @@ or inference acceptance with an xAI subscription.
 
 ### Qwen Token Plan checkpoint
 
-The international, China, and individual Qwen Token Plan providers expose the
-pinned Pi model catalogs, regional credentials, per-model reasoning maps, and
-image limits. Their chat-completions requests use Qwen's `enable_thinking`
-switch, with `reasoning_effort` only where the selected model supports it.
+The four Qwen Token Plan providers use the Pi v1.6.0 chat catalogs,
+including the 13-model `qwen-token-plan-individual-cn` catalog. The
+international providers default to QwenCloud, and the China providers default
+to Qianwen AI Platform. Both regions still recognize their former Aliyun host
+when explicitly configured. An API key saved with an endpoint stays scoped to
+that endpoint. A Pi auth entry without an endpoint follows the named provider's official
+routes.
+
+The Team providers prefer `QWEN_TOKEN_PLAN_TEAM_API_KEY` and
+`QWEN_TOKEN_PLAN_TEAM_CN_API_KEY`. The Individual providers prefer
+`QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY` and
+`QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY`. Each also accepts its region's
+original variable as a fallback. Chat requests keep the system role and use
+Qwen's `enable_thinking` switch, with `reasoning_effort` where the selected
+model supports it.
 For models declaring strict-mode support, unconstrained and preferred fallback
 tools use `strict: false`, while successfully prepared strict tools use
 `strict: true` with the transformed schema.

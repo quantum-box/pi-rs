@@ -95,7 +95,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             )
             .is_some())
         || super::builtin_chat::find(provider.id())
-            .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
+            .is_some_and(|builtin| builtin.is_default_endpoint(args.endpoint_for(&provider)));
     let mut complete = false;
     if (probe && !bundled) || provider == Provider::Radius {
         match client.models().await {

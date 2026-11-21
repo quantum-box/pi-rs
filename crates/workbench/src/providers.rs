@@ -214,7 +214,7 @@ impl Provider {
                 }
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
-                    && (builtin.endpoint() == endpoint
+                    && (builtin.is_default_endpoint(endpoint)
                         || (self.id() == "cloudflare-ai-gateway"
                             && super::cloudflare_gateway::Route::is_endpoint(endpoint))
                         || (self.id() == "cloudflare-workers-ai"

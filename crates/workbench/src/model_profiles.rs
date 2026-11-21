@@ -2600,27 +2600,37 @@ mod tests {
         for (name, endpoint, key, count) in [
             (
                 "qwen-token-plan",
-                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_API_KEY",
-                21,
+                "token-plan.maas.qwencloudapi.com",
+                "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+                20,
             ),
             (
                 "qwen-token-plan-cn",
-                "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_CN_API_KEY",
-                21,
+                "token-plan.maas.qianwenaiapi.com",
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                20,
             ),
             (
                 "qwen-token-plan-individual",
-                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_API_KEY",
-                9,
+                "token-plan.maas.qwencloudapi.com",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+                13,
+            ),
+            (
+                "qwen-token-plan-individual-cn",
+                "token-plan.maas.qianwenaiapi.com",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+                13,
             ),
         ] {
             let provider = profiles.provider(name).unwrap();
             assert_eq!(provider.adapter(), Adapter::ChatCompletions);
-            assert_eq!(profiles.endpoint(&provider), endpoint);
-            assert_eq!(builtin_chat::find(name).unwrap().env(), key);
+            assert_eq!(
+                profiles.endpoint(&provider),
+                format!("https://{endpoint}/compatible-mode/v1/chat/completions")
+            );
+            let builtin = builtin_chat::find(name).unwrap();
+            assert_eq!(builtin.env(), key);
             assert_eq!(profiles.model_ids(&provider).len(), count);
             let model = profiles.model(&provider, "qwen3.8-max").unwrap();
             assert_eq!(model.supports_images(), Some(true));
@@ -2628,16 +2638,117 @@ mod tests {
                 model.levels(Adapter::ChatCompletions).unwrap(),
                 ["low", "medium", "xhigh"]
             );
+            assert!(profiles.model(&provider, "qwen4-max-preview").is_some());
             assert!(profiles.model(&provider, "qwen3.8-max-preview").is_none());
+            assert!(profiles.model(&provider, "deepseek-v3.2").is_none());
+            assert!(profiles.model(&provider, "deepseek-v4-flash").is_none());
         }
-        assert!(
-            profiles
-                .model(
-                    &profiles.provider("qwen-token-plan-individual").unwrap(),
-                    "deepseek-v3.2"
-                )
-                .is_none()
-        );
+    }
+
+    #[test]
+    fn qwen_token_plan_environment_keys_are_ordered_and_scoped() {
+        const CHILD: &str = "PI_RS_TEST_QWEN_TOKEN_PLAN_KEYS";
+        let entries = [
+            (
+                "qwen-token-plan",
+                "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "international-legacy",
+            ),
+            (
+                "qwen-token-plan-cn",
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                "china-legacy",
+            ),
+            (
+                "qwen-token-plan-individual",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "international-legacy",
+            ),
+            (
+                "qwen-token-plan-individual-cn",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                "china-legacy",
+            ),
+        ];
+        let Ok(scenario) = std::env::var(CHILD) else {
+            for scenario in ["preferred", "fallback", "blank"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "model_profiles::tests::qwen_token_plan_environment_keys_are_ordered_and_scoped"])
+                    .env(CHILD, scenario);
+                for (provider, primary, fallback, legacy) in entries {
+                    command.env(fallback, legacy).env_remove(primary);
+                    match scenario {
+                        "preferred" => {
+                            command.env(primary, provider);
+                        }
+                        "blank" => {
+                            command.env(primary, " ");
+                        }
+                        _ => {}
+                    }
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        };
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = Profiles::parse(&json!({})).unwrap();
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({}));
+        let international_old = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+        let china_old =
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+        for (name, _, _, fallback) in entries {
+            let provider = args.model_profiles.provider(name).unwrap();
+            let official = args.model_profiles.endpoint(&provider);
+            let (legacy, foreign) = if name.ends_with("-cn") {
+                (china_old, international_old)
+            } else {
+                (international_old, china_old)
+            };
+            let expected = if scenario == "preferred" {
+                name
+            } else {
+                fallback
+            };
+            for endpoint in [official, legacy] {
+                assert_eq!(
+                    args.configured_model_credential(&provider, endpoint)
+                        .unwrap()
+                        .literal(),
+                    Some(expected)
+                );
+            }
+            for endpoint in [
+                foreign,
+                "https://token-plan.maas.qwencloudapi.com:444/compatible-mode/v1/chat/completions",
+                "https://relay.example/compatible-mode/v1/chat/completions",
+            ] {
+                assert!(
+                    args.configured_model_credential(&provider, endpoint)
+                        .is_none()
+                );
+            }
+            let saved = super::super::model_auth::Keys::parse(
+                &json!({(name):{"type":"api_key", "key":"old-route-key", "endpoint":legacy}}),
+            );
+            assert!(saved.credential(&provider, official).is_none());
+            assert_eq!(
+                saved.credential(&provider, legacy).unwrap().literal(),
+                Some("old-route-key")
+            );
+        }
     }
 
     #[test]

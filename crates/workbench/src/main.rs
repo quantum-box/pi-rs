@@ -491,9 +491,14 @@ impl Cli {
                         builtin.is_official_endpoint(endpoint)
                     };
                     return official
-                        .then(|| std::env::var(builtin.env()).ok())
+                        .then(|| {
+                            builtin.env_names().find_map(|name| {
+                                std::env::var(name)
+                                    .ok()
+                                    .filter(|key| !key.trim().is_empty())
+                            })
+                        })
                         .flatten()
-                        .filter(|key| !key.trim().is_empty())
                         .map(model_auth::Credential::Literal);
                 }
                 if endpoint != provider.default_endpoint() {
