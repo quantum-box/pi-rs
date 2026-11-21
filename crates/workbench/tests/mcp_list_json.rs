@@ -472,3 +472,52 @@ fn list_reports_invalid_auto_enable_codemode_in_each_trusted_scope() {
     );
     assert!(!stderr.contains("private-value"), "{stderr}");
 }
+
+#[test]
+fn text_list_reports_bad_configuration_and_continues_with_the_other_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let user_file = home.join("mcp.json");
+    let project_file = project.join("mcp.json");
+
+    for (bad_file, good_file, invalid, diagnostic) in [
+        (
+            &user_file,
+            &project_file,
+            r#"{"mcpServers":[]}"#,
+            "mcpServers must be an object",
+        ),
+        (
+            &project_file,
+            &user_file,
+            r#"{"mcpServers":"private-value""#,
+            "could not read or parse MCP configuration",
+        ),
+    ] {
+        std::fs::write(bad_file, invalid).unwrap();
+        std::fs::write(
+            good_file,
+            r#"{"mcpServers":{"retired":{"command":"unused","enabled":false}}}"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(["--trust", "--offline", "mcp", "list"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = format!("mcp.json: {diagnostic}");
+        assert!(stderr.contains(&expected), "{stderr}");
+        assert!(!stderr.contains("private-value"), "{stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("retired") && stdout.contains("disabled"),
+            "{stdout}"
+        );
+    }
+}

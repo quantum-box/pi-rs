@@ -181,6 +181,25 @@ Extensions that implement `handles_lifecycle` also receive `agent_settled`
 after `agent_end` when a run has finished its retries and automatic compaction.
 Its `aborted` field distinguishes cancellation from completion or failure.
 
+For an actionable callback before settlement, opt into
+`handles_agent_before_settle` and implement `agent_before_settle`.
+Handlers run in extension load order. Each can replace the proposed entries
+or continuation flag independently. The preview includes journal record IDs
+for projected messages and the next queued batch. Proposals can append
+custom entries, custom messages, context edits, or compaction summaries.
+The host validates the full list before writing its plan or any of its
+entries. A continuation runs within the original run's request and token
+limits. Cancelling during delivery of this callback preserves valid entries
+and suppresses continuation.
+
+Executable extensions negotiate the callback capability in their description.
+`AgentSession::resume` recovers a saved plan under the original run ID,
+including proposals interrupted partway through persistence. Hosts that drive
+`Agent` directly can inspect `Session::pending_extension_boundary_run` to
+select the run ID for explicit recovery.
+Tree navigation and forks can select the completed proposal as a unit.
+Forks retain the applied entries and start with their own run lifecycle.
+
 Before a model request, an extension may opt into `context_with_system` to
 transform the complete message list, including system messages. All ordinary
 `before_request` hooks run first; these hooks then run in registration order.
