@@ -405,7 +405,7 @@ impl OpenAiResponses {
         headers: &reqwest::header::HeaderMap,
     ) -> Option<reqwest::header::HeaderMap> {
         pi_rs_core::provider_header_session_id()?;
-        pi_rs_core::prepare_provider_headers(headers, &vec![self.token.clone()]).await
+        pi_rs_core::prepare_provider_headers(headers, std::slice::from_ref(&self.token)).await
     }
 
     pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
