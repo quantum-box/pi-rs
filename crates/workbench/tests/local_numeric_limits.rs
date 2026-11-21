@@ -27,6 +27,12 @@ impl Model for Script {
                 ("ls-invalid", "ls", json!({"limit": " true "})),
                 ("read-missing", "read", json!({})),
                 ("edit-missing", "edit", json!({})),
+                ("edit-empty", "edit", json!({"path":"a","edits":[]})),
+                (
+                    "edit-empty-old",
+                    "edit",
+                    json!({"path":"a","edits":[{"oldText":"","newText":"no edit"}]}),
+                ),
                 (
                     "edit-invalid",
                     "edit",
@@ -152,6 +158,11 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
             "read-missing",
             "Validation failed for tool \"read\":\n  - path: missing\n\nReceived arguments:\n{}",
         ),
+        (
+            "edit-empty",
+            "Edit tool input is invalid. edits must contain at least one replacement.",
+        ),
+        ("edit-empty-old", "oldText must not be empty in a."),
         (
             "edit-missing",
             "Validation failed for tool \"edit\":\n  - path: missing\n  - edits: missing\n\nReceived arguments:\n{}",
