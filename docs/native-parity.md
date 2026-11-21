@@ -2269,7 +2269,10 @@ and theme changes apply immediately.
 The local settings editor remains open when an outstanding model response
 finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
-Remaining upstream settings and specialized selector behavior are still open.
+The terminal lists shared settings in Pi's order and uses Pi's labels and
+boolean values for those rows. Native controls and JSON editors remain
+available after the shared settings. The transport, changelog, installation
+telemetry and warnings controls are still open.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
 settings. When several values in a file are invalid, the diagnostic lists the
 settings file and affected JSON paths, including nested package fields and

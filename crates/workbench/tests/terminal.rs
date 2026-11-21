@@ -409,15 +409,15 @@ fn settings_picker_can_be_operated_with_the_mouse() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     // Header row, picker title, then the first setting (SGR mouse uses 1-based coordinates).
     master.write_all(b"\x1b[<0;2;3M\x1b[<0;2;3m").unwrap();
     output_until(&mut master, |text| {
-        text.contains("HTTP idle timeout") && text.contains("disabled")
+        settings_row_shows(text, "Auto-compact", "false")
     });
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(settings["httpIdleTimeoutMs"], 0);
+    assert_eq!(settings["compaction"]["enabled"], false);
 }
 
 #[test]
@@ -494,26 +494,30 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
             .unwrap(),
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
-    for (query, label, key) in [
-        ("Auto-compaction", "Auto-compaction", "compaction"),
-        ("Auto-retry", "Auto-retry", "retry"),
+    for (label, key, enabled, disabled) in [
+        ("Auto-compact", "compaction", "true", "false"),
+        ("Auto-retry", "retry", "on", "off"),
     ] {
         master.write_all(b"/settings\r").unwrap();
-        output_until(&mut master, |text| text.contains("HTTP idle timeout"));
-        master.write_all(query.as_bytes()).unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "on"));
+        output_until(&mut master, |text| text.contains("Auto-compact"));
+        master.write_all(label.as_bytes()).unwrap();
+        output_until(&mut master, |text| settings_row_shows(text, label, enabled));
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "off"));
+        output_until(&mut master, |text| {
+            settings_row_shows(text, label, disabled)
+        });
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved[key]["enabled"], false);
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "on"));
+        output_until(&mut master, |text| settings_row_shows(text, label, enabled));
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved[key]["enabled"], true);
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "off"));
+        output_until(&mut master, |text| {
+            settings_row_shows(text, label, disabled)
+        });
         master.write_all(b"\x1b").unwrap();
         output_until(&mut master, |text| text.contains("Enter to send"));
     }
@@ -1011,7 +1015,7 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Autocomplete max items\r").unwrap();
     output_until(&mut master, |text| {
         settings_row_shows(text, "Autocomplete max items", "3")
@@ -1162,24 +1166,32 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         output_until(&mut master, |text| text.contains("live-stream-marker"));
         master.write_all(b"/settings\r").unwrap();
         output_until(&mut master, |text| {
-            text.contains("HTTP idle timeout") && text.contains("Maximum idle gap")
+            settings_row_shows(text, "Auto-compact", "true")
         });
         master.write_all(b" ").unwrap();
         output_until(&mut master, |text| {
-            text.contains("HTTP idle timeout") && text.contains("disabled")
+            settings_row_shows(text, "Auto-compact", "false")
         });
         master.write_all(b"\r").unwrap();
         output_until(&mut master, |text| {
-            text.contains("HTTP idle timeout") && text.contains("30 sec")
+            settings_row_shows(text, "Auto-compact", "true")
         });
-        master.write_all(b"\x1b[B\r").unwrap();
-        output_until(&mut master, |text| {
-            settings_row_shows(text, "Steering mode", "all")
-        });
-        master.write_all(b"\x1b[B\r").unwrap();
-        output_until(&mut master, |text| {
-            settings_row_shows(text, "Follow-up mode", "all")
-        });
+        for (setting, first, second) in [
+            ("HTTP idle timeout", "disabled", Some("30 sec")),
+            ("Steering mode", "all", None),
+            ("Follow-up mode", "all", None),
+        ] {
+            master.write_all(setting.as_bytes()).unwrap();
+            master.write_all(b"\r").unwrap();
+            output_until(&mut master, |text| settings_row_shows(text, setting, first));
+            if let Some(second) = second {
+                master.write_all(b"\r").unwrap();
+                output_until(&mut master, |text| {
+                    settings_row_shows(text, setting, second)
+                });
+            }
+            master.write_all(&vec![0x7f; setting.len()]).unwrap();
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(session) = pi_rs::Session::snapshot(&session_path)
@@ -1959,7 +1971,7 @@ fn settings_switches_terminal_modes_and_restores_input() {
                     serde_json::json!(1),
                 ),
                 (
-                    "Mermaid rendering",
+                    "Mermaid diagrams",
                     "markdown.mermaid",
                     serde_json::json!("off"),
                 ),
@@ -1969,10 +1981,14 @@ fn settings_switches_terminal_modes_and_restores_input() {
                 master.write_all(label.as_bytes()).unwrap();
                 output_until(&mut master, |text| text.contains(label));
                 master.write_all(b"\r").unwrap();
-                let displayed = expected
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| expected.to_string());
+                let displayed = if key == "defaultProjectTrust" {
+                    "Always trust".into()
+                } else {
+                    expected
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| expected.to_string())
+                };
                 output_until(&mut master, |text| {
                     settings_row_shows(text, label, &displayed)
                 });
@@ -2045,7 +2061,7 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Theme\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Automatic · follow terminal appearance")
@@ -2270,7 +2286,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         startup.write_all(b"G").unwrap();
     }
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master
         .write_all(b"Default thinking level per model\r")
         .unwrap();
@@ -2531,7 +2547,7 @@ fn thinking_model_discovery_can_be_cancelled_while_server_is_slow() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master
         .write_all(b"Default thinking level per model\r")
         .unwrap();
@@ -2608,7 +2624,7 @@ fn save_default_model_persists_provider_and_extends_scope() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Save default model\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Save default model") && text.contains("to change")
