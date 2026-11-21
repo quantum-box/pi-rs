@@ -1789,6 +1789,11 @@ that session records and command output contain no key value.
 
 ### Repeated CLI modes and session references
 
+Repeated `--list-models` options use the last filter. The standalone option
+leaves `@file` attachments and dash-prefixed arguments for normal argument
+handling. Use `--list-models=FILTER` to pass a literal filter beginning with
+`@` or `-`, as a native extension.
+
 Repeated `--mode`, `--tui-mode`, `--session`, `--session-id` and `--fork`
 options use their last value, as in Pi v1.5.0. Invalid mode values are still
 rejected even when a later value is valid. Native session-option conflicts and
