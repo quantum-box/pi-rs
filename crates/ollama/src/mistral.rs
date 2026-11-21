@@ -677,8 +677,7 @@ mod tests {
             let fourth = json!({"choices":[{"index":0,"delta":{"tool_calls":[
                 {"index":0,"id":"call"},
                 {"index":0,"id":"late-call"}
-            ]},
-"finish_reason":"tool_calls"}],
+            ]},"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":12,"completion_tokens":3,"num_cached_tokens":7}});
             let output =
                 format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\ndata: {fourth}\n\n");
@@ -723,9 +722,10 @@ mod tests {
                     assert_eq!(usage.unwrap().input_tokens, 12);
                 }
                 ModelEvent::Text(delta) => text.push_str(&delta),
-                ModelEvent::ToolCallDelta(delta) if !delta.id.is_empty() => {
-                    streamed_ids.push(delta.id)
-                }
+                ModelEvent::ToolCallDelta(delta) if !delta.id.is_empty() => streamed_ids
+                    .entry(delta.index)
+                    .or_default()
+                    .push_str(&delta.id),
                 _ => {}
             }
         }
