@@ -24,6 +24,7 @@ mod cache_warming;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+mod cloudflare_gateway;
 mod codex_auth;
 mod config;
 mod copilot_auth;
@@ -470,6 +471,13 @@ impl Cli {
                     }
                     return None;
                 }
+                if provider.id() == "cloudflare-ai-gateway" {
+                    return cloudflare_gateway::Route::is_endpoint(endpoint)
+                        .then(|| std::env::var("CLOUDFLARE_API_KEY").ok())
+                        .flatten()
+                        .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal);
+                }
                 if provider.id() == "openai-codex" {
                     return None;
                 }
@@ -601,6 +609,12 @@ impl Cli {
 
     fn replace_model_keys(&mut self, keys: model_auth::Keys) -> Result<()> {
         self.model_keys = keys;
+        if self.model_profiles.cloudflare_gateway_route()
+            != self.model_keys.cloudflare_gateway_route().as_ref()
+        {
+            self.reload_model_profiles()?;
+            return Ok(());
+        }
         if self.model_profiles.cloudflare_saved_account()
             != self.model_keys.cloudflare_chat_account()
         {
