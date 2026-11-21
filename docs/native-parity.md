@@ -2133,6 +2133,10 @@ an active descendant resets that idle period. Unlike Pi, pi-rs also caps the
 post-exit drain at two seconds to bound continuously writing descendants. Unit and CLI fixtures cover line/byte
 limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
 
+If a local model shell exits before its timeout while background processes
+hold the output pipes open, the diagnostic includes the shell's exit code
+and elapsed time rounded to a tenth of a second, as in Pi 1.6.0.
+
 ### Text paging checkpoint
 
 Unrestricted local `read` accepts JavaScript numbers for `offset` and `limit`.
