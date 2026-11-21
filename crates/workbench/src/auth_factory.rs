@@ -151,9 +151,9 @@ pub fn expand_config_value(
                 let close = tail.find('}').expect("closing brace remains");
                 cursor += close + 1;
                 let name = &tail[1..close];
-                if !NAME
+                if NAME
                     .find(name)
-                    .is_some_and(|found| found.end() == name.len())
+                    .is_none_or(|found| found.end() != name.len())
                 {
                     append(&value[dollar..cursor])?;
                     continue;
