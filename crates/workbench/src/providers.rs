@@ -1524,6 +1524,13 @@ pub(super) async fn stream_with_declarations(
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn minimum_output_tokens(&self) -> u32 {
+        match self {
+            Self::OpenAi(client) => client.minimum_output_tokens(),
+            _ => 1,
+        }
+    }
+
     async fn stream_detailed_with_tool_declarations(
         &self,
         request_id: uuid::Uuid,

@@ -866,6 +866,14 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn minimum_output_tokens(&self) -> u32 {
+        if self.codex_account.is_some() && self.send_max_output_tokens {
+            16
+        } else {
+            1
+        }
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -1253,10 +1261,7 @@ impl OpenAiResponses {
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
         let api = self.api();
-        if api == pi_rs_core::ModelApi::OpenaiCodexResponses
-            && self.send_max_output_tokens
-            && (1..16).contains(&max_output_tokens)
-        {
+        if (1..self.minimum_output_tokens()).contains(&max_output_tokens) {
             return Err(Error::Budget);
         }
         let mut body = responses_payload(
