@@ -86,6 +86,7 @@ fn normalize(
     let mut hyphen_values = false;
     let mut trust_flag_index = None;
     let mut selected_subcommand = false;
+    let mut positional_index = 0;
     let mut value_owner: Option<usize> = None;
     let mut export_values = false;
     let mut export_waiting_output = false;
@@ -229,9 +230,22 @@ fn normalize(
             {
                 command = subcommand;
                 selected_subcommand = true;
+                positional_index = 0;
             } else if std::ptr::eq(command, root) {
                 prompt.push(arg);
                 continue;
+            } else {
+                positional_index += 1;
+                if command.get_positionals().any(|positional| {
+                    positional.is_trailing_var_arg_set()
+                        && positional.get_index() == Some(positional_index)
+                }) {
+                    // Clap gives the rest of argv to this positional, such as
+                    // the child command in `mcp add`.
+                    output.push(arg);
+                    output.extend(input);
+                    break;
+                }
             }
             output.push(arg);
             continue;

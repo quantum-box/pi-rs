@@ -518,7 +518,8 @@ fn mcp_add_forwards_stdio_arguments_with_or_without_a_separator() {
             .args(separator)
             .args([
                 "node",
-                "--version",
+                "-v",
+                "-nt",
                 "--description",
                 "child option",
                 "-l",
@@ -542,7 +543,8 @@ fn mcp_add_forwards_stdio_arguments_with_or_without_a_separator() {
         assert_eq!(
             servers[name]["args"],
             json!([
-                "--version",
+                "-v",
+                "-nt",
                 "--description",
                 "child option",
                 "-l",
