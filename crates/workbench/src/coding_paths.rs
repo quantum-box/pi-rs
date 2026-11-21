@@ -135,7 +135,7 @@ pub(super) fn read_variant(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(any(windows, test))]
-fn windows_shell_path(value: &str) -> String {
+pub(super) fn windows_shell_path(value: &str) -> String {
     if !value.starts_with('/')
         || value.starts_with("//")
         || value.contains(['\\', '\n', '\r', '\u{2028}', '\u{2029}'])

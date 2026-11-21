@@ -170,7 +170,9 @@ without storing its value in that configuration file.
 Local package sources expand `~` using a nonempty `HOME` or the platform
 home-directory fallback, including `~\` on Windows. On Unix an explicitly
 empty `HOME` remains empty. Relative home values resolve from the source
-settings scope, matching Pi.
+settings scope, matching Pi. On Windows, local package sources and resource
+filters accept Git Bash/MSYS, Cygwin, and WSL drive spellings such as `/c/...`,
+`/cygdrive/c/...`, and `/mnt/c/...`.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
