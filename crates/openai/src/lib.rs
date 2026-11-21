@@ -1030,9 +1030,8 @@ fn limit_visible_output(
         // The provider's tokenizer is unknown. This is a runaway output guard,
         // not a token counter. The agent uses reported usage for accounting.
         let limit = u64::from(allowance).saturating_mul(128);
-        let mut visible_units = 0_u64;
-        let mut reasoning_units = 0_u64;
-        let mut streamed_tool_units = 0_u64;
+        let mut streamed_units = 0_u64;
+        let mut legacy_text_units = 0_u64;
         let mut text = BTreeMap::new();
         let mut reasoning = BTreeMap::new();
         while let Some(event) = stream.next().await {
@@ -1041,49 +1040,47 @@ fn limit_visible_output(
             let observe = |parts: &mut BTreeMap<u64, u64>, index, content: &str, final_block| {
                 let previous = parts.entry(index).or_default();
                 let observed = units(content);
-                let added = if final_block {
-                    observed.saturating_sub(*previous)
-                } else {
-                    observed
-                };
-                *previous = previous.saturating_add(added);
+                let next = if final_block { observed } else { previous.saturating_add(observed) };
+                let added = next.saturating_sub(*previous);
+                *previous = next;
                 added
             };
             match &event {
                 TextDelta { index, delta } => {
-                    visible_units = visible_units.saturating_add(observe(&mut text, *index, delta, false));
+                    streamed_units = streamed_units.saturating_add(observe(&mut text, *index, delta, false));
                 }
                 TextEnd { index, content } => {
-                    visible_units = visible_units.saturating_add(observe(&mut text, *index, content, true));
+                    streamed_units = streamed_units.saturating_add(observe(&mut text, *index, content, true));
                 }
                 ReasoningDelta { index, delta } => {
-                    reasoning_units = reasoning_units.saturating_add(observe(&mut reasoning, *index, delta, false));
+                    streamed_units = streamed_units.saturating_add(observe(&mut reasoning, *index, delta, false));
                 }
                 ReasoningEnd { index, content } => {
-                    reasoning_units = reasoning_units.saturating_add(observe(&mut reasoning, *index, content, true));
+                    streamed_units = streamed_units.saturating_add(observe(&mut reasoning, *index, content, true));
                 }
                 Legacy(ModelEvent::Text(delta)) => {
-                    visible_units = visible_units.saturating_add(units(delta));
+                    legacy_text_units = legacy_text_units.saturating_add(units(delta));
+                    streamed_units = streamed_units.saturating_add(units(delta));
                 }
                 Legacy(ModelEvent::Reasoning(delta)) => {
-                    reasoning_units = reasoning_units.saturating_add(units(delta));
+                    streamed_units = streamed_units.saturating_add(units(delta));
                 }
                 Legacy(ModelEvent::ToolCallDelta(delta)) => {
-                    streamed_tool_units = streamed_tool_units
+                    streamed_units = streamed_units
                         .saturating_add(units(&delta.name))
                         .saturating_add(units(&delta.arguments));
                 }
                 // Some relays omit usage. Before accepting their final output
                 // or any tool call, check the same estimate Pi uses for text.
-                Legacy(ModelEvent::Complete { calls, usage: None })
-                    if pi_rs_core::estimate_assistant_output_tokens(visible_units, calls)
-                        > u64::from(allowance) =>
-                {
-                    Err(Error::Budget)?;
+                Legacy(ModelEvent::Complete { calls, usage: None }) => {
+                    let text_units = text.values().fold(legacy_text_units, |sum, units| sum.saturating_add(*units));
+                    if pi_rs_core::estimate_assistant_output_tokens(text_units, calls) > u64::from(allowance) {
+                        Err(Error::Budget)?;
+                    }
                 }
                 _ => {}
             }
-            if visible_units.saturating_add(reasoning_units).saturating_add(streamed_tool_units) > limit {
+            if streamed_units > limit {
                 Err(Error::Budget)?;
             }
             yield event;
@@ -1454,6 +1451,28 @@ mod tests {
         assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
         assert!(matches!(stream.next().await, Some(Ok(TextEnd { .. }))));
         assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let replaced_text = [
+            Ok(TextDelta {
+                index: 0,
+                delta: "moderately long".into(),
+            }),
+            Ok(TextEnd {
+                index: 0,
+                content: "yes".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream =
+            limit_visible_output(Box::pin(futures_util::stream::iter(replaced_text)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
 
         let with_thought = [
             Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta {
