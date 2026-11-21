@@ -1236,8 +1236,15 @@ impl Model for Google {
                     .into(),
                 )
             })?;
-        let response = check_status(response, &self.error_secrets()).await?;
         let error_secrets = self.error_secrets();
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &error_secrets,
+            &self.headers,
+        )
+        .await;
+        let response = check_status(response, &error_secrets).await?;
         let progress = self.progress.clone();
         let observe_reasoning = self.reasoning.clone();
         let provider = self.provider.clone();
