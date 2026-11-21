@@ -477,7 +477,9 @@ mod tests {
                     _ => BlockTokenKind::Block(BlockFlavor::Other),
                 })
                 .collect();
-            let actual = block_inventory(source).map(|tokens| {
+            // The renderer normalizes line endings before it inventories blocks.
+            let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+            let actual = block_inventory(&normalized).map(|tokens| {
                 tokens
                     .into_iter()
                     .map(|token| match token.kind {
