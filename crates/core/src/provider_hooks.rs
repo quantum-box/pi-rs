@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures_util::FutureExt;
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -32,8 +32,12 @@ pub struct ProviderStreamEvent {
     pub data: Value,
 }
 
+/// The configured headers available to a request observer before transport authentication.
+pub type BeforeProviderHeaders = BTreeMap<String, Option<String>>;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Hook {
+    Headers,
     Response,
     Stream,
 }
@@ -41,6 +45,7 @@ enum Hook {
 impl Hook {
     fn name(self) -> &'static str {
         match self {
+            Self::Headers => "before_provider_headers",
             Self::Response => "after_provider_response",
             Self::Stream => "provider_stream_event",
         }
@@ -50,6 +55,7 @@ impl Hook {
 struct Handler {
     extension: Arc<dyn Extension>,
     state: Option<ExtensionState>,
+    headers: bool,
     response: bool,
     stream: bool,
 }
@@ -57,6 +63,7 @@ struct Handler {
 impl Handler {
     fn subscribes(&self, hook: Hook) -> bool {
         match hook {
+            Hook::Headers => self.headers,
             Hook::Response => self.response,
             Hook::Stream => self.stream,
         }
@@ -80,6 +87,7 @@ pub(crate) struct ProviderHooks {
     model_timeout: Duration,
     stream_budget: Mutex<Duration>,
     errors: Mutex<Vec<Failure>>,
+    external_id: Option<String>,
 }
 
 impl ProviderHooks {
@@ -88,15 +96,34 @@ impl ProviderHooks {
         session: &Session,
         model_timeout: Duration,
     ) -> Option<Arc<Self>> {
+        Self::snapshot(registry, session, model_timeout, false)
+    }
+
+    pub(crate) fn for_header_preparation(
+        registry: &Registry,
+        session: &Session,
+        model_timeout: Duration,
+    ) -> Option<Arc<Self>> {
+        Self::snapshot(registry, session, model_timeout, true)
+    }
+
+    fn snapshot(
+        registry: &Registry,
+        session: &Session,
+        model_timeout: Duration,
+        preparing_headers: bool,
+    ) -> Option<Arc<Self>> {
         let handlers: Vec<_> = registry
             .extensions
             .iter()
             .filter_map(|extension| {
-                let response = extension.handles_after_provider_response();
-                let stream = extension.handles_provider_stream_event();
-                (response || stream).then(|| Handler {
+                let headers = preparing_headers && extension.handles_before_provider_headers();
+                let response = !preparing_headers && extension.handles_after_provider_response();
+                let stream = !preparing_headers && extension.handles_provider_stream_event();
+                (headers || response || stream).then(|| Handler {
                     extension: extension.clone(),
                     state: None,
+                    headers,
                     response,
                     stream,
                 })
@@ -116,6 +143,7 @@ impl ProviderHooks {
             model_timeout,
             stream_budget: Mutex::new(model_timeout / 4),
             errors: Mutex::default(),
+            external_id: preparing_headers.then(|| session.external_session_id()),
         }))
     }
 
@@ -183,11 +211,12 @@ impl ProviderHooks {
         }
         let callback = AssertUnwindSafe(future).catch_unwind();
         let event = match hook {
+            Hook::Headers => "provider header hook",
             Hook::Response => "provider response hook",
             Hook::Stream => "provider stream hook",
         };
         let duration = match hook {
-            Hook::Response => duration,
+            Hook::Headers | Hook::Response => duration,
             Hook::Stream => {
                 duration.min(*self.stream_budget.lock().expect("provider stream budget"))
             }
@@ -253,13 +282,156 @@ fn protected_values<'a>(
         .map(String::as_str)
         .chain(
             request_headers
-                .values()
-                .filter(|value| value.is_sensitive())
-                .filter_map(|value| value.to_str().ok()),
+                .iter()
+                .filter_map(|(name, value)| {
+                    if value.is_sensitive() || crate::retry::is_provider_auth_header(name.as_str())
+                    {
+                        value.to_str().ok()
+                    } else {
+                        None
+                    }
+                })
+                .flat_map(|value| {
+                    let value = value.trim_matches([' ', '\t']);
+                    let credential = value.split_once([' ', '\t']).and_then(|(scheme, value)| {
+                        (scheme.eq_ignore_ascii_case("bearer")
+                            || scheme.eq_ignore_ascii_case("basic"))
+                        .then_some(value)
+                    });
+                    [Some(value), credential].into_iter().flatten()
+                }),
         )
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+/// The active session ID used when preparing configured provider headers.
+#[doc(hidden)]
+pub fn provider_header_session_id() -> Option<String> {
+    ProviderHooks::subscribed(Hook::Headers)?
+        .external_id
+        .clone()
+}
+
+fn protected_header_name(name: &str) -> bool {
+    crate::retry::is_provider_auth_header(name)
+        || name.starts_with("x-amz-")
+        || matches!(
+            name,
+            "host"
+                | "cookie"
+                | "set-cookie"
+                | "content-length"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
+}
+
+/// Run request observers in registration order before freezing adapter configuration.
+/// Returns the complete header map when a subscriber was invoked.
+#[doc(hidden)]
+pub async fn prepare_provider_headers(
+    headers: &HeaderMap,
+    request_secrets: &[String],
+) -> Option<HeaderMap> {
+    let hooks = ProviderHooks::subscribed(Hook::Headers)?;
+    let secrets = protected_values(request_secrets, headers);
+    let mut protected = std::collections::BTreeSet::new();
+    let mut current = headers.clone();
+    for (name, value) in headers {
+        if protected_header_name(name.as_str())
+            || value.is_sensitive()
+            || value.to_str().is_err()
+            || secrets.iter().any(|&secret| {
+                name.as_str().contains(secret)
+                    || value.to_str().is_ok_and(|value| value.contains(secret))
+            })
+        {
+            protected.insert(name.as_str().to_owned());
+        }
+    }
+    let duration = hooks.handler_timeout(Hook::Headers);
+    for (index, handler) in hooks
+        .handlers
+        .iter()
+        .enumerate()
+        .filter(|(_, handler)| handler.headers)
+    {
+        let mut visible = BeforeProviderHeaders::new();
+        for (name, value) in &current {
+            if protected.contains(name.as_str()) || protected_header_name(name.as_str()) {
+                continue;
+            }
+            let Ok(value) = value.to_str() else { continue };
+            visible
+                .entry(name.as_str().to_owned())
+                .and_modify(|previous| {
+                    if let Some(previous) = previous {
+                        previous.push_str(", ");
+                        previous.push_str(value);
+                    }
+                })
+                .or_insert_with(|| Some(value.to_owned()));
+        }
+        visible.retain(|name, value| {
+            let contains_secret = value
+                .as_ref()
+                .is_some_and(|value| secrets.iter().any(|&secret| value.contains(secret)));
+            if contains_secret {
+                protected.insert(name.clone());
+            }
+            !contains_secret
+        });
+        let mut edited = visible.clone();
+        hooks
+            .notify(index, Hook::Headers, duration, async {
+                handler
+                    .extension
+                    .before_provider_headers(&mut edited, handler.state.as_ref())
+                    .await?;
+                current = apply_header_edits(&current, &visible, edited, &protected)?;
+                Ok(())
+            })
+            .await;
+    }
+    Some(current)
+}
+
+fn apply_header_edits(
+    current: &HeaderMap,
+    previous: &BeforeProviderHeaders,
+    edited: BeforeProviderHeaders,
+    protected: &std::collections::BTreeSet<String>,
+) -> ExtensionResult<HeaderMap> {
+    let mut next = current.clone();
+    for name in previous.keys().filter(|name| !edited.contains_key(*name)) {
+        next.remove(name.as_str());
+    }
+    for (name, value) in edited {
+        if previous.get(&name) == Some(&value) {
+            continue;
+        }
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "invalid provider header name".to_owned())?;
+        if protected.contains(name.as_str()) || protected_header_name(name.as_str()) {
+            return Err("provider header hook cannot change managed or sensitive headers".into());
+        }
+        if let Some(value) = value {
+            let value = HeaderValue::from_str(value.trim_matches([' ', '\t']))
+                .map_err(|_| "invalid provider header value".to_owned())?;
+            next.try_insert(name, value)
+                .map_err(|_| "provider header hook exceeded the HTTP header limit".to_owned())?;
+        } else {
+            next.remove(name);
+        }
+    }
+    Ok(next)
 }
 
 /// Report an HTTP response before reading its body. Outside an agent request
@@ -728,5 +900,256 @@ mod tests {
             }
         });
         assert_eq!(errors, ["provider stream hook timed out"]);
+    }
+
+    #[tokio::test]
+    async fn provider_header_hooks_edit_only_unprotected_configuration_in_order() {
+        struct Edit(&'static str);
+        #[async_trait::async_trait]
+        impl Extension for Edit {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn handles_before_provider_headers(&self) -> bool {
+                true
+            }
+            async fn before_provider_headers(
+                &self,
+                headers: &mut BeforeProviderHeaders,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert!(provider_header_session_id().is_none());
+                for hidden in [
+                    "authorization",
+                    "x-api-key",
+                    "x-private",
+                    "x-combined",
+                    "x-reflected",
+                    "x-gateway-echo",
+                    "x-proxy-echo",
+                ] {
+                    assert!(!headers.contains_key(hidden));
+                }
+                match self.0 {
+                    "edit" => {
+                        assert_eq!(headers["x-repeated"].as_deref(), Some("a, b"));
+                        headers.insert("X-TRACE".into(), Some(" edited ".into()));
+                        headers.insert("x-delete".into(), None);
+                    }
+                    "blocked" => {
+                        headers.insert("AUTHORIZATION".into(), Some("bad".into()));
+                        headers.insert("x-rejected".into(), Some("bad".into()));
+                    }
+                    "later" => {
+                        assert_eq!(headers["x-trace"].as_deref(), Some("edited"));
+                        assert!(!headers.contains_key("x-delete"));
+                        assert!(!headers.contains_key("x-rejected"));
+                        headers.insert("x-completion".into(), Some("yes".into()));
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            }
+        }
+
+        let mut registry = Registry::default();
+        for id in ["edit", "blocked", "later"] {
+            registry.register(Arc::new(Edit(id))).unwrap();
+        }
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let hooks =
+            ProviderHooks::for_header_preparation(&registry, &session, Duration::from_secs(5));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static(" \tBearer credential \t"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("gateway-key"));
+        headers.insert(
+            "proxy-authorization",
+            HeaderValue::from_static("\t Basic proxy-key \t"),
+        );
+        headers.insert(
+            "x-proxy-echo",
+            HeaderValue::from_static("reflected proxy-key"),
+        );
+        headers.insert(
+            "x-gateway-echo",
+            HeaderValue::from_static("reflected gateway-key"),
+        );
+        headers.insert("x-trace", HeaderValue::from_static("initial"));
+        headers.insert("x-delete", HeaderValue::from_static("delete"));
+        headers.insert("x-reflected", HeaderValue::from_static("echo credential"));
+        headers.append("x-repeated", HeaderValue::from_static("a"));
+        headers.append("x-repeated", HeaderValue::from_static("b"));
+        headers.append("x-combined", HeaderValue::from_static("first"));
+        headers.append("x-combined", HeaderValue::from_static("second"));
+        let mut private = HeaderValue::from_static("hidden");
+        private.set_sensitive(true);
+        headers.insert("x-private", private);
+        let edited = ProviderHooks::scope(hooks.clone(), async {
+            assert_eq!(
+                provider_header_session_id().as_deref(),
+                Some(session.external_session_id().as_str())
+            );
+            prepare_provider_headers(&headers, &["first, second".into()])
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(edited["authorization"], " \tBearer credential \t");
+        assert_eq!(edited["x-reflected"], "echo credential");
+        assert_eq!(edited["x-private"], "hidden");
+        assert_eq!(edited["x-trace"], "edited");
+        assert_eq!(edited["x-completion"], "yes");
+        assert_eq!(edited.get_all("x-repeated").iter().count(), 2);
+        assert_eq!(edited.get_all("x-combined").iter().count(), 2);
+        assert!(!edited.contains_key("x-delete"));
+        let mut failures = Vec::new();
+        hooks.unwrap().report_errors(&mut |notification| {
+            if let Notification::ExtensionLifecycleError {
+                extension, event, ..
+            } = notification
+            {
+                failures.push((extension.to_owned(), event));
+            }
+        });
+        assert_eq!(
+            failures,
+            [("blocked".to_owned(), "before_provider_headers")]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_header_turn_edits_do_not_leak_into_threshold_summary() {
+        struct Change;
+        #[async_trait::async_trait]
+        impl Extension for Change {
+            fn id(&self) -> &str {
+                "change-headers"
+            }
+            fn handles_before_provider_headers(&self) -> bool {
+                true
+            }
+            async fn before_provider_headers(
+                &self,
+                headers: &mut BeforeProviderHeaders,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                headers.insert("x-route".into(), Some("turn-only".into()));
+                Ok(())
+            }
+        }
+
+        #[derive(Clone)]
+        struct RecordingModel {
+            headers: HeaderMap,
+            used: Arc<Mutex<Vec<(&'static str, String)>>>,
+        }
+
+        impl RecordingModel {
+            fn answer(&self, kind: &'static str, content: &str) -> ModelStream {
+                self.used
+                    .lock()
+                    .unwrap()
+                    .push((kind, self.headers["x-route"].to_str().unwrap().into()));
+                Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text(content.into())),
+                    Ok(ModelEvent::Complete {
+                        calls: Vec::new(),
+                        usage: None,
+                    }),
+                ]))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Model for RecordingModel {
+            async fn prepare_context<'a>(
+                &'a self,
+                _: &ModelRequest,
+            ) -> Result<Option<Arc<dyn Model + 'a>>> {
+                let modified = prepare_provider_headers(&self.headers, &[]).await;
+                Ok(modified.map(|headers| {
+                    Arc::new(Self {
+                        headers,
+                        used: self.used.clone(),
+                    }) as Arc<dyn Model + 'a>
+                }))
+            }
+
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+                Ok(self.answer("turn", "answer"))
+            }
+
+            async fn stream_for_summary(
+                &self,
+                _: uuid::Uuid,
+                _: uuid::Uuid,
+                _: ModelRequest,
+            ) -> Result<ModelStream> {
+                Ok(self.answer("summary", "summary"))
+            }
+        }
+
+        let model = RecordingModel {
+            headers: HeaderMap::from_iter([(
+                HeaderName::from_static("x-route"),
+                HeaderValue::from_static("original"),
+            )]),
+            used: Arc::default(),
+        };
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Change)).unwrap();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 2,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(1000),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(crate::Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(crate::Event::Assistant {
+                content: "old reply".into(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_tx, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let answer = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(
+            *model.used.lock().unwrap(),
+            [
+                ("summary", "original".to_owned()),
+                ("turn", "turn-only".to_owned()),
+            ]
+        );
     }
 }

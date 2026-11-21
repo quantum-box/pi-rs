@@ -287,6 +287,19 @@ impl Anthropic {
         self.headers.clone()
     }
 
+    #[doc(hidden)]
+    pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        pi_rs_core::provider_header_session_id()?;
+        let credential = self.auth.1.to_str().unwrap_or_default();
+        let mut secrets = vec![credential.to_owned()];
+        if let Some((scheme, token)) = credential.split_once(' ')
+            && scheme.eq_ignore_ascii_case("bearer")
+        {
+            secrets.push(token.to_owned());
+        }
+        pi_rs_core::prepare_provider_headers(headers, &secrets).await
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -1443,6 +1456,19 @@ fn resolve_tools(
 
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_header_override(&self.headers)
+            .await
+            .map(|headers| {
+                std::sync::Arc::new(self.clone().with_headers(headers))
+                    as std::sync::Arc<dyn Model + 'a>
+            }))
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,

@@ -46,8 +46,9 @@ pub use lifecycle::{
 pub use model_catalog::*;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
 pub use provider_hooks::{
-    ProviderResponseEvent, ProviderStreamEvent, observe_provider_response, observe_provider_stream,
-    observes_provider_response, observes_provider_stream,
+    BeforeProviderHeaders, ProviderResponseEvent, ProviderStreamEvent, observe_provider_response,
+    observe_provider_stream, observes_provider_response, observes_provider_stream,
+    prepare_provider_headers, provider_header_session_id,
 };
 pub use resource::Resource;
 pub use retry::*;

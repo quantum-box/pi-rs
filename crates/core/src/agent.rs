@@ -1732,12 +1732,25 @@ impl Agent<'_> {
                 if request.max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
+                let header_hooks = crate::provider_hooks::ProviderHooks::for_header_preparation(
+                    active.registry,
+                    session,
+                    active.limits.model_timeout,
+                );
+                let mutable_headers = header_hooks.is_some();
                 let preparation = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = platform_time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
-                        result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
+                    result = platform_time::timeout(
+                        active.limits.model_timeout,
+                        crate::provider_hooks::ProviderHooks::scope(
+                            header_hooks.clone(), active.model.prepare_context(&request),
+                        ),
+                    ) => result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
                 };
+                if let Some(hooks) = header_hooks {
+                    hooks.report_errors(observer);
+                }
                 let prepared = match preparation {
                     Ok(prepared) => prepared,
                     Err(Error::RetryableModel(message))
@@ -1786,6 +1799,11 @@ impl Agent<'_> {
                         continue;
                     }
                     Err(error) => return Err(error),
+                };
+                let summary_model = if mutable_headers {
+                    active.model
+                } else {
+                    prepared.as_deref().unwrap_or(active.model)
                 };
                 let active = Agent {
                     model: prepared.as_deref().unwrap_or(active.model),
@@ -1917,23 +1935,27 @@ impl Agent<'_> {
                     if model_summary_available || exceeds {
                         abandon_turn_request_for_summary(session, observer)?;
                     }
-                    let summary = active
-                        .summarize_prefix(
-                            session,
-                            &states,
-                            SummaryScope {
-                                retention,
-                                instructions: None,
-                                output_limit: summary_limit,
-                                cancellation: cancel,
-                                reason: crate::CompactionTrigger::Threshold,
-                                will_retry: false,
-                                skip_without_model: !exceeds && !model_summary_available,
-                            },
-                            observer,
-                            Some(followups),
-                        )
-                        .await?;
+                    let summary = Agent {
+                        model: summary_model,
+                        limits: active.limits.clone(),
+                        ..active
+                    }
+                    .summarize_prefix(
+                        session,
+                        &states,
+                        SummaryScope {
+                            retention,
+                            instructions: None,
+                            output_limit: summary_limit,
+                            cancellation: cancel,
+                            reason: crate::CompactionTrigger::Threshold,
+                            will_retry: false,
+                            skip_without_model: !exceeds && !model_summary_available,
+                        },
+                        observer,
+                        Some(followups),
+                    )
+                    .await?;
                     if let Some((spent, provided)) = summary {
                         budget -= spent;
                         states = session.extension_states();

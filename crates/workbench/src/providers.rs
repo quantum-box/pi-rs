@@ -576,7 +576,15 @@ impl Client {
         &self,
         model: &str,
     ) -> Result<Option<(Client, Option<String>)>> {
-        let (client, headers) = match self {
+        self.prepare_for_context_with_header_hook(model, None).await
+    }
+
+    pub(super) async fn prepare_for_context_with_header_hook(
+        &self,
+        model: &str,
+        affinity: Option<(&[&'static str], &str)>,
+    ) -> Result<Option<(Client, Option<String>)>> {
+        let (mut client, mut headers) = match self {
             Self::Deferred(deferred) => deferred.resolve_with_headers().await?,
             Self::Ollama(client) => (self.clone(), client.context_headers()),
             Self::Anthropic(client) => (self.clone(), client.context_headers()),
@@ -585,14 +593,42 @@ impl Client {
             Self::PiMessages(client) => (self.clone(), client.context_headers()),
             Self::Bedrock(_) => (self.clone(), HeaderMap::new()),
         };
-        let client = match client {
+        client = match client {
             Self::PiMessages(client) => Self::PiMessages(client.prepare_context(model).await?),
-            Self::Bedrock(client) => match client.prepare_bedrock().await? {
+            Self::Bedrock(client) if affinity.is_none() => match client.prepare_bedrock().await? {
                 Some(prepared) => Self::Bedrock(prepared),
                 None => Self::Bedrock(client),
             },
             other => other,
         };
+        if let Some((names, external_id)) = affinity {
+            if let Self::Bedrock(bedrock) = &client {
+                let defaults = super::image_policy::session_affinity_headers(
+                    names,
+                    external_id,
+                    &bedrock.context_headers(),
+                )?;
+                let edited = bedrock.prepare_header_context(&defaults).await?;
+                headers = edited.context_headers();
+                client = Self::Bedrock(edited);
+            } else {
+                headers.extend(super::image_policy::session_affinity_headers(
+                    names,
+                    external_id,
+                    &headers,
+                )?);
+                let edited = match &client {
+                    Self::Ollama(client) => client.prepare_header_override(&headers).await,
+                    Self::Anthropic(client) => client.prepare_header_override(&headers).await,
+                    Self::Google(client) => client.prepare_header_override(&headers).await,
+                    Self::OpenAi(client) => client.prepare_header_override(&headers).await,
+                    Self::PiMessages(client) => client.prepare_header_override(&headers).await,
+                    _ => unreachable!("provider already handled during header preparation"),
+                };
+                headers = edited.unwrap_or(headers);
+                client = client.with_headers(headers.clone());
+            }
+        }
         // The keyed fingerprint protects low-entropy headers and adapter credentials.
         let base = match &client {
             Self::Bedrock(_) => client.context_identity(),

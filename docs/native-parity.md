@@ -4341,6 +4341,20 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can subscribe to `before_provider_headers` and add, replace
+or delete configured headers before a turn request is sent. A null value or
+removing a key deletes an editable header. Changes run in registration order
+and are frozen before model estimation and tool preparation, so retained
+context identity reflects the headers the adapter will use. Workbench merges
+session affinity defaults before this hook. Managed authentication, host and
+connection framing headers, and configured values marked sensitive stay under
+host control. This includes profile headers Workbench marks sensitive and
+configured Bedrock values when the caller supplied an opaque signer. Turn
+edits do not carry into compaction requests.
+Invalid or failing edits leave the previous header set intact. Executable
+extensions advertise `before_provider_headers_hook` and respond with the
+edited header map.
+
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
 OpenAI-compatible chat, Anthropic Messages, Google Gemini, Ollama and Pi

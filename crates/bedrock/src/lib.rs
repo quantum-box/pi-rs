@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
     headers: BTreeMap<String, Vec<String>>,
+    sensitive_headers: BTreeSet<String>,
     unsupported: Option<String>,
     bearer: Option<String>,
     force_sigv4: bool,
@@ -55,6 +56,7 @@ impl Bedrock {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             headers: BTreeMap::new(),
+            sensitive_headers: BTreeSet::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -82,6 +84,7 @@ impl Bedrock {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
             headers: BTreeMap::new(),
+            sensitive_headers: BTreeSet::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -111,6 +114,7 @@ impl Bedrock {
                 &config,
             )))),
             headers: BTreeMap::new(),
+            sensitive_headers: BTreeSet::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -137,6 +141,11 @@ impl Bedrock {
     }
     /// Replace custom request headers; authentication and SigV4 headers are ignored.
     pub fn with_headers(mut self, headers: http::HeaderMap) -> Result<Self> {
+        self.sensitive_headers = headers
+            .iter()
+            .filter(|(_, value)| value.is_sensitive())
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect();
         self.headers = headers::filtered(headers)?;
         self.prepared_identity = None;
         Ok(self)
@@ -144,11 +153,71 @@ impl Bedrock {
     /// Add missing default headers without overriding configured request headers.
     pub fn with_default_headers(mut self, headers: &http::HeaderMap) -> Result<Self> {
         for (name, value) in headers::filtered(headers.clone())? {
-            self.headers.entry(name).or_insert(value);
+            if let std::collections::btree_map::Entry::Vacant(entry) = self.headers.entry(name) {
+                if headers
+                    .get_all(entry.key().as_str())
+                    .iter()
+                    .any(http::HeaderValue::is_sensitive)
+                {
+                    self.sensitive_headers.insert(entry.key().clone());
+                }
+                entry.insert(value);
+            }
         }
         self.prepared_identity = None;
         Ok(self)
     }
+    #[doc(hidden)]
+    pub fn context_headers(&self) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (name, values) in &self.headers {
+            let key = http::HeaderName::from_bytes(name.as_bytes()).expect("validated header name");
+            for value in values {
+                let mut value = http::HeaderValue::from_str(value).expect("validated header value");
+                value.set_sensitive(self.sensitive_headers.contains(name));
+                headers.append(key.clone(), value);
+            }
+        }
+        headers
+    }
+
+    /// Freeze inspectable AWS authentication before editing configured headers.
+    #[doc(hidden)]
+    pub async fn prepare_header_context(&self, defaults: &http::HeaderMap) -> Result<Self> {
+        let prepared = self.prepare_bedrock_with_auth(true).await?;
+        let (resolved, secrets, opaque_auth) = match prepared {
+            Some((resolved, secrets)) => (resolved, secrets, false),
+            None => (
+                self.clone(),
+                self.bearer.iter().cloned().collect(),
+                self.bearer.is_none(),
+            ),
+        };
+        let mut headers = resolved.context_headers();
+        if opaque_auth {
+            // A caller-supplied signer can hold credentials this adapter cannot inspect.
+            for value in headers.values_mut() {
+                value.set_sensitive(true);
+            }
+        }
+        for (name, value) in defaults {
+            headers.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+        let Some(headers) = pi_rs_core::prepare_provider_headers(&headers, &secrets).await else {
+            return Ok(resolved);
+        };
+        let identity = resolved.prepared_identity.clone();
+        let mut resolved = resolved.with_headers(headers)?;
+        resolved.prepared_identity = identity.and_then(|identity| {
+            pi_rs_core::protected_model_fingerprint(&(
+                "bedrock-header-override-v1",
+                identity,
+                &resolved.headers,
+            ))
+        });
+        Ok(resolved)
+    }
+
     /// Prefer bearer authentication over the AWS credential chain.
     pub fn with_bearer_token(mut self, token: String) -> Result<Self> {
         if token.is_empty() || !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
@@ -230,6 +299,16 @@ impl Bedrock {
     }
     /// Freeze an inspectable SDK configuration and its effective authentication for one request.
     pub async fn prepare_bedrock(&self) -> Result<Option<Self>> {
+        Ok(self
+            .prepare_bedrock_with_auth(false)
+            .await?
+            .map(|(model, _)| model))
+    }
+
+    async fn prepare_bedrock_with_auth(
+        &self,
+        collect_header_secrets: bool,
+    ) -> Result<Option<(Self, Vec<String>)>> {
         use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
         if self.unsupported.is_some() || self.http_client.is_some() {
             return Ok(None);
@@ -311,6 +390,19 @@ impl Bedrock {
                 .build();
             identity
         };
+        let secrets = if collect_header_secrets {
+            [
+                Some(auth_identity.1.clone()),
+                Some(auth_identity.2.clone()),
+                auth_identity.3.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .collect()
+        } else {
+            Vec::new()
+        };
         let identity = pi_rs_core::protected_model_fingerprint(&(
             "bedrock-converse-v1",
             &region,
@@ -357,7 +449,7 @@ impl Bedrock {
         prepared.bearer = bearer;
         prepared.known_config = None;
         prepared.prepared_identity = identity;
-        Ok(Some(prepared))
+        Ok(Some((prepared, secrets)))
     }
 
     /// Configure Pi's reasoning level and an optional model-specific effort mapping.
@@ -917,10 +1009,12 @@ impl Model for Bedrock {
         &'a self,
         _: &ModelRequest,
     ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
-        Ok(self
-            .prepare_bedrock()
-            .await?
-            .map(|model| std::sync::Arc::new(model) as std::sync::Arc<dyn Model + 'a>))
+        let prepared = if pi_rs_core::provider_header_session_id().is_some() {
+            Some(self.prepare_header_context(&http::HeaderMap::new()).await?)
+        } else {
+            self.prepare_bedrock().await?
+        };
+        Ok(prepared.map(|model| std::sync::Arc::new(model) as std::sync::Arc<dyn Model + 'a>))
     }
 
     fn context_identity(&self) -> Option<String> {
