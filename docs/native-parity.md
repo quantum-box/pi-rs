@@ -4099,7 +4099,10 @@ streams text, thought summaries, and tool calls. It encodes image inputs and
 tool results, records measured usage including thought tokens, and preserves
 ordered signed response parts for the same model across tools and journal
 reopening. Gemini 2.5 and newer model families use their budget or level
-controls. A truncated response keeps its text and skips tool dispatch.
+controls. A truncated response keeps its text and skips tool dispatch. The
+adapter folds nonempty system updates into `systemInstruction` without
+interrupting consecutive tool results or their follow-up image turn on Gemini
+2.5.
 
 Loopback checks covered these paths and a PTY showed thinking, generation,
 and the final answer. [Generate Content API](https://ai.google.dev/api/generate-content?hl=en)
