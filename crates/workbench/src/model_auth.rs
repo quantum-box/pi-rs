@@ -672,6 +672,62 @@ pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()>
     )
 }
 
+pub(super) fn save_cloudflare_login(
+    provider: &Provider,
+    key: &str,
+    account: &str,
+    gateway: Option<&str>,
+) -> Result<()> {
+    save_cloudflare_login_at(
+        &config::agent_dir().join("auth.json"),
+        provider,
+        key,
+        account,
+        gateway,
+    )
+}
+
+fn save_cloudflare_login_at(
+    path: &std::path::Path,
+    provider: &Provider,
+    key: &str,
+    account: &str,
+    gateway: Option<&str>,
+) -> Result<()> {
+    if !valid_key(key) {
+        return Err(Error::Config("Enter a valid Cloudflare API key".into()));
+    }
+    if !super::operation_models::valid_cloudflare_account(account) {
+        return Err(Error::Config("Enter a valid Cloudflare account ID".into()));
+    }
+    let mut environment = json!({"CLOUDFLARE_ACCOUNT_ID":account});
+    match (provider.id(), gateway) {
+        ("cloudflare-workers-ai", None) => {}
+        ("cloudflare-ai-gateway", Some(gateway))
+            if super::cloudflare_gateway::Route::new(account, gateway).is_some() =>
+        {
+            environment["CLOUDFLARE_GATEWAY_ID"] = json!(gateway);
+        }
+        ("cloudflare-ai-gateway", _) => {
+            return Err(Error::Config(
+                "Enter a valid Cloudflare AI Gateway ID".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Config(
+                "unsupported Cloudflare login provider".into(),
+            ));
+        }
+    }
+    config::update_object(path, |data| {
+        data.insert(
+            provider.id().into(),
+            json!({"type":"api_key","key":key,"literal":true,"env":environment}),
+        );
+        Ok(())
+    })
+}
+
 fn save_at(path: &std::path::Path, provider: &Provider, endpoint: &str, key: &str) -> Result<()> {
     let key = key.trim();
     if !valid_key(key) {
@@ -756,6 +812,83 @@ pub(super) use pi_rs_workbench::auth_factory::valid_api_key as valid_key;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloudflare_login_saves_only_valid_account_and_gateway_routes() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let workers = Provider::named("cloudflare-workers-ai").unwrap();
+        let gateway = Provider::named("cloudflare-ai-gateway").unwrap();
+        save_cloudflare_login_at(&path, &workers, "$literal", "workersaccount", None).unwrap();
+        save_cloudflare_login_at(
+            &path,
+            &gateway,
+            "gateway-token",
+            "gatewayaccount",
+            Some("test-gateway"),
+        )
+        .unwrap();
+        assert!(
+            save_cloudflare_login_at(
+                &path,
+                &gateway,
+                "replacement",
+                "gatewayaccount",
+                Some("wrong/path")
+            )
+            .is_err()
+        );
+
+        let saved = config::read_object(&path).unwrap();
+        assert_eq!(
+            saved["cloudflare-workers-ai"]["env"]["CLOUDFLARE_ACCOUNT_ID"],
+            "workersaccount"
+        );
+        assert_eq!(saved["cloudflare-workers-ai"]["literal"], true);
+        assert_eq!(saved["cloudflare-ai-gateway"]["key"], "gateway-token");
+        let keys = Keys::parse(&saved);
+        assert_eq!(keys.cloudflare_chat_account(), Some("workersaccount"));
+        let route = keys.cloudflare_gateway_route().unwrap();
+        let profiles = super::super::model_profiles::Profiles::parse_with_cloudflare_routes(
+            &json!({}),
+            keys.cloudflare_chat_account(),
+            Some(route.clone()),
+        )
+        .unwrap();
+        let workers_endpoint =
+            "https://api.cloudflare.com/client/v4/accounts/workersaccount/ai/v1/chat/completions";
+        assert_eq!(
+            keys.custom_credential(&workers, workers_endpoint, &profiles)
+                .and_then(Credential::literal),
+            Some("$literal")
+        );
+        assert!(
+            keys.custom_credential(
+                &workers,
+                &workers_endpoint.replace("workersaccount", "otheraccount"),
+                &profiles
+            )
+            .is_none()
+        );
+
+        let gateway_endpoint = route
+            .endpoint(super::super::providers::Adapter::Anthropic)
+            .unwrap();
+        assert_eq!(
+            keys.custom_credential(&gateway, &gateway_endpoint, &profiles)
+                .and_then(Credential::literal),
+            Some("gateway-token")
+        );
+        assert!(
+            keys.custom_credential(
+                &gateway,
+                &gateway_endpoint.replace("test-gateway", "other-gateway"),
+                &profiles
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn vercel_ui_saved_key_only_bridges_exact_official_classifier_route() {
         use super::*;

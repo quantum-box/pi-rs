@@ -4761,7 +4761,8 @@ catalogues are projected from the published
 
 Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
-requests. Pi-format saved credentials may declare an account through their
+requests. Terminal `/login cloudflare-workers-ai` prompts for a masked API
+key and the account ID. Pi-format saved credentials may declare an account through their
 `env` field. A stored account scopes the key to that account's chat route.
 An unscoped saved key works only on official Workers AI routes. Credentials
 and headers inferred from classifier-only model URLs apply to those operations.
@@ -4778,7 +4779,9 @@ selects the Chat Completions, Messages, or Responses path. All three send
 `cf-aig-authorization` for gateway authentication, and saved keys remain
 scoped to their account and gateway. A concrete provider `baseUrl` can
 supply missing route identifiers for an imported key when the configured
-route agrees with any saved or environment identifiers.
+route agrees with any saved or environment identifiers. Terminal
+`/login cloudflare-ai-gateway` prompts for a masked API key, account ID, and
+gateway ID. The two Cloudflare sign-in flows store Pi-compatible credentials.
 
 The published Pi AI package and local fixtures cover each route and
 authentication header. Live gateway authentication was unverified because
