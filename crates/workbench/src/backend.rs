@@ -131,6 +131,11 @@ enum Request {
         name: String,
         id: Option<serde_json::Value>,
     },
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
+        id: Option<serde_json::Value>,
+    },
     SetQueueMode {
         kind: InputKind,
         mode: QueueMode,
@@ -2128,6 +2133,7 @@ fn read_requests(
                 | Request::QueueInput { .. }
                 | Request::ClearQueue { .. }
                 | Request::SetSessionName { .. }
+                | Request::SetSessionLabel { .. }
                 | Request::SetQueueMode { .. }) => {
                     if prepare_in_background {
                         if let Err(error) = queue_requests.try_send(request) {

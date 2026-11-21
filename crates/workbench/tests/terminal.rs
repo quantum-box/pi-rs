@@ -3637,6 +3637,7 @@ fn check_streaming_tree_navigation(mode: &str) {
     session
         .append_user_with_images("historical anchor".into(), vec![], None)
         .unwrap();
+    let anchor = session.head();
     drop(session);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3761,7 +3762,21 @@ fn check_streaming_tree_navigation(mode: &str) {
 
     master.write_all(b"/tree\r").unwrap();
     output_until(&mut master, |text| text.contains("Session tree"));
-    master.write_all(b"historical anchor\r").unwrap();
+    master.write_all(b"historical anchorL").unwrap();
+    output_until(&mut master, |text| text.contains("Label record"));
+    master.write_all(b"stream-bookmark\r").unwrap();
+    output_until(&mut master, |text| text.contains("[stream-bookmark]"));
+    let labeled = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert_eq!(
+        labeled.labels().get(&anchor).map(String::as_str),
+        Some("stream-bookmark")
+    );
+    assert!(
+        !labeled.queued_inputs().is_empty(),
+        "editing a label keeps queued input"
+    );
+
+    master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| text.contains("Summarize branch?"));
     let session = pi_rs::Session::snapshot(&session_path).unwrap();
     assert!(session.branch().iter().any(|record| matches!(&record.event,
