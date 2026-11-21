@@ -115,14 +115,8 @@ fn open_pty() -> io::Result<(File, File)> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn child_stopped(pid: u32) -> io::Result<bool> {
     let mut event: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let status = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut event,
-            libc::WNOHANG | libc::WSTOPPED,
-        )
-    };
+    let status =
+        unsafe { libc::waitid(libc::P_PID, pid, &mut event, libc::WNOHANG | libc::WSTOPPED) };
     match check(status) {
         Ok(_) => Ok(event.si_code == libc::CLD_STOPPED),
         Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
@@ -155,7 +149,7 @@ fn mark_close_on_exec(inherited: &[libc::c_int]) -> io::Result<()> {
     if unsafe {
         libc::syscall(
             libc::SYS_close_range,
-            3 as libc::c_uint,
+            3_u32,
             libc::c_uint::MAX,
             libc::CLOSE_RANGE_CLOEXEC,
         )
