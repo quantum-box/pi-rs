@@ -1,6 +1,7 @@
 //! A bounded QuickJS runner that reaches external effects only through ToolHost.
 #[cfg(test)]
 use pi_rs_core::ModelRequest;
+use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -845,35 +846,81 @@ fn describe(tool: &ToolSpec) -> String {
     )
 }
 fn typescript(schema: &Value) -> String {
-    match schema["type"].as_str() {
-        Some("string") => "string".into(),
-        Some("number" | "integer") => "number".into(),
-        Some("boolean") => "boolean".into(),
-        Some("array") => format!("{}[]", typescript(&schema["items"])),
-        Some("object") => {
-            let fields = schema["properties"]
-                .as_object()
-                .map(|properties| {
-                    properties
-                        .iter()
-                        .map(|(name, value)| {
-                            let required = schema["required"]
-                                .as_array()
-                                .is_some_and(|names| names.iter().any(|value| value == name));
-                            format!(
-                                "{}{}: {}",
-                                serde_json::to_string(name).unwrap(),
-                                if required { "" } else { "?" },
-                                typescript(value)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .unwrap_or_default();
-            format!("{{ {fields} }}")
+    let mut renderer = SchemaRenderer {
+        root: schema,
+        resolving: BTreeSet::new(),
+        expansions: 0,
+        text: String::new(),
+        units: 0,
+    };
+    match renderer.write_type(schema) {
+        Some(()) => renderer.text,
+        None => "unknown".into(),
+    }
+}
+
+struct SchemaRenderer<'a> {
+    root: &'a Value,
+    resolving: BTreeSet<*const Value>,
+    expansions: usize,
+    text: String,
+    units: usize,
+}
+
+impl SchemaRenderer<'_> {
+    fn write(&mut self, text: &str) -> Option<()> {
+        self.units += text.encode_utf16().count();
+        if self.units > 16_000 {
+            return None;
         }
-        _ => "unknown".into(),
+        self.text.push_str(text);
+        Some(())
+    }
+
+    fn write_type(&mut self, schema: &Value) -> Option<()> {
+        if let Some(reference) = schema["$ref"].as_str() {
+            let Some(target) = crate::schema_ref::resolve(self.root, reference) else {
+                return self.write("unknown");
+            };
+            let pointer = std::ptr::from_ref(target);
+            if self.expansions >= 32 || !self.resolving.insert(pointer) {
+                return self.write("unknown");
+            }
+            self.expansions += 1;
+            let result = self.write_type(target);
+            self.resolving.remove(&pointer);
+            return result;
+        }
+        match schema["type"].as_str() {
+            Some("string") => self.write("string"),
+            Some("number" | "integer") => self.write("number"),
+            Some("boolean") => self.write("boolean"),
+            Some("array") => {
+                self.write_type(&schema["items"])?;
+                self.write("[]")
+            }
+            Some("object") => self.write_object(schema),
+            _ if schema == &Value::Bool(false) => self.write("never"),
+            _ => self.write("unknown"),
+        }
+    }
+
+    fn write_object(&mut self, schema: &Value) -> Option<()> {
+        self.write("{ ")?;
+        if let Some(properties) = schema["properties"].as_object() {
+            let required = schema["required"].as_array();
+            for (index, (name, field)) in properties.iter().enumerate() {
+                if index != 0 {
+                    self.write("; ")?;
+                }
+                self.write(&serde_json::to_string(name).unwrap())?;
+                let name_is_required =
+                    required.is_some_and(|names| names.iter().any(|value| value == name));
+                self.write(if name_is_required { ": " } else { "?: " })?;
+                self.write_type(field)?;
+            }
+        }
+        self.write(" }")
     }
 }
 
@@ -1396,6 +1443,44 @@ fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_declarations_expand_local_refs_without_recursing_forever() {
+        let tool = ToolSpec {
+            name: "read-record".into(),
+            description: "Read a record".into(),
+            parameters: json!({
+                "$ref": "#/$defs/a~1b~0%20c",
+                "$defs": {
+                    "a/b~ c": {
+                        "type": "object",
+                        "required": ["amount"],
+                        "properties": {
+                            "amount": {"$ref": "#/$defs/cost"},
+                            "cycle": {"$ref": "#/$defs/a~1b~0%20c"},
+                            "denied": {"$ref": "#/$defs/never"},
+                            "mystery": {"$ref": "https://example.com/schema"}
+                        }
+                    },
+                    "cost": {"type": "number"},
+                    "never": false
+                }
+            }),
+        };
+        let declaration = describe(&tool);
+        assert!(declaration.contains("read_record(args: {"));
+        for field in [
+            "\"amount\": number",
+            "\"cycle\"?: unknown",
+            "\"denied\"?: never",
+            "\"mystery\"?: unknown",
+        ] {
+            assert!(declaration.contains(field), "{declaration}");
+        }
+        let property_name = "x".repeat(16_000);
+        let oversized = json!({"type":"object","properties": {(property_name):{"type":"string"}}});
+        assert_eq!(typescript(&oversized), "unknown");
+    }
 
     #[test]
     fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
@@ -1980,7 +2065,12 @@ mod tests {
             vec![ToolSpec {
                 name: "echo".into(),
                 description: "Echo a value".into(),
-                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"text": {"$ref": "#/$defs/echoText"}},
+                    "required": ["text"],
+                    "$defs": {"echoText": {"type": "string", "description": "Reconciliation"}}
+                }),
             }]
         }
         async fn call(&self, name: &str, arguments: Value) -> Outcome {
@@ -2616,7 +2706,7 @@ mod tests {
     #[test]
     fn metadata_helpers_and_output_truncation_are_available() {
         let reply = run(
-            "const found = await searchTools('echo'); text(found[0].name); text((await describeTool('echo')).declaration); return (await describeNamespace('builtin')).tools.length;",
+            "const found = await searchTools('reconciliation'); if (found[0]?.name !== 'echo') throw new Error('missing referenced tool'); const declaration = (await describeTool('echo')).declaration; if (!declaration.includes('string')) throw new Error('missing referenced type'); text(declaration); return (await describeNamespace('builtin')).tools.length;",
             None,
         );
         assert!(reply.outcome.tool_content().contains("Echo a value"));
