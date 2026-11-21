@@ -2490,8 +2490,11 @@ changes update the active branch and user defaults. New native frontend sessions
 default to one-at-a-time delivery. Existing core embeddings retain all-at-once
 behavior unless configured otherwise.
 
-Alt+Up restores queued messages in the TUI, with Alt+Q on Windows/WSL. Escape
-restores the queue before stopping the active run. An RPC abort retains queued
+Alt+Up restores queued messages in the TUI, with Alt+Q on Windows/WSL. The
+status reports the number restored or an empty queue. Steering precedes
+follow-up text, and restored messages precede the current draft. Native image
+attachments are retained. An empty queue leaves the draft and cursor intact.
+Escape restores the queue before stopping the active run. An RPC abort retains queued
 messages and continues them without repeating the interrupted request first.
 Compaction queue handling is covered below. Review queue handling is covered below.
 
