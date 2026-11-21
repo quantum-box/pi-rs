@@ -1203,6 +1203,12 @@ impl Client {
                     .model_profiles
                     .anthropic_strict_tool_support(&args.provider, metadata.as_ref());
                 let mut client = client
+                    .with_eager_tool_input_streaming(
+                        args.model_profiles.anthropic_eager_tool_input_streaming(
+                            &args.provider,
+                            metadata.as_ref(),
+                        ),
+                    )
                     .with_strict_tool_support(strict)
                     .with_strict_tool_models(args.model_profiles.anthropic_strict_tool_models(
                         &args.provider,

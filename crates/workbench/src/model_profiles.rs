@@ -213,6 +213,7 @@ struct ModelCompatibility {
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
+    supports_eager_tool_input_streaming: Option<bool>,
     cache_control_format: Option<CacheControlFormat>,
 }
 
@@ -244,6 +245,9 @@ impl ModelCompatibility {
             supports_cache_control_on_tools: newer
                 .supports_cache_control_on_tools
                 .or(self.supports_cache_control_on_tools),
+            supports_eager_tool_input_streaming: newer
+                .supports_eager_tool_input_streaming
+                .or(self.supports_eager_tool_input_streaming),
             cache_control_format: newer.cache_control_format.or(self.cache_control_format),
         }
     }
@@ -1372,6 +1376,16 @@ impl Profiles {
         models
     }
 
+    pub fn anthropic_eager_tool_input_streaming(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.cache_compatibility(provider, model)
+            .supports_eager_tool_input_streaming
+            .unwrap_or(true)
+    }
+
     pub fn messages_cache_support(
         &self,
         provider: &Provider,
@@ -2167,6 +2181,19 @@ mod tests {
         let model = profiles.model(&provider, "amazon.nova-lite-v1:0").unwrap();
         assert_eq!(model.context_window, Some(300_000));
         assert_eq!(model.max_tokens, Some(10_000));
+    }
+
+    #[test]
+    fn anthropic_tool_input_streaming_uses_the_selected_model_configuration() {
+        let profiles = Profiles::parse(&json!({"providers":{"fireworks":{"modelOverrides":{
+            "accounts/fireworks/models/deepseek-v4p1-flash":{"compat":{"supportsEagerToolInputStreaming":true}}
+        }}}})).unwrap();
+        let provider = profiles.provider("fireworks").unwrap();
+        let forced_eager =
+            profiles.model(&provider, "accounts/fireworks/models/deepseek-v4p1-flash");
+        assert!(profiles.anthropic_eager_tool_input_streaming(&provider, forced_eager.as_ref()));
+        let legacy = profiles.model(&provider, "accounts/fireworks/models/gpt-oss-120b");
+        assert!(!profiles.anthropic_eager_tool_input_streaming(&provider, legacy.as_ref()));
     }
 
     #[test]
