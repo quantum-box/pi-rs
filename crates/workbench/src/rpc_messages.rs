@@ -785,6 +785,14 @@ impl Projection {
                     "model":model_id,"timestamp":timestamp,"stopReason":stop,
                     "usage":super::rpc_events::usage_value(usage, metadata)
                 });
+                if !edited
+                    && api == "openai-responses"
+                    && let Some(effort) = replay
+                        .as_deref()
+                        .and_then(pi_rs::ProviderReplay::openai_effort)
+                {
+                    value["providerThinkingLevel"] = json!(effort);
+                }
                 if let Some(id) = &metadata.provider_request_id {
                     value["responseId"] = json!(id);
                 }

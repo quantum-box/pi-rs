@@ -637,6 +637,25 @@ pub struct ProviderReplay {
 }
 
 impl ProviderReplay {
+    /// Keep the request effort as private metadata beside the response blocks.
+    pub fn record_openai_effort(&mut self, effort: &str) {
+        if !effort.is_empty() {
+            self.blocks
+                .retain(|block| block.get("_pi_openai_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_openai_effort":effort}));
+        }
+    }
+
+    pub fn openai_effort(&self) -> Option<&str> {
+        self.blocks.iter().find_map(|block| {
+            block
+                .get("_pi_openai_effort")?
+                .as_str()
+                .filter(|effort| !effort.is_empty())
+        })
+    }
+
     pub fn is_context_edit(&self) -> bool {
         self.blocks
             .iter()
