@@ -1163,7 +1163,8 @@ pub(crate) fn resource_matches(
     };
     let matcher = glob.compile_matcher();
     candidates.iter().any(|candidate| {
-        (matcher.is_match(candidate) && matches_hidden_filter_segments(candidate, &pattern))
+        (matcher.is_match(candidate)
+            && (directory_roots || matches_hidden_filter_segments(candidate, &pattern)))
             || (directory_roots
                 && !pattern.contains(['*', '?', '[', '{'])
                 && candidate.starts_with(&format!("{pattern}/")))
