@@ -1253,6 +1253,33 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> BTreeMap<String, bool> {
+        self.anthropic_route_capabilities(provider, selected, explicit_endpoint, |metadata| {
+            self.anthropic_strict_tool_support(provider, metadata)
+        })
+    }
+
+    pub fn anthropic_mid_conversation_system_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeSet<String> {
+        self.anthropic_route_capabilities(provider, selected, explicit_endpoint, |metadata| {
+            self.chat_compatibility(provider, metadata)
+                .supports_mid_conversation_system_messages()
+        })
+        .into_iter()
+        .filter_map(|(id, supported)| supported.then_some(id))
+        .collect()
+    }
+
+    fn anthropic_route_capabilities(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        capability: impl Fn(Option<&ModelMetadata>) -> bool,
+    ) -> BTreeMap<String, bool> {
         let endpoint = explicit_endpoint
             .or_else(|| self.model_endpoint(provider, selected))
             .unwrap_or_else(|| self.endpoint(provider));
@@ -1270,7 +1297,7 @@ impl Profiles {
                     return None;
                 }
                 let metadata = self.model(provider, &id)?;
-                let supported = self.anthropic_strict_tool_support(provider, Some(&metadata));
+                let supported = capability(Some(&metadata));
                 Some((id, supported))
             })
             .collect();
@@ -1278,7 +1305,7 @@ impl Profiles {
         // capability (or the default false) still applies to that selection.
         models.entry(selected.to_owned()).or_insert_with(|| {
             let metadata = self.model(provider, selected);
-            self.anthropic_strict_tool_support(provider, metadata.as_ref())
+            capability(metadata.as_ref())
         });
         models
     }
@@ -1950,6 +1977,42 @@ mod tests {
             assert_eq!(explicit.get(rewritten), Some(&expected));
             assert!(!explicit.contains_key("other-api"));
         }
+    }
+
+    #[test]
+    fn anthropic_system_update_policy_follows_the_final_model_on_the_selected_route() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoSystemMessages":true},
+            "models":[
+                {"id":"enabled"},
+                {"id":"disabled","compat":{"supportsMidConvoSystemMessages":false}},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"},
+                {"id":"other-api","api":"openai-completions"}
+            ]
+        }}}))
+        .unwrap();
+        let proxy = profiles.provider("proxy").unwrap();
+        assert_eq!(
+            profiles.anthropic_mid_conversation_system_models(&proxy, "selected", None),
+            BTreeSet::from(["enabled".into(), "selected".into()])
+        );
+        assert_eq!(
+            profiles.anthropic_mid_conversation_system_models(
+                &proxy,
+                "selected",
+                Some("http://localhost:3/v1/messages"),
+            ),
+            BTreeSet::from(["enabled".into(), "other-endpoint".into(), "selected".into()])
+        );
+
+        let provider = Provider::Anthropic;
+        let default = Profiles::default();
+        let native =
+            default.anthropic_mid_conversation_system_models(&provider, "claude-opus-4-8", None);
+        assert_eq!(native.len(), 7);
+        assert!(native.contains("claude-opus-4-8"));
+        assert!(!native.contains("claude-sonnet-5"));
     }
 
     #[test]

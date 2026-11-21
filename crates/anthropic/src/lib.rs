@@ -81,6 +81,7 @@ pub struct Anthropic {
     cache_tools: bool,
     strict_tool_support: bool,
     strict_tool_models: Option<Arc<BTreeMap<String, bool>>>,
+    mid_conversation_system_models: Arc<BTreeSet<String>>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -174,9 +175,16 @@ impl Anthropic {
             cache_tools: true,
             strict_tool_support: false,
             strict_tool_models: None,
+            mid_conversation_system_models: Arc::default(),
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Enable native system updates for the listed models on this client route.
+    pub fn with_mid_conversation_system_models(mut self, models: BTreeSet<String>) -> Self {
+        self.mid_conversation_system_models = Arc::new(models);
+        self
     }
 
     /// Set the selected model's JSON Schema strict-tool capability.
@@ -830,13 +838,21 @@ fn encode_request(
     replay_scope: &str,
     edited_scope: &str,
     allow_empty_signature: bool,
+    supports_mid_conversation_system: bool,
 ) -> Result<Value> {
     let mut system = Vec::new();
+    let mut pending_system = Vec::new();
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
-    for message in request.messages {
+    for (index, message) in request.messages.into_iter().enumerate() {
         let (role, blocks) = match message {
             Message::System { content } => {
-                system.push(content);
+                if index == 0 || !supports_mid_conversation_system {
+                    if !content.is_empty() {
+                        system.push(content);
+                    }
+                } else if let Some(block) = text_block(content) {
+                    pending_system.push(("system", vec![block]));
+                }
                 continue;
             }
             Message::User { content } => ("user", text_block(content).into_iter().collect()),
@@ -905,6 +921,10 @@ fn encode_request(
         if blocks.is_empty() {
             continue;
         }
+        // System updates cannot separate an assistant tool call from its result.
+        if role == "assistant" {
+            turns.append(&mut pending_system);
+        }
         if let Some((previous, content)) = turns.last_mut()
             && *previous == role
         {
@@ -918,6 +938,7 @@ fn encode_request(
             "Anthropic requires at least one conversation message".into(),
         ));
     }
+    turns.append(&mut pending_system);
     let messages: Vec<_> = turns
         .into_iter()
         .map(|(role, content)| json!({"role":role,"content":content}))
@@ -953,7 +974,7 @@ fn apply_cache_control(body: &mut Value, retention: CacheRetention, cache_tools:
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .and_then(|messages| messages.last_mut())
-        && message["role"] == "user"
+        && matches!(message["role"].as_str(), Some("user" | "system"))
         && let Some(block) = message
             .get_mut("content")
             .and_then(Value::as_array_mut)
@@ -1528,6 +1549,15 @@ impl Model for Anthropic {
         } else {
             pi_rs_core::protected_model_fingerprint(&identity)
         }?;
+        let base = if self.mid_conversation_system_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "mid-conversation-system-v1",
+                self.mid_conversation_system_models.as_ref(),
+            ))?
+        };
         match &self.strict_tool_models {
             // A map containing only unsupported models cannot change any
             // successful request's sampling compared with the default.
@@ -1730,6 +1760,8 @@ impl Anthropic {
             &replay_scope,
             &edited_scope,
             self.allow_empty_signature,
+            self.mid_conversation_system_models
+                .contains(&requested_model),
         )?;
         if let Some(tools) = wire_tools
             && !tools.is_empty()
@@ -2469,7 +2501,7 @@ mod tests {
             pi_rs_core::StrictToolPolicy::Prefer,
             json!({"type":"object","title":"dropped"}),
         );
-        let old = encode_request(request.clone(), &legacy.replay_scope, "", false).unwrap();
+        let old = encode_request(request.clone(), &legacy.replay_scope, "", false, false).unwrap();
         let (wire, _) = super::resolve_tools(&request, &[declaration], false).unwrap();
         assert_ne!(old["tools"][0]["input_schema"], wire[0]["input_schema"]);
         assert_eq!(
@@ -2641,8 +2673,9 @@ mod tests {
                 })),
             }],
         };
-        let same = encode_request(request.clone(), &api_key.replay_scope, "", false).unwrap();
-        let other = encode_request(request, &custom.replay_scope, "", false).unwrap();
+        let same =
+            encode_request(request.clone(), &api_key.replay_scope, "", false, false).unwrap();
+        let other = encode_request(request, &custom.replay_scope, "", false, false).unwrap();
         assert!(same.to_string().contains("secret"));
         assert!(!other.to_string().contains("secret"));
     }
@@ -3606,7 +3639,7 @@ mod tests {
             tools: vec![],
             max_output_tokens: 16,
         };
-        let body = encode_request(request, "anthropic", &scope, false).unwrap();
+        let body = encode_request(request, "anthropic", &scope, false, false).unwrap();
         assert_eq!(
             body["messages"][0]["content"],
             json!([{"type":"text","text":"first \n"},{"type":"text","text":"second"},{"type":"thinking","thinking":"secret","signature":"sig"}])
@@ -3641,9 +3674,9 @@ mod tests {
             tools: vec![],
             max_output_tokens: 16,
         };
-        let same = encode_request(request.clone(), "anthropic", &scope_a, false).unwrap();
+        let same = encode_request(request.clone(), "anthropic", &scope_a, false, false).unwrap();
         assert_eq!(same["messages"][1]["content"][0]["thinking"], "secret");
-        let other = encode_request(request, "anthropic", &scope_b, false).unwrap();
+        let other = encode_request(request, "anthropic", &scope_b, false, false).unwrap();
         assert_eq!(other["messages"].as_array().unwrap().len(), 1);
         assert!(!other.to_string().contains("secret"));
     }
@@ -3670,16 +3703,106 @@ mod tests {
                 })),
             }],
         };
-        let same = encode_request(make("claude"), "anthropic", "anthropic", false).unwrap();
+        let same = encode_request(make("claude"), "anthropic", "anthropic", false, false).unwrap();
         assert_eq!(
             same["messages"][0]["content"],
             json!([{"type":"thinking","thinking":"secret","signature":"signed"},{"type":"text","text":"answer"}])
         );
-        let other = encode_request(make("other"), "anthropic", "anthropic", false).unwrap();
+        let other = encode_request(make("other"), "anthropic", "anthropic", false, false).unwrap();
         assert_eq!(
             other["messages"][0]["content"],
             json!([{"type":"text","text":"answer"}])
         );
+    }
+
+    #[test]
+    fn system_updates_are_delayed_until_an_emitted_assistant_turn_or_the_end() {
+        let system = |content: &str| Message::System {
+            content: content.into(),
+        };
+        let user = |content: &str| Message::User {
+            content: content.into(),
+        };
+        let assistant = |content: &str, calls| Message::Assistant {
+            content: content.into(),
+            calls,
+            replay: None,
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            max_output_tokens: 128,
+            tools: vec![],
+            messages: vec![
+                system("base"),
+                user("question"),
+                assistant(
+                    "",
+                    vec![ToolCall {
+                        id: "call".into(),
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    }],
+                ),
+                system("while the tool runs"),
+                Message::Tool {
+                    call_id: "call".into(),
+                    content: "result".into(),
+                    is_error: false,
+                    is_structured: None,
+                },
+                assistant("", vec![]),
+                system(""),
+                user("follow-up"),
+                system("next instruction"),
+                assistant("answer", vec![]),
+                system("last instruction"),
+            ],
+        };
+        let mut native = encode_request(request.clone(), "", "", false, true).unwrap();
+        assert_eq!(native["system"], "base");
+        assert_eq!(
+            native["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "user",
+                "assistant",
+                "user",
+                "system",
+                "system",
+                "assistant",
+                "system"
+            ]
+        );
+        assert_eq!(native["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(native["messages"][2]["content"][1]["text"], "follow-up");
+        assert_eq!(
+            native["messages"][3]["content"][0]["text"],
+            "while the tool runs"
+        );
+        assert_eq!(
+            native["messages"][4]["content"][0]["text"],
+            "next instruction"
+        );
+        assert_eq!(
+            native["messages"][6]["content"][0]["text"],
+            "last instruction"
+        );
+        apply_cache_control(&mut native, CacheRetention::Short, true);
+        assert_eq!(
+            native["messages"][6]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+
+        let folded = encode_request(request, "", "", false, false).unwrap();
+        assert_eq!(
+            folded["system"],
+            "base\n\nwhile the tool runs\n\nnext instruction\n\nlast instruction"
+        );
+        assert_eq!(folded["messages"].as_array().unwrap().len(), 4);
     }
 
     #[test]
@@ -3709,6 +3832,7 @@ mod tests {
             },
             "fixture",
             "fixture",
+            false,
             false,
         )
         .unwrap();

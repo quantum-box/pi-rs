@@ -1151,6 +1151,14 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     ))
+                    .with_mid_conversation_system_models(
+                        args.model_profiles
+                            .anthropic_mid_conversation_system_models(
+                                &args.provider,
+                                &args.model,
+                                args.explicit_endpoint_for(&args.provider),
+                            ),
+                    )
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
                         args.settings.value().get("thinkingBudgets").cloned(),

@@ -5088,6 +5088,15 @@ with reasoning and image capabilities and token limits.
 The model picker and CLI can list them offline. Automatic environment keys
 are bound to the standard service endpoints, including the port and path.
 
+Anthropic Messages honors Pi's `supportsMidConvoSystemMessages` catalog metadata
+for direct Claude, GitHub Copilot, and OpenCode Zen. Model and provider profiles
+can override the capability. Native system updates are sent before the next
+emitted assistant turn or at the end of the transcript, preserving tool-call
+and tool-result adjacency. Other Messages models use one combined initial
+system prompt. Terminal and SDK tool declarations still represent the current
+tool set. Live requests using these models and authenticated gateways were
+unverified.
+
 ### Model-specific chat API checkpoint
 
 A native connection profile can declare the API per model. A model can
