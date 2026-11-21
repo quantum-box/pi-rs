@@ -1220,8 +1220,9 @@ refresh, and selection for provider-less legacy history remain host-owned.
 
 
 Native SDK hosts can construct OpenAI-compatible chat, OpenAI Responses,
-ChatGPT Responses, Anthropic Messages and Gemini clients from an explicitly supplied credential snapshot,
-provider identity and endpoint, then register them in a host-owned model catalog.
+ChatGPT Responses, Anthropic Messages, Gemini and Amazon Bedrock ConverseStream
+clients from an explicitly supplied credential snapshot, provider identity and
+endpoint, then register them in a host-owned model catalog.
 The factory does not perform implicit credential or model discovery, OAuth
 refresh, proxy discovery, model metadata probes, or network I/O at construction. Gemini
 uses a base URL and appends model-specific streaming paths. Hosts own endpoint
@@ -1229,6 +1230,15 @@ policy and existing clients outlive replacement of the credential snapshot.
 Unauthenticated chat clients require a separate explicit factory method. Typed
 clients let hosts supply provider/model configuration; the factory does not
 automatically infer that configuration.
+
+Bedrock sends an authorized API key or bearer token using the bearer auth
+scheme. The generic catalog constructor obtains the region from a regional
+AWS Runtime hostname. A host with a custom Runtime endpoint supplies the
+region through the typed `bedrock_client` factory. The explicit endpoint, region
+and credentials take no input from AWS environment variables or profiles. This
+path uses a direct transport without proxy discovery. The AWS SDK still supplies its standard transport metadata. Hosts that use a
+rotating credential provider can supply their own AWS SDK configuration through
+`Bedrock::from_sdk_config`.
 
 
 `/thinking`, Shift+Tab and `--thinking` select a reasoning effort. Selection is

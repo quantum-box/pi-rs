@@ -34,6 +34,7 @@ pub struct Bedrock {
     known_config: Option<std::sync::Arc<tokio::sync::OnceCell<aws_types::SdkConfig>>>,
     prepared_identity: Option<String>,
     environment_config: bool,
+    direct_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     credentials_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     reasoning: Option<ReasoningLevel>,
@@ -61,6 +62,7 @@ impl Bedrock {
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new())),
             prepared_identity: None,
             environment_config: true,
+            direct_http_client: None,
             http_client: None,
             credentials_http_client: None,
             reasoning: None,
@@ -77,6 +79,89 @@ impl Bedrock {
     }
     /// Use a caller-configured SDK client, including custom profile or endpoint settings.
     pub fn new(client: Client) -> Self {
+        Self::configured_client(
+            client,
+            None,
+            default_cache_retention(),
+            std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|value| value == "1"),
+        )
+    }
+
+    /// Construct from a shared SDK configuration whose route can be inspected.
+    pub fn from_sdk_config(config: aws_types::SdkConfig) -> Self {
+        Self::configured_client(
+            Client::new(&config),
+            Some(config),
+            default_cache_retention(),
+            std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|value| value == "1"),
+        )
+    }
+
+    /// Construct a Bedrock Runtime client from an explicit endpoint, region and
+    /// literal bearer token. Endpoint, region and authentication do not use
+    /// the AWS profile, default credential chain or environment. The SDK
+    /// still adds its standard transport metadata.
+    pub fn from_bearer_endpoint(endpoint: &str, region: &str, token: String) -> Result<Self> {
+        validate_bearer_token(&token)?;
+        let endpoint_uri = endpoint
+            .parse::<http::Uri>()
+            .map_err(|_| Error::Config("invalid Bedrock endpoint".into()))?;
+        let host = endpoint_uri.host().unwrap_or_default();
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if host.is_empty()
+            || endpoint_uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'))
+            || endpoint_uri.query().is_some()
+            || endpoint.contains('#')
+            || !(endpoint_uri.scheme_str() == Some("https")
+                || (endpoint_uri.scheme_str() == Some("http") && loopback))
+        {
+            return Err(Error::Config("invalid Bedrock endpoint".into()));
+        }
+        if region.is_empty()
+            || !region.split('-').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            })
+        {
+            return Err(Error::Config("invalid Bedrock region".into()));
+        }
+        let config = aws_types::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_types::region::Region::new(region.to_owned()))
+            .endpoint_url(endpoint)
+            .build();
+        // The generated client's default transport consults proxy environment
+        // variables. Build a direct transport and retain it during preparation.
+        use aws_smithy_http_client::{Builder, tls};
+        let transport = Builder::new()
+            .tls_provider(tls::Provider::Rustls(
+                tls::rustls_provider::CryptoMode::AwsLc,
+            ))
+            .build_https();
+        let client = bearer_client(
+            aws_sdk_bedrockruntime::config::Builder::from(&config).http_client(transport.clone()),
+            &token,
+        );
+        let mut model = Self::configured_client(client, Some(config), CacheRetention::Short, false);
+        model.direct_http_client = Some(transport);
+        model.bearer = Some(token);
+        Ok(model)
+    }
+
+    fn configured_client(
+        client: Client,
+        config: Option<aws_types::SdkConfig>,
+        cache_retention: CacheRetention,
+        force_cache: bool,
+    ) -> Self {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
             headers: BTreeMap::new(),
@@ -85,9 +170,11 @@ impl Bedrock {
             force_sigv4: false,
             profile: None,
             model_name: None,
-            known_config: None,
+            known_config: config
+                .map(|config| std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(config)))),
             prepared_identity: None,
             environment_config: false,
+            direct_http_client: None,
             http_client: None,
             credentials_http_client: None,
             reasoning: None,
@@ -96,43 +183,13 @@ impl Bedrock {
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
-            cache_retention: default_cache_retention(),
+            cache_retention,
             long_cache_support: None,
-            force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
+            force_cache,
             summary: false,
         }
     }
-    /// Construct from a shared SDK configuration whose route can be inspected.
-    pub fn from_sdk_config(config: aws_types::SdkConfig) -> Self {
-        Self {
-            client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(Client::new(
-                &config,
-            )))),
-            headers: BTreeMap::new(),
-            unsupported: None,
-            bearer: None,
-            force_sigv4: false,
-            profile: None,
-            model_name: None,
-            known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
-                config,
-            )))),
-            prepared_identity: None,
-            environment_config: false,
-            http_client: None,
-            credentials_http_client: None,
-            reasoning: None,
-            mapped_effort: None,
-            thinking_budgets: ThinkingBudgets::default(),
-            configured_thinking_budgets: None,
-            thinking_display: ThinkingDisplay::default(),
-            interleaved_thinking: true,
-            cache_retention: default_cache_retention(),
-            long_cache_support: None,
-            force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
-            summary: false,
-        }
-    }
+
     /// Replace custom request headers; authentication and SigV4 headers are ignored.
     pub fn with_headers(mut self, headers: http::HeaderMap) -> Result<Self> {
         self.headers = headers::filtered(headers)?;
@@ -149,9 +206,7 @@ impl Bedrock {
     }
     /// Prefer bearer authentication over the AWS credential chain.
     pub fn with_bearer_token(mut self, token: String) -> Result<Self> {
-        if token.is_empty() || !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-            return Err(Error::Config("invalid Bedrock bearer token".into()));
-        }
+        validate_bearer_token(&token)?;
         let client = self
             .client
             .get()
@@ -168,6 +223,7 @@ impl Bedrock {
         self.profile = Some(profile);
         self.bearer = None;
         self.force_sigv4 = true;
+        self.direct_http_client = None;
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
         self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
         self.prepared_identity = None;
@@ -180,6 +236,7 @@ impl Bedrock {
         self.profile = None;
         self.force_sigv4 = true;
         self.bearer = None;
+        self.direct_http_client = None;
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
         self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
         self.prepared_identity = None;
@@ -310,7 +367,11 @@ impl Bedrock {
             identity
         };
         let identity = pi_rs_core::protected_model_fingerprint(&(
-            "bedrock-converse-v1",
+            if self.direct_http_client.is_some() {
+                "bedrock-converse-direct-v1"
+            } else {
+                "bedrock-converse-v1"
+            },
             &region,
             &endpoint,
             config.use_fips(),
@@ -340,6 +401,9 @@ impl Bedrock {
         // Freeze the endpoint selected above instead of consulting service
         // environment settings again during dispatch.
         builder.set_endpoint_url(endpoint);
+        if let Some(client) = &self.direct_http_client {
+            builder.set_http_client(Some(client.clone()));
+        }
         let client = if let Some(token) = bearer.as_deref() {
             bearer_client(builder, token)
         } else {
@@ -452,6 +516,7 @@ impl Bedrock {
             })
         };
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(existing));
+        self.direct_http_client = None;
         self.http_client = Some(client);
         self.credentials_http_client = Some(credentials_client);
         self.prepared_identity = None;
@@ -591,6 +656,13 @@ fn diagnostic(
     }
     redact(&parts.join(": "))
 }
+fn validate_bearer_token(token: &str) -> Result<()> {
+    if token.is_empty() || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(Error::Config("invalid Bedrock bearer token".into()));
+    }
+    Ok(())
+}
+
 fn bearer_client(builder: aws_sdk_bedrockruntime::config::Builder, token: &str) -> Client {
     let config = builder
         .bearer_token(aws_sdk_bedrockruntime::config::Token::new(
@@ -1248,7 +1320,11 @@ impl Model for Bedrock {
                     } else {
                         aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
                     };
-                    let config = if let Some(http_client) = &self.http_client {
+                    let config = if let Some(http_client) = self
+                        .http_client
+                        .as_ref()
+                        .or(self.direct_http_client.as_ref())
+                    {
                         config.to_builder().http_client(http_client.clone()).build()
                     } else {
                         config

@@ -15,6 +15,7 @@ pub enum NativeModelApi {
     ChatGptResponses,
     AnthropicMessages,
     GoogleGemini,
+    BedrockConverse,
 }
 
 /// A catalog entry with an explicitly authorized provider protocol and route.
@@ -65,7 +66,8 @@ impl ModelClientFactory {
     /// returned client. Replacing a snapshot does not revoke existing clients.
     /// Chat, Responses and Messages endpoints are complete request URLs; Gemini uses
     /// an API base URL and appends its model-specific streaming path. Granting a
-    /// Gemini base authorizes those derived paths. Model discovery probes,
+    /// Gemini base authorizes those derived paths. Bedrock uses a regional
+    /// Runtime endpoint and appends the model's ConverseStream path. Model discovery probes,
     /// redirects, and implicit proxy discovery are disabled.
     pub fn client(
         &self,
@@ -85,6 +87,11 @@ impl ModelClientFactory {
                 Ok(Arc::new(self.anthropic_client(provider, endpoint)?))
             }
             NativeModelApi::GoogleGemini => Ok(Arc::new(self.gemini_client(provider, endpoint)?)),
+            NativeModelApi::BedrockConverse => Ok(Arc::new(self.bedrock_client(
+                provider,
+                endpoint,
+                &bedrock_endpoint_region(endpoint)?,
+            )?)),
         }
     }
 
@@ -163,6 +170,28 @@ impl ModelClientFactory {
             .with_context_probe(false))
     }
 
+    /// Construct an explicitly routed Bedrock ConverseStream client. The
+    /// caller supplies the region for custom Runtime endpoints. Bedrock API
+    /// keys and literal bearer credentials both use the bearer scheme.
+    pub fn bedrock_client(
+        &self,
+        provider: &str,
+        endpoint: &str,
+        region: &str,
+    ) -> Result<pi_rs::bedrock::Bedrock> {
+        if provider != "amazon-bedrock" {
+            return Err(Error::Config(
+                "the Bedrock model API requires the amazon-bedrock provider".into(),
+            ));
+        }
+        let credential = self.credential(provider, endpoint)?;
+        pi_rs::bedrock::Bedrock::from_bearer_endpoint(
+            endpoint,
+            region,
+            credential.secret().to_owned(),
+        )
+    }
+
     /// Construct a typed chat client so the host can explicitly configure
     /// provider/model compatibility before adding it to a catalog. Defaults do
     /// not infer Pi provider profiles or enable native endpoint probes.
@@ -200,4 +229,30 @@ impl ModelClientFactory {
         catalog.register(provider, model, client)?;
         Ok(())
     }
+}
+
+/// The generic catalog route has no separate region field. Read the region
+/// only from a standard regional Runtime hostname; custom routes use the
+/// typed factory and supply the region explicitly.
+fn bedrock_endpoint_region(endpoint: &str) -> Result<String> {
+    const MESSAGE: &str = "custom Bedrock endpoints require an explicit region";
+    let uri: http::Uri = endpoint
+        .parse()
+        .map_err(|_| Error::Config(MESSAGE.into()))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| Error::Config(MESSAGE.into()))?
+        .to_ascii_lowercase();
+    let regional_host = host
+        .strip_prefix("bedrock-runtime.")
+        .or_else(|| host.strip_prefix("bedrock-runtime-fips."))
+        .ok_or_else(|| Error::Config(MESSAGE.into()))?;
+    let (region, suffix) = regional_host
+        .split_once('.')
+        .ok_or_else(|| Error::Config(MESSAGE.into()))?;
+    if uri.scheme_str() != Some("https") || !matches!(suffix, "amazonaws.com" | "amazonaws.com.cn")
+    {
+        return Err(Error::Config(MESSAGE.into()));
+    }
+    Ok(region.to_owned())
 }
