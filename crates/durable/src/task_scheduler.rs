@@ -2882,6 +2882,18 @@ pub(crate) fn on_pending_graph_scope_retry(id: Uuid, hook: impl FnOnce() + Send 
         .insert(id, Box::new(hook));
 }
 #[cfg(test)]
+fn known_woken_busy_retry_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_known_woken_busy_retry(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    known_woken_busy_retry_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 fn invoke_boundary(hooks: &BoundaryHooks, id: Uuid) {
     let hook = hooks.lock().unwrap().remove(&id);
     if let Some(hook) = hook {
@@ -11601,6 +11613,8 @@ impl Scheduler {
             {
                 return;
             }
+            #[cfg(test)]
+            invoke_boundary(known_woken_busy_retry_hooks(), completed.task_id());
             let Some(attachment) = &known.attachment else {
                 return;
             };

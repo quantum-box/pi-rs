@@ -8374,10 +8374,38 @@ async fn woken_owned_callback_fixture() {
             .unwrap();
         let has_receipt = std::env::var("PI_TEST_WOKEN_OWNED_CUT").unwrap() == "receipt";
         assert_eq!(receipt.is_some(), has_receipt);
+        let graph_entry = store
+            .get(&crate::runtime::woken_owned_graph_key(root))
+            .unwrap()
+            .unwrap();
+        let graph: crate::runtime::WokenOwnedGraphEvidence =
+            serde_json::from_slice(&graph_entry.value).unwrap();
+        for edge in graph.edges {
+            assert!(
+                crate::conversation_signal::clear_callback_start_check(&store, edge.edge.child)
+                    .is_ok()
+            );
+        }
+        assert!(
+            store
+                .get(format!("durable/task-callback-start/{root}").as_bytes())
+                .unwrap()
+                .is_none()
+        );
         let task = driver.get(root).unwrap().unwrap();
+        let crate::task::TaskOwner::Conversation(owner) = task.owner() else {
+            panic!("missing root owner")
+        };
+        assert!(crate::conversation_signal::clear_callback_start_check(&store, *owner).is_ok());
         assert!(
             matches!(task.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
         );
+        if !has_receipt {
+            let crate::task::TaskOwner::Conversation(owner) = task.owner() else {
+                panic!("missing owner")
+            };
+            assert!(!scheduler.conversation(*owner).unwrap().messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content.contains("after cancel"))));
+        }
         if has_receipt {
             let crate::task::TaskOwner::Conversation(owner) = task.owner() else {
                 panic!("missing owner")
@@ -8454,7 +8482,11 @@ async fn woken_owned_busy_receipt_retries_without_callback_replay() {
 #[tokio::test]
 async fn woken_owned_callback_kill_and_reopen() {
     use std::process::{Command, Stdio};
-    for cut in ["callback", "receipt"] {
+    let mut cuts = vec!["callback", "receipt"];
+    if cfg!(feature = "experimental-graph-scope") {
+        cuts.push("busy");
+    }
+    for cut in cuts {
         let control = tempfile::tempdir().unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -8463,7 +8495,10 @@ async fn woken_owned_callback_kill_and_reopen() {
                 "conversation_claim_boundary_tests::woken_owned_callback_fixture",
                 "--nocapture",
             ])
-            .env("PI_TEST_WOKEN_OWNED_CASE", "18")
+            .env(
+                "PI_TEST_WOKEN_OWNED_CASE",
+                if cut == "busy" { "27" } else { "18" },
+            )
             .env("PI_TEST_WOKEN_OWNED_CONTROL", control.path())
             .env("PI_TEST_WOKEN_OWNED_CUT", cut)
             .stdout(Stdio::inherit())
@@ -8472,10 +8507,10 @@ async fn woken_owned_callback_kill_and_reopen() {
             command.env("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT", control.path());
         }
         let mut worker = command.spawn().unwrap();
-        let ready = control.path().join(if cut == "callback" {
-            "cut-ready"
-        } else {
+        let ready = control.path().join(if cut == "receipt" {
             "woken-receipt"
+        } else {
+            "cut-ready"
         });
         let reached = tokio::time::timeout(Duration::from_secs(35), async {
             while !ready.exists() {
@@ -8492,9 +8527,48 @@ async fn woken_owned_callback_kill_and_reopen() {
             let _ = worker.wait();
         }
         reached.unwrap();
+        let dir = std::fs::read_to_string(control.path().join("fixture-path")).unwrap();
+        if cut == "busy" {
+            let store = durable_store::Store::open(std::path::Path::new(&dir).join("db")).unwrap();
+            let root = crate::task_store::TaskStore::new(&store)
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|record| {
+                    matches!(record.task.owner(), crate::task::TaskOwner::Conversation(_))
+                        && record.task.woken_interrupted_attempt().is_some()
+                })
+                .unwrap();
+            assert_eq!(root.task.state(), &TaskState::Running);
+            assert!(
+                store
+                    .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                        root.task.id()
+                    ))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get(format!("durable/task-callback-start/{}", root.task.id()).as_bytes())
+                    .unwrap()
+                    .is_some()
+            );
+            let graph = store
+                .get(&crate::runtime::woken_owned_graph_key(root.task.id()))
+                .unwrap()
+                .unwrap();
+            let graph: crate::runtime::WokenOwnedGraphEvidence =
+                serde_json::from_slice(&graph.value).unwrap();
+            for edge in graph.edges {
+                assert!(matches!(
+                    crate::conversation_signal::clear_callback_start_check(&store, edge.edge.child),
+                    Err(crate::conversation_signal::Error::CallbackStartBusy)
+                ));
+            }
+        }
         worker.kill().unwrap();
         worker.wait().unwrap();
-        let dir = std::fs::read_to_string(control.path().join("fixture-path")).unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -9412,6 +9486,17 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 });
             }
             if graph_aba == 27 {
+                if std::env::var("PI_TEST_WOKEN_OWNED_CUT").ok().as_deref() == Some("busy") {
+                    let control = std::path::PathBuf::from(
+                        std::env::var_os("PI_TEST_WOKEN_OWNED_CONTROL").unwrap(),
+                    );
+                    crate::task_scheduler::on_known_woken_busy_retry(root_id, move || {
+                        std::fs::write(control.join("cut-ready"), b"known busy").unwrap();
+                        loop {
+                            std::thread::park();
+                        }
+                    });
+                }
                 let writer_path = path.clone();
                 crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
