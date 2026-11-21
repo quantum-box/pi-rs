@@ -60,6 +60,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: standard,
     },
     Builtin {
+        id: "github-copilot",
+        endpoint: "https://api.individual.githubcopilot.com/chat/completions",
+        env: "COPILOT_GITHUB_TOKEN",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "groq",
         endpoint: "https://api.groq.com/openai/v1/chat/completions",
         env: "GROQ_API_KEY",
@@ -276,6 +282,12 @@ impl Builtin {
             }
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
+            }
+            (Adapter::Anthropic, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/v1/messages")
+            }
+            (Adapter::OpenAiResponses, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/responses")
             }
             (Adapter::OpenAiResponses, "opencode") => {
                 Some("https://opencode.ai/inference/openai/v1/responses")
