@@ -731,3 +731,88 @@ async fn tool_choice_matches_pi_converse_stream_payload() {
     .await;
     assert!(body.get("toolConfig").is_none());
 }
+
+#[tokio::test]
+async fn disabled_tool_choice_keeps_tool_history_as_text() {
+    let mut request = request("anthropic.claude-sonnet-5-5", 4096);
+    request.messages.extend([
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "call".into(),
+            content: "found".into(),
+            is_error: false,
+            is_structured: Some(false),
+        },
+    ]);
+    let (body, _) = capture(
+        "us-east-1",
+        |client| {
+            client
+                .with_tool_choice(ToolChoice::None)
+                .with_reasoning(Some("off"), None)
+                .unwrap()
+        },
+        request.clone(),
+        false,
+    )
+    .await;
+    assert!(body.get("toolConfig").is_none());
+    assert_eq!(
+        body["additionalModelRequestFields"]["thinking"]["type"],
+        "between_tools"
+    );
+    assert!(
+        body["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Historical tool call")
+    );
+    assert!(
+        body["messages"][2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Historical tool result")
+    );
+
+    let client = Bedrock::from_env();
+    let estimate = client
+        .clone()
+        .with_tool_choice(ToolChoice::None)
+        .estimate_request_tokens(&request);
+    request.tools.clear();
+    assert_eq!(estimate, client.estimate_request_tokens(&request));
+}
+
+#[tokio::test]
+async fn bedrock_rejects_forced_tool_choice_with_budgeted_claude_thinking() {
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_types::region::Region::new("us-east-1"))
+        .build();
+    let client = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config))
+        .with_reasoning(Some("low"), None)
+        .unwrap();
+    for choice in [
+        ToolChoice::Any,
+        ToolChoice::Tool {
+            name: "lookup".into(),
+        },
+    ] {
+        let result = client
+            .clone()
+            .with_tool_choice(choice)
+            .stream(request("anthropic.claude-sonnet-4-5", 4096))
+            .await;
+        assert!(
+            matches!(result, Err(pi_rs_core::Error::Config(message)) if message.contains("extended thinking"))
+        );
+    }
+}

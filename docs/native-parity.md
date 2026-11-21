@@ -5755,10 +5755,12 @@ headers or echoed response frames; application tracing remains enabled.
 
 The Rust adapter exposes Pi's optional ConverseStream tool choice through
 `Bedrock::with_tool_choice`. It supports automatic, required and named tool
-selection, and can omit tool configuration entirely. A request without tools
-also omits tool configuration. The option is covered by signed loopback
-requests and a comparison with published Pi payloads. Live Bedrock tool
-selection with account credentials was unverified.
+selection on compatible models. Disabling tools omits tool configuration and
+keeps historical calls and results as text, using the existing tool-free
+request behavior. Budget-based Claude extended thinking rejects required and
+named tool choices locally. The option is covered by signed loopback requests
+and a comparison with published Pi payloads. Live Bedrock tool selection with
+account credentials was unverified.
 
 Not yet supported: non-image multimodal inputs, workbench-specific thinking
 display controls, strict tool sampling, guardrails, prompt management ARNs, live account-specific

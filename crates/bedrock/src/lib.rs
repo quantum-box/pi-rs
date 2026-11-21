@@ -422,6 +422,10 @@ impl Bedrock {
         self.prepared_identity = None;
         self
     }
+    fn has_tools(&self, request: &ModelRequest) -> bool {
+        !request.tools.is_empty() && self.tool_choice != Some(ToolChoice::None)
+    }
+
     /// Set Pi's tool-choice behavior for ConverseStream requests.
     pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
         self.tool_choice = Some(choice);
@@ -959,6 +963,18 @@ impl Model for Bedrock {
         self.prepared_identity.clone()
     }
 
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let mut base = request.clone();
+        base.messages.clear();
+        if self.tool_choice == Some(ToolChoice::None) {
+            base.tools.clear();
+        }
+        request.messages.iter().fold(
+            pi_rs_core::estimate_request_tokens(&base),
+            |total, message| total.saturating_add(self.estimate_message_tokens(request, message)),
+        )
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         fn text_tokens(text: &str) -> u64 {
             (text.encode_utf16().count() as u64).div_ceil(4)
@@ -983,7 +999,7 @@ impl Model for Bedrock {
                     } else {
                         (content.clone(), Vec::new())
                     };
-                let text = if request.tools.is_empty() {
+                let text = if !self.has_tools(request) {
                     format!(
                         "Historical tool result ({}; {}):\n{}",
                         call_id,
@@ -1007,7 +1023,7 @@ impl Model for Bedrock {
                 calls,
                 replay,
             } => {
-                let tool_free = request.tools.is_empty();
+                let tool_free = !self.has_tools(request);
                 let mut visible = if content.trim().is_empty() {
                     String::new()
                 } else {
@@ -1072,7 +1088,7 @@ impl Model for Bedrock {
         if request.max_output_tokens == 0 || request.model.contains(":prompt/") {
             return Err(Error::Config("Bedrock requires a positive max output token limit and does not support managed prompt ARNs".into()));
         }
-        let tool_free = request.tools.is_empty();
+        let tool_free = !self.has_tools(&request);
         let is_claude = self.is_claude(&request.model);
         let model_name = self
             .model_name
@@ -1256,7 +1272,7 @@ impl Model for Bedrock {
                 last.content.push(ContentBlock::CachePoint(point.clone()));
             }
         }
-        let tool_config = if tool_free || self.tool_choice == Some(ToolChoice::None) {
+        let tool_config = if tool_free {
             None
         } else {
             let tools = request
@@ -1357,6 +1373,20 @@ impl Model for Bedrock {
                 interleaved: self.interleaved_thinking,
             },
         )?;
+        if !tool_free
+            && matches!(
+                self.tool_choice,
+                Some(ToolChoice::Any | ToolChoice::Tool { .. })
+            )
+            && fields
+                .as_ref()
+                .is_some_and(|fields| fields["thinking"]["type"] == "enabled")
+        {
+            return Err(Error::Config(
+                "Bedrock Claude extended thinking requires automatic tool selection or no tools"
+                    .into(),
+            ));
+        }
         let requested_model = request.model.clone();
         let mut command = client
             .converse_stream()
