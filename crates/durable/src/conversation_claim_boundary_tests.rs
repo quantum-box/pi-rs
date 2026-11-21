@@ -7933,6 +7933,12 @@ async fn owned_graph_terminal_accepts_only_bound_woken_receipt() {
 
 #[cfg(feature = "experimental-graph-revision")]
 #[tokio::test]
+async fn owned_graph_publication_rejects_replaced_edge() {
+    exercise_woken_owned_graph_receipt(false, 16).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
 async fn owned_graph_terminal_rejects_late_tool_receipt() {
     exercise_woken_owned_graph_receipt(false, 13).await;
 }
@@ -8797,6 +8803,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             || graph_aba == 11
             || graph_aba == 12
             || graph_aba == 13
+            || graph_aba == 16
         {
             let mut running = recovered.clone();
             running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
@@ -8844,7 +8851,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 );
                 return;
             }
-            if graph_aba == 12 || graph_aba == 13 {
+            if graph_aba == 12 || graph_aba == 13 || graph_aba == 16 {
                 let boundary = store.put_version().unwrap();
                 let (claim, claim_checks) =
                     crate::task_scheduler::prepare_woken_conversation_cancel_claim(
@@ -8927,6 +8934,50 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                     .replay_safe_woken_owned_cleanup_checks(&failed, store.put_version().unwrap())
                     .unwrap();
                 store.commit(&checks, &[]).unwrap();
+                let (uncertain, publication_checks, _leases) =
+                    crate::task_scheduler::authenticated_woken_terminal_descendants(
+                        &store,
+                        &failed,
+                        &tasks.list().unwrap(),
+                        store.put_version().unwrap(),
+                        &registry,
+                        &harness,
+                    )
+                    .unwrap();
+                assert!(uncertain.is_none());
+                store.commit(&publication_checks, &[]).unwrap();
+                if graph_aba == 16 {
+                    let key = crate::ownership_edge::edge_key(conversation);
+                    let edge = store.get(&key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(edge.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: edge.value,
+                            }],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        store.commit(&publication_checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    assert!(
+                        crate::task_scheduler::authenticated_woken_terminal_descendants(
+                            &store,
+                            &failed,
+                            &tasks.list().unwrap(),
+                            store.put_version().unwrap(),
+                            &registry,
+                            &harness,
+                        )
+                        .is_err()
+                    );
+                    return;
+                }
                 if graph_aba == 13 {
                     let late = format!(
                         "durable/unsafe-park-async/{}/{}/intent/receipt",
@@ -8948,6 +8999,10 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                         .unwrap();
                     assert!(matches!(
                         store.commit(&checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    assert!(matches!(
+                        store.commit(&publication_checks, &[]),
                         Err(durable_store::Error::Conflict { .. })
                     ));
                     assert!(

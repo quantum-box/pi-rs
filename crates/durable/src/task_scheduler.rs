@@ -4284,6 +4284,16 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        #[cfg(feature = "experimental-graph-revision")]
+        checks.extend(
+            provisional_woken_owned_checks(
+                self.validator.ok_or("missing harness")?,
+                owner.store(),
+                &current,
+                boundary,
+            )
+            .map_err(|e| e.to_string())?,
+        );
         // Until evidence traversal covers conversation ownership edges, refuse
         // to authorize cleanup through one, including after a live graph abort.
         let records = tasks.list().map_err(|e| e.to_string())?;
@@ -4760,6 +4770,16 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        #[cfg(feature = "experimental-graph-revision")]
+        checks.extend(
+            provisional_woken_owned_checks(
+                self.validator.ok_or("missing harness")?,
+                owner.store(),
+                &current,
+                boundary,
+            )
+            .map_err(|e| e.to_string())?,
+        );
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
                 owner.store(),
@@ -5534,6 +5554,16 @@ impl AdmissionHandle<'_> {
             .ok_or("missing harness")?
             .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
             .map_err(|e| e.to_string())?;
+        #[cfg(feature = "experimental-graph-revision")]
+        checks.extend(
+            provisional_woken_owned_checks(
+                self.validator.ok_or("missing harness")?,
+                owner.store(),
+                &current,
+                boundary,
+            )
+            .map_err(|e| e.to_string())?,
+        );
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
                 owner.store(),
@@ -10271,13 +10301,22 @@ impl Scheduler {
                                                     harness,
                                                     None,
                                                 )?;
+                                            #[cfg(feature = "experimental-graph-revision")]
+                                            let owned_checks = provisional_woken_owned_checks(
+                                                harness, store, &running, boundary,
+                                            )
+                                            .ok();
+                                            #[cfg(not(feature = "experimental-graph-revision"))]
+                                            let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
                                             if uncertain.is_none()
+                                                && owned_checks.is_some()
                                                 && !has_live_owned(
                                                     store,
                                                     running.task.id(),
                                                     &records,
                                                 )?
                                             {
+                                                checks.extend(owned_checks.unwrap());
                                                 checks.extend(binding);
                                                 checks.extend(descendants);
                                                 _nested_identity_leases = leases;
@@ -13275,9 +13314,21 @@ impl Scheduler {
                                                 harness,
                                                 None,
                                             )?;
+                                        #[cfg(feature = "experimental-graph-revision")]
+                                        let owned_checks = provisional_woken_owned_checks(
+                                            harness,
+                                            store,
+                                            &item,
+                                            recovery_graph_version,
+                                        )
+                                        .ok();
+                                        #[cfg(not(feature = "experimental-graph-revision"))]
+                                        let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
                                         if uncertain.is_none()
+                                            && owned_checks.is_some()
                                             && !has_live_owned(store, item.task.id(), &records)?
                                         {
+                                            checks.extend(owned_checks.unwrap());
                                             checks.extend(binding);
                                             checks.extend(descendants);
                                             _nested_identity_leases = leases;
@@ -18294,6 +18345,31 @@ pub(crate) fn unsafe_descendant_reconciliation(
     Ok((unresolved, checks))
 }
 
+/// Carry authenticated owned-graph evidence into a dependent woken cleanup
+/// transaction. This is an additional fence only: it never enables dispatch.
+#[cfg(feature = "experimental-graph-revision")]
+fn provisional_woken_owned_checks(
+    harness: &crate::runtime::Harness,
+    store: &durable_store::Store,
+    root: &task_store::StoredTask,
+    boundary: u64,
+) -> Result<Vec<durable_store::Check>, Error> {
+    let key = crate::runtime::woken_owned_graph_key(root.task.id());
+    if store
+        .first_commit_for_key(&key)
+        .map_err(task_store::Error::from)?
+        .is_none()
+    {
+        return Ok(vec![durable_store::Check {
+            key,
+            expected: durable_store::Expected::MissingUnchangedSince(boundary),
+        }]);
+    }
+    harness
+        .woken_owned_graph_checks_if_required(root, boundary)
+        .map_err(|e| Error::Handler(e.to_string()))
+}
+
 /// Verify nested cancelled children while the caller holds the Harness
 /// selection gate. The returned identity leases must remain held through the
 /// same commit as every returned store check. Unverifiable evidence remains an
@@ -18344,6 +18420,8 @@ pub(crate) fn authenticated_woken_terminal_descendants(
 > {
     let (_, root_checks) =
         woken_terminal_after_checks(store, parent, boundary).map_err(Error::Handler)?;
+    #[cfg(feature = "experimental-graph-revision")]
+    let owned_checks = provisional_woken_owned_checks(harness, store, parent, boundary)?;
     let (uncertain, mut checks, leases) = authenticated_unsafe_descendant_reconciliation_inner(
         store,
         parent.task.id(),
@@ -18355,6 +18433,8 @@ pub(crate) fn authenticated_woken_terminal_descendants(
         true,
     )?;
     checks.extend(root_checks);
+    #[cfg(feature = "experimental-graph-revision")]
+    checks.extend(owned_checks);
     Ok((uncertain, checks, leases))
 }
 
