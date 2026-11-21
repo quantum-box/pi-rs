@@ -287,10 +287,13 @@ fn compatible_continuation(
         return true;
     };
     let name = incoming.name.as_deref().unwrap_or_default();
-    let has_arguments = incoming
-        .arguments
-        .as_ref()
-        .is_some_and(|value| !value.as_str().is_some_and(str::is_empty));
+    let has_arguments = incoming.arguments.as_ref().is_some_and(|value| {
+        !value.as_str().is_some_and(|fragment| {
+            fragment
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        })
+    });
     let has_open_arguments = active.arguments.trim().is_empty()
         || serde_json::from_str::<Value>(&active.arguments).is_err_and(|error| error.is_eof());
     if name.is_empty() || repeats_declared_name(declared, &active.name, name) {
@@ -567,6 +570,14 @@ mod tests {
         );
         assert!(
             stream_call_index(None, Some(&first_arguments), 0, true, &complete, &declared).is_err()
+        );
+        let whitespace = super::super::WireFunction {
+            name: None,
+            arguments: Some(json!(" \n")),
+        };
+        assert_eq!(
+            stream_call_index(None, Some(&whitespace), 0, true, &complete, &declared).unwrap(),
+            0,
         );
         assert_eq!(
             stream_call_index(Some("late"), Some(&named_id), 0, true, &complete, &declared)
