@@ -4011,9 +4011,9 @@ Embedders can opt out of interleaving or request omitted thinking text while
 retaining its replay signature. Loopback requests verified the header and
 payload. Live authenticated interleaved thinking was unverified.
 
-Anthropic Messages uses per-reply effort for the five Anthropic and four
-OpenRouter models marked `supportsMidConvoEffort` in Pi v1.5.0. The top-level
-effort stays low while system messages set the historical and active reply
+Anthropic Messages uses per-reply effort for Anthropic and OpenRouter catalog
+models marked `supportsMidConvoEffort`. The top-level effort stays low while
+system messages set the historical and active reply
 levels. Adaptive thinking drops signed blocks whose cached prefix no longer
 matches. Explicit off omits effort messages and block binding on models that
 can disable thinking. For models with an explicit null off mapping, an unset
@@ -4887,7 +4887,7 @@ field is covered by loopback tests; no live compatible server was used.
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
-The bundled chat catalog includes 506 chat-completions entries for Cerebras,
+The bundled chat catalog includes 534 chat-completions entries for Cerebras,
 DeepSeek, Fireworks, Groq, Hugging Face, Moonshot AI and Moonshot AI CN,
 OpenRouter, Together, Z.AI, and Z.AI Coding CN. It preserves their context,
 output, image and thinking capabilities from the pinned Pi AI release.
@@ -5113,8 +5113,11 @@ endpoint-bound keys and headers, and route-bound signed Messages replay.
 
 ### Fireworks and OpenRouter Messages catalogs checkpoint
 
-The offline catalog includes 19 Fireworks and 19 OpenRouter models using
-Messages alongside the existing Chat Completions models. The official
+The offline catalog includes 19 Fireworks and 20 OpenRouter models using
+Messages. The OpenRouter catalog follows Pi AI v1.6.0 and includes 397 Chat
+Completions entries. Those requests default to the system instruction role,
+and profiles can override the role or disable session affinity. Fable 5.2
+uses the Messages route with per-reply effort. The official
 Messages routes use bearer authentication. Environment credentials and
 imported provider-wide keys or OpenRouter OAuth work on the official routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
