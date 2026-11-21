@@ -943,7 +943,7 @@ impl Client {
         }
     }
 
-    pub async fn models(&self) -> Result<Vec<String>> {
+    pub async fn models(&self, azure_version: &str) -> Result<Vec<String>> {
         match self {
             Self::Ollama(client) => client.models().await,
             Self::Anthropic(client) => Ok(client
@@ -959,9 +959,9 @@ impl Client {
                 .map(|model| model.id)
                 .collect()),
             Self::PiMessages(client) => client.models().await,
-            Self::OpenAi(client) => client.models().await,
+            Self::OpenAi(client) => client.models_with_azure_version(Some(azure_version)).await,
             Self::Bedrock(_) => Ok(Vec::new()),
-            Self::Deferred(client) => Box::pin(client.resolve().await?.models()).await,
+            Self::Deferred(client) => Box::pin(client.resolve().await?.models(azure_version)).await,
         }
     }
 
@@ -4022,16 +4022,73 @@ mod estimation_tests {
     }
 
     #[tokio::test]
+    async fn azure_relay_model_discovery_uses_its_prefix_and_api_key() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        let mut data = json!({"providers":{"azure-relay":{
+            "api":"azure-openai-responses",
+            "baseUrl":format!("http://{}/tenant/openai/v1", listener.local_addr().unwrap()),
+            "apiKey":"fixture"
+        }}});
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse_with_azure_env(&mut data, |name| {
+                (name == "AZURE_OPENAI_API_VERSION").then(|| "preview".into())
+            })
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                line,
+                "GET /tenant/openai/v1/models?api-version=preview HTTP/1.1\r\n"
+            );
+            let mut saw_key = false;
+            loop {
+                line.clear();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                let line = line.to_ascii_lowercase();
+                if line == "\r\n" {
+                    break;
+                }
+                saw_key |= line.trim() == "api-key: fixture";
+                assert!(!line.starts_with("authorization:"));
+            }
+            assert!(saw_key);
+            let body = r#"{"data":[{"id":"relay-model"}]}"#;
+            socket.get_mut().write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let provider = args.model_profiles.provider("azure-relay").unwrap();
+        let catalog = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::model_selection::catalog(&args, provider, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(catalog.models, ["relay-model"]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn azure_uses_distinct_wire_auth_and_deployment_names() {
         use clap::Parser;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
-        for (provider, model, responses) in [
-            ("azure", "o4-mini", true),
-            ("azure", "gpt-6-luna", true),
-            ("azure", "deepseek-v4-pro", false),
-            ("azure-relay", "o4-mini", true),
+        for (provider, model, responses, thinking) in [
+            ("azure", "o4-mini", true, "off"),
+            ("azure", "o4-mini", true, "high"),
+            ("azure", "gpt-6-luna", true, "off"),
+            ("azure", "deepseek-v4-pro", false, "off"),
+            ("azure-relay", "o4-mini", true, "off"),
         ] {
             let mut args = super::super::Cli::parse_from(["pi"]);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4059,7 +4116,13 @@ mod estimation_tests {
             let selected = args.model_profiles.provider(provider).unwrap();
             args.activate_provider(selected, Some(model)).unwrap();
             args.model = model.into();
-            args.thinking = Some("off".into());
+            if provider == "azure" && model == "o4-mini" {
+                assert_eq!(
+                    super::super::thinking::available(&mut args),
+                    ["off", "low", "medium", "high"]
+                );
+            }
+            args.thinking = Some(thinking.into());
             let endpoint = args.model_endpoint_for(&args.provider, Some(model));
             assert!(
                 args.model_profiles
@@ -4131,7 +4194,9 @@ mod estimation_tests {
                 );
                 assert!(!headers.contains("authorization:"), "{headers}");
                 assert_eq!(body["max_output_tokens"], 16);
-                if model == "gpt-6-luna" {
+                if thinking == "high" {
+                    assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+                } else if model == "gpt-6-luna" {
                     assert_eq!(body["reasoning"], json!({"effort":"none"}));
                 } else {
                     assert!(body.get("reasoning").is_none());

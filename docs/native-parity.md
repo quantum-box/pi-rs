@@ -353,7 +353,9 @@ or a saved key. An explicit `models.json` provider base URL takes precedence
 over the environment. `AZURE_OPENAI_API_VERSION` configures the Responses
 query parameter, and `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` replaces the wire
 model name while preserving the catalog ID. Responses uses an `api-key`
-header and Chat Completions uses a bearer token. With thinking off and no
+header and Chat Completions uses a bearer token. Model discovery on named
+Responses relays uses the same API key, version and URL prefix. The bundled
+o-series entries support low, medium and high effort. With thinking off and no
 explicit model mapping, the original GPT-5 reasoning models and o-series
 leave effort unset so Azure can apply its default. This differs from Pi's
 `none` fallback and follows [Azure's model support documentation](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning).

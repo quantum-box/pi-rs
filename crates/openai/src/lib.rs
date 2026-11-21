@@ -511,15 +511,51 @@ impl OpenAiResponses {
         }
     }
 
+    fn authenticate(
+        &self,
+        request: reqwest::RequestBuilder,
+        azure_version: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder> {
+        let mut headers = self.headers.clone();
+        if let Some(version) = azure_version {
+            if !headers.contains_key("api-key") {
+                let mut key = reqwest::header::HeaderValue::from_str(&self.token)
+                    .map_err(|_| Error::Config("invalid Azure OpenAI API key".into()))?;
+                key.set_sensitive(true);
+                headers.insert("api-key", key);
+            }
+            Ok(request.headers(headers).query(&[("api-version", version)]))
+        } else {
+            Ok(request.headers(headers).bearer_auth(&self.token))
+        }
+    }
+
     /// Return the signed-in account's displayable models in server order.
     pub async fn models(&self) -> Result<Vec<String>> {
+        self.models_with_azure_version(None).await
+    }
+
+    /// List models using the configured Azure API version when applicable.
+    pub async fn models_with_azure_version(
+        &self,
+        azure_version: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut endpoint = self.endpoint.clone();
-        endpoint.set_path("/v1/models");
+        let version = self
+            .azure_api_version
+            .as_deref()
+            .map(|version| azure_version.unwrap_or(version));
+        if version.is_some() {
+            let path = endpoint.path().trim_end_matches('/');
+            let base = path
+                .strip_suffix("/responses")
+                .ok_or_else(|| Error::Config("Azure discovery requires a /responses URL".into()))?;
+            endpoint.set_path(&format!("{base}/models"));
+        } else {
+            endpoint.set_path("/v1/models");
+        }
         let mut response = self
-            .client
-            .get(endpoint)
-            .headers(self.headers.clone())
-            .bearer_auth(&self.token)
+            .authenticate(self.client.get(endpoint), version)?
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI model listing failed".into()))?;
@@ -1173,21 +1209,10 @@ impl OpenAiResponses {
                 value.to_str().ok().map(|value| (name.as_str(), value))
             }),
         );
-        let request = self.client.post(self.endpoint.clone());
-        let request = if let Some(version) = &self.azure_api_version {
-            let mut headers = self.headers.clone();
-            if !headers.contains_key("api-key") {
-                let mut key = reqwest::header::HeaderValue::from_str(&self.token)
-                    .map_err(|_| Error::Config("invalid Azure OpenAI API key".into()))?;
-                key.set_sensitive(true);
-                headers.insert("api-key", key);
-            }
-            request.headers(headers).query(&[("api-version", version)])
-        } else {
-            request
-                .headers(self.headers.clone())
-                .bearer_auth(&self.token)
-        };
+        let request = self.authenticate(
+            self.client.post(self.endpoint.clone()),
+            self.azure_api_version.as_deref(),
+        )?;
         let mut response = request
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body)

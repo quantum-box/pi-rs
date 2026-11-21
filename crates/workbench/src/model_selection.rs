@@ -92,7 +92,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
     let mut complete = false;
     if (probe && !bundled) || provider == Provider::Radius {
-        match client.models().await {
+        match client.models(args.model_profiles.azure_api_version()).await {
             Ok(discovered) => {
                 complete = true;
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
