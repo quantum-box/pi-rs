@@ -261,7 +261,7 @@ pub(super) async fn login(
     let path = auth_path();
     let previous = {
         let guard = super::auth_lock::acquire_async(&path).await?;
-        let value = super::config::read_object_unlocked(&path)?
+        let value = super::config::read_auth_object_locked(&guard)?
             .get("xai")
             .cloned();
         guard.check()?;
@@ -316,7 +316,7 @@ async fn access_at(
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let stored = super::config::read_object_unlocked(&path)?;
+    let stored = super::config::read_auth_object_locked(&guard)?;
     let value = parse_credential(&stored)?.ok_or_else(|| error("credentials not configured"))?;
     let previous = stored["xai"].clone();
     guard.check()?;
