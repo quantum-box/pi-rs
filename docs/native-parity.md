@@ -145,6 +145,13 @@ with an optional thinking suffix applied to the selected models.
 Package list emits native JSON events for every configured entry in user then
 trusted-project order, including duplicates, with `scope` and `filtered` fields.
 Transient `-e` sources are excluded, as in Pi's configured-package list.
+A failed remote package install during startup or reload emits a diagnostic
+and allows the session to continue, including for transient `-e` sources.
+A failed transient refresh reuses its cached package when available.
+Explicit install and update commands propagate the failure. Standalone Radius
+share preparation requires a complete runtime, and uncached local `-e`
+sources still require successful native validation.
+
 
 Local package `file://` sources ignore URL query and fragment components and
 reject malformed path escapes and encoded separators, as Pi does.

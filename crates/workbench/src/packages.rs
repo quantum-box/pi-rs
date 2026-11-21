@@ -180,7 +180,8 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
     let mut plan = resource_declarations(args, false)?;
     plan.extend(resource_declarations(args, true)?);
     for declaration in plan {
-        let cached = if remote(&declaration.source) {
+        let is_remote = remote(&declaration.source);
+        let cached = if is_remote {
             installed.contains_key(&key(&declaration.source))
         } else {
             installed
@@ -191,7 +192,7 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                         .unwrap_or(true)
                 })
         };
-        if args.offline && remote(&declaration.source) {
+        if args.offline && is_remote {
             if !cached {
                 eprintln!(
                     "Package {}: skipped in offline mode",
@@ -216,7 +217,11 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
-                Err(error) if cleanup.is_some() || (declaration.transient && !cached) => {
+                // Standalone share requires a complete runtime. Keep strict
+                // validation for explicitly requested native files and directories.
+                Err(error)
+                    if cleanup.is_some() || (!is_remote && declaration.transient && !cached) =>
+                {
                     return Err(error);
                 }
                 Err(error) => eprintln!("Package {}: {error}", display_source(&declaration.source)),

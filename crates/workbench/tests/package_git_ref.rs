@@ -73,6 +73,96 @@ fn git(directory: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn unavailable_transient_git_package_warns_and_keeps_rpc_available() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("agent");
+    std::fs::create_dir(&home).unwrap();
+    let repo = "https://example.invalid/acme/missing";
+    let source = format!("git:{repo}");
+    let missing = reqwest::Url::from_directory_path(directory.path().join("missing")).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .env_remove("PI_OFFLINE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", directory.path().join("gitconfig"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", format!("url.{missing}.insteadOf"))
+            .env("GIT_CONFIG_VALUE_0", repo)
+            .arg("--no-trust");
+        command
+    };
+    let mut child = command()
+        .args([
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-session",
+            "--mode",
+            "rpc",
+            "-e",
+            &source,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"id":"package-startup","type":"get_commands"})
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut warned = false;
+    let response = loop {
+        let Ok(line) =
+            receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        else {
+            let _ = child.kill();
+            break None;
+        };
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if value["id"] == "package-startup" {
+            break Some(value);
+        }
+        warned |= value["message"].as_str().is_some_and(|message| {
+            message.contains(&format!("Package {source}:"))
+                && message.contains("package command failed")
+        });
+    };
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(output.status.success(), "{response:?}");
+    assert!(
+        warned,
+        "missing package warning before RPC response: {response:?}"
+    );
+    assert!(response.is_some_and(|value| value["success"] == true));
+
+    let explicit = command().args(["install", &source]).output().unwrap();
+    assert!(!explicit.status.success());
+    assert!(String::from_utf8_lossy(&explicit.stderr).contains("package command failed"));
+}
+
+#[test]
 fn installs_explicit_ref_and_preserves_legacy_at_sign_repository() {
     let directory = tempfile::tempdir().unwrap();
     let repo = directory.path().join("org@team/repo");
