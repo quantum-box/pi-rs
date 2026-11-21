@@ -4883,17 +4883,19 @@ field is covered by loopback tests; no live compatible server was used.
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
-The bundled chat catalog includes 506 chat-completions entries for Cerebras,
+The bundled chat catalog includes chat-completions entries for Cerebras,
 DeepSeek, Fireworks, Groq, Hugging Face, Moonshot AI and Moonshot AI CN,
 OpenRouter, Together, Z.AI, and Z.AI Coding CN. It preserves their context,
 output, image and thinking capabilities from the pinned Pi AI release.
 User models and overrides take precedence. The CLI lists available providers
 together, and `--provider` can restrict the list to one. Built-in environment
 keys and endpoint-bound saved credentials stay off user-configured relays.
-Baseten and NVIDIA's pinned chat-completions catalogs are also available,
-including model-specific compatibility, NVIDIA polling headers and Baseten's
-thinking template. Catalog entries that use other upstream APIs still need
-their own adapters.
+Baseten and NVIDIA's bundled chat-completions catalogs include model-specific
+compatibility, NVIDIA polling headers and Baseten's thinking template.
+Baseten and Together match the Pi 1.6.0 catalogs of 15 and 16 entries.
+Both expose Kimi K3.1 Pro with image input. Baseten lists a 262,144-token
+output maximum, and Together lists 1,048,576 for both Kimi K3 and K3.1 Pro.
+Live inference for the updated entries was unverified.
 
 ### OpenAI Codex
 
