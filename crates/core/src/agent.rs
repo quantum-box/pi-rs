@@ -2065,8 +2065,10 @@ impl Agent<'_> {
                     .extensions
                     .iter()
                     .any(|extension| extension.handles_before_summary_compaction());
-                let model_summary_available =
-                    budget > 1 && request_index + 1 < active.limits.model_requests;
+                let summary_budget = max_output_tokens.min(512).min(budget / 2);
+                let model_summary_available = summary_budget
+                    >= active.model.minimum_output_tokens()
+                    && request_index + 1 < active.limits.model_requests;
                 if exceeds
                     || (control.enabled()
                         && !compacted
@@ -2085,7 +2087,7 @@ impl Agent<'_> {
                         ));
                     }
                     let summary_limit = if model_summary_available {
-                        max_output_tokens.min(512).min(budget / 2)
+                        summary_budget
                     } else {
                         0
                     };
@@ -8895,6 +8897,77 @@ mod tree_tests {
                 .any(|event| event["type"] == "session_compact"
                     && event["reason"] == "threshold"
                     && event["fromExtension"] == true)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_skips_summary_below_the_adapter_output_minimum() {
+        struct MinimumBudgetModel;
+        #[async_trait::async_trait]
+        impl Model for MinimumBudgetModel {
+            fn minimum_output_tokens(&self) -> u32 {
+                16
+            }
+
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                assert_eq!(request.max_output_tokens, 16);
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let agent = Agent {
+            model: &MinimumBudgetModel,
+            model_name: "fixture",
+            registry: &Registry::default(),
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                output_tokens_per_run: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(1000),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, "answer");
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
         );
     }
 

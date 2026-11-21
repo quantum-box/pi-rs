@@ -1421,6 +1421,10 @@ impl Client {
                     client
                 };
                 let client = client
+                    .with_max_output_tokens_field(
+                        args.model_profiles
+                            .responses_max_output_tokens(&args.provider, metadata.as_ref()),
+                    )
                     .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_strict_tool_support(args.model_profiles.responses_strict_tool_support(
@@ -1585,6 +1589,13 @@ pub(super) async fn stream_with_declarations(
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn minimum_output_tokens(&self) -> u32 {
+        match self {
+            Self::OpenAi(client) => client.minimum_output_tokens(),
+            _ => 1,
+        }
+    }
+
     async fn stream_detailed_with_tool_declarations(
         &self,
         request_id: uuid::Uuid,
@@ -3967,44 +3978,50 @@ mod estimation_tests {
     }
 
     #[tokio::test]
-    async fn responses_instruction_role_follows_model_capabilities() {
+    async fn responses_wire_fields_follow_model_capabilities() {
         use std::io::{Read, Write};
-        for (models, overrides, provider_compat, expected) in [
+        for (models, overrides, provider_compat, expected, output_limit) in [
             (
                 serde_json::json!([{"id":"m","reasoning":true}]),
                 serde_json::json!({}),
                 serde_json::json!({}),
                 "developer",
+                true,
             ),
             (
                 serde_json::json!([{"id":"m","reasoning":false}]),
                 serde_json::json!({}),
                 serde_json::json!({}),
                 "system",
+                true,
             ),
             (
                 serde_json::json!([{"id":"m","reasoning":true}]),
                 serde_json::json!({}),
-                serde_json::json!({"supportsDeveloperRole":false}),
+                serde_json::json!({"supportsDeveloperRole":false,"supportsMaxOutputTokens":false}),
                 "system",
+                false,
             ),
             (
-                serde_json::json!([{"id":"m","reasoning":true,"compat":{"supportsDeveloperRole":true}}]),
+                serde_json::json!([{"id":"m","reasoning":true,"compat":{"supportsDeveloperRole":true,"supportsMaxOutputTokens":true}}]),
                 serde_json::json!({}),
-                serde_json::json!({"supportsDeveloperRole":false}),
+                serde_json::json!({"supportsDeveloperRole":false,"supportsMaxOutputTokens":false}),
                 "developer",
+                true,
             ),
             (
                 serde_json::json!([]),
                 serde_json::json!({}),
                 serde_json::json!({}),
                 "system",
+                true,
             ),
             (
                 serde_json::json!([]),
-                serde_json::json!({"m":{"name":"partial"}}),
+                serde_json::json!({"m":{"name":"partial","compat":{"supportsMaxOutputTokens":false}}}),
                 serde_json::json!({}),
                 "system",
+                false,
             ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4094,6 +4111,10 @@ mod estimation_tests {
                 .await;
             let body = server.join().unwrap();
             assert_eq!(body["input"][0]["role"], expected);
+            assert_eq!(
+                body["max_output_tokens"].as_u64(),
+                output_limit.then_some(10)
+            );
         }
     }
 
