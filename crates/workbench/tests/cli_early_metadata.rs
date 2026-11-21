@@ -113,6 +113,25 @@ fn unknown_long_options_use_pi_wording_and_first_occurrence_order() {
 }
 
 #[test]
+fn model_listing_reports_unknown_options_before_showing_results() {
+    let output = run(&[
+        "--offline",
+        "--no-extensions",
+        "--no-approve",
+        "--no-mcp",
+        "--list-models",
+        "--z-fixture",
+        "--model",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        output.stderr,
+        b"Error: Unknown options: --z-fixture, --model\n"
+    );
+}
+
+#[test]
 fn rpc_rejects_file_arguments_before_startup() {
     for args in [
         &["--mode", "rpc", "@missing.txt"][..],

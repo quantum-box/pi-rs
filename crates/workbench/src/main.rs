@@ -1829,6 +1829,19 @@ async fn execute(
         Vec::new()
     };
     if let Some(search) = &args.list_models {
+        if pi_style_invocation
+            && !args.extension_flags.is_empty()
+            && let Some(registered) = cli_compat::discovered_extension_flags(&args)
+        {
+            let unknown: Vec<_> = args
+                .ordered_extension_flags()
+                .filter(|(name, _)| !registered.iter().any(|flag| flag.name == **name))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !unknown.is_empty() {
+                eprintln!("Error: {}", cli_compat::unknown_extension_options(&unknown));
+            }
+        }
         return model_listing::list(&args, search).await;
     }
     let needs_default_model = args.model.is_empty()
