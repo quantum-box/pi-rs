@@ -4601,8 +4601,12 @@ device authorization. The terminal offers both methods. Existing Pi Codex
 credentials can be read and refreshed in place. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
 
-The native transport sends uncompressed JSON over HTTP SSE. The upstream
-WebSocket transport, pasted browser callback fallback, and specialized Codex
+Codex also accepts Pi's `transport` setting. `auto` and `websocket-cached`
+reuse a live connection and can send a transcript suffix when the request
+matches the previous conversation. `websocket` sends the full history on
+the connection, and `sse` uses HTTP directly. An unavailable WebSocket
+upgrade falls back to HTTP SSE before any inference request is sent.
+The native HTTP fallback sends uncompressed JSON. Specialized Codex
 grammar tools and tool search remain open. Authentication was exercised with
 fixtures. Live sign-in and inference were unverified because no account was
 available for acceptance.

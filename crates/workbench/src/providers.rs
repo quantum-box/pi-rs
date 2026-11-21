@@ -1329,7 +1329,12 @@ impl Client {
                             model.mapped_effort("off").unwrap_or(Some("none"))
                         }
                     });
-                    client.with_codex_off_effort(off)
+                    client.with_codex_off_effort(off).with_codex_transport(
+                        args.settings
+                            .string("transport")
+                            .and_then(pi_rs::openai::CodexTransport::named)
+                            .unwrap_or_default(),
+                    )
                 } else {
                     client
                 };
