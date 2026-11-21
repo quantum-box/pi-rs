@@ -2243,42 +2243,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_scroll_window_stays_centered_and_keeps_mouse_rows_aligned() {
-        let items = (0..19)
-            .map(|index| Item {
-                label: format!("Setting {index:02}"),
-                selection: Selection::EditSetting(format!("key{index}")),
-            })
-            .collect();
-        let mut picker = Picker::new("Settings", items);
-        let theme = Theme::system();
-        let keys = Keys::default();
-        let contains = |lines: &[Line], value: &str| {
-            lines
-                .iter()
-                .any(|line| line.spans.iter().any(|span| span.text.contains(value)))
-        };
-        for (selected, first) in [(0, 0), (8, 3), (18, 9)] {
-            picker.selected = selected;
-            let lines = picker.render(&theme, 80, 32, &keys);
-            assert!(contains(&lines, format!("({}/19)", selected + 1).as_str()));
-            assert_eq!(picker.mouse_layout.get(), (first, 10, 32));
-            for index in 0..19 {
-                assert_eq!(
-                    contains(&lines, format!("Setting {index:02}").as_str()),
-                    (first..first + 10).contains(&index)
-                );
-            }
-        }
-        let lines = picker.render(&theme, 80, 8, &keys);
-        assert!(lines.len() <= 8);
-        assert!(contains(&lines, "Setting 18"));
-        picker.paste("missing");
-        let lines = picker.render(&theme, 80, 32, &keys);
-        assert!(contains(&lines, "No matching settings"));
-    }
-
-    #[test]
     fn settings_describe_selected_item_within_the_available_height() {
         let item = |label: &str, key: &str| Item {
             label: label.into(),
@@ -2390,6 +2354,42 @@ mod tests {
         assert!(picker.matches().is_empty());
         picker.query = "//".into();
         assert_eq!(picker.matches().len(), 4);
+    }
+
+    #[test]
+    fn settings_scroll_window_stays_centered_and_keeps_mouse_rows_aligned() {
+        let items = (0..19)
+            .map(|index| Item {
+                label: format!("Setting {index:02}"),
+                selection: Selection::EditSetting(format!("key{index}")),
+            })
+            .collect();
+        let mut picker = Picker::new("Settings", items);
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let contains = |lines: &[Line], value: &str| {
+            lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.text.contains(value)))
+        };
+        for (selected, first) in [(0, 0), (8, 3), (18, 9)] {
+            picker.selected = selected;
+            let lines = picker.render(&theme, 80, 32, &keys);
+            assert!(contains(&lines, format!("({}/19)", selected + 1).as_str()));
+            assert_eq!(picker.mouse_layout.get(), (first, 10, 32));
+            for index in 0..19 {
+                assert_eq!(
+                    contains(&lines, format!("Setting {index:02}").as_str()),
+                    (first..first + 10).contains(&index)
+                );
+            }
+        }
+        let lines = picker.render(&theme, 80, 8, &keys);
+        assert!(lines.len() <= 8);
+        assert!(contains(&lines, "Setting 18"));
+        picker.paste("missing");
+        let lines = picker.render(&theme, 80, 32, &keys);
+        assert!(contains(&lines, "No matching settings"));
     }
 
     #[test]
