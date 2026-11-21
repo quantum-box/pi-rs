@@ -2,7 +2,10 @@
 use pi_rs::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use similar::{Algorithm, ChangeTag, DiffOp};
 use unicode_normalization::UnicodeNormalization;
+
+use crate::diff_sequence::{self, Tag};
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,86 +31,175 @@ fn lf(text: &str) -> String {
 pub(super) fn normalized_content(text: &str) -> String {
     lf(text.strip_prefix('\u{feff}').unwrap_or(text))
 }
-pub(super) fn unified_patch<'a>(
-    path: &str,
-    diff: &'a similar::TextDiff<'a, 'a, 'a, str>,
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut patch = format!("--- {path}\n+++ {path}\n");
-    for hunk in diff.unified_diff().context_radius(4).iter_hunks() {
-        let first = hunk.ops().first().expect("hunk has operations");
-        let last = hunk.ops().last().expect("hunk has operations");
-        let old_start = first.old_range().start;
-        let new_start = first.new_range().start;
-        let old_count = last.old_range().end - old_start;
-        let new_count = last.new_range().end - new_start;
-        // Pi prints both counts, even for a single line. Empty ranges use the
-        // preceding line number, including zero at the start of a file.
-        let _ = writeln!(
-            patch,
-            "@@ -{},{} +{},{} @@",
-            old_start + usize::from(old_count > 0),
-            old_count,
-            new_start + usize::from(new_count > 0),
-            new_count,
-        );
-        // Reuse similar's line prefixes and missing-final-newline markers.
-        let rendered = hunk.to_string();
-        let (_, changes) = rendered
-            .split_once('\n')
-            .expect("hunk header ends in a newline");
-        patch.push_str(changes);
-    }
-    patch
+pub(super) struct EditDiff<'a> {
+    old: Vec<&'a str>,
+    new: Vec<&'a str>,
+    ops: Vec<DiffOp>,
+    digits: usize,
 }
 
-pub(super) fn numbered_diff(diff: &similar::TextDiff<'_, '_, '_, str>, digits: usize) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::new();
-    let context = 4;
-    for (index, op) in diff.ops().iter().enumerate() {
-        if matches!(op, similar::DiffOp::Equal { .. }) {
-            let range = op.old_range();
-            let leading = if index > 0 {
-                context.min(range.len())
-            } else {
-                0
-            };
-            let trailing = if index + 1 < diff.ops().len() {
-                context.min(range.len() - leading)
-            } else {
-                0
-            };
-            if leading + trailing == 0 {
-                continue;
-            }
-            for row in range.start..range.start + leading {
-                let text = diff.old_slices()[row].trim_end_matches('\n');
-                let _ = writeln!(output, " {:>digits$} {text}", row + 1);
-            }
-            if leading + trailing < range.len() {
-                let _ = writeln!(output, " {:digits$} ...", "");
-            }
-            for row in range.end - trailing..range.end {
-                let text = diff.old_slices()[row].trim_end_matches('\n');
-                let _ = writeln!(output, " {:>digits$} {text}", row + 1);
-            }
-        } else {
-            for change in diff.iter_changes(op) {
-                let (marker, row) = match change.tag() {
-                    similar::ChangeTag::Delete => ('-', change.old_index().expect("deleted line")),
-                    similar::ChangeTag::Insert => ('+', change.new_index().expect("inserted line")),
-                    similar::ChangeTag::Equal => continue,
-                };
-                let text = change.value().trim_end_matches('\n');
-                let _ = writeln!(output, "{marker}{:>digits$} {text}", row + 1);
-            }
+impl<'a> EditDiff<'a> {
+    pub(super) fn new(before: &'a str, after: &'a str) -> Self {
+        let old: Vec<_> = before.split_inclusive('\n').collect();
+        let new: Vec<_> = after.split_inclusive('\n').collect();
+        let digits = before
+            .split('\n')
+            .count()
+            .max(after.split('\n').count())
+            .to_string()
+            .len();
+
+        // The buffered search can retain paths across many diagonals. Give it
+        // a bounded amount of extra work on top of a full scan of both files.
+        let mut remaining = old
+            .len()
+            .saturating_add(new.len())
+            .saturating_add(1_000_000);
+        let components = diff_sequence::align(
+            &old,
+            &new,
+            |old, new| old == new,
+            1024,
+            || {
+                if let Some(next) = remaining.checked_sub(1) {
+                    remaining = next;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let ops = components.map_or_else(
+            || similar::capture_diff_slices(Algorithm::Myers, &old, &new),
+            line_operations,
+        );
+        Self {
+            old,
+            new,
+            ops,
+            digits,
         }
     }
-    output.pop();
-    output
+
+    pub(super) fn first_changed_line(&self) -> Option<usize> {
+        self.ops
+            .iter()
+            .find(|op| !matches!(op, DiffOp::Equal { .. }))
+            .map(|op| op.new_range().start + 1)
+    }
+
+    pub(super) fn unified_patch(&self, path: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut patch = format!("--- {path}\n+++ {path}\n");
+        for hunk in similar::group_diff_ops(self.ops.clone(), 4) {
+            let first = hunk.first().expect("hunk has operations");
+            let last = hunk.last().expect("hunk has operations");
+            let old_start = first.old_range().start;
+            let new_start = first.new_range().start;
+            let old_count = last.old_range().end - old_start;
+            let new_count = last.new_range().end - new_start;
+            // Pi prints both counts, even for a single line. Empty ranges use the
+            // preceding line number, including zero at the start of a file.
+            let _ = writeln!(
+                patch,
+                "@@ -{},{} +{},{} @@",
+                old_start + usize::from(old_count > 0),
+                old_count,
+                new_start + usize::from(new_count > 0),
+                new_count,
+            );
+            for op in hunk {
+                for change in op.iter_changes(&self.old[..], &self.new[..]) {
+                    let line = change.value();
+                    let _ = write!(patch, "{}{line}", change.tag());
+                    if !line.ends_with('\n') {
+                        patch.push_str("\n\\ No newline at end of file\n");
+                    }
+                }
+            }
+        }
+        patch
+    }
+
+    pub(super) fn numbered_diff(&self) -> String {
+        use std::fmt::Write as _;
+        let digits = self.digits;
+        let mut output = String::new();
+        let context = 4;
+        for (index, op) in self.ops.iter().enumerate() {
+            if matches!(op, DiffOp::Equal { .. }) {
+                let range = op.old_range();
+                let leading = if index > 0 {
+                    context.min(range.len())
+                } else {
+                    0
+                };
+                let trailing = if index + 1 < self.ops.len() {
+                    context.min(range.len() - leading)
+                } else {
+                    0
+                };
+                if leading + trailing == 0 {
+                    continue;
+                }
+                for row in range.start..range.start + leading {
+                    let text = self.old[row].trim_end_matches('\n');
+                    let _ = writeln!(output, " {:>digits$} {text}", row + 1);
+                }
+                if leading + trailing < range.len() {
+                    let _ = writeln!(output, " {:digits$} ...", "");
+                }
+                for row in range.end - trailing..range.end {
+                    let text = self.old[row].trim_end_matches('\n');
+                    let _ = writeln!(output, " {:>digits$} {text}", row + 1);
+                }
+            } else {
+                for change in op.iter_changes(&self.old[..], &self.new[..]) {
+                    let (marker, row) = match change.tag() {
+                        ChangeTag::Delete => ('-', change.old_index().expect("deleted line")),
+                        ChangeTag::Insert => ('+', change.new_index().expect("inserted line")),
+                        ChangeTag::Equal => continue,
+                    };
+                    let text = change.value().trim_end_matches('\n');
+                    let _ = writeln!(output, "{marker}{:>digits$} {text}", row + 1);
+                }
+            }
+        }
+        output.pop();
+        output
+    }
 }
+
+fn line_operations(components: Vec<(Tag, usize)>) -> Vec<DiffOp> {
+    let (mut old, mut new) = (0, 0);
+    components
+        .into_iter()
+        .map(|(tag, len)| {
+            let op = match tag {
+                Tag::Equal => DiffOp::Equal {
+                    old_index: old,
+                    new_index: new,
+                    len,
+                },
+                Tag::Delete => DiffOp::Delete {
+                    old_index: old,
+                    new_index: new,
+                    old_len: len,
+                },
+                Tag::Insert => DiffOp::Insert {
+                    old_index: old,
+                    new_index: new,
+                    new_len: len,
+                },
+            };
+            old = op.old_range().end;
+            new = op.new_range().end;
+            op
+        })
+        .collect()
+}
+
 fn fuzzy(text: &str) -> String {
     text.nfkc()
         .collect::<String>()
@@ -420,6 +512,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn edit_diff_matches_pi_alignment_for_repeated_lines() {
+        let before = "a\nb\nc\nb\nc\na\na\nb\nc\nc\nb\nb\na\nc\nb\n";
+        let after = "a\nb\nc\nb\nc\nb\na\nb\nc\nc\nb\nb\na\nc\nb\n";
+        let diff = EditDiff::new(before, after);
+
+        assert_eq!(diff.first_changed_line(), Some(6));
+        assert_eq!(
+            diff.numbered_diff(),
+            "    ...\n  2 b\n  3 c\n  4 b\n  5 c\n+ 6 b\n  6 a\n- 7 a\n  8 b\n  9 c\n 10 c\n 11 b\n    ..."
+        );
+        assert_eq!(
+            diff.unified_patch("fixture"),
+            "--- fixture\n+++ fixture\n@@ -2,10 +2,10 @@\n b\n c\n b\n c\n+b\n a\n-a\n b\n c\n c\n b\n"
+        );
+    }
+
+    #[test]
     fn unified_patch_matches_pi_single_line_range_and_newline_markers() {
         for (before, after, expected) in [
             ("old\n", "new\n", "@@ -1,1 +1,1 @@\n-old\n+new\n"),
@@ -441,9 +550,9 @@ mod tests {
                 "@@ -1,2 +1,2 @@\n one\n-two\n+new\n",
             ),
         ] {
-            let diff = similar::TextDiff::from_lines(before, after);
+            let diff = EditDiff::new(before, after);
             assert_eq!(
-                unified_patch("fixture", &diff),
+                diff.unified_patch("fixture"),
                 format!("--- fixture\n+++ fixture\n{expected}"),
                 "{before:?} -> {after:?}"
             );
