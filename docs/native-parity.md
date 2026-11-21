@@ -973,6 +973,11 @@ pinned Pi's prefix regex. This also hides non-App profiles such as
 `mcp-app-extra`; the MCP Apps specification identifies `mcp-app` itself, so this
 is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
+Within the existing initialization deadline, HTTP connections retry after
+250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
+other than 501. Remote resource reads and listings, including paged listings
+and templates, retry once on those HTTP statuses. Cancellation interrupts the
+resource retry wait, and ordinary tool calls are sent once on these failures.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
