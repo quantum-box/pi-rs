@@ -467,7 +467,7 @@ impl Keys {
         let gateway_match = provider.id() != "cloudflare-ai-gateway"
             || (super::cloudflare_gateway::Route::is_endpoint(endpoint)
                 && super::cloudflare_gateway::Route::from_endpoint(endpoint)
-                    .is_some_and(|route| route.matches_environment(entry.env.as_ref())));
+                    .is_some_and(|route| Some(route) == self.cloudflare_gateway_route()));
         (entry.endpoint.is_none()
             && profiles.has_provider_endpoint(provider, endpoint)
             && cloudflare_match

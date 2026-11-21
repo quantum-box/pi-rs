@@ -163,6 +163,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn saved_gateway_key_requires_a_matching_resolved_route() {
+        let account = uuid::Uuid::new_v4().simple().to_string();
+        let endpoint = Route::new(&account, "other-gateway")
+            .unwrap()
+            .endpoint(Adapter::ChatCompletions)
+            .unwrap();
+        let provider = Provider::named("cloudflare-ai-gateway").unwrap();
+        let profiles = Profiles::parse_with_cloudflare_routes(
+            &json!({"providers":{"cloudflare-ai-gateway":{"baseUrl":endpoint}}}),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(profiles.has_provider_endpoint(&provider, &endpoint));
+        let keys = Keys::parse(&json!({"cloudflare-ai-gateway":{
+            "type":"api_key","key":"fixture","env":{"CLOUDFLARE_GATEWAY_ID":"other-gateway"},
+        }}));
+        assert!(
+            keys.custom_credential(&provider, &endpoint, &profiles)
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn cloudflare_gateway_adapters_send_only_gateway_authentication() {
         let provider = Provider::named("cloudflare-ai-gateway").unwrap();
