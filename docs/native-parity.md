@@ -1634,6 +1634,10 @@ inference; model discovery and resolution remain available while those slots are
 
 Model catalogue search checks provider and ID argument types before dispatch,
 including the sandbox's JSON conversion of omitted and non-finite values.
+Tool discovery also validates string queries and names, string namespace
+filters and positive integer search limits after the same JSON conversion.
+The default limit is eight. Higher limits can return the whole matching
+catalogue.
 
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
 fresh QuickJS context. Scripts can call registered tools through `tools`, use
