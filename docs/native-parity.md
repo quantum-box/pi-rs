@@ -795,6 +795,9 @@ layout cases still need comparison.
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
+Alacritty can advertise OSC 8 using an `alacritty` prefix in `TERM` or a
+nonempty `ALACRITTY_WINDOW_ID` when it uses `TERM=xterm-256color`, matching Pi
+v1.6.0 even when `TERM_PROGRAM` is unset.
 Empty terminal-identification environment variables do not advertise OSC 8
 support or indicate a tmux session.
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
