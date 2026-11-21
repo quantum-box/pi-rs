@@ -80,6 +80,7 @@ pub struct OpenAiResponses {
     session_affinity_format: Option<SessionAffinityFormat>,
     prompt_cache_key_enabled: bool,
     strict_tool_support: bool,
+    send_max_output_tokens: bool,
     use_developer_role: bool,
 }
 
@@ -294,6 +295,7 @@ impl OpenAiResponses {
             session_affinity_format: None,
             prompt_cache_key_enabled: true,
             strict_tool_support: false,
+            send_max_output_tokens: true,
             use_developer_role: false,
         })
     }
@@ -314,6 +316,12 @@ impl OpenAiResponses {
     pub fn with_cache_retention(mut self, retention: CacheRetention, explicit_mode: bool) -> Self {
         self.cache_retention = retention;
         self.explicit_cache_mode = explicit_mode;
+        self
+    }
+
+    /// Omit the output limit for Responses-compatible endpoints that reject it.
+    pub fn with_max_output_tokens_field(mut self, enabled: bool) -> Self {
+        self.send_max_output_tokens = enabled;
         self
     }
 
@@ -844,6 +852,16 @@ impl Model for OpenAiResponses {
                 pi_rs_core::protected_model_fingerprint(&(base, format!("{format:?}")))
             }),
         };
+        let base = if self.send_max_output_tokens {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "responses-without-max-output-tokens",
+                ))
+            })
+        };
         let base = if self.prompt_cache_key_enabled {
             base
         } else {
@@ -1100,6 +1118,11 @@ impl OpenAiResponses {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
+        if !self.send_max_output_tokens {
+            body.as_object_mut()
+                .expect("Responses request object")
+                .remove("max_output_tokens");
+        }
         self.apply_cache(&mut body);
         let error_secrets = pi_rs_core::provider_error_secrets(
             Some(self.token.as_str()),
