@@ -1002,6 +1002,12 @@ Within the existing initialization deadline, HTTP connections retry after
 other than 501. Remote resource reads and listings, including paged listings
 and templates, retry once on those HTTP statuses. Cancellation interrupts the
 resource retry wait, and ordinary tool calls are sent once on these failures.
+For stdio and streamable HTTP tool calls, progress notifications matching the
+request's MCP progress token renew its idle timeout. The live tool result shows
+the server's message or `Progress N[/total]` when no message was supplied.
+Progress for another request does not extend the deadline. The CLI can cancel
+an active tool call even while progress is arriving. Resource requests retain
+their fixed deadlines.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials

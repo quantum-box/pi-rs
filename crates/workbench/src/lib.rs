@@ -31,6 +31,7 @@ pub mod mcp_auth;
 mod mcp_login_config_lock;
 #[doc(hidden)]
 pub mod mcp_oauth_client;
+mod mcp_progress;
 mod mcp_provider_auth;
 #[doc(hidden)]
 pub mod mcp_refresh;
