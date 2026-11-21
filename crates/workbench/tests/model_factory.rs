@@ -2,6 +2,55 @@ use pi_rs::{HostAuthBuilder, HostCredential, HostCredentialKind, ModelCatalogBui
 use pi_rs_workbench::model_factory::{ModelClientFactory, NativeModelApi};
 
 #[test]
+fn model_factory_builds_an_exact_catalog_with_host_metadata() {
+    use pi_rs::CatalogModelInfo;
+    use pi_rs_workbench::model_factory::NativeModelDefinition;
+
+    let endpoint = "https://api.example.test/v1/chat/completions";
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "example",
+        endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let factory = ModelClientFactory::new(auth.build());
+    let definition = NativeModelDefinition {
+        api: NativeModelApi::OpenAiChat,
+        provider: "example",
+        endpoint,
+        model: "demo",
+        info: Some(CatalogModelInfo {
+            display_name: Some("Demo model".into()),
+            ..Default::default()
+        }),
+    };
+    let catalog = factory.catalog([definition.clone()]).unwrap();
+    assert_eq!(
+        catalog
+            .info("example", "demo")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Demo model")
+    );
+    assert!(
+        factory
+            .catalog([definition.clone(), definition.clone()])
+            .is_err()
+    );
+    assert!(
+        factory
+            .catalog([NativeModelDefinition {
+                endpoint: "https://ungranted.example.test/v1/chat/completions",
+                ..definition
+            }])
+            .is_err()
+    );
+    assert!(catalog.session_builder("example", "demo").is_ok());
+}
+
+#[test]
 fn factory_uses_only_exact_host_authorized_routes_and_credential_kinds() {
     let mut auth = HostAuthBuilder::new();
     auth.register(

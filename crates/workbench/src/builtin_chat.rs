@@ -38,6 +38,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
+        id: "cloudflare-workers-ai",
+        endpoint: "",
+        env: "CLOUDFLARE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "deepseek",
         endpoint: "https://api.deepseek.com/chat/completions",
         env: "DEEPSEEK_API_KEY",
@@ -52,6 +58,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         endpoint: "https://api.fireworks.ai/inference/v1/chat/completions",
         env: "FIREWORKS_API_KEY",
         compatibility: standard,
+    },
+    Builtin {
+        id: "github-copilot",
+        endpoint: "https://api.individual.githubcopilot.com/chat/completions",
+        env: "COPILOT_GITHUB_TOKEN",
+        compatibility: || json!({}),
     },
     Builtin {
         id: "groq",
@@ -271,6 +283,12 @@ impl Builtin {
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
             }
+            (Adapter::Anthropic, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/v1/messages")
+            }
+            (Adapter::OpenAiResponses, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/responses")
+            }
             (Adapter::OpenAiResponses, "opencode") => {
                 Some("https://opencode.ai/inference/openai/v1/responses")
             }
@@ -293,14 +311,15 @@ impl Builtin {
     }
 
     pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
-        self.endpoint == endpoint
-            || [
-                Adapter::Anthropic,
-                Adapter::Google,
-                Adapter::OpenAiResponses,
-            ]
-            .into_iter()
-            .any(|adapter| self.endpoint_for(adapter) == Some(endpoint))
+        !endpoint.is_empty()
+            && (self.endpoint == endpoint
+                || [
+                    Adapter::Anthropic,
+                    Adapter::Google,
+                    Adapter::OpenAiResponses,
+                ]
+                .into_iter()
+                .any(|adapter| self.endpoint_for(adapter) == Some(endpoint)))
     }
 
     pub fn env(&self) -> &'static str {

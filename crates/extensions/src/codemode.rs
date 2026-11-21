@@ -1,8 +1,11 @@
 //! A bounded QuickJS runner that reaches external effects only through ToolHost.
 #[cfg(test)]
 use pi_rs_core::ModelRequest;
+use std::collections::BTreeSet;
+use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -612,6 +615,21 @@ async fn evaluate(
             format!("{error} {detail}")
         })
     });
+    let mut operation = std::pin::pin!(operation);
+    let operation = poll_fn(|cx| match operation.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(result),
+        Poll::Pending => {
+            // async_with polls host futures and drains QuickJS jobs before it
+            // yields. This runtime belongs to this script, and a pending host
+            // future keeps the scheduler nonempty even between I/O wakeups.
+            let mut pending_jobs = std::pin::pin!(runtime.is_job_pending());
+            if pending_jobs.as_mut().poll(cx) == Poll::Ready(false) {
+                Poll::Ready(Err("The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here.".into()))
+            } else {
+                Poll::Pending
+            }
+        }
+    });
     let result = tokio::select! {
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
         result = async {
@@ -828,35 +846,103 @@ fn describe(tool: &ToolSpec) -> String {
     )
 }
 fn typescript(schema: &Value) -> String {
-    match schema["type"].as_str() {
-        Some("string") => "string".into(),
-        Some("number" | "integer") => "number".into(),
-        Some("boolean") => "boolean".into(),
-        Some("array") => format!("{}[]", typescript(&schema["items"])),
-        Some("object") => {
-            let fields = schema["properties"]
-                .as_object()
-                .map(|properties| {
-                    properties
-                        .iter()
-                        .map(|(name, value)| {
-                            let required = schema["required"]
-                                .as_array()
-                                .is_some_and(|names| names.iter().any(|value| value == name));
-                            format!(
-                                "{}{}: {}",
-                                serde_json::to_string(name).unwrap(),
-                                if required { "" } else { "?" },
-                                typescript(value)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .unwrap_or_default();
-            format!("{{ {fields} }}")
+    let mut renderer = SchemaRenderer {
+        root: schema,
+        resolving: BTreeSet::new(),
+        text: String::new(),
+        units: 0,
+    };
+    match renderer.write_type(schema) {
+        Some(()) => renderer.text,
+        None => "unknown".into(),
+    }
+}
+
+struct SchemaRenderer<'a> {
+    root: &'a Value,
+    resolving: BTreeSet<*const Value>,
+    text: String,
+    units: usize,
+}
+
+impl SchemaRenderer<'_> {
+    fn write(&mut self, text: &str) -> Option<()> {
+        self.units += text.encode_utf16().count();
+        if self.units > 16_000 {
+            return None;
         }
-        _ => "unknown".into(),
+        self.text.push_str(text);
+        Some(())
+    }
+
+    fn write_type(&mut self, schema: &Value) -> Option<()> {
+        if let Some(reference) = schema["$ref"].as_str() {
+            let Some(target) = crate::schema_ref::resolve(self.root, reference) else {
+                return self.write_type_without_ref(schema);
+            };
+            let pointer = std::ptr::from_ref(target);
+            if self.resolving.len() >= 32 || !self.resolving.insert(pointer) {
+                return self.write_type_without_ref(schema);
+            }
+            let has_sibling_type = matches!(
+                schema["type"].as_str(),
+                Some("string" | "number" | "integer" | "boolean" | "array" | "object")
+            );
+            let initial_bytes = self.text.len();
+            let initial_units = self.units;
+            if has_sibling_type {
+                self.write("(")?;
+            }
+            let target_start = self.text.len();
+            let result = self.write_type(target);
+            self.resolving.remove(&pointer);
+            result?;
+            if has_sibling_type {
+                if &self.text[target_start..] == "unknown" {
+                    self.text.truncate(initial_bytes);
+                    self.units = initial_units;
+                    return self.write_type_without_ref(schema);
+                }
+                self.write(" & ")?;
+                self.write_type_without_ref(schema)?;
+                self.write(")")?;
+            }
+            return Some(());
+        }
+        self.write_type_without_ref(schema)
+    }
+
+    fn write_type_without_ref(&mut self, schema: &Value) -> Option<()> {
+        match schema["type"].as_str() {
+            Some("string") => self.write("string"),
+            Some("number" | "integer") => self.write("number"),
+            Some("boolean") => self.write("boolean"),
+            Some("array") => {
+                self.write_type(&schema["items"])?;
+                self.write("[]")
+            }
+            Some("object") => self.write_object(schema),
+            _ if schema == &Value::Bool(false) => self.write("never"),
+            _ => self.write("unknown"),
+        }
+    }
+
+    fn write_object(&mut self, schema: &Value) -> Option<()> {
+        self.write("{ ")?;
+        if let Some(properties) = schema["properties"].as_object() {
+            let required = schema["required"].as_array();
+            for (index, (name, field)) in properties.iter().enumerate() {
+                if index != 0 {
+                    self.write("; ")?;
+                }
+                self.write(&serde_json::to_string(name).unwrap())?;
+                let name_is_required =
+                    required.is_some_and(|names| names.iter().any(|value| value == name));
+                self.write(if name_is_required { ": " } else { "?: " })?;
+                self.write_type(field)?;
+            }
+        }
+        self.write(" }")
     }
 }
 
@@ -1379,6 +1465,91 @@ fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_declarations_expand_local_refs_without_recursing_forever() {
+        let tool = ToolSpec {
+            name: "read-record".into(),
+            description: "Read a record".into(),
+            parameters: json!({
+                "$ref": "#/$defs/a~1b~0%20c",
+                "$defs": {
+                    "a/b~ c": {
+                        "type": "object",
+                        "required": ["amount"],
+                        "properties": {
+                            "amount": {"$ref": "#/$defs/cost"},
+                            "cycle": {"$ref": "#/$defs/a~1b~0%20c"},
+                            "denied": {"$ref": "#/$defs/never"},
+                            "mystery": {"$ref": "https://example.com/schema"}
+                        }
+                    },
+                    "cost": {"type": "number"},
+                    "never": false
+                }
+            }),
+        };
+        let declaration = describe(&tool);
+        assert!(declaration.contains("read_record(args: {"));
+        for field in [
+            "\"amount\": number",
+            "\"cycle\"?: unknown",
+            "\"denied\"?: never",
+            "\"mystery\"?: unknown",
+        ] {
+            assert!(declaration.contains(field), "{declaration}");
+        }
+        let property_name = "x".repeat(16_000);
+        let oversized = json!({"type":"object","properties": {(property_name):{"type":"string"}}});
+        assert_eq!(typescript(&oversized), "unknown");
+    }
+
+    #[test]
+    fn tool_declarations_retain_argument_types_alongside_references() {
+        let generic = json!({"$ref": "#/$defs/base", "type": "string", "$defs": {"base": true}});
+        assert_eq!(typescript(&generic), "string");
+        let missing = json!({"$ref": "#/$defs/absent", "type": "number"});
+        assert_eq!(typescript(&missing), "number");
+        let array = json!({
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/base",
+                "type": "object",
+                "properties": {"label": {"type": "string"}}
+            },
+            "$defs": {"base": {"type": "object", "properties": {"count": {"type": "number"}}}}
+        });
+        assert_eq!(
+            typescript(&array),
+            "({ \"count\"?: number } & { \"label\"?: string })[]"
+        );
+    }
+
+    #[test]
+    fn tool_declarations_bound_reference_depth_without_dropping_siblings() {
+        let properties: serde_json::Map<_, _> = (0..40)
+            .map(|index| (format!("field{index}"), json!({"$ref": "#/$defs/shared"})))
+            .collect();
+        let wide = json!({
+            "type": "object",
+            "$defs": {"shared": {"type": "string"}},
+            "properties": properties
+        });
+        assert_eq!(typescript(&wide).matches(": string").count(), 40);
+        let mut chain: serde_json::Map<_, _> = (0..40)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    json!({"$ref": format!("#/$defs/{}", index + 1)}),
+                )
+            })
+            .collect();
+        chain.insert("40".into(), json!({"type": "string"}));
+        assert_eq!(
+            typescript(&json!({"$ref": "#/$defs/0", "$defs": chain})),
+            "unknown"
+        );
+    }
 
     #[test]
     fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
@@ -1963,7 +2134,12 @@ mod tests {
             vec![ToolSpec {
                 name: "echo".into(),
                 description: "Echo a value".into(),
-                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"text": {"$ref": "#/$defs/echoText"}},
+                    "required": ["text"],
+                    "$defs": {"echoText": {"type": "string", "description": "Reconciliation"}}
+                }),
             }]
         }
         async fn call(&self, name: &str, arguments: Value) -> Outcome {
@@ -2046,31 +2222,40 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn unbounded_script_honors_cancellation() {
+    async fn unbounded_script_honors_cancellation_during_host_call() {
         let cancellation = pi_rs_core::CancellationToken::new();
-        let trigger = cancellation.clone();
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            trigger.cancel();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: true,
         });
-        let reply = tokio::time::timeout(
-            Duration::from_secs(1),
-            ScriptTool { timeout: None }.invoke_transaction(
-                json!({"code":"await new Promise(() => {})"}),
-                ToolContext {
-                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
-                    cancellation,
-                },
-                None,
-                Arc::new(Host),
-            ),
-        )
+        let run = ScriptTool { timeout: None };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run.invoke_transaction(
+                    json!({"code":"await tools.started({})"}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: cancellation.clone(),
+                    },
+                    None,
+                    host,
+                ),
+                async {
+                    started.notified().await;
+                    cancellation.cancel();
+                }
+            )
+        })
         .await
-        .unwrap();
-        task.await.unwrap();
+        .expect("expected pending host call to be cancelled");
         assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
     }
-    struct StartedHost(Arc<tokio::sync::Notify>);
+
+    struct StartedHost {
+        started: Arc<tokio::sync::Notify>,
+        wait_for_cancellation: bool,
+    }
     #[async_trait::async_trait]
     impl ToolHost for StartedHost {
         fn cancellation_safe_calls(&self) -> bool {
@@ -2084,7 +2269,10 @@ mod tests {
             }]
         }
         async fn call(&self, _: &str, _: Value) -> Outcome {
-            self.0.notify_one();
+            self.started.notify_one();
+            if self.wait_for_cancellation {
+                std::future::pending::<()>().await;
+            }
             Outcome::Succeeded("ready".into())
         }
     }
@@ -2110,7 +2298,10 @@ mod tests {
             })
         };
         let script_cancel = cancellation.clone();
-        let host = Arc::new(StartedHost(started.clone()));
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
         let script = tokio::spawn(async move {
             ScriptTool { timeout: None }.invoke_transaction(
                 json!({"code":"await tools.started({}); store('uncommitted', true); while (true) {}"}),
@@ -2138,7 +2329,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_invocation_stops_busy_worker() {
         let started = Arc::new(tokio::sync::Notify::new());
-        let host = Arc::new(StartedHost(started.clone()));
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
         let weak_host = Arc::downgrade(&host);
         let cancellation = pi_rs_core::CancellationToken::new();
         let watchdog_cancel = cancellation.clone();
@@ -2521,10 +2715,67 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
+    #[tokio::test]
+    async fn unresolved_promise_fails_without_a_deadline() {
+        struct DelayedHost;
+
+        #[async_trait::async_trait]
+        impl ToolHost for DelayedHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "fixture".into(),
+                    description: "Wait for a fixture response".into(),
+                    parameters: json!({"type": "object"}),
+                }]
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Outcome::Succeeded("fixture returned".into())
+            }
+        }
+
+        for source in [
+            "text('before stall'); await new Promise(() => {});",
+            "text(await tools.fixture({})); await new Promise(() => {});",
+        ] {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(5),
+                ScriptTool { timeout: None }.invoke_transaction(
+                    json!({"code":source}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    Arc::new(DelayedHost),
+                ),
+            )
+            .await
+            .expect("an idle script must release its worker with no configured deadline");
+            let Outcome::Failed(error) = reply.outcome else {
+                panic!("unresolved script unexpectedly completed");
+            };
+            let output = if source.contains("tools.fixture") {
+                "fixture returned"
+            } else {
+                "before stall"
+            };
+            assert!(
+                error.contains(output) && error.contains("promise that can never settle"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn metadata_helpers_and_output_truncation_are_available() {
         let reply = run(
-            "const found = await searchTools('echo'); text(found[0].name); text((await describeTool('echo')).declaration); return (await describeNamespace('builtin')).tools.length;",
+            "const found = await searchTools('reconciliation'); if (found[0]?.name !== 'echo') throw new Error('missing referenced tool'); const declaration = (await describeTool('echo')).declaration; if (!declaration.includes('string')) throw new Error('missing referenced type'); text(declaration); return (await describeNamespace('builtin')).tools.length;",
             None,
         );
         assert!(reply.outcome.tool_content().contains("Echo a value"));

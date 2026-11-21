@@ -1703,30 +1703,31 @@ mod tests {
     #[test]
     fn sts_fixture_socket_waits_for_data_with_a_timeout() {
         use std::io::{Read, Write};
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut socket, _) = listener.accept().unwrap();
         socket.set_nonblocking(true).unwrap();
-        configure_sts_fixture_socket(&socket, Duration::from_millis(200)).unwrap();
-        let (release, hold) = std::sync::mpsc::channel::<()>();
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            client.write_all(b"x").unwrap();
-            // Keep the connection open until the bounded read times out.
-            let _ = hold.recv_timeout(Duration::from_secs(5));
-        });
+        let timeout = Duration::from_millis(200);
+        configure_sts_fixture_socket(&socket, timeout).unwrap();
+
+        // Keep the connected client idle. Verify that the empty read waits
+        // instead of immediately returning WouldBlock on an inherited mode.
         let mut byte = [0];
-        socket.read_exact(&mut byte).unwrap();
-        assert_eq!(&byte, b"x");
+        let started = Instant::now();
         let error = socket.read(&mut byte).unwrap_err();
         assert!(matches!(
             error.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
         ));
-        release.send(()).unwrap();
-        writer.join().unwrap();
+        assert!(started.elapsed() >= timeout / 2);
+
+        // Queue the byte before reading so no writer thread has to be
+        // scheduled inside the socket timeout.
+        client.write_all(b"x").unwrap();
+        socket.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
     }
 
     #[cfg(any(unix, windows))]

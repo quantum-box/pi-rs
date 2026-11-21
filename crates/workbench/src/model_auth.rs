@@ -16,6 +16,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    Copilot,
     AnthropicOAuth,
     Kimi,
     Meta,
@@ -54,6 +55,7 @@ impl Credential {
             | Self::StoredCommand(_)
             | Self::Invalid
             | Self::ChatGpt
+            | Self::Copilot
             | Self::AnthropicOAuth
             | Self::Kimi
             | Self::Meta
@@ -66,7 +68,7 @@ impl Credential {
     pub fn is_bearer(&self) -> bool {
         matches!(
             self,
-            Self::Bearer(_) | Self::ChatGpt | Self::Kimi | Self::AnthropicOAuth
+            Self::Bearer(_) | Self::ChatGpt | Self::Copilot | Self::Kimi | Self::AnthropicOAuth
         )
     }
 
@@ -79,6 +81,7 @@ impl Credential {
             || matches!(
                 self,
                 Self::ChatGpt
+                    | Self::Copilot
                     | Self::AnthropicOAuth
                     | Self::Kimi
                     | Self::Meta
@@ -108,6 +111,10 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::Copilot => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::copilot_auth::access(&settings, None, false).await;
             }
             Self::AnthropicOAuth => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -166,6 +173,7 @@ struct SavedKey {
     endpoint: Option<String>,
     official_routes: bool,
     oauth: bool,
+    available_model_ids: Option<Vec<String>>,
     key: Option<Credential>,
     env: Option<serde_json::Map<String, Value>>,
 }
@@ -204,23 +212,29 @@ impl Keys {
                 }
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
+                let copilot =
+                    name.eq_ignore_ascii_case("github-copilot") && entry["type"] == "oauth";
+                let copilot_credential = copilot
+                    .then(|| super::copilot_auth::read_entry(entry))
+                    .transpose()
+                    .ok()?;
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
                 let meta = name.eq_ignore_ascii_case("meta") && entry["type"] == "oauth";
                 let xai = name.eq_ignore_ascii_case("xai") && entry["type"] == "oauth";
                 let anthropic = name.eq_ignore_ascii_case("anthropic") && entry["type"] == "oauth";
                 let oauth = (name.eq_ignore_ascii_case("openrouter")
                     || chatgpt
+                    || copilot
                     || kimi
                     || meta
                     || xai
                     || anthropic)
                     && entry["type"] == "oauth";
                 let key = if chatgpt {
-                    serde_json::from_value::<pi_rs::openai::oauth::Credential>(
-                        entry["credential"].clone(),
-                    )
-                    .ok()?;
+                    super::chatgpt_auth::decode_entry(entry).ok()?;
                     Some(Credential::ChatGpt)
+                } else if copilot {
+                    Some(Credential::Copilot)
                 } else if anthropic {
                     let valid =
                         serde_json::from_value::<super::anthropic_auth::Credential>(entry.clone())
@@ -305,6 +319,7 @@ impl Keys {
                     }
                 };
                 let endpoint = match entry.get("endpoint") {
+                    None if name.eq_ignore_ascii_case("cloudflare-workers-ai") => None,
                     None => Provider::named(name)
                         .map(|provider| provider.default_endpoint())
                         .or_else(|| {
@@ -319,6 +334,8 @@ impl Keys {
                         "kimi-coding"
                     } else if meta {
                         "meta"
+                    } else if copilot {
+                        "github-copilot"
                     } else if xai {
                         "xai"
                     } else {
@@ -326,6 +343,9 @@ impl Keys {
                     })
                     .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
+                    return None;
+                }
+                if chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT) {
                     return None;
                 }
                 if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {
@@ -337,6 +357,8 @@ impl Keys {
                         endpoint: endpoint.map(str::to_owned),
                         official_routes: oauth || entry.get("endpoint").is_none(),
                         oauth,
+                        available_model_ids: copilot_credential
+                            .and_then(|credential| credential.available_model_ids),
                         key,
                         env: entry["env"].as_object().cloned(),
                     },
@@ -384,10 +406,32 @@ impl Keys {
         endpoint: &str,
         profiles: &super::model_profiles::Profiles,
     ) -> Option<&Credential> {
+        self.custom_entry(provider, endpoint, profiles)?
+            .key
+            .as_ref()
+    }
+
+    fn custom_entry(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+        profiles: &super::model_profiles::Profiles,
+    ) -> Option<&SavedKey> {
         let entry = self.entries.get(provider.id())?;
-        (entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint))
-            .then_some(entry.key.as_ref())
-            .flatten()
+        let cloudflare_match = provider.id() != "cloudflare-workers-ai"
+            || super::model_profiles::cloudflare_workers_chat_account(endpoint).is_some_and(
+                |account| {
+                    entry
+                        .env
+                        .as_ref()
+                        .is_none_or(|env| !env.contains_key("CLOUDFLARE_ACCOUNT_ID"))
+                        || self.cloudflare_chat_account() == Some(account)
+                },
+            );
+        (entry.endpoint.is_none()
+            && profiles.has_provider_endpoint(provider, endpoint)
+            && cloudflare_match)
+            .then_some(entry)
     }
 
     pub fn environment(
@@ -397,13 +441,15 @@ impl Keys {
         profiles: &super::model_profiles::Profiles,
     ) -> Option<&serde_json::Map<String, Value>> {
         self.entry_for(provider, endpoint)
-            .or_else(|| {
-                self.entries.get(provider.id()).filter(|entry| {
-                    entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint)
-                })
-            })?
+            .or_else(|| self.custom_entry(provider, endpoint, profiles))?
             .env
             .as_ref()
+    }
+
+    pub fn available_model_ids(&self, provider: &Provider, endpoint: &str) -> Option<&[String]> {
+        self.entry_for(provider, endpoint)?
+            .available_model_ids
+            .as_deref()
     }
 
     pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {
@@ -436,27 +482,59 @@ impl Keys {
             .as_ref()
     }
 
-    // A scoped credential may supply an account only when that account
-    // reconstructs its own official operation endpoint.
-    pub(super) fn cloudflare_operation_account(&self) -> Option<&str> {
+    fn cloudflare_worker_account_entry(&self) -> Option<(&SavedKey, &str)> {
         let entry = self.entries.get("cloudflare-workers-ai")?;
         let account = entry.env.as_ref()?.get("CLOUDFLARE_ACCOUNT_ID")?.as_str()?;
-        if entry.official_routes {
+        super::operation_models::valid_cloudflare_account(account).then_some((entry, account))
+    }
+
+    fn cloudflare_saved_chat_account(&self) -> Option<&str> {
+        let entry = self.entries.get("cloudflare-workers-ai")?;
+        let account =
+            super::model_profiles::cloudflare_workers_chat_account(entry.endpoint.as_deref()?)?;
+        let configured = entry
+            .env
+            .as_ref()
+            .and_then(|env| env.get("CLOUDFLARE_ACCOUNT_ID"));
+        configured
+            .is_none_or(|value| value.as_str() == Some(account))
+            .then_some(account)
+    }
+
+    // A chat-scoped key also covers the classifier of the same account.
+    pub(super) fn cloudflare_operation_account(&self) -> Option<&str> {
+        if let Some(account) = self.cloudflare_saved_chat_account() {
             return Some(account);
         }
-        if !super::operation_models::valid_cloudflare_account(account) {
-            return None;
-        }
+        let (entry, account) = self.cloudflare_worker_account_entry()?;
         let expected = format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run");
-        entry
-            .endpoint
-            .as_deref()
-            .filter(|endpoint| same_operation_endpoint(endpoint, &expected))?;
-        Some(account)
+        (entry.official_routes
+            || entry
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| same_operation_endpoint(endpoint, &expected)))
+        .then_some(account)
+    }
+
+    pub(super) fn cloudflare_chat_account(&self) -> Option<&str> {
+        self.cloudflare_saved_chat_account().or_else(|| {
+            let (entry, account) = self.cloudflare_worker_account_entry()?;
+            entry.official_routes.then_some(account)
+        })
     }
 
     fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
+        if provider == "cloudflare-workers-ai" && official {
+            if entry.official_routes {
+                return Some(entry);
+            }
+            if let Some(account) = self.cloudflare_saved_chat_account() {
+                let expected =
+                    format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run");
+                return same_operation_endpoint(endpoint, &expected).then_some(entry);
+            }
+        }
         // The provider-key UI binds a Vercel key to its official chat route.
         // Pi uses that same key for the gateway's separate classifier route.
         let vercel_classifier = provider == "vercel-ai-gateway"
@@ -833,6 +911,26 @@ mod tests {
         ));
         assert!(
             keys.credential(&provider, "http://127.0.0.1:1234/v1/responses")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_pi_chatgpt_oauth_is_official_endpoint_only() {
+        let provider = Provider::named("openai-chatgpt").unwrap();
+        let mut entry = json!({"type":"oauth","access":"access","refresh":"refresh","expires":1000,
+            "clientId":"issued-client","scopes":["chatgpt.tokens.use.direct"]});
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(matches!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT),
+            Some(Credential::ChatGpt)
+        ));
+        let loopback = "http://127.0.0.1:1234/v1/responses";
+        entry["endpoint"] = json!(loopback);
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(keys.credential(&provider, loopback).is_none());
+        assert!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT)
                 .is_none()
         );
     }
