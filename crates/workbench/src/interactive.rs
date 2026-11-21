@@ -4143,7 +4143,7 @@ fn apply_terminal_color_snapshot(
 
 #[cfg(any(unix, windows))]
 fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut Theme) {
-    let selection = args.use_theme.as_deref().unwrap_or("system");
+    let selection = args.theme_setting().unwrap_or("system");
     if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
         if let Ok(next) = settings.preview(picker, args) {
             *theme = next;
@@ -4186,7 +4186,7 @@ fn settle_complete_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
     let resources = super::resources::Resources::load_for_startup(args)?;
     Ok(load_resolved_theme(
-        args.use_theme.as_deref().unwrap_or("system"),
+        args.theme_setting().unwrap_or("system"),
         &resources.themes,
         &args.workspace,
         args.trusted,
@@ -4346,7 +4346,7 @@ pub(super) async fn run(
     let _pending_colors = crate::ui::theme::PendingTerminalColors::new();
     let mut deferred_theme_error = None;
     let mut theme = match load_resolved_theme(
-        args.use_theme.as_deref().unwrap_or("system"),
+        args.theme_setting().unwrap_or("system"),
         &args.theme_paths,
         &args.workspace,
         args.trusted,
@@ -4384,7 +4384,7 @@ pub(super) async fn run(
         #[cfg(any(unix, windows))]
         None,
         #[cfg(any(unix, windows))]
-        follows_terminal_appearance(args.use_theme.as_deref()),
+        follows_terminal_appearance(args.theme_setting()),
     )?);
     let mut input = crate::ui::input::Reader::new()?;
     let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -4427,7 +4427,7 @@ pub(super) async fn run(
         }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
-            let enabled = follows_terminal_appearance(args.use_theme.as_deref());
+            let enabled = follows_terminal_appearance(args.theme_setting());
             let refresh_requested = std::mem::take(&mut view.theme_refresh_requested);
             let mut output = std::io::stdout();
             if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
@@ -4780,7 +4780,7 @@ pub(super) async fn run(
                 }
                 let resources_changed = value["type"] == "resources_discovered";
                 view.receive_worker(value, &mut args);
-                if resources_changed && let Some(name) = args.use_theme.as_deref() {
+                if resources_changed && let Some(name) = args.theme_setting() {
                     match load_resolved_theme(
                         name,
                         &args.theme_paths,
@@ -5553,7 +5553,7 @@ pub(super) async fn run(
                                 match settings.stage {
                                     ThemeSettingsStage::Single => {
                                         theme = load_resolved_theme(
-                                            args.use_theme.as_deref().unwrap_or("system"),
+                                            args.theme_setting().unwrap_or("system"),
                                             &args.theme_paths,
                                             &args.workspace,
                                             args.trusted,
@@ -6240,7 +6240,7 @@ pub(super) async fn run(
                                 Err(error) => view.append(&error.to_string()),
                             }
                             match load_resolved_theme(
-                                args.use_theme.as_deref().unwrap_or("system"),
+                                args.theme_setting().unwrap_or("system"),
                                 &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
@@ -7094,7 +7094,7 @@ fn start_tree_navigation(
 
 impl ThemeSettings {
     fn new(parent: Picker, args: &Cli, theme: &Theme) -> Self {
-        let selected = args.use_theme.as_deref().unwrap_or("system");
+        let selected = args.theme_setting().unwrap_or("system");
         let pair = crate::ui::theme::parse_auto_theme_setting(selected);
         let (light, dark) = pair.unwrap_or((selected, selected));
         Self {
@@ -7606,7 +7606,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
-            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
+            label: format!("Theme · {}", args.theme_setting().unwrap_or("system")),
             selection: Selection::EditSetting("theme".into()),
         },
         Item {
@@ -7825,7 +7825,7 @@ fn select(
         Selection::SaveDefaultModel => save_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
-                "theme" => json!(args.use_theme.as_deref().unwrap_or("system")),
+                "theme" => json!(args.theme_setting().unwrap_or("system")),
                 "defaultModel" => json!(args.model),
                 "defaultThinkingLevel" => json!(args.thinking.as_deref().unwrap_or("off")),
                 "tuiMode" => json!(if args.tui_mode == Some(TuiMode::Regular) {
@@ -8594,7 +8594,7 @@ fn finish_external_editor(
         #[cfg(any(unix, windows))]
         editor_colors.take(),
         #[cfg(any(unix, windows))]
-        follows_terminal_appearance(args.use_theme.as_deref()),
+        follows_terminal_appearance(args.theme_setting()),
     )?);
     EXTERNAL_EDITOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     if view.graphics.enabled() {
