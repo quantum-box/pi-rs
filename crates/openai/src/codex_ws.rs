@@ -697,6 +697,10 @@ mod tests {
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).await.unwrap();
                     assert!(header_lines.contains("openai-beta: responses=experimental"));
+                    assert!(header_lines.contains("content-encoding: zstd"));
+                    let body = zstd::bulk::decompress(&body, 65536).unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["input"].as_array().unwrap().len(), 1);
                     let completion = "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{completion}",

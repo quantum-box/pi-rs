@@ -1216,11 +1216,32 @@ impl OpenAiResponses {
                 request = request.header("originator", "pi");
             }
         }
+        let request = if self.codex_account.is_some() {
+            let serialized = serde_json::to_vec(body)?;
+            let (bytes, compressed) =
+                tokio::task::spawn_blocking(move || match zstd::bulk::compress(&serialized, 3) {
+                    Ok(compressed) => (compressed, true),
+                    Err(_) => (serialized, false),
+                })
+                .await
+                .map_err(|_| Error::Model("Codex request compression task failed".into()))?;
+            headers.entry(reqwest::header::CONTENT_TYPE).or_insert(
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            headers.remove(reqwest::header::CONTENT_ENCODING);
+            if compressed {
+                headers.insert(
+                    reqwest::header::CONTENT_ENCODING,
+                    reqwest::header::HeaderValue::from_static("zstd"),
+                );
+            }
+            request.headers(headers).body(bytes)
+        } else {
+            request.headers(headers).json(body)
+        };
         let mut response = request
-            .headers(headers)
             .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(body)
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
@@ -1612,12 +1633,15 @@ mod tests {
                 "openai-beta: responses=experimental",
                 "originator: pi",
                 "authorization: bearer",
+                "content-type: application/json",
+                "content-encoding: zstd",
             ] {
                 assert!(headers.contains(header), "missing {header}");
             }
             let mut body = vec![0; length];
             socket.read_exact(&mut body).unwrap();
-            let body: Value = serde_json::from_slice(&body).unwrap();
+            let body: Value =
+                serde_json::from_slice(&zstd::bulk::decompress(&body, 65536).unwrap()).unwrap();
             assert_eq!(body["instructions"], "fixture system");
             assert_eq!(body["input"][0]["role"], "user");
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
