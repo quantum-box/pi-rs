@@ -166,7 +166,19 @@ impl Editor {
     /// Insert a typed character, grouping consecutive typing as Pi does.
     /// Paste and programmatic insertion continue to use the atomic `insert`.
     pub fn type_character(&mut self, character: char) {
-        let text = super::render::clean(&character.to_string());
+        self.type_character_text(character, &super::render::clean(&character.to_string()));
+    }
+    pub(super) fn type_settings_search(&mut self, character: char) {
+        let mut utf8 = [0; 4];
+        let text = match character {
+            '\r' | '\n' => return,
+            '\t' => "    ",
+            _ => character.encode_utf8(&mut utf8),
+        };
+        self.type_character_text(character, text);
+    }
+
+    fn type_character_text(&mut self, character: char, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -181,7 +193,7 @@ impl Editor {
             self.preferred_column = None;
             self.jump_forward = None;
         }
-        self.text.insert_str(self.cursor, &text);
+        self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.typing_word = true;
     }

@@ -1049,7 +1049,7 @@ impl Picker {
             {
                 let focus = self.tree_filter_focus();
                 if self.title == "Settings" {
-                    self.query.type_character(character);
+                    self.query.type_settings_search(character);
                 } else {
                     self.query.text.push(character);
                 }
@@ -2629,6 +2629,24 @@ mod tests {
             &keys,
         );
         assert_eq!(picker.query.text, "http\u{1b}timeout");
+    }
+
+    #[test]
+    fn settings_search_matches_control_characters_without_rendering_them() {
+        let mut picker = Picker::new("Settings", vec![]);
+        picker.paste("http");
+        picker.input(
+            KeyEvent::new(KeyCode::Char('\u{85}'), KeyModifiers::NONE),
+            &Keys::default(),
+        );
+        assert_eq!(picker.query.text, "http\u{85}");
+        let heading = picker.settings_heading("Settings · ", &Theme::system(), 80);
+        assert!(
+            heading
+                .spans
+                .iter()
+                .all(|span| !span.text.contains('\u{85}'))
+        );
     }
 
     #[test]
