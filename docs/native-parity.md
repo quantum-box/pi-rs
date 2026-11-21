@@ -4496,6 +4496,20 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can subscribe to assistant `message_start`,
+`message_update`, and `message_end` through the message lifecycle callback.
+The stream notifications use native text, thinking and tool-call fragments
+and arrive before the corresponding public notifications. A completed
+`message_end` may replace text within the response limit while retaining the
+assistant role and the provider's tool decisions. Edits are reflected in the
+model's retained reply, journal and final RPC message. Native provider replay
+retains opaque reasoning, tool data and empty signed placeholders while
+replacing its visible text. Signatures on replaced visible text are not
+reused. Display layout is rebuilt after an edit, and context estimates use the
+edited text while billing retains measured usage. Failed and aborted
+attempts receive transient start and end notifications when needed. Executable extensions advertise
+`message_lifecycle_hook`. Summary requests stay outside the hook.
+
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
 OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters

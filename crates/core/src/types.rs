@@ -507,6 +507,10 @@ impl ModelApi {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelMetadata {
+    /// Whether an extension replaced finalized assistant text after streaming.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assistant_text_edited: bool,
+
     /// Provider, importer, or catalog estimate in USD, absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<serde_json::Number>,

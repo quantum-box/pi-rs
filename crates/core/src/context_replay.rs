@@ -11,6 +11,62 @@ pub fn endpoint_replay_scope(scope: &str, endpoint: &str) -> String {
     )
 }
 
+/// Replace provider-visible text while retaining the native reasoning and tool payloads.
+pub(crate) fn replace_assistant_replay_text(
+    metadata: &ModelMetadata,
+    text: &str,
+) -> Option<Box<ProviderReplay>> {
+    let api = metadata.provider_api?;
+    let mut replay = metadata.replay.clone()?;
+    if !replay.supports_api(api) {
+        return None;
+    }
+    if api == ModelApi::OpenaiCompletions && !replay.is_context_edit() {
+        // Native chat-completions replay only carries reasoning. Its adapter
+        // always reads the visible text from the assistant message separately.
+        return Some(replay);
+    }
+    let visible = |block: &Value| match api {
+        ModelApi::AnthropicMessages => block["type"] == "text" && block["_pi_thinking"] != true,
+        ModelApi::BedrockConverseStream => block["type"] == "text",
+        ModelApi::PiMessages => {
+            block["type"] == "text" && !(block["text"] == "" && block["textSignature"].is_string())
+        }
+        ModelApi::GoogleGenerativeAi => {
+            block["text"].is_string()
+                && block["thought"] != true
+                && !(block["text"] == "" && block["thoughtSignature"].is_string())
+        }
+        ModelApi::OpenaiResponses => block["type"] == "message" || block["role"] == "assistant",
+        ModelApi::OpenaiCompletions => block["type"] == "context_edit_text",
+    };
+    let first_text = replay.blocks.iter().position(visible);
+    replay.blocks.retain(|block| !visible(block));
+    if !text.is_empty() {
+        let position = first_text.unwrap_or_else(|| {
+            replay
+                .blocks
+                .iter()
+                .position(|block| {
+                    block["type"] == "tool_use"
+                        || block["type"] == "toolCall"
+                        || block["type"] == "function_call"
+                        || block.get("functionCall").is_some()
+                        || block.get("_pi_context_edit_api").is_some()
+                })
+                .unwrap_or(replay.blocks.len())
+        });
+        let block = match api {
+            ModelApi::GoogleGenerativeAi => json!({"text":text}),
+            ModelApi::OpenaiResponses => json!({"role":"assistant","content":text}),
+            ModelApi::OpenaiCompletions => json!({"type":"context_edit_text","text":text}),
+            _ => json!({"type":"text","text":text}),
+        };
+        replay.blocks.insert(position, block);
+    }
+    (!replay.blocks.is_empty()).then_some(replay)
+}
+
 pub(crate) fn replacement_replay(
     replacement: &ContextContent,
     metadata: &ModelMetadata,
@@ -231,6 +287,72 @@ mod tests {
     use super::*;
     use crate::{Event, MemoryStore, Message, ResolvedModelIdentity, Session, UsageReport};
     use uuid::Uuid;
+
+    #[test]
+    fn native_message_edit_preserves_empty_signed_text_placeholders() {
+        for (api, visible, empty_signed, call, edited) in [
+            (
+                ModelApi::GoogleGenerativeAi,
+                json!({"text":"old"}),
+                json!({"text":"","thoughtSignature":"signed-empty"}),
+                json!({"functionCall":{"id":"call","name":"read","args":{}},"thoughtSignature":"signed-call"}),
+                json!({"text":"edited"}),
+            ),
+            (
+                ModelApi::PiMessages,
+                json!({"type":"text","text":"old"}),
+                json!({"type":"text","text":"","textSignature":"signed-empty"}),
+                json!({"type":"toolCall","id":"call","name":"read","arguments":{},"thoughtSignature":"signed-call"}),
+                json!({"type":"text","text":"edited"}),
+            ),
+        ] {
+            let metadata = ModelMetadata {
+                provider_api: Some(api),
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: "fixture".into(),
+                        model: "fixture".into(),
+                    },
+                    blocks: vec![visible, empty_signed.clone(), call.clone()],
+                })),
+                ..Default::default()
+            };
+            assert_eq!(
+                replace_assistant_replay_text(&metadata, "edited")
+                    .unwrap()
+                    .blocks,
+                [edited, empty_signed, call]
+            );
+        }
+    }
+
+    #[test]
+    fn native_message_edit_preserves_signed_reasoning_and_tool_replay() {
+        let reasoning = json!({"type":"thinking","thinking":"hidden","signature":"sealed"});
+        let call = json!({"type":"tool_use","id":"call","name":"read","input":{"path":"file"}});
+        let original = ModelMetadata {
+            provider_api: Some(ModelApi::AnthropicMessages),
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "anthropic".into(),
+                    model: "fixture".into(),
+                },
+                blocks: vec![
+                    reasoning.clone(),
+                    json!({"type":"text","text":"old"}),
+                    call.clone(),
+                    json!({"type":"text","text":"suffix"}),
+                ],
+            })),
+            ..Default::default()
+        };
+        let replay = replace_assistant_replay_text(&original, "edited").unwrap();
+        assert_eq!(
+            replay.blocks,
+            [reasoning, json!({"type":"text","text":"edited"}), call]
+        );
+        assert_eq!(original.replay.unwrap().identity, replay.identity);
+    }
 
     #[test]
     fn bedrock_edited_empty_thinking_signature_survives_reopen() {

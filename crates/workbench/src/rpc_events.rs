@@ -510,11 +510,20 @@ impl Stream {
             let blocks = self.assistant["content"]
                 .as_array_mut()
                 .expect("assistant blocks");
-            let mut text = blocks.iter_mut().filter(|block| block["type"] == "text");
-            if let Some(first) = text.next()
-                && text.next().is_none()
-            {
-                first["text"] = json!(content);
+            if self.metadata.assistant_text_edited {
+                let first_text = blocks.iter().position(|block| block["type"] == "text");
+                blocks.retain(|block| block["type"] != "text");
+                if !content.is_empty() {
+                    let index = first_text.unwrap_or(0).min(blocks.len());
+                    blocks.insert(index, json!({"type": "text", "text": content}));
+                }
+            } else {
+                let mut text = blocks.iter_mut().filter(|block| block["type"] == "text");
+                if let Some(first) = text.next()
+                    && text.next().is_none()
+                {
+                    first["text"] = json!(content);
+                }
             }
         }
         events.push(json!({"type":"message_end","message":self.assistant}));
@@ -948,6 +957,38 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn native_message_edit_replaces_every_streamed_text_block_in_final_rpc_message() {
+        let mut stream = Stream {
+            assistant: json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "reasoning"},
+                {"type": "text", "text": "first"},
+                {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}},
+                {"type": "text", "text": "second"}
+            ]}),
+            started: true,
+            metadata: ModelMetadata {
+                assistant_text_edited: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        stream.finish_message(Some("replace both".into()), &mut events);
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(
+            end["message"]["content"],
+            json!([
+                {"type": "thinking", "thinking": "reasoning"},
+                {"type": "text", "text": "replace both"},
+                {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}}
+            ])
+        );
+    }
 
     #[test]
     fn tool_attempt_start_is_deduplicated_by_operation_identity() {
