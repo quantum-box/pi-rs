@@ -1459,6 +1459,19 @@ pub trait Extension: Send + Sync {
         Ok(())
     }
 
+    /// Opt in to observing parsed transport events before model normalization.
+    fn handles_provider_stream_event(&self) -> bool {
+        false
+    }
+
+    async fn provider_stream_event(
+        &self,
+        _event: &crate::ProviderStreamEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Opt in to model and thinking-level selection events.
     fn handles_model_selection(&self) -> bool {
         false

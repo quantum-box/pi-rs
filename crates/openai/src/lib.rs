@@ -1202,6 +1202,8 @@ impl OpenAiResponses {
             if !pending.is_empty() { yield Ok(pending); }
         };
         let mut source = Box::pin(bytes.eventsource());
+        let observation_headers =
+            pi_rs_core::observes_provider_stream().then(|| self.headers.clone());
         Ok(Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
@@ -1215,6 +1217,11 @@ impl OpenAiResponses {
                 })?;
                 if item.data == "[DONE]" { continue; }
                 let event: Value = serde_json::from_str(&item.data).map_err(|_| Error::Model("invalid OpenAI stream event".into()))?;
+                if let Some(headers) = &observation_headers {
+                    pi_rs_core::observe_provider_stream(
+                        &provider, pi_rs_core::ModelApi::OpenaiResponses, &model, &event, &error_secrets, headers,
+                    ).await;
+                }
                 let kind = field(&event, "type")?;
                 started |= recognized_response_event(kind);
                 match kind {

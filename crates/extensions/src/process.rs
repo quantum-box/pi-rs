@@ -195,6 +195,10 @@ enum ProtocolRequest {
         event: pi_rs_core::ProviderResponseEvent,
         state: Option<ExtensionState>,
     },
+    ProviderStreamEvent {
+        event: pi_rs_core::ProviderStreamEvent,
+        state: Option<ExtensionState>,
+    },
     AgentBeforeSettle {
         event: pi_rs_core::AgentBeforeSettle,
         state: Option<ExtensionState>,
@@ -420,6 +424,8 @@ struct Description {
     model_selection_hook: bool,
     #[serde(default)]
     after_provider_response_hook: bool,
+    #[serde(default)]
+    provider_stream_event_hook: bool,
     #[serde(default)]
     session_lifecycle_hook: bool,
     #[serde(default)]
@@ -1106,6 +1112,23 @@ impl Extension for ExecutableExtension {
             return Ok(());
         }
         self.request_async(ProtocolRequest::AfterProviderResponse {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+    fn handles_provider_stream_event(&self) -> bool {
+        self.description.provider_stream_event_hook
+    }
+    async fn provider_stream_event(
+        &self,
+        event: &pi_rs_core::ProviderStreamEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if !self.handles_provider_stream_event() {
+            return Ok(());
+        }
+        self.request_async(ProtocolRequest::ProviderStreamEvent {
             event: event.clone(),
             state: state.cloned(),
         })
@@ -3689,6 +3712,7 @@ async fn dispatch_inner(
             ui_prompt_lifecycle_hook: extension.handles_ui_prompt_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
             after_provider_response_hook: extension.handles_after_provider_response(),
+            provider_stream_event_hook: extension.handles_provider_stream_event(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
             pi_lifecycle_fields: true,
@@ -3837,6 +3861,11 @@ async fn dispatch_inner(
         ProtocolRequest::AfterProviderResponse { event, state } => encode(
             extension
                 .after_provider_response(&event, state.as_ref())
+                .await,
+        ),
+        ProtocolRequest::ProviderStreamEvent { event, state } => encode(
+            extension
+                .provider_stream_event(&event, state.as_ref())
                 .await,
         ),
         ProtocolRequest::AgentBeforeSettle { event, state } => {
@@ -4531,7 +4560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_response_hook_negotiates_and_dispatches_read_only_metadata() {
+    async fn provider_hooks_negotiate_and_dispatch_read_only_metadata() {
         struct Observe;
         #[async_trait::async_trait]
         impl Extension for Observe {
@@ -4557,6 +4586,26 @@ mod tests {
                 );
                 Ok(())
             }
+
+            fn handles_provider_stream_event(&self) -> bool {
+                true
+            }
+
+            async fn provider_stream_event(
+                &self,
+                event: &pi_rs_core::ProviderStreamEvent,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(event.provider, "fixture");
+                assert_eq!(event.api, pi_rs_core::ModelApi::AnthropicMessages);
+                assert_eq!(event.model, "model-id");
+                assert_eq!(
+                    event.data,
+                    serde_json::json!({"type":"content_block_delta"})
+                );
+                assert!(state.is_none());
+                Ok(())
+            }
         }
 
         let fixture: Arc<dyn Extension> = Arc::new(Observe);
@@ -4568,6 +4617,19 @@ mod tests {
             "type": "after_provider_response",
             "event": {"status": 429, "headers": {"retry-after": "3"}},
             "state": {"version": 1, "data": {"seen": 1}}
+        }))
+        .unwrap();
+        assert_eq!(
+            dispatch(fixture.clone(), request).await.unwrap(),
+            Value::Null
+        );
+        assert_eq!(descriptor["provider_stream_event_hook"], true);
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "provider_stream_event",
+            "event": {
+                "provider": "fixture", "api": "anthropic-messages", "model": "model-id",
+                "data": {"type":"content_block_delta"}
+            }
         }))
         .unwrap();
         assert_eq!(dispatch(fixture, request).await.unwrap(), Value::Null);

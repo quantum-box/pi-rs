@@ -4475,7 +4475,8 @@ caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
-OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, Ollama and Pi
+Messages adapters
 await these callbacks in registration order before reading either a success or
 error body. This includes HTTP errors the native transports receive directly.
 Callback failures are reported as extension diagnostics. The
@@ -4490,6 +4491,19 @@ gateway fields. It services the hook as soon as the SDK reports those headers,
 even if the SDK waits for the stream before returning. HTTP errors follow Pi's
 Bedrock behavior and produce no callback. Custom transports opt in by reporting metadata.
 Summary and catalog requests remain outside the turn hook.
+
+Native `provider_stream_event` callbacks see parsed events from OpenAI
+Responses, OpenAI-compatible chat, Anthropic Messages, Google Gemini, Ollama
+and Pi Messages before those transports normalize them into model events.
+Events include the provider, API, requested model and parsed data. Callbacks
+run in registration order and their results cannot rewrite the stream. The
+observer copy withholds known reflected credentials and authentication fields
+and is never persisted. Executable extensions negotiate
+`provider_stream_event_hook` and receive `provider_stream_event` requests.
+Repeated callback failures produce one diagnostic per observer and request,
+and a timeout ends that observer's participation in the remaining frames.
+Stream callbacks share up to one quarter of the model request timeout across
+all frames. The Bedrock adapter currently supplies HTTP metadata at this boundary.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,

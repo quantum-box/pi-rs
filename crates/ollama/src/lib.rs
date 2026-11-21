@@ -1186,6 +1186,7 @@ impl Ollama {
         let progress = self.progress.clone();
         let reasoning = self.reasoning.clone();
         let loading_probe = self.clone();
+        let observe_stream = pi_rs_core::observes_provider_stream();
         Ok(Box::pin(async_stream::try_stream! {
             let mut bytes = 0usize;
             let mut events = response.bytes_stream().map(move |chunk| {
@@ -1251,6 +1252,12 @@ impl Ollama {
                     }
                     yield ModelEvent::Complete { calls, usage };
                     return;
+                }
+                if observe_stream && let Ok(raw) = serde_json::from_str::<Value>(&event.data) {
+                    pi_rs_core::observe_provider_stream(
+                        &loading_probe.provider, ModelApi::OpenaiCompletions, &requested_model,
+                        &raw, &error_secrets, &loading_probe.headers,
+                    ).await;
                 }
                 let chunk: Chunk = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed SSE chunk".into()))?;
