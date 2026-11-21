@@ -2543,7 +2543,7 @@ impl View {
             ));
         }
         if let Some(picker) = &self.picker {
-            lines = picker.render(theme, width, body_height, keys);
+            lines = picker.render_in_terminal(theme, width, body_height, height, keys);
         }
         let dialog_cursor = self
             .dialog()
@@ -2994,8 +2994,13 @@ impl View {
                 active.extend(render_entry(&entry));
             }
             if let Some(picker) = &self.picker {
-                active =
-                    picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
+                active = picker.render_in_terminal(
+                    theme,
+                    width,
+                    height - prompt_height - 4 - below.len(),
+                    height,
+                    keys,
+                );
             }
         }
         let dialog_height = height - prompt_height - 4 - below.len();

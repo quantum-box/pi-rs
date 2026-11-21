@@ -2484,6 +2484,9 @@ so descendants attach to their nearest visible ancestor. Deep trees pan
 horizontally to keep the selected entry visible while retaining the selection
 gutter; clipping skips partially visible wide characters at either boundary
 while preserving theme styling.
+The tree centers the selected row when possible. It shows up to half the
+terminal height, with a five-row minimum when space allows, and uses the
+visible row capacity for page movement.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label without changing its identity. Direct `/checkout` releases its
 journal lock before restoring the view.
