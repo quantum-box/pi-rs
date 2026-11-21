@@ -4456,6 +4456,19 @@ discovery. An independently built Rust extension verified turn order
 across a retry and a tool call, successful and failed runs, and a
 non-fatal callback failure.
 
+### Native UI prompt lifecycle
+
+Native tools that wait on an extension UI emit Pi's `ui_prompt_start` and
+`ui_prompt_end` to opted-in Rust and executable observers. Overlapping
+prompts in a turn keep the first kind and title. A cancellation or dropped
+UI future closes the interval. The payload omits input values and replies.
+The native callback uses the turn's extension-state snapshot and runs
+without a session host. Tool-owned prompts work through the terminal, RPC,
+or embedding UI. An ordered, bounded queue per run skips entire pairs when
+saturated so the UI can continue. The run drains queued observations for
+up to one second before settlement, cancels remaining dispatch, and reports
+observed callback failures.
+
 ### Native modal components
 
 A Rust extension can request a custom modal component with styled
