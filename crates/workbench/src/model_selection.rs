@@ -87,8 +87,11 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
     };
     let mut models = args.model_profiles.model_ids(&provider);
     let mut probe_details = false;
-    let bundled = super::builtin_chat::find(provider.id())
-        .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
+    let bundled = (provider.id() == "cloudflare-workers-ai"
+        && super::model_profiles::cloudflare_workers_chat_account(args.endpoint_for(&provider))
+            .is_some())
+        || super::builtin_chat::find(provider.id())
+            .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
     let mut complete = false;
     if (probe && !bundled) || provider == Provider::Radius {
         match client.models().await {
