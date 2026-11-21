@@ -6829,13 +6829,20 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
             _ => None,
         });
     restore_workspace(args)?;
-    view.restore(args)?;
+    let images = std::mem::take(&mut view.draft_images);
+    let restored = view.restore(args);
+    view.draft_images = images;
+    restored?;
     for warning in args.settings.diagnostics() {
         view.append(warning);
     }
-    if let Some(input) = input {
+    if view.editor.text.trim().is_empty()
+        && view.draft_images.is_empty()
+        && let Some(input) = input
+    {
         view.editor.replace(input);
     }
+    view.append("Navigated to selected point");
     Ok(())
 }
 
@@ -12752,6 +12759,42 @@ exit {exit}
         assert!(output.len() > first_len);
         assert!(!colors.color_requery);
         assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+    }
+
+    #[test]
+    fn tree_navigation_preserves_an_existing_editor_draft() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&path).unwrap();
+        session
+            .append_user_with_images("previous user message".into(), vec![], None)
+            .unwrap();
+        let selected = session.head();
+        drop(session);
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--no-trust"]);
+        args.workspace = directory.path().into();
+        args.session = path;
+        let mut view = super::View::default();
+
+        view.editor.replace("unsent draft".into());
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert_eq!(view.editor.text, "unsent draft");
+
+        let image = pi_rs::ImageContent {
+            mime_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        };
+        view.editor.replace(String::new());
+        view.draft_images.push(image.clone());
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert!(view.editor.text.is_empty());
+        assert_eq!(view.draft_images, [image]);
+
+        view.draft_images.clear();
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert_eq!(view.editor.text, "previous user message");
     }
 
     #[test]
