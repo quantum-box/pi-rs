@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolSpec};
 use rmcp::{
     RoleClient,
-    model::{CallToolResponse, ProtocolVersion, SubscriptionFilter},
+    model::{
+        CallToolResponse, ErrorData, PaginatedRequestParams, ProtocolVersion, SubscriptionFilter,
+    },
     service::{
         ClientInitializeError, ClientLifecycleMode, ClientServiceExt, NotificationContext,
         RunningService, ServiceError,
@@ -827,7 +829,12 @@ impl McpExtension {
             .as_ref()
             .is_some_and(|info| info.capabilities.tools.is_some())
         {
-            tokio::time::timeout(timeout, service.list_all_tools())
+            let service = &*service;
+            let listing = all_pages("tools/list", |params| async move {
+                let result = service.list_tools(Some(params)).await?;
+                Ok((result.tools, result.next_cursor))
+            });
+            tokio::time::timeout(timeout, listing)
                 .await
                 .map_err(|_| Error::Config(format!("MCP {name} tool discovery timed out")))?
                 .map_err(|error| {
@@ -1641,16 +1648,24 @@ impl McpTool {
     }
     async fn invoke_resource(&self, arguments: &Value) -> std::result::Result<Value, CallError> {
         let service = self.connection.active_service().await?;
+        let service = &*service;
         match self.remote_name.as_str() {
             "list_resources" => {
-                let resources = service.list_all_resources().await.map_err(call_error)?;
+                let resources = all_pages("resources/list", |params| async move {
+                    let result = service.list_resources(Some(params)).await?;
+                    Ok((result.resources, result.next_cursor))
+                })
+                .await
+                .map_err(call_error)?;
                 Ok(json!({"resources": visible_resource_listing(serde_json::to_value(resources)?)}))
             }
             "list_resource_templates" => {
-                let templates = service
-                    .list_all_resource_templates()
-                    .await
-                    .map_err(call_error)?;
+                let templates = all_pages("resources/templates/list", |params| async move {
+                    let result = service.list_resource_templates(Some(params)).await?;
+                    Ok((result.resource_templates, result.next_cursor))
+                })
+                .await
+                .map_err(call_error)?;
                 Ok(
                     json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
                 )
@@ -1680,7 +1695,12 @@ impl McpTool {
                 ))
             }
             "list_prompts" => {
-                let prompts = service.list_all_prompts().await.map_err(call_error)?;
+                let prompts = all_pages("prompts/list", |params| async move {
+                    let result = service.list_prompts(Some(params)).await?;
+                    Ok((result.prompts, result.next_cursor))
+                })
+                .await
+                .map_err(call_error)?;
                 Ok(json!({"prompts":prompts}))
             }
             "get_prompt" => {
@@ -1710,6 +1730,42 @@ impl McpTool {
     }
 }
 
+const MAX_LIST_PAGES: usize = 1_000;
+
+async fn all_pages<T, F>(
+    method: &str,
+    mut list: impl FnMut(PaginatedRequestParams) -> F,
+) -> std::result::Result<Vec<T>, ServiceError>
+where
+    F: std::future::Future<Output = std::result::Result<(Vec<T>, Option<String>), ServiceError>>,
+{
+    let invalid = |message| ServiceError::McpError(ErrorData::invalid_request(message, None));
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_LIST_PAGES {
+        let mut params = PaginatedRequestParams::default();
+        params.cursor = cursor;
+        let (page, next) = list(params).await?;
+        items.extend(page);
+        let Some(next) = nonempty_cursor(next) else {
+            return Ok(items);
+        };
+        if !seen.insert(next.clone()) {
+            // Cursors are opaque server-provided data and can contain secrets.
+            return Err(invalid(format!("MCP {method} returned a duplicate cursor")));
+        }
+        cursor = Some(next);
+    }
+    Err(invalid(format!(
+        "MCP {method} exceeded {MAX_LIST_PAGES} pages"
+    )))
+}
+
+fn nonempty_cursor(cursor: Option<String>) -> Option<String> {
+    cursor.filter(|value| !value.is_empty())
+}
+
 fn resource_page_params(arguments: &Value) -> Result<rmcp::model::PaginatedRequestParams> {
     let cursor = match arguments.get("cursor") {
         None | Some(Value::Null) => None,
@@ -1731,7 +1787,7 @@ fn resource_page(server: &str, key: &str, items: Value, cursor: Option<String>) 
         .collect();
     let mut result = json!({"server": server});
     result[key] = json!(items);
-    if let Some(cursor) = cursor {
+    if let Some(cursor) = nonempty_cursor(cursor) {
         result["nextCursor"] = json!(cursor);
     }
     result
@@ -2032,6 +2088,72 @@ pub async fn resolve_value_with_cleanup(value: &str, cleanup: Option<&Children>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pagination_preserves_items_and_treats_empty_cursors_as_terminal() {
+        let mut calls = 0;
+        let items = all_pages("resources/list", |params| {
+            calls += 1;
+            let page = if calls == 1 {
+                assert!(params.cursor.is_none());
+                (vec!["first"], Some(" through ".into()))
+            } else {
+                assert_eq!(params.cursor.as_deref(), Some(" through "));
+                (vec!["last"], Some(String::new()))
+            };
+            std::future::ready(Ok(page))
+        })
+        .await
+        .unwrap();
+        assert_eq!(items, ["first", "last"]);
+        assert_eq!(calls, 2);
+        assert!(
+            resource_page("fixture", "resources", json!([]), Some(String::new()))
+                .get("nextCursor")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_cycles_and_limits_pages() {
+        let mut calls = 0;
+        let error = all_pages("tools/list", |params| {
+            calls += 1;
+            let next = match params.cursor.as_deref() {
+                None | Some("another") => "opaque-secret",
+                Some("opaque-secret") => "another",
+                value => panic!("unexpected cursor {value:?}"),
+            };
+            std::future::ready(Ok((Vec::<()>::new(), Some(next.into()))))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(calls, 3);
+        assert!(error.contains("duplicate cursor") && !error.contains("opaque-secret"));
+
+        for terminal_at_limit in [false, true] {
+            let mut calls = 0;
+            let results = all_pages("resources/templates/list", |_| {
+                calls += 1;
+                let next =
+                    (!(terminal_at_limit && calls == MAX_LIST_PAGES)).then(|| calls.to_string());
+                std::future::ready(Ok((vec![calls], next)))
+            })
+            .await;
+            assert_eq!(calls, MAX_LIST_PAGES);
+            if terminal_at_limit {
+                assert_eq!(results.unwrap().len(), MAX_LIST_PAGES);
+            } else {
+                assert!(
+                    results
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exceeded 1000 pages")
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_page_preparation_does_not_block_or_leak_file() {
