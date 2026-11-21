@@ -42,6 +42,7 @@ mod packages;
 mod pi_messages;
 mod process;
 mod providers;
+mod vertex_auth;
 mod xai_auth;
 use providers::Provider;
 mod radius_auth;
@@ -467,6 +468,20 @@ impl Cli {
                             .map(model_auth::Credential::Literal);
                     }
                     return None;
+                }
+                if provider.id() == "google-vertex" && endpoint == provider.default_endpoint() {
+                    return std::env::var("GOOGLE_CLOUD_API_KEY")
+                        .ok()
+                        .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal)
+                        .or_else(|| {
+                            vertex_auth::Adc::configured(self.model_keys.environment(
+                                provider,
+                                endpoint,
+                                &self.model_profiles,
+                            ))
+                            .map(model_auth::Credential::VertexAdc)
+                        });
                 }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
                     return builtin

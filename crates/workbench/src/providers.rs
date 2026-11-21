@@ -33,6 +33,7 @@ pub(super) enum Adapter {
     OpenAiResponses,
     Anthropic,
     Google,
+    GoogleVertex,
     Bedrock,
     PiMessages,
 }
@@ -44,6 +45,7 @@ impl Adapter {
             "openai-responses" => Some(Self::OpenAiResponses),
             "anthropic-messages" => Some(Self::Anthropic),
             "google-generative-ai" => Some(Self::Google),
+            "google-vertex" => Some(Self::GoogleVertex),
             "bedrock-converse-stream" => Some(Self::Bedrock),
             "pi-messages" => Some(Self::PiMessages),
             _ => None,
@@ -56,6 +58,7 @@ impl Adapter {
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic-messages",
             Self::Google => "google-generative-ai",
+            Self::GoogleVertex => "google-vertex",
             Self::Bedrock => "bedrock-converse-stream",
             Self::PiMessages => "pi-messages",
         }
@@ -214,9 +217,12 @@ impl Provider {
                 }
                 Ok(Client::Anthropic(client))
             }
-            Adapter::Google => {
+            Adapter::Google | Adapter::GoogleVertex => {
                 let token = token.ok_or_else(missing_key)?;
                 let mut client = Google::new(endpoint, &token)?;
+                if adapter == Adapter::GoogleVertex {
+                    client = client.with_vertex(bearer)?;
+                }
                 if self != &Self::Google {
                     client = client.with_provider(self.id(), self.replay_scope(adapter, endpoint));
                 }
@@ -402,7 +408,7 @@ impl Deferred {
             Some(credential) => Some(credential.resolve().await?),
             None => None,
         };
-        let headers = self
+        let mut headers = self
             .headers
             .resolve(&self.provider, token.as_deref())
             .await?;
@@ -422,9 +428,21 @@ impl Deferred {
                 radius_checked = true;
             }
         }
+        let endpoint = match &self.credential {
+            Some(Credential::VertexAdc(adc)) => {
+                if !headers.contains_key("x-goog-user-project")
+                    && let Some(quota) = adc.quota_project()
+                    && let Ok(value) = reqwest::header::HeaderValue::from_str(&quota)
+                {
+                    headers.insert("x-goog-user-project", value);
+                }
+                adc.endpoint.as_str()
+            }
+            _ => &self.endpoint,
+        };
         let mut client = self
             .provider
-            .connect_prechecked(self.adapter, &self.endpoint, token, bearer, radius_checked)?
+            .connect_prechecked(self.adapter, endpoint, token, bearer, radius_checked)?
             .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         match (&self.credential, &mut client) {
@@ -490,6 +508,7 @@ impl Client {
                 Adapter::OpenAiResponses
                     | Adapter::ChatCompletions
                     | Adapter::Google
+                    | Adapter::GoogleVertex
                     | Adapter::Anthropic
             ),
             _ => false,
@@ -882,6 +901,7 @@ impl Client {
                     Adapter::OpenAiResponses
                         | Adapter::ChatCompletions
                         | Adapter::Google
+                        | Adapter::GoogleVertex
                         | Adapter::Anthropic
                 ) =>
             {
@@ -1140,9 +1160,12 @@ impl Client {
             }
             Self::Google(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
-                let levels = metadata
-                    .as_ref()
-                    .and_then(|model| model.levels(Adapter::Google));
+                let levels = metadata.as_ref().and_then(|model| {
+                    model.levels(
+                        args.model_profiles
+                            .model_adapter(&args.provider, &args.model),
+                    )
+                });
                 let resolve = |level: &str| -> Result<String> {
                     let mapped = metadata
                         .as_ref()
@@ -1181,11 +1204,14 @@ impl Client {
                     .google_strict_tool_policy(&args.provider);
                 // The final model still dispatches on the selected client's route.
                 let selected_endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
+                let adapter = args
+                    .model_profiles
+                    .model_adapter(&args.provider, &args.model);
                 let same_route = |id: &str| {
-                    args.model_profiles.model_adapter(&args.provider, id) == Adapter::Google
+                    args.model_profiles.model_adapter(&args.provider, id) == adapter
                         && args.model_endpoint_for(&args.provider, Some(id)) == selected_endpoint
                 };
-                let unknown_route = args.provider.adapter() == Adapter::Google
+                let unknown_route = args.provider.adapter() == adapter
                     && args.model_endpoint_for(&args.provider, None) == selected_endpoint;
                 let configured_models: std::collections::BTreeSet<String> = args
                     .model_profiles

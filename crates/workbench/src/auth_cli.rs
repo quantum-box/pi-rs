@@ -127,6 +127,12 @@ async fn resolve(
                 }),
             );
         }
+        if matches!(credential, super::model_auth::Credential::VertexAdc(_)) {
+            return Ok((wanted.is_none()).then_some(Resolved {
+                kind: AuthType::ApiKey,
+                value: None,
+            }));
+        }
         if matches!(credential, super::model_auth::Credential::BedrockProfile(_)) {
             return Ok((wanted.is_none()).then_some(Resolved {
                 kind: AuthType::ApiKey,

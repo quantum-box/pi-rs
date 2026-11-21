@@ -24,6 +24,7 @@ pub(crate) fn replacement_replay(
         api,
         ModelApi::AnthropicMessages
             | ModelApi::GoogleGenerativeAi
+            | ModelApi::GoogleVertex
             | ModelApi::OpenaiResponses
             | ModelApi::OpenaiCompletions
     ) {
@@ -77,7 +78,7 @@ pub(crate) fn replacement_replay(
                 }
             }
             (
-                ModelApi::GoogleGenerativeAi,
+                ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex,
                 ContentBlock::Text {
                     text,
                     text_signature,
@@ -90,7 +91,7 @@ pub(crate) fn replacement_replay(
                 Some(part)
             }
             (
-                ModelApi::GoogleGenerativeAi,
+                ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex,
                 ContentBlock::Thinking {
                     thinking,
                     thinking_signature,
@@ -181,7 +182,7 @@ pub(crate) fn replacement_replay(
                 ModelApi::AnthropicMessages | ModelApi::BedrockConverseStream => {
                     Some(json!({"type":"tool_use","id":id,"name":name,"input":arguments}))
                 }
-                ModelApi::GoogleGenerativeAi => {
+                ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex => {
                     let mut part = json!({"functionCall":{"id":id,"name":name,"args":arguments}});
                     if let Some(signature) = thought_signature.as_deref().filter(|s| !s.is_empty())
                     {

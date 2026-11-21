@@ -442,6 +442,7 @@ pub enum ModelApi {
     OpenaiResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
+    GoogleVertex,
     BedrockConverseStream,
     PiMessages,
 }
@@ -453,6 +454,7 @@ impl ModelApi {
             "openai-responses" => Some(Self::OpenaiResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             "google-generative-ai" => Some(Self::GoogleGenerativeAi),
+            "google-vertex" => Some(Self::GoogleVertex),
             "bedrock-converse-stream" => Some(Self::BedrockConverseStream),
             "pi-messages" => Some(Self::PiMessages),
             _ => None,
@@ -465,6 +467,7 @@ impl ModelApi {
             Self::OpenaiResponses => "openai-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
+            Self::GoogleVertex => "google-vertex",
             Self::BedrockConverseStream => "bedrock-converse-stream",
             Self::PiMessages => "pi-messages",
         }
