@@ -594,6 +594,15 @@ impl Cli {
             .unwrap_or_else(|| self.model_profiles.endpoint(provider))
     }
 
+    fn replace_model_keys(&mut self, keys: model_auth::Keys) -> Result<()> {
+        let old_account = self.model_keys.cloudflare_chat_account().map(str::to_owned);
+        self.model_keys = keys;
+        if old_account.as_deref() != self.model_keys.cloudflare_chat_account() {
+            self.reload_model_profiles()?;
+        }
+        Ok(())
+    }
+
     fn reload_model_profiles(&mut self) -> Result<()> {
         let profiles = model_profiles::Profiles::load(&self.model_keys)?;
         let provider = profiles.provider(self.provider.id()).ok_or_else(|| {

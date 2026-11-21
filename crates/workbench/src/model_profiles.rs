@@ -749,6 +749,11 @@ fn configure_cloudflare_workers(
             super::operation_models::valid_cloudflare_account(configured).then_some(configured)
         }),
     };
+    let route_account = route_account.map(str::to_owned);
+    if entry.get("api").and_then(Value::as_str) == Some("cloudflare-workers-ai-system-one") {
+        // The operation catalogue has already consumed this classifier-only profile.
+        entry.clear();
+    }
     if let Some(account) = route_account {
         let base = format!("{PREFIX}{account}/ai/v1");
         entry.insert("baseUrl".into(), Value::String(base));
@@ -1678,6 +1683,24 @@ mod tests {
             keys.environment(&provider, other.endpoint(&provider), &other)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cloudflare_classifier_only_api_does_not_override_chat_api() {
+        let profiles = Profiles::parse(&json!({"providers":{"cloudflare-workers-ai":{
+            "baseUrl":"https://api.cloudflare.com/client/v4/accounts/mine/ai",
+            "api":"cloudflare-workers-ai-system-one","apiKey":"classifier-only",
+            "models":[{"id":"typesafe/jev","type":"classifier"}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(
+            endpoint,
+            "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
+        );
+        assert!(profiles.credential(&provider, endpoint).is_none());
+        assert_eq!(profiles.model_ids(&provider).len(), 19);
     }
 
     #[test]
