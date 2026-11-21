@@ -8,8 +8,9 @@ directly in each `prompts` directory and honors its ignore files, matching Pi.
 Nested or hidden prompt files can still be selected explicitly.
 The requested compatibility is equivalent functionality implemented in Rust.
 
-Markdown headings are separated from a following block by one blank line,
-without adding a trailing blank line after a final heading.
+Markdown headings are separated from a following block by one blank line. A
+final heading has a trailing blank line when the source contains a trailing
+Markdown space token, matching Pi.
 
 [Reference CLI](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/cli.md)
 · [Reference terminal](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/usage.md)
@@ -492,9 +493,19 @@ is rejected before its hook runs. A prompt that runs an extension command return
 Idle extension commands
 take precedence over valid attached images in RPC; the
 attachments are not sent to the model even when the command triggers a turn.
-RPC validates images before command dispatch. Unlike Pi, a command that
-triggers a model turn reports `started`, and commands submitted while a turn
-is active cannot yet execute immediately. A model turn returns
+When an idle RPC command callback reports an identifiable error, native emits
+an `extension_error` with Pi's `command:<invocation>` path and returns `handled`.
+The native extension ID remains in `extension`, and executable extensions also
+include `nativeExtensionPath`. Executables advertise typed command failure
+support; legacy executable `Err` responses remain prompt failures because they
+cannot distinguish callback failures from dispatch failures. Executable transport
+and protocol failures, state migration, action validation, and journal failures
+remain prompt errors. Native in-process extensions report command callback errors
+as strings and do not distinguish a transport error unless they override the
+classified callback.
+RPC validates images before command dispatch. An idle command that triggers a
+model turn reports `handled` before that turn completes, as in Pi. Commands
+submitted while a turn is active cannot yet execute immediately. A normal model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
@@ -525,8 +536,19 @@ can queue input before the next prompt without starting the model. The same
 queue accepts prompts with `streamingBehavior` during a turn, expands prompt
 templates and skills, and emits `queue_update` as inputs are saved or consumed.
 Successful RPC steering and follow-up mode changes omit `data`, matching Pi.
-Native persists mode changes asynchronously; overlapping requests can persist
-out of order, and a settings-write failure can leave the live mode changed.
+Native applies mode changes in order and persists their settings in the same
+order. Unlike Pi's asynchronously queued settings save, native reports a mode
+request's settings-write result; a write failure can leave the live mode changed.
+At most 32 accepted mode changes may be awaiting application or persistence in
+one worker. Invalid mode values and changes rejected because this capacity is
+full receive errors without waiting for earlier accepted writes, so their
+responses can precede those writes' responses. The rejected changes do not take
+effect, and a client may retry after pending writes finish. Pi's handler forwards
+the mode without native's enum validation. This bound applies
+to mode changes, not to all RPC input. Shutdown waits for accepted mode writes
+while abort and extension UI responses remain available. Pi's JSONL reader
+dispatches lines without waiting for earlier command handlers; it does not
+promise FIFO ordering for all RPC responses.
 Queued input is acknowledged after it is saved. The `get_entries` and
 `get_tree` responses use Pi entry types, string IDs, parent links, and a leaf
 ID. Session records used internally for run recovery are omitted from this
@@ -580,8 +602,12 @@ The echoed JSON value retains Rust's parsed integer precision, which can differ
 from JavaScript for integers outside the safe range; out-of-range JSON numbers
 such as `1e400` are rejected by the native parser.
 Malformed JSON produces a `parse` response with a
-parser diagnostic. Unescaped string control characters reached by the parser
-use Pi's V8 wording and UTF-16 positions, including controls after a lone
+parser diagnostic. When the native parser reaches an unfinished numeric fraction,
+exponent, or leading minus at the end of a record, it uses Pi's V8 wording and
+UTF-16 position. Earlier
+errors, including lone surrogates and out-of-range numbers, retain their own
+diagnostics. Unescaped string control characters reached
+by the parser use Pi's V8 wording and UTF-16 positions, including controls after a lone
 surrogate in the same string. For records up to 1 MiB, a diagnostic-only retry
 also recognizes controls after a surrogate in another string when it is the
 next parser error. Larger records, retry depth or number-range failures, and
@@ -1885,6 +1911,21 @@ and byte limits. Large text files remain searchable. Overlapping context ranges
 are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
 radius is limited to 1,000 lines.
 
+Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
+JSON numbers as JavaScript doubles. `ls` compares the number directly, including
+zero, negative and fractional values. Local `find` reproduces fd's numeric
+argument parsing: zero means unlimited, while negative, fractional, and values
+outside fd's host-sized integer range produce fd-style errors before checking
+the search path. These diagnostics retain error status and reach the model
+without an added failure prefix. Notices and details retain the JavaScript numeric value. Scoped tools retain their positive
+integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
+plus one byte while counting the complete output. Directory enumeration and
+locale sorting still retain all directory entries in memory. `find` uses the
+serial walker's sibling-sorted depth-first traversal, which has the same
+component-wise `Path` order as sorting selected full paths; it no longer retains
+the selected result list. The walker itself buffers directory entries for
+sorting, so its total traversal memory can grow with directory size.
+
 `find` uses a 1,000-result default and reports result limits. `ls` sorts names
 case-insensitively, identifies linked directories, reports entry limits and
 labels empty directories. Head truncation preserves complete lines where they
@@ -1899,17 +1940,18 @@ continues to skip binary files. Context still comes from the original file, as
 in Pi. Focused checks compare both linked and ordinary files, including context
 lines.
 
-Unrestricted `grep` applies path-containing glob overrides to the absolute
-search paths passed to ripgrep by Pi. Basename globs, negated globs, and
-explicit file arguments retain ripgrep's matching behavior. Directory results
-use Pi's slash-normalized relative paths and its basename fallback for paths
+Unrestricted `grep` anchors path-containing glob overrides at the selected
+search directory, including when that directory is a symlink. It removes
+leading `./` components, including after `!`, as current Pi does. Basename
+globs, negated globs, and explicit file arguments retain ripgrep's matching
+behavior. Directory results use Pi's slash-normalized relative paths and its basename fallback for paths
 starting with `..`; a single-file result retains the requested basename.
 The scoped native profile intentionally keeps its workspace-relative glob
 interpretation. On Unix, scoped `grep` preserves literal backslashes in file
 names so its results can be passed to `read`; unrestricted Pi-compatible grep
 normalizes them as Pi does. Both profiles normalize Windows path separators.
-Offline fixtures compare these cases with Pi's pinned ripgrep invocation and
-exercise `grep`-to-`read` for a Unix filename containing a backslash.
+Offline fixtures cover Pi's directory-rooted glob cases and exercise
+`grep`-to-`read` for a Unix filename containing a backslash.
 
 ### Published native package checkpoint
 
@@ -2010,6 +2052,17 @@ Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
 Consecutive paragraphs retain a single separating blank line, including inside
 block quotes; hard line breaks do not add paragraph spacing.
+Source-level blank blocks are retained after visible blocks and between link
+reference definitions. List items retain block separators and continuation
+indentation for code and quotes. A pinned Pi fixture checks these layouts,
+including duplicate definitions and narrow quotes. Inventory and rendering
+have native work limits; inputs that exceed them use the existing bounded
+renderer and can differ in spacing from Pi.
+Nested list spacing follows source block boundaries. Soft-wrapped source lines
+inside list items can differ from Pi in line breaks, indentation, and wrapping;
+some numbered nested lists and list-contained horizontal rules also differ.
+If nested-math scanning exceeds its resource limit, reference links may remain
+unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
 Inline and display LaTeX use a native port of the pinned Pi terminal renderer,
 including fractions, operators, scripts and matrix environments. Math can occur
@@ -2070,12 +2123,19 @@ yet been exercised in this environment.
 
 ### Edit matching checkpoint
 
-File edits preserve UTF-8 BOMs and the file's LF/CRLF convention. Matching first
-uses exact text, then Pi-compatible Unicode normalization, quote/dash handling
-and trailing-space normalization. If fuzzy matching is needed, only touched
-line blocks are rewritten from the normalized view. Other line content retains
-its original characters and whitespace. Fuzzy trailing-space matching follows
-ECMAScript `trimEnd`: U+FEFF is trimmed, while U+0085 is retained. A missing
+File edits preserve UTF-8 BOMs and untouched line endings in files that mix
+LF, CRLF and lone CR. To choose the style for inserted breaks, Pi uses the
+first LF or CRLF at or after the replacement's start, falling back to the
+preceding LF or CRLF. When the file has no LF, it uses CR if one is present
+and LF otherwise. If a splice would merge a lone CR and LF into one break,
+the edit keeps both breaks so the written file matches the diff.
+Matching first uses exact text, then Pi-compatible Unicode normalization,
+quote/dash handling and trailing-space normalization. If fuzzy matching is
+needed, only touched line blocks are rewritten from the normalized view.
+Overlapping touched line blocks form one replacement, so inserted breaks
+within that block use the style selected at its start. Other line content
+retains its original characters and whitespace. Fuzzy trailing-space
+matching follows ECMAScript `trimEnd`: U+FEFF is trimmed, while U+0085 is retained. A missing
 U+0085 in an edit target therefore cannot cause a fuzzy match and file rewrite.
 Local and injected edit regressions verify that this mismatch leaves the file
 or backend untouched.
@@ -2145,7 +2205,8 @@ components and the remaining extension events are still tracked above.
 editor for implemented model defaults, resource lists, native packages, tool
 selection, trust defaults, terminal mode and codemode settings. Ctrl+S validates
 and saves, Escape discards the edit. Invalid values keep the editor open and
-show the failing settings path. Unrecognized extension-owned keys survive
+show the failing settings path. The selected setting includes an explanatory
+hint below the searchable list. Unrecognized extension-owned keys survive
 updates. Runtime/resource changes take effect on reload or the next startup,
 and theme changes apply immediately.
 
@@ -2153,6 +2214,12 @@ The local settings editor remains open when an outstanding model response
 finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
+Unlike upstream's permissive settings loading, pi-rs validates implemented
+settings. When several values in a file are invalid, the diagnostic lists the
+settings file and affected JSON paths, including nested package fields and
+invalid HTTP idle timeout strings. It omits the rejected values and preserves
+the file. If the editor cannot fit the diagnostic, Page Up and Page Down show
+the other pages without discarding the edit.
 
 Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
 BOM when loaded or updated. Malformed or unreadable user and trusted-project
@@ -3222,6 +3289,9 @@ are recreated; compaction boundaries and retained record metadata are remapped.
 New Pi imports record conversion provenance. Forking rejects ambiguous legacy
 ownership or inconsistent provenance when it cannot safely reconstruct the
 selected history.
+Provenance replay also rejects a source that branches before its parent source's
+conversion completes, or declares a conflicting existing Pi parent. Genuine
+orphans and parents removed when forking labels remain supported.
 Interactive and startup branch forks retain imported conversion provenance and
 compaction metadata when saving and reopening the fork.
 
@@ -5182,6 +5252,28 @@ strips one leading BOM and removes exactly one final LF. Failed editors leave
 the draft unchanged. As in Pi, the temporary draft is closed before the editor
 launches, allowing editors that require exclusive file access. Native shell-style
 command splitting remains supported.
+Multiline extension editor dialogs and local multiline editors use the same
+external-editor action and configured keybinding. Editor failures remain
+visible in the dialog without submitting or losing its draft. Escape cancels
+the dialog, and extension cancellation still removes the correlated request.
+On Unix, prompt and local editors inherit Pi's foreground process group and
+terminal, matching upstream shell job control, including orphan-group signal
+behavior. Extension editors on Linux and macOS run in a separate session with
+a private pseudoterminal. Pi relays input, output and window size while
+foregrounded. Cancellation or worker loss disconnects that terminal before
+Pi resumes drawing and reaps the direct editor. A wrapper descendant may
+survive, including one that has started a new session, but its inherited
+editor terminal can no longer receive input from Pi's terminal. The editor
+still runs with the user's permissions. The extension editor's Ctrl+Z does
+not suspend Pi's job in the invoking shell. If the direct extension editor
+stops, Pi closes it and returns to the dialog with its draft intact. If
+Pi's job is backgrounded by the shell, restoration and redraw wait until
+the job is foregrounded. On Windows the job object also terminates wrapper
+descendants. Terminal-owned workers leave terminal SIGINT handling to the
+frontend, which sends explicit cancel or shutdown controls. The frontend
+samples editor activity at signal delivery so an editor interrupt does not
+stop an active backend or cancel the session after the editor closes.
+The native 1 MiB extension response limit also applies to externally edited text.
 
 ### Editor kill ring checkpoint
 
@@ -5224,7 +5316,8 @@ non-null content. Other specialized message variants remain open.
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
-escapes, invalid escape characters or Unicode digits, and missing values. Offsets
+escapes, invalid escape characters or Unicode digits, missing values, and numeric
+fractions, exponents, and leading minus signs cut off at EOF. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
 For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
 control after a surrogate in another string if no other parse error occurs first.

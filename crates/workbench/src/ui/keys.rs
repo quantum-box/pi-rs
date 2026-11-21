@@ -15,6 +15,11 @@ pub struct Keys {
     bindings: BTreeMap<String, Vec<KeyEvent>>,
 }
 impl Keys {
+    #[cfg(test)]
+    pub(super) fn set_test_binding(&mut self, action: &str, key: &str) {
+        self.bindings
+            .insert(action.into(), vec![parse(key).unwrap()]);
+    }
     fn defaults() -> Result<BTreeMap<String, Vec<KeyEvent>>> {
         Self::defaults_for(cfg!(windows), windows_keybindings())
     }

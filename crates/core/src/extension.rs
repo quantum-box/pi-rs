@@ -10,6 +10,25 @@ use crate::{
 };
 
 pub type ExtensionResult<T> = std::result::Result<T, String>;
+
+/// Distinguishes a command's reported failure from failures contacting its host.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum CommandCallbackFailure {
+    Callback(String),
+    Transport(String),
+}
+
+impl From<String> for CommandCallbackFailure {
+    fn from(message: String) -> Self {
+        Self::Transport(message)
+    }
+}
+
+impl From<&str> for CommandCallbackFailure {
+    fn from(message: &str) -> Self {
+        Self::Transport(message.into())
+    }
+}
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
 type BranchModels = BTreeMap<
     (Option<Uuid>, Option<String>, String),
@@ -1284,6 +1303,17 @@ pub trait Extension: Send + Sync {
                     .map(|entry| ExtensionCommandAction::Entry { entry })
                     .collect(),
             })
+    }
+
+    /// Invoke a command while retaining the source of a failure when available.
+    fn command_effects_classified(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> std::result::Result<ExtensionCommandEffects, CommandCallbackFailure> {
+        self.command_effects(name, arguments, previous)
+            .map_err(CommandCallbackFailure::Callback)
     }
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {

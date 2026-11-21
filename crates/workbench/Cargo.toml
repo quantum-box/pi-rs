@@ -49,6 +49,7 @@ libc = "0.2"
 jsonschema = { version = "0.33", default-features = false }
 palette = "0.7"
 pulldown-cmark = "0.13"
+unicase = "2"
 ryu-js = "1.0.3"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 shell-words = "1"
@@ -64,7 +65,7 @@ pi-rs-remote-ls = { path = "../remote-ls" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 regex = "1"
 rquickjs = { version = "0.14.0", features = ["parallel"] }
-process-wrap = { version = "10", features = ["tokio1"] }
+process-wrap = { version = "10", features = ["std", "tokio1"] }
 rmcp = { version = "3.9", default-features = false, features = ["client", "auth", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 oauth2 = { version = "5", default-features = false }
 reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
@@ -90,10 +91,13 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 tower = "0.5"
 
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = "1"
+
 [target.'cfg(windows)'.dependencies]
 crossterm_winapi = "0.9.1"
 winapi = { version = "0.3.9", features = ["winuser", "winerror", "synchapi"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

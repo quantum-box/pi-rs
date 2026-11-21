@@ -2139,19 +2139,34 @@ impl Tool for CodingTool {
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
+                json!({
+                    "pattern": {"type": "string"},
+                    "path": path,
+                    "glob": {
+                        "type": "string",
+                        "description": if self.unrestricted {
+                            "Filter by glob relative to the search directory, e.g. 'src/**/*.ts'. A basename glob such as '*.ts' matches at any depth."
+                        } else {
+                            "Filter by glob relative to the workspace root."
+                        }
+                    },
+                    "ignoreCase": {"type": "boolean"},
+                    "literal": {"type": "boolean"},
+                    "context": {"type": "integer", "minimum": 0},
+                    "limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }
+                }),
                 vec!["pattern"],
             ),
             Kind::Find => (
                 "find",
                 "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
-                json!({"pattern":{"type":"string"},"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({"pattern":{"type":"string"},"path":path,"limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec!["pattern"],
             ),
             Kind::List => (
                 "ls",
                 "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
-                json!({"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({"path":path,"limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec![],
             ),
         };
@@ -2448,6 +2463,32 @@ fn is_unix_access_denied(error: &std::io::Error) -> bool {
 #[cfg(not(unix))]
 fn is_unix_access_denied(_error: &std::io::Error) -> bool {
     false
+}
+
+// Pi parses JSON numbers as JavaScript doubles and formats them using Number.toString.
+fn local_numeric_limit(args: &Value, default: f64) -> f64 {
+    args.get("limit").and_then(Value::as_f64).unwrap_or(default)
+}
+
+fn js_number(value: f64) -> String {
+    ryu_js::Buffer::new().format(value).to_owned()
+}
+
+// fd receives String(limit), and its --max-results parser accepts usize. Zero
+// is fd's unlimited sentinel; the original number remains relevant to notices.
+fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
+    let text = js_number(value);
+    let reason = if text.starts_with('-') {
+        return Err("error: a value is required for '--max-results <count>' but none was supplied\n\nFor more information, try '--help'.".into());
+    } else {
+        match text.parse::<usize>() {
+            Ok(limit) => return Ok(limit),
+            Err(error) => error.to_string(),
+        }
+    };
+    Err(format!(
+        "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
+    ))
 }
 
 impl CodingTool {
@@ -2933,6 +2974,7 @@ impl CodingTool {
             &crate::coding_paths::normalize(requested_path)?,
         );
         let path = self.path(requested_path)?;
+        let numeric_limit = local_numeric_limit(args, 500.0);
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
@@ -2954,49 +2996,76 @@ impl CodingTool {
         let locale = directory_locale(|key| std::env::var(key).ok());
         let collator = directory_collator(&locale)?;
         entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
-        let mut results = Vec::new();
+        let mut listing = crate::tool_output::Listing::new();
+        let mut result_count = 0usize;
         let mut entry_limit_reached = false;
         for (_, entry) in entries {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            if results.len() >= limit {
+            if if self.unrestricted {
+                (result_count as f64) >= numeric_limit
+            } else {
+                result_count >= limit
+            } {
                 entry_limit_reached = true;
                 break;
             }
             if let Ok(metadata) = std::fs::metadata(entry.path()) {
-                results.push(format!(
+                listing.push(&format!(
                     "{}{}",
                     entry.file_name().to_string_lossy(),
                     if metadata.is_dir() { "/" } else { "" }
                 ));
+                result_count += 1;
             }
         }
-        if results.is_empty() {
+        if result_count == 0 {
             return Ok(Outcome::Succeeded("(empty directory)".into()));
         }
         let mut details = Map::new();
         let mut notices = Vec::new();
         if entry_limit_reached {
-            details.insert("entryLimitReached".into(), json!(limit));
-            notices.push(format!(
-                "{limit} entries limit reached. Use limit={} for more",
-                limit.saturating_mul(2)
-            ));
+            if self.unrestricted {
+                details.insert("entryLimitReached".into(), json!(numeric_limit));
+                notices.push(format!(
+                    "{} entries limit reached. Use limit={} for more",
+                    js_number(numeric_limit),
+                    js_number(numeric_limit * 2.0)
+                ));
+            } else {
+                details.insert("entryLimitReached".into(), json!(limit));
+                notices.push(format!(
+                    "{limit} entries limit reached. Use limit={} for more",
+                    limit.saturating_mul(2)
+                ));
+            }
         }
-        Ok(crate::tool_output::listing(
-            results.join("\n"),
-            details,
-            notices,
-        ))
+        Ok(listing.finish(details, notices))
     }
 
     fn search(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let base = self.path(args["path"].as_str().unwrap_or("."))?;
         let is_find = matches!(self.kind, Kind::Find);
+        let numeric_find_limit = local_numeric_limit(args, 1000.0);
+        // fd parses its arguments before checking the search path.
+        let unrestricted_find_limit = if is_find && self.unrestricted {
+            match fd_numeric_limit(numeric_find_limit) {
+                Ok(limit) => Some(limit),
+                Err(output) => {
+                    return Ok(Outcome::TextResult {
+                        output,
+                        details: None,
+                        is_error: true,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let base = self.path(args["path"].as_str().unwrap_or("."))?;
         // Keep the requested name for a single-file grep, even when path()
         // resolves a symlink to enforce workspace boundaries.
         let grep_file_name = if !is_find && base.is_file() {
@@ -3007,15 +3076,17 @@ impl CodingTool {
         } else {
             None
         };
-        let limit = args["limit"]
+        let requested_limit = args["limit"]
             .as_u64()
             .unwrap_or(if is_find { 1000 } else { 100 });
-        let limit = if is_find || !self.unrestricted {
-            limit.min(100_000)
-        } else {
-            limit
-        };
-        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let limit = unrestricted_find_limit.unwrap_or_else(|| {
+            let limit = if self.unrestricted {
+                requested_limit
+            } else {
+                requested_limit.min(100_000)
+            };
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        });
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
         let glob = if is_find {
@@ -3069,7 +3140,8 @@ impl CodingTool {
         };
         let mut results = Vec::new();
         let mut find_count = 0usize;
-        let mut find_paths = Vec::new();
+        let mut find_listing = crate::tool_output::Listing::new();
+        let mut find_line_count = 0usize;
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -3088,21 +3160,37 @@ impl CodingTool {
                         || entry.file_name() != ".git"
                         || !entry.file_type().is_some_and(|kind| kind.is_dir())
                 })
+                // ignore's serial sorted walker visits each parent before its
+                // children and sorts siblings by Path::cmp. Path ordering is
+                // component-wise, so all descendants of a sibling precede the
+                // next sibling: this is the same global order as sorting the
+                // selected full paths afterwards.
                 .sort_by_file_path(std::path::Path::cmp);
         } else if let Some(glob) = args["glob"].as_str() {
-            // Pi invokes ripgrep with an absolute search path. Ripgrep builds
-            // command-line glob overrides against ".", so path-containing
-            // globs match that absolute path rather than a workspace-relative
-            // path. Basename globs and explicit file roots still work as usual.
-            // Scoped hosts retain their existing workspace-relative globs.
-            let glob_root = if self.unrestricted {
-                Path::new(".")
+            // Pi runs directory searches from the search directory and strips
+            // leading ./ components, including after a negation marker. File
+            // searches retain ripgrep's existing explicit-file behavior.
+            let glob_root = match (self.unrestricted, grep_file_name.is_some()) {
+                (false, _) => &self.root,
+                (true, true) => Path::new("."),
+                (true, false) => &base,
+            };
+            let glob = if self.unrestricted {
+                let (negation, pattern) = glob
+                    .strip_prefix('!')
+                    .map_or(("", glob), |pattern| ("!", pattern));
+                let pattern = pattern.trim_start_matches("./");
+                if negation.is_empty() {
+                    std::borrow::Cow::Borrowed(pattern)
+                } else {
+                    std::borrow::Cow::Owned(format!("{negation}{pattern}"))
+                }
             } else {
-                &self.root
+                std::borrow::Cow::Borrowed(glob)
             };
             let mut overrides = ignore::overrides::OverrideBuilder::new(glob_root);
             let overrides = overrides
-                .add(glob)
+                .add(&glob)
                 .and_then(|builder| builder.build())
                 .map_err(|error| Error::Config(error.to_string()))?;
             walker.overrides(overrides);
@@ -3161,7 +3249,10 @@ impl CodingTool {
             } else {
                 let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
                 if self.unrestricted {
-                    find_paths.push((entry.path().to_owned(), is_directory));
+                    for line in find_pi_lines(&base, entry.path(), is_directory) {
+                        find_listing.push(&line);
+                        find_line_count += 1;
+                    }
                 } else {
                     let mut path = relative
                         .to_string_lossy()
@@ -3172,7 +3263,7 @@ impl CodingTool {
                     results.push(path);
                 }
                 find_count += 1;
-                if find_count >= limit {
+                if find_count >= limit && !(self.unrestricted && limit == 0) {
                     break;
                 }
             }
@@ -3181,13 +3272,23 @@ impl CodingTool {
             return Err(Error::Cancelled);
         }
         if is_find && self.unrestricted {
-            find_paths.sort_by(|(left, _), (right, _)| left.cmp(right));
-            for (path, is_directory) in find_paths {
-                if cancellation.is_cancelled() {
-                    return Err(Error::Cancelled);
+            if find_line_count == 0 {
+                if let Some(error) = find_error {
+                    return Err(Error::Config(error));
                 }
-                results.extend(find_pi_lines(&base, &path, is_directory));
+                return Ok(Outcome::Succeeded("No files found matching pattern".into()));
             }
+            let mut details = Map::new();
+            let mut notices = Vec::new();
+            if (find_line_count as f64) >= numeric_find_limit {
+                details.insert("resultLimitReached".into(), json!(numeric_find_limit));
+                notices.push(format!(
+                    "{} results limit reached. Use limit={} for more, or refine pattern",
+                    js_number(numeric_find_limit),
+                    js_number(numeric_find_limit * 2.0)
+                ));
+            }
+            return Ok(find_listing.finish(details, notices));
         }
         Ok(match grep {
             Some(grep) => grep.finish(),
@@ -6189,6 +6290,76 @@ mod tests {
     }
 
     #[test]
+    fn local_edit_preserves_mixed_line_endings() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let path = root.path().join("mixed.txt");
+        for (original, edits, expected) in [
+            (
+                "\u{feff}α\nb\r\nX = 1\r\n",
+                json!([{"oldText":"X = 1","newText":"X = 2"}]),
+                "\u{feff}α\nb\r\nX = 2\r\n",
+            ),
+            (
+                "a\r\nb\nc",
+                json!([{"oldText":"c","newText":"C\nD"}]),
+                "a\r\nb\nC\nD",
+            ),
+            (
+                "lf1\nlf2\ncr1\r\ncr2\r\n",
+                json!([
+                    {"oldText":"cr1\n","newText":"C\r\nD\n"},
+                    {"oldText":"lf1\n","newText":"A\nB\n"}
+                ]),
+                "A\nB\nlf2\nC\r\nD\r\ncr2\r\n",
+            ),
+            (
+                "a\r\n“keep”  \nfoo   \r\nb\n",
+                json!([{"oldText":"foo\n","newText":"FOO\nMORE\n"}]),
+                "a\r\n“keep”  \nFOO\r\nMORE\r\nb\n",
+            ),
+            ("a\rb\nc", json!([{"oldText":"b","newText":""}]), "a\r\n\nc"),
+            (
+                "a\rb\rc",
+                json!([{"oldText":"b","newText":"B\nD"}]),
+                "a\rB\rD\rc",
+            ),
+            (
+                "a\rb\r\nc",
+                json!([{"oldText":"a","newText":"A\nB"}]),
+                "A\r\nB\rb\r\nc",
+            ),
+            (
+                "a\nb\rc",
+                json!([{"oldText":"c","newText":"C\nD"}]),
+                "a\nb\rC\nD",
+            ),
+            (
+                "head\r\na\n“b” tail\r\n",
+                json!([
+                    {"oldText":"a\n\"b\"","newText":"x"},
+                    {"oldText":"tail","newText":"Y\nZ"}
+                ]),
+                "head\r\nx Y\nZ\n",
+            ),
+        ] {
+            std::fs::write(&path, original).unwrap();
+            tool.edit(&json!({"path":"mixed.txt","edits":edits}))
+                .unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                expected.as_bytes(),
+                "{original:?}"
+            );
+        }
+    }
+
+    #[test]
     fn local_edit_does_not_remove_u0085_via_fuzzy_match() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("example.txt");
@@ -6606,6 +6777,116 @@ mod tests {
         assert_eq!(output, "a/\na/x\na.txt");
     }
 
+    #[test]
+    fn find_and_ls_limit_schemas_preserve_scoped_cap() {
+        for kind in [Kind::Find, Kind::List] {
+            let tool = CodingTool {
+                root: PathBuf::from("."),
+                unrestricted: false,
+                shell: ShellConfig::default(),
+                kind,
+            };
+            assert_eq!(
+                tool.spec().parameters["properties"]["limit"]["maximum"],
+                json!(100000)
+            );
+            let unrestricted = CodingTool {
+                unrestricted: true,
+                ..tool
+            };
+            assert_eq!(
+                unrestricted.spec().parameters["properties"]["limit"],
+                json!({"type":"number"})
+            );
+        }
+    }
+
+    #[test]
+    fn local_numeric_limit_details_and_javascript_formatting() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::List,
+        };
+        let token = pi_rs::CancellationToken::new();
+        let outcome = tool.list(&json!({"limit": 1.5}), &token).unwrap();
+        assert!(
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.5))
+        );
+        tool.kind = Kind::Find;
+        let outcome = tool
+            .search(&json!({"pattern":"*", "limit": 0.0}), &token)
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(0.0))
+        );
+        let failed = tool
+            .search(&json!({"pattern":"*", "limit":1.5}), &token)
+            .unwrap();
+        assert!(failed.is_error());
+        assert_eq!(
+            failed.tool_content(),
+            "error: invalid value '1.5' for '--max-results <count>': invalid digit found in string\n\nFor more information, try '--help'."
+        );
+        let missing = json!({"pattern":"*", "path":"missing", "limit":1.5});
+        let missing_outcome = tool.search(&missing, &token).unwrap();
+        assert!(missing_outcome.is_error());
+        assert_eq!(missing_outcome.tool_content(), failed.tool_content());
+        tool.unrestricted = false;
+        assert!(tool.search(&missing, &token).is_err());
+        assert_eq!(js_number(9007199254740993_u64 as f64), "9007199254740992");
+        assert_eq!(js_number(u64::MAX as f64), "18446744073709552000");
+        assert_eq!(js_number(-0.0), "0");
+        assert_eq!(js_number(f64::MAX * 2.0), "Infinity");
+        assert_eq!(fd_numeric_limit(0.0).unwrap(), 0);
+        assert_eq!(fd_numeric_limit(2_147_483_647.0).unwrap(), 2_147_483_647);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(
+                fd_numeric_limit(18_446_744_073_709_550_000.0).unwrap(),
+                18_446_744_073_709_550_000usize
+            );
+            assert!(
+                fd_numeric_limit(u64::MAX as f64)
+                    .unwrap_err()
+                    .contains("number too large")
+            );
+        }
+        assert!(
+            fd_numeric_limit(f64::MAX)
+                .unwrap_err()
+                .contains("invalid digit found in string")
+        );
+        assert!(
+            fd_numeric_limit(f64::MIN_POSITIVE)
+                .unwrap_err()
+                .contains("invalid digit found in string")
+        );
+    }
+
+    #[test]
+    fn find_sorted_walk_matches_global_path_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in ["a", "a/z", "a/z/d", "a-", "a./x", "b"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let mut walker = ignore::WalkBuilder::new(root);
+        walker.hidden(false).sort_by_file_path(Path::cmp);
+        let paths: Vec<_> = walker
+            .build()
+            .map(|entry| entry.unwrap().into_path())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+    }
+
     #[cfg(unix)]
     #[test]
     fn find_newline_filename_counts_displayed_lines_for_limit_notice() {
@@ -6813,7 +7094,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_globs_match_pi_absolute_search_paths() {
+    fn grep_globs_follow_the_search_directory() {
         let root = tempfile::tempdir().unwrap();
         for file in [
             "project/src/main.rs",
@@ -6845,6 +7126,15 @@ mod tests {
                 vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
             ),
             ("!**/src/**", vec!["other/no.rs:1: needle"]),
+            (
+                "src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            (
+                "././src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            ("!./src/**", vec!["other/no.rs:1: needle"]),
             (
                 "*.rs",
                 vec![
@@ -6880,6 +7170,76 @@ mod tests {
                 .tool_content(),
                 "main.rs:1: needle"
             );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let output = scoped
+            .search(
+                &json!({"pattern":"needle","path":"project","glob":"project/src/**"}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .unwrap()
+            .tool_content();
+        let mut actual: Vec<_> = output.lines().collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            ["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_globs_follow_symlinked_search_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        for name in ["migrations/main/a.js", "nested/migrations/main/b.js"] {
+            let path = repo.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "hello\n").unwrap();
+        }
+        std::os::unix::fs::symlink(&repo, root.path().join("repo-link")).unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        for path in ["repo", "repo-link"] {
+            for (glob, expected) in [
+                (
+                    "migrations/main/*.js",
+                    vec!["migrations/main/a.js:1: hello"],
+                ),
+                (
+                    "./migrations/main/*.js",
+                    vec!["migrations/main/a.js:1: hello"],
+                ),
+                (
+                    "**/migrations/main/*.js",
+                    vec![
+                        "migrations/main/a.js:1: hello",
+                        "nested/migrations/main/b.js:1: hello",
+                    ],
+                ),
+                (
+                    "!./migrations/**",
+                    vec!["nested/migrations/main/b.js:1: hello"],
+                ),
+            ] {
+                let output = tool
+                    .search(
+                        &json!({"pattern":"hello", "path":path, "glob":glob}),
+                        &pi_rs::CancellationToken::new(),
+                    )
+                    .unwrap()
+                    .tool_content();
+                let mut actual: Vec<_> = output.lines().collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "path={path}, glob={glob}");
+            }
         }
     }
 

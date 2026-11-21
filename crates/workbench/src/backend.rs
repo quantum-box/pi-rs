@@ -839,12 +839,14 @@ async fn run_worker(
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
     let signal_notify = stop_notify.clone();
-    super::install_ctrl_c(move || {
-        signal_stopping.store(true, Ordering::SeqCst);
-        signal_notify.notify_one();
-        cancel_active(&signal_active);
-    })
-    .await;
+    if !args.terminal_managed_worker {
+        super::install_ctrl_c(move || {
+            signal_stopping.store(true, Ordering::SeqCst);
+            signal_notify.notify_one();
+            cancel_active(&signal_active);
+        })
+        .await;
+    }
     super::startup_ready(&mut ready);
     notify_session_lifecycle(
         &args,
@@ -1264,20 +1266,49 @@ async fn run_worker(
                     mut images,
                     queued_only,
                     require_command,
+                    rpc,
                     ..
                 } => {
+                    let mut prompt_acknowledged = false;
                     if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
                         return Ok(());
                     }
-                    if let Some(input) = content.as_deref()
-                        && let Some(trigger) = agent.try_extension_command_with_trigger(
-                            session,
-                            input,
-                            &mut observer,
-                        )?
-                    {
+                    let command = if let Some(input) = content.as_deref() {
+                        if rpc {
+                            match agent.try_extension_command_rpc(session, input, &mut observer) {
+                                Err(pi_rs::CommandDispatchError::Callback { id, message }) => {
+                                    let name = input
+                                        .split_once(char::is_whitespace)
+                                        .map_or(input, |(name, _)| name)
+                                        .strip_prefix('/')
+                                        .unwrap_or(input);
+                                    output(
+                                        json!({"type":"extension_error","extension":id,"extensionPath":format!("command:{name}"),"event":"command","message":message}),
+                                    );
+                                    return Ok(());
+                                }
+                                Err(pi_rs::CommandDispatchError::Other(error)) => {
+                                    return Err(error);
+                                }
+                                Ok(result) => result,
+                            }
+                        } else {
+                            agent.try_extension_command_with_trigger(
+                                session,
+                                input,
+                                &mut observer,
+                            )?
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(trigger) = command {
                         if !trigger {
                             return Ok(());
+                        }
+                        if let Some(id) = prompt_response.take() {
+                            control_response("prompt", id, Ok(json!({"disposition":"handled"})));
+                            prompt_acknowledged = true;
                         }
                         content = None;
                         images.clear();
@@ -1327,8 +1358,11 @@ async fn run_worker(
                         return Err(Error::Cancelled);
                     }
                     if let Some(id) = prompt_response.take() {
-                        started = true;
                         control_response("prompt", id, Ok(json!({"disposition":"started"})));
+                        prompt_acknowledged = true;
+                    }
+                    if prompt_acknowledged {
+                        started = true;
                         output(json!({"type":"agent_started"}));
                     }
                     let run_id = Uuid::new_v4();

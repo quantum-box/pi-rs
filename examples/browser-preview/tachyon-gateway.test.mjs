@@ -104,3 +104,65 @@ test('browser model requests stay in the worker, switch models, and abort', asyn
     assert.equal(workers[1].terminated, true);
   } finally { globalThis.Worker = previousWorker; }
 });
+
+test('OpenAI maps tool calls and results through the WASM gateway without persisting credentials', async () => {
+  const requests = [];
+  const gateway = createGatewayFetch({origin, getProvider: () => 'openai', getOpenAIKey: () => ' secret ', getOpenAIModel: () => 'gpt-4.1-mini', onError: assert.fail, fetchImpl: async (url, options) => {
+    requests.push({url, options});
+    return Response.json({status:'completed',output:[{type:'reasoning',id:'rs_1',encrypted_content:'opaque'},{type:'function_call',call_id:'call_1',name:'add_numbers',arguments:'{"a":2,"b":3}'}]});
+  }});
+  const body = {messages:[{role:'assistant',content:'',calls:[{id:'call_0',name:'add_numbers',arguments:'{"a":1,"b":2}'}]},{role:'tool',call_id:'call_0',content:'3'},{role:'user',content:'2+3?'}], tools:[{name:'add_numbers',description:'Add',parameters:{type:'object'}}]};
+  const response = await gateway(new Request(`${origin}/demo-gateway`, {method:'POST',body:JSON.stringify(body)}));
+  assert.deepEqual(await response.json(),{text:'',calls:[{id:'call_1',name:'add_numbers',arguments:'{"a":2,"b":3}'}]});
+  const {url, options} = requests[0];
+  assert.equal(url,'https://api.openai.com/v1/responses');
+  assert.equal(options.headers.authorization,'Bearer secret');
+  assert.equal(options.redirect,'error');
+  assert.equal(options.credentials,'omit');
+  const sent = JSON.parse(options.body);
+  assert.deepEqual(sent.input[1],{type:'function_call_output',call_id:'call_0',output:'3'});
+  assert.equal(sent.input[0].name,'add_numbers');
+  assert.equal(sent.tools[0].name,'add_numbers');
+  assert.ok(!options.body.includes('secret'));
+});
+
+test('OpenAI rejects missing key, provider errors, and truncated completions', async () => {
+  let message = '', invoked = false;
+  const options = {origin, getProvider: () => 'openai', onError: value => {message=value;}};
+  await assert.rejects(createGatewayFetch({...options,getOpenAIKey:()=>'',fetchImpl:()=>{invoked=true;}})(request()));
+  assert.equal(invoked,false);
+  assert.match(message,/API キー/);
+  const failure = createGatewayFetch({...options,getOpenAIKey:()=> 'key',fetchImpl:async()=>new Response('secret body',{status:401})});
+  assert.equal((await failure(request())).status,401);
+  assert.match(message,/401/);
+  assert.ok(!message.includes('secret body'));
+  const incomplete = createGatewayFetch({...options,getOpenAIKey:()=> 'key',fetchImpl:async()=>Response.json({status:'incomplete',output:[]})});
+  await assert.rejects(incomplete(request()),/完了/);
+});
+
+test('OpenAI reports network failures separately from malformed responses', async () => {
+  let message = '';
+  const base = {origin, getProvider:()=> 'openai', getOpenAIKey:()=> 'test-key', onError:value=>{message=value;}};
+  const network = createGatewayFetch({...base,fetchImpl:async()=>{throw new TypeError('Failed to fetch');}});
+  await assert.rejects(network(request()));
+  assert.match(message,/通信に失敗/);
+  const malformed = createGatewayFetch({...base,fetchImpl:async()=>new Response('not-json')});
+  await assert.rejects(malformed(request()));
+  assert.match(message,/予期しない応答/);
+});
+
+test('OpenAI replays reasoning and function calls when the tool result arrives', async () => {
+  const sent = [];
+  const gateway = createGatewayFetch({origin,getProvider:()=> 'openai',getOpenAIKey:()=> 'test-key',onError:assert.fail,fetchImpl:async (_url,options)=>{
+    sent.push(JSON.parse(options.body));
+    return Response.json(sent.length===1 ? {status:'completed',output:[{type:'reasoning',id:'rs_1',encrypted_content:'opaque'},{type:'function_call',call_id:'call_1',name:'add_numbers',arguments:'{"a":2,"b":3}'}]} : {status:'completed',output:[{type:'message',role:'assistant',content:[{type:'output_text',text:'5'}]}]});
+  }});
+  const make = messages => new Request(`${origin}/demo-gateway`,{method:'POST',body:JSON.stringify({messages,tools:[]})});
+  await gateway(make([{role:'user',content:'2+3'}]));
+  const response = await gateway(make([{role:'user',content:'2+3'},{role:'assistant',content:'',calls:[{id:'call_1',name:'add_numbers',arguments:'{"a":2,"b":3}'}]},{role:'tool',call_id:'call_1',content:'5'}]));
+  assert.deepEqual(await response.json(),{text:'5',calls:[]});
+  assert.equal(sent[1].input[1].type,'reasoning');
+  assert.equal(sent[1].input[2].type,'function_call');
+  assert.equal(sent[1].input[3].type,'function_call_output');
+  assert.equal(sent[1].store,false);
+});

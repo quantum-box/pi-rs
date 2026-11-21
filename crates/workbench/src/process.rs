@@ -222,6 +222,24 @@ impl Worker {
         let follow_up_mode = session_queue_mode(&snapshot_args, pi_rs::InputKind::FollowUp)?;
         let refresh_barrier = tempfile::NamedTempFile::new()?;
         let mut command = Command::new(std::env::current_exe()?);
+        if args.mode != Some(super::OutputMode::Rpc) {
+            command.arg("--terminal-managed-worker");
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // Protect the startup interval before the worker installs its
+                // listener; a caught disposition is installed immediately in
+                // run_cli, before starting any child processes.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
         command.env(REFRESH_BARRIER_ENV, refresh_barrier.path());
         command.env_remove("PI_RS_MODEL_TOKEN");
         command.env_remove(SESSION_TRANSITION_ENV);
@@ -557,7 +575,11 @@ impl Worker {
                         .as_str()
                         .and_then(|id| self.extension_sources.get(id))
                 {
-                    event["extensionPath"] = source.clone();
+                    if event.get("extensionPath").is_some() {
+                        event["nativeExtensionPath"] = source.clone();
+                    } else {
+                        event["extensionPath"] = source.clone();
+                    }
                 }
                 Some(event)
             })
