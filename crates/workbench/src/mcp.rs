@@ -693,7 +693,7 @@ impl McpExtension {
                             Error::Config("invalid MCP credential generation".into())
                         })?);
                     NativeClient {
-                        dispatch_closed: client.1.clone(),
+                        dispatch_closed: client.dispatch_state.clone(),
                         ..Default::default()
                     }
                     .serve_with_lifecycle(
@@ -2209,7 +2209,7 @@ mod tests {
             crate::mcp_auth::test_oauth_client(path.clone(), &resource, &format!("{base}/token"))
                 .await;
         let native = NativeClient {
-            dispatch_closed: client.1.clone(),
+            dispatch_closed: client.dispatch_state.clone(),
             ..Default::default()
         };
         let transport = StreamableHttpClientTransport::with_client(
