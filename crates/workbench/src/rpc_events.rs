@@ -953,7 +953,11 @@ mod streaming_tool_tests {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let fallback = Uuid::new_v4();
-        for operation_id in [first, second, fallback] {
+        for (operation_id, arguments) in [
+            (first, r#"{"path":42}"#),
+            (second, "[42]"),
+            (fallback, "{}"),
+        ] {
             stream.calls.insert(
                 operation_id,
                 (
@@ -962,19 +966,19 @@ mod streaming_tool_tests {
                         call: ToolCall {
                             id: "repeated-id".into(),
                             name: "read".into(),
-                            arguments: r#"{"path":42}"#.into(),
+                            arguments: arguments.into(),
                         },
                     },
                     None,
                 ),
             );
         }
-        for operation_id in [first, second] {
+        for (operation_id, arguments) in [(first, json!({"path":42})), (second, json!({}))] {
             let event = json!({"type":"internal_tool_attempt","operationId":operation_id});
             assert_eq!(
                 stream.observe(&event, &args),
                 vec![
-                    json!({"type":"tool_execution_start","toolCallId":"repeated-id","toolName":"read","args":{"path":42}})
+                    json!({"type":"tool_execution_start","toolCallId":"repeated-id","toolName":"read","args":arguments})
                 ]
             );
             let mut events = Vec::new();
