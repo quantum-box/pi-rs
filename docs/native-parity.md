@@ -4248,9 +4248,13 @@ after request hooks, using its provider and model overlays; an unknown rewritten
 model on the same route is treated as unsupported, and a different adapter or
 endpoint is rejected. A prepared context is bound to its request model. Direct
 SDK capability settings apply to the client endpoint and must be valid for every
-model the caller dispatches through it. Grammar declarations in Chat Completions currently fall back to
-ordinary function tools; custom grammar tools and their streaming/replay remain
-unsupported. No provider-side strict-limit retry is implemented on this path.
+model the caller dispatches through it. Chat Completions models with
+`compat.supportsOpenAIGrammarTools` send custom grammar declarations and map
+streamed input onto the required string argument. Replay preserves historical
+function arguments when a single string cannot represent them. Models without
+the capability use ordinary function tools. Workbench resolves grammar support
+for the final request model after request hooks, including Responses and Codex.
+No provider-side strict-limit retry is implemented on this path.
 
 Workbench defaults to strict-tool support for the selected ChatGPT plan model,
 matching Pi's Codex Responses adapter. `compat.supportsStrictMode` can override
