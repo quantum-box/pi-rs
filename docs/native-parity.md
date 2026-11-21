@@ -5646,10 +5646,11 @@ Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
 escapes, invalid escape characters or Unicode digits, missing values, and numeric
-fractions, exponents, and leading minus signs cut off at EOF. Offsets
-and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
-For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
-control after a surrogate in another string if no other parse error occurs first.
+fractions, exponents, and leading minus signs cut off at EOF. Offsets and
+columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+For records up to 1 MiB, diagnostic retries distinguish incomplete object
+separators and commas in nested containers. They also identify a raw control
+after a surrogate in another string if no other parse error occurs first.
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
 position-aware wording. Other malformed records, including array trailing
