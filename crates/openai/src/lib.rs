@@ -1214,6 +1214,13 @@ impl OpenAiResponses {
             }),
         );
         let mut headers = self.headers.clone();
+        if provider == "github-copilot" {
+            for (name, value) in pi_rs_core::copilot_request_headers(&request.messages) {
+                headers
+                    .entry(name)
+                    .or_insert_with(|| reqwest::header::HeaderValue::from_static(value));
+            }
+        }
         let mut request = self.client.post(self.endpoint.clone());
         if let Some(account) = &self.codex_account {
             headers.remove("chatgpt-account-id");

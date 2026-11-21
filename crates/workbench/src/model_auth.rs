@@ -17,6 +17,7 @@ pub(super) enum Credential {
     Invalid,
     ChatGpt,
     Codex,
+    Copilot,
     AnthropicOAuth,
     Kimi,
     Meta,
@@ -56,6 +57,7 @@ impl Credential {
             | Self::Invalid
             | Self::ChatGpt
             | Self::Codex
+            | Self::Copilot
             | Self::AnthropicOAuth
             | Self::Kimi
             | Self::Meta
@@ -68,7 +70,7 @@ impl Credential {
     pub fn is_bearer(&self) -> bool {
         matches!(
             self,
-            Self::Bearer(_) | Self::ChatGpt | Self::Kimi | Self::AnthropicOAuth
+            Self::Bearer(_) | Self::ChatGpt | Self::Copilot | Self::Kimi | Self::AnthropicOAuth
         )
     }
 
@@ -82,6 +84,7 @@ impl Credential {
                 self,
                 Self::ChatGpt
                     | Self::Codex
+                    | Self::Copilot
                     | Self::AnthropicOAuth
                     | Self::Kimi
                     | Self::Meta
@@ -121,6 +124,10 @@ impl Credential {
                     false,
                 )
                 .await;
+            }
+            Self::Copilot => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::copilot_auth::access(&settings, None, false).await;
             }
             Self::AnthropicOAuth => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -179,6 +186,7 @@ struct SavedKey {
     endpoint: Option<String>,
     official_routes: bool,
     oauth: bool,
+    available_model_ids: Option<Vec<String>>,
     key: Option<Credential>,
     env: Option<serde_json::Map<String, Value>>,
 }
@@ -218,6 +226,12 @@ impl Keys {
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
                 let codex = name.eq_ignore_ascii_case("openai-codex") && entry["type"] == "oauth";
+                let copilot =
+                    name.eq_ignore_ascii_case("github-copilot") && entry["type"] == "oauth";
+                let copilot_credential = copilot
+                    .then(|| super::copilot_auth::read_entry(entry))
+                    .transpose()
+                    .ok()?;
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
                 let meta = name.eq_ignore_ascii_case("meta") && entry["type"] == "oauth";
                 let xai = name.eq_ignore_ascii_case("xai") && entry["type"] == "oauth";
@@ -225,6 +239,7 @@ impl Keys {
                 let oauth = (name.eq_ignore_ascii_case("openrouter")
                     || chatgpt
                     || codex
+                    || copilot
                     || kimi
                     || meta
                     || xai
@@ -235,6 +250,8 @@ impl Keys {
                     Some(Credential::ChatGpt)
                 } else if codex {
                     super::codex_auth::valid_entry(entry).then_some(Credential::Codex)
+                } else if copilot {
+                    Some(Credential::Copilot)
                 } else if anthropic {
                     let valid =
                         serde_json::from_value::<super::anthropic_auth::Credential>(entry.clone())
@@ -334,6 +351,8 @@ impl Keys {
                         "kimi-coding"
                     } else if meta {
                         "meta"
+                    } else if copilot {
+                        "github-copilot"
                     } else if xai {
                         "xai"
                     } else {
@@ -357,6 +376,8 @@ impl Keys {
                         endpoint: endpoint.map(str::to_owned),
                         official_routes: oauth || entry.get("endpoint").is_none(),
                         oauth,
+                        available_model_ids: copilot_credential
+                            .and_then(|credential| credential.available_model_ids),
                         key,
                         env: entry["env"].as_object().cloned(),
                     },
@@ -424,6 +445,12 @@ impl Keys {
             })?
             .env
             .as_ref()
+    }
+
+    pub fn available_model_ids(&self, provider: &Provider, endpoint: &str) -> Option<&[String]> {
+        self.entry_for(provider, endpoint)?
+            .available_model_ids
+            .as_deref()
     }
 
     pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {
