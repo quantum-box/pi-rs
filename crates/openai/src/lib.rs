@@ -1544,7 +1544,7 @@ impl OpenAiResponses {
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
                             identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
                                 ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
-                            } else { identity },
+                            } else { ResolvedModelIdentity { provider: replay_provider.clone(), model: model.clone() } },
                             blocks:output.clone()
                         })), ..Default::default() }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });

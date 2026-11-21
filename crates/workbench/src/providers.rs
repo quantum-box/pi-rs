@@ -4202,6 +4202,8 @@ mod estimation_tests {
                 .with_context_probes(false)
                 .with_model_options(&args, false)
                 .unwrap();
+            let expected_replay_provider =
+                pi_rs::endpoint_replay_scope(provider, &format!("{endpoint}\nmy-deployment"));
 
             let serve = tokio::spawn(async move {
                 let (socket, _) = listener.accept().await.unwrap();
@@ -4222,7 +4224,21 @@ mod estimation_tests {
                 }
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body).await.unwrap();
-                socket.get_mut().write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                let response = if responses {
+                    let event = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+                        event.len()
+                    )
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .into()
+                };
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
                 (
                     headers,
                     serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -4246,7 +4262,25 @@ mod estimation_tests {
             )
             .await
             .unwrap();
-            assert!(sent.is_err());
+            if responses {
+                use futures_util::StreamExt;
+                let mut stream = sent.unwrap();
+                let mut replay_provider = None;
+                while let Some(event) = stream.next().await {
+                    if let pi_rs::EnrichedModelEvent::Legacy(pi_rs::ModelEvent::Metadata(
+                        metadata,
+                    )) = event.unwrap()
+                    {
+                        replay_provider = metadata.replay.map(|replay| replay.identity.provider);
+                    }
+                }
+                assert_eq!(
+                    replay_provider.as_deref(),
+                    Some(expected_replay_provider.as_str())
+                );
+            } else {
+                assert!(sent.is_err());
+            }
             let (headers, body) = serve.await.unwrap();
             assert_eq!(body["model"], "my-deployment");
             assert_eq!(body["store"], false);
