@@ -78,15 +78,16 @@ impl Capture {
         } = std::mem::take(&mut *self.0.lock().expect("Bedrock response capture"));
         let Some(response) = response else { return };
         let mut secrets = configured_secrets.to_vec();
-        if let Some(token) = request_headers
-            .get("x-amz-security-token")
-            .and_then(|value| value.to_str().ok())
-        {
-            secrets.push(token.to_owned());
-        }
-        if let Some(auth) = request_headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
+        secrets.extend(
+            request_headers
+                .get_all("x-amz-security-token")
+                .iter()
+                .filter_map(|value| value.to_str().ok().map(str::to_owned)),
+        );
+        for auth in request_headers
+            .get_all("authorization")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
         {
             secrets.push(auth.to_owned());
             if let Some((scheme, value)) = auth.split_once(' ') {
