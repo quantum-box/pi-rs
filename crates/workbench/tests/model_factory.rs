@@ -147,11 +147,46 @@ fn invalid_endpoint_and_secrets_do_not_leak_in_errors() {
     assert!(!error.to_string().contains("private-fixture"));
 }
 
+async fn capture_model_headers(
+    listener: tokio::net::TcpListener,
+    model: std::sync::Arc<dyn pi_rs::Model>,
+    request: pi_rs::ModelRequest,
+) -> String {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let serve = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    };
+    let (captured, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(serve, model.stream(request))
+    })
+    .await
+    .unwrap();
+    captured
+}
+
 #[tokio::test]
 async fn model_requests_use_authorized_routes_without_metadata_probes() {
     use pi_rs::ModelRequest;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     for (api, provider, endpoint_path, expected_path, auth_header) in [
@@ -210,31 +245,7 @@ async fn model_requests_use_authorized_routes_without_metadata_probes() {
             tools: vec![],
             max_output_tokens: 16,
         };
-        let serve = async {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut chunk = [0u8; 2048];
-            loop {
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert_ne!(count, 0);
-                bytes.extend_from_slice(&chunk[..count]);
-                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            socket
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-            String::from_utf8(bytes).unwrap()
-        };
-        let (captured, _) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serve, model.stream(request))
-        })
-        .await
-        .unwrap();
+        let captured = capture_model_headers(listener, model, request).await;
         assert!(
             captured.starts_with(&format!("POST {expected_path} HTTP/1.1\r\n")),
             "{captured}"
@@ -457,6 +468,7 @@ fn auth_file_snapshot_binds_only_granted_routes() {
     let other = "https://other.example.test/v1/chat/completions";
     let keys = serde_json::json!({
         "compatible": { "type": "api_key", "key": "prefix-${TOKEN}-$!$$", "env": { "TOKEN": "saved" } },
+        "malformed": { "type": "api_key", "key": "${bad-$INNER}-${TOKEN}-${open-$TOKEN", "env": { "INNER": "private", "TOKEN": "saved" } },
         "bound": { "type": "api_key", "key": "$LITERAL", "literal": true, "endpoint": endpoint },
         "command": { "type": "api_key", "key": "!printf should-not-be-read" },
         "process_env": { "type": "api_key", "key": "$PATH" },
@@ -468,6 +480,7 @@ fn auth_file_snapshot_binds_only_granted_routes() {
         file: file.clone(),
         routes: [
             ("compatible", endpoint),
+            ("malformed", endpoint),
             ("bound", endpoint),
             ("bound", other),
             ("command", endpoint),
@@ -487,6 +500,10 @@ fn auth_file_snapshot_binds_only_granted_routes() {
         "prefix-saved-!$"
     );
     assert_eq!(auth.get("bound", endpoint).unwrap().secret(), "$LITERAL");
+    assert_eq!(
+        auth.get("malformed", endpoint).unwrap().secret(),
+        "${bad-$INNER}-saved-${open-saved"
+    );
     for provider in ["command", "process_env", "login", "ungranted"] {
         assert!(auth.get(provider, endpoint).is_none());
     }
@@ -533,4 +550,210 @@ fn auth_file_snapshot_binds_only_granted_routes() {
     );
     std::fs::remove_file(&file).unwrap();
     assert!(grants.load().unwrap().get("compatible", endpoint).is_none());
+}
+
+#[test]
+fn granted_auth_only_resolves_real_variables_on_matching_routes() {
+    use pi_rs_workbench::auth_factory::{AuthFileReadGrants, AuthRoute};
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let auth_path = directory.path().join("auth.json");
+    let endpoint = "https://example.test/v1/messages";
+    std::fs::write(&auth_path, json!({
+        "allowed": {"type":"api_key","key":"${BAD$SECRET}-${LOCAL}-$GRANTED","env":{"LOCAL":"file"}},
+        "unmatched": {"type":"api_key","key":"$SECRET","endpoint":"https://outside.example.test"},
+        "ungranted": {"type":"api_key","key":"$SECRET"},
+    }).to_string()).unwrap();
+    let grants = AuthFileReadGrants {
+        file: auth_path,
+        routes: ["allowed", "unmatched"]
+            .into_iter()
+            .map(|provider| AuthRoute {
+                provider: provider.into(),
+                endpoint: endpoint.into(),
+            })
+            .collect(),
+    };
+    let mut requested = Vec::new();
+    let auth = grants
+        .load_with_variables(|route, variable| {
+            requested.push((route.provider.clone(), variable.to_owned()));
+            Some("host".into())
+        })
+        .unwrap();
+    assert_eq!(requested, [("allowed".into(), "GRANTED".into())]);
+    assert_eq!(
+        auth.get("allowed", endpoint).unwrap().secret(),
+        "${BAD$SECRET}-file-host"
+    );
+    assert!(auth.get("unmatched", endpoint).is_none());
+}
+#[tokio::test]
+async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes() {
+    use pi_rs_workbench::auth_factory::{AuthFileReadGrants, AuthRoute};
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let auth_path = directory.path().join("auth.json");
+    let models_path = directory.path().join("models.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let private_base = "https://relay.example.test/v1";
+    let endpoint = format!("{base_url}/chat/completions");
+    let responses_endpoint = "https://relay.example.test/v1/responses";
+    std::fs::write(
+        &auth_path,
+        json!({
+            "relay": {"type":"api_key","key":"token-${TOKEN}"},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let auth_grants = AuthFileReadGrants {
+        file: auth_path,
+        routes: [endpoint.as_str(), responses_endpoint]
+            .into_iter()
+            .map(|endpoint| AuthRoute {
+                provider: "relay".into(),
+                endpoint: endpoint.into(),
+            })
+            .collect(),
+    };
+    assert!(
+        auth_grants
+            .load()
+            .unwrap()
+            .get("relay", &endpoint)
+            .is_none()
+    );
+    let auth = auth_grants
+        .load_with_variables(|route, name| {
+            (route.provider == "relay" && name == "TOKEN").then(|| "fixture".into())
+        })
+        .unwrap();
+    assert_eq!(
+        auth.get("relay", &endpoint).unwrap().secret(),
+        "token-fixture"
+    );
+    let factory = ModelClientFactory::new(auth);
+    let definition = json!({
+        "providers":{
+            "relay":{
+                "baseUrl":base_url,
+                "api":"openai-completions",
+                "apiKey":"!untrusted-command",
+                "headers":{"Authorization":"Bearer should-not-be-used"},
+                "modelOverrides":{
+                    "chat":{"name":"Final display","contextWindow":144000,"cost":{"input":3},"baseUrl":"https://outside.example.test"},
+                    "missing":{"name":"never registered"}
+                },
+                "models":[
+                    {"id":"chat","name":"Demo chat","reasoning":true,"input":["text","image"],"maxTokens":2400,
+                     "cost":{"input":1,"output":2,"cacheRead":0.5,"cacheWrite":0.125}},
+                    {"id":"responses","api":"openai-responses","baseUrl":private_base},
+                    {"id":"wrong-api","api":"anthropic-messages"},
+                    {"id":"redirect","baseUrl":"https://outside.example.test/v1"},
+                    {"id":"classifier","type":"classifier"},
+                ]
+            },
+            "unknown":{"models":true}
+        }
+    });
+    std::fs::write(&models_path, format!("\u{feff}{definition}")).unwrap();
+    let mut grants = ModelFileReadGrants {
+        file: models_path.clone(),
+        routes: vec![
+            ModelFileRoute {
+                provider: "relay".into(),
+                api: NativeModelApi::OpenAiChat,
+                base_url: base_url.clone(),
+                endpoint: endpoint.clone(),
+            },
+            ModelFileRoute {
+                provider: "relay".into(),
+                api: NativeModelApi::OpenAiResponses,
+                base_url: private_base.into(),
+                endpoint: responses_endpoint.into(),
+            },
+        ],
+    };
+
+    let catalog = grants.load(&factory).unwrap();
+    assert_eq!(
+        catalog.identities().collect::<Vec<_>>(),
+        [("relay", "chat"), ("relay", "responses")]
+    );
+    let chat = catalog.info("relay", "chat").unwrap();
+    assert_eq!(chat.display_name.as_deref(), Some("Final display"));
+    assert_eq!(chat.context_window, Some(144_000));
+    assert_eq!(
+        chat.cost.as_ref().unwrap().input.as_ref().unwrap().as_u64(),
+        Some(3)
+    );
+    assert_eq!(
+        chat.cost
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .as_u64(),
+        Some(2)
+    );
+    assert_eq!(chat.max_output_tokens, Some(2400));
+    assert_eq!(chat.reasoning, Some(true));
+    assert_eq!(chat.images, Some(true));
+    assert_eq!(
+        chat.cost
+            .as_ref()
+            .unwrap()
+            .cache_read
+            .as_ref()
+            .unwrap()
+            .as_f64(),
+        Some(0.5)
+    );
+
+    let responses = catalog.info("relay", "responses").unwrap();
+    assert_eq!(responses.context_window, Some(128_000));
+    assert_eq!(responses.max_output_tokens, Some(16_384));
+    assert_eq!(responses.reasoning, Some(false));
+    assert!(catalog.session_builder("relay", "responses").is_ok());
+    let captured = capture_model_headers(
+        listener,
+        catalog.get("relay", "chat").unwrap(),
+        pi_rs::ModelRequest {
+            model: "chat".into(),
+            messages: vec![pi_rs::Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        },
+    )
+    .await;
+    assert!(captured.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+    assert!(
+        captured
+            .to_ascii_lowercase()
+            .contains("authorization: bearer token-fixture")
+    );
+    assert!(!captured.contains("should-not-be-used"));
+
+    assert!(grants.load(&ModelClientFactory::default()).is_err());
+    grants.routes.push(grants.routes[0].clone());
+    assert!(grants.load(&factory).is_err());
+    grants.routes.pop();
+    let mut duplicate = definition;
+    let models = duplicate["providers"]["relay"]["models"]
+        .as_array_mut()
+        .unwrap();
+    models.push(models[0].clone());
+    std::fs::write(&models_path, duplicate.to_string()).unwrap();
+    assert!(grants.load(&factory).is_err());
+    assert_eq!(catalog.identities().len(), 2);
+    std::fs::remove_file(models_path).unwrap();
+    assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
 }

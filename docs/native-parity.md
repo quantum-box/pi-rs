@@ -1253,6 +1253,8 @@ factory. The caller supplies one absolute file path and exact provider and
 endpoint grants. An endpointless entry is usable only on granted routes. A
 pi-rs entry with a saved endpoint must also match that endpoint. File contents
 can supply variables for key expansion, including Pi's `$$` and `$!` escapes.
+Closed braced references with invalid names are preserved verbatim. A missing
+closing brace leaves the opening dollar sign literal and scanning continues.
 The pi-rs `literal` flag preserves the key verbatim.
 
 Each load reads the file afresh and leaves existing clients and snapshots
@@ -1260,6 +1262,24 @@ usable. The caller owns the lifetime of each client and should load the file
 off the UI thread. Unresolved variable or command references and OAuth entries
 leave the route unconfigured. The SDK host controls ambient environment access,
 OAuth, and any credential writes.
+
+### Native SDK model file catalogs
+
+Embedded hosts can build an immutable catalog with
+`pi_rs_workbench::model_file::ModelFileReadGrants`. An explicit file path and
+exact provider, API, and declared base URL grants select custom chat models
+from strict Pi-format JSON. Provider fields are inherited unless the model
+overrides them. The grant supplies the actual request endpoint and the model
+factory supplies its exact credential. The import applies descriptive
+`modelOverrides` to selected declarations, including partial prices. Transport options such as
+configuration headers, provider compatibility and command-based keys stay
+under host control.
+
+Hosts may resolve saved key variables with
+`AuthFileReadGrants::load_with_variables`. The resolver receives the exact
+route and variable name after checking saved inline values, and the loader
+never consults process environment variables itself. Catalog and key reloads
+produce independent snapshots.
 
 ### Regular terminal checkpoint
 

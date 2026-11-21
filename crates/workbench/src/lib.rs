@@ -35,6 +35,7 @@ mod mcp_provider_auth;
 #[doc(hidden)]
 pub mod mcp_refresh;
 pub mod model_factory;
+pub mod model_file;
 #[doc(hidden)]
 pub mod oauth_callback;
 #[doc(hidden)]
