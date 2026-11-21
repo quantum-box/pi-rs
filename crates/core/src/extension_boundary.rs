@@ -480,7 +480,9 @@ pub(crate) async fn dispatch_agent_before_settle(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) -> Result<bool> {
-    let deadline = crate::runtime::time::Instant::now() + timeout.min(Duration::from_secs(10));
+    let started = crate::runtime::time::Instant::now();
+    let hook_budget = timeout.min(Duration::from_secs(10));
+    let deadline = started + hook_budget;
     let states = session.extension_states();
     let mut event = AgentBeforeSettle {
         outcome: if result.is_ok() {
@@ -501,7 +503,7 @@ pub(crate) async fn dispatch_agent_before_settle(
         if cancel.is_cancelled() {
             break;
         }
-        if crate::runtime::time::Instant::now() >= deadline {
+        if started.elapsed() >= hook_budget {
             report(
                 extension.id(),
                 "boundary handler deadline expired",
