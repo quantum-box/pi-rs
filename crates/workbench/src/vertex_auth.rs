@@ -59,7 +59,12 @@ impl Adc {
     }
 
     pub async fn access(&self) -> Result<String> {
-        let mut command = tokio::process::Command::new("gcloud");
+        let executable = if cfg!(windows) {
+            "gcloud.cmd"
+        } else {
+            "gcloud"
+        };
+        let mut command = tokio::process::Command::new(executable);
         command
             .args([
                 "auth",
