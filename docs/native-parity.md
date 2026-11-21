@@ -4913,8 +4913,10 @@ Chat Completions, Anthropic Messages, and OpenAI Responses.
 device authorization and store a Pi-compatible OAuth entry. pi-rs can also
 read an existing entry, refresh access, and filter the picker by the stored
 account catalog. If catalog discovery fails during refresh, inference uses the
-new token and the last saved catalog. Saved OAuth tokens can route to individual, business, or
-enterprise Copilot inference hosts. Requests carry the Copilot initiator and
+new token and the last saved catalog. An admitted refresh and its write finish
+even if the caller cancels. Copilot's device poller follows the server interval
+on `slow_down` and adds five seconds when it supplies no interval. Saved OAuth
+tokens can route to individual, business, or enterprise Copilot inference hosts. Requests carry the Copilot initiator and
 vision headers.
 
 Native sign-in leaves account model policies as configured. Authentication
