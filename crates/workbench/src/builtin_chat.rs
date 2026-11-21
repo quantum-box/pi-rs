@@ -12,6 +12,15 @@ pub(super) struct Builtin {
     compatibility: fn() -> Value,
 }
 
+const QWEN_TOKEN_PLAN: &str =
+    "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/chat/completions";
+const QWEN_TOKEN_PLAN_CN: &str =
+    "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1/chat/completions";
+const LEGACY_QWEN_TOKEN_PLAN: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+const LEGACY_QWEN_TOKEN_PLAN_CN: &str =
+    "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+
 pub(super) const PROVIDERS: &[Builtin] = &[
     Builtin {
         id: "openai",
@@ -81,7 +90,7 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "huggingface",
         endpoint: "https://router.huggingface.co/v1/chat/completions",
         env: "HF_TOKEN",
-        compatibility: standard,
+        compatibility: || json!({"supportsStore":true,"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
         id: "kimi-coding",
@@ -168,20 +177,26 @@ pub(super) const PROVIDERS: &[Builtin] = &[
     },
     Builtin {
         id: "qwen-token-plan",
-        endpoint: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-        env: "QWEN_TOKEN_PLAN_API_KEY",
+        endpoint: QWEN_TOKEN_PLAN,
+        env: "QWEN_TOKEN_PLAN_TEAM_API_KEY",
         compatibility: qwen_token_plan,
     },
     Builtin {
         id: "qwen-token-plan-cn",
-        endpoint: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-        env: "QWEN_TOKEN_PLAN_CN_API_KEY",
+        endpoint: QWEN_TOKEN_PLAN_CN,
+        env: "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
         compatibility: qwen_token_plan,
     },
     Builtin {
         id: "qwen-token-plan-individual",
-        endpoint: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-        env: "QWEN_TOKEN_PLAN_API_KEY",
+        endpoint: QWEN_TOKEN_PLAN,
+        env: "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
+        id: "qwen-token-plan-individual-cn",
+        endpoint: QWEN_TOKEN_PLAN_CN,
+        env: "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
         compatibility: qwen_token_plan,
     },
     Builtin {
@@ -343,9 +358,25 @@ impl Builtin {
         }
     }
 
+    pub fn is_default_endpoint(&self, endpoint: &str) -> bool {
+        if endpoint.is_empty() {
+            return false;
+        }
+        self.endpoint == endpoint
+            || match self.id {
+                "qwen-token-plan" | "qwen-token-plan-individual" => {
+                    endpoint == LEGACY_QWEN_TOKEN_PLAN
+                }
+                "qwen-token-plan-cn" | "qwen-token-plan-individual-cn" => {
+                    endpoint == LEGACY_QWEN_TOKEN_PLAN_CN
+                }
+                _ => false,
+            }
+    }
+
     pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
         !endpoint.is_empty()
-            && (self.endpoint == endpoint
+            && (self.is_default_endpoint(endpoint)
                 || [
                     Adapter::Anthropic,
                     Adapter::Google,
@@ -357,6 +388,19 @@ impl Builtin {
 
     pub fn env(&self) -> &'static str {
         self.env
+    }
+
+    pub fn env_names(&self) -> impl Iterator<Item = &'static str> {
+        let fallback = match self.id {
+            "qwen-token-plan" | "qwen-token-plan-individual" => Some("QWEN_TOKEN_PLAN_API_KEY"),
+            "qwen-token-plan-cn" | "qwen-token-plan-individual-cn" => {
+                Some("QWEN_TOKEN_PLAN_CN_API_KEY")
+            }
+            _ => None,
+        };
+        std::iter::once(self.env)
+            .chain(fallback)
+            .filter(|name| !name.is_empty())
     }
 
     pub fn compatibility(&self) -> Value {
