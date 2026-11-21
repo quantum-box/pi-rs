@@ -3893,27 +3893,8 @@ impl Agent<'_> {
                     outcome
                 }
             }
-            outcome @ Outcome::Structured { .. } => {
-                let size = outcome.tool_content().len();
-                if size > max_output_bytes && outcome.is_error() {
-                    Outcome::Failed("failure detail exceeds size limit".into())
-                } else if size > max_output_bytes {
-                    Outcome::Truncated {
-                        original_bytes: size,
-                    }
-                } else {
-                    outcome
-                }
-            }
-            outcome @ Outcome::StructuredWithDetails { .. } => {
-                let size = serde_json::to_vec(&outcome)?.len();
-                if size > max_output_bytes {
-                    Outcome::Truncated {
-                        original_bytes: size,
-                    }
-                } else {
-                    outcome
-                }
+            outcome @ (Outcome::Structured { .. } | Outcome::StructuredWithDetails { .. }) => {
+                bound_structured_tool_outcome(outcome, max_output_bytes)?
             }
             Outcome::Failed(reason) if reason.len() > max_output_bytes => {
                 Outcome::Failed("failure detail exceeds size limit".into())
@@ -7529,6 +7510,24 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
 
 // Fingerprint only stable request configuration, excluding conversation and
 // output allowance, which legitimately change between turns.
+fn bound_structured_tool_outcome(outcome: Outcome, max_bytes: usize) -> Result<Outcome> {
+    let size = if matches!(&outcome, Outcome::StructuredWithDetails { .. }) {
+        serde_json::to_vec(&outcome)?.len()
+    } else {
+        outcome.tool_content().len()
+    };
+    if size <= max_bytes {
+        return Ok(outcome);
+    }
+    if outcome.is_error() {
+        Ok(Outcome::Failed("failure detail exceeds size limit".into()))
+    } else {
+        Ok(Outcome::Truncated {
+            original_bytes: size,
+        })
+    }
+}
+
 fn prepared_configuration_hash(
     model: &dyn Model,
     request: &ModelRequest,
@@ -11820,6 +11819,40 @@ mod tree_tests {
         let round_trip: Outcome =
             serde_json::from_slice(&serde_json::to_vec(&shell).unwrap()).unwrap();
         assert_eq!(round_trip, shell);
+    }
+
+    #[test]
+    fn oversized_structured_tool_outcomes_preserve_error_status() {
+        for is_error in [false, true] {
+            let data =
+                serde_json::json!({"isError":is_error,"content":[{"type":"text","text":"result"}]});
+            for outcome in [
+                Outcome::Structured {
+                    data: data.clone(),
+                    attachments: vec![],
+                },
+                Outcome::StructuredWithDetails {
+                    data: data.clone(),
+                    attachments: vec![],
+                    details: serde_json::json!({"source":"extension"}),
+                },
+            ] {
+                assert_eq!(
+                    bound_structured_tool_outcome(outcome.clone(), 1024).unwrap(),
+                    outcome
+                );
+                let limited = bound_structured_tool_outcome(outcome, 16).unwrap();
+                assert_eq!(limited.is_error(), is_error);
+                if is_error {
+                    assert_eq!(
+                        limited,
+                        Outcome::Failed("failure detail exceeds size limit".into())
+                    );
+                } else {
+                    assert!(matches!(limited, Outcome::Truncated { .. }));
+                }
+            }
+        }
     }
 
     #[tokio::test]
