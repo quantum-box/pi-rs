@@ -58,7 +58,21 @@ or pass `false` to save the message without a turn. Native tools and supported
 callbacks can call `ToolHost::send_message` with steering, follow-up, next-turn,
 trigger-turn, or after-turn delivery. Supported callbacks and recovery behavior
 are listed in the [native parity details](native-parity.md#active-run-native-custom-messages).
-Custom message renderers are not yet supported.
+To render a displayed message in the terminal, advertise its type through
+`custom_message_renderer_types` and implement `render_custom_message`. The
+first extension in load order for that type receives the message including
+its details, the expansion state, the configured output padding and the
+host's expand-key label. Return `RenderedCustomMessage` with styled rows,
+horizontal padding and an optional background theme role. The terminal
+applies its active theme and wraps the rows to fit. The callback runs off the
+terminal paint path with a one-second deadline. A missing or failed
+renderer leaves the default transcript presentation in place.
+
+Rust SDK hosts can acquire the same renderer snapshot through
+`AgentSession::custom_message_renderers`, invoke it asynchronously with a
+host-defined deadline, and apply their own palette. RPC and HTML exports
+retain the original custom-message content. This API uses native styled
+rows. Pi extensions can return arbitrary interactive TypeScript components.
 
 Executable hosts advertising `command_failure_classification_v1` accept the
 `command_effects_classified_v1` request. Its successful protocol envelope

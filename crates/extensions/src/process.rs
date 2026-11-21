@@ -197,6 +197,10 @@ enum ProtocolRequest {
         metadata: Option<Value>,
         state: Option<ExtensionState>,
     },
+    RenderCustomMessage {
+        message: pi_rs_core::CustomMessage,
+        options: pi_rs_core::CustomMessageRenderOptions,
+    },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
         state: Option<ExtensionState>,
@@ -327,6 +331,8 @@ struct Envelope {
 struct Description {
     id: String,
     dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_message_renderers: Vec<String>,
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
@@ -997,6 +1003,24 @@ impl Extension for ExecutableExtension {
     }
     fn handles_tool_execution_updates(&self) -> bool {
         self.description.tool_execution_update_hook
+    }
+    fn custom_message_renderer_types(&self) -> Vec<&str> {
+        self.description
+            .custom_message_renderers
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+    async fn render_custom_message(
+        &self,
+        message: &pi_rs_core::CustomMessage,
+        options: &pi_rs_core::CustomMessageRenderOptions,
+    ) -> ExtensionResult<Option<pi_rs_core::RenderedCustomMessage>> {
+        self.request_async(ProtocolRequest::RenderCustomMessage {
+            message: message.clone(),
+            options: options.clone(),
+        })
+        .await
     }
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
@@ -3571,6 +3595,11 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            custom_message_renderers: extension
+                .custom_message_renderer_types()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             flags: extension.cli_flags(),
             host_calls: true,
             command_entries: extension.supports_command_entries(),
@@ -3767,6 +3796,16 @@ async fn dispatch_inner(
                 )
                 .await,
         ),
+        ProtocolRequest::RenderCustomMessage { message, options } => {
+            if !message.display
+                || !extension
+                    .custom_message_renderer_types()
+                    .contains(&message.custom_type.as_str())
+            {
+                return encode(Ok(Option::<pi_rs_core::RenderedCustomMessage>::None));
+            }
+            encode(extension.render_custom_message(&message, &options).await)
+        }
         ProtocolRequest::DiscoverResources { event, state } => {
             if host.supports_custom_messages()
                 || host.supports_custom_entries()
@@ -4594,6 +4633,69 @@ mod tests {
             serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
             DuplexFrame::Progress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn custom_message_renderer_capability_and_request_round_trip() {
+        struct Renderer;
+        #[async_trait::async_trait]
+        impl Extension for Renderer {
+            fn id(&self) -> &str {
+                "renderer"
+            }
+            fn custom_message_renderer_types(&self) -> Vec<&str> {
+                vec!["card"]
+            }
+            async fn render_custom_message(
+                &self,
+                message: &pi_rs_core::CustomMessage,
+                options: &pi_rs_core::CustomMessageRenderOptions,
+            ) -> ExtensionResult<Option<pi_rs_core::RenderedCustomMessage>> {
+                assert_eq!(
+                    message.details,
+                    Some(serde_json::json!({"label":"rendered"}))
+                );
+                assert!(options.expanded);
+                Ok(Some(pi_rs_core::RenderedCustomMessage {
+                    lines: vec![],
+                    padding: options.output_pad,
+                    background: None,
+                }))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Renderer);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(
+            description["custom_message_renderers"],
+            serde_json::json!(["card"])
+        );
+        let mut legacy = description;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("custom_message_renderers");
+        assert!(
+            serde_json::from_value::<Description>(legacy)
+                .unwrap()
+                .custom_message_renderers
+                .is_empty()
+        );
+        let mut message = serde_json::json!({
+            "type":"render_custom_message",
+            "message":{"customType":"card","content":"model context","display":true,"details":{"label":"rendered"}},
+            "options":{"expanded":true,"outputPad":3}
+        });
+        let request = serde_json::from_value(message.clone()).unwrap();
+        assert_eq!(
+            dispatch(extension.clone(), request).await.unwrap()["padding"],
+            3
+        );
+        message["message"]["display"] = false.into();
+        let request = serde_json::from_value(message).unwrap();
+        assert!(dispatch(extension, request).await.unwrap().is_null());
     }
 
     #[tokio::test]
