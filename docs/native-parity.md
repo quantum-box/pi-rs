@@ -5367,8 +5367,10 @@ fractions, exponents, and leading minus signs cut off at EOF. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
 For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
 control after a surrogate in another string if no other parse error occurs first.
-Other malformed JSON retains the native parser's diagnostics; full
-malformed-input parity remains open.
+Malformed object property names and separators, object trailing commas, missing
+array separators and trailing text after a complete JSON value also use Pi's
+position-aware wording. Other malformed records, including array trailing
+commas, retain the native parser's diagnostics.
 
 ### Shell execution transcript checkpoint
 
