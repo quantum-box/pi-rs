@@ -1698,7 +1698,8 @@ Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
 when converted to milliseconds use the usual backoff. The 60-second
 server-delay cap applies to finite values. Retry dates accept the obsolete
 RFC 850 form with JavaScript's two-digit year interpretation. The asctime
-form uses local time unless the header specifies GMT or UTC, matching Pi.
+form uses local time unless the header specifies GMT or UTC. It follows Pi's
+handling of clock changes and inconsistent weekday names.
 
 ### Resource selection checkpoint
 
