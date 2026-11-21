@@ -2227,7 +2227,10 @@ editor for implemented model defaults, resource lists, native packages, tool
 selection, trust defaults, terminal mode and codemode settings. Ctrl+S validates
 and saves, Escape discards the edit. Invalid values keep the editor open and
 show the failing settings path. The selected setting includes an explanatory
-hint below the searchable list. Unrecognized extension-owned keys survive
+hint below the searchable list. Values stay in the same column as the list
+is filtered. On narrow terminals, short rows can use less padding to keep
+their values visible. The selected row uses Pi's arrow and accent color, and other
+values use the muted theme color. Unrecognized extension-owned keys survive
 updates. Runtime/resource changes take effect on reload or the next startup,
 and theme changes apply immediately.
 
