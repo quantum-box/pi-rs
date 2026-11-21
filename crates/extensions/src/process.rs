@@ -4681,6 +4681,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_before_settle_capability_carries_structural_decisions() {
+        struct Hook;
+
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "boundary-hook"
+            }
+
+            fn handles_agent_before_settle(&self) -> bool {
+                true
+            }
+
+            async fn agent_before_settle(
+                &self,
+                event: &pi_rs_core::AgentBeforeSettle,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+                assert!(event.context.can_continue);
+                assert_eq!(event.context.context_messages[0].record_id, 4);
+                Ok(pi_rs_core::BoundaryDecision {
+                    entries: Some(event.entries.clone()),
+                    should_continue: Some(false),
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["agent_before_settle_hook"], true);
+        let entry = serde_json::json!({"type":"context_edit","targetId":4,"replacement":null});
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "agent_before_settle",
+            "event": {
+                "outcome": "completed", "entries": [entry], "continue": true,
+                "context": {
+                    "contextMessages": [{"recordId":4,"message":{"role":"user","content":"hello"}}],
+                    "pendingMessages": [], "canContinue": true
+                }
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response["entries"][0], entry);
+        assert_eq!(response["continue"], false);
+    }
+
+    #[tokio::test]
     async fn tool_execution_lifecycle_capability_and_events_round_trip() {
         struct Hook;
         #[async_trait::async_trait]
