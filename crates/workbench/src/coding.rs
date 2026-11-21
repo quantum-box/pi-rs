@@ -2945,23 +2945,39 @@ impl CodingTool {
         }
         self.path(&ancestor.to_string_lossy())?;
         check_mutation_cancelled(cancellation)?;
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            if self.unrestricted && cfg!(unix) {
+                local_write_mkdir_error(error, parent)
+            } else {
+                error.into()
+            }
+        })?;
         let parent = self.path(&parent.to_string_lossy())?;
-        let mut target = parent.join(
+        let mut destination = parent.join(
             target
                 .file_name()
                 .ok_or_else(|| Error::Config("file name missing".into()))?,
         );
-        if target.symlink_metadata().is_ok() {
-            let existing = self.path(&target.to_string_lossy())?;
+        if destination.symlink_metadata().is_ok() {
+            let existing = self.path(&destination.to_string_lossy())?;
             if !existing.is_file() {
+                if self.unrestricted && cfg!(unix) && existing.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        format!(
+                            "EISDIR: illegal operation on a directory, open '{}'",
+                            target.display()
+                        ),
+                    )
+                    .into());
+                }
                 return Err(Error::Config("expected a regular file".into()));
             }
-            target = existing;
+            destination = existing;
         }
-        let _lock = mutation_lock(&target, cancellation)?;
+        let _lock = mutation_lock(&destination, cancellation)?;
         check_mutation_cancelled(cancellation)?;
-        atomic_write(&target, content.as_bytes(), cancellation)?;
+        atomic_write(&destination, content.as_bytes(), cancellation)?;
         check_mutation_cancelled(cancellation)?;
         Ok(format!("Successfully wrote to {display_path}"))
     }
@@ -3984,6 +4000,16 @@ fn atomic_write(
     Ok(())
 }
 
+fn local_write_mkdir_error(error: std::io::Error, parent: &Path) -> Error {
+    let kind = error.kind();
+    let diagnostic = match kind {
+        std::io::ErrorKind::AlreadyExists => "EEXIST: file already exists",
+        std::io::ErrorKind::NotADirectory => "ENOTDIR: not a directory",
+        _ => return error.into(),
+    };
+    std::io::Error::new(kind, format!("{diagnostic}, mkdir '{}'", parent.display())).into()
+}
+
 fn edit_error_text(error: Error) -> String {
     match error {
         Error::Config(message) => message,
@@ -4484,6 +4510,88 @@ mod tests {
                 assert!(declarations.iter().any(|tool| tool.spec.name == name));
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_matches_pi_directory_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("parent-file"), "retained").unwrap();
+        std::os::unix::fs::symlink("dir", root.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink("parent-file", root.join("file-link")).unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        };
+        for (path, reported_path, diagnostic) in [
+            (
+                "dir",
+                "dir",
+                "EISDIR: illegal operation on a directory, open",
+            ),
+            (
+                "dir-link",
+                "dir-link",
+                "EISDIR: illegal operation on a directory, open",
+            ),
+            (
+                "parent-file/child",
+                "parent-file",
+                "EEXIST: file already exists, mkdir",
+            ),
+            (
+                "parent-file/nested/child",
+                "parent-file/nested",
+                "ENOTDIR: not a directory, mkdir",
+            ),
+            (
+                "file-link/child",
+                "file-link",
+                "EEXIST: file already exists, mkdir",
+            ),
+            (
+                "file-link/nested/child",
+                "file-link/nested",
+                "ENOTDIR: not a directory, mkdir",
+            ),
+        ] {
+            let result = tool
+                .invoke(
+                    json!({"path":path,"content":"replacement"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            let expected = format!("{diagnostic} '{}'", root.join(reported_path).display());
+            assert!(
+                matches!(&result, Outcome::Failed(actual) if actual == &expected),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("parent-file")).unwrap(),
+            "retained"
+        );
+        assert!(
+            std::fs::read_dir(root.join("dir"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        assert!(matches!(
+            scoped.write(&json!({"path":"dir","content":"replacement"})),
+            Err(Error::Config(message)) if message == "expected a regular file"
+        ));
     }
 
     #[cfg(unix)]
