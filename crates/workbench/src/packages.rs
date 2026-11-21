@@ -3675,6 +3675,44 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
     }
 
     #[test]
+    fn package_filters_match_bounded_positive_extglobs() {
+        let root = Path::new("package");
+        let candidates = [
+            "review",
+            "triage",
+            "audit",
+            "review-quick",
+            "@(review|triage)",
+        ]
+        .map(|name| root.join(format!("prompts/{name}.md")));
+        let filter = ResourceFilter::new(
+            &json!({"prompts":["prompts/@(review|triage).md", "!@(triage|audit).md", "+prompts/audit.md"]}),
+            "prompts",
+        ).unwrap();
+
+        assert_eq!(
+            filter.states(&candidates, root, false).unwrap(),
+            [
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false)
+            ]
+        );
+
+        let delta = ResourceFilter::new(
+            &json!({"autoload":false,"prompts":["prompts/review?(-quick).md"]}),
+            "prompts",
+        )
+        .unwrap();
+        assert_eq!(
+            delta.states(&candidates, root, false).unwrap(),
+            [Some(true), None, None, Some(true), None]
+        );
+    }
+
+    #[test]
     fn package_filter_reports_invalid_file_urls_when_evaluated() {
         let root = std::env::temp_dir();
         let path = root.join("prompts/review.md");
@@ -5086,43 +5124,5 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(source.contains("native-demo"));
         assert!(!source.contains("project_notes"));
         assert!(scaffold(&target, None).is_err());
-    }
-
-    #[test]
-    fn package_filters_match_bounded_positive_extglobs() {
-        let root = Path::new("package");
-        let candidates = [
-            "review",
-            "triage",
-            "audit",
-            "review-quick",
-            "@(review|triage)",
-        ]
-        .map(|name| root.join(format!("prompts/{name}.md")));
-        let filter = ResourceFilter::new(
-            &json!({"prompts":["prompts/@(review|triage).md", "!@(triage|audit).md", "+prompts/audit.md"]}),
-            "prompts",
-        ).unwrap();
-
-        assert_eq!(
-            filter.states(&candidates, root, false).unwrap(),
-            [
-                Some(true),
-                Some(false),
-                Some(true),
-                Some(false),
-                Some(false)
-            ]
-        );
-
-        let delta = ResourceFilter::new(
-            &json!({"autoload":false,"prompts":["prompts/review?(-quick).md"]}),
-            "prompts",
-        )
-        .unwrap();
-        assert_eq!(
-            delta.states(&candidates, root, false).unwrap(),
-            [Some(true), None, None, Some(true), None]
-        );
     }
 }
