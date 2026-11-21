@@ -36,3 +36,6 @@ Model scope resolution in src/model_selection.rs follows Pi v1.5.0 model-resolve
 
 builtin-chat-models.json and the bundled classifier/image data are projected from
 @earendil-works/pi-ai v1.5.0 under the same MIT license.
+
+The llama.cpp classifier prompt and protocol in src/operation_models/llama_cpp.rs
+follow Pi v1.5.0 packages/ai/src/api/llama-cpp-classify.ts under the same MIT license.

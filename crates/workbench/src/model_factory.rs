@@ -1,7 +1,10 @@
 //! Explicit native provider clients for hosts that own endpoints and credentials.
 use std::sync::Arc;
 
-use pi_rs::{Error, HostAuthSnapshot, HostCredentialKind, Model, ModelCatalogBuilder, Result};
+use pi_rs::{
+    CatalogModelInfo, Error, HostAuthSnapshot, HostCredentialKind, Model, ModelCatalog,
+    ModelCatalogBuilder, Result,
+};
 
 /// Provider protocol selected by the host. This is not inferred from a model or
 /// from session history.
@@ -14,9 +17,20 @@ pub enum NativeModelApi {
     GoogleGemini,
 }
 
+/// A catalog entry with an explicitly authorized provider protocol and route.
+/// Optional metadata is descriptive and cannot change the route.
+#[derive(Clone, Debug)]
+pub struct NativeModelDefinition<'a> {
+    pub api: NativeModelApi,
+    pub provider: &'a str,
+    pub endpoint: &'a str,
+    pub model: &'a str,
+    pub info: Option<CatalogModelInfo>,
+}
+
 /// Construct clients only from the immutable credentials supplied by the host.
-/// This does not read environment variables, discover models, run commands,
-/// refresh OAuth, select endpoints, or perform network requests during creation.
+/// This does not discover credentials or models, run commands, refresh OAuth,
+/// select endpoints, or perform network requests during creation.
 #[derive(Clone, Default)]
 pub struct ModelClientFactory {
     credentials: HostAuthSnapshot,
@@ -25,6 +39,25 @@ pub struct ModelClientFactory {
 impl ModelClientFactory {
     pub fn new(credentials: HostAuthSnapshot) -> Self {
         Self { credentials }
+    }
+
+    /// Build an independent catalog from host-supplied definitions. Any
+    /// invalid route, missing credential or duplicate identity fails the
+    /// entire construction. Provider access is not probed.
+    pub fn catalog<'a>(
+        &self,
+        definitions: impl IntoIterator<Item = NativeModelDefinition<'a>>,
+    ) -> Result<ModelCatalog> {
+        let mut catalog = ModelCatalogBuilder::new();
+        for definition in definitions {
+            let client = self.client(definition.api, definition.provider, definition.endpoint)?;
+            if let Some(info) = definition.info {
+                catalog.register_with_info(definition.provider, definition.model, client, info)?;
+            } else {
+                catalog.register(definition.provider, definition.model, client)?;
+            }
+        }
+        Ok(catalog.build())
     }
 
     /// Construct a client for an exact registered provider and endpoint.

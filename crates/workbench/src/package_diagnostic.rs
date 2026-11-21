@@ -256,7 +256,7 @@ fn negative_extglob_regex(pattern: &str) -> Option<fancy_regex::Regex> {
 // This deliberately supports a bounded subset. In particular negated extglobs,
 // classes, braces and globstars require Node-specific semantics; falling back
 // is preferable to reporting a partial or incorrectly empty candidate set.
-fn extglob_regex(pattern: &str) -> Option<Option<regex::Regex>> {
+pub(super) fn extglob_regex(pattern: &str) -> Option<Option<regex::Regex>> {
     let bytes = pattern.as_bytes();
     if !has_extglob(pattern) {
         return Some(None);

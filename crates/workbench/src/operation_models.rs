@@ -15,6 +15,7 @@ use super::{
 };
 
 mod decisions;
+mod llama_cpp;
 mod wire;
 use wire::{
     classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
@@ -45,12 +46,17 @@ enum Api {
     WorkersAiSystemOne,
     #[serde(rename = "openrouter-images")]
     OpenRouterImages,
+    #[serde(rename = "llama-cpp-classify")]
+    LlamaCppClassifier,
 }
 
 impl Api {
     fn kind(self) -> Kind {
         match self {
-            Self::SystemOne | Self::WorkersAiSystemOne | Self::OpenAiDecisions => Kind::Classifier,
+            Self::SystemOne
+            | Self::WorkersAiSystemOne
+            | Self::OpenAiDecisions
+            | Self::LlamaCppClassifier => Kind::Classifier,
             Self::OpenRouterImages => Kind::Image,
         }
     }
@@ -61,6 +67,7 @@ impl Api {
             Self::SystemOne => "systemone",
             Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
+            Self::LlamaCppClassifier => "completion",
         }
     }
 }
@@ -514,7 +521,7 @@ impl Catalogue {
                 let cloudflare_default = cloudflare
                     && (base.contains("{CLOUDFLARE_ACCOUNT_ID}")
                         || (configured.base_url.is_none() && provider["baseUrl"].is_null()));
-                let (base, endpoint) = operation_endpoints(base, api.route(), cloudflare)?;
+                let (base, endpoint) = operation_endpoints(base, api, cloudflare)?;
                 let key_base = match &configured_binding {
                     Some(binding) => binding.as_deref(),
                     None => provider["baseUrl"]
@@ -523,7 +530,7 @@ impl Catalogue {
                         .or(inferred_base.as_deref()),
                 };
                 let key_endpoint = key_base
-                    .map(|base| operation_endpoints(base, api.route(), cloudflare))
+                    .map(|base| operation_endpoints(base, api, cloudflare))
                     .transpose()?
                     .map(|(_, endpoint)| endpoint);
                 let inherited: BTreeMap<String, String> = if provider["headers"].is_null() {
@@ -601,7 +608,11 @@ impl Catalogue {
                 continue;
             }
             if available {
-                let key = (model.provider.as_str(), model.endpoint.as_str());
+                let key = (
+                    model.provider.as_str(),
+                    model.endpoint.as_str(),
+                    model.allows_keyless(),
+                );
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
                     None => {
@@ -611,7 +622,7 @@ impl Catalogue {
                             .and_then(|model| model.credential(keys))
                         {
                             Some(credential) => credential.resolve().await.is_ok(),
-                            None => false,
+                            None => model.allows_keyless(),
                         };
                         resolved.insert(key, usable);
                         usable
@@ -639,10 +650,16 @@ fn cloudflare_model_binding(provider: &Value) -> Option<Option<String>> {
     }
     let binding = (|| {
         let first = models.first()?["baseUrl"].as_str()?;
-        let expected = operation_endpoints(first, "run", true).ok()?.1;
+        let expected = operation_endpoints(first, Api::WorkersAiSystemOne, true)
+            .ok()?
+            .1;
         for model in models {
             let base = model["baseUrl"].as_str()?;
-            if operation_endpoints(base, "run", true).ok()?.1 != expected {
+            if operation_endpoints(base, Api::WorkersAiSystemOne, true)
+                .ok()?
+                .1
+                != expected
+            {
                 return None;
             }
         }
@@ -728,7 +745,15 @@ pub(super) fn valid_cloudflare_account(account: &str) -> bool {
         && account.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-fn operation_endpoints(value: &str, route: &str, cloudflare: bool) -> Result<(Url, Url)> {
+fn operation_endpoints(value: &str, api: Api, cloudflare: bool) -> Result<(Url, Url)> {
+    let route = api.route();
+    if matches!(api, Api::LlamaCppClassifier) {
+        let value = value.trim_end_matches('/');
+        let root = value.strip_suffix("/v1").unwrap_or(value);
+        let (base, _) = endpoints(root, route)?;
+        let endpoint = llama_cpp::endpoint(&base, route);
+        return Ok((base, endpoint));
+    }
     const PLACEHOLDER: &str = "{CLOUDFLARE_ACCOUNT_ID}";
     if value.contains(PLACEHOLDER) {
         if !cloudflare || value.matches(PLACEHOLDER).count() != 1 {
@@ -757,6 +782,10 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 }
 
 impl Entry {
+    fn allows_keyless(&self) -> bool {
+        matches!(self.api, Api::LlamaCppClassifier)
+    }
+
     fn is_official(&self) -> bool {
         self.cloudflare_default
             || (self.provider == "cloudflare-workers-ai"
@@ -1192,36 +1221,18 @@ impl Operations {
         let entry = &resolved;
         initialize_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
+            Api::LlamaCppClassifier => {
+                let questions = llama_cpp::prepare(context)?;
+                let headers = self.request_headers(entry, keys).await?;
+                data["answers"] =
+                    llama_cpp::classify(&self.client, entry, &headers, questions).await?;
+                return Ok(());
+            }
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
-        let credential = entry
-            .credential(keys)
-            .ok_or_else(|| Error::Config(format!("No API key for provider: {}", entry.provider)))?;
-        let key = credential.resolve().await?;
-        let credential_env = keys.operation_environment(
-            &entry.provider,
-            entry.endpoint.as_str(),
-            entry.is_official(),
-        );
-        let mut headers = HeaderMap::new();
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
-            .map_err(|_| Error::Config("invalid model operation credential".into()))?;
-        authorization.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        for (name, value) in &entry.model.headers {
-            let value = resolve_header(value, credential_env).await.ok_or_else(|| {
-                Error::Config(format!("could not resolve operation model header {name}"))
-            })?;
-            let mut value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::Config(format!("invalid operation model header {name}")))?;
-            value.set_sensitive(true);
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
-                value,
-            );
-        }
+        let mut headers = self.request_headers(entry, keys).await?;
         // Pi adds the automatic classifier image opt-in as request options,
         // after provider and model headers have been combined.
         if image_opt_in {
@@ -1230,17 +1241,14 @@ impl Operations {
                 HeaderValue::from_static("true"),
             );
         }
-        let request = self
-            .client
-            .post(entry.endpoint.clone())
-            .headers(headers)
-            .header("content-type", "application/json")
-            .body(serde_json::to_vec(&payload)?)
-            .build()
-            .map_err(|_| Error::Config("invalid model operation request".into()))?;
-        let body = send_model_request(&self.client, request, entry.api).await?;
-        let body: Value = serde_json::from_slice(&body)
-            .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
+        let body = send_model_json(
+            &self.client,
+            entry.endpoint.clone(),
+            &headers,
+            &payload,
+            entry.api,
+        )
+        .await?;
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -1268,9 +1276,63 @@ impl Operations {
                     .expect("image operation output is initialized as an array");
                 image_output(&body, output)?;
             }
+            Api::LlamaCppClassifier => unreachable!("handled before the single request"),
         }
         Ok(())
     }
+
+    async fn request_headers(&self, entry: &Entry, keys: &Keys) -> Result<HeaderMap> {
+        let credential_env = keys.operation_environment(
+            &entry.provider,
+            entry.endpoint.as_str(),
+            entry.is_official(),
+        );
+        let mut headers = HeaderMap::new();
+        if let Some(credential) = entry.credential(keys) {
+            let key = credential.resolve().await?;
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
+                .map_err(|_| Error::Config("invalid model operation credential".into()))?;
+            authorization.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        } else if !entry.allows_keyless() {
+            return Err(Error::Config(format!(
+                "No API key for provider: {}",
+                entry.provider
+            )));
+        }
+        for (name, value) in &entry.model.headers {
+            let value = resolve_header(value, credential_env).await.ok_or_else(|| {
+                Error::Config(format!("could not resolve operation model header {name}"))
+            })?;
+            let mut value = HeaderValue::from_str(&value)
+                .map_err(|_| Error::Config(format!("invalid operation model header {name}")))?;
+            value.set_sensitive(true);
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
+                value,
+            );
+        }
+        Ok(headers)
+    }
+}
+
+async fn send_model_json(
+    client: &reqwest::Client,
+    endpoint: Url,
+    headers: &HeaderMap,
+    payload: &Value,
+    api: Api,
+) -> Result<Value> {
+    let request = client
+        .post(endpoint)
+        .headers(headers.clone())
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(payload)?)
+        .build()
+        .map_err(|_| Error::Config("invalid model operation request".into()))?;
+    let body = send_model_request(client, request, api).await?;
+    serde_json::from_slice(&body)
+        .map_err(|_| Error::Model("model operation response is not valid JSON".into()))
 }
 
 #[cfg(test)]
@@ -1776,7 +1838,10 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/x{CLOUDFLARE_ACCOUNT_ID}/ai",
             "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/other",
         ] {
-            assert!(operation_endpoints(url, "run", true).is_err(), "{url}");
+            assert!(
+                operation_endpoints(url, Api::WorkersAiSystemOne, true).is_err(),
+                "{url}"
+            );
         }
         for url in [
             "https://evil.example/client/v4/accounts/explicit123/ai",
