@@ -2190,6 +2190,15 @@ The Rust 1.89 CI matrix passed formatting, all-target Clippy and workspace tests
 on Linux, macOS and Windows at commit `706a249`. Subsequent changes receive the
 same matrix on main.
 
+### SDK extension event bus
+
+`pi_rs_extensions::ExtensionEventBus` provides an in-process Pi-style channel
+bus for native SDK hosts and extensions. One subscription can be removed
+without affecting other listeners, and the host can clear the bus. The
+embedding host shares the bus and owns subscription lifetime. Rust handlers
+run synchronously with JSON values, and failures are returned to the emitter.
+Executable extensions use a separate process protocol.
+
 ### Native extension host calls
 
 Native executables built with the current `serve_extension` can discover and
