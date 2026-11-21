@@ -680,14 +680,15 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     /// Requested model-side sampling constraint, captured when the tool is registered.
     /// The provider's effective decision may differ when fallback is allowed.
-    /// Agent dispatch currently rejects required JSON constraints until it can
-    /// record and replay the provider's effective decision.
+    /// Required JSON Schema constraints use prepared dispatch so the agent can
+    /// record the provider's effective decision before sending the request.
     fn constrained_sampling(&self) -> Option<crate::ToolConstraint> {
         None
     }
     /// Stable, non-secret identity of the implementation and backend used to
     /// recover a pending operation across restarts. Return `None` when that
-    /// continuity cannot be established. The agent does not yet consume it.
+    /// continuity cannot be established. Strictly sampled calls to pollable
+    /// tools require this identity before execution.
     fn recovery_identity(&self) -> Option<String> {
         None
     }

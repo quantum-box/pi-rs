@@ -25,25 +25,14 @@ enum TurnNormalized {
 // first bind the invocation to the successful active-branch model reply.
 fn turn_model_arguments(
     invocation: &Invocation,
-    spec: &ToolSpec,
     decision: Option<&crate::ValidatedToolDecisionSnapshot<'_>>,
 ) -> std::result::Result<serde_json::Value, String> {
     match decision {
         None => crate::parse_tool_arguments(&invocation.call.arguments)
             .map_err(|error| error.to_string()),
-        Some(decision) => {
-            if !decision
-                .effective_tools()
-                .iter()
-                .any(|entry| &entry.spec == spec)
-                || invocation.call.name != spec.name
-            {
-                return Err("registered tool does not match the request decision".into());
-            }
-            decision
-                .normalized_arguments(&invocation.call)
-                .map_err(|error| error.to_string())
-        }
+        Some(decision) => decision
+            .normalized_arguments(&invocation.call)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -230,7 +219,7 @@ fn turn_active_decision_inner(
     Ok(Some(decision))
 }
 
-fn turn_is_strict(decision: &crate::ToolDecisionSnapshot, spec: &ToolSpec) -> Result<bool> {
+fn turn_is_strict(decision: &crate::ToolDecisionSnapshot, name: &str) -> Result<bool> {
     let validated = decision
         .validate_recorded(
             decision.context(),
@@ -242,7 +231,7 @@ fn turn_is_strict(decision: &crate::ToolDecisionSnapshot, spec: &ToolSpec) -> Re
     let effective = validated
         .effective_tools()
         .iter()
-        .find(|entry| &entry.spec == spec)
+        .find(|entry| entry.spec.name == name)
         .ok_or_else(|| Error::Session("tool does not match request decision".into()))?;
     Ok(matches!(
         effective.sampling,
@@ -286,7 +275,10 @@ fn turn_preflight_decision_calls(
         else {
             continue;
         };
-        if tool.spec != effective.spec {
+        if !decision
+            .matches_registered_tool(&tool.owner, &tool.spec)
+            .map_err(|_| Error::Session("invalid tool registration binding".into()))?
+        {
             return Err(Error::Session(
                 "tool does not match request decision".into(),
             ));
@@ -353,7 +345,7 @@ fn turn_poll_snapshot(
     };
     let strict = decision
         .as_ref()
-        .map(|decision| turn_is_strict(decision, &tool.spec))
+        .map(|decision| turn_is_strict(decision, &tool.spec.name))
         .transpose()
         .map_err(|_| pending())?
         .unwrap_or(false);
@@ -1562,15 +1554,19 @@ mod strict_argument_tests {
                 )
                 .unwrap();
             assert_eq!(
-                turn_model_arguments(&invocation, &spec, Some(&decision)).unwrap(),
+                turn_model_arguments(&invocation, Some(&decision)).unwrap(),
                 expected
             );
             let mut changed = spec.clone();
             changed.description = "changed".into();
-            assert!(turn_model_arguments(&invocation, &changed, Some(&decision)).is_err());
+            assert!(
+                !snapshot
+                    .matches_registered_tool("fixture", &changed)
+                    .unwrap()
+            );
         }
         assert_eq!(
-            turn_model_arguments(&invocation, &spec, None).unwrap(),
+            turn_model_arguments(&invocation, None).unwrap(),
             json!({"path":"file","limit":null})
         );
         assert!(invocation.call.arguments.contains("null"));
@@ -1699,7 +1695,7 @@ impl Agent<'_> {
             })
             .transpose()
             .map_err(|_| Error::Session("invalid tool decision".into()))?;
-        let args = match turn_model_arguments(invocation, &tool.spec, validated.as_ref()) {
+        let args = match turn_model_arguments(invocation, validated.as_ref()) {
             Ok(arguments) => arguments,
             Err(error) => {
                 return Ok(TurnNormalized::Skipped(format!(
@@ -1709,7 +1705,7 @@ impl Agent<'_> {
             }
         };
         if let Some(decision) = decision
-            && turn_is_strict(decision, &tool.spec)?
+            && turn_is_strict(decision, &tool.spec.name)?
         {
             turn_strict_tool_preflight(&tool)?;
         }
@@ -2637,7 +2633,7 @@ impl Agent<'_> {
                                 if let TurnPreparation::Ready { tool, args, .. } = &prepared {
                                     let strict_decision = if calls[index].lane.is_none() {
                                         match turn_decision.as_ref() {
-                                            Some(decision) if turn_is_strict(decision, &tool.spec)? => Some(decision),
+                                            Some(decision) if turn_is_strict(decision, &tool.spec.name)? => Some(decision),
                                             _ => None,
                                         }
                                     } else { None };
@@ -2708,7 +2704,7 @@ impl Agent<'_> {
                             && let Some(decision) = turn_decision.as_ref()
                             && let Some(tool) = self.registry.tools.get(&calls[index].invocation.call.name)
                             && !tool.tool.can_poll()
-                            && turn_is_strict(decision, &tool.spec)?
+                            && turn_is_strict(decision, &tool.spec.name)?
                         {
                             reply.outcome = Outcome::Unknown(format!("non-pollable strict tool returned pending ({reference}); reconciliation required"));
                             reply.state = None;

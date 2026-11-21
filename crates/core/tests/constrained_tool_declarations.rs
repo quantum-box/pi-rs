@@ -340,6 +340,32 @@ impl Extension for StrictExtension {
         vec![Arc::new(StrictTool(self.0.clone()))]
     }
 }
+struct RewriteStrictRead {
+    nullable_limit: bool,
+}
+impl Extension for RewriteStrictRead {
+    fn id(&self) -> &str {
+        "rewrite-strict-read"
+    }
+    fn context(
+        &self,
+        request: &mut ContextRequest<'_>,
+        _: Option<&ExtensionState>,
+    ) -> ExtensionResult<ContextChange> {
+        let tool = request
+            .tools_mut()
+            .iter_mut()
+            .find(|tool| tool.name == "strict_read")
+            .unwrap();
+        tool.description = "read using this request's schema".into();
+        tool.parameters["properties"]["limit"] = if self.nullable_limit {
+            json!({"type":"null"})
+        } else {
+            json!({"type":"integer","minimum":1})
+        };
+        Ok(ContextChange::Changed)
+    }
+}
 struct StrictModel(Arc<AtomicUsize>);
 struct StrictDispatch {
     calls: Arc<AtomicUsize>,
@@ -448,6 +474,47 @@ async fn strict_tool_execution_records_decision_and_normalizes_a_copy() {
         })
         .unwrap();
     assert!(raw.call.arguments.contains("null"));
+}
+
+#[tokio::test]
+async fn rewritten_wire_schema_normalizes_before_registered_schema_validation() {
+    for nullable_limit in [false, true] {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(StrictExtension(captured.clone())))
+            .unwrap();
+        registry
+            .register(Arc::new(RewriteStrictRead { nullable_limit }))
+            .unwrap();
+        let mut session = SessionBuilder::new(
+            Arc::new(StrictModel(Arc::new(AtomicUsize::new(0)))),
+            "fixture",
+        )
+        .registry(registry)
+        .in_memory()
+        .unwrap();
+        assert_eq!(session.prompt("read").await.unwrap(), "done");
+        let journal = session.journal().unwrap();
+        let result = journal
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::ToolFinished { outcome, .. } => Some(outcome),
+                _ => None,
+            });
+        if nullable_limit {
+            // The advertised schema preserves an explicit null. The registered
+            // tool contract still rejects it before invocation.
+            assert!(
+                matches!(result, Some(Outcome::Skipped(reason)) if reason.contains("JSON Schema"))
+            );
+            assert_eq!(*captured.lock().unwrap(), None);
+        } else {
+            assert_eq!(result, Some(&Outcome::Succeeded("ok".into())));
+            assert_eq!(*captured.lock().unwrap(), Some(json!({"path":"file"})));
+        }
+    }
 }
 
 struct StrictPendingTool(Arc<AtomicUsize>);
@@ -606,7 +673,7 @@ async fn strict_pending_reopens_with_original_authorized_arguments() {
     });
     let observed = Arc::new(std::sync::Mutex::new(None));
     let model = Arc::new(StrictModel(Arc::new(AtomicUsize::new(0))));
-    let make_registry = || {
+    let make_registry = |rewrite_request| {
         let mut registry = Registry::default();
         registry
             .register(Arc::new(RestartExtension(tool.clone())))
@@ -614,10 +681,17 @@ async fn strict_pending_reopens_with_original_authorized_arguments() {
         registry
             .register(Arc::new(AuthorizeAndObserve(observed.clone())))
             .unwrap();
+        if rewrite_request {
+            registry
+                .register(Arc::new(RewriteStrictRead {
+                    nullable_limit: false,
+                }))
+                .unwrap();
+        }
         registry
     };
     let mut session = SessionBuilder::new(model.clone(), "fixture")
-        .registry(make_registry())
+        .registry(make_registry(true))
         .in_memory()
         .unwrap();
     let control = session.controls();
@@ -637,7 +711,7 @@ async fn strict_pending_reopens_with_original_authorized_arguments() {
     drop(session);
     *observed.lock().unwrap() = None;
     let mut session = SessionBuilder::new(model, "fixture")
-        .registry(make_registry())
+        .registry(make_registry(false))
         .open(path)
         .unwrap();
     assert_eq!(

@@ -1,4 +1,6 @@
 //! Conversion of tool schemas to the strict subset used by model providers.
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -120,6 +122,10 @@ pub struct ToolDecisionSnapshot {
     binding_sha256: String,
     declarations: Vec<ToolDeclaration>,
     effective: Vec<EffectiveToolDeclaration>,
+    // Local execution contracts can differ from the tools advertised by a
+    // request hook. Provider snapshots leave this field unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registered_tools: Option<BTreeMap<String, String>>,
 }
 
 /// A decision snapshot checked against its request and binding.
@@ -185,26 +191,73 @@ impl ToolDecisionSnapshot {
             StrictSchemaError(format!("cannot encode dispatch request: {error}"))
         })?;
         let dispatch_sha256 = format!("{:x}", Sha256::digest(dispatch_bytes));
-        let binding = serde_json::to_vec(&(
-            1_u32,
-            context,
-            &request_sha256,
-            &dispatch_sha256,
-            declarations,
-            effective,
-        ))
-        .map_err(|error| {
-            StrictSchemaError(format!("cannot encode tool decision binding: {error}"))
-        })?;
-        Ok(Self {
+        let mut snapshot = Self {
             version: 1,
             context: context.clone(),
             request_sha256,
             dispatch_sha256,
-            binding_sha256: format!("{:x}", Sha256::digest(binding)),
+            binding_sha256: String::new(),
             declarations: declarations.to_vec(),
             effective: effective.to_vec(),
-        })
+            registered_tools: None,
+        };
+        snapshot.binding_sha256 = snapshot.binding_digest()?;
+        Ok(snapshot)
+    }
+
+    fn binding_digest(&self) -> Result<String, StrictSchemaError> {
+        let provider = (
+            self.version,
+            &self.context,
+            &self.request_sha256,
+            &self.dispatch_sha256,
+            &self.declarations,
+            &self.effective,
+        );
+        // Keep existing provider snapshot digests and older journal records
+        // compatible when they have no separate registration binding.
+        match &self.registered_tools {
+            Some(tools) => schema_digest(&(provider, tools)),
+            None => schema_digest(&provider),
+        }
+    }
+
+    pub(crate) fn with_registered_tools(
+        mut self,
+        registry: &crate::Registry,
+    ) -> Result<Self, StrictSchemaError> {
+        self.registered_tools = Some(
+            self.effective
+                .iter()
+                .map(|entry| {
+                    let name = &entry.spec.name;
+                    let tool = registry.tools.get(name).ok_or_else(|| {
+                        StrictSchemaError(format!("tool {name:?} is not registered"))
+                    })?;
+                    Ok((name.clone(), schema_digest(&(&tool.owner, &tool.spec))?))
+                })
+                .collect::<Result<_, StrictSchemaError>>()?,
+        );
+        self.binding_sha256 = self.binding_digest()?;
+        Ok(self)
+    }
+
+    pub(crate) fn matches_registered_tool(
+        &self,
+        owner: &str,
+        spec: &crate::ToolSpec,
+    ) -> Result<bool, StrictSchemaError> {
+        let Some(advertised) = self
+            .effective
+            .iter()
+            .find(|entry| entry.spec.name == spec.name)
+        else {
+            return Ok(false);
+        };
+        match &self.registered_tools {
+            Some(tools) => Ok(tools.get(&spec.name) == Some(&schema_digest(&(owner, spec))?)),
+            None => Ok(&advertised.spec == spec),
+        }
     }
 
     /// Check the request, context and effective decisions before use.
@@ -227,9 +280,14 @@ impl ToolDecisionSnapshot {
             declarations,
             &self.effective,
         )?;
+        let binding_sha256 = if self.registered_tools.is_some() {
+            self.binding_digest()?
+        } else {
+            expected.binding_sha256
+        };
         if self.request_sha256 != expected.request_sha256
             || self.dispatch_sha256 != expected.dispatch_sha256
-            || self.binding_sha256 != expected.binding_sha256
+            || self.binding_sha256 != binding_sha256
         {
             return Err(StrictSchemaError(
                 "tool decision snapshot binding mismatch".into(),
@@ -269,18 +327,7 @@ impl ToolDecisionSnapshot {
             max_output_tokens: 1,
         };
         validate_effective_tool_declarations(&request, &self.declarations, &self.effective)?;
-        let binding = serde_json::to_vec(&(
-            self.version,
-            &self.context,
-            &self.request_sha256,
-            &self.dispatch_sha256,
-            &self.declarations,
-            &self.effective,
-        ))
-        .map_err(|error| {
-            StrictSchemaError(format!("cannot encode tool decision binding: {error}"))
-        })?;
-        if self.binding_sha256 != format!("{:x}", Sha256::digest(binding)) {
+        if self.binding_sha256 != self.binding_digest()? {
             return Err(StrictSchemaError(
                 "tool decision snapshot binding mismatch".into(),
             ));
@@ -307,6 +354,13 @@ impl ToolDecisionSnapshot {
     pub fn binding_sha256(&self) -> &str {
         &self.binding_sha256
     }
+}
+
+fn schema_digest(value: &impl Serialize) -> Result<String, StrictSchemaError> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        StrictSchemaError(format!("cannot encode tool decision binding: {error}"))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// Validate effective decisions against the final request and declarations.

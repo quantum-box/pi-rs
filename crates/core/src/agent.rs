@@ -2894,9 +2894,14 @@ impl Agent<'_> {
             tool_decision: None,
         };
         if let Some(prepared) = &prepared {
+            let decision = prepared
+                .decision_snapshot()
+                .clone()
+                .with_registered_tools(self.registry)
+                .map_err(|error| Error::Session(error.to_string()))?;
             let record = session.append_tool_decision_request(
                 requested,
-                prepared.decision_snapshot(),
+                &decision,
                 &request,
                 prepared.dispatch_request(),
                 &declarations,
@@ -3508,6 +3513,7 @@ impl Agent<'_> {
                                     invocation.operation_id,
                                     start.id,
                                     start.run_id,
+                                    &tool.owner,
                                     &tool.spec,
                                 )
                                 .map_err(|_| Error::PendingOperation(invocation.operation_id))?;

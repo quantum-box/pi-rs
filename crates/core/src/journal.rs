@@ -1034,6 +1034,7 @@ impl Session {
         operation_id: Uuid,
         before: u64,
         run_id: Option<Uuid>,
+        owner: &str,
         spec: &crate::ToolSpec,
     ) -> Result<(crate::Invocation, String)> {
         let RecordedToolDecision::Current(decision) = self.active_tool_decision(request_id)? else {
@@ -1070,10 +1071,9 @@ impl Session {
                 &marker.binding_sha256,
             )
             .map_err(|_| Error::Session("invalid tool decision".into()))?;
-        if !validated
-            .effective_tools()
-            .iter()
-            .any(|tool| &tool.spec == spec)
+        if !decision
+            .matches_registered_tool(owner, spec)
+            .map_err(|_| Error::Session("invalid tool registration binding".into()))?
         {
             return Err(Error::Session(
                 "registered tool is not in the request decision".into(),
@@ -1237,6 +1237,7 @@ impl Session {
             operation_id,
             self.records.len() as u64 + 1,
             self.run_id,
+            owner,
             spec,
         )?;
         snapshot.validate(
@@ -1310,8 +1311,14 @@ impl Session {
         if self.branch().iter().filter(|entry| matches!(&entry.event, Event::ToolStarted { operation_id: other, .. } if other == operation_id)).count() != 1 {
             return Err(Error::Session("ambiguous tool start".into()));
         }
-        let (invocation, decision) =
-            self.execution_provenance(marker.request_id, *operation_id, id, record.run_id, spec)?;
+        let (invocation, decision) = self.execution_provenance(
+            marker.request_id,
+            *operation_id,
+            id,
+            record.run_id,
+            owner,
+            spec,
+        )?;
         if decision != marker.decision_sha256 {
             return Err(Error::Session("tool execution decision mismatch".into()));
         }
