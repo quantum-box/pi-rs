@@ -2235,6 +2235,10 @@ impl Tool for CodingTool {
         }
     }
 
+    fn pi_argument_diagnostics(&self) -> bool {
+        self.unrestricted
+    }
+
     async fn prepare_arguments(&self, mut arguments: Value) -> pi_rs::ExtensionResult<Value> {
         if self.unrestricted {
             if matches!(self.kind, Kind::Edit)
