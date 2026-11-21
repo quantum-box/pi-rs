@@ -266,18 +266,64 @@ pub enum CustomEntryPresentation {
 }
 
 #[derive(Clone)]
+pub struct TranscriptMarkdown {
+    pub original: String,
+    pub record: Option<(u64, Option<String>)>,
+    pub rendering: Option<(usize, Option<String>)>,
+}
+
+impl From<String> for TranscriptMarkdown {
+    fn from(original: String) -> Self {
+        Self {
+            original,
+            record: None,
+            rendering: None,
+        }
+    }
+}
+
+impl From<&str> for TranscriptMarkdown {
+    fn from(original: &str) -> Self {
+        original.to_owned().into()
+    }
+}
+
+impl TranscriptMarkdown {
+    pub fn from_record(original: String, record: &pi_rs::Record) -> Self {
+        Self {
+            record: Some((record.id, record.timestamp.clone())),
+            ..original.into()
+        }
+    }
+
+    fn at_width(&self, width: usize) -> &str {
+        match &self.rendering {
+            Some((rendered_width, Some(text))) if *rendered_width == width => text,
+            _ => &self.original,
+        }
+    }
+
+    pub fn attempted(&self, width: usize) -> bool {
+        self.rendering
+            .as_ref()
+            .is_some_and(|(rendered_width, _)| *rendered_width == width)
+    }
+}
+
+#[derive(Clone)]
 pub enum Entry {
     Notice(String),
     ModelCycleStatus(String),
     Warning(String),
-    User(String),
+    User(TranscriptMarkdown),
     Skill {
         text: String,
+        user: Option<TranscriptMarkdown>,
         expanded: Option<bool>,
     },
-    Assistant(String),
+    Assistant(TranscriptMarkdown),
     Thinking {
-        text: String,
+        text: TranscriptMarkdown,
         expanded: Option<bool>,
     },
     CustomMessage {
@@ -320,13 +366,48 @@ pub struct TranscriptOptions {
 
 impl Entry {
     pub fn user(text: String) -> Self {
-        if crate::resources::skill_invocation(&text).is_some() {
+        Self::user_markdown(text.into())
+    }
+
+    pub fn user_markdown(markdown: TranscriptMarkdown) -> Self {
+        if let Some((_, _, message)) = crate::resources::skill_invocation(&markdown.original) {
+            let user = message.map(|message| TranscriptMarkdown {
+                record: markdown.record,
+                ..message.into()
+            });
             Self::Skill {
-                text,
+                text: markdown.original,
+                user,
                 expanded: None,
             }
         } else {
-            Self::User(text)
+            Self::User(markdown)
+        }
+    }
+
+    pub fn markdown(
+        &self,
+        show_thinking: bool,
+    ) -> Option<(pi_rs::MarkdownMessageType, &TranscriptMarkdown)> {
+        use pi_rs::MarkdownMessageType::{Assistant, AssistantThinking, User};
+        match self {
+            Self::User(text) => Some((User, text)),
+            Self::Skill {
+                user: Some(text), ..
+            } => Some((User, text)),
+            Self::Assistant(text) => Some((Assistant, text)),
+            Self::Thinking { text, expanded } if expanded.unwrap_or(show_thinking) => {
+                Some((AssistantThinking, text))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn markdown_mut(&mut self) -> Option<&mut TranscriptMarkdown> {
+        match self {
+            Self::User(text) | Self::Assistant(text) | Self::Thinking { text, .. } => Some(text),
+            Self::Skill { user, .. } => user.as_mut(),
+            _ => None,
         }
     }
 
@@ -356,9 +437,13 @@ impl Entry {
             Self::Warning(text) => {
                 return wrap(&[Span::themed(text, theme, "warning")], width);
             }
-            Self::User(text) => user_lines(text, theme, inner, options),
-            Self::Skill { text, expanded } => {
-                let (name, body, message) =
+            Self::User(text) => user_lines(text.at_width(inner), theme, inner, options),
+            Self::Skill {
+                text,
+                user,
+                expanded,
+            } => {
+                let (name, body, _) =
                     crate::resources::skill_invocation(text).expect("skill invocation");
 
                 let mut label = Span::themed("[skill]", theme, "customMessageLabel");
@@ -400,14 +485,21 @@ impl Entry {
                     line.background = Some(theme.color("customMessageBg"));
                 }
                 lines.push(Line::default());
-                if let Some(message) = message {
-                    lines.extend(user_lines(message, theme, inner, options));
+                if let Some(message) = user {
+                    lines.extend(user_lines(message.at_width(inner), theme, inner, options));
                 }
                 lines
             }
             Self::Assistant(text) => {
-                let mut lines =
-                    markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS, false);
+                let mut lines = markdown_at_depth(
+                    text.at_width(inner),
+                    theme,
+                    inner,
+                    0,
+                    options.mermaid,
+                    *HYPERLINKS,
+                    false,
+                );
                 lines.push(Line::default());
                 lines
             }
@@ -524,7 +616,7 @@ impl Entry {
                     .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
             }
             Self::Thinking { text, expanded } => {
-                if text.trim().is_empty() {
+                if text.original.trim().is_empty() {
                     return vec![];
                 }
                 let mut lines = if !expanded.unwrap_or(show_thinking) {
@@ -536,7 +628,7 @@ impl Entry {
                     // from the Mermaid transformer. Only default text inherits the
                     // thinking style; explicit Markdown roles keep their colors.
                     let mut lines = markdown_at_depth(
-                        text,
+                        text.at_width(inner),
                         theme,
                         inner,
                         0,

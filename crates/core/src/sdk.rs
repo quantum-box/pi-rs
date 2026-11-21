@@ -1809,6 +1809,11 @@ impl AgentSession {
         self.registry.custom_entry_renderers()
     }
 
+    /// Snapshot configured Markdown transformers for a presentation host.
+    pub fn markdown_transformers(&self) -> crate::MarkdownTransformers {
+        self.registry.markdown_transformers()
+    }
+
     /// Inspect configured extension commands, including collision-resolved
     /// invocation names and extension provenance. Prompt templates, skills and
     /// built-in host commands remain the host's responsibility. Per-request

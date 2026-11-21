@@ -176,6 +176,72 @@ impl CustomEntryRenderers {
     }
 }
 
+/// The normal message content being rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MarkdownMessageType {
+    User,
+    Assistant,
+    AssistantThinking,
+}
+
+/// Layout and message identity available to a display-only Markdown hook.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownTransformContext {
+    pub message_type: MarkdownMessageType,
+    pub is_streaming: bool,
+    pub available_width: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+/// Markdown transformers in extension load order.
+#[derive(Clone, Default)]
+pub struct MarkdownTransformers {
+    pub(crate) extensions: Vec<std::sync::Arc<dyn crate::Extension>>,
+}
+
+impl MarkdownTransformers {
+    pub const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
+
+    pub fn is_empty(&self) -> bool {
+        self.extensions.is_empty()
+    }
+
+    /// Transform Markdown for display. A failed or oversized result leaves the
+    /// preceding Markdown available to the next transformer. A missing result
+    /// means the host can render the original Markdown.
+    pub async fn transform(
+        &self,
+        markdown: &str,
+        context: &MarkdownTransformContext,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        use futures_util::FutureExt;
+
+        if markdown.len() > Self::MAX_MARKDOWN_BYTES {
+            return None;
+        }
+        let mut transformed: Option<String> = None;
+        for extension in &self.extensions {
+            let current = transformed.as_deref().unwrap_or(markdown);
+            let callback = std::panic::AssertUnwindSafe(async {
+                extension.transform_markdown(current, context).await
+            })
+            .catch_unwind();
+            if let Ok(Ok(Ok(Some(next)))) = crate::runtime::time::timeout(timeout, callback).await
+                && next.len() <= Self::MAX_MARKDOWN_BYTES
+            {
+                transformed = Some(next);
+            }
+        }
+        transformed.filter(|text| text != markdown)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiComponentAction {
     pub key: String,
@@ -360,6 +426,62 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn markdown_transformers_chain_display_results_in_load_order() {
+        struct Transformer(&'static str);
+
+        #[async_trait::async_trait]
+        impl crate::Extension for Transformer {
+            fn id(&self) -> &str {
+                self.0
+            }
+
+            fn handles_markdown_transform(&self) -> bool {
+                true
+            }
+
+            async fn transform_markdown(
+                &self,
+                markdown: &str,
+                context: &MarkdownTransformContext,
+            ) -> ExtensionResult<Option<String>> {
+                match self.0 {
+                    "prefix" => Ok(Some(format!("prefix {markdown}"))),
+                    "failure" => Err("expected error".into()),
+                    "large" => Ok(Some("x".repeat(256 * 1024 + 1))),
+                    _ => {
+                        assert_eq!(context.message_type, MarkdownMessageType::AssistantThinking);
+                        assert!(context.is_streaming);
+                        assert_eq!(context.message_id, Some(12));
+                        assert_eq!(context.timestamp.as_deref(), Some("2026-11-21T07:00:00Z"));
+                        Ok(Some(format!("{markdown} [{}]", context.available_width)))
+                    }
+                }
+            }
+        }
+
+        let mut registry = crate::Registry::default();
+        assert!(registry.markdown_transformers().is_empty());
+        for name in ["prefix", "failure", "large", "suffix"] {
+            registry
+                .register(std::sync::Arc::new(Transformer(name)))
+                .unwrap();
+        }
+        let context = MarkdownTransformContext {
+            message_type: MarkdownMessageType::AssistantThinking,
+            is_streaming: true,
+            available_width: 42,
+            message_id: Some(12),
+            timestamp: Some("2026-11-21T07:00:00Z".into()),
+        };
+        let rendered = registry
+            .markdown_transformers()
+            .transform("original", &context, std::time::Duration::from_secs(1))
+            .await;
+        assert_eq!(rendered.as_deref(), Some("prefix original [42]"));
+    }
+
     #[tokio::test]
     async fn custom_entry_renderers_select_the_first_registration_and_distinguish_failure() {
         struct Renderer(&'static str);

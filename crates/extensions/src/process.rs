@@ -209,6 +209,10 @@ enum ProtocolRequest {
         entry: pi_rs_core::CustomEntryRecord,
         options: pi_rs_core::CustomEntryRenderOptions,
     },
+    TransformMarkdown {
+        markdown: String,
+        context: pi_rs_core::MarkdownTransformContext,
+    },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
         state: Option<ExtensionState>,
@@ -346,6 +350,8 @@ struct Description {
     flags: Vec<ExtensionFlag>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     custom_entry_renderers: Vec<String>,
+    #[serde(default)]
+    markdown_transform_hook: bool,
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
@@ -1074,6 +1080,20 @@ impl Extension for ExecutableExtension {
         self.request_async(ProtocolRequest::RenderCustomEntry {
             entry: entry.clone(),
             options: options.clone(),
+        })
+        .await
+    }
+    fn handles_markdown_transform(&self) -> bool {
+        self.description.markdown_transform_hook
+    }
+    async fn transform_markdown(
+        &self,
+        markdown: &str,
+        context: &pi_rs_core::MarkdownTransformContext,
+    ) -> ExtensionResult<Option<String>> {
+        self.request_async(ProtocolRequest::TransformMarkdown {
+            markdown: markdown.to_owned(),
+            context: context.clone(),
         })
         .await
     }
@@ -3652,6 +3672,7 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            markdown_transform_hook: extension.handles_markdown_transform(),
             custom_entry_renderers: extension
                 .custom_entry_renderer_types()
                 .into_iter()
@@ -3876,6 +3897,12 @@ async fn dispatch_inner(
                 return encode(Ok(Option::<pi_rs_core::RenderedExtensionContent>::None));
             }
             encode(extension.render_custom_entry(&entry, &options).await)
+        }
+        ProtocolRequest::TransformMarkdown { markdown, context } => {
+            if !extension.handles_markdown_transform() {
+                return encode(Ok(Option::<String>::None));
+            }
+            encode(extension.transform_markdown(&markdown, &context).await)
         }
         ProtocolRequest::DiscoverResources { event, state } => {
             if host.supports_custom_messages()
@@ -4704,6 +4731,61 @@ mod tests {
             serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
             DuplexFrame::Progress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn markdown_transform_negotiates_capability_and_context() {
+        struct Transformer;
+        #[async_trait::async_trait]
+        impl Extension for Transformer {
+            fn id(&self) -> &str {
+                "markdown-transformer"
+            }
+
+            fn handles_markdown_transform(&self) -> bool {
+                true
+            }
+
+            async fn transform_markdown(
+                &self,
+                markdown: &str,
+                context: &pi_rs_core::MarkdownTransformContext,
+            ) -> ExtensionResult<Option<String>> {
+                assert_eq!(context.message_type, pi_rs_core::MarkdownMessageType::User);
+                assert!(!context.is_streaming);
+                assert_eq!(context.message_id, Some(8));
+                assert_eq!(context.timestamp.as_deref(), Some("2026-11-21T07:00:00Z"));
+                Ok(Some(format!("{markdown} [{}]", context.available_width)))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Transformer);
+        let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["markdown_transform_hook"], true);
+        description
+            .as_object_mut()
+            .unwrap()
+            .remove("markdown_transform_hook");
+        assert!(
+            !serde_json::from_value::<Description>(description)
+                .unwrap()
+                .markdown_transform_hook
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "transform_markdown",
+            "markdown": "original",
+            "context": {
+                "messageType": "user",
+                "isStreaming": false,
+                "availableWidth": 18,
+                "messageId": 8,
+                "timestamp": "2026-11-21T07:00:00Z"
+            }
+        }))
+        .unwrap();
+        assert_eq!(dispatch(extension, request).await.unwrap(), "original [18]");
     }
 
     #[tokio::test]
