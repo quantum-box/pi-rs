@@ -262,12 +262,14 @@ impl DurableAsyncTool for MutableSpecTool {
     }
 }
 async fn exercise_conversation_park_claim(case: &str) {
-    exercise_conversation_park_claim_with_late_publication(case, false, false).await;
+    exercise_conversation_park_claim_with_late_publication(case, false, false, false, false).await;
 }
 async fn exercise_conversation_park_claim_with_late_publication(
     case: &str,
     late_publication: bool,
     graph_aba: bool,
+    retry_after_busy: bool,
+    delete_graph: bool,
 ) {
     use pi_rs_durable::async_task_tool::{
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_park_cancel,
@@ -1703,7 +1705,33 @@ async fn exercise_conversation_park_claim_with_late_publication(
         if case == "selection_hook_writer_busy" && graph_aba {
             let path = path.clone();
             crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
-                let store = durable_store::Store::open(path).unwrap();
+                let store = durable_store::Store::open(&path).unwrap();
+                if delete_graph {
+                    let child = crate::task_store::TaskStore::new(&store)
+                        .list()
+                        .unwrap()
+                        .into_iter()
+                        .find(|item| item.task.owner() == &crate::task::TaskOwner::Task(root_id))
+                        .unwrap();
+                    store
+                        .commit(
+                            &[],
+                            &[durable_store::Mutation::Delete {
+                                key: crate::task_store::key(child.task.id()),
+                            }],
+                        )
+                        .unwrap();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let conn = rusqlite::Connection::open(path).unwrap();
+                        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                        tx.send(()).unwrap();
+                        std::thread::sleep(Duration::from_secs(6));
+                        conn.execute_batch("ROLLBACK").unwrap();
+                    });
+                    rx.recv().unwrap();
+                    return;
+                }
                 let child = crate::task::Task::new(
                     uuid::Uuid::new_v4(),
                     crate::task::TaskOwner::Task(root_id),
@@ -1739,13 +1767,14 @@ async fn exercise_conversation_park_claim_with_late_publication(
         }
         if case == "selection_hook_writer_busy" && !graph_aba {
             let path = path.clone();
+            let hold_for = if retry_after_busy { 6 } else { 20 };
             crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let conn = rusqlite::Connection::open(path).unwrap();
                     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                     ready_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_secs(6));
+                    std::thread::sleep(Duration::from_secs(hold_for));
                     conn.execute_batch("ROLLBACK").unwrap();
                 });
                 ready_rx.recv().unwrap();
@@ -1764,6 +1793,28 @@ async fn exercise_conversation_park_claim_with_late_publication(
             );
             crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                 let writer = durable_store::Store::open(path).unwrap();
+                if graph_aba {
+                    let child = crate::task::Task::new(
+                        uuid::Uuid::new_v4(),
+                        crate::task::TaskOwner::Task(root_id),
+                        crate::task::Checkpoint {
+                            phase: "initial".into(),
+                            data: json!({}),
+                        },
+                        3,
+                    )
+                    .unwrap();
+                    writer
+                        .commit(
+                            &[],
+                            &[durable_store::Mutation::Put {
+                                key: crate::task_store::key(child.id()),
+                                value: serde_json::to_vec(&child).unwrap(),
+                            }],
+                        )
+                        .unwrap();
+                    return;
+                }
                 let key = if snapshot_conflict {
                     format!("runtime/conversation/{conversation}").into_bytes()
                 } else {
@@ -1838,6 +1889,22 @@ async fn exercise_conversation_park_claim_with_late_publication(
             })
             .await
             .unwrap();
+            if retry_after_busy {
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    while store.get(key.as_bytes()).unwrap().is_none() {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+                let _ = driver.shutdown_with_pending().unwrap();
+                return;
+            }
+            if delete_graph {
+                tokio::time::sleep(Duration::from_secs(7)).await;
+            }
             let report = driver.shutdown_with_pending().unwrap();
             let known = report
                 .pending()
@@ -1858,6 +1925,17 @@ async fn exercise_conversation_park_claim_with_late_publication(
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(after_calls.load(Ordering::SeqCst), 1);
             assert!(store.get(key.as_bytes()).unwrap().is_none());
+            assert!(
+                identity_handle
+                    .update(Some("backend-v2".into()), || {})
+                    .await
+                    .is_err()
+            );
+            drop(report);
+            identity_handle
+                .update(Some("backend-v2".into()), || {})
+                .await
+                .unwrap();
             return;
         }
         if matches!(
@@ -1899,16 +1977,9 @@ async fn exercise_conversation_park_claim_with_late_publication(
             })
             .await
             .unwrap();
-            let receipt = store.get(key.as_bytes()).unwrap();
-            let receipt: crate::task_scheduler::ConversationCancelReceipt =
-                serde_json::from_slice(&receipt.unwrap().value).unwrap();
-            assert_eq!(receipt.version, 1);
-            if case == "selection_hook_memo_conflict" {
-                let memo_key = format!("runtime/extension-memo/{root_id}/abort-memo");
-                assert!(store.get(memo_key.as_bytes()).unwrap().is_none());
-            }
-            assert_eq!(receipt.result, "callback returned");
-            assert!(receipt.after_result.is_none());
+            assert!(store.get(key.as_bytes()).unwrap().is_none());
+            let memo_key = format!("runtime/extension-memo/{root_id}/abort-memo");
+            assert!(store.get(memo_key.as_bytes()).unwrap().is_none());
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(after_calls.load(Ordering::SeqCst), 1);
             assert!(
@@ -3485,11 +3556,37 @@ async fn selected_hook_callback_pins_selection_and_publishes_after_result() {
 }
 
 #[tokio::test]
+async fn selected_hook_retry_rejects_deleted_child_after_start() {
+    exercise_conversation_park_claim_with_late_publication(
+        "selection_hook_writer_busy",
+        false,
+        true,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn selected_parked_child_graph_aba_is_retained_without_retry() {
     exercise_conversation_park_claim_with_late_publication(
         "selection_hook_writer_busy",
         false,
         true,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn selected_hook_busy_receipt_retries_without_reinvoking_callback() {
+    exercise_conversation_park_claim_with_late_publication(
+        "selection_hook_writer_busy",
+        false,
+        false,
+        true,
+        false,
     )
     .await;
 }
@@ -3527,6 +3624,18 @@ async fn selected_hook_conversation_abort_publishes_after_result() {
 #[tokio::test]
 async fn selected_hook_abort_memo_is_persisted() {
     exercise_conversation_park_claim("selection_hook_after_memo").await;
+}
+
+#[tokio::test]
+async fn selected_hook_v1_fallback_rejects_child_added_after_start() {
+    exercise_conversation_park_claim_with_late_publication(
+        "selection_hook_memo_conflict",
+        false,
+        true,
+        false,
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -6053,6 +6162,11 @@ async fn selected_woken_after_is_retained_without_resolving_uncertain_effect() {
 }
 
 #[tokio::test]
+async fn selected_woken_busy_receipt_retries_after_writer_release() {
+    exercise_selected_woken_receipt("busy_success").await;
+}
+
+#[tokio::test]
 async fn selected_woken_busy_receipt_is_retained_without_retry() {
     exercise_selected_woken_receipt("busy").await;
 }
@@ -6193,11 +6307,29 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         .unwrap();
     let busy_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let busy_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if mode == "busy" {
+    if mode == "busy" || mode == "busy_success" {
         let writer_path = path.clone();
         let busy_ready = busy_ready.clone();
         let busy_released = busy_released.clone();
+        let force_stale = mode == "busy";
         crate::task_scheduler::on_conversation_receipt_before_commit(root.task.id(), move || {
+            if force_stale {
+                let store = durable_store::Store::open(&writer_path).unwrap();
+                let key = format!("runtime/conversation/{independent_conversation}").into_bytes();
+                let entry = store.get(&key).unwrap().unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(entry.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: entry.value,
+                        }],
+                    )
+                    .unwrap();
+            }
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let conn = rusqlite::Connection::open(writer_path).unwrap();
@@ -6294,7 +6426,7 @@ async fn exercise_selected_woken_receipt(mode: &str) {
     }
     let busy_store = durable_store::Store::open(&path).unwrap();
     let driver = scheduler.start_tasks(registry).unwrap();
-    if mode == "busy" {
+    if mode == "busy" || mode == "busy_success" {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !busy_ready.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6323,6 +6455,20 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 .unwrap()
                 .is_some()
         );
+    }
+    if mode == "busy_success" {
+        let key = crate::task_scheduler::woken_conversation_receipt_key(root.task.id());
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while busy_store.get(&key).unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+        let _ = driver.shutdown_with_pending().unwrap();
+        return;
     }
     if mode == "busy" {
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -6365,7 +6511,7 @@ async fn exercise_selected_woken_receipt(mode: &str) {
             .expect("known woken result retained");
         assert_eq!(
             known.commit_state(),
-            crate::task_scheduler::KnownCancelCommitState::Busy
+            crate::task_scheduler::KnownCancelCommitState::Stale
         );
         assert!(known.after_result().is_some());
         assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
@@ -7093,6 +7239,8 @@ async fn nested_selected_late_child_receipt_prevents_after_publication() {
     exercise_conversation_park_claim_with_late_publication(
         "nested_claim_actual_selected",
         true,
+        false,
+        false,
         false,
     )
     .await;

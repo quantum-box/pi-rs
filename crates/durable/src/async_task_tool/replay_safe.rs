@@ -2042,6 +2042,10 @@ impl Handler for Executor {
                         cancel.conversation_cancel_policy(),
                     )?;
                     let start = admission.conversation_callback_start_lease()?;
+                    let graph_start_boundary = admission.graph_start_boundary()?;
+                    let bounded_admission =
+                        admission.with_graph_start_boundary(graph_start_boundary);
+                    let admission = &bounded_admission;
                     let marker = admission.record_woken_conversation_start_markers(
                         self,
                         &claim,
@@ -2174,6 +2178,7 @@ impl Handler for Executor {
                                     marker,
                                     _identity_lease,
                                     state,
+                                    graph_start_boundary,
                                 ),
                             ));
                             return Ok(Step::Succeed(serde_json::Value::Null));
@@ -2535,6 +2540,9 @@ impl Handler for Executor {
                     };
                     (*id, admission.conversation_callback_start_lease()?)
                 };
+                let graph_start_boundary = admission.graph_start_boundary()?;
+                let bounded_admission = admission.with_graph_start_boundary(graph_start_boundary);
+                let admission = &bounded_admission;
                 let marker_result = if nested {
                     admission.record_nested_conversation_start_markers(
                         self,
@@ -2748,6 +2756,7 @@ impl Handler for Executor {
                                     }
                                     _ => crate::task_scheduler::KnownCancelCommitState::Uncertain,
                                 },
+                                graph_start_boundary,
                             ),
                         ));
                         return Ok(Step::Succeed(serde_json::Value::Null));
