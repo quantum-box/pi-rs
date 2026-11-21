@@ -505,3 +505,52 @@ fn text_list_reports_bad_configuration_and_continues_with_the_other_scope() {
         );
     }
 }
+
+#[test]
+fn mcp_add_forwards_stdio_arguments_with_or_without_a_separator() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    for (name, separator) in [("implicit", None), ("explicit", Some("--"))] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(["mcp", "add", name, "--env", "SAMPLE=value"])
+            .args(separator)
+            .args([
+                "node",
+                "--version",
+                "--description",
+                "child option",
+                "-l",
+                "--",
+                "--url",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(home.join("mcp.json")).unwrap()).unwrap();
+    let servers = &config["mcpServers"];
+    for name in ["implicit", "explicit"] {
+        assert_eq!(servers[name]["command"], "node");
+        assert_eq!(
+            servers[name]["args"],
+            json!([
+                "--version",
+                "--description",
+                "child option",
+                "-l",
+                "--",
+                "--url"
+            ])
+        );
+        assert_eq!(servers[name]["env"], json!({"SAMPLE":"value"}));
+        assert!(servers[name].get("description").is_none());
+    }
+}

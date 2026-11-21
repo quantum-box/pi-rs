@@ -64,7 +64,8 @@ pub enum McpCommand {
         exposure: Option<String>,
         #[arg(long = "env")]
         environment: Vec<String>,
-        #[arg(last = true)]
+        /// Stdio command and arguments. Options after the command are passed through.
+        #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
     Remove {
