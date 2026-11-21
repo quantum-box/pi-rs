@@ -751,8 +751,17 @@ fn configure_cloudflare_workers(
             super::operation_models::valid_cloudflare_account(configured).then_some(configured)
         }),
     };
-    let classifier_profile =
-        entry.get("api").and_then(Value::as_str) == Some("cloudflare-workers-ai-system-one");
+    let classifier_profile = entry.get("api").and_then(Value::as_str)
+        == Some("cloudflare-workers-ai-system-one")
+        || (!entry.contains_key("api")
+            && !entry.contains_key("baseUrl")
+            && entry
+                .get("models")
+                .and_then(Value::as_array)
+                .is_some_and(|models| {
+                    models.iter().all(|model| model["type"] == "classifier")
+                        && models.iter().any(|model| model["baseUrl"].is_string())
+                }));
     let route_account = route_account
         .or(account.filter(|_| classifier_profile))
         .map(str::to_owned);
@@ -1826,6 +1835,82 @@ mod tests {
                 .model_ids(&provider)
                 .contains(&"custom-chat".to_owned())
         );
+    }
+
+    #[test]
+    fn inferred_classifier_credentials_do_not_apply_to_official_chat() {
+        let profiles = Profiles::parse_with_cloudflare_account(
+            &json!({"providers":{"cloudflare-workers-ai":{
+                "apiKey":"classified","headers":{"x-provider-secret":"value"},
+                "models":[{"id":"custom","type":"classifier",
+                    "api":"cloudflare-workers-ai-system-one",
+                    "baseUrl":"https://classifiers.example/v1"}]
+            }}}),
+            Some("mine"),
+        )
+        .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(cloudflare_workers_chat_account(endpoint), Some("mine"));
+        assert!(profiles.credential(&provider, endpoint).is_none());
+        let headers = profiles
+            .header_settings(&provider, endpoint, None)
+            .static_headers(&provider, None)
+            .unwrap();
+        assert!(!headers.contains_key("x-provider-secret"));
+    }
+
+    #[test]
+    fn classifiers_on_the_default_route_keep_explicit_provider_chat_credentials() {
+        let profiles = Profiles::parse_with_cloudflare_account(
+            &json!({"providers":{"cloudflare-workers-ai":{
+                "apiKey":"fixture","headers":{"x-provider-setting":"value"},
+                "models":[{"id":"custom","type":"classifier",
+                    "api":"cloudflare-workers-ai-system-one"}]
+            }}}),
+            Some("mine"),
+        )
+        .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(
+            profiles
+                .credential(&provider, endpoint)
+                .as_ref()
+                .and_then(|key| key.literal()),
+            Some("fixture"),
+        );
+        let headers = profiles
+            .header_settings(&provider, endpoint, None)
+            .static_headers(&provider, None)
+            .unwrap();
+        assert_eq!(headers["x-provider-setting"], "value");
+    }
+
+    #[test]
+    fn implicit_cloudflare_keys_are_available_only_on_official_chat_routes() {
+        let keys = super::super::model_auth::Keys::parse(&json!({
+            "cloudflare-workers-ai":{"type":"api_key","key":"fixture"}
+        }));
+        for (base, expected) in [
+            ("https://example.org/client/v4/accounts/mine/ai/v1", false),
+            (
+                "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1",
+                true,
+            ),
+        ] {
+            let profiles = Profiles::parse(&json!({"providers":{"cloudflare-workers-ai":{
+                "baseUrl":base
+            }}}))
+            .unwrap();
+            let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+            let endpoint = profiles.endpoint(&provider);
+            assert_eq!(
+                keys.custom_credential(&provider, endpoint, &profiles)
+                    .is_some(),
+                expected
+            );
+        }
     }
 
     #[test]

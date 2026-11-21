@@ -4535,8 +4535,9 @@ Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
 requests. Pi-format saved credentials may declare an account through their
 `env` field. A stored account scopes the key to that account's chat route.
-For classifier models, existing rules for explicitly configured official
-endpoints still apply. Live Workers AI inference has not been verified.
+An unscoped saved key works only on official Workers AI routes. Credentials
+and headers inferred from classifier-only model URLs apply to those operations.
+Live Workers AI inference has not been verified.
 
 ### Cloudflare AI Gateway
 

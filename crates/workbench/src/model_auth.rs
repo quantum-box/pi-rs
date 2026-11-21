@@ -414,13 +414,15 @@ impl Keys {
     ) -> Option<&SavedKey> {
         let entry = self.entries.get(provider.id())?;
         let cloudflare_match = provider.id() != "cloudflare-workers-ai"
-            || entry
-                .env
-                .as_ref()
-                .is_none_or(|env| !env.contains_key("CLOUDFLARE_ACCOUNT_ID"))
-            || self.cloudflare_chat_account().is_some_and(|account| {
-                super::model_profiles::cloudflare_workers_chat_account(endpoint) == Some(account)
-            });
+            || super::model_profiles::cloudflare_workers_chat_account(endpoint).is_some_and(
+                |account| {
+                    entry
+                        .env
+                        .as_ref()
+                        .is_none_or(|env| !env.contains_key("CLOUDFLARE_ACCOUNT_ID"))
+                        || self.cloudflare_chat_account() == Some(account)
+                },
+            );
         let gateway_match = provider.id() != "cloudflare-ai-gateway"
             || (super::cloudflare_gateway::Route::is_endpoint(endpoint)
                 && super::cloudflare_gateway::Route::from_endpoint(endpoint)
