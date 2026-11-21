@@ -971,7 +971,11 @@ Credentials are keyed by server name and normalized URL, so a project server
 with the same name and URL as a global server shares its credentials.
 
 `pi mcp add`, `pi mcp remove`, `pi mcp list` and `/mcp` use user-level
-`mcp.json` and trusted project overrides. The native client uses rmcp 3.9 for
+`mcp.json` and trusted project overrides. `pi mcp add` validates HTTP URLs before
+writing, including when replacing a server. Native applies its existing
+transport policy at that point, allowing HTTPS and loopback HTTP without
+embedded credentials. `pi mcp remove` reports the selected file and suggests
+`--local` or its omission when the other file defines the requested server. The native client uses rmcp 3.9 for
 stdio and streamable HTTP. It exposes namespaced server tools and resource
 listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
