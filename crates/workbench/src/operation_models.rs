@@ -16,6 +16,7 @@ use super::{
 
 mod decisions;
 mod llama_cpp;
+mod llama_discovery;
 mod wire;
 use wire::{
     classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
@@ -365,6 +366,7 @@ struct Entry {
     endpoint: Url,
     api_key: Option<String>,
     cloudflare_default: bool,
+    llama_root: Option<Url>,
 }
 
 #[derive(Clone, Default)]
@@ -584,6 +586,7 @@ impl Catalogue {
                     endpoint,
                     api_key,
                     cloudflare_default,
+                    llama_root: None,
                 });
             }
         }
@@ -611,6 +614,7 @@ impl Catalogue {
                     model.provider.as_str(),
                     model.endpoint.as_str(),
                     model.allows_keyless(),
+                    model.llama_root.is_some(),
                 );
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
@@ -782,7 +786,7 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 
 impl Entry {
     fn allows_keyless(&self) -> bool {
-        matches!(self.api, Api::LlamaCppClassifier)
+        self.llama_root.is_some() || matches!(self.api, Api::LlamaCppClassifier)
     }
 
     fn is_official(&self) -> bool {
@@ -858,6 +862,12 @@ impl Entry {
         keys: &Keys,
         env: impl Fn(&str) -> Option<String>,
     ) -> Option<Credential> {
+        if let Some(root) = &self.llama_root {
+            return match llama_discovery::configured_server(keys, env) {
+                Some((configured, key)) if configured == *root => key,
+                _ => Some(Credential::Invalid),
+            };
+        }
         let official = self.is_official();
         if let Some(key) =
             keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
@@ -945,6 +955,36 @@ impl Operations {
                 Error::Config("could not initialize model operation HTTP client".into())
             })?,
         })
+    }
+
+    pub async fn discover_llama(&mut self) {
+        if self.args.offline {
+            return;
+        }
+        let keys = Keys::load_async().await.unwrap_or_default();
+        let Some((root, key)) =
+            llama_discovery::configured_server(&keys, |name| std::env::var(name).ok())
+        else {
+            return;
+        };
+        let key = match key {
+            Some(key) => match tokio::time::timeout(Duration::from_secs(2), key.resolve()).await {
+                Ok(Ok(secret)) => Some(secret),
+                _ => return,
+            },
+            None => None,
+        };
+        let discovered = llama_discovery::discover(&self.client, &root, key.as_deref()).await;
+        let configured = &mut self.args.model_profiles.operations_mut().0;
+        for entry in discovered {
+            if !configured.iter().any(|model| {
+                model.provider == entry.provider
+                    && model.api.kind() == entry.api.kind()
+                    && model.model.id == entry.model.id
+            }) {
+                configured.push(entry);
+            }
+        }
     }
 }
 
