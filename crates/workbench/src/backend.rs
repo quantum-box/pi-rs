@@ -1534,7 +1534,7 @@ async fn run_worker(
                 }
                 Request::McpStatus { inspect } => {
                     if inspect {
-                        runtime.inspect_mcp(ui.as_ref(), &cancel).await?;
+                        runtime.inspect_mcp(&args, ui.as_ref(), &cancel).await?;
                     } else {
                         runtime.mcp_status(&args)?;
                     }

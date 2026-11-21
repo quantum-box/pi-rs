@@ -228,7 +228,7 @@ impl Runtime {
                 eprintln!("{warning}");
             }
         }
-        let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
+        let servers = self.catalog.servers();
         let (selection, _, hidden) = tool_discovery(args, &servers)?;
         self.system_prompt = select_tools(
             &mut self.registry,
@@ -379,7 +379,7 @@ impl Runtime {
         }
     }
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
-        let servers = self.catalog.servers.lock().expect("MCP catalogs");
+        let servers = self.catalog.current_servers(&self.registry);
         for (name, value) in
             mcp_config::registered_configurations(args, &self.registry.registered_mcp_servers())?
         {
@@ -397,17 +397,22 @@ impl Runtime {
     }
     pub async fn inspect_mcp(
         &self,
+        args: &Cli,
         ui: &dyn ExtensionUi,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
-        mcp_config::inspect_servers(&self.mcp_inspection, &servers, ui, cancel).await
+        let servers = self.catalog.current_servers(&self.registry);
+        let mut inspection = self.mcp_inspection.clone();
+        inspection.extend(mcp_config::registered_inspection(
+            args,
+            &self.registry.registered_mcp_servers(),
+            &self.catalog.configured_namespaces,
+        )?);
+        mcp_config::inspect_servers(&inspection, &servers, ui, cancel).await
     }
 
     pub async fn refresh_mcp(&mut self, _args: &Cli) -> Result<()> {
-        if let Some(update) =
-            pi_rs::RegistryRefresher::refresh(self.catalog.as_ref(), &self.registry).await?
-        {
+        if let Some(update) = self.catalog.reconcile(&self.registry, true).await? {
             self.registry = update.registry;
             if let Some(prompt) = update.system_prompt {
                 self.system_prompt = prompt;
@@ -503,16 +508,23 @@ impl Runtime {
                     continue;
                 }
             };
+            let _refresh = self.catalog.refresh.lock().await;
+            match current() {
+                Ok(refreshed) if refreshed.as_ref() == Some(&config) => {}
+                outcome => {
+                    extension.close().await;
+                    outcome?;
+                    continue;
+                }
+            }
             if let Err(error) = self.registry.register(extension.clone()) {
                 extension.close().await;
                 eprintln!("MCP {name}: {error}");
                 continue;
             }
-            self.catalog
-                .servers
-                .lock()
-                .expect("MCP catalogs")
-                .push(extension);
+            let mut state = self.catalog.state.lock().expect("MCP catalog");
+            state.installed_ids.insert(extension.id().into());
+            state.servers.push(extension);
         }
         Ok(())
     }
@@ -578,6 +590,7 @@ impl Runtime {
         Ok(())
     }
     pub async fn close(&self) -> Result<()> {
+        self.catalog.close().await;
         self.registry.shutdown().await
     }
 }
@@ -733,13 +746,6 @@ async fn standalone_share_snapshot_with_runtime(
             |extension| started.contains(extension),
         )
         .await;
-    let servers = runtime
-        .catalog
-        .servers
-        .lock()
-        .expect("MCP catalogs")
-        .clone();
-    futures_util::future::join_all(servers.iter().map(|server| server.close())).await;
     let closed = runtime.close().await;
     let snapshot = result?;
     if shutdown_failed {
@@ -796,23 +802,270 @@ struct LiveMcpCatalog {
     args: Cli,
     builtin_tool_search: bool,
     resources: std::sync::Mutex<resources::Resources>,
-    servers: std::sync::Mutex<Vec<Arc<pi_rs_workbench::mcp::McpExtension>>>,
+    configured_namespaces: std::collections::BTreeSet<String>,
+    state: std::sync::Mutex<McpCatalogState>,
+    refresh: tokio::sync::Mutex<()>,
+    closing: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+#[derive(Clone)]
+struct McpCatalogState {
+    servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
+    declarations: std::collections::BTreeMap<String, serde_json::Value>,
+    // A later turn can start with a registry captured before the previous refresh.
+    // Keep ownership of removed IDs so stale snapshots cannot restore their tools.
+    installed_ids: std::collections::BTreeSet<String>,
+}
+
+struct PreparedMcpRefresh {
+    servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
+    installed_ids: std::collections::BTreeSet<String>,
+    update: pi_rs::RegistryUpdate,
+}
+
+struct PendingMcpConnections<'a> {
+    catalog: &'a LiveMcpCatalog,
+    servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
+}
+
+impl Drop for PendingMcpConnections<'_> {
+    fn drop(&mut self) {
+        for server in self.servers.drain(..) {
+            self.catalog.close_in_background(server);
+        }
+    }
+}
+
+impl LiveMcpCatalog {
+    fn snapshot(&self) -> McpCatalogState {
+        self.state.lock().expect("MCP catalog").clone()
+    }
+
+    fn servers(&self) -> Vec<Arc<pi_rs_workbench::mcp::McpExtension>> {
+        self.state.lock().expect("MCP catalog").servers.clone()
+    }
+
+    // Cleanup keeps ownership after a model deadline or refresh cancellation.
+    fn close_in_background(&self, server: Arc<pi_rs_workbench::mcp::McpExtension>) {
+        if server.retire() {
+            let mut closing = self.closing.lock().expect("MCP shutdown tasks");
+            closing.retain(|task| !task.is_finished());
+            closing.push(tokio::spawn(async move { server.close().await }));
+        }
+    }
+
+    async fn close(&self) {
+        let _refresh = self.refresh.lock().await;
+        for server in self.servers() {
+            self.close_in_background(server);
+        }
+        let closing = std::mem::take(&mut *self.closing.lock().expect("MCP shutdown tasks"));
+        futures_util::future::join_all(closing).await;
+    }
+
+    fn current_servers(&self, registry: &Registry) -> Vec<Arc<pi_rs_workbench::mcp::McpExtension>> {
+        let declarations = self.declared_configs(registry);
+        let snapshot = self.snapshot();
+        snapshot
+            .servers
+            .into_iter()
+            .filter(|server| {
+                let name = &server.server_name;
+                !server.is_retired()
+                    && snapshot
+                        .declarations
+                        .get(name)
+                        .is_none_or(|old| declarations.get(name) == Some(old))
+            })
+            .collect()
+    }
+
+    fn declared_configs(
+        &self,
+        registry: &Registry,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        mcp_config::effective_registered_configs(
+            &registry.registered_mcp_servers(),
+            &self.configured_namespaces,
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl pi_rs::RegistryRefresher for LiveMcpCatalog {
     async fn refresh(&self, current: &Registry) -> Result<Option<pi_rs::RegistryUpdate>> {
-        let previous = self.servers.lock().expect("MCP catalogs").clone();
-        if previous.is_empty() {
+        self.reconcile(current, false).await
+    }
+
+    async fn refresh_for_dispatch(
+        &self,
+        current: &Registry,
+    ) -> Result<Option<pi_rs::RegistryUpdate>> {
+        let _refresh = self.refresh.lock().await;
+        let previous = self.snapshot();
+        if previous.installed_ids.is_empty() {
             return Ok(None);
         }
-        let mut servers = Vec::with_capacity(previous.len());
+        self.retire_changed_servers(&previous, &self.declared_configs(current));
+        let mut refreshed = Vec::with_capacity(previous.servers.len());
+        let mut catalog = Vec::with_capacity(previous.servers.len());
+        for server in &previous.servers {
+            let registered: Arc<dyn pi_rs::Extension> = server.clone();
+            if !server.is_retired() && current.contains_extension_instance(&registered) {
+                let refreshed_server = server
+                    .refresh_if_changed()
+                    .await?
+                    .map(Arc::new)
+                    .unwrap_or_else(|| server.clone());
+                refreshed.push(refreshed_server.clone());
+                catalog.push(refreshed_server);
+            } else {
+                catalog.push(server.clone());
+            }
+        }
+        self.retire_changed_servers(&previous, &self.declared_configs(current));
+        refreshed.retain(|server| !server.is_retired());
+        // Refresh only the transports installed in the request snapshot.
+        // A same-name replacement becomes callable on the next model request.
+        let prepared = self.prepare_refresh(current, &previous, refreshed, &[])?;
+        self.state.lock().expect("MCP catalog").servers = catalog;
+        Ok(Some(prepared.update))
+    }
+}
+
+impl LiveMcpCatalog {
+    fn retire_changed_servers(
+        &self,
+        previous: &McpCatalogState,
+        declarations: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        for server in &previous.servers {
+            let name = &server.server_name;
+            if previous
+                .declarations
+                .get(name)
+                .is_some_and(|old| declarations.get(name) != Some(old))
+            {
+                self.close_in_background(server.clone());
+            }
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        current: &Registry,
+        retry_missing: bool,
+    ) -> Result<Option<pi_rs::RegistryUpdate>> {
+        let _refresh = self.refresh.lock().await;
+        let previous = self.snapshot();
+        loop {
+            let registrations = current.registered_mcp_servers();
+            let declarations = mcp_config::effective_registered_configs(
+                &registrations,
+                &self.configured_namespaces,
+            );
+            if previous.servers.is_empty()
+                && previous.installed_ids.is_empty()
+                && declarations == previous.declarations
+                && (!retry_missing || declarations.is_empty())
+            {
+                return Ok(None);
+            }
+            self.retire_changed_servers(&previous, &declarations);
+            let mut servers = Vec::with_capacity(previous.servers.len());
+            for server in previous
+                .servers
+                .iter()
+                .filter(|server| !server.is_retired())
+            {
+                let refreshed = server
+                    .refresh_if_changed()
+                    .await?
+                    .map(Arc::new)
+                    .unwrap_or_else(|| server.clone());
+                servers.push(refreshed);
+            }
+
+            let changed = registrations
+                .into_iter()
+                .filter(|entry| {
+                    let name = &entry.server.name;
+                    declarations.get(name).is_some_and(|config| {
+                        previous.declarations.get(name) != Some(config)
+                            || previous
+                                .servers
+                                .iter()
+                                .any(|server| server.server_name == *name && server.is_retired())
+                            || (retry_missing
+                                && !servers.iter().any(|server| server.server_name == *name))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let added = mcp_config::discover_registered(
+                &self.args,
+                &changed,
+                &self.configured_namespaces,
+                false,
+                None,
+            )
+            .await?
+            .connected;
+            let mut pending = PendingMcpConnections {
+                catalog: self,
+                servers: added,
+            };
+            let prepared = self.prepare_refresh(current, &previous, servers, &pending.servers)?;
+            if self.declared_configs(current) != declarations {
+                drop(pending);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            pending.servers.retain(|server| {
+                !prepared
+                    .servers
+                    .iter()
+                    .any(|adopted| Arc::ptr_eq(server, adopted))
+            });
+            *self.state.lock().expect("MCP catalog") = McpCatalogState {
+                declarations,
+                servers: prepared.servers,
+                installed_ids: prepared.installed_ids,
+            };
+            return Ok(Some(prepared.update));
+        }
+    }
+}
+
+impl LiveMcpCatalog {
+    fn prepare_refresh(
+        &self,
+        current: &Registry,
+        previous: &McpCatalogState,
+        mut servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
+        added: &[Arc<pi_rs_workbench::mcp::McpExtension>],
+    ) -> Result<PreparedMcpRefresh> {
         let mut registry = current.clone();
-        for server in previous {
-            let refreshed = server.refresh_if_changed().await?.map_or(server, Arc::new);
-            // A prior in-flight refresh may have updated the shared catalog
-            // while this caller still holds the previous registry snapshot.
-            registry.replace(refreshed.clone())?;
-            servers.push(refreshed);
+        let retained_ids: std::collections::BTreeSet<_> =
+            servers.iter().map(|server| server.id()).collect();
+        for removed in previous
+            .installed_ids
+            .iter()
+            .filter(|id| !retained_ids.contains(id.as_str()))
+        {
+            registry.unregister(removed)?;
+        }
+        for server in &servers {
+            if !registry.replace(server.clone())? {
+                registry.register(server.clone())?;
+            }
+        }
+        for server in added {
+            match registry.register(server.clone()) {
+                Ok(()) => servers.push(server.clone()),
+                Err(error) => {
+                    eprintln!("MCP {}: {error}", server.server_name);
+                }
+            }
         }
         let (selection, documents, hidden) = tool_discovery(&self.args, &servers)?;
         if self.builtin_tool_search {
@@ -829,11 +1082,16 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
             &self.args,
             &servers,
         )?;
-        *self.servers.lock().expect("MCP catalogs") = servers;
-        Ok(Some(pi_rs::RegistryUpdate {
-            registry,
-            system_prompt: Some(system_prompt),
-        }))
+        let mut installed_ids = previous.installed_ids.clone();
+        installed_ids.extend(servers.iter().map(|server| server.id().to_owned()));
+        Ok(PreparedMcpRefresh {
+            servers,
+            installed_ids,
+            update: pi_rs::RegistryUpdate {
+                registry,
+                system_prompt: Some(system_prompt),
+            },
+        })
     }
 }
 
@@ -1056,7 +1314,7 @@ async fn configure_after(
         let configured_count = mcp_connections.len();
         mcp_connections.extend(extra.connected);
         discovered.sign_in.extend(extra.sign_in);
-        discovered.inspection.extend(extra.inspection);
+
         for connection in &mcp_connections[configured_count..] {
             registry.register(connection.clone())?;
         }
@@ -1078,7 +1336,20 @@ async fn configure_after(
             args: args.clone(),
             builtin_tool_search,
             resources: std::sync::Mutex::new(local_resources.clone()),
-            servers: std::sync::Mutex::new(mcp_connections.clone()),
+            configured_namespaces: discovered.configured_namespaces.clone(),
+            state: std::sync::Mutex::new(McpCatalogState {
+                servers: mcp_connections.clone(),
+                declarations: mcp_config::effective_registered_configs(
+                    &registry.registered_mcp_servers(),
+                    &discovered.configured_namespaces,
+                ),
+                installed_ids: mcp_connections
+                    .iter()
+                    .map(|server| server.id().to_owned())
+                    .collect(),
+            }),
+            refresh: tokio::sync::Mutex::new(()),
+            closing: Default::default(),
         });
         registry.set_refresher(catalog.clone());
         let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;
@@ -1288,6 +1559,9 @@ impl pi_rs::Extension for LocalCommandPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod live_mcp_catalog_tests;
 
 #[cfg(test)]
 mod standalone_share_tests {
