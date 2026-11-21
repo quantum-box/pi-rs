@@ -378,8 +378,9 @@ tool progress and completion-order notifications remain open.
 
 ### Azure OpenAI checkpoint
 
-Azure exposes the 45 pinned chat models and chooses Responses or Chat
-Completions per model. Configure the account with `AZURE_OPENAI_BASE_URL`
+Azure exposes the 48 chat models from Pi AI v1.6.0 and chooses Responses or
+Chat Completions per model. Catalog pricing includes the long-context tier
+above 272,000 input tokens where the Pi catalog declares it. Configure the account with `AZURE_OPENAI_BASE_URL`
 or `AZURE_OPENAI_RESOURCE_NAME` and authenticate with `AZURE_OPENAI_API_KEY`
 or a saved key. An explicit `models.json` provider base URL takes precedence
 over the environment. `AZURE_OPENAI_API_VERSION` configures the Responses
