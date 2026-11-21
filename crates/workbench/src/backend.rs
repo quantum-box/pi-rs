@@ -1273,7 +1273,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1409,7 +1409,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1451,7 +1451,7 @@ async fn run_worker(
                             &mut |event| match event {
                                 pi_rs::AgentEvent::Notification(event) => observer(event),
                                 event if args.trace => {
-                                    let mut event = super::reasoning_event_json(event);
+                                    let mut event = super::agent_stream_event_json(event);
                                     if args.mode == Some(super::OutputMode::Rpc) {
                                         super::attach_redacted_reasoning(&mut event);
                                     }

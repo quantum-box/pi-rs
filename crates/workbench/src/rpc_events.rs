@@ -914,6 +914,60 @@ pub(super) fn tool_event_result_value(
     result
 }
 
+pub(super) fn auto_compaction_value(
+    reason: pi_rs::CompactionTrigger,
+    update: &pi_rs::AutoCompactionUpdate,
+) -> Value {
+    use pi_rs::AutoCompactionUpdate;
+
+    match update {
+        AutoCompactionUpdate::Started => json!({"type":"compaction_start","reason":reason}),
+        AutoCompactionUpdate::Completed {
+            compaction_entry,
+            details,
+            estimated_tokens_after,
+            will_retry,
+        } => {
+            let Event::Compacted {
+                summary,
+                retain_from,
+                tokens_before,
+                usage,
+                usage_metadata,
+                ..
+            } = &compaction_entry.event
+            else {
+                unreachable!("completed automatic compaction must have a compaction record");
+            };
+            let mut result = json!({
+                "summary":summary,
+                "firstKeptEntryId":retain_from.unwrap_or(compaction_entry.id).to_string(),
+                "tokensBefore":tokens_before.unwrap_or_default(),
+                "estimatedTokensAfter":estimated_tokens_after,
+            });
+            if let Some(usage) = usage {
+                let metadata = usage_metadata.as_ref().map(|usage| &usage.metadata);
+                result["usage"] =
+                    usage_value(*usage, metadata.unwrap_or(&ModelMetadata::default()));
+            }
+            if let Some(details) = details {
+                result["details"] = details.clone();
+            }
+            json!({"type":"compaction_end","reason":reason,"aborted":false,"willRetry":will_retry,"result":result})
+        }
+        AutoCompactionUpdate::Failed {
+            aborted,
+            error_message,
+        } => {
+            let mut event = json!({"type":"compaction_end","reason":reason,"aborted":aborted,"willRetry":false});
+            if let Some(error_message) = error_message {
+                event["errorMessage"] = json!(error_message);
+            }
+            event
+        }
+    }
+}
+
 pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
     let read = metadata.cached_input_tokens.unwrap_or_default();
     let write = metadata.cache_creation_input_tokens.unwrap_or_default();
@@ -1029,6 +1083,26 @@ mod streaming_tool_tests {
         );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "tool_execution_start");
+    }
+
+    #[test]
+    fn automatic_compaction_uses_pi_16_event_names() {
+        use pi_rs::{AutoCompactionUpdate, CompactionTrigger};
+
+        assert_eq!(
+            auto_compaction_value(CompactionTrigger::Threshold, &AutoCompactionUpdate::Started),
+            json!({"type":"compaction_start","reason":"threshold"})
+        );
+        assert_eq!(
+            auto_compaction_value(
+                CompactionTrigger::Overflow,
+                &AutoCompactionUpdate::Failed {
+                    aborted: true,
+                    error_message: None
+                },
+            ),
+            json!({"type":"compaction_end","reason":"overflow","aborted":true,"willRetry":false})
+        );
     }
 
     #[test]
