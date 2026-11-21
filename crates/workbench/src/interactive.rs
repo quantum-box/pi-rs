@@ -11,7 +11,7 @@ use crate::ui::{
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
     picker::{Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeFilter},
-    render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
+    render::{CustomEntryPresentation, Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
     viewport::{Viewport, Wheel},
@@ -1037,7 +1037,7 @@ struct StreamingTool {
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
-struct CustomMessageRenderPending {
+struct TranscriptExtensionRenderPending {
     request: uuid::Uuid,
     record: u64,
     options: pi_rs::CustomMessageRenderOptions,
@@ -1058,9 +1058,10 @@ struct View {
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
+    custom_entry_count: usize,
     custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
     custom_render_attempted: BTreeSet<u64>,
-    custom_render_pending: Option<CustomMessageRenderPending>,
+    custom_render_pending: Option<TranscriptExtensionRenderPending>,
     custom_render_redraw_at: Option<Instant>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
@@ -1431,16 +1432,74 @@ impl View {
     }
     fn append_entry(&mut self, entry: Entry) {
         self.lines.push(entry);
-        if self.lines.len() > 4000 {
-            let removed = self.lines.len() - 4000;
-            for entry in self.lines.drain(..removed) {
-                if let Entry::CustomMessage { id, .. } = entry {
+        let ordinary = self.lines.len() - self.custom_entry_count;
+        let excess = ordinary.saturating_sub(4000);
+        if excess == 0 {
+            return;
+        }
+        let removed = if self.custom_entry_count == 0 {
+            excess
+        } else {
+            self.lines
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !matches!(entry, Entry::CustomRecord { .. }))
+                .nth(excess - 1)
+                .expect("ordinary transcript entries")
+                .0
+                + 1
+        };
+        for entry in self.lines.drain(..removed) {
+            match entry {
+                Entry::CustomRecord { id, .. } => {
+                    self.custom_entry_count -= 1;
                     self.custom_render_attempted.remove(&id);
                 }
+                Entry::CustomMessage { id, .. } => {
+                    self.custom_render_attempted.remove(&id);
+                }
+                _ => {}
             }
-            self.regular.committed = self.regular.committed.saturating_sub(removed);
         }
+        self.regular.committed = self.regular.committed.saturating_sub(removed);
     }
+
+    fn show_custom_entry(&mut self, id: u64, entry: &pi_rs::CustomEntry) {
+        // Keep metadata-only placeholders out of the ordinary transcript limit
+        // while waiting for extensions to finish their startup discovery.
+        if self.custom_entry_count == 4000 {
+            let oldest = self
+                .lines
+                .iter()
+                .position(|line| {
+                    matches!(line, Entry::CustomRecord { presentation, .. }
+                        if *presentation != CustomEntryPresentation::Included)
+                })
+                .or_else(|| {
+                    self.lines
+                        .iter()
+                        .position(|line| matches!(line, Entry::CustomRecord { .. }))
+                })
+                .expect("retained custom entry");
+            let Entry::CustomRecord { id, rendered, .. } = self.lines.remove(oldest) else {
+                unreachable!("custom entry position")
+            };
+            self.custom_render_attempted.remove(&id);
+            if oldest < self.regular.committed {
+                self.regular.committed -= 1;
+                self.regular.redraw |= rendered.is_some();
+            }
+        } else {
+            self.custom_entry_count += 1;
+        }
+        self.lines.push(Entry::CustomRecord {
+            id,
+            custom_type: entry.custom_type.clone(),
+            presentation: CustomEntryPresentation::Pending,
+            rendered: None,
+        });
+    }
+
     fn show_custom_message(&mut self, id: u64, message: &pi_rs::CustomMessage) {
         if !message.display {
             return;
@@ -1474,12 +1533,23 @@ impl View {
             self.add_images(&images);
         }
     }
+    fn refresh_transcript_extension_renderers(&mut self) -> bool {
+        self.custom_render_pending = None;
+        for line in &mut self.lines {
+            if let Entry::CustomRecord { presentation, .. } = line {
+                *presentation = CustomEntryPresentation::Pending;
+            }
+        }
+        self.invalidate_custom_message_renderings()
+    }
+
     fn invalidate_custom_message_renderings(&mut self) -> bool {
         self.custom_render_attempted.clear();
         self.custom_render_redraw_at = None;
         let mut redrawn = false;
         for (index, entry) in self.lines.iter_mut().enumerate() {
-            if let Entry::CustomMessage { rendered, .. } = entry
+            if let Entry::CustomMessage { rendered, .. } | Entry::CustomRecord { rendered, .. } =
+                entry
                 && rendered.take().is_some()
             {
                 self.regular.redraw |= index < self.regular.committed;
@@ -1489,8 +1559,8 @@ impl View {
         redrawn
     }
 
-    fn prepare_custom_message_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
-        if worker.message_renderer_types.is_empty() {
+    fn prepare_transcript_extension_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
+        if worker.message_renderer_types.is_empty() && worker.entry_renderer_types.is_empty() {
             return false;
         }
         let options = pi_rs::CustomMessageRenderOptions {
@@ -1516,15 +1586,26 @@ impl View {
             {
                 Some(*id)
             }
+            Entry::CustomRecord {
+                id,
+                custom_type,
+                presentation,
+                ..
+            } if *presentation != CustomEntryPresentation::Omitted
+                && worker.entry_renderer_types.contains(custom_type)
+                && !self.custom_render_attempted.contains(id) =>
+            {
+                Some(*id)
+            }
             _ => None,
         });
         if let Some(record) = candidate {
             self.custom_render_attempted.insert(record);
             let request = uuid::Uuid::new_v4();
             if worker.send(json!({
-                "type":"render_custom_message","id":request,"record_id":record,"options":options,
+                "type":"render_transcript_extension","id":request,"record_id":record,"options":options,
             })).is_ok() {
-                self.custom_render_pending = Some(CustomMessageRenderPending {
+                self.custom_render_pending = Some(TranscriptExtensionRenderPending {
                     request,
                     record,
                     options,
@@ -1534,7 +1615,7 @@ impl View {
         changed
     }
 
-    fn receive_custom_message_render(&mut self, event: Value) -> bool {
+    fn receive_transcript_extension_render(&mut self, event: Value) -> bool {
         let Some(pending) = self.custom_render_pending.as_ref() else {
             return false;
         };
@@ -1547,26 +1628,43 @@ impl View {
             .expect("matching render request");
         if self.custom_render_options.as_ref() != Some(&pending.options)
             || !self.custom_render_attempted.contains(&pending.record)
-            || event["rendered"].is_null()
         {
             return false;
         }
-        let Ok(rendering) =
-            serde_json::from_value::<pi_rs::RenderedCustomMessage>(event["rendered"].clone())
-        else {
+        let Ok(rendering) = serde_json::from_value::<Option<pi_rs::RenderedExtensionContent>>(
+            event["rendered"].clone(),
+        ) else {
             return false;
         };
         for (index, entry) in self.lines.iter_mut().enumerate().rev() {
-            if let Entry::CustomMessage { id, rendered, .. } = entry
-                && *id == pending.record
-            {
-                *rendered = Some(rendering);
-                if index < self.regular.committed {
-                    self.custom_render_redraw_at
-                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+            let target = match entry {
+                Entry::CustomMessage { id, rendered, .. } if *id == pending.record => rendered,
+                Entry::CustomRecord {
+                    id,
+                    presentation,
+                    rendered,
+                    ..
+                } if *id == pending.record => {
+                    if *presentation == CustomEntryPresentation::Pending {
+                        *presentation = if rendering.is_some() {
+                            CustomEntryPresentation::Included
+                        } else {
+                            CustomEntryPresentation::Omitted
+                        };
+                    }
+                    rendered
                 }
-                return true;
+                _ => continue,
+            };
+            if rendering.is_none() {
+                return false;
             }
+            *target = rendering;
+            if index < self.regular.committed {
+                self.custom_render_redraw_at
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+            }
+            return true;
         }
         false
     }
@@ -1761,6 +1859,7 @@ impl View {
                         | "branch_summary"
                         | "custom_message"
                         | "custom_message_delivered"
+                        | "custom_entry"
                 )
             )
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
@@ -1769,6 +1868,9 @@ impl View {
             | pi_rs::Event::CustomMessageDelivered { message, .. } = &record.event
             {
                 self.show_custom_message(record.id, message);
+            }
+            if let pi_rs::Event::CustomEntry { entry } = &record.event {
+                self.show_custom_entry(record.id, entry);
             }
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
@@ -1803,6 +1905,7 @@ impl View {
         self.regular.committed = 0;
         self.regular.redraw = true;
         self.lines.clear();
+        self.custom_entry_count = 0;
         self.custom_render_redraw_at = None;
         // Keep an in-flight request as the only one until its response. The
         // cleared attempted set prevents it from updating the restored rows.
@@ -1862,6 +1965,7 @@ impl View {
             .collect();
         for record in session.branch() {
             match &record.event {
+                pi_rs::Event::CustomEntry { entry } => self.show_custom_entry(record.id, entry),
                 pi_rs::Event::CustomMessage { message }
                 | pi_rs::Event::CustomMessageDelivered { message, .. } => {
                     self.show_custom_message(record.id, message)
@@ -4543,7 +4647,7 @@ pub(super) async fn run(
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
             && let Some(mut old) = worker.take()
         {
-            if !old.message_renderer_types.is_empty() {
+            if !old.message_renderer_types.is_empty() || !old.entry_renderer_types.is_empty() {
                 startup_extensions = None;
                 view.custom_render_pending = None;
                 dirty |= view.invalidate_custom_message_renderings();
@@ -4714,11 +4818,13 @@ pub(super) async fn run(
                     active.message_renderer_types =
                         serde_json::from_value(value["custom_message_renderers"].clone())
                             .unwrap_or_default();
-                    view.custom_render_pending = None;
-                    dirty |= view.invalidate_custom_message_renderings();
+                    active.entry_renderer_types =
+                        serde_json::from_value(value["custom_entry_renderers"].clone())
+                            .unwrap_or_default();
+                    dirty |= view.refresh_transcript_extension_renderers();
                 }
-                if value["type"] == "custom_message_rendered" {
-                    dirty |= view.receive_custom_message_render(value);
+                if value["type"] == "transcript_extension_rendered" {
+                    dirty |= view.receive_transcript_extension_render(value);
                     continue;
                 }
                 if value["type"] == "response" && value["command"] == "get_share_context" {
@@ -4828,7 +4934,7 @@ pub(super) async fn run(
                 }
                 dirty = true;
             }
-            dirty |= view.prepare_custom_message_render(active, &args);
+            dirty |= view.prepare_transcript_extension_render(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
                 view.custom_render_pending = None;
@@ -11517,6 +11623,69 @@ exit {exit}
     }
 
     #[test]
+    fn custom_entry_renderer_absence_omits_the_initial_row() {
+        use super::Entry;
+
+        let mut view = super::View::default();
+        view.append("ordinary history");
+        let entry = pi_rs::CustomEntry {
+            custom_type: "card".into(),
+            data: Some(serde_json::json!({"ignored":"private"})),
+        };
+        for id in 1..=4001 {
+            view.show_custom_entry(id, &entry);
+        }
+        assert_eq!(view.custom_entry_count, 4000);
+        assert!(matches!(view.lines[0], Entry::Notice(_)));
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        let Entry::CustomRecord { presentation, .. } = &mut view.lines[1] else {
+            unreachable!()
+        };
+        *presentation = super::CustomEntryPresentation::Included;
+        view.show_custom_entry(4002, &entry);
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        assert!(matches!(view.lines[2], Entry::CustomRecord { id: 4, .. }));
+        let options = pi_rs::CustomMessageRenderOptions::default();
+        view.custom_render_options = Some(options.clone());
+        let request = uuid::Uuid::new_v4();
+        view.custom_render_attempted.insert(4002);
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
+            request,
+            record: 4002,
+            options,
+        });
+        assert!(
+            !view.receive_transcript_extension_render(serde_json::json!({
+                "id":request,"rendered":null,
+            }))
+        );
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Omitted,
+                rendered: None,
+                ..
+            })
+        ));
+        view.invalidate_custom_message_renderings();
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Omitted,
+                ..
+            })
+        ));
+        view.refresh_transcript_extension_renderers();
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Pending,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn custom_message_render_responses_follow_transcript_and_expansion_state() {
         let mut view = super::View::default();
         let message = pi_rs::CustomMessage {
@@ -11535,27 +11704,29 @@ exit {exit}
         let old_request = uuid::Uuid::new_v4();
         view.custom_render_options = Some(expanded.clone());
         view.custom_render_attempted.insert(14);
-        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
             request: old_request,
             record: 14,
             options: collapsed,
         });
         let rendered = serde_json::json!({"lines":[[{"text":"details"}]]});
-        assert!(!view.receive_custom_message_render(serde_json::json!({
-            "id":old_request,"rendered":rendered
-        })));
+        assert!(
+            !view.receive_transcript_extension_render(serde_json::json!({
+                "id":old_request,"rendered":rendered
+            }))
+        );
         assert!(matches!(
             &view.lines[0],
             super::Entry::CustomMessage { rendered: None, .. }
         ));
 
         let active_request = uuid::Uuid::new_v4();
-        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
             request: active_request,
             record: 14,
             options: expanded,
         });
-        assert!(view.receive_custom_message_render(serde_json::json!({
+        assert!(view.receive_transcript_extension_render(serde_json::json!({
             "id":active_request,"rendered":rendered
         })));
         assert!(matches!(

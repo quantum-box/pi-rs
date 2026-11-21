@@ -205,6 +205,10 @@ enum ProtocolRequest {
         message: pi_rs_core::CustomMessage,
         options: pi_rs_core::CustomMessageRenderOptions,
     },
+    RenderCustomEntry {
+        entry: pi_rs_core::CustomEntryRecord,
+        options: pi_rs_core::CustomEntryRenderOptions,
+    },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
         state: Option<ExtensionState>,
@@ -340,6 +344,8 @@ struct Description {
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_entry_renderers: Vec<String>,
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
@@ -1052,6 +1058,24 @@ impl Extension for ExecutableExtension {
     }
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
+    }
+    fn custom_entry_renderer_types(&self) -> Vec<&str> {
+        self.description
+            .custom_entry_renderers
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+    async fn render_custom_entry(
+        &self,
+        entry: &pi_rs_core::CustomEntryRecord,
+        options: &pi_rs_core::CustomEntryRenderOptions,
+    ) -> ExtensionResult<Option<pi_rs_core::RenderedExtensionContent>> {
+        self.request_async(ProtocolRequest::RenderCustomEntry {
+            entry: entry.clone(),
+            options: options.clone(),
+        })
+        .await
     }
     fn handles_resource_discovery(&self) -> bool {
         self.description.resource_discovery_hook
@@ -3628,6 +3652,11 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            custom_entry_renderers: extension
+                .custom_entry_renderer_types()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             flags: extension.cli_flags(),
             host_calls: true,
             command_entries: extension.supports_command_entries(),
@@ -3838,6 +3867,15 @@ async fn dispatch_inner(
                 return encode(Ok(Option::<pi_rs_core::RenderedCustomMessage>::None));
             }
             encode(extension.render_custom_message(&message, &options).await)
+        }
+        ProtocolRequest::RenderCustomEntry { entry, options } => {
+            if !extension
+                .custom_entry_renderer_types()
+                .contains(&entry.entry.custom_type.as_str())
+            {
+                return encode(Ok(Option::<pi_rs_core::RenderedExtensionContent>::None));
+            }
+            encode(extension.render_custom_entry(&entry, &options).await)
         }
         ProtocolRequest::DiscoverResources { event, state } => {
             if host.supports_custom_messages()

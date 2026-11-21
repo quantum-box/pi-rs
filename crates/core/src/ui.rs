@@ -40,7 +40,7 @@ pub struct CustomMessageRenderOptions {
 /// and wraps the rows to fit.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RenderedCustomMessage {
+pub struct RenderedExtensionContent {
     pub lines: Vec<Vec<UiComponentSpan>>,
     #[serde(default)]
     pub padding: usize,
@@ -48,7 +48,10 @@ pub struct RenderedCustomMessage {
     pub background: Option<String>,
 }
 
-impl RenderedCustomMessage {
+/// Rendered rows returned by a custom-message renderer.
+pub type RenderedCustomMessage = RenderedExtensionContent;
+
+impl RenderedExtensionContent {
     fn within_limits(&self) -> bool {
         component_lines_within_limits(&self.lines)
             && self
@@ -115,6 +118,61 @@ impl CustomMessageRenderers {
             .ok()?
             .ok()?
             .filter(RenderedCustomMessage::within_limits)
+    }
+}
+
+/// Presentation state for a branch-local entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEntryRenderOptions {
+    pub expanded: bool,
+    pub expand_key: Option<String>,
+}
+
+/// First-registered renderers of branch-local entries. They are independent
+/// of the active session and request context.
+#[derive(Clone, Default)]
+pub struct CustomEntryRenderers {
+    pub(crate) renderers: std::collections::BTreeMap<String, std::sync::Arc<dyn crate::Extension>>,
+}
+
+impl CustomEntryRenderers {
+    pub fn types(&self) -> impl Iterator<Item = &str> {
+        self.renderers.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, custom_type: &str) -> bool {
+        self.renderers.contains_key(custom_type)
+    }
+
+    /// Produce presentation rows for an entry. No registered renderer or an
+    /// intentionally hidden entry returns `None`. Failures are returned so
+    /// the host can decide whether to display a local error row.
+    pub async fn render(
+        &self,
+        entry: &crate::CustomEntryRecord,
+        options: &CustomEntryRenderOptions,
+        timeout: std::time::Duration,
+    ) -> ExtensionResult<Option<RenderedExtensionContent>> {
+        use futures_util::FutureExt;
+        let Some(renderer) = self.renderers.get(&entry.entry.custom_type) else {
+            return Ok(None);
+        };
+        let callback = std::panic::AssertUnwindSafe(async {
+            renderer.render_custom_entry(entry, options).await
+        })
+        .catch_unwind();
+        let rendering = crate::runtime::time::timeout(timeout, callback)
+            .await
+            .map_err(|_| "custom entry renderer timed out")?
+            .map_err(|_| "custom entry renderer panicked")??;
+        if rendering
+            .as_ref()
+            .is_some_and(|content| !content.within_limits())
+        {
+            return Err("custom entry exceeds rendering limits".into());
+        }
+        Ok(rendering)
     }
 }
 
@@ -302,6 +360,94 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn custom_entry_renderers_select_the_first_registration_and_distinguish_failure() {
+        struct Renderer(&'static str);
+        #[async_trait::async_trait]
+        impl crate::Extension for Renderer {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn custom_entry_renderer_types(&self) -> Vec<&str> {
+                vec!["card"]
+            }
+            async fn render_custom_entry(
+                &self,
+                entry: &crate::CustomEntryRecord,
+                options: &CustomEntryRenderOptions,
+            ) -> ExtensionResult<Option<RenderedExtensionContent>> {
+                if !options.expanded {
+                    return Ok(None);
+                }
+                let label = entry
+                    .entry
+                    .data
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("card is missing its label")?;
+                Ok(Some(RenderedExtensionContent {
+                    lines: vec![vec![UiComponentSpan {
+                        text: format!("{} {} {label}", self.0, entry.id),
+                        ..Default::default()
+                    }]],
+                    ..Default::default()
+                }))
+            }
+        }
+
+        let mut registry = crate::Registry::default();
+        registry
+            .register(std::sync::Arc::new(Renderer("first")))
+            .unwrap();
+        registry
+            .register(std::sync::Arc::new(Renderer("second")))
+            .unwrap();
+        let renderers = registry.custom_entry_renderers();
+        let mut entry = crate::CustomEntryRecord {
+            id: 19,
+            entry: crate::CustomEntry {
+                custom_type: "card".into(),
+                data: Some(serde_json::json!("label")),
+            },
+        };
+        let deadline = std::time::Duration::from_secs(1);
+        let mut options = CustomEntryRenderOptions::default();
+        assert!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        options.expanded = true;
+        assert_eq!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap()
+                .unwrap()
+                .lines[0][0]
+                .text,
+            "first 19 label"
+        );
+        entry.entry.data = None;
+        assert_eq!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap_err(),
+            "card is missing its label"
+        );
+        entry.entry.custom_type = "unknown".into();
+        assert!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn first_custom_message_renderer_wins_and_hidden_messages_do_not_run() {
         struct Renderer(&'static str);

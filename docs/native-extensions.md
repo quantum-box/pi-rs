@@ -74,6 +74,12 @@ host-defined deadline, and apply their own palette. RPC and HTML exports
 retain the original custom-message content. This API uses native styled
 rows. Pi extensions can return arbitrary interactive TypeScript components.
 
+For UI-only custom entries, use `custom_entry_renderer_types` and
+`render_custom_entry`. Entry data remains outside model context. An entry
+with no renderer, or whose first render returns no content, stays out of
+the terminal transcript. Renderer failures show an error row. SDK hosts
+can render journal entries through `AgentSession::custom_entry_renderers`.
+
 Executable hosts advertising `command_failure_classification_v1` accept the
 `command_effects_classified_v1` request. Its successful protocol envelope
 contains a typed `Ok` effects value or an `Err` containing `Callback` or
