@@ -10972,8 +10972,17 @@ async fn nested_woken_real_callback_records_receipt_once() {
 #[cfg(unix)]
 #[tokio::test]
 async fn nested_woken_with_owned_conversation_remains_fail_closed() {
+    exercise_nested_woken_owned_rejection(false).await;
+    exercise_nested_woken_owned_rejection(true).await;
+}
+
+#[cfg(unix)]
+async fn exercise_nested_woken_owned_rejection(selected: bool) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
+    if selected {
+        std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
+    }
     let mut initial = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -11049,8 +11058,32 @@ async fn nested_woken_with_owned_conversation_remains_fail_closed() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(resumed.try_wait().unwrap().is_none());
     assert!(!dir.path().join("nested-cancelled").exists());
+    assert!(!dir.path().join("child-after").exists());
     resumed.kill().unwrap();
     resumed.wait().unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let child = records
+        .iter()
+        .find(|record| record.task.id() == edge.task)
+        .unwrap();
+    assert!(
+        store
+            .get(&crate::task_scheduler::woken_conversation_claim_key(
+                edge.task
+            ))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                edge.task
+            ))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!matches!(child.task.state(), TaskState::Succeeded(_)));
 }
 
 #[cfg(unix)]
