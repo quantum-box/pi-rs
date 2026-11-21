@@ -83,12 +83,7 @@ impl Model {
         } else {
             Api::LlamaCppClassifier
         };
-        let inference = if decision {
-            llama_cpp::endpoint(root, "v1")
-        } else {
-            root.clone()
-        };
-        let (base, endpoint) = operation_endpoints(inference.as_str(), api, false).ok()?;
+        let (base, endpoint) = classifier_endpoints(root, api)?;
         Some(Entry {
             provider: "llama.cpp".into(),
             model: Configured {
@@ -112,6 +107,15 @@ impl Model {
             llama_root: Some(root.clone()),
         })
     }
+}
+
+pub(super) fn classifier_endpoints(root: &Url, api: Api) -> Option<(Url, Url)> {
+    let inference = match api {
+        Api::SystemOne => llama_cpp::endpoint(root, "v1"),
+        Api::LlamaCppClassifier => root.clone(),
+        _ => return None,
+    };
+    operation_endpoints(inference.as_str(), api, false).ok()
 }
 
 fn server_root(server: &str) -> Option<Url> {

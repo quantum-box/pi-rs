@@ -884,6 +884,13 @@ impl Entry {
                 _ => Credential::Invalid,
             });
         }
+        if self.provider == "llama.cpp"
+            && let Some((root, key)) = llama_discovery::configured_server(keys, &env)
+            && let Some((_, endpoint)) = llama_discovery::classifier_endpoints(&root, self.api)
+            && endpoint == self.endpoint
+        {
+            return key;
+        }
         {
             let key = match (self.provider.as_str(), official) {
                 ("typesafe", true) => "TYPESAFE_API_KEY",
@@ -1378,6 +1385,53 @@ async fn send_model_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_llama_classifiers_inherit_keys_only_for_the_matching_router() {
+        let providers = json!({
+            "llama.cpp": {
+                "models": [
+                    {"id":"chat","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1"},
+                    {"id":"decisions","type":"classifier","api":"typesafe-system-one",
+                     "baseUrl":"https://router.example/prefix/v1"},
+                    {"id":"other-path","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/other/v1"},
+                    {"id":"other-host","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://other.example/prefix/v1"}
+                ]
+            }
+        });
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::default();
+        let env = |name: &str| match name {
+            "LLAMA_BASE_URL" => Some("https://router.example/prefix/v1/".into()),
+            "LLAMA_API_KEY" => Some("router-key".into()),
+            _ => None,
+        };
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let credential = entry.credential_with_env(&keys, env);
+            match entry.model.id.as_str() {
+                "chat" | "decisions" => {
+                    assert_eq!(credential.unwrap().literal(), Some("router-key"));
+                }
+                "other-path" | "other-host" => assert!(credential.is_none()),
+                id => panic!("unexpected fixture model {id}"),
+            }
+        }
+        assert_eq!(
+            catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "llama.cpp")
+                .count(),
+            4
+        );
+    }
 
     #[tokio::test]
     async fn unfiltered_catalogue_does_not_read_auth_file() {
