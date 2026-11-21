@@ -613,10 +613,11 @@ impl Catalogue {
                 continue;
             }
             if available {
+                let allows_keyless = model.allows_keyless(keys);
                 let key = (
                     model.provider.as_str(),
                     model.endpoint.as_str(),
-                    model.allows_keyless(),
+                    allows_keyless,
                     model.llama_root.is_some(),
                 );
                 let usable = match resolved.get(&key) {
@@ -628,7 +629,7 @@ impl Catalogue {
                             .and_then(|model| model.credential(keys))
                         {
                             Some(credential) => credential.resolve().await.is_ok(),
-                            None => model.allows_keyless(),
+                            None => allows_keyless,
                         };
                         resolved.insert(key, usable);
                         usable
@@ -787,8 +788,26 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 }
 
 impl Entry {
-    fn allows_keyless(&self) -> bool {
-        self.llama_root.is_some() || matches!(self.api, Api::LlamaCppClassifier)
+    fn allows_keyless(&self, keys: &Keys) -> bool {
+        self.llama_root.is_some()
+            || matches!(self.api, Api::LlamaCppClassifier)
+            || matches!(
+                self.router_credential(keys, |name| std::env::var(name).ok()),
+                Some(None)
+            )
+    }
+
+    fn router_credential(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Option<Credential>> {
+        if self.provider != "llama.cpp" {
+            return None;
+        }
+        let (root, key) = llama_discovery::configured_server(keys, env)?;
+        let (_, endpoint) = llama_discovery::classifier_endpoints(&root, self.api)?;
+        (endpoint == self.endpoint).then_some(key)
     }
 
     fn is_official(&self) -> bool {
@@ -885,11 +904,7 @@ impl Entry {
                 _ => Credential::Invalid,
             });
         }
-        if self.provider == "llama.cpp"
-            && let Some((root, key)) = llama_discovery::configured_server(keys, &env)
-            && let Some((_, endpoint)) = llama_discovery::classifier_endpoints(&root, self.api)
-            && endpoint == self.endpoint
-        {
+        if let Some(key) = self.router_credential(keys, &env) {
             return key;
         }
         {
@@ -1342,7 +1357,7 @@ impl Operations {
                 .map_err(|_| Error::Config("invalid model operation credential".into()))?;
             authorization.set_sensitive(true);
             headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        } else if !entry.allows_keyless() {
+        } else if !entry.allows_keyless(keys) {
             return Err(Error::Config(format!(
                 "No API key for provider: {}",
                 entry.provider
@@ -1432,6 +1447,46 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_system_one_classifier_can_use_only_the_matching_keyless_router() {
+        use clap::Parser;
+
+        let providers = json!({"llama.cpp":{"models":[
+            {"id":"decision","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/prefix/v1"},
+            {"id":"other-path","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/other/v1"},
+            {"id":"other-host","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://other.example/prefix/v1"}
+        ]}});
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::parse(&json!({"llama.cpp":{
+            "type":"api_key","env":{"LLAMA_BASE_URL":"https://router.example/prefix"}
+        }}));
+        let available = catalogue
+            .list(Kind::Classifier, Some("llama.cpp"), None, true, &keys)
+            .await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0]["id"], "decision");
+        let operations = Operations::new(&Cli::parse_from(["pi"])).unwrap();
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let headers = operations.request_headers(entry, &keys).await;
+            if entry.model.id == "decision" {
+                assert!(
+                    !headers
+                        .unwrap()
+                        .contains_key(reqwest::header::AUTHORIZATION)
+                );
+            } else {
+                assert!(headers.is_err());
+            }
+        }
     }
 
     #[tokio::test]

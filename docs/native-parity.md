@@ -4757,7 +4757,8 @@ Loaded and sleeping models, and unloaded presets eligible for router
 autoload, can appear as classifiers.
 Models advertising `decisions` output use `/v1/systemone`; other models use
 next-token classification. Explicit model entries take precedence and inherit
-the router key only when their operation endpoint matches the configured router.
+the router's credentials or keyless access only when their operation endpoint
+matches the configured router.
 `--offline` skips discovery. This refresh is scoped to the native Codemode
 classifier catalog. Pi also refreshes its chat catalog. A llama-server 1.0.0
 router run discovered an unloaded preset and exercised autoload and
