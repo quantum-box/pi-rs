@@ -390,7 +390,8 @@ fn resolve_cli_catalog_model(
                 let (_, id) = explicit?;
                 let names = aliases(profiles, &provider, &models);
                 let candidates = search_ids(&models, &names);
-                partial(id, &candidates, provider.id())
+                exact(id, &candidates, provider.id())
+                    .or_else(|| partial(id, &candidates, provider.id()))
                     .map(|model| canonical(model.clone(), &models, &names))
             });
             let Some(id) = id else {
@@ -851,7 +852,8 @@ mod tests {
         args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
             "providers":{
                 "direct": {"api":"anthropic-messages","baseUrl":"https://direct.example/v1",
-                    "models":[{"id":"other"},{"id":"named"},{"id":"direct/own"},{"id":"part-long"}]},
+                    "models":[{"id":"other"},{"id":"named"},{"id":"direct/own"},
+                        {"id":"part-long"},{"id":"actual-id","name":"fast"},{"id":"fast-pro"}]},
                 "gateway-one": {"api":"openai-completions","baseUrl":"https://one.example/v1",
                     "models":[{"id":"direct/model"},{"id":"direct/named"},{"id":"model:high"},{"id":"direct/own"}]},
                 "gateway-two": {"api":"openai-completions","baseUrl":"https://two.example/v1",
@@ -895,6 +897,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(partial.qualified(), "direct/part-long");
+
+        let display_name = super::cli_catalog_model(&args, "direct/FAST", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(display_name.qualified(), "direct/actual-id");
 
         args.model_keys = Default::default();
         let unauthenticated = super::cli_catalog_model(&args, "direct/model", false)
