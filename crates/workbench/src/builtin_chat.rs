@@ -81,7 +81,7 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "huggingface",
         endpoint: "https://router.huggingface.co/v1/chat/completions",
         env: "HF_TOKEN",
-        compatibility: standard,
+        compatibility: || json!({"supportsStore":true,"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
         id: "kimi-coding",
