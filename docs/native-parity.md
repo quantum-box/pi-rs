@@ -1700,7 +1700,9 @@ also rejected. Pi instead drops a retained boundary that is not on the current
 path; native import rejects it rather than silently retaining unrelated history.
 
 Context edits are projected onto future model context while the imported raw
-entries remain available. Remaining specialized message variants and system
+entries remain available. Imported system messages appear as `[system]` in the
+default session tree, where their text can be searched and copied.
+Remaining specialized message variants and system
 prompt checkpoints still need parity work. Images currently appear as
 attachment notices in the terminal.
 
@@ -2542,8 +2544,6 @@ custom messages, branch summaries, and compaction token counts. Selected
 content is bold, and labels and their optional local timestamps have separate
 theme roles. Native record IDs remain searchable for direct checkout. Custom
 messages and imported compaction summaries can be copied from the tree.
-Imported system messages appear in the default tree as `[system]`. Their text
-can be searched and copied from that entry.
 Message preview and navigation gaps remain in the Sessions row.
 
 ### Package identity checkpoint
