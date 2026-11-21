@@ -5148,19 +5148,22 @@ Multiline extension editor dialogs and local multiline editors use the same
 external-editor action and configured keybinding. Editor failures remain
 visible in the dialog without submitting or losing its draft; Escape cancels
 the dialog, and extension cancellation still removes the correlated request.
-If the extension worker exits during editing, its editor is stopped and the
-terminal is restored. On Unix, the editor inherits Pi's foreground process
-group and terminal, matching Pi's shell job control, including the operating
-system's orphan-group signal behavior. If an editor exits or an extension
-request is cancelled while the job is in the background, terminal restoration
-and TUI redraw wait until the job is foregrounded. Correlated cancellation
-terminates and reaps the direct editor process; Unix editor descendants are not
-guaranteed to terminate. On Windows the job object also terminates wrapper
+On Unix, prompt and local editors inherit Pi's foreground process group and
+terminal, matching upstream shell job control, including orphan-group signal
+behavior. Extension editors on Linux and macOS run in a separate session with
+a private pseudoterminal. Pi relays input, output and window size while
+foregrounded. Cancellation or worker loss disconnects that terminal before
+Pi resumes drawing and reaps the direct editor. A wrapper descendant may
+survive, including one that has started a new session, but its inherited
+editor terminal can no longer receive input from Pi's terminal. This is
+terminal isolation for configured editors, not a sandbox. The extension
+editor's Ctrl+Z does not suspend Pi's job in the invoking shell. If Pi's
+job is backgrounded by the shell, restoration and redraw wait until the
+job is foregrounded. On Windows the job object also terminates wrapper
 descendants. Terminal-owned workers leave terminal SIGINT handling to the
-frontend, which sends explicit cancel or shutdown controls; this prevents an
-editor interrupt from independently stopping an active backend. The frontend
-samples editor activity when the interrupt is delivered, so a delayed signal
-notification does not cancel the session after the editor closes.
+frontend, which sends explicit cancel or shutdown controls. The frontend
+samples editor activity at signal delivery so an editor interrupt does not
+stop an active backend or cancel the session after the editor closes.
 The native 1 MiB extension response limit also applies to externally edited text.
 
 ### Editor kill ring checkpoint

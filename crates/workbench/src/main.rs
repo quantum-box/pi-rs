@@ -1317,12 +1317,10 @@ async fn run_cli() -> i32 {
     // Terminal-owned workers receive the same foreground-group SIGINT as the
     // frontend and editor. Their parent handles terminal interrupts and sends
     // explicit cancel/shutdown commands; do not independently stop the worker.
-    let argv: Vec<_> = std::env::args_os().collect();
-    let terminal_managed = argv
-        .iter()
-        .skip(1)
-        .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "--terminal-managed-worker");
+    // Worker::start places its internal flag first, before user arguments.
+    let terminal_managed = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--terminal-managed-worker");
     let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
     let mcp_login_cancel = CancellationToken::new();
     let signal_cancel = mcp_login_cancel.clone();

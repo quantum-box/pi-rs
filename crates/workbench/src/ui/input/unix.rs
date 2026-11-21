@@ -21,7 +21,8 @@ impl Reader {
             .custom_flags(libc::O_NONBLOCK)
             .open("/dev/tty")
             .or_else(|_| {
-                let descriptor = unsafe { libc::dup(libc::STDIN_FILENO) };
+                let descriptor =
+                    unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
                 if descriptor < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -39,8 +40,12 @@ impl Reader {
     // Avoid pulling input intended for the next terminal owner into our decoder.
     pub fn new_for_handoff() -> io::Result<Self> {
         let mut reader = Self::new()?;
-        reader.read_one = true;
+        reader.read_for_handoff(true);
         Ok(reader)
+    }
+
+    pub fn read_for_handoff(&mut self, enabled: bool) {
+        self.read_one = enabled;
     }
 
     pub fn drain(&mut self, max: Duration, idle: Duration) -> io::Result<()> {

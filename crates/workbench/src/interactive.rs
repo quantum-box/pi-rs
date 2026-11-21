@@ -1009,6 +1009,7 @@ struct View {
     regular: RegularState,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
+    pending_terminal_title: Option<String>,
     local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
     tree_confirmation: Option<u64>,
     tree_navigation: Option<(u64, bool)>,
@@ -1209,15 +1210,10 @@ impl View {
                     self.widgets.push((key, lines, placement));
                 }
             }
-            pi_rs::UiRequest::SetTitle { title } => execute!(
-                std::io::stdout(),
-                crossterm::terminal::SetTitle(
-                    title
-                        .chars()
-                        .filter(|character| !character.is_control())
-                        .collect::<String>()
-                )
-            )?,
+            pi_rs::UiRequest::SetTitle { mut title } => {
+                title.retain(|character| !character.is_control());
+                self.pending_terminal_title = Some(title);
+            }
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
@@ -4601,19 +4597,7 @@ pub(super) async fn run(
                     continue;
                 }
                 if value["type"] == "extension_ui_cancelled" {
-                    if let Some(target) =
-                        cancel_running_extension_editor(&mut external_editor, Some(&value))
-                    {
-                        finish_external_editor(
-                            &args,
-                            &mut view,
-                            &mut _terminal,
-                            #[cfg(any(unix, windows))]
-                            &mut editor_colors,
-                            target,
-                            None,
-                        )?;
-                    }
+                    cancel_running_extension_editor(&mut external_editor, Some(&value));
                     view.cancel_extension_dialog(&value["id"]);
                     dirty = true;
                     continue;
@@ -4674,6 +4658,7 @@ pub(super) async fn run(
                 }
                 if settled {
                     active.busy = false;
+                    cancel_running_extension_editor(&mut external_editor, None);
                     view.dialogs.clear();
                     view.settle();
                     if let Some((id, _)) = view.tree_navigation.take() {
@@ -4714,17 +4699,7 @@ pub(super) async fn run(
                 }
                 view.settle();
                 view.cache_warming_status = None;
-                if let Some(target) = cancel_running_extension_editor(&mut external_editor, None) {
-                    finish_external_editor(
-                        &args,
-                        &mut view,
-                        &mut _terminal,
-                        #[cfg(any(unix, windows))]
-                        &mut editor_colors,
-                        target,
-                        None,
-                    )?;
-                }
+                cancel_running_extension_editor(&mut external_editor, None);
                 view.dialogs.clear();
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
@@ -4901,6 +4876,9 @@ pub(super) async fn run(
                 }
             }
         }
+        if let Some(title) = view.pending_terminal_title.take() {
+            execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
+        }
         if (dirty && last_frame.elapsed() >= frame_interval)
             || ((is_busy(&worker) || view.remote_task.is_some() || view.pending_share.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
@@ -4938,6 +4916,11 @@ pub(super) async fn run(
         } else {
             next_thinking_level_input(&mut thinking_level_input, loading, ready, blocked)
         };
+        #[cfg(unix)]
+        input.read_for_handoff(
+            view.dialog()
+                .is_some_and(crate::ui::dialog::Dialog::supports_external_editor),
+        );
         let next_input = if let Some(event) = pending {
             Some(crate::ui::input::InputEvent::Event(event))
         } else if let Some(event) = deferred_input.pop_front() {
@@ -8016,6 +7999,9 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+mod editor_pty;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExternalEditorTarget {
     Main,
@@ -8055,7 +8041,11 @@ struct RunningExternalEditor {
     target: ExternalEditorTarget,
     cancelled: bool,
     #[cfg(unix)]
-    _terminal_state: Option<EditorTerminalState>,
+    terminal_state: Option<EditorTerminalState>,
+    #[cfg(unix)]
+    pty: Option<editor_pty::EditorPty>,
+    #[cfg(unix)]
+    drain_deadline: Option<Instant>,
 }
 
 // The editor shares Pi's foreground process group. Capture terminal settings
@@ -8064,15 +8054,18 @@ struct RunningExternalEditor {
 struct EditorTerminalState {
     tty: std::fs::File,
     baseline: libc::termios,
+    relaying: bool,
 }
 
 #[cfg(unix)]
 impl EditorTerminalState {
     fn capture() -> std::io::Result<Option<Self>> {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
         let tty = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open("/dev/tty")
         {
             Ok(tty) => tty,
@@ -8082,7 +8075,27 @@ impl EditorTerminalState {
         if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut baseline) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Some(Self { tty, baseline }))
+        Ok(Some(Self {
+            tty,
+            baseline,
+            relaying: false,
+        }))
+    }
+
+    fn enter_relay_mode(&mut self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if !self.foreground()? {
+            return Err(std::io::Error::other(
+                "Pi must be foregrounded to open an extension editor",
+            ));
+        }
+        let mut raw = self.baseline;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.relaying = true;
+        Ok(())
     }
 
     fn foreground(&self) -> std::io::Result<bool> {
@@ -8100,7 +8113,13 @@ impl Drop for EditorTerminalState {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
         if self.foreground().unwrap_or(false) {
-            unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &self.baseline) };
+            let fd = self.tty.as_raw_fd();
+            unsafe {
+                if self.relaying {
+                    libc::tcflush(fd, libc::TCIFLUSH);
+                }
+                libc::tcsetattr(fd, libc::TCSANOW, &self.baseline);
+            }
         }
     }
 }
@@ -8111,16 +8130,50 @@ impl RunningExternalEditor {
             && matches!(self.target, ExternalEditorTarget::Extension(id) if json!(id) == event["id"])
     }
     fn start(command: &str, text: &str, target: ExternalEditorTarget) -> Result<Self> {
+        #[cfg(unix)]
+        let terminal_state = EditorTerminalState::capture()?;
+        #[cfg(unix)]
+        if matches!(target, ExternalEditorTarget::Extension(_)) && terminal_state.is_none() {
+            return Err(Error::Config(
+                "External editing of an extension dialog requires a controlling terminal".into(),
+            ));
+        }
+        Self::start_with_terminal(
+            command,
+            text,
+            target,
+            #[cfg(unix)]
+            terminal_state,
+        )
+    }
+
+    fn start_with_terminal(
+        command: &str,
+        text: &str,
+        target: ExternalEditorTarget,
+        #[cfg(unix)] mut terminal_state: Option<EditorTerminalState>,
+    ) -> Result<Self> {
         let parts =
             shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
         let Some((program, arguments)) = parts.split_first() else {
             return Err(Error::Config("external editor is empty".into()));
         };
         let file = ExternalEditorFile::new(text)?;
-        #[cfg(unix)]
-        let terminal_state = EditorTerminalState::capture()?;
         let mut process = std::process::Command::new(program);
         process.args(arguments).arg(file.path());
+        #[cfg(unix)]
+        let pty = if matches!(target, ExternalEditorTarget::Extension(_)) {
+            let pty = editor_pty::EditorPty::attach(
+                &mut process,
+                terminal_state.as_ref().map(|tty| (&tty.tty, &tty.baseline)),
+            )?;
+            if let Some(tty) = &mut terminal_state {
+                tty.enter_relay_mode()?;
+            }
+            Some(pty)
+        } else {
+            None
+        };
         #[cfg(windows)]
         let child = {
             let mut wrapped = process_wrap::std::CommandWrap::from(process);
@@ -8137,7 +8190,11 @@ impl RunningExternalEditor {
             target,
             cancelled: false,
             #[cfg(unix)]
-            _terminal_state: terminal_state,
+            terminal_state,
+            #[cfg(unix)]
+            pty,
+            #[cfg(unix)]
+            drain_deadline: None,
         })
     }
 
@@ -8145,19 +8202,49 @@ impl RunningExternalEditor {
         // Do not redraw over the shell if an editor exits while the job is
         // backgrounded. The shell will foreground this shared group again.
         #[cfg(unix)]
-        if let Some(tty) = &self._terminal_state
+        if let Some(tty) = &self.terminal_state
             && !tty.foreground()?
         {
             return Ok(None);
         }
-        Ok(self.child.try_wait()?)
+        #[cfg(not(windows))]
+        let status = self.child.try_wait()?;
+        #[cfg(windows)]
+        let status = self.child.inner_mut().try_wait()?;
+        #[cfg(unix)]
+        if let (Some(tty), Some(pty)) = (&self.terminal_state, &mut self.pty) {
+            let drained = pty.relay(&tty.tty, status.is_none())?;
+            if status.is_some() && !drained {
+                // Preserve final editor output when possible. A live
+                // descendant or stalled terminal must not hold the TUI.
+                let deadline = self
+                    .drain_deadline
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
+                if Instant::now() < *deadline {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(status)
     }
 
     fn cancel(&mut self) {
-        // On Unix the editor shares Pi's group. Never signal the group: it can
-        // include Pi and shell wrappers. Windows retains the job object.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Disconnect the private terminal even if the child already exited.
+        // Descendants may be alive but have no route to Pi's terminal.
+        #[cfg(unix)]
+        drop(self.pty.take());
+        #[cfg(not(windows))]
+        {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        #[cfg(windows)]
+        {
+            // Polling can already have consumed the final job notification.
+            // Terminate via the job and wait on the editor process handle.
+            let _ = self.child.start_kill();
+            let _ = self.child.inner_mut().wait();
+        }
     }
 
     fn result(&self, status: std::process::ExitStatus) -> Result<String> {
@@ -8169,7 +8256,22 @@ impl RunningExternalEditor {
                 "External editor exited with {exit}; prompt unchanged"
             )));
         }
-        Ok(external_editor_text(&std::fs::read(self.file.path())?))
+        if self.target == ExternalEditorTarget::Main {
+            return Ok(external_editor_text(&std::fs::read(self.file.path())?));
+        }
+        use std::io::Read;
+        // The decoder can remove a three-byte BOM and one final newline.
+        const MAX_DRAFT_BYTES: usize = 1024 * 1024 + 4;
+        let mut bytes = Vec::new();
+        std::fs::File::open(self.file.path())?
+            .take((MAX_DRAFT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_DRAFT_BYTES {
+            return Err(Error::Config(
+                "External editor result exceeds 1 MiB; draft unchanged".into(),
+            ));
+        }
+        Ok(external_editor_text(&bytes))
     }
 }
 
@@ -8179,6 +8281,8 @@ impl Drop for RunningExternalEditor {
         // job must be terminated even after the wrapper has been reaped.
         #[cfg(windows)]
         self.cancel();
+        #[cfg(unix)]
+        drop(self.pty.take());
         #[cfg(not(windows))]
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
             self.cancel();
@@ -8191,29 +8295,15 @@ impl Drop for RunningExternalEditor {
 fn cancel_running_extension_editor(
     running: &mut Option<RunningExternalEditor>,
     event: Option<&Value>,
-) -> Option<ExternalEditorTarget> {
-    let editor = running.as_ref()?;
-    if !matches!(editor.target, ExternalEditorTarget::Extension(_))
-        || event.is_some_and(|event| !editor.cancelled_by(event))
+) {
+    if let Some(editor) = running.as_mut()
+        && !editor.cancelled
+        && matches!(editor.target, ExternalEditorTarget::Extension(_))
+        && event.is_none_or(|event| editor.cancelled_by(event))
     {
-        return None;
+        editor.cancel();
+        editor.cancelled = true;
     }
-    let editor = running.as_mut()?;
-    editor.cancel();
-    editor.cancelled = true;
-    #[cfg(unix)]
-    if editor
-        ._terminal_state
-        .as_ref()
-        .is_some_and(|tty| matches!(tty.foreground(), Ok(false)))
-    {
-        // Keep the terminal guard until the shell foregrounds this job.
-        return None;
-    }
-    let editor = running.take()?;
-    let target = editor.target;
-    drop(editor);
-    Some(target)
 }
 
 fn open_external_editor(
@@ -9072,10 +9162,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let id = uuid::Uuid::new_v4();
-        let mut editor = super::RunningExternalEditor::start(
+        let mut editor = super::RunningExternalEditor::start_with_terminal(
             program.to_str().unwrap(),
             "draft",
             super::ExternalEditorTarget::Extension(id),
+            None,
         )
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -9104,30 +9195,25 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\nexec sleep 30\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let id = uuid::Uuid::new_v4();
-        let editor = super::RunningExternalEditor::start(
+        let editor = super::RunningExternalEditor::start_with_terminal(
             program.to_str().unwrap(),
             "draft",
             super::ExternalEditorTarget::Extension(id),
+            None,
         )
         .unwrap();
         let pid = editor.child.id() as libc::pid_t;
         let path = editor.file.path().to_owned();
         let mut running = Some(editor);
-        assert!(
-            super::cancel_running_extension_editor(
-                &mut running,
-                Some(
-                    &serde_json::json!({"type":"extension_ui_cancelled", "id":uuid::Uuid::new_v4()})
-                ),
-            )
-            .is_none()
+        super::cancel_running_extension_editor(
+            &mut running,
+            Some(&json!({"type":"extension_ui_cancelled", "id":uuid::Uuid::new_v4()})),
         );
-        assert!(running.is_some());
-        assert_eq!(
-            super::cancel_running_extension_editor(&mut running, None),
-            Some(super::ExternalEditorTarget::Extension(id))
-        );
-        assert!(running.is_none());
+        assert!(!running.as_ref().unwrap().cancelled);
+        super::cancel_running_extension_editor(&mut running, None);
+        assert!(running.as_ref().unwrap().cancelled);
+        assert!(running.as_mut().unwrap().poll().unwrap().is_some());
+        drop(running.take());
         assert!(!path.exists());
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(
@@ -9142,8 +9228,8 @@ mod tests {
         )
         .unwrap();
         let mut running = Some(main);
-        assert!(super::cancel_running_extension_editor(&mut running, None).is_none());
-        assert!(running.is_some());
+        super::cancel_running_extension_editor(&mut running, None);
+        assert!(!running.as_ref().unwrap().cancelled);
     }
 
     #[test]

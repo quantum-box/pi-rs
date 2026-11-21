@@ -88,8 +88,11 @@ impl Dialog {
     pub fn external_editor_text(&self) -> &str {
         &self.editor.text
     }
-    pub fn external_editor_requested(&self, key: KeyEvent, keys: &Keys) -> bool {
+    pub fn supports_external_editor(&self) -> bool {
         matches!(self.request, UiRequest::Editor { .. })
+    }
+    pub fn external_editor_requested(&self, key: KeyEvent, keys: &Keys) -> bool {
+        self.supports_external_editor()
             && !keys.matches("tui.select.cancel", key)
             && keys.matches("app.editor.external", key)
     }
