@@ -36,6 +36,8 @@ pub enum Selection {
     LoginKimi,
     LoginMeta,
     LoginXai,
+    LoginCodex,
+    LoginCodexDevice,
     LoginChatGpt,
     LoginChatGptNew,
     LoginChatGptAccount(String),

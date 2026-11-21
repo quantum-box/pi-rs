@@ -583,6 +583,7 @@ impl ModelMetadata {
             Adapter::ChatCompletions
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
+                | Adapter::CodexResponses
                 | Adapter::Google
                 | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
@@ -1110,7 +1111,7 @@ impl Profiles {
     ) -> bool {
         self.chat_compatibility(provider, model)
             .supports_strict_mode()
-            .unwrap_or_else(|| provider.id() == "openai-chatgpt")
+            .unwrap_or_else(|| matches!(provider.id(), "openai-chatgpt" | "openai-codex"))
     }
 
     fn cache_compatibility(
@@ -1320,7 +1321,10 @@ impl Profiles {
         };
         if !matches!(
             adapter,
-            Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
+            Adapter::Anthropic
+                | Adapter::ChatCompletions
+                | Adapter::OpenAiResponses
+                | Adapter::CodexResponses
         ) || provider.id() == "openai-chatgpt"
         {
             return routing;
@@ -1357,7 +1361,9 @@ impl Profiles {
         let send = model_compat
             .and_then(|compat| compat.send_session_affinity_headers)
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
-            .unwrap_or(openrouter || adapter == Adapter::OpenAiResponses);
+            .unwrap_or(
+                openrouter || matches!(adapter, Adapter::OpenAiResponses | Adapter::CodexResponses),
+            );
         if !send {
             return routing;
         }
@@ -1390,10 +1396,13 @@ impl Profiles {
                 "x-session-affinity",
             ],
             (_, AffinityFormat::Openrouter) => &["x-session-id"],
-            (Adapter::OpenAiResponses, AffinityFormat::Openai) => {
+            (Adapter::OpenAiResponses | Adapter::CodexResponses, AffinityFormat::Openai) => {
                 &["session-id", "x-client-request-id"]
             }
-            (Adapter::OpenAiResponses, AffinityFormat::OpenaiNosession) => &["x-client-request-id"],
+            (
+                Adapter::OpenAiResponses | Adapter::CodexResponses,
+                AffinityFormat::OpenaiNosession,
+            ) => &["x-client-request-id"],
             (Adapter::Anthropic, _) => &["x-session-affinity"],
             (_, AffinityFormat::Openai) => {
                 &["session_id", "x-client-request-id", "x-session-affinity"]
@@ -1483,6 +1492,18 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
     }
 
     let suffix = match adapter {
+        Adapter::CodexResponses => {
+            let path = url.path().trim_end_matches('/');
+            let normalized = if path.ends_with("/codex/responses") || path.ends_with("/responses") {
+                path.to_owned()
+            } else if path.ends_with("/codex") {
+                format!("{path}/responses")
+            } else {
+                format!("{path}/codex/responses")
+            };
+            url.set_path(&normalized);
+            return Ok(url.to_string());
+        }
         Adapter::ChatCompletions => "/chat/completions",
         Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",

@@ -16,6 +16,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    Codex,
     AnthropicOAuth,
     Kimi,
     Meta,
@@ -54,6 +55,7 @@ impl Credential {
             | Self::StoredCommand(_)
             | Self::Invalid
             | Self::ChatGpt
+            | Self::Codex
             | Self::AnthropicOAuth
             | Self::Kimi
             | Self::Meta
@@ -79,6 +81,7 @@ impl Credential {
             || matches!(
                 self,
                 Self::ChatGpt
+                    | Self::Codex
                     | Self::AnthropicOAuth
                     | Self::Kimi
                     | Self::Meta
@@ -108,6 +111,16 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::Codex => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::codex_auth::access(
+                    &config::agent_dir().join("auth.json"),
+                    &settings,
+                    std::time::Duration::ZERO,
+                    false,
+                )
+                .await;
             }
             Self::AnthropicOAuth => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -204,12 +217,14 @@ impl Keys {
                 }
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
+                let codex = name.eq_ignore_ascii_case("openai-codex") && entry["type"] == "oauth";
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
                 let meta = name.eq_ignore_ascii_case("meta") && entry["type"] == "oauth";
                 let xai = name.eq_ignore_ascii_case("xai") && entry["type"] == "oauth";
                 let anthropic = name.eq_ignore_ascii_case("anthropic") && entry["type"] == "oauth";
                 let oauth = (name.eq_ignore_ascii_case("openrouter")
                     || chatgpt
+                    || codex
                     || kimi
                     || meta
                     || xai
@@ -221,6 +236,8 @@ impl Keys {
                     )
                     .ok()?;
                     Some(Credential::ChatGpt)
+                } else if codex {
+                    super::codex_auth::valid_entry(entry).then_some(Credential::Codex)
                 } else if anthropic {
                     let valid =
                         serde_json::from_value::<super::anthropic_auth::Credential>(entry.clone())
@@ -314,6 +331,7 @@ impl Keys {
                 };
                 if oauth
                     && !chatgpt
+                    && !codex
                     && !anthropic
                     && super::builtin_chat::find(if kimi {
                         "kimi-coding"
@@ -326,6 +344,9 @@ impl Keys {
                     })
                     .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
+                    return None;
+                }
+                if codex && endpoint != Some(pi_rs::openai::CODEX_ENDPOINT) {
                     return None;
                 }
                 if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {

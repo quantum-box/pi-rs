@@ -25,6 +25,7 @@ pub(crate) fn replacement_replay(
         ModelApi::AnthropicMessages
             | ModelApi::GoogleGenerativeAi
             | ModelApi::OpenaiResponses
+            | ModelApi::OpenaiCodexResponses
             | ModelApi::OpenaiCompletions
     ) {
         let identity = metadata.replay_identity.clone()?;
@@ -138,7 +139,7 @@ pub(crate) fn replacement_replay(
                 Some(json!({"role":"assistant","content":text}))
             }
             (
-                ModelApi::OpenaiResponses,
+                ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses,
                 ContentBlock::Thinking {
                     thinking_signature, ..
                 },
@@ -189,7 +190,7 @@ pub(crate) fn replacement_replay(
                     }
                     Some(part)
                 }
-                ModelApi::OpenaiResponses => Some(
+                ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses => Some(
                     json!({"type":"function_call","call_id":id,"name":name,"arguments":arguments.to_string()}),
                 ),
                 _ => None,

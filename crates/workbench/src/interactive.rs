@@ -3455,6 +3455,15 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login"
+            if rest.eq_ignore_ascii_case("openai-codex")
+                || rest.eq_ignore_ascii_case("openai-codex browser") =>
+        {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -3487,6 +3496,20 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Browser authorization".into(),
+                            selection: Selection::LoginCodex,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Device authorization".into(),
+                            selection: Selection::LoginCodexDevice,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -6495,6 +6518,37 @@ fn take_device_code_action(
     view.remote_task.as_mut()?.device_code.take()
 }
 
+fn start_codex_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::codex_auth::Method,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to OpenAI Codex",
+        "OpenAI Codex login cancelled",
+        move |sender| async move {
+            super::codex_auth::login(&settings, task_control, method, |url, code| {
+                let event = match code {
+                    Some(code) => RemoteEvent::DeviceCode {
+                        url: url.to_owned(),
+                        code: code.to_owned(),
+                    },
+                    None => RemoteEvent::Notice(format!("Continue in your browser: {url}")),
+                };
+                let _ = sender.send(event);
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenAI Codex".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -6645,6 +6699,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to OpenAI Codex" {
+            "OpenAI Codex sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
             "Anthropic sign-in is completing; waiting for the result"
         } else {
@@ -7610,6 +7666,12 @@ fn select(
                 },
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
+        }
+        Selection::LoginCodex => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        Selection::LoginCodexDevice => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
