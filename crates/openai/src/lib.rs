@@ -1058,9 +1058,6 @@ fn limit_visible_output(
                         .saturating_add(units(&delta.name))
                         .saturating_add(units(&delta.arguments));
                 }
-                Legacy(ModelEvent::Complete { usage: Some(usage), .. }) if usage.output_tokens > limit => {
-                    Err(Error::Budget)?;
-                }
                 _ => {}
             }
             if visible_units.div_ceil(4) > limit {
@@ -1434,6 +1431,28 @@ mod tests {
         assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
         assert!(matches!(stream.next().await, Some(Ok(TextEnd { .. }))));
         assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let completion = pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+            calls: vec![],
+            usage: Some(Usage {
+                input_tokens: 1,
+                output_tokens: 32,
+            }),
+        });
+        let mut stream =
+            limit_visible_output(Box::pin(futures_util::stream::iter([Ok(completion)])), 2);
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    usage: Some(Usage {
+                        output_tokens: 32,
+                        ..
+                    }),
+                    ..
+                }
+            )))
+        ));
     }
 
     #[tokio::test]
