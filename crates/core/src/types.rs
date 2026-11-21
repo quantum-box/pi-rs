@@ -517,6 +517,9 @@ pub struct ModelMetadata {
     pub cost_breakdown: Option<UsageCostBreakdown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_from_provider: Option<bool>,
+    /// Service tier multiplier applied to catalog estimates for this reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_cost_multiplier: Option<serde_json::Number>,
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
