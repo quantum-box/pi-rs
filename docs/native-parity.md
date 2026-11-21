@@ -1008,6 +1008,11 @@ Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
 were absent from captured CLI output.
 
+As in Pi 1.6.0, HTTP 404 on a tool request carrying an MCP session ID triggers
+one new handshake and one retry. Loopback checks cover reusing the original
+arguments and native operation ID, stopping after a second 404, and sending
+only one tool request on HTTP 503.
+
 For servers implementing the 2026-07-28 protocol, set
 `"protocolVersion": "2026-07-28"` on the server entry in `mcp.json` to use
 `server/discover` and subscribe to tool catalog changes. Legacy stdio servers
