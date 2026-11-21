@@ -925,7 +925,6 @@ configuration as a whole, preserving pi-rs's existing override validation.
 Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
 reports do not expose configured credentials through connection errors.
-Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
 
 `pi mcp login NAME` uses the effective HTTP server and OAuth settings from
 the user configuration and the trusted project. `--local` requires a full
