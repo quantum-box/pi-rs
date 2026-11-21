@@ -1,5 +1,5 @@
 //! Terminal presentation over the same journaled CLI used by automation.
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1037,6 +1037,12 @@ struct StreamingTool {
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
+struct CustomMessageRenderPending {
+    request: uuid::Uuid,
+    record: u64,
+    options: pi_rs::CustomMessageRenderOptions,
+}
+
 #[derive(Default)]
 struct View {
     async_transitions: bool,
@@ -1052,6 +1058,10 @@ struct View {
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
+    custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
+    custom_render_attempted: BTreeSet<u64>,
+    custom_render_pending: Option<CustomMessageRenderPending>,
+    custom_render_redraw_at: Option<Instant>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
     thinking_settings: Option<ThinkingSettings>,
@@ -1423,11 +1433,15 @@ impl View {
         self.lines.push(entry);
         if self.lines.len() > 4000 {
             let removed = self.lines.len() - 4000;
-            self.lines.drain(..removed);
+            for entry in self.lines.drain(..removed) {
+                if let Entry::CustomMessage { id, .. } = entry {
+                    self.custom_render_attempted.remove(&id);
+                }
+            }
             self.regular.committed = self.regular.committed.saturating_sub(removed);
         }
     }
-    fn show_custom_message(&mut self, message: &pi_rs::CustomMessage) {
+    fn show_custom_message(&mut self, id: u64, message: &pi_rs::CustomMessage) {
         if !message.display {
             return;
         }
@@ -1451,6 +1465,8 @@ impl View {
             }
         }
         self.append_entry(Entry::CustomMessage {
+            id,
+            rendered: None,
             custom_type: message.custom_type.clone(),
             text: text.join("\n"),
         });
@@ -1458,6 +1474,103 @@ impl View {
             self.add_images(&images);
         }
     }
+    fn invalidate_custom_message_renderings(&mut self) -> bool {
+        self.custom_render_attempted.clear();
+        self.custom_render_redraw_at = None;
+        let mut redrawn = false;
+        for (index, entry) in self.lines.iter_mut().enumerate() {
+            if let Entry::CustomMessage { rendered, .. } = entry
+                && rendered.take().is_some()
+            {
+                self.regular.redraw |= index < self.regular.committed;
+                redrawn = true;
+            }
+        }
+        redrawn
+    }
+
+    fn prepare_custom_message_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
+        if worker.message_renderer_types.is_empty() {
+            return false;
+        }
+        let options = pi_rs::CustomMessageRenderOptions {
+            expanded: self.expand_tools,
+            output_pad: args.settings.output_padding(),
+            expand_key: self
+                .expand_key
+                .map(|key| crate::ui::keys::binding_hint(Some(key))),
+        };
+        let mut changed = false;
+        if self.custom_render_options.as_ref() != Some(&options) {
+            self.custom_render_options = Some(options.clone());
+            changed = self.invalidate_custom_message_renderings();
+        }
+        if self.custom_render_pending.is_some() {
+            return changed;
+        }
+        let candidate = self.lines.iter().rev().find_map(|entry| match entry {
+            Entry::CustomMessage {
+                id, custom_type, ..
+            } if worker.message_renderer_types.contains(custom_type)
+                && !self.custom_render_attempted.contains(id) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        });
+        if let Some(record) = candidate {
+            self.custom_render_attempted.insert(record);
+            let request = uuid::Uuid::new_v4();
+            if worker.send(json!({
+                "type":"render_custom_message","id":request,"record_id":record,"options":options,
+            })).is_ok() {
+                self.custom_render_pending = Some(CustomMessageRenderPending {
+                    request,
+                    record,
+                    options,
+                });
+            }
+        }
+        changed
+    }
+
+    fn receive_custom_message_render(&mut self, event: Value) -> bool {
+        let Some(pending) = self.custom_render_pending.as_ref() else {
+            return false;
+        };
+        if event["id"] != json!(pending.request) {
+            return false;
+        }
+        let pending = self
+            .custom_render_pending
+            .take()
+            .expect("matching render request");
+        if self.custom_render_options.as_ref() != Some(&pending.options)
+            || !self.custom_render_attempted.contains(&pending.record)
+            || event["rendered"].is_null()
+        {
+            return false;
+        }
+        let Ok(rendering) =
+            serde_json::from_value::<pi_rs::RenderedCustomMessage>(event["rendered"].clone())
+        else {
+            return false;
+        };
+        for (index, entry) in self.lines.iter_mut().enumerate().rev() {
+            if let Entry::CustomMessage { id, rendered, .. } = entry
+                && *id == pending.record
+            {
+                *rendered = Some(rendering);
+                if index < self.regular.committed {
+                    self.custom_render_redraw_at
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
         if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
             && args.settings.boolean("showCacheMissNotices") == Some(true)
@@ -1655,7 +1768,7 @@ impl View {
             if let pi_rs::Event::CustomMessage { message }
             | pi_rs::Event::CustomMessageDelivered { message, .. } = &record.event
             {
-                self.show_custom_message(message);
+                self.show_custom_message(record.id, message);
             }
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
@@ -1690,6 +1803,10 @@ impl View {
         self.regular.committed = 0;
         self.regular.redraw = true;
         self.lines.clear();
+        self.custom_render_redraw_at = None;
+        // Keep an in-flight request as the only one until its response. The
+        // cleared attempted set prevents it from updating the restored rows.
+        self.custom_render_attempted.clear();
         self.viewport.follow();
         self.search = None;
         self.mouse.clear();
@@ -1747,7 +1864,7 @@ impl View {
             match &record.event {
                 pi_rs::Event::CustomMessage { message }
                 | pi_rs::Event::CustomMessageDelivered { message, .. } => {
-                    self.show_custom_message(message)
+                    self.show_custom_message(record.id, message)
                 }
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
@@ -2624,8 +2741,8 @@ impl View {
                 .as_ref()
                 .map_or(String::new(), |(message, _)| format!("{message} ")),
         );
-        self.graphics.clear_placements(&mut out)?;
-        queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+        queue!(out, Hide)?;
+        self.graphics.clear_fullscreen_frame(&mut out)?;
         if header_rows != 0 {
             Line::themed(
                 &format!(
@@ -2960,16 +3077,25 @@ impl View {
         let render_entry = |entry: &Entry| {
             entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let committing = !busy && !modal;
+        // A trailing cycle notice can still be replaced by another cycle.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
+        let commit_end = if committing {
+            (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
+        } else {
+            self.regular.committed
+        };
         let pending = || {
-            self.lines[self.regular.committed..]
+            self.lines[self.regular.committed..commit_end]
                 .iter()
                 .flat_map(render_entry)
         };
-        let modal = self.picker.is_some() || self.dialog().is_some();
-        let committing = !busy && !modal;
-        let mut active = Vec::new();
+        let mut active: Vec<_> = self.lines[commit_end..]
+            .iter()
+            .flat_map(render_entry)
+            .collect();
         if !committing {
-            active.extend(pending());
             active.extend(
                 Entry::Thinking {
                     text: self.thinking.clone(),
@@ -3037,13 +3163,7 @@ impl View {
             synchronized_updates_supported(),
         )?;
         if redraw {
-            self.graphics.clear_placements(&mut out)?;
-            queue!(
-                out,
-                Clear(ClearType::All),
-                MoveTo(0, 0),
-                Clear(ClearType::Purge)
-            )?;
+            self.graphics.purge_regular_transcript(&mut out)?;
         }
         if !redraw {
             self.graphics.clear_active(&mut out)?;
@@ -3088,7 +3208,7 @@ impl View {
                 queue!(out, Print("\r\n"))?;
                 self.regular.committed_rows += 1;
             }
-            self.regular.committed = self.lines.len();
+            self.regular.committed = commit_end;
         }
         let total_rows = self.regular.committed_rows + region_height;
         self.regular.max_rows = if redraw {
@@ -3497,6 +3617,13 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
+            start_copilot_login(view, &args.settings)
+        }
+        "/login" if rest.eq_ignore_ascii_case("github-copilot api-key") => edit_provider_key(
+            super::Provider::named("github-copilot").expect("built-in Copilot provider"),
+            view,
+        ),
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -3529,6 +3656,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "github-copilot · Subscription OAuth".into(),
+                            selection: Selection::LoginCopilot,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -3793,7 +3927,7 @@ fn slash(
                 json!({"type":"compact","summary":null,"keep_turns":1,"use_token_settings":true,"instructions":rest}),
             )
         }
-        "/mcp" => view.pending_request = Some(json!({"type":"mcp_status"})),
+        "/mcp" => view.pending_request = Some(json!({"type":"mcp_status","inspect":true})),
         "/trust" => {
             view.picker = Some(Picker::new(
                 "Load project configuration?",
@@ -4403,6 +4537,11 @@ pub(super) async fn run(
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
             && let Some(mut old) = worker.take()
         {
+            if !old.message_renderer_types.is_empty() {
+                startup_extensions = None;
+                view.custom_render_pending = None;
+                dirty |= view.invalidate_custom_message_renderings();
+            }
             for warning in old.take_pending_warnings() {
                 view.append(&warning);
                 dirty = true;
@@ -4565,6 +4704,17 @@ pub(super) async fn run(
             }
             let events: Vec<_> = active.drain_events();
             for value in events {
+                if value["type"] == "backend_ready" {
+                    active.message_renderer_types =
+                        serde_json::from_value(value["custom_message_renderers"].clone())
+                            .unwrap_or_default();
+                    view.custom_render_pending = None;
+                    dirty |= view.invalidate_custom_message_renderings();
+                }
+                if value["type"] == "custom_message_rendered" {
+                    dirty |= view.receive_custom_message_render(value);
+                    continue;
+                }
                 if value["type"] == "response" && value["command"] == "get_share_context" {
                     if let Some((pending, snapshot)) = view.take_share_response(&value) {
                         start_share_upload(&mut view, pending, snapshot);
@@ -4672,8 +4822,11 @@ pub(super) async fn run(
                 }
                 dirty = true;
             }
+            dirty |= view.prepare_custom_message_render(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
+                view.custom_render_pending = None;
+                view.invalidate_custom_message_renderings();
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
@@ -4705,6 +4858,14 @@ pub(super) async fn run(
                 view.shell_running = false;
                 dirty = true;
             }
+        }
+        if view
+            .custom_render_redraw_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            view.custom_render_redraw_at = None;
+            view.regular.redraw = true;
+            dirty = true;
         }
         if view.dialogs.is_empty()
             && view
@@ -6379,17 +6540,38 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         args.model_scope.as_slice()
     };
-    if let Some(choice) = next_model(args, choices, reverse) {
+    let status = if let Some(choice) = next_model(args, choices, reverse) {
         args.change_model(
             choice.provider,
             choice.model,
             choice.thinking,
             pi_rs::ModelSelectSource::Cycle,
         )?;
+        let name = args
+            .model_profiles
+            .model(&args.provider, &args.model)
+            .and_then(|model| model.name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| args.model.clone());
+        let mut status = format!("Switched to {name}");
+        if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
+            && super::thinking::adopted_reasoning(args) == Some(true)
+        {
+            status.push_str(&format!(" (thinking: {level})"));
+        }
+        status
     } else if args.model_scope.is_empty() {
-        view.append("Only one model available");
+        "Only one model available".into()
     } else {
-        view.append("Only one model in scope");
+        "Only one model in scope".into()
+    };
+    // A normal terminal has already printed committed rows to its scrollback.
+    if (args.tui_mode != Some(TuiMode::Regular) || view.regular.committed < view.lines.len())
+        && let Some(Entry::ModelCycleStatus(previous)) = view.lines.last_mut()
+    {
+        *previous = status;
+    } else {
+        view.append_entry(Entry::ModelCycleStatus(status));
     }
     Ok(())
 }
@@ -6502,6 +6684,29 @@ fn take_device_code_action(
         return None;
     }
     view.remote_task.as_mut()?.device_code.take()
+}
+
+fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to GitHub Copilot",
+        "GitHub Copilot login cancelled",
+        move |sender| async move {
+            super::copilot_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::DeviceCode {
+                    url: url.to_string(),
+                    code: code.to_owned(),
+                });
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to GitHub Copilot".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
 }
 
 fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
@@ -6654,6 +6859,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to GitHub Copilot" {
+            "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
             "Anthropic sign-in is completing; waiting for the result"
         } else {
@@ -7620,6 +7827,7 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
@@ -11303,6 +11511,58 @@ exit {exit}
     }
 
     #[test]
+    fn custom_message_render_responses_follow_transcript_and_expansion_state() {
+        let mut view = super::View::default();
+        let message = pi_rs::CustomMessage {
+            custom_type: "card".into(),
+            content: pi_rs::ContextContent::Text("fallback".into()),
+            display: true,
+            details: None,
+        };
+        view.show_custom_message(14, &message);
+        view.regular.committed = 1;
+        let collapsed = pi_rs::CustomMessageRenderOptions::default();
+        let expanded = pi_rs::CustomMessageRenderOptions {
+            expanded: true,
+            ..Default::default()
+        };
+        let old_request = uuid::Uuid::new_v4();
+        view.custom_render_options = Some(expanded.clone());
+        view.custom_render_attempted.insert(14);
+        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+            request: old_request,
+            record: 14,
+            options: collapsed,
+        });
+        let rendered = serde_json::json!({"lines":[[{"text":"details"}]]});
+        assert!(!view.receive_custom_message_render(serde_json::json!({
+            "id":old_request,"rendered":rendered
+        })));
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::CustomMessage { rendered: None, .. }
+        ));
+
+        let active_request = uuid::Uuid::new_v4();
+        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+            request: active_request,
+            record: 14,
+            options: expanded,
+        });
+        assert!(view.receive_custom_message_render(serde_json::json!({
+            "id":active_request,"rendered":rendered
+        })));
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::CustomMessage {
+                rendered: Some(_),
+                ..
+            }
+        ));
+        assert!(view.custom_render_redraw_at.is_some());
+    }
+
+    #[test]
     fn custom_message_display_flag_controls_terminal_visibility() {
         let mut view = super::View::default();
         let mut message = pi_rs::CustomMessage {
@@ -11311,12 +11571,12 @@ exit {exit}
             display: false,
             details: Some(serde_json::json!({"private": "metadata"})),
         };
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(view.lines.is_empty());
         message.display = true;
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(
-            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "example" && text == "visible content")
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "example" && text == "visible content")
         );
     }
 
@@ -11342,9 +11602,9 @@ exit {exit}
             display: true,
             details: Some(serde_json::json!({"secret": "not displayed"})),
         };
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(
-            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**first**\nsecond")
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**first**\nsecond")
         );
     }
 
@@ -11378,7 +11638,7 @@ exit {exit}
             &mut args,
         );
         assert!(
-            matches!(&live.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
+            matches!(&live.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
         );
         let mut session = pi_rs::Session::open(&args.session).unwrap();
         session.append_custom_message(message).unwrap();
@@ -11404,7 +11664,7 @@ exit {exit}
             .filter(|entry| matches!(entry, super::Entry::CustomMessage { .. }))
             .collect();
         assert!(
-            matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
+            matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
         );
     }
 
