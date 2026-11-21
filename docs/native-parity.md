@@ -1035,6 +1035,10 @@ Loopback RPC and PTY checks covered consent, decline, scope union, one retry,
 and credential generation changes. The existing OAuth and live catalog checks
 passed with the same implementation.
 
+Servers that return JSON-RPC Method not found for `resources/templates/list`
+produce an empty template list, including when a page cursor is supplied.
+Other template errors remain visible.
+
 ### Remote model read operations
 
 Native hosts can inject asynchronous `ReadOperations` through
@@ -2085,7 +2089,9 @@ zero, negative and fractional values. Local `find` reproduces fd's numeric
 argument parsing: zero means unlimited, while negative, fractional, and values
 outside fd's host-sized integer range produce fd-style errors before checking
 the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Notices and details retain the JavaScript numeric value. Scoped tools retain their positive
+without an added failure prefix. Generated local tool errors carry Pi's empty
+`details` object in JSON and RPC. Notices and details retain the JavaScript
+numeric value. Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
@@ -4478,6 +4484,21 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can subscribe to `after_provider_response` to observe the
+HTTP status and normalized headers from an agent turn. The OpenAI Responses,
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+await these callbacks in registration order before reading either a success or
+error body. This includes HTTP errors the native transports receive directly.
+Callback failures are reported as extension diagnostics. The
+callbacks share up to five seconds and at most half the remaining model time. The
+response remains under the adapter's control. Executable extensions advertise
+`after_provider_response_hook` and receive an `after_provider_response`
+request with `event.status`, `event.headers`, and their branch state. Response
+metadata is ephemeral. Credential headers, cookies, sensitive header values and
+reflected configured credentials are withheld. Bedrock and custom transports
+without response metadata reporting do not emit this event. Summary and catalog
+requests remain outside the turn hook.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and

@@ -191,6 +191,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    AfterProviderResponse {
+        event: pi_rs_core::ProviderResponseEvent,
+        state: Option<ExtensionState>,
+    },
     AgentBeforeSettle {
         event: pi_rs_core::AgentBeforeSettle,
         state: Option<ExtensionState>,
@@ -414,6 +418,8 @@ struct Description {
     ui_prompt_lifecycle_hook: bool,
     #[serde(default)]
     model_selection_hook: bool,
+    #[serde(default)]
+    after_provider_response_hook: bool,
     #[serde(default)]
     session_lifecycle_hook: bool,
     #[serde(default)]
@@ -1087,6 +1093,23 @@ impl Extension for ExecutableExtension {
         tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
             .await
             .map_err(|error| error.to_string())?
+    }
+    fn handles_after_provider_response(&self) -> bool {
+        self.description.after_provider_response_hook
+    }
+    async fn after_provider_response(
+        &self,
+        event: &pi_rs_core::ProviderResponseEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if !self.handles_after_provider_response() {
+            return Ok(());
+        }
+        self.request_async(ProtocolRequest::AfterProviderResponse {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
     }
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
@@ -3665,6 +3688,7 @@ async fn dispatch_inner(
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
             ui_prompt_lifecycle_hook: extension.handles_ui_prompt_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
+            after_provider_response_hook: extension.handles_after_provider_response(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
             pi_lifecycle_fields: true,
@@ -3810,6 +3834,11 @@ async fn dispatch_inner(
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
         }
+        ProtocolRequest::AfterProviderResponse { event, state } => encode(
+            extension
+                .after_provider_response(&event, state.as_ref())
+                .await,
+        ),
         ProtocolRequest::AgentBeforeSettle { event, state } => {
             encode(extension.agent_before_settle(&event, state.as_ref()).await)
         }
@@ -4499,6 +4528,49 @@ mod tests {
                 }),
             }))
         }
+    }
+
+    #[tokio::test]
+    async fn provider_response_hook_negotiates_and_dispatches_read_only_metadata() {
+        struct Observe;
+        #[async_trait::async_trait]
+        impl Extension for Observe {
+            fn id(&self) -> &str {
+                "response"
+            }
+            fn handles_after_provider_response(&self) -> bool {
+                true
+            }
+            async fn after_provider_response(
+                &self,
+                event: &pi_rs_core::ProviderResponseEvent,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(event.status, 429);
+                assert_eq!(event.headers["retry-after"], "3");
+                assert_eq!(
+                    state,
+                    Some(&ExtensionState {
+                        version: 1,
+                        data: serde_json::json!({"seen": 1})
+                    })
+                );
+                Ok(())
+            }
+        }
+
+        let fixture: Arc<dyn Extension> = Arc::new(Observe);
+        let descriptor = dispatch(fixture.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(descriptor["after_provider_response_hook"], true);
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "after_provider_response",
+            "event": {"status": 429, "headers": {"retry-after": "3"}},
+            "state": {"version": 1, "data": {"seen": 1}}
+        }))
+        .unwrap();
+        assert_eq!(dispatch(fixture, request).await.unwrap(), Value::Null);
     }
 
     #[tokio::test]
