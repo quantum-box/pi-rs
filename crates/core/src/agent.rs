@@ -255,7 +255,7 @@ pub enum Notification<'a> {
     Reasoning(&'a str),
     /// Transient tool call fragments. Tool dispatch uses only the completed response.
     ToolCallDelta(&'a crate::ToolCallDelta),
-    /// A transient partial result from a running tool.
+    /// A transient tool update, or a start when the host enables tool attempts.
     ToolProgress(&'a crate::LifecycleEvent),
     /// A non-fatal failure in an observing extension hook.
     ExtensionLifecycleError {
@@ -3111,6 +3111,15 @@ impl Agent<'_> {
         let mut reasoning_item_ids = HashSet::new();
         let mut observed_reasoning = std::collections::HashMap::<u64, String>::new();
         let mut reasoning_final_bytes = 0_usize;
+        let response_hooks = retain_reply
+            .then(|| {
+                crate::provider_response::ResponseHooks::for_session(
+                    self.registry,
+                    session,
+                    self.limits.model_timeout,
+                )
+            })
+            .flatten();
         let collect = async {
             let session_id = session.session_id();
             let external_id = session.external_session_id();
@@ -3132,6 +3141,8 @@ impl Agent<'_> {
                         .await
                 }
             };
+            let opening =
+                crate::provider_response::ResponseHooks::scope(response_hooks.clone(), opening);
             tokio::pin!(opening);
             let mut stream = loop {
                 tokio::select! {
@@ -3141,7 +3152,7 @@ impl Agent<'_> {
             };
             loop {
                 let event = tokio::select! {
-                    event = stream.next() => event,
+                    event = crate::provider_response::ResponseHooks::scope(response_hooks.clone(), stream.next()) => event,
                     Some(input) = receive_input(&mut inputs) => {
                         queue_input(session, input.into(), observer)?;
                         continue;
@@ -3360,6 +3371,9 @@ impl Agent<'_> {
             result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
+        if let Some(hooks) = response_hooks {
+            hooks.report_errors(observer);
+        }
         let content = if result.is_ok() {
             String::new()
         } else {
@@ -6852,11 +6866,29 @@ fn branch_excerpt(entry: Message) -> String {
 }
 
 thread_local! {
+    static TOOL_ATTEMPT_OPERATION_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
     static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
     static REASONING_EVENT_METADATA: std::cell::RefCell<Vec<ReasoningEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
     static REDACTED_REASONING_START: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Operation identity for the tool attempt being delivered to this observer.
+#[doc(hidden)]
+pub fn tool_attempt_operation_id() -> Option<Uuid> {
+    TOOL_ATTEMPT_OPERATION_ID.get()
+}
+
+fn with_tool_attempt<T>(id: Uuid, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Uuid>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TOOL_ATTEMPT_OPERATION_ID.set(self.0);
+        }
+    }
+    let _restore = Restore(TOOL_ATTEMPT_OPERATION_ID.replace(Some(id)));
+    f()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

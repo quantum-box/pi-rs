@@ -16,6 +16,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    Codex,
     Copilot,
     AnthropicOAuth,
     Kimi,
@@ -55,6 +56,7 @@ impl Credential {
             | Self::StoredCommand(_)
             | Self::Invalid
             | Self::ChatGpt
+            | Self::Codex
             | Self::Copilot
             | Self::AnthropicOAuth
             | Self::Kimi
@@ -81,6 +83,7 @@ impl Credential {
             || matches!(
                 self,
                 Self::ChatGpt
+                    | Self::Codex
                     | Self::Copilot
                     | Self::AnthropicOAuth
                     | Self::Kimi
@@ -111,6 +114,16 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::Codex => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::codex_auth::access(
+                    &config::agent_dir().join("auth.json"),
+                    &settings,
+                    std::time::Duration::ZERO,
+                    false,
+                )
+                .await;
             }
             Self::Copilot => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -212,6 +225,7 @@ impl Keys {
                 }
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
+                let codex = name.eq_ignore_ascii_case("openai-codex") && entry["type"] == "oauth";
                 let copilot =
                     name.eq_ignore_ascii_case("github-copilot") && entry["type"] == "oauth";
                 let copilot_credential = copilot
@@ -224,6 +238,7 @@ impl Keys {
                 let anthropic = name.eq_ignore_ascii_case("anthropic") && entry["type"] == "oauth";
                 let oauth = (name.eq_ignore_ascii_case("openrouter")
                     || chatgpt
+                    || codex
                     || copilot
                     || kimi
                     || meta
@@ -233,6 +248,8 @@ impl Keys {
                 let key = if chatgpt {
                     super::chatgpt_auth::decode_entry(entry).ok()?;
                     Some(Credential::ChatGpt)
+                } else if codex {
+                    super::codex_auth::valid_entry(entry).then_some(Credential::Codex)
                 } else if copilot {
                     Some(Credential::Copilot)
                 } else if anthropic {
@@ -319,6 +336,7 @@ impl Keys {
                     }
                 };
                 let endpoint = match entry.get("endpoint") {
+                    None if name.eq_ignore_ascii_case("cloudflare-workers-ai") => None,
                     None => Provider::named(name)
                         .map(|provider| provider.default_endpoint())
                         .or_else(|| {
@@ -328,6 +346,7 @@ impl Keys {
                 };
                 if oauth
                     && !chatgpt
+                    && !codex
                     && !anthropic
                     && super::builtin_chat::find(if kimi {
                         "kimi-coding"
@@ -344,7 +363,9 @@ impl Keys {
                 {
                     return None;
                 }
-                if chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT) {
+                if (codex && endpoint != Some(pi_rs::openai::CODEX_ENDPOINT))
+                    || (chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT))
+                {
                     return None;
                 }
                 if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {
@@ -405,10 +426,32 @@ impl Keys {
         endpoint: &str,
         profiles: &super::model_profiles::Profiles,
     ) -> Option<&Credential> {
+        self.custom_entry(provider, endpoint, profiles)?
+            .key
+            .as_ref()
+    }
+
+    fn custom_entry(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+        profiles: &super::model_profiles::Profiles,
+    ) -> Option<&SavedKey> {
         let entry = self.entries.get(provider.id())?;
-        (entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint))
-            .then_some(entry.key.as_ref())
-            .flatten()
+        let cloudflare_match = provider.id() != "cloudflare-workers-ai"
+            || super::model_profiles::cloudflare_workers_chat_account(endpoint).is_some_and(
+                |account| {
+                    entry
+                        .env
+                        .as_ref()
+                        .is_none_or(|env| !env.contains_key("CLOUDFLARE_ACCOUNT_ID"))
+                        || self.cloudflare_chat_account() == Some(account)
+                },
+            );
+        (entry.endpoint.is_none()
+            && profiles.has_provider_endpoint(provider, endpoint)
+            && cloudflare_match)
+            .then_some(entry)
     }
 
     pub fn environment(
@@ -418,11 +461,7 @@ impl Keys {
         profiles: &super::model_profiles::Profiles,
     ) -> Option<&serde_json::Map<String, Value>> {
         self.entry_for(provider, endpoint)
-            .or_else(|| {
-                self.entries.get(provider.id()).filter(|entry| {
-                    entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint)
-                })
-            })?
+            .or_else(|| self.custom_entry(provider, endpoint, profiles))?
             .env
             .as_ref()
     }
@@ -463,27 +502,59 @@ impl Keys {
             .as_ref()
     }
 
-    // A scoped credential may supply an account only when that account
-    // reconstructs its own official operation endpoint.
-    pub(super) fn cloudflare_operation_account(&self) -> Option<&str> {
+    fn cloudflare_worker_account_entry(&self) -> Option<(&SavedKey, &str)> {
         let entry = self.entries.get("cloudflare-workers-ai")?;
         let account = entry.env.as_ref()?.get("CLOUDFLARE_ACCOUNT_ID")?.as_str()?;
-        if entry.official_routes {
+        super::operation_models::valid_cloudflare_account(account).then_some((entry, account))
+    }
+
+    fn cloudflare_saved_chat_account(&self) -> Option<&str> {
+        let entry = self.entries.get("cloudflare-workers-ai")?;
+        let account =
+            super::model_profiles::cloudflare_workers_chat_account(entry.endpoint.as_deref()?)?;
+        let configured = entry
+            .env
+            .as_ref()
+            .and_then(|env| env.get("CLOUDFLARE_ACCOUNT_ID"));
+        configured
+            .is_none_or(|value| value.as_str() == Some(account))
+            .then_some(account)
+    }
+
+    // A chat-scoped key also covers the classifier of the same account.
+    pub(super) fn cloudflare_operation_account(&self) -> Option<&str> {
+        if let Some(account) = self.cloudflare_saved_chat_account() {
             return Some(account);
         }
-        if !super::operation_models::valid_cloudflare_account(account) {
-            return None;
-        }
+        let (entry, account) = self.cloudflare_worker_account_entry()?;
         let expected = format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run");
-        entry
-            .endpoint
-            .as_deref()
-            .filter(|endpoint| same_operation_endpoint(endpoint, &expected))?;
-        Some(account)
+        (entry.official_routes
+            || entry
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| same_operation_endpoint(endpoint, &expected)))
+        .then_some(account)
+    }
+
+    pub(super) fn cloudflare_chat_account(&self) -> Option<&str> {
+        self.cloudflare_saved_chat_account().or_else(|| {
+            let (entry, account) = self.cloudflare_worker_account_entry()?;
+            entry.official_routes.then_some(account)
+        })
     }
 
     fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
+        if provider == "cloudflare-workers-ai" && official {
+            if entry.official_routes {
+                return Some(entry);
+            }
+            if let Some(account) = self.cloudflare_saved_chat_account() {
+                let expected =
+                    format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run");
+                return same_operation_endpoint(endpoint, &expected).then_some(entry);
+            }
+        }
         // The provider-key UI binds a Vercel key to its official chat route.
         // Pi uses that same key for the gateway's separate classifier route.
         let vercel_classifier = provider == "vercel-ai-gateway"

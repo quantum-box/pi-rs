@@ -1446,6 +1446,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to observing HTTP metadata before consuming a provider response body.
+    fn handles_after_provider_response(&self) -> bool {
+        false
+    }
+
+    async fn after_provider_response(
+        &self,
+        _event: &crate::ProviderResponseEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Opt in to model and thinking-level selection events.
     fn handles_model_selection(&self) -> bool {
         false
@@ -1933,6 +1946,7 @@ pub struct Registry {
     pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
     refresher: Option<Arc<dyn RegistryRefresher>>,
     pub(crate) omit_default_tool_timeout: bool,
+    pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
@@ -2297,6 +2311,12 @@ impl Registry {
     /// Explicitly configured host timeouts should leave this disabled.
     pub fn omit_default_tool_timeout(&mut self, omit: bool) {
         self.omit_default_tool_timeout = omit;
+    }
+
+    /// Publish transient tool starts before argument preparation. Enabled by
+    /// hosts that expose Pi's tool execution event stream.
+    pub fn publish_tool_attempts(&mut self, publish: bool) {
+        self.publish_tool_attempts = publish;
     }
     pub fn has_resource_discovery_hooks(&self) -> bool {
         self.extensions
@@ -2874,6 +2894,7 @@ impl Registry {
             ui: self.ui.clone(),
             refresher: None,
             omit_default_tool_timeout: self.omit_default_tool_timeout,
+            publish_tool_attempts: self.publish_tool_attempts,
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
         })

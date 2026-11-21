@@ -440,6 +440,7 @@ Live acceptance with an Ant Ling account remains open.
 
 ### OpenCode Zen and Go
 
+The pinned Pi CLI defaults to Kimi K2.6 for Zen and Kimi K3 for Go.
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
 
@@ -558,6 +559,10 @@ turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
 `toolcall_start` includes the ID and tool name available at that point.
+JSON and RPC emit `tool_execution_start` before preparation and authorization,
+including for rejected attempts. As in Pi, unparseable or non-object arguments
+appear as an empty object. The native `ToolStarted` journal record is reserved
+for dispatch.
 JSON and RPC `message_update` events include Pi's top-level `usage` object.
 Its counters start at zero and use the reported totals once the provider
 finishes. Providers that report usage incrementally in Pi can therefore expose
@@ -744,6 +749,10 @@ message details. Context edits replace the affected content in the snapshot.
 Imported Gemini conversations carry signed text, thought, and function parts
 into continued requests. Tests covered a live partial, a typed tool result,
 and a resumed signed Gemini tool conversation.
+
+Native tool failures and skipped calls projected from untyped outcomes include
+Pi's empty `details` object in result events and messages. Typed tool results
+retain the details supplied by the tool.
 
 ## Verification
 
@@ -1024,6 +1033,10 @@ discovery uses the scopes granted through `pi mcp login`.
 Loopback RPC and PTY checks covered consent, decline, scope union, one retry,
 and credential generation changes. The existing OAuth and live catalog checks
 passed with the same implementation.
+
+Servers that return JSON-RPC Method not found for `resources/templates/list`
+produce an empty template list, including when a page cursor is supplied.
+Other template errors remain visible.
 
 ### Remote model read operations
 
@@ -1600,7 +1613,14 @@ extensions and session names.
 
 MCP `deferred` exposure now hides tool schemas until `tool_search` loads a
 match. A native BM25 ranker uses names, descriptions, schema fields and server
-metadata. Selection state follows the journal branch and survives reopening.
+metadata. As in Pi 1.6.0, `tool_search` and Codemode `searchTools` index
+reachable local schema references once. `describeTool` follows local input
+schema references and bounds recursive and oversized declarations. Neither
+operation fetches external schemas. Native resolution also accepts RFC 6901
+array indices, empty keys and encoded separators. The declaration retains
+supported input types stated alongside a reference. A depth bound limits
+reference chains while allowing independent fields to reuse a definition.
+Selection state follows the journal branch and survives reopening.
 Exact exposure overrides and wildcard matching are supported. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
@@ -1682,8 +1702,9 @@ Classifier results include their API and invocation timestamp even if the
 request fails early or is cancelled, as they do on successful requests.
 
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
-`Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
-server-delay cap still applies to the parsed value. GMT retry dates also accept
+`Retry-After-Ms`, including decimal and exponent forms. Values that overflow
+when converted to milliseconds use the usual backoff. The 60-second
+server-delay cap applies to finite values. GMT retry dates also accept
 the obsolete RFC 850 form with JavaScript's two-digit year interpretation.
 
 ### Resource selection checkpoint
@@ -2052,11 +2073,17 @@ same saved notes reached both requests.
 
 ### Streaming search checkpoint
 
+Unrestricted local built-in tools coerce model arguments to their declared
+string, number and boolean types before schema validation. Optional null fields
+are treated as omissions, and edit batches also normalize replacement fields.
+Scoped tools and injected operations retain their argument handling.
+
 `grep` streams files with the native ripgrep libraries, supports surrounding
-context lines, bounds long displayed lines at 500 characters, and reports match
-and byte limits. Large text files remain searchable. Overlapping context ranges
-are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
-radius is limited to 1,000 lines.
+context lines, bounds long displayed lines at 500 UTF-16 units, and reports
+match and byte limits. The unrestricted local tool uses ripgrep's context
+events as in Pi 1.6.0. When the context exceeds the native searcher's 64 MiB
+buffer, it indexes matches on disk and streams the selected context from the
+same open file.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
 JSON numbers as JavaScript doubles. `ls` compares the number directly, including
@@ -2064,7 +2091,9 @@ zero, negative and fractional values. Local `find` reproduces fd's numeric
 argument parsing: zero means unlimited, while negative, fractional, and values
 outside fd's host-sized integer range produce fd-style errors before checking
 the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Notices and details retain the JavaScript numeric value. Scoped tools retain their positive
+without an added failure prefix. Generated local tool errors carry Pi's empty
+`details` object in JSON and RPC. Notices and details retain the JavaScript
+numeric value. Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
@@ -2391,7 +2420,10 @@ and theme changes apply immediately.
 The local settings editor remains open when an outstanding model response
 finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
-Remaining upstream settings and specialized selector behavior are still open.
+The terminal lists shared settings in Pi's order and uses Pi's labels and
+boolean values for those rows. Native controls and JSON editors remain
+available after the shared settings. The transport, changelog, installation
+telemetry and warnings controls are still open.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
 settings. When several values in a file are invalid, the diagnostic lists the
 settings file and affected JSON paths, including nested package fields and
@@ -2605,6 +2637,8 @@ theme roles. Native record IDs remain searchable for direct checkout. Custom
 messages and imported compaction summaries can be copied from the tree.
 Copying an imported assistant failure with empty content uses its original
 error message, including line breaks.
+The all-entries filter shows thinking-level changes as separate bookkeeping
+rows, including imported changes made before a model was selected.
 Message preview and navigation gaps remain in the Sessions row.
 
 ### Package identity checkpoint
@@ -3204,24 +3238,19 @@ Malformed `glob` filters report the original glob with ripgrep's diagnostic
 before regex compilation. Unrestricted local `grep` and `ls` report the
 requested path as missing when an intermediate component is a regular file.
 
-Grep now emits a separate context block for each match, including repeated lines
-where adjacent matches overlap. The matching marker belongs to that block's
-center; a neighboring match uses the context marker. Pending blocks flush at EOF,
-including the final empty line when the file ends with a newline. The streaming
-implementation retains a bounded context window and bounded output.
+Unrestricted local grep emits each matching or context line once, keeps
+embedded carriage returns, and stops at the last real line of each file.
+Numeric match limits are floored and clamped to at least one. The notice
+is reported only when another match exceeds that effective limit, including
+in a different file. An extra match within the last selected match's trailing
+context uses the context marker. Long lines use Pi's 500 UTF-16-unit cutoff
+without splitting a surrogate pair. Match counting continues after the 50 KB
+output limit, so byte and line totals cover all selected output.
+Scoped tools retain their existing per-match context blocks and line truncation.
 
-Long lines use Pi's 500 UTF-16-unit cutoff. A split surrogate is rendered as a
-replacement character in native UTF-8 text. Match counting continues after the
-50 KB output limit, so combined match, byte and long-line notices reflect the
-same selected matches as the reference. Notice wording also matches Pi.
-
-Regression tests cover overlapping blocks, the final selected match's context,
-EOF with and without a trailing newline, surrogate boundaries, and combined
-limits. Direct execution of the pinned Pi tool confirmed the context output and
-the 101-line, 51,098-byte combined-limit result. A loopback CLI test also verified
-that invoking the native grep tool delivers those per-match context blocks to
-the next model request. Workspace tests and all-target Clippy passed. Other local-tool differences,
-including structured result details and find traversal, remain open.
+Regressions cover overlapping context, the final selected match's context,
+exact and exceeded limits, CRLF and embedded CR, and surrogate boundaries.
+The published Pi 1.6.0 tool produced the same representative results.
 
 ### Find traversal and glob checkpoint
 
@@ -3697,9 +3726,10 @@ Workspace tests, the imported-details regression and all-target Clippy pass.
 ### Numbered edit diff checkpoint
 
 Native edit results preserve a numbered display diff alongside the unified
-patch. The display diff uses old-file numbers for deletions and context,
-new-file numbers for insertions, and four context lines on either side of a
-change. Omitted ranges appear as ellipses. The terminal prefers the numbered
+patch. Unified hunk headers use Pi's explicit line counts, including for a
+single line and zero-length ranges. The display diff uses old-file numbers for
+deletions and context, new-file numbers for insertions, and four context lines
+on either side of a change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
 and uses the existing word highlighting for single-line changes. Added, removed
 and context rows use the corresponding Pi theme roles. Numbered rows wrap at
@@ -4454,6 +4484,21 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can subscribe to `after_provider_response` to observe the
+HTTP status and normalized headers from an agent turn. The OpenAI Responses,
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+await these callbacks in registration order before reading either a success or
+error body. This includes HTTP errors the native transports receive directly.
+Callback failures are reported as extension diagnostics. The
+callbacks share up to five seconds and at most half the remaining model time. The
+response remains under the adapter's control. Executable extensions advertise
+`after_provider_response_hook` and receive an `after_provider_response`
+request with `event.status`, `event.headers`, and their branch state. Response
+metadata is ephemeral. Credential headers, cookies, sensitive header values and
+reflected configured credentials are withheld. Bedrock and custom transports
+without response metadata reporting do not emit this event. Summary and catalog
+requests remain outside the turn hook.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
@@ -4717,6 +4762,17 @@ total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
 
+### Cloudflare Workers AI chat checkpoint
+
+Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+`CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
+requests. Pi-format saved credentials may declare an account through their
+`env` field. A stored account scopes the key to that account's chat route.
+An unscoped saved key works only on official Workers AI routes. Credentials
+and headers inferred from classifier-only model URLs apply to those operations.
+When the inferred URL is on the configured official account, its provider
+credentials also apply to chat. Live Workers AI inference has not been verified.
+
 ### Configured llama.cpp classifiers
 
 A `models.json` provider can declare an entry with `"type": "classifier"` and
@@ -4801,6 +4857,24 @@ Baseten and NVIDIA's pinned chat-completions catalogs are also available,
 including model-specific compatibility, NVIDIA polling headers and Baseten's
 thinking template. Catalog entries that use other upstream APIs still need
 their own adapters.
+
+### OpenAI Codex
+
+`openai-codex` exposes the eight pinned models through the ChatGPT Codex
+Responses route. It supports native HTTP streaming, model-specific reasoning
+levels, image inputs, tool calls, and endpoint-bound response replay.
+`pi login openai-codex` uses browser PKCE, and `--device-code` selects
+device authorization. Browser sign-in also accepts a pasted code or redirect.
+The terminal offers both methods. Existing Pi Codex
+credentials can be read and refreshed in place. A refresh in flight saves
+rotated credentials even when the requesting turn is cancelled. They stay bound to the
+official Codex endpoint and are independent of native `openai-chatgpt` accounts.
+
+The native transport sends uncompressed JSON over HTTP SSE. The upstream
+WebSocket transport and specialized Codex
+grammar tools and tool search remain open. Authentication was exercised with
+fixtures. Live sign-in and inference were unverified because no account was
+available for acceptance.
 
 ### GitHub Copilot
 
@@ -5623,10 +5697,11 @@ Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
 escapes, invalid escape characters or Unicode digits, missing values, and numeric
-fractions, exponents, and leading minus signs cut off at EOF. Offsets
-and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
-For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
-control after a surrogate in another string if no other parse error occurs first.
+fractions, exponents, and leading minus signs cut off at EOF. Offsets and
+columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+For records up to 1 MiB, diagnostic retries distinguish incomplete object
+separators and commas in nested containers. They also identify a raw control
+after a surrogate in another string if no other parse error occurs first.
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
 position-aware wording. Other malformed records, including array trailing
@@ -5868,6 +5943,19 @@ comparing effective routes. Unconfigured and override-only models must resolve
 to the selected route. When they do, they retain provider-default or
 Gemini-version inference. Standalone Google SDK capability overrides remain
 endpoint-wide.
+
+### Native SDK extension factory
+
+`pi_rs_extensions::NativeExtensionLoader` composes a fresh registry from
+host-supplied Rust extensions and explicitly granted executable paths. It uses
+native protocol discovery and validates executable flags and dependencies
+before returning the registry for a `SessionBuilder`. Executable grants
+include symlink targets and authorize discovery before the loader applies
+disabled IDs. Hosts can omit a path to skip executing its discovery hook.
+A replaceable inline extension yields when an enabled, non-replaceable
+extension claims a tool, command or flag of the same kind and name. The SDK
+host controls settings, load order, and package discovery. Pi's default
+resource loader also discovers project and package extensions automatically.
 
 ### Combined native SDK resource snapshots
 

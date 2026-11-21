@@ -627,6 +627,7 @@ enum LocalEditor {
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
+    CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -684,6 +685,7 @@ enum RemoteEvent {
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
     AnthropicCode(tokio::sync::oneshot::Sender<String>),
+    CodexCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -3617,6 +3619,15 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login"
+            if rest.eq_ignore_ascii_case("openai-codex")
+                || rest.eq_ignore_ascii_case("openai-codex browser") =>
+        {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
         "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
             start_copilot_login(view, &args.settings)
         }
@@ -3656,6 +3667,20 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Browser authorization".into(),
+                            selection: Selection::LoginCodex,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Device authorization".into(),
+                            selection: Selection::LoginCodexDevice,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -4438,9 +4463,12 @@ pub(super) async fn run(
             match task.receiver.try_recv() {
                 Ok(Ok(keys)) => {
                     if args.model_keys.revision() == task.revision {
-                        args.model_keys = keys;
+                        let result = args.replace_model_keys(keys);
                         view.invalidate_model_catalog();
-                        view.append("Provider credentials reloaded");
+                        match result {
+                            Ok(()) => view.append("Provider credentials reloaded"),
+                            Err(error) => view.append(&format!("Model profile reload: {error}")),
+                        }
                     } else {
                         view.append("Provider credentials changed during reload; keeping the newer selection");
                     }
@@ -4899,6 +4927,15 @@ pub(super) async fn run(
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::CodexCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::CodexCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret(
+                            "OpenAI Codex code or redirect URL".into(),
+                        ),
+                    ));
+                    dirty = true;
+                }
                 Ok(RemoteEvent::AnthropicCode(sender)) => {
                     view.local_editor = Some((
                         LocalEditor::AnthropicCode(Some(sender)),
@@ -4907,7 +4944,11 @@ pub(super) async fn run(
                     dirty = true;
                 }
                 Ok(RemoteEvent::ForgetModelKey(provider)) => {
-                    args.model_keys.forget(provider);
+                    let mut keys = args.model_keys.clone();
+                    keys.forget(provider);
+                    if let Err(error) = args.replace_model_keys(keys) {
+                        view.append(&format!("Model profile reload: {error}"));
+                    }
                     view.invalidate_model_catalog();
                     dirty = true;
                 }
@@ -5446,7 +5487,7 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
-                                LocalEditor::AnthropicCode(sender) => {
+                                LocalEditor::AnthropicCode(sender) | LocalEditor::CodexCode(sender) => {
                                     if let Some(sender) = sender.take() { let _ = sender.send(text); }
                                     Ok(())
                                 }
@@ -5471,9 +5512,11 @@ pub(super) async fn run(
                                     &text,
                                 )
                                 .and_then(|()| super::model_auth::Keys::load())
-                                .map(|keys| {
-                                    args.model_keys = keys;
+                                .and_then(|keys| {
+                                    args.replace_model_keys(keys)?;
+                                    view.invalidate_model_catalog();
                                     view.append(&format!("API key saved for {}", provider.id()));
+                                    Ok(())
                                 }),
                             };
                             if let Err(error) = result {
@@ -5489,7 +5532,10 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
-                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                            } else if matches!(
+                                editor,
+                                LocalEditor::AnthropicCode(_) | LocalEditor::CodexCode(_)
+                            ) {
                                 interrupt_remote_task(&mut view);
                             }
                         }
@@ -6447,7 +6493,9 @@ fn edit_provider_key(provider: super::Provider, view: &mut View) {
 
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
     let removed = super::model_auth::remove(&provider)?;
-    args.model_keys.forget(provider.id());
+    let mut keys = args.model_keys.clone();
+    keys.forget(provider.id());
+    let result = args.replace_model_keys(keys);
     view.invalidate_model_catalog();
     view.append(&format!(
         "{} for {}",
@@ -6458,7 +6506,7 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
         },
         provider.id()
     ));
-    Ok(())
+    result
 }
 
 fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
@@ -6686,6 +6734,41 @@ fn take_device_code_action(
     view.remote_task.as_mut()?.device_code.take()
 }
 
+fn start_codex_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::codex_auth::Method,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to OpenAI Codex",
+        "OpenAI Codex login cancelled",
+        move |sender| async move {
+            super::codex_auth::login(&settings, task_control, method, |notice| match notice {
+                super::codex_auth::Notice::Device { url, code } => {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_owned(),
+                        code,
+                    });
+                }
+                super::codex_auth::Notice::Browser(url, input) => {
+                    let _ = sender.send(RemoteEvent::Notice(format!(
+                        "Continue in your browser: {url}"
+                    )));
+                    let _ = sender.send(RemoteEvent::CodexCode(input));
+                }
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenAI Codex".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -6859,6 +6942,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to OpenAI Codex" {
+            "OpenAI Codex sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to GitHub Copilot" {
             "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
@@ -6875,7 +6960,9 @@ fn clear_openrouter_editor(view: &mut View) {
     if matches!(
         view.local_editor,
         Some((
-            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            LocalEditor::OpenRouterCode(_)
+                | LocalEditor::AnthropicCode(_)
+                | LocalEditor::CodexCode(_),
             _
         ))
     ) {
@@ -7278,163 +7365,8 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         }
     };
-    let mut items = vec![
-        Item {
-            label: format!(
-                "HTTP idle timeout · {}",
-                match args.settings.http_idle_timeout_ms() {
-                    0 => "disabled".to_owned(),
-                    30_000 => "30 sec".to_owned(),
-                    60_000 => "1 min".to_owned(),
-                    120_000 => "2 min".to_owned(),
-                    300_000 => "5 min".to_owned(),
-                    ms => format!("{} sec", ms as f64 / 1000.0),
-                }
-            ),
-            selection: Selection::Setting(
-                "httpIdleTimeoutMs".into(),
-                json!(match args.settings.http_idle_timeout_ms() {
-                    30_000 => 60_000,
-                    60_000 => 120_000,
-                    120_000 => 300_000,
-                    300_000 => 0,
-                    _ => 30_000,
-                }),
-            ),
-        },
-        queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
-        queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
-        Item {
-            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
-            selection: Selection::EditSetting("theme".into()),
-        },
-        Item {
-            label: format!(
-                "Default thinking level per model · {} configured",
-                args.settings.value()["modelThinkingLevels"]
-                    .as_object()
-                    .map_or(0, |levels| levels.len())
-            ),
-            selection: Selection::EditSetting("modelThinkingLevels".into()),
-        },
-        Item {
-            label: format!(
-                "Tool output · {} (toggle)",
-                if view.expand_tools {
-                    "expanded"
-                } else {
-                    "collapsed"
-                }
-            ),
-            selection: Selection::Setting("expandTools".into(), json!(!view.expand_tools)),
-        },
-        Item {
-            label: format!(
-                "Thinking blocks · {} (toggle)",
-                if view.hide_thinking {
-                    "hidden"
-                } else {
-                    "shown"
-                }
-            ),
-            selection: Selection::Setting("hideThinkingBlock".into(), json!(!view.hide_thinking)),
-        },
-        Item {
-            label: format!(
-                "Cache miss notices · {} (toggle)",
-                if args.settings.boolean("showCacheMissNotices") == Some(true) {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            selection: Selection::Setting(
-                "showCacheMissNotices".into(),
-                json!(args.settings.boolean("showCacheMissNotices") != Some(true)),
-            ),
-        },
-        Item {
-            label: format!("Save default model · {}/{}", args.provider.id(), args.model),
-            selection: Selection::SaveDefaultModel,
-        },
-        Item {
-            label: format!("Cache warming · {cache_mode} (cycle)"),
-            selection: Selection::Setting("cacheWarming".into(), json!(next_cache_mode)),
-        },
-        Item {
-            label: format!(
-                "Save default thinking · {}",
-                args.thinking.as_deref().unwrap_or("model default")
-            ),
-            selection: Selection::Setting("defaultThinkingLevel".into(), json!(args.thinking)),
-        },
-        Item {
-            label: format!(
-                "Auto-compaction · {} (toggle)",
-                if args.settings.auto_compaction_enabled() {
-                    "on"
-                } else {
-                    "off"
-                },
-            ),
-            selection: Selection::Setting(
-                "autoCompactionEnabled".into(),
-                json!(!args.settings.auto_compaction_enabled()),
-            ),
-        },
-        Item {
-            label: format!(
-                "Auto-retry · {} (toggle)",
-                if args.settings.retry_settings().enabled {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            selection: Selection::Setting(
-                "autoRetryEnabled".into(),
-                json!(!args.settings.retry_settings().enabled),
-            ),
-        },
-    ];
     let resize_images = args.settings.resize_model_images();
-    items.push(Item {
-        label: format!(
-            "Auto-resize images · {} (toggle)",
-            if resize_images { "on" } else { "off" }
-        ),
-        selection: Selection::Setting("images.autoResize".into(), json!(!resize_images)),
-    });
     let block_images = args.settings.block_model_images();
-    items.push(Item {
-        label: format!(
-            "Block images · {} (toggle)",
-            if block_images { "on" } else { "off" }
-        ),
-        selection: Selection::Setting("images.blockImages".into(), json!(!block_images)),
-    });
-    if view.graphics.enabled() {
-        let show_images = args.settings.show_terminal_images();
-        let image_width = args.settings.terminal_image_width();
-        let next_width = match image_width {
-            60 => 80,
-            80 => 120,
-            _ => 60,
-        };
-        items.extend([
-            Item {
-                label: format!(
-                    "Show images · {} (toggle)",
-                    if show_images { "on" } else { "off" }
-                ),
-                selection: Selection::Setting("terminal.showImages".into(), json!(!show_images)),
-            },
-            Item {
-                label: format!("Image width · {image_width} cells"),
-                selection: Selection::Setting("terminal.imageWidthCells".into(), json!(next_width)),
-            },
-        ]);
-    }
     let autocomplete_items = args.settings.autocomplete_max_visible();
     let skill_commands = args.settings.enable_skill_commands();
     let quiet = &args.settings.value()["quietStartup"];
@@ -7454,95 +7386,6 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
     let wheel_lines = wheel
         .as_f64()
         .map(|value| value.clamp(1.0, 100.0).floor() as u64);
-    items.extend([
-        Item {
-            label: format!(
-                "TUI mode · {}",
-                if args.tui_mode == Some(TuiMode::Regular) {
-                    "regular"
-                } else {
-                    "fullscreen"
-                }
-            ),
-            selection: Selection::Setting(
-                "tuiMode".into(),
-                json!(if args.tui_mode == Some(TuiMode::Regular) {
-                    "fullscreen"
-                } else {
-                    "regular"
-                }),
-            ),
-        },
-        Item {
-            label: format!("Quiet startup · {quiet_label}"),
-            selection: Selection::Setting(
-                "quietStartup".into(),
-                match quiet_label {
-                    "true" => json!("header"),
-                    "header" => json!(false),
-                    _ => json!(true),
-                },
-            ),
-        },
-        Item {
-            label: format!("Session share destination · {share}"),
-            selection: Selection::Setting(
-                "sessionShareDestination".into(),
-                json!(match share {
-                    "auto" => "gist",
-                    "gist" => "radius",
-                    _ => "auto",
-                }),
-            ),
-        },
-        Item {
-            label: format!("Default project trust · {trust}"),
-            selection: Selection::Setting(
-                "defaultProjectTrust".into(),
-                json!(match trust {
-                    "ask" => "always",
-                    "always" => "never",
-                    _ => "ask",
-                }),
-            ),
-        },
-        Item {
-            label: format!(
-                "Fullscreen wheel scrolling · {}",
-                wheel_lines.map_or_else(|| "auto".into(), |n| n.to_string())
-            ),
-            selection: Selection::Setting(
-                "fullscreenWheelScrollLines".into(),
-                match wheel_lines {
-                    None => json!(1),
-                    Some(current) => [1, 2, 3, 5, 10]
-                        .into_iter()
-                        .find(|value| *value > current)
-                        .map_or_else(|| json!("auto"), |value| json!(value)),
-                },
-            ),
-        },
-        Item {
-            label: format!("Autocomplete max items · {autocomplete_items}"),
-            selection: Selection::Setting(
-                "autocompleteMaxVisible".into(),
-                json!(
-                    [3, 5, 7, 10, 15, 20]
-                        .into_iter()
-                        .skip_while(|count| *count != autocomplete_items)
-                        .nth(1)
-                        .unwrap_or(3)
-                ),
-            ),
-        },
-        Item {
-            label: format!(
-                "Skill commands · {} (toggle)",
-                if skill_commands { "on" } else { "off" }
-            ),
-            selection: Selection::Setting("enableSkillCommands".into(), json!(!skill_commands)),
-        },
-    ]);
     let escape = args.settings.string("doubleEscapeAction").unwrap_or("tree");
     let next_escape = match escape {
         "tree" => "fork",
@@ -7566,19 +7409,240 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         .settings
         .boolean("fullscreenCopyOnSelect")
         .unwrap_or(true);
+    let thinking_summary = match args.settings.value()["modelThinkingLevels"]
+        .as_object()
+        .map_or(0, |levels| levels.len())
+    {
+        0 => "none".into(),
+        count => format!("{count} configured"),
+    };
+    let mut items = vec![Item {
+        label: format!("Auto-compact · {}", args.settings.auto_compaction_enabled()),
+        selection: Selection::Setting(
+            "autoCompactionEnabled".into(),
+            json!(!args.settings.auto_compaction_enabled()),
+        ),
+    }];
+    if view.graphics.enabled() {
+        let show_images = args.settings.show_terminal_images();
+        let image_width = args.settings.terminal_image_width();
+        let next_width = match image_width {
+            60 => 80,
+            80 => 120,
+            _ => 60,
+        };
+        items.extend([
+            Item {
+                label: format!("Show images · {show_images}"),
+                selection: Selection::Setting("terminal.showImages".into(), json!(!show_images)),
+            },
+            Item {
+                label: format!("Image width · {image_width}"),
+                selection: Selection::Setting("terminal.imageWidthCells".into(), json!(next_width)),
+            },
+        ]);
+    }
     items.extend([
         Item {
+            label: format!("Auto-resize images · {resize_images}"),
+            selection: Selection::Setting("images.autoResize".into(), json!(!resize_images)),
+        },
+        Item {
+            label: format!("Block images · {block_images}"),
+            selection: Selection::Setting("images.blockImages".into(), json!(!block_images)),
+        },
+        Item {
+            label: format!("Skill commands · {skill_commands}"),
+            selection: Selection::Setting("enableSkillCommands".into(), json!(!skill_commands)),
+        },
+        Item {
             label: format!(
-                "Terminal progress · {} (toggle)",
-                if args.settings.terminal_progress() {
-                    "on"
+                "Show hardware cursor · {}",
+                if args.settings.show_hardware_cursor() {
+                    "true"
                 } else {
-                    "off"
-                },
+                    "false"
+                }
             ),
+            selection: Selection::Setting(
+                "showHardwareCursor".into(),
+                json!(!args.settings.show_hardware_cursor()),
+            ),
+        },
+        Item {
+            label: format!("Editor padding · {padding}"),
+            selection: Selection::Setting("editorPaddingX".into(), json!((padding + 1) % 4)),
+        },
+        Item {
+            label: format!("Output padding · {}", args.settings.output_padding()),
+            selection: Selection::Setting(
+                "outputPad".into(),
+                json!(1 - args.settings.output_padding()),
+            ),
+        },
+        Item {
+            label: format!("Autocomplete max items · {autocomplete_items}"),
+            selection: Selection::Setting(
+                "autocompleteMaxVisible".into(),
+                json!(
+                    [3, 5, 7, 10, 15, 20]
+                        .into_iter()
+                        .skip_while(|count| *count != autocomplete_items)
+                        .nth(1)
+                        .unwrap_or(3)
+                ),
+            ),
+        },
+        Item {
+            label: format!(
+                "Clear on shrink · {}",
+                if args.settings.clear_terminal_on_shrink() {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+            selection: Selection::Setting(
+                "terminal.clearOnShrink".into(),
+                json!(!args.settings.clear_terminal_on_shrink()),
+            ),
+        },
+        Item {
+            label: format!("Terminal progress · {}", args.settings.terminal_progress()),
             selection: Selection::Setting(
                 "terminal.showTerminalProgress".into(),
                 json!(!args.settings.terminal_progress()),
+            ),
+        },
+        queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
+        queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
+        Item {
+            label: format!("Session share destination · {share}"),
+            selection: Selection::Setting(
+                "sessionShareDestination".into(),
+                json!(match share {
+                    "auto" => "gist",
+                    "gist" => "radius",
+                    _ => "auto",
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "HTTP idle timeout · {}",
+                match args.settings.http_idle_timeout_ms() {
+                    0 => "disabled".to_owned(),
+                    30_000 => "30 sec".to_owned(),
+                    60_000 => "1 min".to_owned(),
+                    120_000 => "2 min".to_owned(),
+                    300_000 => "5 min".to_owned(),
+                    ms => format!("{} sec", ms as f64 / 1000.0),
+                }
+            ),
+            selection: Selection::Setting(
+                "httpIdleTimeoutMs".into(),
+                json!(match args.settings.http_idle_timeout_ms() {
+                    30_000 => 60_000,
+                    60_000 => 120_000,
+                    120_000 => 300_000,
+                    300_000 => 0,
+                    _ => 30_000,
+                }),
+            ),
+        },
+        Item {
+            label: format!("Cache warming · {cache_mode}"),
+            selection: Selection::Setting("cacheWarming".into(), json!(next_cache_mode)),
+        },
+        Item {
+            label: format!("Hide thinking · {}", view.hide_thinking),
+            selection: Selection::Setting("hideThinkingBlock".into(), json!(!view.hide_thinking)),
+        },
+        Item {
+            label: format!("Mermaid diagrams · {}", args.settings.mermaid_mode()),
+            selection: Selection::Setting(
+                "markdown.mermaid".into(),
+                json!(match args.settings.mermaid_mode() {
+                    "off" => "final",
+                    "final" => "streaming",
+                    _ => "off",
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "Cache miss notices · {}",
+                if args.settings.boolean("showCacheMissNotices") == Some(true) {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+            selection: Selection::Setting(
+                "showCacheMissNotices".into(),
+                json!(args.settings.boolean("showCacheMissNotices") != Some(true)),
+            ),
+        },
+        Item {
+            label: format!("Quiet startup · {quiet_label}"),
+            selection: Selection::Setting(
+                "quietStartup".into(),
+                match quiet_label {
+                    "true" => json!("header"),
+                    "header" => json!(false),
+                    _ => json!(true),
+                },
+            ),
+        },
+        Item {
+            label: format!(
+                "Default project trust · {}",
+                match trust {
+                    "always" => "Always trust",
+                    "never" => "Never trust",
+                    _ => "Ask",
+                }
+            ),
+            selection: Selection::Setting(
+                "defaultProjectTrust".into(),
+                json!(match trust {
+                    "ask" => "always",
+                    "always" => "never",
+                    _ => "ask",
+                }),
+            ),
+        },
+        Item {
+            label: format!("Double-escape action · {escape}"),
+            selection: Selection::Setting("doubleEscapeAction".into(), json!(next_escape)),
+        },
+        Item {
+            label: format!("Tree filter mode · {}", tree_filter.name()),
+            selection: Selection::Setting(
+                "treeFilterMode".into(),
+                json!(tree_filter.next().name()),
+            ),
+        },
+        Item {
+            label: format!("Default thinking level per model · {thinking_summary}"),
+            selection: Selection::EditSetting("modelThinkingLevels".into()),
+        },
+        Item {
+            label: format!(
+                "TUI mode · {}",
+                if args.tui_mode == Some(TuiMode::Regular) {
+                    "regular"
+                } else {
+                    "fullscreen"
+                }
+            ),
+            selection: Selection::Setting(
+                "tuiMode".into(),
+                json!(if args.tui_mode == Some(TuiMode::Regular) {
+                    "fullscreen"
+                } else {
+                    "regular"
+                }),
             ),
         },
         Item {
@@ -7604,71 +7668,63 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
-            label: format!(
-                "Fullscreen copy on select · {}",
-                if copy_on_select { "on" } else { "off" }
-            ),
+            label: format!("Fullscreen copy on select · {copy_on_select}"),
             selection: Selection::Setting("fullscreenCopyOnSelect".into(), json!(!copy_on_select)),
         },
         Item {
-            label: format!("Editor padding · {padding}"),
-            selection: Selection::Setting("editorPaddingX".into(), json!((padding + 1) % 4)),
-        },
-        Item {
-            label: format!("Mermaid rendering · {}", args.settings.mermaid_mode()),
+            label: format!(
+                "Fullscreen wheel scrolling · {}",
+                wheel_lines.map_or_else(|| "auto".into(), |n| n.to_string())
+            ),
             selection: Selection::Setting(
-                "markdown.mermaid".into(),
-                json!(match args.settings.mermaid_mode() {
-                    "off" => "final",
-                    "final" => "streaming",
-                    _ => "off",
-                }),
+                "fullscreenWheelScrollLines".into(),
+                match wheel_lines {
+                    None => json!(1),
+                    Some(current) => [1, 2, 3, 5, 10]
+                        .into_iter()
+                        .find(|value| *value > current)
+                        .map_or_else(|| json!("auto"), |value| json!(value)),
+                },
             ),
         },
         Item {
+            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
+            selection: Selection::EditSetting("theme".into()),
+        },
+        Item {
             label: format!(
-                "Clear on shrink · {}",
-                if args.settings.clear_terminal_on_shrink() {
+                "Tool output · {} (toggle)",
+                if view.expand_tools {
+                    "expanded"
+                } else {
+                    "collapsed"
+                }
+            ),
+            selection: Selection::Setting("expandTools".into(), json!(!view.expand_tools)),
+        },
+        Item {
+            label: format!("Save default model · {}/{}", args.provider.id(), args.model),
+            selection: Selection::SaveDefaultModel,
+        },
+        Item {
+            label: format!(
+                "Save default thinking · {}",
+                args.thinking.as_deref().unwrap_or("model default")
+            ),
+            selection: Selection::Setting("defaultThinkingLevel".into(), json!(args.thinking)),
+        },
+        Item {
+            label: format!(
+                "Auto-retry · {} (toggle)",
+                if args.settings.retry_settings().enabled {
                     "on"
                 } else {
                     "off"
                 }
             ),
             selection: Selection::Setting(
-                "terminal.clearOnShrink".into(),
-                json!(!args.settings.clear_terminal_on_shrink()),
-            ),
-        },
-        Item {
-            label: format!(
-                "Hardware cursor · {}",
-                if args.settings.show_hardware_cursor() {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            selection: Selection::Setting(
-                "showHardwareCursor".into(),
-                json!(!args.settings.show_hardware_cursor()),
-            ),
-        },
-        Item {
-            label: format!("Output padding · {}", args.settings.output_padding()),
-            selection: Selection::Setting(
-                "outputPad".into(),
-                json!(1 - args.settings.output_padding()),
-            ),
-        },
-        Item {
-            label: format!("Double-escape action · {escape}"),
-            selection: Selection::Setting("doubleEscapeAction".into(), json!(next_escape)),
-        },
-        Item {
-            label: format!("Tree filter mode · {}", tree_filter.name()),
-            selection: Selection::Setting(
-                "treeFilterMode".into(),
-                json!(tree_filter.next().name()),
+                "autoRetryEnabled".into(),
+                json!(!args.settings.retry_settings().enabled),
             ),
         },
     ]);
@@ -7826,6 +7882,12 @@ fn select(
                 },
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
+        }
+        Selection::LoginCodex => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        Selection::LoginCodexDevice => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
         Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),

@@ -24,6 +24,7 @@ mod cache_warming;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+mod codex_auth;
 mod config;
 mod copilot_auth;
 mod extension_ui;
@@ -469,9 +470,19 @@ impl Cli {
                     }
                     return None;
                 }
+                if provider.id() == "openai-codex" {
+                    return None;
+                }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    return builtin
-                        .is_official_endpoint(endpoint)
+                    let official = if provider.id() == "cloudflare-workers-ai" {
+                        model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
+                            && self
+                                .model_profiles
+                                .has_provider_endpoint(provider, endpoint)
+                    } else {
+                        builtin.is_official_endpoint(endpoint)
+                    };
+                    return official
                         .then(|| std::env::var(builtin.env()).ok())
                         .flatten()
                         .filter(|key| !key.trim().is_empty())
@@ -588,8 +599,18 @@ impl Cli {
             .unwrap_or_else(|| self.model_profiles.endpoint(provider))
     }
 
+    fn replace_model_keys(&mut self, keys: model_auth::Keys) -> Result<()> {
+        self.model_keys = keys;
+        if self.model_profiles.cloudflare_saved_account()
+            != self.model_keys.cloudflare_chat_account()
+        {
+            self.reload_model_profiles()?;
+        }
+        Ok(())
+    }
+
     fn reload_model_profiles(&mut self) -> Result<()> {
-        let profiles = model_profiles::Profiles::load()?;
+        let profiles = model_profiles::Profiles::load(&self.model_keys)?;
         let provider = profiles.provider(self.provider.id()).ok_or_else(|| {
             Error::Config(format!(
                 "model provider {} is no longer configured",
@@ -1154,7 +1175,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1173,7 +1194,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1494,11 +1515,11 @@ async fn run_cli() -> i32 {
                 eprintln!("{warning}");
             }
         }
-        args.model_profiles = model_profiles::Profiles::load()?;
         args.model_keys = tokio::select! {
             result = model_auth::Keys::load_async() => result?,
             _ = &mut signal_rx => return Err(Error::Cancelled),
         };
+        args.model_profiles = model_profiles::Profiles::load(&args.model_keys)?;
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model
@@ -1932,6 +1953,28 @@ async fn execute(
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "openai-codex" {
+                    let method = if *device_code {
+                        codex_auth::Method::Device
+                    } else {
+                        codex_auth::Method::Browser
+                    };
+                    codex_auth::login(
+                        &args.settings, meta_auth::LoginControl::default(), method,
+                        |notice| match notice {
+                            codex_auth::Notice::Device {url, code} => eprintln!("Enter code {code} at {url}"),
+                            codex_auth::Notice::Browser(url, sender) => {
+                                eprintln!("Continue in your browser: {url}");
+                                eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+                                std::thread::spawn(move || {
+                                    let mut line = String::new();
+                                    if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) {
+                                        let _ = sender.send(line);
+                                    }
+                                });
+                            }
+                        },
+                    ).await
                 } else if provider == "github-copilot" {
                     copilot_auth::login(
                         &args.settings,
@@ -1992,7 +2035,7 @@ async fn execute(
                 kimi_auth::logout().await?
             } else if matches!(
                 provider.as_str(),
-                "openrouter" | "anthropic" | "github-copilot"
+                "openrouter" | "anthropic" | "github-copilot" | "openai-codex"
             ) {
                 model_auth::remove(&Provider::named(provider).expect("built-in login provider"))?
             } else {
@@ -2639,7 +2682,13 @@ fn trace_tool_progress(
     trace: bool,
     json_stream: bool,
 ) -> Option<Value> {
-    (trace && !json_stream).then(|| serde_json::to_value(event).expect("tool progress"))
+    if json_stream {
+        return None;
+    }
+    if let Some(id) = pi_rs::tool_attempt_operation_id() {
+        return Some(json!({"type":"internal_tool_attempt","operationId":id}));
+    }
+    trace.then(|| serde_json::to_value(event).expect("tool progress"))
 }
 
 fn observe(event: Notification<'_>, trace: bool) {

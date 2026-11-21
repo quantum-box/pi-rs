@@ -24,6 +24,7 @@ pub(super) struct Stream {
     metadata: ModelMetadata,
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
+    started_tools: HashSet<Uuid>,
     result_metadata: HashMap<Uuid, Value>,
     pending_tools: HashMap<u64, PendingTool>,
     reasoning_items: HashMap<u64, (usize, bool)>,
@@ -65,6 +66,11 @@ impl Stream {
                     && let Some(content) = event.get("structuredContent")
                 {
                     self.result_metadata.insert(id, content.clone());
+                }
+            }
+            Some("internal_tool_attempt") => {
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok()) {
+                    events.extend(self.start_tool(id));
                 }
             }
             Some("summary_request_start") => {
@@ -179,7 +185,11 @@ impl Stream {
                 }
             }
             Notification::ToolProgress(event) => {
-                events.push(serde_json::to_value(event).expect("tool progress"));
+                if let Some(id) = pi_rs::tool_attempt_operation_id() {
+                    events.extend(self.start_tool(id));
+                } else {
+                    events.push(serde_json::to_value(event).expect("tool progress"));
+                }
             }
             Notification::ToolCallDelta(delta) if !self.assistant.is_null() && !self.ended => {
                 self.tool_delta((*delta).clone(), &mut events);
@@ -187,6 +197,21 @@ impl Stream {
             _ => {}
         }
         events
+    }
+
+    fn start_tool(&mut self, operation_id: Uuid) -> Option<Value> {
+        let (invocation, parent) = self.calls.get(&operation_id)?;
+        if !self.started_tools.insert(operation_id) {
+            return None;
+        }
+        let mut event = json!({
+            "type":"tool_execution_start", "toolCallId":invocation.call.id,
+            "toolName":invocation.call.name, "args":tool_call_value(&invocation.call)["arguments"],
+        });
+        if let Some(parent) = parent {
+            event["parentToolCallId"] = json!(parent);
+        }
+        Some(event)
     }
 
     pub fn settle(&mut self, aborted: bool) -> Vec<Value> {
@@ -374,16 +399,7 @@ impl Stream {
                     .insert(invocation.operation_id, (invocation, parent));
             }
             Event::ToolStarted { operation_id, .. } => {
-                if let Some((invocation, parent)) = self.calls.get(&operation_id) {
-                    let mut event = json!({
-                        "type":"tool_execution_start", "toolCallId":invocation.call.id,
-                        "toolName":invocation.call.name, "args":tool_call_value(&invocation.call)["arguments"],
-                    });
-                    if let Some(parent) = &parent {
-                        event["parentToolCallId"] = json!(parent);
-                    }
-                    events.push(event);
-                }
+                events.extend(self.start_tool(operation_id));
             }
             Event::ToolFinished {
                 operation_id,
@@ -394,6 +410,7 @@ impl Stream {
                 operation_id,
                 outcome,
             } => {
+                self.started_tools.remove(&operation_id);
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
                     let mut result = tool_event_result_value(
@@ -794,6 +811,9 @@ pub(super) fn tool_result_value(
             .map(|image| json!({"type":"image","data":image.data,"mimeType":image.mime_type})),
     );
     let mut result = json!({"content":content});
+    if matches!(outcome, Some(Outcome::Failed(_) | Outcome::Skipped(_))) {
+        result["details"] = json!({});
+    }
     if let Some(
         Outcome::SucceededWithDetails { details, .. }
         | Outcome::StructuredWithDetails { details, .. },
@@ -928,6 +948,88 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn tool_attempt_start_is_deduplicated_by_operation_identity() {
+        let args = Cli::parse_from(["pi"]);
+        let mut stream = Stream::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let fallback = Uuid::new_v4();
+        for (operation_id, arguments) in [
+            (first, r#"{"path":42}"#),
+            (second, "[42]"),
+            (fallback, "{}"),
+        ] {
+            stream.calls.insert(
+                operation_id,
+                (
+                    Invocation {
+                        operation_id,
+                        call: ToolCall {
+                            id: "repeated-id".into(),
+                            name: "read".into(),
+                            arguments: arguments.into(),
+                        },
+                    },
+                    None,
+                ),
+            );
+        }
+        for (operation_id, arguments) in [(first, json!({"path":42})), (second, json!({}))] {
+            let event = json!({"type":"internal_tool_attempt","operationId":operation_id});
+            assert_eq!(
+                stream.observe(&event, &args),
+                vec![
+                    json!({"type":"tool_execution_start","toolCallId":"repeated-id","toolName":"read","args":arguments})
+                ]
+            );
+            let mut events = Vec::new();
+            stream.record(
+                Event::ToolStarted {
+                    operation_id,
+                    tool_execution: None,
+                },
+                &args,
+                &mut events,
+            );
+            assert!(events.is_empty());
+        }
+
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id: first,
+                outcome: Outcome::Skipped("rejected before dispatch".into()),
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        assert_eq!(events[0]["type"], "tool_execution_end");
+        assert!(!stream.started_tools.contains(&first));
+        assert!(stream.started_tools.contains(&second));
+        assert!(
+            stream
+                .observe(
+                    &json!({"type":"internal_tool_attempt","operationId":first}),
+                    &args
+                )
+                .is_empty()
+        );
+
+        events.clear();
+        stream.record(
+            Event::ToolStarted {
+                operation_id: fallback,
+                tool_execution: None,
+            },
+            &args,
+            &mut events,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "tool_execution_start");
+    }
 
     #[test]
     fn failed_model_attempts_expose_classification_without_provider_text() {
@@ -1635,6 +1737,67 @@ mod streaming_tool_tests {
         let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
         assert_eq!(result["content"], json!([image]));
         assert_eq!(result["structuredContent"], json!({"answer":42}));
+    }
+
+    #[test]
+    fn generated_tool_failures_have_pi_error_details() {
+        for outcome in [
+            Outcome::Failed("execution failed".into()),
+            Outcome::Skipped("validation failed".into()),
+        ] {
+            let mut stream = Stream::default();
+            let args = Cli::parse_from(["pi"]);
+            let operation_id = Uuid::new_v4();
+            stream.calls.insert(
+                operation_id,
+                (
+                    Invocation {
+                        operation_id,
+                        call: ToolCall {
+                            id: "call".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    None,
+                ),
+            );
+
+            let mut events = Vec::new();
+            stream.record(
+                Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    states: Default::default(),
+                },
+                &args,
+                &mut events,
+            );
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "tool_execution_end")
+                .unwrap();
+            let message = events
+                .iter()
+                .find(|event| event["type"] == "message_end")
+                .unwrap();
+            assert_eq!(end["isError"], true);
+            assert_eq!(end["result"]["details"], json!({}));
+            assert_eq!(message["message"]["isError"], true);
+            assert_eq!(message["message"]["details"], json!({}));
+        }
+
+        let returned_error = Outcome::TextResult {
+            output: "explicit result".into(),
+            details: None,
+            is_error: true,
+        };
+        let result = tool_event_result_value(
+            &returned_error.tool_content(),
+            Some(&returned_error),
+            Some(false),
+        );
+        assert!(result.get("details").is_none());
     }
 
     #[test]
