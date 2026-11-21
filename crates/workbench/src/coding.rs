@@ -4406,7 +4406,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_empty_truncated_snapshot_keeps_placeholder_and_exit_status() {
+    fn shell_partial_line_snapshot_keeps_output_and_exit_status() {
         for code in [0, 2] {
             let input = format!("{}\n", "x".repeat(300_000));
             let mut output = super::super::shell_output::Accumulator::default();
@@ -4425,12 +4425,13 @@ mod tests {
             else {
                 panic!("missing structured result")
             };
-            assert!(output.starts_with(
-                "(no output)\n\n[Showing lines 2-1 of 1 (50.0KB limit). Full output: "
-            ));
+            assert!(output.starts_with(&format!(
+                "{}\n\n[Showing last 50.0KB of line 1 (line is 0B). Full output: ",
+                "x".repeat(50 * 1024)
+            )));
             assert_eq!(is_error, code != 0);
             assert_eq!(output.ends_with("Command exited with code 2"), code == 2);
-            assert_eq!(details.unwrap()["truncation"]["outputLines"], 0);
+            assert_eq!(details.unwrap()["truncation"]["outputLines"], 1);
             assert_eq!(structured_content["output"], input);
             assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
             std::fs::remove_file(path).unwrap();
