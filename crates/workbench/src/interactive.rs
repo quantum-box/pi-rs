@@ -138,7 +138,7 @@ struct Terminal {
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
     #[cfg(unix)]
-    _suspend_signal: SuspendSignal,
+    _suspend_signal: Option<SuspendSignal>,
 }
 
 #[cfg(unix)]
@@ -240,7 +240,7 @@ impl Terminal {
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
             #[cfg(unix)]
-            _suspend_signal: suspend_signal,
+            _suspend_signal: Some(suspend_signal),
         };
         if guard.alternate {
             execute!(
@@ -12712,6 +12712,8 @@ exit {exit}
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Disabled,
+            #[cfg(unix)]
+            _suspend_signal: None,
         };
         drop(guard);
         theme = super::Theme::system();
