@@ -81,6 +81,12 @@ impl ResponseHooks {
     }
 }
 
+/// Whether the current request has a provider response observer.
+#[doc(hidden)]
+pub fn observes_provider_response() -> bool {
+    RESPONSE_HOOKS.try_with(Option::is_some).unwrap_or(false)
+}
+
 /// Report an HTTP response before reading its body. Outside an agent request
 /// with subscribed extensions, reporting has no effect. The adapter supplies
 /// request secrets and its configured headers so that reflected credentials,

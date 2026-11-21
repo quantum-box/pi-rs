@@ -1,6 +1,7 @@
 //! Amazon Bedrock ConverseStream adapter.
 mod headers;
 mod options;
+mod response;
 use aws_sdk_bedrockruntime::{
     Client,
     types::{
@@ -1334,6 +1335,13 @@ impl Model for Bedrock {
         use tracing::instrument::WithSubscriber;
         let has_secrets = !secrets.is_empty();
         let mut request = command.customize();
+        let observations = if pi_rs_core::observes_provider_response() {
+            let (capture, observations) = response::Capture::channel();
+            request = request.interceptor(capture);
+            Some(observations)
+        } else {
+            None
+        };
         if !headers.is_empty() {
             request = request.mutate_request(move |request| headers::apply(request, &headers));
         }
@@ -1342,10 +1350,17 @@ impl Model for Bedrock {
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             tracing::Dispatch::new(headers::SigningTraceGuard(dispatch))
         });
-        let response = if let Some(dispatch) = &guarded_dispatch {
-            request.with_subscriber(dispatch.clone()).await
+        let send = async {
+            if let Some(dispatch) = &guarded_dispatch {
+                request.with_subscriber(dispatch.clone()).await
+            } else {
+                request.await
+            }
+        };
+        let response = if let Some(observations) = observations {
+            response::observe_while_sending(send, observations, &secrets).await
         } else {
-            request.await
+            send.await
         };
         let mut response = response.map_err(|error| request_error(error, &secrets))?;
         let request_id = response.request_id().map(str::to_owned);

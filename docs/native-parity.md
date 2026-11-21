@@ -4484,9 +4484,12 @@ response remains under the adapter's control. Executable extensions advertise
 `after_provider_response_hook` and receive an `after_provider_response`
 request with `event.status`, `event.headers`, and their branch state. Response
 metadata is ephemeral. Credential headers, cookies, sensitive header values and
-reflected configured credentials are withheld. Bedrock and custom transports
-without response metadata reporting do not emit this event. Summary and catalog
-requests remain outside the turn hook.
+reflected configured credentials are withheld. The Bedrock adapter captures
+successful ConverseStream HTTP status and raw Smithy headers, including custom
+gateway fields. It services the hook as soon as the SDK reports those headers,
+even if the SDK waits for the stream before returning. HTTP errors follow Pi's
+Bedrock behavior and produce no callback. Custom transports opt in by reporting metadata.
+Summary and catalog requests remain outside the turn hook.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
