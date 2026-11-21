@@ -28,8 +28,15 @@ pub(crate) fn replace_assistant_replay_text(
     }
     let visible = |block: &Value| match api {
         ModelApi::AnthropicMessages => block["type"] == "text" && block["_pi_thinking"] != true,
-        ModelApi::BedrockConverseStream | ModelApi::PiMessages => block["type"] == "text",
-        ModelApi::GoogleGenerativeAi => block["text"].is_string() && block["thought"] != true,
+        ModelApi::BedrockConverseStream => block["type"] == "text",
+        ModelApi::PiMessages => {
+            block["type"] == "text" && !(block["text"] == "" && block["textSignature"].is_string())
+        }
+        ModelApi::GoogleGenerativeAi => {
+            block["text"].is_string()
+                && block["thought"] != true
+                && !(block["text"] == "" && block["thoughtSignature"].is_string())
+        }
         ModelApi::OpenaiResponses => block["type"] == "message" || block["role"] == "assistant",
         ModelApi::OpenaiCompletions => block["type"] == "context_edit_text",
     };
@@ -278,6 +285,44 @@ mod tests {
     use super::*;
     use crate::{Event, MemoryStore, Message, ResolvedModelIdentity, Session, UsageReport};
     use uuid::Uuid;
+
+    #[test]
+    fn native_message_edit_preserves_empty_signed_text_placeholders() {
+        for (api, visible, empty_signed, call, edited) in [
+            (
+                ModelApi::GoogleGenerativeAi,
+                json!({"text":"old"}),
+                json!({"text":"","thoughtSignature":"signed-empty"}),
+                json!({"functionCall":{"id":"call","name":"read","args":{}},"thoughtSignature":"signed-call"}),
+                json!({"text":"edited"}),
+            ),
+            (
+                ModelApi::PiMessages,
+                json!({"type":"text","text":"old"}),
+                json!({"type":"text","text":"","textSignature":"signed-empty"}),
+                json!({"type":"toolCall","id":"call","name":"read","arguments":{},"thoughtSignature":"signed-call"}),
+                json!({"type":"text","text":"edited"}),
+            ),
+        ] {
+            let metadata = ModelMetadata {
+                provider_api: Some(api),
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: "fixture".into(),
+                        model: "fixture".into(),
+                    },
+                    blocks: vec![visible, empty_signed.clone(), call.clone()],
+                })),
+                ..Default::default()
+            };
+            assert_eq!(
+                replace_assistant_replay_text(&metadata, "edited")
+                    .unwrap()
+                    .blocks,
+                [edited, empty_signed, call]
+            );
+        }
+    }
 
     #[test]
     fn native_message_edit_preserves_signed_reasoning_and_tool_replay() {

@@ -4380,8 +4380,9 @@ and arrive before the corresponding public notifications. A completed
 `message_end` may replace text within the response limit while retaining the
 assistant role and the provider's tool decisions. Edits are reflected in the
 model's retained reply, journal and final RPC message. Native provider replay
-retains opaque reasoning and tool data while replacing its visible text.
-Display layout is rebuilt after an edit, and context estimates use the
+retains opaque reasoning, tool data and empty signed placeholders while
+replacing its visible text. Signatures on replaced visible text are not
+reused. Display layout is rebuilt after an edit, and context estimates use the
 edited text while billing retains measured usage. Failed and aborted
 attempts receive transient start and end notifications when needed. Executable extensions advertise
 `message_lifecycle_hook`. Summary requests stay outside the hook.
