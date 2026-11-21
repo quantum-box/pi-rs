@@ -5644,6 +5644,12 @@ chat models, including long-context pricing tiers where published. The runtime
 uses the configured AWS region, and the account determines which models can be
 invoked. Live access to the newly listed models was unverified.
 
+The native estimator retains its existing input-rate charge for Nova cache
+writes. Cache tokens reported by Converse are counted separately from fresh
+input tokens, and AWS describes Nova cache writes as having no price premium.
+[Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
+[AWS Nova prompt caching announcement](https://aws.amazon.com/blogs/aws/reduce-costs-and-latency-with-amazon-bedrock-intelligent-prompt-routing-and-prompt-caching-preview/)
+
 Text, user images, structured tool-result images, tool calls and results,
 streamed reasoning, stop reasons, and input/output/cache usage are supported.
 Redacted Bedrock reasoning emits Pi's fixed placeholder once per block while
