@@ -461,6 +461,21 @@ the same endpoint-scoped credential rules as other providers. Model-specific
 reasoning and empty-signature compatibility are retained. Live acceptance with
 a Vercel account remains open.
 
+### Mistral checkpoint
+
+Mistral exposes the 34 pinned chat models using `MISTRAL_API_KEY` and the
+`mistral-conversations` transport. It sends each model's reasoning control,
+replays streamed thinking and text on the same route, and pads short tool ID
+hashes to nine characters for [Mistral's validator](https://github.com/mistralai/mistral-common/blob/main/src/mistral_common/protocol/instruct/validator.py).
+Tool errors and supported images are encoded in the tool message. In a
+session, routing and cache hints include `x-affinity` and
+`prompt_cache_key`. Parallel continuations need a tool ID or index when the
+stream does not uniquely identify the target call. Live Mistral account
+inference has not been verified.
+ Streams that omit both the
+tool index and call ID are rejected when multiple invocations fit the same
+fragments.
+
 ### Kimi Code API key checkpoint
 
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
@@ -4259,6 +4274,13 @@ unconstrained calls on official OpenAI and ChatGPT plan routes so the server
 preserves the recorded decision. Compatible endpoints that lack strict-field
 support continue to omit it.
 
+Responses-compatible endpoints that reject `max_output_tokens` can set
+`compat.supportsMaxOutputTokens: false` at the provider or model level, or in
+`modelOverrides`. Dispatch then omits the field. A conservative local size
+guard stops runaway visible output. The agent applies reported usage
+including hidden reasoning when available. When the provider omits usage,
+Pi's estimate of the visible output applies before accepting the completion.
+
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
@@ -4787,7 +4809,8 @@ catalogues are projected from the published
 
 Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
-requests. Pi-format saved credentials may declare an account through their
+requests. Terminal `/login cloudflare-workers-ai` prompts for a masked API
+key and the account ID for routes derived from login or environment settings. Pi-format saved credentials may declare an account through their
 `env` field. A stored account scopes the key to that account's chat route.
 An unscoped saved key works only on official Workers AI routes. Credentials
 and headers inferred from classifier-only model URLs apply to those operations.
@@ -4804,7 +4827,12 @@ selects the Chat Completions, Messages, or Responses path. All three send
 `cf-aig-authorization` for gateway authentication, and saved keys remain
 scoped to their account and gateway. A concrete provider `baseUrl` can
 supply missing route identifiers for an imported key when the configured
-route agrees with any saved or environment identifiers.
+route agrees with any saved or environment identifiers. Terminal
+`/login cloudflare-ai-gateway` prompts for a masked API key, account ID, and
+gateway ID for routes derived from login or environment settings. Those
+routes can be changed by signing in again. The two Cloudflare sign-in flows
+store Pi-compatible credentials for official routes. A fixed endpoint uses
+masked key entry and binds the stored key to that endpoint.
 
 The published Pi AI package and local fixtures cover each route and
 authentication header. Live gateway authentication was unverified because
@@ -4900,12 +4928,22 @@ their own adapters.
 `openai-codex` exposes the eight pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
+Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
+a smaller positive budget ends the run before a request goes to Codex.
+A model with `compat.supportsMaxOutputTokens: false` uses local output safeguards.
 `pi login openai-codex` uses browser PKCE, and `--device-code` selects
 device authorization. Browser sign-in also accepts a pasted code or redirect.
 The terminal offers both methods. Existing Pi Codex
 credentials can be read and refreshed in place. A refresh in flight saves
 rotated credentials even when the requesting turn is cancelled. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
+
+Codex and Copilot use Pi's five-minute refresh window against the expiry
+stored in `auth.json`. A refresh that returns a shorter-lived credential is
+saved for ordinary inference. An explicit bearer-token export still requires
+the effective minimum validity after the saved refresh. Loopback fixtures
+covered early refresh and persistence. Live Codex and Copilot refresh was
+unverified.
 
 The native transport sends uncompressed JSON over HTTP SSE. OpenAI Responses
 and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar

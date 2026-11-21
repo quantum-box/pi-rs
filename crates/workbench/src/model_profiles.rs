@@ -27,6 +27,7 @@ struct Profile {
     provider: Provider,
     endpoint: String,
     base_url: Option<String>,
+    configured_cloudflare_base: Option<String>,
     provider_endpoints: BTreeSet<String>,
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
@@ -205,6 +206,7 @@ struct ModelCompatibility {
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
     supports_mid_convo_effort: Option<bool>,
+    supports_max_output_tokens: Option<bool>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -224,6 +226,9 @@ impl ModelCompatibility {
             supports_mid_convo_effort: newer
                 .supports_mid_convo_effort
                 .or(self.supports_mid_convo_effort),
+            supports_max_output_tokens: newer
+                .supports_max_output_tokens
+                .or(self.supports_max_output_tokens),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -586,6 +591,7 @@ impl ModelMetadata {
         if !matches!(
             adapter,
             Adapter::ChatCompletions
+                | Adapter::MistralConversations
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
                 | Adapter::CodexResponses
@@ -664,6 +670,10 @@ impl ModelMetadata {
     }
 
     pub fn has_thinking_level_map(&self) -> bool {
+        !self.thinking_level_map.is_empty()
+    }
+
+    pub fn has_thinking_map(&self) -> bool {
         !self.thinking_level_map.is_empty()
     }
 
@@ -786,6 +796,10 @@ fn configure_cloudflare_workers(
     Ok(())
 }
 
+fn fixed_cloudflare_base(base: &str) -> bool {
+    !base.contains("{CLOUDFLARE_ACCOUNT_ID}") && !base.contains("{CLOUDFLARE_GATEWAY_ID}")
+}
+
 pub(super) fn cloudflare_workers_chat_account(endpoint: &str) -> Option<&str> {
     let path = endpoint.strip_prefix("https://api.cloudflare.com/client/v4/accounts/")?;
     let account = path.strip_suffix("/ai/v1/chat/completions")?;
@@ -836,6 +850,27 @@ impl Profiles {
     #[cfg(test)]
     fn parse_with_cloudflare_account(data: &Value, account: Option<&str>) -> Result<Self> {
         Self::parse_with_cloudflare_routes(data, account, None)
+    }
+
+    pub(super) fn cloudflare_configured_base(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+    ) -> Option<&str> {
+        let profile = self.entries.get(provider.id())?;
+        model
+            .and_then(|id| profile.models.iter().find(|model| model.id == id))
+            .and_then(|model| model.base_url.as_deref())
+            .or(profile.configured_cloudflare_base.as_deref())
+    }
+
+    pub(super) fn has_fixed_cloudflare_endpoint(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+    ) -> bool {
+        self.cloudflare_configured_base(provider, model)
+            .is_some_and(fixed_cloudflare_base)
     }
 
     pub(super) fn cloudflare_gateway_route(&self) -> Option<&super::cloudflare_gateway::Route> {
@@ -1040,6 +1075,16 @@ impl Profiles {
                 metadata.validate(&provider, adapter, id)?;
                 metadata.headers = validate_headers(std::mem::take(&mut metadata.headers))?;
             }
+            let configured_cloudflare_base = configured_providers
+                .get(name)
+                .filter(|configured| {
+                    matches!(
+                        provider.id(),
+                        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+                    ) && configured["api"] != "cloudflare-workers-ai-system-one"
+                })
+                .and_then(|configured| configured["baseUrl"].as_str())
+                .map(str::to_owned);
             let id = provider.id().to_owned();
             if entries
                 .insert(
@@ -1048,6 +1093,7 @@ impl Profiles {
                         provider,
                         endpoint,
                         base_url: profile.base_url,
+                        configured_cloudflare_base,
                         provider_endpoints,
                         api_key: profile.api_key,
                         headers: validate_headers(profile.headers)?,
@@ -1377,6 +1423,16 @@ impl Profiles {
         )
     }
 
+    pub fn responses_max_output_tokens(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.cache_compatibility(provider, model)
+            .supports_max_output_tokens
+            .unwrap_or(true)
+    }
+
     pub fn responses_cache_support(
         &self,
         provider: &Provider,
@@ -1492,6 +1548,9 @@ impl Profiles {
         endpoint: &str,
     ) -> &'static [&'static str] {
         let adapter = self.model_adapter(provider, model);
+        if adapter == Adapter::MistralConversations {
+            return &["x-affinity"];
+        }
         let opencode = matches!(provider.id(), "opencode" | "opencode-go");
         let routing: &'static [&'static str] = if opencode {
             &["x-opencode-session"]
@@ -1690,7 +1749,7 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
             url.set_path(&normalized);
             return Ok(url.to_string());
         }
-        Adapter::ChatCompletions => "/chat/completions",
+        Adapter::ChatCompletions | Adapter::MistralConversations => "/chat/completions",
         Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Bedrock => return Ok(url.to_string()),
@@ -3256,6 +3315,32 @@ mod tests {
         assert_eq!(existing.supports_images(), None);
         assert_eq!(existing.context_window, Some(32000));
         assert_eq!(existing.max_tokens, None);
+    }
+
+    #[test]
+    fn mistral_catalog_uses_the_conversations_transport() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("mistral").unwrap();
+        assert_eq!(provider.adapter(), Adapter::MistralConversations);
+        assert_eq!(profiles.model_ids(&provider).len(), 34);
+        assert_eq!(profiles.model_ids(&provider)[0], "devstral-medium-latest");
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            profiles.session_affinity(
+                &provider,
+                "deepseek-v4-1-flash-1017",
+                profiles.endpoint(&provider)
+            ),
+            ["x-affinity"]
+        );
+        let model = profiles
+            .model(&provider, "deepseek-v4-1-flash-1017")
+            .unwrap();
+        assert_eq!(model.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(model.mapped_effort("off"), Some(Some("none")));
     }
 
     #[test]
