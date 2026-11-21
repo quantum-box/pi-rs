@@ -8947,6 +8947,12 @@ async fn exercise_nested_woken_live_receipt(selected: bool) {
             .state(),
         crate::task::TaskState::Failed(_)
     ));
+    drop(reopened);
+    let mut second_reopen = launch(true);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(second_reopen.try_wait().unwrap().is_none());
+    second_reopen.kill().unwrap();
+    second_reopen.wait().unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
         "called\n"
