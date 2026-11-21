@@ -1626,11 +1626,7 @@ fn edit_success(display_path: &str, original: &str, output: &str, count: usize) 
         .to_string()
         .len();
     let display = crate::text_edit::numbered_diff(&diff, digits);
-    let patch = diff
-        .unified_diff()
-        .context_radius(4)
-        .header(display_path, display_path)
-        .to_string();
+    let patch = crate::text_edit::unified_patch(display_path, &diff);
     Outcome::SucceededWithDetails {
         output: format!("Successfully replaced {count} block(s) in {display_path}."),
         details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
@@ -2050,6 +2046,14 @@ impl Tool for RemoteShellTool {
     }
 }
 
+fn pi_tool_failure(output: String) -> Outcome {
+    Outcome::TextResult {
+        output,
+        details: Some(json!({})),
+        is_error: true,
+    }
+}
+
 fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -> Outcome {
     let text = output.result_display();
     let mut structured_content = json!({"output":output.script,"truncated":output.script_truncated,"exit_code":code,"wall_time_seconds":(elapsed * 10.0).round() / 10.0});
@@ -2331,11 +2335,7 @@ impl Tool for CodingTool {
         };
         // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
         match outcome {
-            Outcome::Failed(output) if self.unrestricted => Outcome::TextResult {
-                output,
-                details: None,
-                is_error: true,
-            },
+            Outcome::Failed(output) if self.unrestricted => pi_tool_failure(output),
             outcome => outcome,
         }
     }
@@ -3267,13 +3267,7 @@ impl CodingTool {
         let unrestricted_find_limit = if is_find && self.unrestricted {
             match fd_numeric_limit(numeric_find_limit) {
                 Ok(limit) => Some(limit),
-                Err(output) => {
-                    return Ok(Outcome::TextResult {
-                        output,
-                        details: None,
-                        is_error: true,
-                    });
-                }
+                Err(output) => return Ok(pi_tool_failure(output)),
             }
         } else {
             None
@@ -5132,7 +5126,7 @@ mod tests {
         {
             Outcome::SucceededWithDetails { details, .. } => {
                 assert!(details.get("matchLimitReached").is_none());
-                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+                assert_eq!(details["truncation"]["totalLines"], count);
             }
             other => panic!("expected truncated result with details, got {other:?}"),
         }
@@ -5247,9 +5241,9 @@ mod tests {
             ),
             (
                 json!(2.5),
-                3,
-                "2.5 matches limit reached. Use limit=5",
-                json!(2.5),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
             ),
             (
                 json!("0b10"),
