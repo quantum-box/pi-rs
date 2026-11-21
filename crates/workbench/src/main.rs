@@ -2617,10 +2617,9 @@ async fn execute(
         ).await;
         if let Some(stream) = &mut stream {
             let aborted = matches!(&answer, Err(Error::Cancelled));
-            for event in stream.settle(aborted) {
+            for event in stream.settle(aborted, answer.is_ok()) {
                 output(event);
             }
-            output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
             output(json!({"type":"agent_settled","aborted":stream.aborted()}));
         }
         let answer = answer?;
@@ -2744,7 +2743,9 @@ fn trace_agent_event_json(mut event: serde_json::Value) -> serde_json::Value {
 
 fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) {
     match event {
-        Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
+        Notification::Retry(event) if !json_stream => {
+            output(serde_json::to_value(event).expect("retry event"))
+        }
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
         Notification::QueueUpdated {
             steering,

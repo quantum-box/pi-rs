@@ -554,8 +554,15 @@ classified callback.
 RPC validates images before command dispatch. An idle command that triggers a
 model turn reports `handled` before that turn completes, as in Pi. Commands
 submitted while a turn is active cannot yet execute immediately. A normal model turn returns
-`started` before completion. Wait for `agent_end` or `agent_settled` for that
-turn. The interface emits native journal events alongside Pi-style
+`started` before completion. Wait for `agent_settled` to know the run is idle.
+In JSON and RPC, a failed model attempt that will be retried emits
+`agent_end` with `willRetry: true` before `auto_retry_start`. The next
+attempt emits its own `agent_start`. Each `agent_end` carries the messages
+from that attempt. Cancelling the retry wait settles the run after
+`auto_retry_end` without starting another attempt. pi-rs acknowledges
+`abort_retry` when the backend handles the command and marks the cancelled
+run with `agent_settled.aborted: true`. The interface emits native journal events
+alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
 `toolcall_start` includes the ID and tool name available at that point.
