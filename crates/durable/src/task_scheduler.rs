@@ -10312,12 +10312,72 @@ impl Scheduler {
                                 || claim.checkpoint != *running.task.checkpoint()
                                 || Some(claim.kind.as_str()) != running.task.kind()
                                 || claim.definition_version != running.task.definition_version()
-                                || running.task.owner()
-                                    != &TaskOwner::Conversation(claim.conversation)
+                                || !(running.task.owner()
+                                    == &TaskOwner::Conversation(claim.conversation)
+                                    || matches!(running.task.owner(), TaskOwner::Task(_)))
                             {
                                 return Err(Error::Handler(
                                     "conversation woken terminal claim mismatch".into(),
                                 ));
+                            }
+                            if matches!(running.task.owner(), TaskOwner::Task(_)) {
+                                let (conversation, ancestry, ancestry_checks, ancestry_version) =
+                                    task_store::read_nested_cancel_claim_ancestry(
+                                        store,
+                                        running.task.id(),
+                                        claim.claim_id,
+                                    )?;
+                                let ancestry_key =
+                                    ancestry_checks.first().ok_or(Error::Ownership)?.key.clone();
+                                let claim_commit = store
+                                    .commit_for_version(&woken_key, entry.version)
+                                    .map_err(task_store::Error::from)?;
+                                let ancestry_commit = store
+                                    .commit_for_version(&ancestry_key, ancestry_version)
+                                    .map_err(task_store::Error::from)?;
+                                if conversation != claim.conversation
+                                    || claim_commit.is_none()
+                                    || claim_commit != ancestry_commit
+                                {
+                                    return Err(Error::Handler(
+                                        "woken child terminal ancestry mismatch".into(),
+                                    ));
+                                }
+                                let boundary =
+                                    store.put_version().map_err(task_store::Error::from)?;
+                                let mut next = running.clone();
+                                next.task.fail(reason).map_err(Error::Transition)?;
+                                let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                                batch.checks.extend(ancestry_checks);
+                                batch.checks.push(durable_store::Check {
+                                    key: woken_key,
+                                    expected: durable_store::Expected::Version(entry.version),
+                                });
+                                batch.checks.push(durable_store::Check {
+                                    key: crate::conversation_signal::callback_start_key(
+                                        conversation,
+                                    ),
+                                    expected: durable_store::Expected::Missing,
+                                });
+                                for ancestor in ancestry {
+                                    batch.checks.push(durable_store::Check {
+                                        key: task_store::callback_start_key(ancestor),
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                                store
+                                    .commit_with_prefix_put_fence(
+                                        &batch.checks,
+                                        &batch.mutations,
+                                        &[
+                                            task_store::PREFIX,
+                                            crate::ownership_edge::PREFIX,
+                                            b"runtime/conversation/",
+                                        ],
+                                        boundary,
+                                    )
+                                    .map_err(task_store::Error::from)?;
+                                return Ok(true);
                             }
                             let reg = self.registered(&running.task)?;
                             let selected = reg
