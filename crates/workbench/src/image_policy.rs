@@ -76,10 +76,14 @@ impl FinalStrictPolicy {
             if matches!(
                 adapter,
                 super::providers::Adapter::OpenAiResponses
+                    | super::providers::Adapter::AzureResponses
                     | super::providers::Adapter::CodexResponses
             ) {
-                self.profiles
-                    .responses_strict_tool_support(&self.provider, metadata.as_ref())
+                self.profiles.responses_strict_tool_support(
+                    &self.provider,
+                    adapter,
+                    metadata.as_ref(),
+                )
             } else {
                 self.profiles
                     .chat_compatibility(&self.provider, metadata.as_ref())

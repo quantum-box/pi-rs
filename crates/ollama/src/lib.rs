@@ -42,6 +42,7 @@ pub struct Ollama {
     reasoning_enabled: bool,
     allow_reasoning_off: bool,
     sampling: BTreeMap<String, Value>,
+    deployments: Arc<BTreeMap<String, String>>,
     native_probes: bool,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
@@ -228,10 +229,17 @@ impl Ollama {
             reasoning_enabled: false,
             allow_reasoning_off: true,
             sampling: BTreeMap::new(),
+            deployments: Arc::default(),
             native_probes: true,
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Map catalog model IDs to their wire deployment names.
+    pub fn with_deployments(mut self, deployments: &BTreeMap<String, String>) -> Self {
+        self.deployments = Arc::new(deployments.clone());
+        self
     }
 
     /// Set the per-read HTTP idle timeout; `None` disables it.
@@ -390,8 +398,16 @@ impl Ollama {
     }
 
     fn replay_identity(&self, model: &str) -> ResolvedModelIdentity {
+        let provider = if let Some(deployment) = self.deployments.get(model) {
+            pi_rs_core::endpoint_replay_scope(
+                &self.provider,
+                &format!("{}\n{deployment}", self.endpoint),
+            )
+        } else {
+            pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str())
+        };
         ResolvedModelIdentity {
-            provider: pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str()),
+            provider,
             model: model.to_owned(),
         }
     }
@@ -885,6 +901,11 @@ impl Model for Ollama {
             &self.sampling,
             self.cache_retention.anthropic_control(),
         ));
+        let base = if self.deployments.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(base, self.deployments.as_ref()))
+        };
         if self.prompt_cache_key_enabled || self.prompt_cache_long {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(
@@ -1061,7 +1082,11 @@ impl Ollama {
                 })
                 .collect()
         });
-        let mut body = json!({"model":request.model,"messages":messages,"stream":true});
+        let wire_model = self
+            .deployments
+            .get(&request.model)
+            .unwrap_or(&request.model);
+        let mut body = json!({"model":wire_model,"messages":messages,"stream":true});
         self.compatibility
             .request_options(&mut body, request.max_output_tokens, !tools.is_empty());
         if self.prompt_cache_key_enabled

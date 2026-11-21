@@ -474,15 +474,22 @@ impl Cli {
                     return None;
                 }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    let official = if provider.id() == "cloudflare-workers-ai" {
-                        model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
-                            && self
-                                .model_profiles
-                                .has_provider_endpoint(provider, endpoint)
-                    } else {
-                        builtin.is_official_endpoint(endpoint)
+                    let eligible = match provider.id() {
+                        "azure" => {
+                            !endpoint.is_empty()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        "cloudflare-workers-ai" => {
+                            model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        _ => builtin.is_official_endpoint(endpoint),
                     };
-                    return official
+                    return eligible
                         .then(|| std::env::var(builtin.env()).ok())
                         .flatten()
                         .filter(|key| !key.trim().is_empty())

@@ -13,6 +13,7 @@ use pi_rs_core::{
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -71,6 +72,9 @@ pub struct OpenAiResponses {
     endpoint: Url,
     endpoint_source: String,
     token: String,
+    azure_api_version: Option<String>,
+    azure_off_reasoning: Option<String>,
+    deployments: Arc<BTreeMap<String, String>>,
     codex_account: Option<String>,
     codex_off_effort: Option<String>,
     thinking: Option<String>,
@@ -254,6 +258,18 @@ impl OpenAiResponses {
         Ok(client)
     }
 
+    /// Connect to an Azure Responses endpoint using its API-key authentication.
+    pub fn new_azure(endpoint: &str, token: String, provider: &str) -> Result<Self> {
+        let mut client = Self::new_api_provider(endpoint, token, provider)?;
+        client.azure_api_version = Some("v1".into());
+        client.session_affinity_format = Some(SessionAffinityFormat::Disabled);
+        Ok(client)
+    }
+
+    pub fn is_azure(&self) -> bool {
+        self.azure_api_version.is_some()
+    }
+
     pub fn new_codex(endpoint: &str, token: String, provider: &str) -> Result<Self> {
         let account = codex_account_id(&token).ok_or_else(|| {
             Error::Config("OpenAI Codex requires a bearer token with an account ID".into())
@@ -311,6 +327,9 @@ impl OpenAiResponses {
             endpoint,
             endpoint_source,
             token,
+            azure_api_version: None,
+            azure_off_reasoning: None,
+            deployments: Arc::default(),
             codex_account: None,
             codex_off_effort: None,
             thinking: None,
@@ -326,6 +345,33 @@ impl OpenAiResponses {
             strict_tool_support: false,
             use_developer_role: false,
         })
+    }
+
+    /// Set the API version and model-to-deployment map for Azure Responses.
+    pub fn with_azure_routes(
+        mut self,
+        version: &str,
+        deployments: &BTreeMap<String, String>,
+        off_reasoning: Option<&str>,
+    ) -> Self {
+        if self.azure_api_version.is_some() {
+            self.azure_api_version = Some(version.to_owned());
+            self.deployments = Arc::new(deployments.clone());
+            self.azure_off_reasoning = off_reasoning.map(str::to_owned);
+        }
+        self
+    }
+
+    fn replay_provider(&self, model: &str) -> String {
+        if self.azure_api_version.is_some() {
+            let deployment = self.deployments.get(model).map_or(model, String::as_str);
+            pi_rs_core::endpoint_replay_scope(
+                &self.provider,
+                &format!("{}\n{deployment}", self.endpoint),
+            )
+        } else {
+            self.provider.clone()
+        }
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
@@ -495,15 +541,51 @@ impl OpenAiResponses {
         }
     }
 
+    fn authenticate(
+        &self,
+        request: reqwest::RequestBuilder,
+        mut headers: reqwest::header::HeaderMap,
+        azure_version: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder> {
+        if let Some(version) = azure_version {
+            if !headers.contains_key("api-key") {
+                let mut key = reqwest::header::HeaderValue::from_str(&self.token)
+                    .map_err(|_| Error::Config("invalid Azure OpenAI API key".into()))?;
+                key.set_sensitive(true);
+                headers.insert("api-key", key);
+            }
+            Ok(request.headers(headers).query(&[("api-version", version)]))
+        } else {
+            Ok(request.headers(headers).bearer_auth(&self.token))
+        }
+    }
+
     /// Return the signed-in account's displayable models in server order.
     pub async fn models(&self) -> Result<Vec<String>> {
+        self.models_with_azure_version(None).await
+    }
+
+    /// List models using the configured Azure API version when applicable.
+    pub async fn models_with_azure_version(
+        &self,
+        azure_version: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut endpoint = self.endpoint.clone();
-        endpoint.set_path("/v1/models");
+        let version = self
+            .azure_api_version
+            .as_deref()
+            .map(|version| azure_version.unwrap_or(version));
+        if version.is_some() {
+            let path = endpoint.path().trim_end_matches('/');
+            let base = path
+                .strip_suffix("/responses")
+                .ok_or_else(|| Error::Config("Azure discovery requires a /responses URL".into()))?;
+            endpoint.set_path(&format!("{base}/models"));
+        } else {
+            endpoint.set_path("/v1/models");
+        }
         let mut response = self
-            .client
-            .get(endpoint)
-            .headers(self.headers.clone())
-            .bearer_auth(&self.token)
+            .authenticate(self.client.get(endpoint), self.headers.clone(), version)?
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI model listing failed".into()))?;
@@ -905,6 +987,16 @@ impl Model for OpenAiResponses {
                     self.explicit_cache_mode,
                 ))
             };
+        let base = if let Some(version) = &self.azure_api_version {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                version,
+                self.deployments.as_ref(),
+                &self.azure_off_reasoning,
+            ))
+        } else {
+            base
+        };
         let base = if self.session_affinity_format.is_none()
             && self.provider != "openrouter"
             && self.endpoint_source.contains("openrouter.ai")
@@ -960,15 +1052,16 @@ impl Model for OpenAiResponses {
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let replay_provider = self.replay_provider(&request.model);
         match message {
             Message::Assistant {
                 replay: Some(replay),
                 ..
             } if replay.identity.provider
                 == if self.codex_account.is_some() || replay.is_context_edit() {
-                    pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str())
+                    pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str())
                 } else {
-                    self.provider.clone()
+                    replay_provider
                 }
                 && replay.identity.model == request.model
                 && replay.supports_api(self.api()) =>
@@ -1159,12 +1252,13 @@ impl OpenAiResponses {
         tools: Option<Vec<Value>>,
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         let model = request.model.clone();
+        let replay_provider = self.replay_provider(&model);
         let edited_scope =
-            pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
+            pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str());
         let api = self.api();
         let mut body = responses_payload(
             &request,
-            &self.provider,
+            &replay_provider,
             &edited_scope,
             if self.use_developer_role {
                 "developer"
@@ -1173,6 +1267,12 @@ impl OpenAiResponses {
             },
             api,
         );
+        if self.azure_api_version.is_some() {
+            if let Some(deployment) = self.deployments.get(&model) {
+                body["model"] = json!(deployment);
+            }
+            body["max_output_tokens"] = json!(request.max_output_tokens.max(16));
+        }
         if let Some(tools) = tools
             && !tools.is_empty()
         {
@@ -1186,7 +1286,11 @@ impl OpenAiResponses {
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
-        } else if let Some(off) = &self.codex_off_effort {
+        } else if let Some(off) = self
+            .codex_off_effort
+            .as_ref()
+            .or(self.azure_off_reasoning.as_ref())
+        {
             body["reasoning"] = json!({"effort": off});
         }
         if self.codex_account.is_some()
@@ -1233,9 +1337,8 @@ impl OpenAiResponses {
                 request = request.header("originator", "pi");
             }
         }
+        let request = self.authenticate(request, headers, self.azure_api_version.as_deref())?;
         let mut response = request
-            .headers(headers)
-            .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body)
             .send()
@@ -1441,7 +1544,7 @@ impl OpenAiResponses {
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
                             identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
                                 ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
-                            } else { identity },
+                            } else { ResolvedModelIdentity { provider: replay_provider.clone(), model: model.clone() } },
                             blocks:output.clone()
                         })), ..Default::default() }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });

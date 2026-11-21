@@ -336,6 +336,8 @@ impl Keys {
                     }
                 };
                 let endpoint = match entry.get("endpoint") {
+                    // Azure routes are scoped by the configured account URL.
+                    None if name.eq_ignore_ascii_case("azure") => None,
                     None if name.eq_ignore_ascii_case("cloudflare-workers-ai") => None,
                     None => Provider::named(name)
                         .map(|provider| provider.default_endpoint())
