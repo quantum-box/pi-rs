@@ -450,6 +450,36 @@ pub(crate) async fn notify_session_compaction_with_host(
     {
         return notify_idle_session_entries(registry, session, event, timeout, observer).await;
     }
+    notify_session_callback(
+        registry,
+        session,
+        Some(event),
+        timeout,
+        observer,
+        idle,
+        compaction,
+    )
+    .await
+}
+
+pub(crate) async fn notify_mcp_registrations_in_session(
+    registry: &Registry,
+    session: &mut Session,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> crate::Result<()> {
+    notify_session_callback(registry, session, None, timeout, observer, true, None).await
+}
+
+async fn notify_session_callback(
+    registry: &Registry,
+    session: &mut Session,
+    event: Option<LifecycleEvent>,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    idle: bool,
+    compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
+) -> crate::Result<()> {
     let states = session.extension_states();
     let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
     let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender, idle });
@@ -467,15 +497,25 @@ pub(crate) async fn notify_session_compaction_with_host(
     };
     {
         let mut include_all = |_: &str| true;
-        let future = notify_inner(
-            registry,
-            event,
-            &states,
-            timeout,
-            (&mut collect, &mut include_all),
-            Some(host),
-            compaction,
-        );
+        let future = async {
+            match event {
+                Some(event) => {
+                    notify_inner(
+                        registry,
+                        event,
+                        &states,
+                        timeout,
+                        (&mut collect, &mut include_all),
+                        Some(host),
+                        compaction,
+                    )
+                    .await
+                }
+                None => {
+                    deliver_mcp_changes(registry, &states, timeout, &mut collect, Some(host)).await
+                }
+            }
+        };
         tokio::pin!(future);
         loop {
             tokio::select! {
@@ -548,13 +588,21 @@ async fn notify_idle_session_entries(
             let future = platform_time::timeout_at(
                 deadline,
                 crate::sdk::scope_extension_callback(host.callback_scope_owner(), async {
-                    extension
-                        .lifecycle_with_host(
-                            &event,
-                            states.get(extension.id()),
-                            crate::sdk::scope_callback_host(host),
-                        )
-                        .await
+                    let host = crate::sdk::scope_callback_host(host);
+                    if let Some(scope) = registry.mcp_callback_scope(extension.as_ref()) {
+                        extension
+                            .lifecycle_with_mcp_registry(
+                                &event,
+                                states.get(extension.id()),
+                                host,
+                                scope.host(),
+                            )
+                            .await
+                    } else {
+                        extension
+                            .lifecycle_with_host(&event, states.get(extension.id()), host)
+                            .await
+                    }
                 }),
             );
             tokio::pin!(future);
@@ -615,13 +663,74 @@ async fn notify_idle_session_entries(
             message,
         });
     }
+    let change_result =
+        notify_mcp_registrations_in_session(registry, session, timeout, observer).await;
     match host_error {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => change_result,
     }
 }
 
 async fn notify_inner(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    (observer, include): (&mut Observer<'_>, &mut (dyn FnMut(&str) -> bool + Send)),
+    host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+    compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
+) {
+    notify_inner_once(
+        registry,
+        event,
+        states,
+        timeout,
+        (observer, include),
+        host.clone(),
+        compaction,
+    )
+    .await;
+    deliver_mcp_changes(registry, states, timeout, observer, host).await;
+}
+
+async fn deliver_mcp_changes(
+    registry: &Registry,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+) {
+    let runtime = &registry.mcp_servers;
+    let Some(mut delivery) = runtime.begin_delivery() else {
+        return;
+    };
+    let began = platform_time::Instant::now();
+    let budget = timeout.min(Duration::from_secs(10));
+    // A callback can enqueue new changes while processing a notification.
+    // Limit one delivery wave even when the runtime clock is paused.
+    for _ in 0..32 {
+        let remaining = budget.saturating_sub(began.elapsed());
+        if remaining.is_zero() {
+            return;
+        }
+        let Some(servers) = delivery.pop_change() else {
+            return;
+        };
+        notify_inner_once(
+            registry,
+            LifecycleEvent::McpServersChange { servers },
+            states,
+            remaining,
+            (observer, &mut |_| true),
+            host.clone(),
+            None,
+        )
+        .await;
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn notify_inner_once(
     registry: &Registry,
     event: LifecycleEvent,
     states: &ExtensionStates,
@@ -679,6 +788,17 @@ async fn notify_inner(
                                         scoped,
                                     )
                                     .await
+                            } else if let Some(scope) =
+                                registry.mcp_callback_scope(extension.as_ref())
+                            {
+                                extension
+                                    .lifecycle_with_mcp_registry(
+                                        &event,
+                                        states.get(extension.id()),
+                                        scoped,
+                                        scope.host(),
+                                    )
+                                    .await
                             } else {
                                 extension
                                     .lifecycle_with_host(&event, states.get(extension.id()), scoped)
@@ -686,9 +806,20 @@ async fn notify_inner(
                             }
                         }
                         None => {
-                            extension
-                                .lifecycle(&event, states.get(extension.id()))
-                                .await
+                            if let Some(scope) = registry.mcp_callback_scope(extension.as_ref()) {
+                                extension
+                                    .lifecycle_with_mcp_registry(
+                                        &event,
+                                        states.get(extension.id()),
+                                        std::sync::Arc::new(McpOnlyHost),
+                                        scope.host(),
+                                    )
+                                    .await
+                            } else {
+                                extension
+                                    .lifecycle(&event, states.get(extension.id()))
+                                    .await
+                            }
                         }
                     }
                 },
@@ -705,6 +836,19 @@ async fn notify_inner(
             event: event.kind(),
             message: &error,
         });
+    }
+}
+
+struct McpOnlyHost;
+
+#[async_trait::async_trait]
+impl crate::ToolHost for McpOnlyHost {
+    fn tools(&self) -> Vec<crate::ToolSpec> {
+        Vec::new()
+    }
+
+    async fn call(&self, _: &str, _: serde_json::Value) -> crate::Outcome {
+        crate::Outcome::Skipped("tool calls are unavailable in this lifecycle callback".into())
     }
 }
 

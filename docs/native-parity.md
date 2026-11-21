@@ -4416,6 +4416,12 @@ handlers with the updated declaration list. Only the owner can replace or
 remove a registration. The SDK reports notification and follow-up errors
 through its session events after applying the registration change. The executable protocol negotiates that event
 independently of ordinary lifecycle events.
+Lifecycle handlers that opt in to the MCP registry host can read, register
+and remove declarations during their callback. The host binds operations to
+the running extension and delivers the resulting snapshots in mutation
+order. An executable negotiates this access through
+`mcp_registry_host_calls` and the duplex capability advertisement. SDK forks
+have their own snapshot of the active MCP registrations.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
