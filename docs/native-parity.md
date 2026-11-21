@@ -186,8 +186,11 @@ pi-rs waits for the auth lock, pi-rs reuses the currently stored token when
 its lifetime is sufficient. Saved plan credentials are bound to OpenAI's
 official endpoint. Live refresh of an imported Pi entry is unverified.
 
-`pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
-servers, and `--description` for either transport. HTTP headers can be combined
+`pi mcp add` accepts stdio commands with or without a preceding `--`.
+pi-rs passes the arguments after the executable verbatim, including a
+literal `--` immediately after it. The command accepts `--cwd` for stdio
+servers, repeated `--header` for HTTP servers, and `--description` for
+either transport. HTTP headers can be combined
 with `--bearer-token-env-var` unless an Authorization header is already present.
 `--env` is restricted to stdio and requires nonempty names; bearer-token
 environment variables apply to HTTP servers.
