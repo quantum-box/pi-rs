@@ -3624,6 +3624,170 @@ fn bedrock_login_selects_profile_chain_and_logout() {
 }
 
 #[test]
+fn tree_navigation_during_streaming_restores_the_queue_before_checkout() {
+    for mode in ["regular", "fullscreen"] {
+        check_streaming_tree_navigation(mode);
+    }
+}
+
+fn check_streaming_tree_navigation(mode: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut session = pi_rs::Session::open(&session_path).unwrap();
+    session
+        .append_user_with_images("historical anchor".into(), vec![], None)
+        .unwrap();
+    drop(session);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    listener.set_nonblocking(true).unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if matches!(
+                        released.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected)
+                    ) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            };
+            prepare_gate(&socket);
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut method = String::new();
+            reader.read_line(&mut method).unwrap();
+            let mut size = 0;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    size = value.trim().parse().unwrap();
+                }
+            }
+            if method.starts_with("GET ") {
+                let body = r#"{"data":[{"id":"test-fixture"}]}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                continue;
+            }
+            let mut body = vec![0; size];
+            reader.read_exact(&mut body).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"live-stream-marker\"}}]}\n\n").unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(45));
+            return;
+        }
+    });
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .args([
+                "--session",
+                session_path.to_str().unwrap(),
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-skills",
+                "--no-extensions",
+                "--model",
+                "test-fixture",
+                "--endpoint",
+                &endpoint,
+                "--tui-mode",
+                mode,
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"active prompt\r").unwrap();
+    output_until(&mut master, |text| text.contains("live-stream-marker"));
+    master.write_all(b"retained draft\r").unwrap();
+    // The terminal can redraw while the worker saves the input. Keep
+    // draining the PTY so a full output buffer cannot stall that redraw.
+    output_until(&mut master, |_| {
+        pi_rs::Session::snapshot(&session_path).is_ok_and(|session| {
+            session
+                .queued_inputs()
+                .iter()
+                .any(|message| message.input.content == "retained draft")
+        })
+    });
+
+    master.write_all(b"/tree\r").unwrap();
+    output_until(&mut master, |text| text.contains("Session tree"));
+    master.write_all(b"historical anchor\r").unwrap();
+    output_until(&mut master, |text| text.contains("Summarize branch?"));
+    let session = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert!(session.branch().iter().any(|record| matches!(&record.event,
+        pi_rs::Event::User { content, .. } if content == "active prompt"
+    )));
+    assert!(
+        !session.queued_inputs().is_empty(),
+        "opening the selector keeps queued input"
+    );
+
+    master.write_all(b"\r").unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(20), |text| {
+        text.contains("Navigated to selected point") && text.contains("retained draft")
+    });
+    let session = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert!(session.queued_inputs().is_empty());
+    assert!(
+        !session.branch().iter().any(|record| matches!(&record.event,
+            pi_rs::Event::User { content, .. } if content == "active prompt"
+        ))
+    );
+    drop(release);
+    server.join().unwrap();
+}
+
+#[test]
 fn external_editor_ctrl_c_does_not_cancel_active_backend_shell() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
