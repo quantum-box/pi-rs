@@ -2598,7 +2598,9 @@ filters. Project and transient declarations override the corresponding user
 package even when they select another revision. Removal accepts an unversioned
 source and leaves cached artifacts intact.
 
-Missing local paths retain their resolved identity for listing and removal.
+Missing local paths retain their resolved identity for listing and removal. Dot
+segments in local declarations are resolved before comparing symlinks. A path
+such as `./link/../package` selects `./package` from the declaration's base.
 Installing a missing source fails before settings change. CLI fixtures cover
 version replacement, cross-scope revision overrides, inherited resource deltas,
 deleted-source cleanup and the existing transient/offline behaviors.
