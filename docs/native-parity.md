@@ -166,6 +166,12 @@ in the future afterward. The probe preserved credentials on authorization
 failure; its successful refresh path was otherwise unchanged. New-account
 browser login, other account configurations and broader live acceptance remain
 open.
+The ChatGPT plan can also use Pi's flat OAuth entries in `auth.json`. Refresh
+preserves Pi's field names, millisecond expiry and rotated token, without
+creating a native account record. If Pi refreshes that same account while
+pi-rs waits for the auth lock, pi-rs reuses the currently stored token when
+its lifetime is sufficient. Saved plan credentials are bound to OpenAI's
+official endpoint. Live refresh of an imported Pi entry is unverified.
 
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
@@ -1582,7 +1588,9 @@ read `auth.json`; availability checks and model calls still load credentials
 and report authentication-file errors. Memory, stack and output have explicit
 bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
-waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
+waiting for a worker. Like Pi, a script awaiting an unresolved promise fails
+as soon as it has no pending host calls or JavaScript jobs, even without a
+configured deadline. Worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
 cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
@@ -2112,6 +2120,10 @@ legacy metadata hooks retain their existing bounded execution.
 
 ### Markdown presentation checkpoint
 
+Terminal Markdown expands tabs to three spaces before parsing, matching Pi.
+This applies to block marker indentation, reference definitions, and inline and
+fenced code.
+
 Level-one headings use underlining, lower-level headings retain their markers,
 and code blocks show language-labelled fences with indented syntax highlighting.
 Code blocks are separated from following blocks; syntax tokens use the active
@@ -2139,9 +2151,12 @@ have native work limits; inputs that exceed them use the existing bounded
 renderer and can differ in spacing from Pi.
 Nested list spacing follows source block boundaries. Source soft breaks
 produce separate rows in paragraphs, quotes, and list items, with list
-continuation prefixes, matching Pi. Extra source indentation, width-based
-wrapping, some numbered nested lists, and list-contained horizontal rules
-can still differ.
+continuation prefixes, matching Pi. Prose wraps at words and CJK graphemes
+and preserves inline styles across the wrap. Thematic breaks within an item
+use its continuation indentation and available width. List continuation rows
+retain extra source spaces after stripping the applicable marker indents.
+Tab-indented continuations, some numbered nested lists, and ambiguous list
+marker and rule syntax can still differ.
 If nested-math scanning exceeds its resource limit, reference links may remain
 unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
@@ -2503,7 +2518,7 @@ horizontally to keep the selected entry visible while retaining the selection
 gutter; clipping skips partially visible wide characters at either boundary
 while preserving theme styling.
 Searching includes records inside folded branches. Shift+L edits or removes a
-record label without changing its identity. Direct `/checkout` releases its
+record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
 journal lock before restoring the view.
 Tree search also matches the first 200 UTF-16 units of tool-result text.
 
@@ -3107,6 +3122,9 @@ with chunked multibyte output; other local-tool parity gaps remain open.
 Invalid regular expressions in unrestricted local `grep` include the `rg:`
 prefix used by Pi's ripgrep diagnostic. Unsupported look-around and
 backreferences include ripgrep's PCRE2 suggestion.
+Malformed `glob` filters report the original glob with ripgrep's diagnostic
+before regex compilation. Unrestricted local `grep` and `ls` report the
+requested path as missing when an intermediate component is a regular file.
 
 Grep now emits a separate context block for each match, including repeated lines
 where adjacent matches overlap. The matching marker belongs to that block's
