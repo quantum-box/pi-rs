@@ -242,3 +242,69 @@ fn skill_grants_reject_drive_relative_or_rooted_paths() {
         assert!(error.contains("fully absolute or relative"));
     }
 }
+
+#[test]
+fn sdk_expands_known_skills_only_with_a_fresh_exact_grant() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("review");
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("SKILL.md");
+    let initial = "\u{feff}---\r\nname: review\r\ndescription: inspect\r\ndisable-model-invocation: true\r\n---\r\nold body";
+    std::fs::write(&path, initial).unwrap();
+
+    let no_files = SkillReadGrants::default();
+    let snapshot = no_files
+        .load_with_directories(&[root.path().to_owned()])
+        .unwrap();
+    assert!(snapshot.skills[0].disable_model_invocation);
+    assert!(
+        snapshot
+            .expand_command("/skill:missing", &no_files)
+            .unwrap()
+            .is_none()
+    );
+    assert!(snapshot.expand_command("/skill:review", &no_files).is_err());
+
+    let granted = SkillReadGrants {
+        files: vec![path.clone()],
+    };
+    std::fs::write(
+        &path,
+        initial.replace("old body", " first line\rsecond line "),
+    )
+    .unwrap();
+    let expanded = snapshot
+        .expand_command("/skill:review \u{a0}topic\u{feff}", &granted)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        expanded,
+        format!(
+            "<skill name=\"review\" location=\"{}\">\nReferences are relative to {}.\n\nfirst line\nsecond line\n</skill>\n\ntopic",
+            path.display(),
+            directory.display()
+        ),
+    );
+    assert!(
+        snapshot
+            .expand_command("/skill:review\ttopic", &granted)
+            .unwrap()
+            .is_none()
+    );
+    std::fs::write(&path, format!("\u{feff}{initial}")).unwrap();
+    let expanded = snapshot
+        .expand_command("/skill:review", &granted)
+        .unwrap()
+        .unwrap();
+    assert!(expanded.contains("\n\n---\nname: review\ndescription: inspect"));
+    let rediscovered = granted.load().unwrap();
+    assert!(rediscovered.skills.is_empty());
+    assert!(
+        rediscovered
+            .diagnostics
+            .iter()
+            .any(|item| item.message == "description is required")
+    );
+    std::fs::remove_file(path).unwrap();
+    assert!(snapshot.expand_command("/skill:review", &granted).is_err());
+}

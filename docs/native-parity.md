@@ -5713,6 +5713,15 @@ returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
 
+### SDK skill commands
+
+`SkillResources::expand_command` renders Pi-style `/skill:name` invocations
+from an existing skill catalog and a current exact-file grant. Directly
+invoked skills can be marked manual-only. Expansion reads the current
+body, strips frontmatter, and appends the trimmed arguments. Unknown names
+are passed on for host handling. Missing files and denied grants return errors,
+so a GUI can report the failure and keep the user's original input.
+
 ### Native SDK theme snapshots
 
 `pi_rs_workbench::theme_resources::ThemeReadGrants` loads an ordered snapshot
