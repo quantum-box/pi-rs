@@ -4354,6 +4354,7 @@ mod estimation_tests {
             ("azure", "gpt-daybreak-red-latest", true, "minimal"),
             ("azure", "deepseek-v4-pro", false, "off"),
             ("azure-relay", "o4-mini", true, "off"),
+            ("azure-relay", "o4-mini", true, "high"),
         ] {
             let mut args = super::super::Cli::parse_from(["pi"]);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4381,7 +4382,7 @@ mod estimation_tests {
             let selected = args.model_profiles.provider(provider).unwrap();
             args.activate_provider(selected, Some(model)).unwrap();
             args.model = model.into();
-            if provider == "azure" && model == "o4-mini" {
+            if model == "o4-mini" {
                 assert_eq!(
                     super::super::thinking::available(&mut args),
                     ["off", "low", "medium", "high"]

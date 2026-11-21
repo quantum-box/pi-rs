@@ -391,9 +391,10 @@ form for Foundry models. [Microsoft Foundry endpoint authentication](https://lea
 Model discovery on named Responses relays uses the same API key, version
 and URL prefix. A positive output budget under 16 tokens ends the run before
 an Azure Responses request is sent. The bundled
-o-series entries support low, medium and high effort. Reasoning models without
-an explicit map, including the Daybreak entries, use Pi's default off, minimal,
-low, medium and high levels. With thinking off and no
+o-series entries support low, medium and high effort. Named Azure relays
+inherit the bundled effort map for matching model IDs unless configured with
+their own. Azure reasoning models without either map, including Daybreak, use
+Pi's default off, minimal, low, medium and high levels. With thinking off and no
 explicit model mapping, the original GPT-5 reasoning models and o-series
 leave effort unset so Azure can apply its default. This differs from Pi's
 `none` fallback and follows [Azure's model support documentation](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning).

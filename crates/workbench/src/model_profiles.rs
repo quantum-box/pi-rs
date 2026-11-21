@@ -1770,10 +1770,23 @@ impl Profiles {
         {
             model.compat = model.compat.clone().overlay(profile.compat.clone());
         }
-        match profile.and_then(|profile| profile.overrides.get(id)) {
-            Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
-            None => model,
+        let mut model = match profile.and_then(|profile| profile.overrides.get(id)) {
+            Some(overrides) => model.unwrap_or_default().overlay(overrides),
+            None => model?,
+        };
+        // A named Azure relay may declare only reasoning capability. Keep a
+        // model-specific map when the same ID has one in the Azure catalog.
+        if self.model_adapter(provider, id) == Adapter::AzureResponses
+            && model.thinking_level_map.is_empty()
+            && let Some(configured) = BUILTIN_MODELS
+                .get("azure")
+                .and_then(|models| models.iter().find(|model| model.id == id))
+        {
+            model
+                .thinking_level_map
+                .clone_from(&configured.metadata.thinking_level_map);
         }
+        Some(model)
     }
 }
 
