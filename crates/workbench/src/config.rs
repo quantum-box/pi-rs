@@ -459,6 +459,13 @@ impl Settings {
         })
     }
 
+    pub fn editor_padding(&self) -> usize {
+        // JSON Schema treats integer-equivalent numbers such as 2.0 as integers.
+        self.value["editorPaddingX"]
+            .as_f64()
+            .map_or(0, |padding| padding.clamp(0.0, 3.0) as usize)
+    }
+
     pub fn output_padding(&self) -> usize {
         usize::from(self.value["outputPad"].as_f64() != Some(0.0))
     }

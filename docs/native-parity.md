@@ -2407,7 +2407,9 @@ telemetry and warnings controls are still open.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
 settings. When several values in a file are invalid, the diagnostic lists the
 settings file and affected JSON paths, including nested package fields and
-invalid HTTP idle timeout strings. It omits the rejected values and preserves
+invalid HTTP idle timeout strings. Integer-equivalent JSON number forms
+such as `2.0` apply the same editor padding and select the same preset as
+`2`. It omits the rejected values and preserves
 the file. If the editor cannot fit the diagnostic, Page Up and Page Down show
 the other pages without discarding the edit.
 

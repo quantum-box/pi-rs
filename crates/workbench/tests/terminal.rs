@@ -955,14 +955,37 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 
 #[test]
 fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
+    check_numeric_setting_cycle(
+        r#"{"autocompleteMaxVisible":4}"#,
+        "Autocomplete max items",
+        "autocompleteMaxVisible",
+        "4",
+        &[3, 5, 7],
+    );
+}
+
+#[test]
+fn settings_treats_integer_equivalent_editor_padding_as_the_same_preset() {
+    check_numeric_setting_cycle(
+        r#"{"editorPaddingX":2.0}"#,
+        "Editor padding",
+        "editorPaddingX",
+        "2",
+        &[3, 0],
+    );
+}
+
+fn check_numeric_setting_cycle(
+    settings: &str,
+    label: &str,
+    key: &str,
+    initial_value: &str,
+    expected: &[u64],
+) {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(
-        home.join("settings.json"),
-        r#"{"autocompleteMaxVisible":4}"#,
-    )
-    .unwrap();
+    std::fs::write(home.join("settings.json"), settings).unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {
@@ -1016,20 +1039,19 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
     output_until(&mut master, |text| text.contains("Auto-compact"));
-    master.write_all(b"Autocomplete max items\r").unwrap();
+    master.write_all(label.as_bytes()).unwrap();
     output_until(&mut master, |text| {
-        settings_row_shows(text, "Autocomplete max items", "3")
+        settings_row_shows(text, label, initial_value)
     });
-    let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(saved["autocompleteMaxVisible"], 3);
-    master.write_all(b"\r\r").unwrap();
-    output_until(&mut master, |text| {
-        settings_row_shows(text, "Autocomplete max items", "7")
-    });
-    let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(saved["autocompleteMaxVisible"], 7);
+    for expected in expected {
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| {
+            settings_row_shows(text, label, &expected.to_string())
+        });
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved[key], *expected);
+    }
 }
 
 #[test]
