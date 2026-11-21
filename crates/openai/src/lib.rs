@@ -514,9 +514,9 @@ impl OpenAiResponses {
     fn authenticate(
         &self,
         request: reqwest::RequestBuilder,
+        mut headers: reqwest::header::HeaderMap,
         azure_version: Option<&str>,
     ) -> Result<reqwest::RequestBuilder> {
-        let mut headers = self.headers.clone();
         if let Some(version) = azure_version {
             if !headers.contains_key("api-key") {
                 let mut key = reqwest::header::HeaderValue::from_str(&self.token)
@@ -555,7 +555,7 @@ impl OpenAiResponses {
             endpoint.set_path("/v1/models");
         }
         let mut response = self
-            .authenticate(self.client.get(endpoint), version)?
+            .authenticate(self.client.get(endpoint), self.headers.clone(), version)?
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI model listing failed".into()))?;
@@ -1209,8 +1209,17 @@ impl OpenAiResponses {
                 value.to_str().ok().map(|value| (name.as_str(), value))
             }),
         );
+        let mut headers = self.headers.clone();
+        if provider == "github-copilot" {
+            for (name, value) in pi_rs_core::copilot_request_headers(&request.messages) {
+                headers
+                    .entry(name)
+                    .or_insert_with(|| reqwest::header::HeaderValue::from_static(value));
+            }
+        }
         let request = self.authenticate(
             self.client.post(self.endpoint.clone()),
+            headers,
             self.azure_api_version.as_deref(),
         )?;
         let mut response = request

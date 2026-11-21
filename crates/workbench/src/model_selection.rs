@@ -103,6 +103,17 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             Err(_) => {}
         }
     }
+    let endpoint = args.endpoint_for(&provider);
+    if matches!(
+        args.model_credential_for(&provider, endpoint),
+        Some(super::model_auth::Credential::Copilot)
+    ) {
+        // The worker may have refreshed the shared subscription since these arguments were cloned.
+        let current = super::model_auth::Keys::load_async().await?;
+        if let Some(available) = current.available_model_ids(&provider, endpoint) {
+            models.retain(|model| available.contains(model));
+        }
+    }
     let mut aliases = aliases(&args.model_profiles, &provider, &models);
     let configured: std::collections::HashSet<_> =
         aliases.iter().map(|(id, _)| id.clone()).collect();
@@ -181,6 +192,14 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
                 if !models.contains(model) {
                     models.push(model.clone());
                 }
+            }
+            let endpoint = args.endpoint_for(&provider);
+            if matches!(
+                args.model_credential_for(&provider, endpoint),
+                Some(super::model_auth::Credential::Copilot)
+            ) && let Some(available) = args.model_keys.available_model_ids(&provider, endpoint)
+            {
+                models.retain(|model| available.contains(model));
             }
             if models.is_empty() {
                 return None;

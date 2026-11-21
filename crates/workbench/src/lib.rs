@@ -15,11 +15,15 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: u64 = 64 * 1024;
 const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 
+pub mod auth_factory;
 mod cli_attachment_sniff;
 pub mod coding;
 pub mod coding_factories;
 mod coding_paths;
 pub use coding_paths::normalize_plain as normalize_path;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use coding_paths::windows_shell_path;
 mod file_search;
 pub mod image_profile;
 pub mod mcp;
