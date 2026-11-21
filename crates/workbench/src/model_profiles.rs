@@ -1603,6 +1603,10 @@ mod tests {
             Some("https://relay.example/v1beta1")
         );
         assert_eq!(profiles.model_ids(&provider).len(), 14);
+        assert_eq!(
+            Profiles::default().model_ids(&provider)[0],
+            "gemini-3.1-pro-preview"
+        );
         assert!(
             profiles
                 .model_ids(&provider)

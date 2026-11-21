@@ -197,7 +197,7 @@ impl Google {
     }
 
     pub fn with_context_probe(mut self, enabled: bool) -> Self {
-        self.probe_context = enabled;
+        self.probe_context = enabled && !self.vertex;
         self
     }
     pub fn with_thinking(mut self, thinking: Option<&str>) -> Self {
