@@ -267,13 +267,11 @@ impl MessageHooks {
     pub(crate) async fn tool(
         &mut self,
         call_id: &str,
-        outcome: &Outcome,
+        mut outcome: Outcome,
         output_limit: usize,
-    ) -> Option<Outcome> {
-        let mut outcome = crate::agent::bound_tool_outcome(outcome.clone(), output_limit).ok()?;
-        let mut edited = false;
+    ) -> Outcome {
         if matches!(outcome, Outcome::Pending { .. } | Outcome::Unknown(_)) {
-            return None;
+            return outcome;
         }
         let mut message = tool_message(call_id, &outcome);
         self.observe(
@@ -318,17 +316,16 @@ impl MessageHooks {
                 None
             };
             if let Some(candidate) = candidate
-                && crate::agent::bound_tool_outcome(candidate.clone(), output_limit)
-                    .is_ok_and(|bounded| bounded == candidate)
+                && crate::agent::encoded_tool_output_bytes(&candidate)
+                    .is_ok_and(|bytes| bytes <= output_limit)
             {
                 message = tool_message(call_id, &candidate);
                 outcome = candidate;
-                edited = true;
             } else {
                 self.record_failure(index, Phase::End, "message_end may edit tool result text within the output limit and must retain the call ID, status and other result data".into(), false);
             }
         }
-        edited.then_some(outcome)
+        outcome
     }
 
     pub(crate) async fn update(&mut self, parts: &[String], update: AssistantMessageUpdate) {

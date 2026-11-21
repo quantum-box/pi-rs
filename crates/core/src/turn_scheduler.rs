@@ -1993,7 +1993,7 @@ enum TurnEvent {
     ),
     Transformed(
         usize,
-        ToolReply,
+        Result<ToolReply>,
         Option<u64>,
         Vec<(String, &'static str, String)>,
         bool,
@@ -2482,23 +2482,6 @@ impl Agent<'_> {
                     unreachable!()
                 };
                 let outcome = Outcome::Skipped(reason);
-                if calls[index].lane.is_none()
-                    && let Some(mut hooks) = crate::message_hooks::MessageHooks::for_states(
-                        self.registry,
-                        states,
-                        self.limits.model_timeout,
-                    )
-                {
-                    let invocation = &calls[index].invocation;
-                    hooks
-                        .tool(
-                            &invocation.call.id,
-                            &outcome,
-                            self.tool_output_limit(session, invocation),
-                        )
-                        .await;
-                    hooks.report_errors(observer);
-                }
                 commit_with_reply(
                     session,
                     Event::ToolFinished {
@@ -2548,7 +2531,8 @@ impl Agent<'_> {
                     invocation.operation_id,
                     "recovered_tool_result",
                 );
-                let message_hooks = if calls[index].lane.is_none() {
+                let output_limit = self.tool_output_limit(session, &invocation);
+                let message_hooks = if calls[index].lane.is_none() && !cancel.is_cancelled() {
                     crate::message_hooks::MessageHooks::for_states(
                         &registry,
                         &snapshot,
@@ -2556,8 +2540,7 @@ impl Agent<'_> {
                     )
                 } else {
                     None
-                }
-                .map(|hooks| (hooks, self.tool_output_limit(session, &invocation)));
+                };
                 let future = async move {
                     let mut errors = Vec::new();
                     let mut collect = |event: Notification<'_>| {
@@ -2581,16 +2564,23 @@ impl Agent<'_> {
                         Some(hook_host),
                     )
                     .await;
-                    if let Some((mut hooks, output_limit)) = message_hooks {
-                        if let Some(outcome) = hooks
-                            .tool(&invocation.call.id, &reply.outcome, output_limit)
-                            .await
-                        {
-                            reply.outcome = outcome;
+                    let result = match bound_tool_outcome(reply.outcome, output_limit) {
+                        Ok(mut outcome) => {
+                            if let Some(mut hooks) = message_hooks
+                                && !cancel.is_cancelled()
+                            {
+                                outcome =
+                                    hooks.tool(&invocation.call.id, outcome, output_limit).await;
+                                hooks.report_errors(&mut collect);
+                            }
+                            Ok(ToolReply {
+                                outcome,
+                                state: reply.state,
+                            })
                         }
-                        hooks.report_errors(&mut collect);
-                    }
-                    TurnEvent::Transformed(index, reply, duration, errors, replaced)
+                        Err(error) => Err(error),
+                    };
+                    TurnEvent::Transformed(index, result, duration, errors, replaced)
                 }
                 .boxed();
                 let started = start_turn_future(future).await;
@@ -2752,7 +2742,7 @@ impl Agent<'_> {
                     }
                     TurnEvent::Transformed(index, reply, duration, errors, replaced) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
-                        let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), !replaced);
+                        let finished = reply.and_then(|reply| self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), !replaced));
                         let outcome = session.operations().into_iter().find_map(|(invocation,state)| if invocation.operation_id == calls[index].invocation.operation_id { if let OperationState::Finished(outcome) = state { Some(outcome) } else { None } } else { None }).unwrap_or_else(|| Outcome::Unknown("tool produced no durable result".into()));
                         if matches!(&finished, Err(Error::PendingOperation(_)))
                             && let Outcome::Pending { reference } = &outcome

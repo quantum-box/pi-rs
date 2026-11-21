@@ -4422,8 +4422,9 @@ tool-result transformations and before the completed result is saved. The
 same record carries the edited text and the tool's state update. A text edit
 retains the call ID, error status, details and attachments, including non-text
 blocks in a structured result. Native `tool_execution_end` follows the
-journal commit. Programmatic tools and outcomes awaiting polling or
-reconciliation do not emit a model-facing result at that point.
+journal commit. Callbacks run for scheduler results and terminal polls.
+Programmatic results, canceled cleanup, and administrative reconciliation
+keep their existing native journal paths.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,

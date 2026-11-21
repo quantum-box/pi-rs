@@ -3937,8 +3937,8 @@ impl Agent<'_> {
                         self.limits.model_timeout,
                     )
                 })
-                .flatten()
-                .map(|hooks| (hooks, self.tool_output_limit(session, &invocation)));
+                .flatten();
+            let max_output_bytes = self.tool_output_limit(session, &invocation);
             let mut errors = Vec::new();
             let mut collect = |event: Notification<'_>| {
                 if let Notification::ExtensionLifecycleError {
@@ -3975,13 +3975,11 @@ impl Agent<'_> {
                         Some(result_host),
                     )
                     .await;
-                    if let Some((mut hooks, max_output_bytes)) = message_hooks {
-                        if let Some(outcome) = hooks
-                            .tool(&invocation.call.id, &reply.outcome, max_output_bytes)
-                            .await
-                        {
-                            reply.outcome = outcome;
-                        }
+                    reply.outcome = bound_tool_outcome(reply.outcome, max_output_bytes)?;
+                    if let Some(mut hooks) = message_hooks {
+                        reply.outcome = hooks
+                            .tool(&invocation.call.id, reply.outcome, max_output_bytes)
+                            .await;
                         hooks.report_errors(&mut collect);
                     }
                     Ok::<_, Error>(reply)
@@ -4073,7 +4071,6 @@ impl Agent<'_> {
             state: update,
         } = reply;
         let max_output_bytes = self.tool_output_limit(session, invocation);
-        let outcome = bound_tool_outcome(outcome, max_output_bytes)?;
         let operation_id = invocation.operation_id;
         let event_metadata = if allow_event_metadata {
             self.registry
@@ -7300,13 +7297,13 @@ fn is_programmatic_tool(session: &Session, invocation: &Invocation) -> bool {
     })
 }
 
-pub(crate) fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> Result<Outcome> {
+fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> Result<Outcome> {
     Ok(match outcome {
         Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {
             original_bytes: output.len(),
         },
         outcome @ Outcome::SucceededWithDetails { .. } => {
-            let size = serde_json::to_vec(&outcome)?.len();
+            let size = encoded_tool_output_bytes(&outcome)?;
             if size > max_output_bytes {
                 Outcome::Truncated {
                     original_bytes: size,
@@ -7317,7 +7314,7 @@ pub(crate) fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> R
         }
         outcome
         @ (Outcome::TextResult { .. } | Outcome::TextResultWithStructuredContent { .. }) => {
-            let size = serde_json::to_vec(&outcome)?.len();
+            let size = encoded_tool_output_bytes(&outcome)?;
             if size > max_output_bytes {
                 Outcome::TextResult {
                     output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
@@ -7329,7 +7326,7 @@ pub(crate) fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> R
             }
         }
         outcome @ Outcome::Structured { .. } => {
-            let size = outcome.tool_content().len();
+            let size = encoded_tool_output_bytes(&outcome)?;
             if size > max_output_bytes {
                 Outcome::Truncated {
                     original_bytes: size,
@@ -7339,7 +7336,7 @@ pub(crate) fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> R
             }
         }
         outcome @ Outcome::StructuredWithDetails { .. } => {
-            let size = serde_json::to_vec(&outcome)?.len();
+            let size = encoded_tool_output_bytes(&outcome)?;
             if size > max_output_bytes {
                 Outcome::Truncated {
                     original_bytes: size,
@@ -7361,6 +7358,14 @@ pub(crate) fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> R
             Outcome::Unknown("tool returned an invalid operation reference".into())
         }
         outcome => outcome,
+    })
+}
+
+pub(crate) fn encoded_tool_output_bytes(outcome: &Outcome) -> Result<usize> {
+    Ok(match outcome {
+        Outcome::Succeeded(text) => text.len(),
+        Outcome::Structured { .. } => outcome.tool_content().len(),
+        outcome => serde_json::to_vec(outcome)?.len(),
     })
 }
 
