@@ -3308,8 +3308,20 @@ impl CodingTool {
         });
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
+        let windows_pattern =
+            (is_find && self.unrestricted && cfg!(windows)).then(|| pattern.replace('\\', "/"));
+        let pattern = windows_pattern.as_deref().unwrap_or(pattern);
+        let pattern = if is_find && self.unrestricted {
+            pattern.trim_start_matches("./")
+        } else {
+            pattern
+        };
+        let is_path_pattern = pattern.contains('/');
+        let relative_find_pattern =
+            self.unrestricted && is_path_pattern && !Path::new(pattern).has_root();
         let glob = if is_find {
-            let pattern = if pattern.contains('/')
+            let pattern = if !self.unrestricted
+                && is_path_pattern
                 && !pattern.starts_with('/')
                 && !pattern.starts_with("**/")
             {
@@ -3439,7 +3451,9 @@ impl CodingTool {
                 .ok()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(entry.file_name()));
-            let match_path = if pattern.contains('/') {
+            let match_path = if relative_find_pattern {
+                relative
+            } else if is_path_pattern {
                 entry.path()
             } else {
                 Path::new(entry.file_name())
@@ -7498,6 +7512,52 @@ mod tests {
                 &pi_rs::CancellationToken::new()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn unrestricted_find_anchors_relative_globs_at_search_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for path in ["src/a.ts", "pkg/src/b.ts", "CaseDir/mixed.ts"] {
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, "").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root,
+            kind: Kind::Find,
+        };
+        let token = pi_rs::CancellationToken::new();
+        for (pattern, expected) in [
+            ("src/*.ts", "src/a.ts"),
+            ("./src/*.ts", "src/a.ts"),
+            ("././src/*.ts", "src/a.ts"),
+            ("**/src/*.ts", "pkg/src/b.ts\nsrc/a.ts"),
+            ("casedir/*.ts", "CaseDir/mixed.ts"),
+        ] {
+            assert_eq!(
+                tool.search(&json!({"pattern": pattern}), &token)
+                    .unwrap()
+                    .tool_content(),
+                expected,
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            tool.search(&json!({"pattern":"src/*.ts", "path":"pkg"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/b.ts"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            tool.search(&json!({"pattern":r"src\*.ts"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/a.ts"
         );
     }
 

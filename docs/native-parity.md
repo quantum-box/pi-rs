@@ -3251,8 +3251,11 @@ Native `find` now includes directory matches (with a trailing slash), hidden
 entries and symlinks without following symlink targets. It follows the reference
 CLI's ignore-file behavior instead of unconditionally excluding `node_modules`
 and `.git`. Git ignore rules also apply outside repositories. Basename patterns
-use smart case; patterns containing a slash match full paths with the reference's
-implicit `**/` prefix. Results use forward slashes and sorted output.
+use smart case. Unrestricted local `find` anchors relative path patterns at the
+search root, strips leading `./` segments and uses explicit `**/` to match
+nested paths, as in Pi 1.6.0. Windows patterns accept backslash separators.
+Scoped `find` retains its implicit `**/` prefix. Native results use forward
+slashes and deterministic traversal order.
 Unrestricted local `find` uses fd's diagnostics for missing or non-directory
 search roots and invalid glob patterns. Search-root validation comes first.
 
