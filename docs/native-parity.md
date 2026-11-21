@@ -4549,7 +4549,12 @@ components; unlike Pi, scripts cannot inspect `baseUrl` in these entries.
 Image results record their API and creation timestamp even when request
 validation fails. Response IDs and measured usage survive malformed choices,
 and accepted text and images survive an error in a later image block. Empty
-choices succeed. Usage estimates identify their total as locally calculated.
+choices succeed. When image generation returned image blocks and the script
+emitted no image, Codemode tells the model to pass each generated block to
+`image(block)`. This also applies when a script fails after generation.
+The note follows the script's output budget, as in Pi. When the budget is
+zero, it appears in the saved full output.
+Usage estimates identify their total as locally calculated.
 Non-data URLs and structurally incomplete data URLs are ignored. Unlike Pi,
 pi-rs validates generated image MIME types and base64 before exposing them and
 retains its response-size limit. Provider-level operation headers are bound to

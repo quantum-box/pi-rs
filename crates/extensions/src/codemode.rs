@@ -645,7 +645,7 @@ fn install_globals(
         ctx.json_parse(serde_json::to_string(&catalogue).unwrap())?,
     )?;
     globals.set("__initial_store", ctx.json_parse(store.to_string())?)?;
-    let model_usage = sink.clone();
+    let model_output = sink.clone();
     let tool_output = sink.clone();
     let output_cancel = cancellation.clone();
     let model_cancel = cancellation.clone();
@@ -671,7 +671,7 @@ fn install_globals(
         Func::from(Async(move |arguments: String| {
             let model_host = model_host.clone();
             let slots = model_slots.clone();
-            let model_usage = model_usage.clone();
+            let model_output = model_output.clone();
             let cancellation = model_cancel.clone();
             async move {
                 let result = match serde_json::from_str::<Value>(&arguments) {
@@ -679,6 +679,7 @@ fn install_globals(
                         // Only inference consumes Pi's four model-call slots.
                         // Discovery and model resolution must remain available
                         // while slow classifier or image requests are in flight.
+                        let generates_images = args["action"] == "generateImages";
                         let _permit = if matches!(
                             args["action"].as_str(),
                             Some("classify" | "generateImages")
@@ -687,7 +688,7 @@ fn install_globals(
                         } else {
                             None
                         };
-                        if model_usage.lock().expect("codemode output").limit_exceeded {
+                        if model_output.lock().expect("codemode output").limit_exceeded {
                             return Ok::<_, rquickjs::Error>(
                                 json!({"ok":false,"error":"Script output limit exceeded"})
                                     .to_string(),
@@ -696,14 +697,27 @@ fn install_globals(
                         let outcome = model_host
                             .call_with_cancellation(MODEL_OPERATION, args, cancellation)
                             .await;
-                        if let Some(usage) = ModelUsage::from_outcome(&outcome) {
-                            model_usage
-                                .lock()
-                                .expect("codemode output")
-                                .model_usage
-                                .add(&usage);
+                        let usage = ModelUsage::from_outcome(&outcome);
+                        let value = tool_value(outcome);
+                        let generated_images = if generates_images {
+                            value["value"]["output"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|block| block["type"] == "image")
+                                .count()
+                        } else {
+                            0
+                        };
+                        if usage.is_some() || generated_images != 0 {
+                            let mut output = model_output.lock().expect("codemode output");
+                            output.generated_images =
+                                output.generated_images.saturating_add(generated_images);
+                            if let Some(usage) = usage {
+                                output.model_usage.add(&usage);
+                            }
                         }
-                        tool_value(outcome)
+                        value
                     }
                     Ok(args) if args["action"] == "list" => json!({"ok":true,"value":[]}),
                     Ok(_) => json!({"ok":false,"error":"native model operations are unavailable"}),
@@ -902,6 +916,7 @@ struct Output {
     calls: usize,
     limit_exceeded: bool,
     model_usage: ModelUsage,
+    generated_images: usize,
     saved_images: std::collections::BTreeMap<String, std::result::Result<String, String>>,
 }
 enum Item {
@@ -988,6 +1003,22 @@ fn visit_chunks(
     }
 }
 impl Output {
+    fn unshown_images_note(&self) -> Option<String> {
+        let count = self.generated_images;
+        if count == 0
+            || self
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Image { .. }))
+        {
+            return None;
+        }
+        let suffix = if count == 1 { "" } else { "s" };
+        Some(format!(
+            "Note: models.generateImages() returned {count} image{suffix} that the script did not show. Show each image block of result.output with image(block)."
+        ))
+    }
+
     // Visit the same text that finish() merges, without copying large outputs.
     fn visit_report(
         &self,
@@ -1074,6 +1105,9 @@ impl Output {
         }
         if let Some(error) = error {
             block(&mut state, &mut visit, &["Script error: ", error]);
+        }
+        if let Some(note) = self.unshown_images_note() {
+            block(&mut state, &mut visit, &[&note]);
         }
     }
 
@@ -1279,6 +1313,9 @@ impl Output {
         }
         if let Some(error) = error {
             content.push(json!({"type":"text","text":format!("Script error: {error}")}));
+        }
+        if let Some(note) = self.unshown_images_note() {
+            content.push(json!({"type":"text","text":note}));
         }
         let mut merged: Vec<Value> = Vec::new();
         for block in content {
@@ -1721,6 +1758,105 @@ mod tests {
         };
         assert_eq!(data["isError"], false, "{data}");
         assert!(data["content"].to_string().contains("discovery completed"));
+    }
+
+    #[tokio::test]
+    async fn reports_generated_images_when_script_emits_none() {
+        struct ImageModelHost;
+
+        #[async_trait::async_trait]
+        impl ToolHost for ImageModelHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                }]
+            }
+
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                let data = match args["action"].as_str() {
+                    Some("resolve") => json!(true),
+                    Some("generateImages") => json!({
+                        "stopReason": "stop",
+                        "output": [
+                            {"type": "text", "text": "two images"},
+                            {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="},
+                            {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="}
+                        ]
+                    }),
+                    _ => panic!("unexpected model operation"),
+                };
+                Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                }
+            }
+        }
+
+        let generate = r#"
+            const result = await models.generateImages({provider:'fixture', id:'fixture'},
+                {input:[{type:'text', text:'draw two images'}]});
+        "#;
+        let note = "returned 2 images that the script did not show";
+        for (prefix, suffix) in [
+            ("", "text(result.output[0].text);"),
+            ("", "image(result.output[1]);"),
+            ("", "throw new Error('failed after generation');"),
+            (concat!(r#"// @options: {"max_output_tokens":0}"#, "\n"), ""),
+        ] {
+            let reply = ScriptTool {
+                timeout: Some(Duration::from_secs(3)),
+            }
+            .invoke_transaction(
+                json!({"code":format!("{prefix}{generate}{suffix}")}),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                None,
+                Arc::new(ImageModelHost),
+            )
+            .await;
+            match reply.outcome {
+                Outcome::Structured { data, .. } if !prefix.is_empty() => {
+                    let path = data["full_output_path"]
+                        .as_str()
+                        .expect("truncated output path");
+                    assert!(!data["content"].to_string().contains(note));
+                    let report = std::fs::read_to_string(path).unwrap();
+                    std::fs::remove_file(path).unwrap();
+                    assert!(report.contains(note), "{report}");
+                }
+                Outcome::Structured { data, .. } => {
+                    let content = data["content"].as_array().unwrap();
+                    let has_image = content.iter().any(|item| item["type"] == "image");
+                    assert_eq!(has_image, suffix.starts_with("image("), "{data}");
+                    assert_eq!(
+                        data["content"].to_string().contains(note),
+                        !has_image,
+                        "{data}"
+                    );
+                    if let Some(path) = content
+                        .iter()
+                        .find_map(|item| item["text"].as_str()?.strip_prefix("Image saved to "))
+                    {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+                Outcome::Failed(error) if suffix.starts_with("throw ") => {
+                    assert!(
+                        error.contains("failed after generation") && error.contains(note),
+                        "{error}"
+                    );
+                }
+                result => panic!("unexpected script result: {result:?}"),
+            }
+        }
     }
 
     #[tokio::test]
