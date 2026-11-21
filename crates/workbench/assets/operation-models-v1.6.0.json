@@ -1,11 +1,33 @@
 {
   "openai": {
-    "models": [{
-      "type": "classifier", "id": "gpt-6-luna", "name": "GPT-6 Luna",
-      "api": "openai-decisions", "input": ["text", "image"], "contextWindow": 922000,
-      "cost": {"input": 0.1, "output": 0, "cacheRead": 0, "cacheWrite": 0,
-        "tiers": [{"inputTokensAbove": 272000, "input": 0.2, "output": 0, "cacheRead": 0, "cacheWrite": 0}]}
-    }]
+    "models": [
+      {
+        "type": "classifier",
+        "id": "gpt-6-luna",
+        "name": "GPT-6 Luna",
+        "api": "openai-decisions",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 922000,
+        "cost": {
+          "input": 0.1,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "tiers": [
+            {
+              "inputTokensAbove": 272000,
+              "input": 0.2,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            }
+          ]
+        }
+      }
+    ]
   },
   "typesafe": {
     "models": [
@@ -47,7 +69,7 @@
         "cost": {
           "input": 0.02,
           "output": 0,
-          "cacheRead": 0.02,
+          "cacheRead": 0,
           "cacheWrite": 0
         },
         "compat": {
@@ -64,11 +86,11 @@
           "text",
           "image"
         ],
-        "contextWindow": 32768,
+        "contextWindow": 65536,
         "cost": {
           "input": 0.042,
           "output": 0,
-          "cacheRead": 0.042,
+          "cacheRead": 0,
           "cacheWrite": 0
         },
         "compat": {
@@ -204,8 +226,8 @@
       },
       {
         "type": "classifier",
-        "id": "cloudflare/clef",
-        "name": "Cloudflare: Clef",
+        "id": "cloudflare/clairic",
+        "name": "Cloudflare: Clairic",
         "api": "typesafe-system-one",
         "input": [
           "text",
@@ -213,7 +235,28 @@
         ],
         "contextWindow": 65536,
         "cost": {
-          "input": 0.24,
+          "input": 0.1,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "cloudflare/clef",
+        "name": "Cloudflare: Clef",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 65537,
+        "cost": {
+          "input": 0.192,
           "output": 0,
           "cacheRead": 0,
           "cacheWrite": 0
@@ -234,7 +277,7 @@
         ],
         "contextWindow": 24576,
         "cost": {
-          "input": 0.038,
+          "input": 0.019,
           "output": 0,
           "cacheRead": 0,
           "cacheWrite": 0
@@ -267,16 +310,58 @@
       },
       {
         "type": "classifier",
-        "id": "inception/mercury-decide",
-        "name": "Inception: Mercury Decide",
+        "id": "google/gemini-decision-1",
+        "name": "Google: Gemini Decision 1",
         "api": "typesafe-system-one",
         "input": [
           "text",
           "image"
         ],
-        "contextWindow": 65536,
+        "contextWindow": 262144,
         "cost": {
-          "input": 0.02,
+          "input": 0.1,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "heygen/heygen-decision-1",
+        "name": "HeyGen: HeyGen Decision",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 131072,
+        "cost": {
+          "input": 0.14,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "heygen/heygen-decision-1-turbo",
+        "name": "HeyGen: HeyGen Decision Turbo",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.09,
           "output": 0,
           "cacheRead": 0,
           "cacheWrite": 0
@@ -371,6 +456,48 @@
       },
       {
         "type": "classifier",
+        "id": "liquid/d1.2",
+        "name": "LiquidAI: d1.2",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 65536,
+        "cost": {
+          "input": 0.02,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "liquid/d1.2-ultra",
+        "name": "LiquidAI: d1.2-ultra",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 65536,
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
         "id": "microsoft/microsoft-decision-1",
         "name": "Microsoft: Microsoft-Decision-1",
         "api": "typesafe-system-one",
@@ -391,8 +518,71 @@
       },
       {
         "type": "classifier",
+        "id": "microsoft/microsoft-decision-1.1",
+        "name": "Microsoft: Microsoft-Decision-1.1",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 32768,
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "morph/reflex",
+        "name": "Morph: Reflex",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 65536,
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0.002,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
         "id": "nace-ai/drex-max",
         "name": "Nace.AI: Drex Max",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.06,
+          "output": 0,
+          "cacheRead": 0.06,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "nace-ai/drex-max-finance",
+        "name": "Nace.AI: Drex Max Finance",
         "api": "typesafe-system-one",
         "input": [
           "text",
@@ -473,6 +663,26 @@
       },
       {
         "type": "classifier",
+        "id": "parallel/decisions-fast",
+        "name": "Parallel: Decisions Fast",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 32000,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
         "id": "perplexity/pplx-decider-flash-v1.2",
         "name": "Perplexity: Decider Flash V1.2",
         "api": "typesafe-system-one",
@@ -494,6 +704,27 @@
       },
       {
         "type": "classifier",
+        "id": "perplexity/pplx-decider-flash-v1.3:free",
+        "name": "Perplexity: Decider Flash V1.3 (free)",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
         "id": "perplexity/pplx-decider-v1.2",
         "name": "Perplexity: Decider V1.2",
         "api": "typesafe-system-one",
@@ -504,6 +735,27 @@
         "contextWindow": 262144,
         "cost": {
           "input": 0.02,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "imageInput": "state-image-urls",
+          "sendImageOptInHeader": false
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "perplexity/pplx-decider-v1.3:free",
+        "name": "Perplexity: Decider V1.3 (free)",
+        "api": "typesafe-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0,
           "output": 0,
           "cacheRead": 0,
           "cacheWrite": 0
@@ -720,7 +972,16 @@
       {
         "type": "image",
         "id": "black-forest-labs/flux-3-image",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Black Forest Labs: FLUX 3 Image",
         "api": "openrouter-images",
         "input": [
@@ -740,7 +1001,16 @@
       {
         "type": "image",
         "id": "black-forest-labs/flux-3-image-klein",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Black Forest Labs: FLUX 3 Image Klein",
         "api": "openrouter-images",
         "input": [
@@ -760,7 +1030,16 @@
       {
         "type": "image",
         "id": "black-forest-labs/flux.2-flex",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Black Forest Labs: FLUX.2 Flex",
         "api": "openrouter-images",
         "input": [
@@ -780,7 +1059,16 @@
       {
         "type": "image",
         "id": "black-forest-labs/flux.2-klein-4b",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Black Forest Labs: FLUX.2 Klein 4B",
         "api": "openrouter-images",
         "input": [
@@ -800,7 +1088,16 @@
       {
         "type": "image",
         "id": "black-forest-labs/flux.2-max",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Black Forest Labs: FLUX.2 Max",
         "api": "openrouter-images",
         "input": [
@@ -820,7 +1117,16 @@
       {
         "type": "image",
         "id": "black-forest-labs/flux.2-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Black Forest Labs: FLUX.2 Pro",
         "api": "openrouter-images",
         "input": [
@@ -840,7 +1146,16 @@
       {
         "type": "image",
         "id": "bytedance-seed/seedream-4.5",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "ByteDance Seed: Seedream 4.5",
         "api": "openrouter-images",
         "input": [
@@ -860,7 +1175,16 @@
       {
         "type": "image",
         "id": "bytedance-seed/seedream-5-0-flash",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "ByteDance Seed: Seedream 5.0 Flash",
         "api": "openrouter-images",
         "input": [
@@ -880,7 +1204,16 @@
       {
         "type": "image",
         "id": "bytedance-seed/seedream-5-0-lite",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "ByteDance Seed: Seedream 5.0 Lite",
         "api": "openrouter-images",
         "input": [
@@ -900,7 +1233,16 @@
       {
         "type": "image",
         "id": "bytedance-seed/seedream-5-0-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "ByteDance Seed: Seedream 5.0 Pro",
         "api": "openrouter-images",
         "input": [
@@ -919,8 +1261,46 @@
       },
       {
         "type": "image",
+        "id": "bytedance-seed/seedream-5-5",
+        "name": "ByteDance Seed: Seedream 5.5",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
         "id": "google/gemini-2.5-flash-image",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Google: Nano Banana (Gemini 2.5 Flash Image)",
         "api": "openrouter-images",
         "input": [
@@ -941,7 +1321,16 @@
       {
         "type": "image",
         "id": "google/gemini-3-pro-image",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Google: Nano Banana Pro (Gemini 3 Pro Image)",
         "api": "openrouter-images",
         "input": [
@@ -962,7 +1351,16 @@
       {
         "type": "image",
         "id": "google/gemini-3-pro-image-preview",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Google: Nano Banana Pro (Gemini 3 Pro Image Preview)",
         "api": "openrouter-images",
         "input": [
@@ -983,7 +1381,16 @@
       {
         "type": "image",
         "id": "google/gemini-3.1-flash-image",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Google: Nano Banana 2 (Gemini 3.1 Flash Image)",
         "api": "openrouter-images",
         "input": [
@@ -1004,7 +1411,16 @@
       {
         "type": "image",
         "id": "google/gemini-3.1-flash-image-preview",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Google: Nano Banana 2 (Gemini 3.1 Flash Image Preview)",
         "api": "openrouter-images",
         "input": [
@@ -1025,7 +1441,16 @@
       {
         "type": "image",
         "id": "google/gemini-3.1-flash-lite-image",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Google: Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
         "api": "openrouter-images",
         "input": [
@@ -1046,7 +1471,16 @@
       {
         "type": "image",
         "id": "google/gemini-nano-banana-2.1",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Google: Nano Banana 2.1",
         "api": "openrouter-images",
         "input": [
@@ -1067,7 +1501,16 @@
       {
         "type": "image",
         "id": "krea/k3-edit",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Krea: K3 Edit",
         "api": "openrouter-images",
         "input": [
@@ -1087,7 +1530,16 @@
       {
         "type": "image",
         "id": "krea/krea-2-large",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Krea: Krea 2 Large",
         "api": "openrouter-images",
         "input": [
@@ -1107,7 +1559,16 @@
       {
         "type": "image",
         "id": "krea/krea-2-medium",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Krea: Krea 2 Medium",
         "api": "openrouter-images",
         "input": [
@@ -1127,7 +1588,16 @@
       {
         "type": "image",
         "id": "krea/krea-2-medium-turbo",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Krea: Krea 2 Medium Turbo",
         "api": "openrouter-images",
         "input": [
@@ -1147,7 +1617,16 @@
       {
         "type": "image",
         "id": "meta/muse-image",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Meta: Muse Image",
         "api": "openrouter-images",
         "input": [
@@ -1167,7 +1646,16 @@
       {
         "type": "image",
         "id": "microsoft/mai-image-2.5",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Microsoft AI: MAI-Image-2.5",
         "api": "openrouter-images",
         "input": [
@@ -1187,7 +1675,16 @@
       {
         "type": "image",
         "id": "microsoft/mai-image-2.5-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Microsoft AI: MAI-Image-2.5 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1207,7 +1704,16 @@
       {
         "type": "image",
         "id": "microsoft/mai-image-2.6",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Microsoft AI: MAI-Image-2.6",
         "api": "openrouter-images",
         "input": [
@@ -1227,7 +1733,16 @@
       {
         "type": "image",
         "id": "microsoft/mai-image-2.6-flash",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Microsoft AI: MAI-Image-2.6 Flash",
         "api": "openrouter-images",
         "input": [
@@ -1246,8 +1761,133 @@
       },
       {
         "type": "image",
+        "id": "microsoft/mai-image-2.7",
+        "name": "Microsoft AI: MAI-Image-2.7",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 5,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
+        "id": "microsoft/mai-image-2.7-flash",
+        "name": "Microsoft AI: MAI-Image-2.7 Flash",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 1.75,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
+        "id": "minimax/minimax-h3-image",
+        "name": "MiniMax: MiniMax H3 Image",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 2.3,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
+        "id": "minimax/minimax-h3-image-highspeed",
+        "name": "MiniMax: MiniMax H3 Image Highspeed",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 2.3,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
         "id": "openai/gpt-5-image",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT-5 Image",
         "api": "openrouter-images",
         "input": [
@@ -1268,7 +1908,16 @@
       {
         "type": "image",
         "id": "openai/gpt-5-image-mini",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT-5 Image Mini",
         "api": "openrouter-images",
         "input": [
@@ -1289,7 +1938,16 @@
       {
         "type": "image",
         "id": "openai/gpt-5.4-image-2",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT-5.4 Image 2",
         "api": "openrouter-images",
         "input": [
@@ -1310,7 +1968,16 @@
       {
         "type": "image",
         "id": "openai/gpt-image-1",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT Image 1",
         "api": "openrouter-images",
         "input": [
@@ -1330,7 +1997,16 @@
       {
         "type": "image",
         "id": "openai/gpt-image-1-mini",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT Image 1 Mini",
         "api": "openrouter-images",
         "input": [
@@ -1350,7 +2026,16 @@
       {
         "type": "image",
         "id": "openai/gpt-image-2",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT Image 2",
         "api": "openrouter-images",
         "input": [
@@ -1370,7 +2055,16 @@
       {
         "type": "image",
         "id": "openai/gpt-image-2.5-flare",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT Image 2.5 Flare",
         "api": "openrouter-images",
         "input": [
@@ -1390,7 +2084,16 @@
       {
         "type": "image",
         "id": "openai/gpt-image-2.5-sunburst",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "OpenAI: GPT Image 2.5 Sunburst",
         "api": "openrouter-images",
         "input": [
@@ -1409,8 +2112,75 @@
       },
       {
         "type": "image",
+        "id": "openai/gpt-image-2.6-flare",
+        "name": "OpenAI: GPT Image 2.6 Flare",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 8,
+          "output": 8,
+          "cacheRead": 2,
+          "cacheWrite": 10
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
+        "id": "openai/gpt-image-2.6-sunburst",
+        "name": "OpenAI: GPT Image 2.6 Sunburst",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 8,
+          "output": 8,
+          "cacheRead": 2,
+          "cacheWrite": 10
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
         "id": "openrouter/auto",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Auto Router",
         "api": "openrouter-images",
         "input": [
@@ -1431,7 +2201,16 @@
       {
         "type": "image",
         "id": "openrouter/auto-beta",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Auto Router (Beta)",
         "api": "openrouter-images",
         "input": [
@@ -1451,8 +2230,47 @@
       },
       {
         "type": "image",
+        "id": "openrouter/auto-code",
+        "name": "Auto Code",
+        "api": "openrouter-images",
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
+      },
+      {
+        "type": "image",
         "id": "qwen/qwen-image-2.1-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Qwen: Qwen Image 2.1 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1472,7 +2290,16 @@
       {
         "type": "image",
         "id": "qwen/qwen-image-2.1-turbo",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Qwen: Qwen Image 2.1 Turbo",
         "api": "openrouter-images",
         "input": [
@@ -1492,7 +2319,16 @@
       {
         "type": "image",
         "id": "qwen/qwen-image-3",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Qwen: Qwen Image 3",
         "api": "openrouter-images",
         "input": [
@@ -1512,7 +2348,16 @@
       {
         "type": "image",
         "id": "qwen/qwen-image-3-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Qwen: Qwen Image 3 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1532,7 +2377,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v3",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V3",
         "api": "openrouter-images",
         "input": [
@@ -1552,7 +2406,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4",
         "api": "openrouter-images",
         "input": [
@@ -1572,7 +2435,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1592,7 +2464,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4-pro-vector",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4 Pro Vector",
         "api": "openrouter-images",
         "input": [
@@ -1612,7 +2493,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4-styles",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4 Styles",
         "api": "openrouter-images",
         "input": [
@@ -1632,7 +2522,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4-styles-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4 Styles Pro",
         "api": "openrouter-images",
         "input": [
@@ -1652,7 +2551,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4-styles-pro-vector",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4 Styles Pro Vector",
         "api": "openrouter-images",
         "input": [
@@ -1672,7 +2580,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4-styles-vector",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4 Styles Vector",
         "api": "openrouter-images",
         "input": [
@@ -1692,7 +2609,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4-vector",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4 Vector",
         "api": "openrouter-images",
         "input": [
@@ -1712,7 +2638,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4.1",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4.1",
         "api": "openrouter-images",
         "input": [
@@ -1749,8 +2684,53 @@
       },
       {
         "type": "image",
+        "id": "recraft/recraft-v4.1-flash-v2",
+        "name": "Recraft: Recraft V4.1 Flash V2",
+        "api": "openrouter-images",
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "image",
+        "id": "recraft/recraft-v4.1-flash-v2:free",
+        "name": "Recraft: Recraft V4.1 Flash V2 (free)",
+        "api": "openrouter-images",
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ],
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "image",
         "id": "recraft/recraft-v4.1-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4.1 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1770,7 +2750,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4.1-pro-vector",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4.1 Pro Vector",
         "api": "openrouter-images",
         "input": [
@@ -1790,7 +2779,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4.1-utility",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4.1 Utility",
         "api": "openrouter-images",
         "input": [
@@ -1810,7 +2808,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4.1-utility-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4.1 Utility Pro",
         "api": "openrouter-images",
         "input": [
@@ -1830,7 +2837,16 @@
       {
         "type": "image",
         "id": "recraft/recraft-v4.1-vector",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Recraft: Recraft V4.1 Vector",
         "api": "openrouter-images",
         "input": [
@@ -1850,7 +2866,16 @@
       {
         "type": "image",
         "id": "sourceful/riverflow-v2-fast",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Sourceful: Riverflow V2 Fast",
         "api": "openrouter-images",
         "input": [
@@ -1870,7 +2895,16 @@
       {
         "type": "image",
         "id": "sourceful/riverflow-v2-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Sourceful: Riverflow V2 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1890,7 +2924,16 @@
       {
         "type": "image",
         "id": "sourceful/riverflow-v2.5-fast",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Sourceful: Riverflow V2.5 Fast",
         "api": "openrouter-images",
         "input": [
@@ -1910,7 +2953,16 @@
       {
         "type": "image",
         "id": "sourceful/riverflow-v2.5-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Sourceful: Riverflow V2.5 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1930,7 +2982,16 @@
       {
         "type": "image",
         "id": "sourceful/riverflow-v2.6-pro",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Sourceful: Riverflow V2.6 Pro",
         "api": "openrouter-images",
         "input": [
@@ -1950,7 +3011,16 @@
       {
         "type": "image",
         "id": "tencent/hy-image-v3.5-preview",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
         "name": "Tencent: Hy Image 3.5 Preview",
         "api": "openrouter-images",
         "input": [
@@ -1969,13 +3039,11 @@
       },
       {
         "type": "image",
-        "id": "x-ai/grok-imagine-image-2.0",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
-        "name": "xAI: Grok Imagine Image 2.0",
+        "id": "tencent/hy-world-2.1-panorama",
+        "name": "Tencent: HY-World 2.1 Panorama",
         "api": "openrouter-images",
         "input": [
-          "text",
-          "image"
+          "text"
         ],
         "output": [
           "image"
@@ -1989,9 +3057,18 @@
       },
       {
         "type": "image",
-        "id": "x-ai/grok-imagine-image-quality",
-        "inputLimits": {"images":{"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
-        "name": "SpaceXAI: Grok Imagine Image Quality",
+        "id": "x-ai/grok-imagine-image-2.0",
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
+        "name": "xAI: Grok Imagine Image 2.0",
         "api": "openrouter-images",
         "input": [
           "text",
@@ -2077,6 +3154,54 @@
       },
       {
         "type": "classifier",
+        "id": "google/gemini-decision-1",
+        "name": "Gemini Decision 1",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.1,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "heygen/heygen-decision-1",
+        "name": "HeyGen Decision 1",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 131072,
+        "cost": {
+          "input": 0.14,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "heygen/heygen-decision-1-turbo",
+        "name": "HeyGen Decision 1 Turbo",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.09,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
         "id": "liquid/d1",
         "name": "Liquid d1",
         "api": "typesafe-system-one",
@@ -2109,6 +3234,54 @@
       },
       {
         "type": "classifier",
+        "id": "liquid/d1.2",
+        "name": "Liquid d1.2",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 65536,
+        "cost": {
+          "input": 0.02,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "liquid/d1.2-ultra",
+        "name": "Liquid d1.2 Ultra",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 65536,
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "microsoft/decision-1.1",
+        "name": "Decision-1.1",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 4096,
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
         "id": "microsoft/microsoft-decision-1",
         "name": "Decision-1",
         "api": "typesafe-system-one",
@@ -2122,6 +3295,70 @@
           "cacheWrite": 0
         },
         "contextWindow": 32768
+      },
+      {
+        "type": "classifier",
+        "id": "modaic/mo",
+        "name": "Mo",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.04,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "nace-ai/drex-max-finance",
+        "name": "Drex Max Finance",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.03,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "nace-ai/drex-max-v1.1",
+        "name": "Drex Max v1.1",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.03,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "nace-ai/drex-v2.0",
+        "name": "Drex 2.0",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.03,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
       },
       {
         "type": "classifier",
@@ -2141,6 +3378,22 @@
       },
       {
         "type": "classifier",
+        "id": "parallel/parallel-decisions-fast",
+        "name": "Decisions Fast",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 32000,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
         "id": "perplexity/pplx-decider-flash-v1.2",
         "name": "Decider Flash V1.2 4B",
         "api": "typesafe-system-one",
@@ -2157,6 +3410,22 @@
       },
       {
         "type": "classifier",
+        "id": "perplexity/pplx-decider-flash-v1.3",
+        "name": "Decider Flash V1.3",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.01,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
         "id": "perplexity/pplx-decider-v1.2",
         "name": "Decider V1.2 27B",
         "api": "typesafe-system-one",
@@ -2170,6 +3439,22 @@
           "cacheWrite": 0
         },
         "contextWindow": 262144
+      },
+      {
+        "type": "classifier",
+        "id": "perplexity/pplx-decider-v1.3",
+        "name": "Decider V1.3",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 262144,
+        "cost": {
+          "input": 0.02,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
       },
       {
         "type": "classifier",
@@ -2343,8 +3628,38 @@
   },
   "opencode": {
     "models": [
-      {"type":"classifier","id":"jev-1.13","name":"Jev 1.13","api":"typesafe-system-one","input":["text"],"contextWindow":32000,"cost":{"input":0.042,"output":0,"cacheRead":0,"cacheWrite":0}},
-      {"type":"classifier","id":"jev-1.13-free","name":"Jev 1.13 Free","api":"typesafe-system-one","input":["text"],"contextWindow":32000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}
+      {
+        "type": "classifier",
+        "id": "jev-1.13",
+        "name": "Jev 1.13",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 32000,
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "jev-1.13-free",
+        "name": "Jev 1.13 Free",
+        "api": "typesafe-system-one",
+        "input": [
+          "text"
+        ],
+        "contextWindow": 32000,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        }
+      }
     ]
   }
 }
