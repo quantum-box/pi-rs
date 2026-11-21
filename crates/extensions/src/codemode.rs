@@ -880,17 +880,42 @@ impl SchemaRenderer<'_> {
     fn write_type(&mut self, schema: &Value) -> Option<()> {
         if let Some(reference) = schema["$ref"].as_str() {
             let Some(target) = crate::schema_ref::resolve(self.root, reference) else {
-                return self.write("unknown");
+                return self.write_type_without_ref(schema);
             };
             let pointer = std::ptr::from_ref(target);
             if self.expansions >= 32 || !self.resolving.insert(pointer) {
-                return self.write("unknown");
+                return self.write_type_without_ref(schema);
             }
             self.expansions += 1;
+            let has_sibling_type = matches!(
+                schema["type"].as_str(),
+                Some("string" | "number" | "integer" | "boolean" | "array" | "object")
+            );
+            let initial_bytes = self.text.len();
+            let initial_units = self.units;
+            if has_sibling_type {
+                self.write("(")?;
+            }
+            let target_start = self.text.len();
             let result = self.write_type(target);
             self.resolving.remove(&pointer);
-            return result;
+            result?;
+            if has_sibling_type {
+                if &self.text[target_start..] == "unknown" {
+                    self.text.truncate(initial_bytes);
+                    self.units = initial_units;
+                    return self.write_type_without_ref(schema);
+                }
+                self.write(" & ")?;
+                self.write_type_without_ref(schema)?;
+                self.write(")")?;
+            }
+            return Some(());
         }
+        self.write_type_without_ref(schema)
+    }
+
+    fn write_type_without_ref(&mut self, schema: &Value) -> Option<()> {
         match schema["type"].as_str() {
             Some("string") => self.write("string"),
             Some("number" | "integer") => self.write("number"),
@@ -1480,6 +1505,27 @@ mod tests {
         let property_name = "x".repeat(16_000);
         let oversized = json!({"type":"object","properties": {(property_name):{"type":"string"}}});
         assert_eq!(typescript(&oversized), "unknown");
+    }
+
+    #[test]
+    fn tool_declarations_retain_argument_types_alongside_references() {
+        let generic = json!({"$ref": "#/$defs/base", "type": "string", "$defs": {"base": true}});
+        assert_eq!(typescript(&generic), "string");
+        let missing = json!({"$ref": "#/$defs/absent", "type": "number"});
+        assert_eq!(typescript(&missing), "number");
+        let array = json!({
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/base",
+                "type": "object",
+                "properties": {"label": {"type": "string"}}
+            },
+            "$defs": {"base": {"type": "object", "properties": {"count": {"type": "number"}}}}
+        });
+        assert_eq!(
+            typescript(&array),
+            "({ \"count\"?: number } & { \"label\"?: string })[]"
+        );
     }
 
     #[test]
