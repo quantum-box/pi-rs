@@ -378,8 +378,9 @@ tool progress and completion-order notifications remain open.
 
 ### Meta Responses API-key checkpoint
 
-The `meta` provider includes Pi v1.5.0's six Muse models, including their
-thinking levels, image limits, token limits and prices. It uses the Responses
+The `meta` provider includes Pi 1.6.0's seven Muse models. Muse Ember supports
+images, reasoning through `max`, up to 524,288 output tokens and catalog
+pricing tiers above 200,000 input tokens. The provider uses the Responses
 adapter and `META_API_KEY` on the official endpoint. Saved and configured
 credentials retain precedence and remain bound to their endpoint. Existing
 Pi-compatible Meta subscription OAuth credentials can supply the inference key;
