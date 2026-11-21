@@ -17,6 +17,13 @@ impl Model for Script {
                 ("ls-negative", "ls", json!({"limit": -2})),
                 ("ls-fraction", "ls", json!({"limit": 1.5})),
                 ("ls-huge", "ls", json!({"limit": 1e100})),
+                ("ls-missing", "ls", json!({"path": "missing"})),
+                (
+                    "grep-missing",
+                    "grep",
+                    json!({"path": "missing", "pattern": "match"}),
+                ),
+                ("read-offset", "read", json!({"path": "a", "offset": 9})),
                 ("find-float", "find", json!({"pattern":"*", "limit": 1.0})),
                 ("find-zero", "find", json!({"pattern":"*", "limit": 0})),
                 ("find-negative", "find", json!({"pattern":"*", "limit": -1})),
@@ -125,6 +132,20 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         )
     );
     assert_eq!(replies["ls-huge"], ("a\nb\nc", false));
+    let missing = format!(
+        "Path not found: {}",
+        root.path()
+            .canonicalize()
+            .unwrap()
+            .join("missing")
+            .display()
+    );
+    assert_eq!(replies["ls-missing"], (missing.as_str(), true));
+    assert_eq!(replies["grep-missing"], (missing.as_str(), true));
+    assert_eq!(
+        replies["read-offset"],
+        ("Offset 9 is beyond end of file (1 lines total)", true)
+    );
     assert_eq!(
         replies["find-float"],
         (

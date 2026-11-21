@@ -784,7 +784,11 @@ fn read_event_content(outcome: &Outcome) -> Option<Value> {
     match outcome {
         Outcome::Succeeded(output)
         | Outcome::SucceededWithDetails { output, .. }
-        | Outcome::TextResult { output, .. } => Some(json!(output)),
+        | Outcome::TextResult {
+            output,
+            is_error: false,
+            ..
+        } => Some(json!(output)),
         Outcome::Structured { data, attachments }
         | Outcome::StructuredWithDetails {
             data, attachments, ..
@@ -2299,7 +2303,15 @@ impl Tool for CodingTool {
             self.bash_with_host(&args, &context.cancellation, Some(host))
                 .await
         } else {
-            self.invoke(args, context).await
+            // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
+            match self.invoke(args, context).await {
+                Outcome::Failed(output) if self.unrestricted => Outcome::TextResult {
+                    output,
+                    details: None,
+                    is_error: true,
+                },
+                outcome => outcome,
+            }
         }
     }
 
