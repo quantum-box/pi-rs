@@ -408,7 +408,8 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
         if name.ends_with("_page") {
             let error = tool.invoke(json!({"cursor":"fault"}), context()).await;
             assert!(
-                matches!(error, Outcome::Failed(message) if message.contains("fixture internal error"))
+                matches!(&error, Outcome::Unknown(message) if message.contains("fixture internal error")),
+                "expected the existing MCP error outcome, got {error:?}"
             );
         }
     }
