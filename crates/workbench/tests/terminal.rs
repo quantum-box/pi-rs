@@ -4020,6 +4020,24 @@ for line in sys.stdin:
         text.contains("Reconnected") && text.contains("Tools · 1")
     });
 
+    for enabled in [false, true] {
+        master.write_all(b"e").unwrap();
+        output_until(&mut master, |text| {
+            if enabled {
+                text.contains("Enabled") && text.contains("Tools · 1")
+            } else {
+                text.contains("Disabled") && text.contains("Tools · 0")
+            }
+        });
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(project.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(saved["mcpServers"]["ready"]["enabled"], enabled);
+        assert_eq!(
+            saved["mcpServers"]["ready"]["toolExposure"]["fixture_tool"],
+            "hidden"
+        );
+    }
+
     master.write_all(b"\x1b").unwrap();
     output_until(&mut master, |text| text.contains("MCP servers"));
     master.write_all(b"\x1b").unwrap();

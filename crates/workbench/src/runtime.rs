@@ -405,29 +405,96 @@ impl Runtime {
             let selected = status
                 .as_ref()
                 .map(|(name, message)| (name.as_str(), *message));
-            let Some(request) =
-                mcp_config::inspect_servers(&self.mcp_inspection, &servers, selected, ui, cancel)
-                    .await?
+            let Some(mut request) = mcp_config::inspect_servers(
+                &self.mcp_inspection,
+                &servers,
+                selected,
+                args.trusted,
+                ui,
+                cancel,
+            )
+            .await?
             else {
                 return Ok(());
             };
-            let message = match self.reconnect_mcp(args, &request, cancel).await {
-                Ok(()) => "Reconnected",
+            let result = match request.action {
+                mcp_config::ManagerAction::Reconnect => self
+                    .reconnect_mcp(args, &request, cancel)
+                    .await
+                    .map(|()| "Reconnected"),
+                mcp_config::ManagerAction::SetEnabled { enabled, project } => {
+                    self.set_mcp_enabled(args, &mut request, enabled, project, cancel)
+                        .await
+                }
+            };
+            let message = match result {
+                Ok(message) => message,
                 Err(pi_rs::Error::Cancelled) => return Err(pi_rs::Error::Cancelled),
                 Err(pi_rs::Error::AuthorizationRequired { .. }) => "Sign-in required",
-                Err(pi_rs::Error::Config(_)) => "Reconnect failed. Check the MCP configuration.",
-                Err(_) => "Could not reconnect",
+                Err(_) => "MCP update failed. Check the configuration or reload if it changed.",
             };
             status = Some((request.name, message));
         }
     }
 
+    async fn set_mcp_enabled(
+        &mut self,
+        args: &Cli,
+        request: &mut mcp_config::ManagerRequest,
+        enabled: bool,
+        project: bool,
+        cancel: &CancellationToken,
+    ) -> Result<&'static str> {
+        let updated =
+            mcp_config::set_manager_enabled(args, request, enabled, project, cancel).await?;
+        request.config = updated.config.clone().expect("validated MCP configuration");
+        if let Some(entry) = self
+            .mcp_inspection
+            .iter_mut()
+            .find(|entry| entry.name == request.name)
+        {
+            *entry = updated;
+        }
+        if enabled {
+            self.reconnect_mcp(args, request, cancel).await?;
+            Ok("Enabled")
+        } else {
+            let catalog = self.catalog.clone();
+            let _mutation = catalog.mutation.lock().await;
+            self.disconnect_mcp(&catalog, &request.name).await?;
+            Ok("Disabled")
+        }
+    }
+
+    async fn disconnect_mcp(
+        &mut self,
+        catalog: &LiveMcpCatalog,
+        name: &str,
+    ) -> Result<Option<usize>> {
+        let mut servers = catalog.servers.lock().expect("MCP catalogs").clone();
+        let Some(index) = servers.iter().position(|server| server.server_name == name) else {
+            return Ok(None);
+        };
+        let old = servers.remove(index);
+        let mut registry = self.registry.clone();
+        registry.unregister(old.id());
+        let prompt = catalog.select_mcp_tools(&mut registry, &servers);
+        self.registry = registry;
+        *catalog.servers.lock().expect("MCP catalogs") = servers;
+        old.close().await;
+        self.system_prompt = prompt?;
+        Ok(Some(index))
+    }
+
     async fn reconnect_mcp(
         &mut self,
         args: &Cli,
-        request: &mcp_config::ReconnectRequest,
+        request: &mcp_config::ManagerRequest,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        if request.config.enabled == Some(false) {
+            return Err(pi_rs::Error::Config("MCP server is disabled".into()));
+        }
         let name = &request.name;
         let id = format!("mcp-{}", name.replace('-', "_"));
         let check_config = || {
@@ -449,20 +516,8 @@ impl Runtime {
         if cancel.is_cancelled() {
             return Err(pi_rs::Error::Cancelled);
         }
+        let index = self.disconnect_mcp(&catalog, name).await?;
         let mut servers = catalog.servers.lock().expect("MCP catalogs").clone();
-        let index = servers
-            .iter()
-            .position(|server| server.server_name == *name);
-        if let Some(index) = index {
-            let old = servers.remove(index);
-            let mut registry = self.registry.clone();
-            registry.unregister(old.id());
-            let prompt = catalog.select_mcp_tools(&mut registry, &servers)?;
-            self.registry = registry;
-            self.system_prompt = prompt;
-            *catalog.servers.lock().expect("MCP catalogs") = servers.clone();
-            old.close().await;
-        }
         check_config()?;
         let replacement = tokio::select! {
             biased;
