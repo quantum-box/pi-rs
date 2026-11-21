@@ -763,8 +763,10 @@ combines the registered tool's callbacks with host defaults. A callback receives
 arguments and tool presentation state and returns styled rows that the host
 can theme. Missing or failed sections fall back independently. Pi returns
 live TUI components with local state and invalidation callbacks. Native
-hosts own framing, image handling, component state and redraws. Terminal
-integration and executable renderer registration remain pending.
+hosts own framing, image handling, component state and redraws. Executable
+extension tool definitions can supply both sections through stateless
+process requests. Workbench terminal integration and executable
+cross-tool resolver registration remain pending.
 
 ### Native custom message renderers
 
