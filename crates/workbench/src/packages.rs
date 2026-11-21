@@ -4678,31 +4678,6 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(package.iter().any(|source| source.ends_with("#v1")));
         assert!(package.iter().any(|source| source.ends_with("#v2")));
     }
-    #[cfg(unix)]
-    #[test]
-    fn package_sources_resolve_parent_segments_before_symlinks() {
-        let directory = tempfile::tempdir().unwrap();
-        let work = directory.path().join("work");
-        let package = work.join("package");
-        let external = directory.path().join("external");
-        let via_symlink = external.join("package");
-        let target = external.join("target");
-        for path in [&package, &via_symlink, &target] {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        std::os::unix::fs::symlink(&target, work.join("link")).unwrap();
-
-        let resolved = normalize("./link/../package", &work).unwrap();
-        assert_eq!(Path::new(&resolved), package.canonicalize().unwrap());
-        let resolved = normalize("./link/../missing/package", &work).unwrap();
-        assert_eq!(
-            Path::new(&resolved),
-            work.canonicalize().unwrap().join("missing/package")
-        );
-        let resolved = normalize("./link", &work).unwrap();
-        assert_eq!(Path::new(&resolved), target.canonicalize().unwrap());
-    }
-
     #[test]
     fn package_sources_normalize_file_urls_and_git_transports() {
         let root = tempfile::tempdir().unwrap();
@@ -5090,5 +5065,30 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(source.contains("native-demo"));
         assert!(!source.contains("project_notes"));
         assert!(scaffold(&target, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_sources_resolve_parent_segments_before_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let work = directory.path().join("work");
+        let package = work.join("package");
+        let external = directory.path().join("external");
+        let via_symlink = external.join("package");
+        let target = external.join("target");
+        for path in [&package, &via_symlink, &target] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, work.join("link")).unwrap();
+
+        let resolved = normalize("./link/../package", &work).unwrap();
+        assert_eq!(Path::new(&resolved), package.canonicalize().unwrap());
+        let resolved = normalize("./link/../missing/package", &work).unwrap();
+        assert_eq!(
+            Path::new(&resolved),
+            work.canonicalize().unwrap().join("missing/package")
+        );
+        let resolved = normalize("./link", &work).unwrap();
+        assert_eq!(Path::new(&resolved), target.canonicalize().unwrap());
     }
 }
