@@ -2174,10 +2174,18 @@ fn markdown_plain_at_depth(
                 }
             }
             let html = strip_html_comments(&html);
-            if html.trim().is_empty() {
+            let html = html.trim();
+            if html.is_empty() {
                 continue;
             }
-            event = Event::Html(html.trim().to_owned().into());
+            // The surrounding block is still distinct from the next paragraph
+            // after removing the comment and trimming its literal HTML.
+            spans.push(Span::themed(html, theme, "text"));
+            flush(&mut spans, &mut lines, width, item_prefixes.last());
+            if let Some(end) = item_block_ends.last_mut() {
+                *end = Some(range.end);
+            }
+            continue;
         }
         // Pulldown omits space and reference-definition tokens inside items.
         // Recover the blank runs between direct item blocks from their source ranges.
@@ -3067,6 +3075,10 @@ mod tests {
             assert_eq!(render(source), render(reference), "{source:?}");
         }
         assert_eq!(render("`<!-- literal -->`"), ["<!-- literal -->"],);
+        assert_eq!(
+            render("<!-- hidden --> trailing text\nnext paragraph"),
+            ["trailing text", "next paragraph"],
+        );
     }
 
     #[test]
