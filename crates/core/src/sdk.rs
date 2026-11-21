@@ -1799,6 +1799,11 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+    /// Snapshot configured custom-message renderers for the host presentation.
+    pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
+        self.registry.custom_message_renderers()
+    }
+
     /// Inspect configured extension commands, including collision-resolved
     /// invocation names and extension provenance. Prompt templates, skills and
     /// built-in host commands remain the host's responsibility. Per-request

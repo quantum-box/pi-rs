@@ -1427,6 +1427,20 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Custom message types this extension can render in a native host.
+    fn custom_message_renderer_types(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Render a displayed message without a session host or model access.
+    async fn render_custom_message(
+        &self,
+        _message: &CustomMessage,
+        _options: &crate::CustomMessageRenderOptions,
+    ) -> ExtensionResult<Option<crate::RenderedCustomMessage>> {
+        Ok(None)
+    }
+
     /// Observe when an extension starts and stops waiting on a native UI prompt.
     fn handles_ui_prompt_lifecycle(&self) -> bool {
         false
@@ -1982,6 +1996,20 @@ impl Registry {
     /// Remove a declaration owned by the named extension.
     pub fn unregister_mcp_server(&mut self, extension_id: &str, name: &str) -> bool {
         Arc::make_mut(&mut self.mcp_servers).remove(extension_id, name)
+    }
+
+    /// Snapshot the first renderer registered for each custom message type.
+    pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
+        let mut renderers = crate::CustomMessageRenderers::default();
+        for extension in &self.extensions {
+            for custom_type in extension.custom_message_renderer_types() {
+                renderers
+                    .renderers
+                    .entry(custom_type.to_owned())
+                    .or_insert_with(|| extension.clone());
+            }
+        }
+        renderers
     }
 
     /// Whether a registered extension without a source path is a host built-in.

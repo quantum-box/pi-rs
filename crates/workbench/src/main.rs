@@ -1314,6 +1314,8 @@ fn main() {
     std::process::exit(code);
 }
 
+const RPC_FILE_ARGUMENT_ERROR: &str = "Error: @file arguments are not supported in RPC mode";
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> i32 {
     // Terminal-owned workers receive the same foreground-group SIGINT as the
@@ -1356,6 +1358,10 @@ async fn run_cli() -> i32 {
             literal_export = metadata.literal_export;
             argv = metadata.args_without_help;
         } else {
+            if !metadata.version && metadata.rpc_has_attachments {
+                eprintln!("{RPC_FILE_ARGUMENT_ERROR}");
+                return 1;
+            }
             let flag = if metadata.version {
                 "--version"
             } else if metadata.short_help {
@@ -1445,7 +1451,7 @@ async fn run_cli() -> i32 {
             && args.mode == Some(OutputMode::Rpc)
             && args.prompt.iter().any(|argument| argument.starts_with('@'))
         {
-            eprintln!("Error: @file arguments are not supported in RPC mode");
+            eprintln!("{RPC_FILE_ARGUMENT_ERROR}");
             cli_exit_code = 1;
             return Ok(());
         }

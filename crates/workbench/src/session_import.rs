@@ -3391,6 +3391,13 @@ mod tests {
         let (messages, _) = super::super::rpc_messages::snapshot(&session);
         assert_eq!(messages.last().unwrap()["errorMessage"], "connection lost");
         assert_eq!(messages.last().unwrap()["stopReason"], "error");
+        let assistant = session.records().iter().find(|record| {
+            matches!(&record.event, Event::Assistant { content, .. } if content == "partial")
+        }).unwrap();
+        assert_eq!(
+            crate::sessions::tree_record_text(&session, assistant.id).unwrap(),
+            "partial"
+        );
     }
 
     #[test]

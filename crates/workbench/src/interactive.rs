@@ -1,5 +1,5 @@
 //! Terminal presentation over the same journaled CLI used by automation.
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1037,6 +1037,12 @@ struct StreamingTool {
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
+struct CustomMessageRenderPending {
+    request: uuid::Uuid,
+    record: u64,
+    options: pi_rs::CustomMessageRenderOptions,
+}
+
 #[derive(Default)]
 struct View {
     async_transitions: bool,
@@ -1052,6 +1058,10 @@ struct View {
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
+    custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
+    custom_render_attempted: BTreeSet<u64>,
+    custom_render_pending: Option<CustomMessageRenderPending>,
+    custom_render_redraw_at: Option<Instant>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
     thinking_settings: Option<ThinkingSettings>,
@@ -1423,11 +1433,15 @@ impl View {
         self.lines.push(entry);
         if self.lines.len() > 4000 {
             let removed = self.lines.len() - 4000;
-            self.lines.drain(..removed);
+            for entry in self.lines.drain(..removed) {
+                if let Entry::CustomMessage { id, .. } = entry {
+                    self.custom_render_attempted.remove(&id);
+                }
+            }
             self.regular.committed = self.regular.committed.saturating_sub(removed);
         }
     }
-    fn show_custom_message(&mut self, message: &pi_rs::CustomMessage) {
+    fn show_custom_message(&mut self, id: u64, message: &pi_rs::CustomMessage) {
         if !message.display {
             return;
         }
@@ -1451,6 +1465,8 @@ impl View {
             }
         }
         self.append_entry(Entry::CustomMessage {
+            id,
+            rendered: None,
             custom_type: message.custom_type.clone(),
             text: text.join("\n"),
         });
@@ -1458,6 +1474,103 @@ impl View {
             self.add_images(&images);
         }
     }
+    fn invalidate_custom_message_renderings(&mut self) -> bool {
+        self.custom_render_attempted.clear();
+        self.custom_render_redraw_at = None;
+        let mut redrawn = false;
+        for (index, entry) in self.lines.iter_mut().enumerate() {
+            if let Entry::CustomMessage { rendered, .. } = entry
+                && rendered.take().is_some()
+            {
+                self.regular.redraw |= index < self.regular.committed;
+                redrawn = true;
+            }
+        }
+        redrawn
+    }
+
+    fn prepare_custom_message_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
+        if worker.message_renderer_types.is_empty() {
+            return false;
+        }
+        let options = pi_rs::CustomMessageRenderOptions {
+            expanded: self.expand_tools,
+            output_pad: args.settings.output_padding(),
+            expand_key: self
+                .expand_key
+                .map(|key| crate::ui::keys::binding_hint(Some(key))),
+        };
+        let mut changed = false;
+        if self.custom_render_options.as_ref() != Some(&options) {
+            self.custom_render_options = Some(options.clone());
+            changed = self.invalidate_custom_message_renderings();
+        }
+        if self.custom_render_pending.is_some() {
+            return changed;
+        }
+        let candidate = self.lines.iter().rev().find_map(|entry| match entry {
+            Entry::CustomMessage {
+                id, custom_type, ..
+            } if worker.message_renderer_types.contains(custom_type)
+                && !self.custom_render_attempted.contains(id) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        });
+        if let Some(record) = candidate {
+            self.custom_render_attempted.insert(record);
+            let request = uuid::Uuid::new_v4();
+            if worker.send(json!({
+                "type":"render_custom_message","id":request,"record_id":record,"options":options,
+            })).is_ok() {
+                self.custom_render_pending = Some(CustomMessageRenderPending {
+                    request,
+                    record,
+                    options,
+                });
+            }
+        }
+        changed
+    }
+
+    fn receive_custom_message_render(&mut self, event: Value) -> bool {
+        let Some(pending) = self.custom_render_pending.as_ref() else {
+            return false;
+        };
+        if event["id"] != json!(pending.request) {
+            return false;
+        }
+        let pending = self
+            .custom_render_pending
+            .take()
+            .expect("matching render request");
+        if self.custom_render_options.as_ref() != Some(&pending.options)
+            || !self.custom_render_attempted.contains(&pending.record)
+            || event["rendered"].is_null()
+        {
+            return false;
+        }
+        let Ok(rendering) =
+            serde_json::from_value::<pi_rs::RenderedCustomMessage>(event["rendered"].clone())
+        else {
+            return false;
+        };
+        for (index, entry) in self.lines.iter_mut().enumerate().rev() {
+            if let Entry::CustomMessage { id, rendered, .. } = entry
+                && *id == pending.record
+            {
+                *rendered = Some(rendering);
+                if index < self.regular.committed {
+                    self.custom_render_redraw_at
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
         if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
             && args.settings.boolean("showCacheMissNotices") == Some(true)
@@ -1655,7 +1768,7 @@ impl View {
             if let pi_rs::Event::CustomMessage { message }
             | pi_rs::Event::CustomMessageDelivered { message, .. } = &record.event
             {
-                self.show_custom_message(message);
+                self.show_custom_message(record.id, message);
             }
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
@@ -1690,6 +1803,10 @@ impl View {
         self.regular.committed = 0;
         self.regular.redraw = true;
         self.lines.clear();
+        self.custom_render_redraw_at = None;
+        // Keep an in-flight request as the only one until its response. The
+        // cleared attempted set prevents it from updating the restored rows.
+        self.custom_render_attempted.clear();
         self.viewport.follow();
         self.search = None;
         self.mouse.clear();
@@ -1747,7 +1864,7 @@ impl View {
             match &record.event {
                 pi_rs::Event::CustomMessage { message }
                 | pi_rs::Event::CustomMessageDelivered { message, .. } => {
-                    self.show_custom_message(message)
+                    self.show_custom_message(record.id, message)
                 }
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
@@ -2624,8 +2741,8 @@ impl View {
                 .as_ref()
                 .map_or(String::new(), |(message, _)| format!("{message} ")),
         );
-        self.graphics.clear_placements(&mut out)?;
-        queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+        queue!(out, Hide)?;
+        self.graphics.clear_fullscreen_frame(&mut out)?;
         if header_rows != 0 {
             Line::themed(
                 &format!(
@@ -3046,13 +3163,7 @@ impl View {
             synchronized_updates_supported(),
         )?;
         if redraw {
-            self.graphics.clear_placements(&mut out)?;
-            queue!(
-                out,
-                Clear(ClearType::All),
-                MoveTo(0, 0),
-                Clear(ClearType::Purge)
-            )?;
+            self.graphics.purge_regular_transcript(&mut out)?;
         }
         if !redraw {
             self.graphics.clear_active(&mut out)?;
@@ -4426,6 +4537,11 @@ pub(super) async fn run(
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
             && let Some(mut old) = worker.take()
         {
+            if !old.message_renderer_types.is_empty() {
+                startup_extensions = None;
+                view.custom_render_pending = None;
+                dirty |= view.invalidate_custom_message_renderings();
+            }
             for warning in old.take_pending_warnings() {
                 view.append(&warning);
                 dirty = true;
@@ -4588,6 +4704,17 @@ pub(super) async fn run(
             }
             let events: Vec<_> = active.drain_events();
             for value in events {
+                if value["type"] == "backend_ready" {
+                    active.message_renderer_types =
+                        serde_json::from_value(value["custom_message_renderers"].clone())
+                            .unwrap_or_default();
+                    view.custom_render_pending = None;
+                    dirty |= view.invalidate_custom_message_renderings();
+                }
+                if value["type"] == "custom_message_rendered" {
+                    dirty |= view.receive_custom_message_render(value);
+                    continue;
+                }
                 if value["type"] == "response" && value["command"] == "get_share_context" {
                     if let Some((pending, snapshot)) = view.take_share_response(&value) {
                         start_share_upload(&mut view, pending, snapshot);
@@ -4695,8 +4822,11 @@ pub(super) async fn run(
                 }
                 dirty = true;
             }
+            dirty |= view.prepare_custom_message_render(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
+                view.custom_render_pending = None;
+                view.invalidate_custom_message_renderings();
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
@@ -4728,6 +4858,14 @@ pub(super) async fn run(
                 view.shell_running = false;
                 dirty = true;
             }
+        }
+        if view
+            .custom_render_redraw_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            view.custom_render_redraw_at = None;
+            view.regular.redraw = true;
+            dirty = true;
         }
         if view.dialogs.is_empty()
             && view
@@ -7140,163 +7278,8 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         }
     };
-    let mut items = vec![
-        Item {
-            label: format!(
-                "HTTP idle timeout · {}",
-                match args.settings.http_idle_timeout_ms() {
-                    0 => "disabled".to_owned(),
-                    30_000 => "30 sec".to_owned(),
-                    60_000 => "1 min".to_owned(),
-                    120_000 => "2 min".to_owned(),
-                    300_000 => "5 min".to_owned(),
-                    ms => format!("{} sec", ms as f64 / 1000.0),
-                }
-            ),
-            selection: Selection::Setting(
-                "httpIdleTimeoutMs".into(),
-                json!(match args.settings.http_idle_timeout_ms() {
-                    30_000 => 60_000,
-                    60_000 => 120_000,
-                    120_000 => 300_000,
-                    300_000 => 0,
-                    _ => 30_000,
-                }),
-            ),
-        },
-        queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
-        queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
-        Item {
-            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
-            selection: Selection::EditSetting("theme".into()),
-        },
-        Item {
-            label: format!(
-                "Default thinking level per model · {} configured",
-                args.settings.value()["modelThinkingLevels"]
-                    .as_object()
-                    .map_or(0, |levels| levels.len())
-            ),
-            selection: Selection::EditSetting("modelThinkingLevels".into()),
-        },
-        Item {
-            label: format!(
-                "Tool output · {} (toggle)",
-                if view.expand_tools {
-                    "expanded"
-                } else {
-                    "collapsed"
-                }
-            ),
-            selection: Selection::Setting("expandTools".into(), json!(!view.expand_tools)),
-        },
-        Item {
-            label: format!(
-                "Thinking blocks · {} (toggle)",
-                if view.hide_thinking {
-                    "hidden"
-                } else {
-                    "shown"
-                }
-            ),
-            selection: Selection::Setting("hideThinkingBlock".into(), json!(!view.hide_thinking)),
-        },
-        Item {
-            label: format!(
-                "Cache miss notices · {} (toggle)",
-                if args.settings.boolean("showCacheMissNotices") == Some(true) {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            selection: Selection::Setting(
-                "showCacheMissNotices".into(),
-                json!(args.settings.boolean("showCacheMissNotices") != Some(true)),
-            ),
-        },
-        Item {
-            label: format!("Save default model · {}/{}", args.provider.id(), args.model),
-            selection: Selection::SaveDefaultModel,
-        },
-        Item {
-            label: format!("Cache warming · {cache_mode} (cycle)"),
-            selection: Selection::Setting("cacheWarming".into(), json!(next_cache_mode)),
-        },
-        Item {
-            label: format!(
-                "Save default thinking · {}",
-                args.thinking.as_deref().unwrap_or("model default")
-            ),
-            selection: Selection::Setting("defaultThinkingLevel".into(), json!(args.thinking)),
-        },
-        Item {
-            label: format!(
-                "Auto-compaction · {} (toggle)",
-                if args.settings.auto_compaction_enabled() {
-                    "on"
-                } else {
-                    "off"
-                },
-            ),
-            selection: Selection::Setting(
-                "autoCompactionEnabled".into(),
-                json!(!args.settings.auto_compaction_enabled()),
-            ),
-        },
-        Item {
-            label: format!(
-                "Auto-retry · {} (toggle)",
-                if args.settings.retry_settings().enabled {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            selection: Selection::Setting(
-                "autoRetryEnabled".into(),
-                json!(!args.settings.retry_settings().enabled),
-            ),
-        },
-    ];
     let resize_images = args.settings.resize_model_images();
-    items.push(Item {
-        label: format!(
-            "Auto-resize images · {} (toggle)",
-            if resize_images { "on" } else { "off" }
-        ),
-        selection: Selection::Setting("images.autoResize".into(), json!(!resize_images)),
-    });
     let block_images = args.settings.block_model_images();
-    items.push(Item {
-        label: format!(
-            "Block images · {} (toggle)",
-            if block_images { "on" } else { "off" }
-        ),
-        selection: Selection::Setting("images.blockImages".into(), json!(!block_images)),
-    });
-    if view.graphics.enabled() {
-        let show_images = args.settings.show_terminal_images();
-        let image_width = args.settings.terminal_image_width();
-        let next_width = match image_width {
-            60 => 80,
-            80 => 120,
-            _ => 60,
-        };
-        items.extend([
-            Item {
-                label: format!(
-                    "Show images · {} (toggle)",
-                    if show_images { "on" } else { "off" }
-                ),
-                selection: Selection::Setting("terminal.showImages".into(), json!(!show_images)),
-            },
-            Item {
-                label: format!("Image width · {image_width} cells"),
-                selection: Selection::Setting("terminal.imageWidthCells".into(), json!(next_width)),
-            },
-        ]);
-    }
     let autocomplete_items = args.settings.autocomplete_max_visible();
     let skill_commands = args.settings.enable_skill_commands();
     let quiet = &args.settings.value()["quietStartup"];
@@ -7316,95 +7299,6 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
     let wheel_lines = wheel
         .as_f64()
         .map(|value| value.clamp(1.0, 100.0).floor() as u64);
-    items.extend([
-        Item {
-            label: format!(
-                "TUI mode · {}",
-                if args.tui_mode == Some(TuiMode::Regular) {
-                    "regular"
-                } else {
-                    "fullscreen"
-                }
-            ),
-            selection: Selection::Setting(
-                "tuiMode".into(),
-                json!(if args.tui_mode == Some(TuiMode::Regular) {
-                    "fullscreen"
-                } else {
-                    "regular"
-                }),
-            ),
-        },
-        Item {
-            label: format!("Quiet startup · {quiet_label}"),
-            selection: Selection::Setting(
-                "quietStartup".into(),
-                match quiet_label {
-                    "true" => json!("header"),
-                    "header" => json!(false),
-                    _ => json!(true),
-                },
-            ),
-        },
-        Item {
-            label: format!("Session share destination · {share}"),
-            selection: Selection::Setting(
-                "sessionShareDestination".into(),
-                json!(match share {
-                    "auto" => "gist",
-                    "gist" => "radius",
-                    _ => "auto",
-                }),
-            ),
-        },
-        Item {
-            label: format!("Default project trust · {trust}"),
-            selection: Selection::Setting(
-                "defaultProjectTrust".into(),
-                json!(match trust {
-                    "ask" => "always",
-                    "always" => "never",
-                    _ => "ask",
-                }),
-            ),
-        },
-        Item {
-            label: format!(
-                "Fullscreen wheel scrolling · {}",
-                wheel_lines.map_or_else(|| "auto".into(), |n| n.to_string())
-            ),
-            selection: Selection::Setting(
-                "fullscreenWheelScrollLines".into(),
-                match wheel_lines {
-                    None => json!(1),
-                    Some(current) => [1, 2, 3, 5, 10]
-                        .into_iter()
-                        .find(|value| *value > current)
-                        .map_or_else(|| json!("auto"), |value| json!(value)),
-                },
-            ),
-        },
-        Item {
-            label: format!("Autocomplete max items · {autocomplete_items}"),
-            selection: Selection::Setting(
-                "autocompleteMaxVisible".into(),
-                json!(
-                    [3, 5, 7, 10, 15, 20]
-                        .into_iter()
-                        .skip_while(|count| *count != autocomplete_items)
-                        .nth(1)
-                        .unwrap_or(3)
-                ),
-            ),
-        },
-        Item {
-            label: format!(
-                "Skill commands · {} (toggle)",
-                if skill_commands { "on" } else { "off" }
-            ),
-            selection: Selection::Setting("enableSkillCommands".into(), json!(!skill_commands)),
-        },
-    ]);
     let escape = args.settings.string("doubleEscapeAction").unwrap_or("tree");
     let next_escape = match escape {
         "tree" => "fork",
@@ -7428,19 +7322,240 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         .settings
         .boolean("fullscreenCopyOnSelect")
         .unwrap_or(true);
+    let thinking_summary = match args.settings.value()["modelThinkingLevels"]
+        .as_object()
+        .map_or(0, |levels| levels.len())
+    {
+        0 => "none".into(),
+        count => format!("{count} configured"),
+    };
+    let mut items = vec![Item {
+        label: format!("Auto-compact · {}", args.settings.auto_compaction_enabled()),
+        selection: Selection::Setting(
+            "autoCompactionEnabled".into(),
+            json!(!args.settings.auto_compaction_enabled()),
+        ),
+    }];
+    if view.graphics.enabled() {
+        let show_images = args.settings.show_terminal_images();
+        let image_width = args.settings.terminal_image_width();
+        let next_width = match image_width {
+            60 => 80,
+            80 => 120,
+            _ => 60,
+        };
+        items.extend([
+            Item {
+                label: format!("Show images · {show_images}"),
+                selection: Selection::Setting("terminal.showImages".into(), json!(!show_images)),
+            },
+            Item {
+                label: format!("Image width · {image_width}"),
+                selection: Selection::Setting("terminal.imageWidthCells".into(), json!(next_width)),
+            },
+        ]);
+    }
     items.extend([
         Item {
+            label: format!("Auto-resize images · {resize_images}"),
+            selection: Selection::Setting("images.autoResize".into(), json!(!resize_images)),
+        },
+        Item {
+            label: format!("Block images · {block_images}"),
+            selection: Selection::Setting("images.blockImages".into(), json!(!block_images)),
+        },
+        Item {
+            label: format!("Skill commands · {skill_commands}"),
+            selection: Selection::Setting("enableSkillCommands".into(), json!(!skill_commands)),
+        },
+        Item {
             label: format!(
-                "Terminal progress · {} (toggle)",
-                if args.settings.terminal_progress() {
-                    "on"
+                "Show hardware cursor · {}",
+                if args.settings.show_hardware_cursor() {
+                    "true"
                 } else {
-                    "off"
-                },
+                    "false"
+                }
             ),
+            selection: Selection::Setting(
+                "showHardwareCursor".into(),
+                json!(!args.settings.show_hardware_cursor()),
+            ),
+        },
+        Item {
+            label: format!("Editor padding · {padding}"),
+            selection: Selection::Setting("editorPaddingX".into(), json!((padding + 1) % 4)),
+        },
+        Item {
+            label: format!("Output padding · {}", args.settings.output_padding()),
+            selection: Selection::Setting(
+                "outputPad".into(),
+                json!(1 - args.settings.output_padding()),
+            ),
+        },
+        Item {
+            label: format!("Autocomplete max items · {autocomplete_items}"),
+            selection: Selection::Setting(
+                "autocompleteMaxVisible".into(),
+                json!(
+                    [3, 5, 7, 10, 15, 20]
+                        .into_iter()
+                        .skip_while(|count| *count != autocomplete_items)
+                        .nth(1)
+                        .unwrap_or(3)
+                ),
+            ),
+        },
+        Item {
+            label: format!(
+                "Clear on shrink · {}",
+                if args.settings.clear_terminal_on_shrink() {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+            selection: Selection::Setting(
+                "terminal.clearOnShrink".into(),
+                json!(!args.settings.clear_terminal_on_shrink()),
+            ),
+        },
+        Item {
+            label: format!("Terminal progress · {}", args.settings.terminal_progress()),
             selection: Selection::Setting(
                 "terminal.showTerminalProgress".into(),
                 json!(!args.settings.terminal_progress()),
+            ),
+        },
+        queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
+        queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
+        Item {
+            label: format!("Session share destination · {share}"),
+            selection: Selection::Setting(
+                "sessionShareDestination".into(),
+                json!(match share {
+                    "auto" => "gist",
+                    "gist" => "radius",
+                    _ => "auto",
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "HTTP idle timeout · {}",
+                match args.settings.http_idle_timeout_ms() {
+                    0 => "disabled".to_owned(),
+                    30_000 => "30 sec".to_owned(),
+                    60_000 => "1 min".to_owned(),
+                    120_000 => "2 min".to_owned(),
+                    300_000 => "5 min".to_owned(),
+                    ms => format!("{} sec", ms as f64 / 1000.0),
+                }
+            ),
+            selection: Selection::Setting(
+                "httpIdleTimeoutMs".into(),
+                json!(match args.settings.http_idle_timeout_ms() {
+                    30_000 => 60_000,
+                    60_000 => 120_000,
+                    120_000 => 300_000,
+                    300_000 => 0,
+                    _ => 30_000,
+                }),
+            ),
+        },
+        Item {
+            label: format!("Cache warming · {cache_mode}"),
+            selection: Selection::Setting("cacheWarming".into(), json!(next_cache_mode)),
+        },
+        Item {
+            label: format!("Hide thinking · {}", view.hide_thinking),
+            selection: Selection::Setting("hideThinkingBlock".into(), json!(!view.hide_thinking)),
+        },
+        Item {
+            label: format!("Mermaid diagrams · {}", args.settings.mermaid_mode()),
+            selection: Selection::Setting(
+                "markdown.mermaid".into(),
+                json!(match args.settings.mermaid_mode() {
+                    "off" => "final",
+                    "final" => "streaming",
+                    _ => "off",
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "Cache miss notices · {}",
+                if args.settings.boolean("showCacheMissNotices") == Some(true) {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+            selection: Selection::Setting(
+                "showCacheMissNotices".into(),
+                json!(args.settings.boolean("showCacheMissNotices") != Some(true)),
+            ),
+        },
+        Item {
+            label: format!("Quiet startup · {quiet_label}"),
+            selection: Selection::Setting(
+                "quietStartup".into(),
+                match quiet_label {
+                    "true" => json!("header"),
+                    "header" => json!(false),
+                    _ => json!(true),
+                },
+            ),
+        },
+        Item {
+            label: format!(
+                "Default project trust · {}",
+                match trust {
+                    "always" => "Always trust",
+                    "never" => "Never trust",
+                    _ => "Ask",
+                }
+            ),
+            selection: Selection::Setting(
+                "defaultProjectTrust".into(),
+                json!(match trust {
+                    "ask" => "always",
+                    "always" => "never",
+                    _ => "ask",
+                }),
+            ),
+        },
+        Item {
+            label: format!("Double-escape action · {escape}"),
+            selection: Selection::Setting("doubleEscapeAction".into(), json!(next_escape)),
+        },
+        Item {
+            label: format!("Tree filter mode · {}", tree_filter.name()),
+            selection: Selection::Setting(
+                "treeFilterMode".into(),
+                json!(tree_filter.next().name()),
+            ),
+        },
+        Item {
+            label: format!("Default thinking level per model · {thinking_summary}"),
+            selection: Selection::EditSetting("modelThinkingLevels".into()),
+        },
+        Item {
+            label: format!(
+                "TUI mode · {}",
+                if args.tui_mode == Some(TuiMode::Regular) {
+                    "regular"
+                } else {
+                    "fullscreen"
+                }
+            ),
+            selection: Selection::Setting(
+                "tuiMode".into(),
+                json!(if args.tui_mode == Some(TuiMode::Regular) {
+                    "fullscreen"
+                } else {
+                    "regular"
+                }),
             ),
         },
         Item {
@@ -7466,71 +7581,63 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
-            label: format!(
-                "Fullscreen copy on select · {}",
-                if copy_on_select { "on" } else { "off" }
-            ),
+            label: format!("Fullscreen copy on select · {copy_on_select}"),
             selection: Selection::Setting("fullscreenCopyOnSelect".into(), json!(!copy_on_select)),
         },
         Item {
-            label: format!("Editor padding · {padding}"),
-            selection: Selection::Setting("editorPaddingX".into(), json!((padding + 1) % 4)),
-        },
-        Item {
-            label: format!("Mermaid rendering · {}", args.settings.mermaid_mode()),
+            label: format!(
+                "Fullscreen wheel scrolling · {}",
+                wheel_lines.map_or_else(|| "auto".into(), |n| n.to_string())
+            ),
             selection: Selection::Setting(
-                "markdown.mermaid".into(),
-                json!(match args.settings.mermaid_mode() {
-                    "off" => "final",
-                    "final" => "streaming",
-                    _ => "off",
-                }),
+                "fullscreenWheelScrollLines".into(),
+                match wheel_lines {
+                    None => json!(1),
+                    Some(current) => [1, 2, 3, 5, 10]
+                        .into_iter()
+                        .find(|value| *value > current)
+                        .map_or_else(|| json!("auto"), |value| json!(value)),
+                },
             ),
         },
         Item {
+            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
+            selection: Selection::EditSetting("theme".into()),
+        },
+        Item {
             label: format!(
-                "Clear on shrink · {}",
-                if args.settings.clear_terminal_on_shrink() {
+                "Tool output · {} (toggle)",
+                if view.expand_tools {
+                    "expanded"
+                } else {
+                    "collapsed"
+                }
+            ),
+            selection: Selection::Setting("expandTools".into(), json!(!view.expand_tools)),
+        },
+        Item {
+            label: format!("Save default model · {}/{}", args.provider.id(), args.model),
+            selection: Selection::SaveDefaultModel,
+        },
+        Item {
+            label: format!(
+                "Save default thinking · {}",
+                args.thinking.as_deref().unwrap_or("model default")
+            ),
+            selection: Selection::Setting("defaultThinkingLevel".into(), json!(args.thinking)),
+        },
+        Item {
+            label: format!(
+                "Auto-retry · {} (toggle)",
+                if args.settings.retry_settings().enabled {
                     "on"
                 } else {
                     "off"
                 }
             ),
             selection: Selection::Setting(
-                "terminal.clearOnShrink".into(),
-                json!(!args.settings.clear_terminal_on_shrink()),
-            ),
-        },
-        Item {
-            label: format!(
-                "Hardware cursor · {}",
-                if args.settings.show_hardware_cursor() {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            selection: Selection::Setting(
-                "showHardwareCursor".into(),
-                json!(!args.settings.show_hardware_cursor()),
-            ),
-        },
-        Item {
-            label: format!("Output padding · {}", args.settings.output_padding()),
-            selection: Selection::Setting(
-                "outputPad".into(),
-                json!(1 - args.settings.output_padding()),
-            ),
-        },
-        Item {
-            label: format!("Double-escape action · {escape}"),
-            selection: Selection::Setting("doubleEscapeAction".into(), json!(next_escape)),
-        },
-        Item {
-            label: format!("Tree filter mode · {}", tree_filter.name()),
-            selection: Selection::Setting(
-                "treeFilterMode".into(),
-                json!(tree_filter.next().name()),
+                "autoRetryEnabled".into(),
+                json!(!args.settings.retry_settings().enabled),
             ),
         },
     ]);
@@ -11373,6 +11480,58 @@ exit {exit}
     }
 
     #[test]
+    fn custom_message_render_responses_follow_transcript_and_expansion_state() {
+        let mut view = super::View::default();
+        let message = pi_rs::CustomMessage {
+            custom_type: "card".into(),
+            content: pi_rs::ContextContent::Text("fallback".into()),
+            display: true,
+            details: None,
+        };
+        view.show_custom_message(14, &message);
+        view.regular.committed = 1;
+        let collapsed = pi_rs::CustomMessageRenderOptions::default();
+        let expanded = pi_rs::CustomMessageRenderOptions {
+            expanded: true,
+            ..Default::default()
+        };
+        let old_request = uuid::Uuid::new_v4();
+        view.custom_render_options = Some(expanded.clone());
+        view.custom_render_attempted.insert(14);
+        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+            request: old_request,
+            record: 14,
+            options: collapsed,
+        });
+        let rendered = serde_json::json!({"lines":[[{"text":"details"}]]});
+        assert!(!view.receive_custom_message_render(serde_json::json!({
+            "id":old_request,"rendered":rendered
+        })));
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::CustomMessage { rendered: None, .. }
+        ));
+
+        let active_request = uuid::Uuid::new_v4();
+        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+            request: active_request,
+            record: 14,
+            options: expanded,
+        });
+        assert!(view.receive_custom_message_render(serde_json::json!({
+            "id":active_request,"rendered":rendered
+        })));
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::CustomMessage {
+                rendered: Some(_),
+                ..
+            }
+        ));
+        assert!(view.custom_render_redraw_at.is_some());
+    }
+
+    #[test]
     fn custom_message_display_flag_controls_terminal_visibility() {
         let mut view = super::View::default();
         let mut message = pi_rs::CustomMessage {
@@ -11381,12 +11540,12 @@ exit {exit}
             display: false,
             details: Some(serde_json::json!({"private": "metadata"})),
         };
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(view.lines.is_empty());
         message.display = true;
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(
-            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "example" && text == "visible content")
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "example" && text == "visible content")
         );
     }
 
@@ -11412,9 +11571,9 @@ exit {exit}
             display: true,
             details: Some(serde_json::json!({"secret": "not displayed"})),
         };
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(
-            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**first**\nsecond")
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**first**\nsecond")
         );
     }
 
@@ -11448,7 +11607,7 @@ exit {exit}
             &mut args,
         );
         assert!(
-            matches!(&live.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
+            matches!(&live.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
         );
         let mut session = pi_rs::Session::open(&args.session).unwrap();
         session.append_custom_message(message).unwrap();
@@ -11474,7 +11633,7 @@ exit {exit}
             .filter(|entry| matches!(entry, super::Entry::CustomMessage { .. }))
             .collect();
         assert!(
-            matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
+            matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
         );
     }
 
