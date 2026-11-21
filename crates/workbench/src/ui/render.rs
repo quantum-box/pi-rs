@@ -1838,7 +1838,29 @@ fn markdown_with_block_spacing(
     if text.trim().is_empty() {
         return Some(Vec::new());
     }
-    let tokens = super::markdown_spaces::block_inventory(text)?;
+    let mut tokens = super::markdown_spaces::block_inventory(text)?;
+    for index in (0..tokens.len()).rev() {
+        let Some(token) = tokens.get(index) else {
+            continue;
+        };
+        if token.kind != BlockTokenKind::Block(BlockFlavor::Html)
+            || !strip_html_comments(&text[token.range.clone()])
+                .trim()
+                .is_empty()
+        {
+            continue;
+        }
+        tokens.remove(index);
+        let space_before = index != 0 && tokens[index - 1].kind == BlockTokenKind::Space;
+        let space_after = tokens
+            .get(index)
+            .is_some_and(|token| token.kind == BlockTokenKind::Space);
+        if space_after && (index == 0 || space_before) {
+            tokens.remove(index);
+        } else if index == tokens.len() && space_before {
+            tokens.remove(index - 1);
+        }
+    }
     if !tokens.iter().any(|token| {
         matches!(
             token.kind,
@@ -1943,6 +1965,24 @@ fn append_math_section(output: &mut Vec<Line>, mut next: Vec<Line>) {
         output.push(Line::default());
     }
     output.append(&mut next);
+}
+
+fn strip_html_comments(html: &str) -> std::borrow::Cow<'_, str> {
+    let Some(first) = html.find("<!--") else {
+        return html.into();
+    };
+    let mut result = html[..first].to_owned();
+    let mut rest = &html[first + 4..];
+    while let Some(end) = rest.find("-->") {
+        rest = &rest[end + 3..];
+        let Some(start) = rest.find("<!--") else {
+            result.push_str(rest);
+            break;
+        };
+        result.push_str(&rest[..start]);
+        rest = &rest[start + 4..];
+    }
+    result.into()
 }
 
 // Replace only complete inline events within list math ranges. Containers stay
@@ -2093,7 +2133,8 @@ fn markdown_plain_at_depth(
     )
     .into_iter()
     .peekable();
-    while let Some((event, mut range)) = events.next() {
+    let mut trim_after_comment = false;
+    while let Some((mut event, mut range)) = events.next() {
         if quote_skip > 0 {
             match event {
                 Event::Start(Tag::BlockQuote(_)) => quote_skip += 1,
@@ -2101,6 +2142,42 @@ fn markdown_plain_at_depth(
                 _ => {}
             }
             continue;
+        }
+        if let Event::InlineHtml(html) = &event
+            && html.starts_with("<!--")
+        {
+            let before = &text[..range.start];
+            trim_after_comment = trim_after_comment
+                || before.ends_with([' ', '\t', '\n'])
+                || spans.is_empty()
+                || (spans.len() == 1 && spans.first() == item_prefixes.last());
+            continue;
+        }
+        if std::mem::take(&mut trim_after_comment)
+            && let Event::Text(value) = &mut event
+        {
+            let trimmed = value.trim_start_matches([' ', '\t']);
+            if trimmed.is_empty() {
+                trim_after_comment = true;
+                continue;
+            }
+            range.start += value.len() - trimmed.len();
+            *value = trimmed.to_owned().into();
+        }
+        if matches!(&event, Event::Start(Tag::HtmlBlock)) && text[range.clone()].contains("<!--") {
+            let mut html = String::new();
+            for (part, _) in events.by_ref() {
+                match part {
+                    Event::Html(value) => html.push_str(&value),
+                    Event::End(TagEnd::HtmlBlock) => break,
+                    _ => {}
+                }
+            }
+            let html = strip_html_comments(&html);
+            if html.trim().is_empty() {
+                continue;
+            }
+            event = Event::Html(html.trim().to_owned().into());
         }
         // Pulldown omits space and reference-definition tokens inside items.
         // Recover the blank runs between direct item blocks from their source ranges.
@@ -2126,6 +2203,14 @@ fn markdown_plain_at_depth(
                     >= if text[..end].ends_with('\n') { 1 } else { 2 })
         {
             let gap = &text[end..range.start];
+            let without_comments = strip_html_comments(gap);
+            // Collapse spacing across a comment-only gap. Keep reference
+            // definitions and their source spacing when they share the gap.
+            let gap = if without_comments.trim().is_empty() {
+                without_comments.as_ref()
+            } else {
+                gap
+            };
             let mut blank = false;
             for line in gap.lines() {
                 if line.trim().is_empty() {
@@ -2946,6 +3031,44 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_hides_html_comments_without_hiding_literal_code() {
+        let render = |source| {
+            markdown(source, &Theme::system(), 60)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.text)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        for (source, reference) in [
+            ("See <!-- inline --> the docs.", "See the docs."),
+            ("a <!-- one --> <!-- two --> b", "a b"),
+            ("a<!-- join -->b", "ab"),
+            ("<!--\nmulti\nline\n-->\ntext", "text"),
+            ("text\n\n<!-- streaming", "text"),
+            (
+                "<!-- start -->\n\n## Release\n\n<!-- notes -->\n\n- item\n\n<!-- end -->",
+                "## Release\n\n- item",
+            ),
+            (
+                "> q\n>\n> <!-- hidden -->\n>\n> r\n\n- a\n\n  <!-- hidden -->\n\n  b\n- <!-- hidden --> item",
+                "> q\n>\n> r\n\n- a\n\n  b\n- item",
+            ),
+            ("<div>\n<!-- multi\nline -->a</div>", "<div>\na</div>"),
+            ("<!-- hidden --> trailing text", "trailing text"),
+        ] {
+            assert_eq!(render(source), render(reference), "{source:?}");
+        }
+        assert_eq!(render("`<!-- literal -->`"), ["<!-- literal -->"],);
+    }
+
     #[test]
     fn markdown_trailing_spaces_match_pinned_pi() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
