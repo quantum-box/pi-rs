@@ -1691,6 +1691,70 @@ fn model_listing_searches_ids_with_pi_token_swaps() {
 }
 
 #[test]
+fn model_listing_uses_pi_table_collation_and_spacing() {
+    let root = tempfile::tempdir().unwrap();
+    let models: Vec<_> = ["Za", "zA", "z-a", "z_a", "ä", "日本語", "😀"]
+        .into_iter()
+        .map(|id| {
+            json!({
+                "id":id, "contextWindow":1_250_000, "maxTokens":1_250,
+                "reasoning":false, "input":["text"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"fixture":{
+            "baseUrl":"http://127.0.0.1:1/v1",
+            "api":"openai-completions",
+            "apiKey":"fixture",
+            "models":models,
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for (locale, expected) in [
+        (
+            "en_US.UTF-8",
+            ["😀", "ä", "z_a", "z-a", "zA", "Za", "日本語"],
+        ),
+        (
+            "sv_SE.UTF-8",
+            ["😀", "z_a", "z-a", "zA", "Za", "ä", "日本語"],
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("LC_ALL", locale)
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-approve",
+                "--provider",
+                "fixture",
+                "--list-models",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let ids: Vec<_> = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_ascii_whitespace().nth(1))
+            .collect();
+        assert_eq!(ids, expected);
+        assert!(text.contains("fixture   😀     1.3M     1.3K"));
+        assert!(text.contains("fixture   日本語    1.3M     1.3K"));
+    }
+}
+
+#[test]
 fn unrelated_provider_loads_legacy_responses_sampling_configuration() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(

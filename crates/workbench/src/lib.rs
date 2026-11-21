@@ -26,6 +26,7 @@ pub use coding_paths::normalize_plain as normalize_path;
 pub use coding_paths::windows_shell_path;
 mod file_search;
 pub mod image_profile;
+mod locale;
 pub mod mcp;
 pub mod mcp_auth;
 mod mcp_login_config_lock;
