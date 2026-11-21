@@ -2050,6 +2050,14 @@ impl Tool for RemoteShellTool {
     }
 }
 
+fn pi_tool_failure(output: String) -> Outcome {
+    Outcome::TextResult {
+        output,
+        details: Some(json!({})),
+        is_error: true,
+    }
+}
+
 fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -> Outcome {
     let text = output.result_display();
     let mut structured_content = json!({"output":output.script,"truncated":output.script_truncated,"exit_code":code,"wall_time_seconds":(elapsed * 10.0).round() / 10.0});
@@ -2331,11 +2339,7 @@ impl Tool for CodingTool {
         };
         // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
         match outcome {
-            Outcome::Failed(output) if self.unrestricted => Outcome::TextResult {
-                output,
-                details: None,
-                is_error: true,
-            },
+            Outcome::Failed(output) if self.unrestricted => pi_tool_failure(output),
             outcome => outcome,
         }
     }
@@ -3267,13 +3271,7 @@ impl CodingTool {
         let unrestricted_find_limit = if is_find && self.unrestricted {
             match fd_numeric_limit(numeric_find_limit) {
                 Ok(limit) => Some(limit),
-                Err(output) => {
-                    return Ok(Outcome::TextResult {
-                        output,
-                        details: None,
-                        is_error: true,
-                    });
-                }
+                Err(output) => return Ok(pi_tool_failure(output)),
             }
         } else {
             None
