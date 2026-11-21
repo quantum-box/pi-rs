@@ -963,8 +963,15 @@ async fn configure_after(
                 }
             }
         }
-        if let Some(name) = flags.keys().next() {
-            return Err(pi_rs::Error::Config(format!("unknown option --{name}")));
+        let unknown: Vec<_> = args
+            .ordered_extension_flags()
+            .filter(|(name, _)| flags.contains_key(*name))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            return Err(pi_rs::Error::Config(
+                super::cli_compat::unknown_extension_options(&unknown),
+            ));
         }
         #[cfg(feature = "evaluation-fixtures")]
         if let Some(endpoint) = args.fixtures.as_deref() {

@@ -41,6 +41,78 @@ fn parse_errors_take_precedence_over_metadata_in_either_order() {
 }
 
 #[test]
+fn root_parse_errors_use_pi_messages_without_help_or_version() {
+    for (args, expected) in [
+        (
+            &["--mode"][..],
+            "Error: --mode requires text, json, or rpc\n",
+        ),
+        (
+            &["--tui-mode"][..],
+            "Error: --tui-mode requires regular or fullscreen\n",
+        ),
+        (&["--name"][..], "Error: --name requires a value\n"),
+        (
+            &["--use-theme"][..],
+            "Error: --use-theme requires a theme name\n",
+        ),
+        (&["-z"][..], "Error: Unknown option: -z\n"),
+        (&["-e"][..], "Error: Unknown option: -e\n"),
+        (&["-t"][..], "Error: Unknown option: -t\n"),
+        (&["-xt"][..], "Error: Unknown option: -xt\n"),
+        (
+            &["--mode", "bad", "--mode", "json", "--thinking", "bad"][..],
+            concat!(
+                "Error: Invalid mode \"bad\". Valid values: text, json, rpc\n",
+                "Warning: Invalid thinking level \"bad\". Valid values: off, minimal, low, medium, high, xhigh, max\n",
+            ),
+        ),
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert_eq!(output.stderr, expected.as_bytes(), "{args:?}");
+    }
+}
+
+#[test]
+fn unknown_long_options_use_pi_wording_and_first_occurrence_order() {
+    for (args, expected) in [
+        (&["--export"][..], "Error: Unknown option: --export\n"),
+        (
+            &["--system-prompt"][..],
+            "Error: Unknown option: --system-prompt\n",
+        ),
+        (&["--extension"][..], "Error: Unknown option: --extension\n"),
+        (
+            &[
+                "--z-fixture",
+                "--a-fixture",
+                "--z-fixture=update",
+                "--model",
+            ][..],
+            "Error: Unknown options: --z-fixture, --a-fixture, --model\n",
+        ),
+    ] {
+        let mut argv = vec!["--offline", "--no-approve", "--no-extensions", "--no-mcp"];
+        argv.extend_from_slice(args);
+        let output = run(&argv);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert_eq!(output.stderr, expected.as_bytes(), "{args:?}");
+    }
+
+    for option in ["--export", "--model", "--extension"] {
+        let output = run(&["--version", option]);
+        assert!(output.status.success(), "{option}: {output:?}");
+        assert_eq!(output.stdout, run(&["--version"]).stdout);
+    }
+    let output = run(&["--version", "-e"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.stderr, b"Error: Unknown option: -e\n");
+}
+
+#[test]
 fn rpc_rejects_file_arguments_before_startup() {
     for args in [
         &["--mode", "rpc", "@missing.txt"][..],
