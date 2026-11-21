@@ -1529,6 +1529,86 @@
       ]
     },
     {
+      "source": "- one\n    two",
+      "lines": [
+        "- one",
+        "    two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n    two"
+        }
+      ]
+    },
+    {
+      "source": "- one\n two",
+      "lines": [
+        "- one",
+        "   two"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- one\n two"
+        }
+      ]
+    },
+    {
+      "source": "-   a\n    b",
+      "lines": [
+        "- a",
+        "  b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "-   a\n    b"
+        }
+      ]
+    },
+    {
+      "source": "- a\n   **b**",
+      "lines": [
+        "- a",
+        "   b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n   **b**"
+        }
+      ]
+    },
+    {
+      "source": "- a  \n    b",
+      "lines": [
+        "- a",
+        "    b"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a  \n    b"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n  - inner\n       second\n  tail",
+      "lines": [
+        "- outer",
+        "    - inner",
+        "         second",
+        "      tail"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n       second\n  tail"
+        }
+      ]
+    },
+    {
       "source": "- a\n  - b\n  1. b",
       "lines": [
         "- a",
