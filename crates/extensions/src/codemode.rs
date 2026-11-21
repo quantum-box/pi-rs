@@ -776,10 +776,10 @@ fn install_globals(
         })),
     )?;
     let searchable = documents.clone();
-    globals.set("__search_tools", Func::from(move |query: String, options: String| {
-        let options: Value = serde_json::from_str(&options).unwrap_or_default();
-        let limit = options["limit"].as_u64().unwrap_or(8).min(1000) as usize;
-        let wanted = options["namespace"].as_str().map(normalize_namespace);
+    globals.set("__search_tools", Func::from(move |query: String, limit: f64, namespace: Option<String>| {
+        // The cast saturates for values larger than usize; ranking takes at most the catalogue size.
+        let limit = limit as usize;
+        let wanted = namespace.as_deref().map(normalize_namespace);
         let documents: Vec<_> = searchable.iter().filter(|document| wanted.as_ref().is_none_or(|wanted| tool_namespace(&document.tool.name) == *wanted)).cloned().collect();
         let matches: Vec<_> = rank(&query, &documents, limit).into_iter().map(|(index, _)| json!({"name":documents[index].tool.name,"description":documents[index].tool.description})).collect();
         serde_json::to_string(&matches).unwrap()
@@ -2611,6 +2611,67 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_validates_arguments_and_preserves_requested_limit() {
+        struct Catalogue;
+        #[async_trait::async_trait]
+        impl ToolHost for Catalogue {
+            fn tools(&self) -> Vec<ToolSpec> {
+                (0..1001)
+                    .map(|index| ToolSpec {
+                        name: format!("fixture_{index}"),
+                        description: "Fixture matching search".into(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+
+            async fn call(&self, _name: &str, _arguments: Value) -> Outcome {
+                panic!("discovery must not invoke tools")
+            }
+        }
+        let script = r#"
+            for (const [invoke, expected] of [
+                [() => searchTools(undefined), "searchTools() expects a query string"],
+                [() => searchTools(3), "searchTools() expects a query string"],
+                ...[0, -1, 1.5, "2", true].map(limit => [
+                    () => searchTools("fixture", {limit}), "searchTools() limit must be a positive integer",
+                ]),
+                [() => searchTools("fixture", {namespace: 3}), "searchTools() namespace must be a string"],
+                [() => describeTool(42), "describeTool() expects a tool name"],
+                [() => describeNamespace(undefined), "describeNamespace() expects a namespace name"],
+            ]) {
+                let error;
+                try { await invoke(); } catch (caught) { error = caught; }
+                if (!error?.message.includes(expected)) throw new Error("Missing validation: " + expected);
+            }
+            const counts = [];
+            for (const limit of [undefined, null, NaN, Infinity, 1, 1001, 1e100]) {
+                counts.push((await searchTools("fixture", {limit})).length);
+            }
+            counts.push((await searchTools("fixture", {namespace: "", limit: 2})).length);
+            counts.push((await searchTools("fixture", {namespace: "pi", limit: 2})).length);
+            counts.push((await searchTools("fixture", {namespace: "missing", limit: 2})).length);
+            text(JSON.stringify(counts));
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(10)),
+        }
+        .invoke_transaction(
+            json!({"code":script}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(Catalogue),
+        )
+        .await;
+        let output = reply.outcome.tool_content();
+        assert!(!reply.outcome.is_error(), "{output}");
+        assert!(output.contains("[8,8,8,8,1,1001,1001,2,2,0]"), "{output}");
     }
 
     #[test]
