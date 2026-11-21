@@ -218,8 +218,12 @@ pub(super) fn stream_call_index(
             return Ok(index);
         }
         if had_calls && calls.values().any(|call| call.id.is_empty()) {
-            if calls.len() == 1 && position == 0 && name.is_none_or(str::is_empty) {
-                return Ok(*calls.first_key_value().expect("one active tool call").0);
+            if let Some((index, active)) = calls.first_key_value()
+                && calls.len() == 1
+                && position == 0
+                && name.is_none_or(|name| name.is_empty() || name == active.name)
+            {
+                return Ok(*index);
             }
             return Err(Error::Model(
                 "ambiguous Mistral tool call ID without an index".into(),
@@ -377,9 +381,21 @@ mod tests {
                 )
             })
             .collect();
-        let anonymous = [(0, crate::CallDelta::default())].into_iter().collect();
+        let anonymous = [(
+            0,
+            crate::CallDelta {
+                name: "read".into(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
         assert_eq!(
             stream_call_index(Some("late"), None, 0, true, &anonymous).unwrap(),
+            0
+        );
+        assert_eq!(
+            stream_call_index(Some("late"), Some("read"), 0, true, &anonymous).unwrap(),
             0
         );
         assert!(stream_call_index(Some("late"), Some("other"), 0, true, &anonymous).is_err());
