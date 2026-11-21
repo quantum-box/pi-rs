@@ -4734,7 +4734,7 @@ and headers inferred from classifier-only model URLs apply to those operations.
 When the inferred URL is on the configured official account, its provider
 credentials also apply to chat. Live Workers AI inference has not been verified.
 
-### Configured llama.cpp classifiers
+### llama.cpp classifiers
 
 A `models.json` provider can declare an entry with `"type": "classifier"` and
 `"api": "llama-cpp-classify"`. Set the provider or model `baseUrl` to the
@@ -4742,11 +4742,29 @@ llama-server URL. A trailing `/v1` is optional. The adapter accepts text
 classification questions and uses llama-server's tokenizer, chat template
 and next-token probabilities, including deeper readouts when necessary.
 It shares the classifier HTTP retry policy. An API key is optional, and
-configured keys and headers are scoped to their server. This adapter
-requires an explicit model entry and caches tokenizer results within each
-call. Automatic llama.cpp discovery and Pi's dynamic decision-model selection
-remain open. A local llama-server 1.0.0 run verified the classifier through
-Codemode against the published Pi adapter.
+configured keys and headers are scoped to their server. Tokenizer results are
+cached within a classification call. A local llama-server 1.0.0 run verified
+the configured classifier through Codemode against the published Pi adapter.
+
+Native snapshots the router catalog at Codemode startup from the Pi-format
+`llama.cpp` API-key entry in `auth.json` or from `LLAMA_BASE_URL`. A saved URL
+takes precedence, and the optional key is scoped to its configured router.
+Native Codemode applies its existing transport policy to these endpoints.
+Use HTTPS for remote servers. Plain HTTP is supported on loopback.
+Single-model servers can be registered explicitly. Automatic discovery
+requires the router catalog, as in Pi.
+Loaded and sleeping models, and unloaded presets eligible for router
+autoload, can appear as classifiers.
+Models advertising `decisions` output use `/v1/systemone`; other models use
+next-token classification. Explicit model entries take precedence and inherit
+the router's credentials or keyless access only when their operation endpoint
+matches the configured router.
+`--offline` skips discovery. This refresh is scoped to the native Codemode
+classifier catalog. Pi also refreshes its chat catalog. A llama-server 1.0.0
+router run discovered an unloaded preset and exercised autoload and
+classification via Codemode. An authenticated run verified saved endpoint and
+key precedence. The native score and confidence matched Pi 1.5.0. The System
+One route was checked with a loopback catalog fixture.
 
 ### OpenRouter image result checkpoint
 

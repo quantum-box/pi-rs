@@ -877,7 +877,9 @@ async fn configure_after(
             )));
         }
         if enabled("builtin:codemode")? {
-            extensions.push(Arc::new(super::operation_models::Operations::new(args)?));
+            let mut operations = super::operation_models::Operations::new(args)?;
+            operations.discover_llama().await;
+            extensions.push(Arc::new(operations));
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"]

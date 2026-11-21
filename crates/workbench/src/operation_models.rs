@@ -16,6 +16,7 @@ use super::{
 
 mod decisions;
 mod llama_cpp;
+mod llama_discovery;
 mod wire;
 use wire::{
     classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
@@ -366,6 +367,7 @@ struct Entry {
     endpoint: Url,
     api_key: Option<String>,
     cloudflare_default: bool,
+    llama_root: Option<Url>,
 }
 
 #[derive(Clone, Default)]
@@ -587,6 +589,7 @@ impl Catalogue {
                     endpoint,
                     api_key,
                     cloudflare_default,
+                    llama_root: None,
                 });
             }
         }
@@ -610,10 +613,12 @@ impl Catalogue {
                 continue;
             }
             if available {
+                let allows_keyless = model.allows_keyless(keys);
                 let key = (
                     model.provider.as_str(),
                     model.endpoint.as_str(),
-                    model.allows_keyless(),
+                    allows_keyless,
+                    model.llama_root.is_some(),
                 );
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
@@ -624,7 +629,7 @@ impl Catalogue {
                             .and_then(|model| model.credential(keys))
                         {
                             Some(credential) => credential.resolve().await.is_ok(),
-                            None => model.allows_keyless(),
+                            None => allows_keyless,
                         };
                         resolved.insert(key, usable);
                         usable
@@ -783,8 +788,26 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 }
 
 impl Entry {
-    fn allows_keyless(&self) -> bool {
-        matches!(self.api, Api::LlamaCppClassifier)
+    fn allows_keyless(&self, keys: &Keys) -> bool {
+        self.llama_root.is_some()
+            || matches!(self.api, Api::LlamaCppClassifier)
+            || matches!(
+                self.router_credential(keys, |name| std::env::var(name).ok()),
+                Some(None)
+            )
+    }
+
+    fn router_credential(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Option<Credential>> {
+        if self.provider != "llama.cpp" {
+            return None;
+        }
+        let (root, key) = llama_discovery::configured_server(keys, env)?;
+        let (_, endpoint) = llama_discovery::classifier_endpoints(&root, self.api)?;
+        (endpoint == self.endpoint).then_some(key)
     }
 
     fn is_official(&self) -> bool {
@@ -860,6 +883,12 @@ impl Entry {
         keys: &Keys,
         env: impl Fn(&str) -> Option<String>,
     ) -> Option<Credential> {
+        if let Some(root) = &self.llama_root {
+            return match llama_discovery::configured_server(keys, env) {
+                Some((configured, key)) if configured == *root => key,
+                _ => Some(Credential::Invalid),
+            };
+        }
         let official = self.is_official();
         if let Some(key) =
             keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
@@ -874,6 +903,9 @@ impl Entry {
                 Some(credential @ Credential::Command(_)) => credential,
                 _ => Credential::Invalid,
             });
+        }
+        if let Some(key) = self.router_credential(keys, &env) {
+            return key;
         }
         {
             let key = match (self.provider.as_str(), official) {
@@ -947,6 +979,36 @@ impl Operations {
                 Error::Config("could not initialize model operation HTTP client".into())
             })?,
         })
+    }
+
+    pub async fn discover_llama(&mut self) {
+        if self.args.offline {
+            return;
+        }
+        let keys = Keys::load_async().await.unwrap_or_default();
+        let Some((root, key)) =
+            llama_discovery::configured_server(&keys, |name| std::env::var(name).ok())
+        else {
+            return;
+        };
+        let key = match key {
+            Some(key) => match tokio::time::timeout(Duration::from_secs(2), key.resolve()).await {
+                Ok(Ok(secret)) => Some(secret),
+                _ => return,
+            },
+            None => None,
+        };
+        let discovered = llama_discovery::discover(&self.client, &root, key.as_deref()).await;
+        let configured = &mut self.args.model_profiles.operations_mut().0;
+        for entry in discovered {
+            if !configured.iter().any(|model| {
+                model.provider == entry.provider
+                    && model.api.kind() == entry.api.kind()
+                    && model.model.id == entry.model.id
+            }) {
+                configured.push(entry);
+            }
+        }
     }
 }
 
@@ -1295,7 +1357,7 @@ impl Operations {
                 .map_err(|_| Error::Config("invalid model operation credential".into()))?;
             authorization.set_sensitive(true);
             headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        } else if !entry.allows_keyless() {
+        } else if !entry.allows_keyless(keys) {
             return Err(Error::Config(format!(
                 "No API key for provider: {}",
                 entry.provider
@@ -1339,6 +1401,93 @@ async fn send_model_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_llama_classifiers_inherit_keys_only_for_the_matching_router() {
+        let providers = json!({
+            "llama.cpp": {
+                "models": [
+                    {"id":"chat","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"decisions","type":"classifier","api":"typesafe-system-one",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"other-path","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1"},
+                    {"id":"other-host","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://other.example/prefix/v1/v1"}
+                ]
+            }
+        });
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::default();
+        let env = |name: &str| match name {
+            "LLAMA_BASE_URL" => Some("https://router.example/prefix/v1/v1/".into()),
+            "LLAMA_API_KEY" => Some("router-key".into()),
+            _ => None,
+        };
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let credential = entry.credential_with_env(&keys, env);
+            match entry.model.id.as_str() {
+                "chat" | "decisions" => {
+                    assert_eq!(credential.unwrap().literal(), Some("router-key"));
+                }
+                "other-path" | "other-host" => assert!(credential.is_none()),
+                id => panic!("unexpected fixture model {id}"),
+            }
+        }
+        assert_eq!(
+            catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "llama.cpp")
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_system_one_classifier_can_use_only_the_matching_keyless_router() {
+        use clap::Parser;
+
+        let providers = json!({"llama.cpp":{"models":[
+            {"id":"decision","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/prefix/v1"},
+            {"id":"other-path","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/other/v1"},
+            {"id":"other-host","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://other.example/prefix/v1"}
+        ]}});
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::parse(&json!({"llama.cpp":{
+            "type":"api_key","env":{"LLAMA_BASE_URL":"https://router.example/prefix"}
+        }}));
+        let available = catalogue
+            .list(Kind::Classifier, Some("llama.cpp"), None, true, &keys)
+            .await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0]["id"], "decision");
+        let operations = Operations::new(&Cli::parse_from(["pi"])).unwrap();
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let headers = operations.request_headers(entry, &keys).await;
+            if entry.model.id == "decision" {
+                assert!(
+                    !headers
+                        .unwrap()
+                        .contains_key(reqwest::header::AUTHORIZATION)
+                );
+            } else {
+                assert!(headers.is_err());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn unfiltered_catalogue_does_not_read_auth_file() {

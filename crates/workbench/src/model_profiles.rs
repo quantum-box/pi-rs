@@ -1035,6 +1035,10 @@ impl Profiles {
         &self.operations
     }
 
+    pub fn operations_mut(&mut self) -> &mut super::operation_models::Catalogue {
+        &mut self.operations
+    }
+
     pub fn revision(&self) -> &str {
         &self.revision
     }
