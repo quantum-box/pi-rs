@@ -36,6 +36,7 @@ pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
 pub use extension_boundary::{
     AgentActivityOutcome, AgentBeforeSettle, BoundaryContext, BoundaryDecision, BoundaryDraft,
+    TurnEndBoundary,
 };
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use host_auth::*;

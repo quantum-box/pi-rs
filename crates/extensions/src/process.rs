@@ -191,6 +191,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    TurnEndBoundary {
+        event: pi_rs_core::TurnEndBoundary,
+        state: Option<ExtensionState>,
+    },
     AfterProviderResponse {
         event: pi_rs_core::ProviderResponseEvent,
         state: Option<ExtensionState>,
@@ -380,6 +384,8 @@ struct Description {
     lifecycle_hook: bool,
     #[serde(default)]
     agent_before_settle_hook: bool,
+    #[serde(default)]
+    turn_end_boundary_hook: bool,
     #[serde(default)]
     lifecycle_host_calls: bool,
     #[serde(default)]
@@ -810,6 +816,22 @@ impl ExecutableExtension {
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn handles_turn_end_boundary(&self) -> bool {
+        self.description.turn_end_boundary_hook
+    }
+
+    async fn turn_end_boundary(
+        &self,
+        event: &pi_rs_core::TurnEndBoundary,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+        self.request_async(ProtocolRequest::TurnEndBoundary {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn handles_agent_before_settle(&self) -> bool {
         self.description.agent_before_settle_hook
     }
@@ -3669,6 +3691,7 @@ async fn dispatch_inner(
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
             agent_before_settle_hook: extension.handles_agent_before_settle(),
+            turn_end_boundary_hook: extension.handles_turn_end_boundary(),
             lifecycle_host_calls: true,
             tool_hook_host_calls: true,
             before_tool_host_calls: true,
@@ -3833,6 +3856,9 @@ async fn dispatch_inner(
             } else {
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
+        }
+        ProtocolRequest::TurnEndBoundary { event, state } => {
+            encode(extension.turn_end_boundary(&event, state.as_ref()).await)
         }
         ProtocolRequest::AfterProviderResponse { event, state } => encode(
             extension
@@ -4853,6 +4879,57 @@ mod tests {
         }))
         .unwrap();
         dispatch(extension, request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actionable_turn_end_negotiates_separately_from_observation() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "turn-boundary"
+            }
+
+            fn handles_turn_end_boundary(&self) -> bool {
+                true
+            }
+
+            async fn turn_end_boundary(
+                &self,
+                event: &pi_rs_core::TurnEndBoundary,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+                assert_eq!(event.message_entry_id, 4);
+                assert_eq!(event.tool_result_entry_ids, [5]);
+                Ok(pi_rs_core::BoundaryDecision {
+                    entries: Some(event.entries.clone()),
+                    should_continue: Some(true),
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["turn_end_boundary_hook"], true);
+        assert_eq!(description["lifecycle_hook"], false);
+        let entry = serde_json::json!({"type":"context_edit","targetId":4,"replacement":null});
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "turn_end_boundary",
+            "event": {
+                "runId": "00000000-0000-0000-0000-000000000000",
+                "turnIndex": 0, "messageEntryId":4,
+                "message":{"role":"assistant","content":"answer","calls":[]},
+                "toolResultEntryIds":[5], "toolResults":[],
+                "outcome": "completed", "entries":[entry], "continue":false,
+                "context":{"contextMessages":[],"pendingMessages":[],"canContinue":false}
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response["entries"][0], entry);
+        assert_eq!(response["continue"], true);
     }
 
     #[tokio::test]

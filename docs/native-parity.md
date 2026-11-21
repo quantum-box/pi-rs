@@ -4662,6 +4662,12 @@ and the host's typed message projection. A requested continuation consumes
 the existing run budget. Cancellation during the hook commits any valid
 proposals and stops the continuation.
 
+The actionable `turn_end` callback runs after the assistant and tool
+results are durable and before the observing lifecycle callback. It carries
+the assistant message and tool-result record IDs. Its plan survives reopening
+and can require one more provider request. A tool result or accepted queued
+input that already starts the next request satisfies that decision.
+
 ### Native modal components
 
 A Rust extension can request a custom modal component with styled
